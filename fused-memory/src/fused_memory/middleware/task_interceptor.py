@@ -2589,6 +2589,54 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         return await tm.get_tasks(project_root, tag)
 
+    async def get_statuses(
+        self,
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, str]:
+        """Return a ``{id_str: status_str}`` mapping for tasks in *project_root*.
+
+        This is a pure read — no events are emitted, no journal entry is written.
+
+        Args:
+            project_root: Absolute path to project root.
+            ids: When given, only these task ids are returned (unknown ids are
+                 silently omitted).  ``None`` returns all tasks.  ``[]`` returns
+                 ``{}``.
+            tag: Tag context forwarded to ``get_tasks`` (optional).
+
+        Notes:
+            Tasks whose dict is missing the ``'status'`` key are included with
+            the sentinel value ``'unknown'``.  Callers that need to distinguish
+            a genuine ``'unknown'`` status from a missing field should treat any
+            ``'unknown'`` value as indeterminate.
+        """
+        tm = await self._ensure_taskmaster()
+        raw = await tm.get_tasks(project_root, tag)
+
+        # Resolve envelope: handles {tasks: [...]} and {data: {tasks: [...]}}
+        if isinstance(raw.get('data'), dict) and 'tasks' in raw['data']:
+            task_list = raw['data']['tasks']
+        else:
+            task_list = raw.get('tasks', [])
+
+        ids_set: set[str] | None = (
+            {str(i) for i in ids} if ids is not None else None
+        )
+        mapping: dict[str, str] = {}
+        for t in task_list:
+            tid = str(t.get('id', ''))
+            if not tid:
+                continue
+            # Filter early: if the caller supplied an ids list, skip tasks
+            # that are not in it rather than building the full mapping first.
+            if ids_set is not None and tid not in ids_set:
+                continue
+            mapping[tid] = str(t.get('status', 'unknown'))
+
+        return mapping
+
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:

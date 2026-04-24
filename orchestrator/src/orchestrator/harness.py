@@ -362,15 +362,25 @@ class Harness:
             # 2. Parse PRD into tasks (skipped when no PRD given)
             if prd_path is not None:
                 logger.info(f'Parsing PRD: {prd_path}')
-                pre_ids = {str(t.get('id', '')) for t in await self.scheduler.get_tasks()}
+                pre_ids = set((await self.scheduler.get_statuses()).keys())
                 await self._populate_tasks(prd_path)
 
                 # 2a. Tag newly-created tasks with PRD source
                 await self._tag_prd_metadata(prd_path, pre_ids)
             else:
                 logger.info('No PRD given — running existing tasks')
-                existing = await self.scheduler.get_tasks()
-                if not any(t.get('status') == 'pending' for t in existing):
+                existing_statuses = await self.scheduler.get_statuses()
+                if 'pending' not in existing_statuses.values():
+                    if not existing_statuses:
+                        # An empty mapping could mean a genuine empty task tree
+                        # OR a transport failure in get_statuses (which swallows
+                        # exceptions and returns {}).  Point operators at the
+                        # fused-memory logs so they can distinguish the two.
+                        logger.error(
+                            'get_statuses returned an empty mapping — if tasks '
+                            'should exist, check fused-memory logs for transport '
+                            'errors before assuming the task tree is empty.'
+                        )
                     raise RuntimeError(
                         'No PRD given and no pending tasks found. '
                         'Pass --prd to decompose a PRD, or create tasks first.'
@@ -386,8 +396,8 @@ class Harness:
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
             await self._reconcile_stranded_in_progress()
 
-            tasks = await self.scheduler.get_tasks()
-            self.report.total_tasks = len([t for t in tasks if t.get('status') == 'pending'])
+            statuses = await self.scheduler.get_statuses()
+            self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
             logger.info(f'Task tree populated: {self.report.total_tasks} pending tasks')
 
             if dry_run:
@@ -886,14 +896,13 @@ Output JSON matching the schema. Every task must appear in the output.
         plan.lock for recovered worktrees) and BEFORE the first
         scheduler.acquire_next() call, so self._dispatched is always empty here.
         """
-        tasks = await self.scheduler.get_tasks()
+        statuses = await self.scheduler.get_statuses()
         reverted = 0
 
-        for t in tasks:
-            if t.get('status') != 'in-progress':
+        for tid, status in statuses.items():
+            if status != 'in-progress':
                 continue
 
-            tid = str(t.get('id', ''))
             worktree_path = self.git_ops.worktree_base / tid
             lock_path = worktree_path / '.task' / 'plan.lock'
 

@@ -178,6 +178,41 @@ class TestStubMcpSessionUpdateTask:
         assert content[0]['type'] == 'text'
 
 
+class TestStubMcpSessionGetStatuses:
+    """Tests for _StubMcpSession.call_tool('get_statuses', ...)."""
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_returns_empty_mapping_when_no_tasks_set(self):
+        """Fresh stub: get_statuses returns envelope text that parses to {'statuses': {}}."""
+        stub = _StubMcpSession()
+        result = await stub.call_tool('get_statuses', {'project_root': '/p'})
+        block = result['result']['content'][0]
+        decoded = json.loads(block['text'])
+        assert decoded == {'statuses': {}}
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_reflects_prior_set_task_status(self):
+        """After set_task_status('7', 'in-progress'), get_statuses returns {'statuses': {'7':'in-progress'}}."""
+        stub = _StubMcpSession()
+        await stub.call_tool('set_task_status', {'id': '7', 'status': 'in-progress'})
+        result = await stub.call_tool('get_statuses', {'project_root': '/p'})
+        block = result['result']['content'][0]
+        decoded = json.loads(block['text'])
+        assert decoded == {'statuses': {'7': 'in-progress'}}
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_filters_by_ids_argument(self):
+        """When ids=['a'] is passed, only 'a' appears in statuses (not other seeded ids)."""
+        stub = _StubMcpSession()
+        await stub.call_tool('set_task_status', {'id': 'a', 'status': 'done'})
+        await stub.call_tool('set_task_status', {'id': 'b', 'status': 'pending'})
+        result = await stub.call_tool('get_statuses', {'project_root': '/p', 'ids': ['a']})
+        block = result['result']['content'][0]
+        decoded = json.loads(block['text'])
+        assert decoded == {'statuses': {'a': 'done'}}
+        assert 'b' not in decoded['statuses']
+
+
 class TestStubMcpSessionUnknownTool:
     """Tests for _StubMcpSession.call_tool with an unknown tool name."""
 

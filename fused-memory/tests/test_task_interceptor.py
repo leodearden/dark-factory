@@ -1568,6 +1568,125 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_
                     await _wt
 
 
+# ── Tests for get_statuses ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_returns_all_id_to_status_mapping(taskmaster, event_buffer):
+    """get_statuses returns {id_str: status_str} for every task; no events emitted."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1, 'status': 'pending'},
+            {'id': 2, 'status': 'done'},
+            {'id': 3, 'status': 'in-progress'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project')
+
+    assert result == {'1': 'pending', '2': 'done', '3': 'in-progress'}
+
+    # Pure read — must not emit any events
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_filters_by_ids_list(taskmaster, event_buffer):
+    """When ids=['1', '3'], only those two keys appear in the result."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1, 'status': 'pending'},
+            {'id': 2, 'status': 'done'},
+            {'id': 3, 'status': 'in-progress'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project', ids=['1', '3'])
+
+    assert result == {'1': 'pending', '3': 'in-progress'}
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_omits_unknown_ids(taskmaster, event_buffer):
+    """Unknown ids in the filter list are silently omitted (no error, no key)."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1, 'status': 'pending'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project', ids=['1', '9999'])
+
+    assert result == {'1': 'pending'}
+    assert '9999' not in result
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_handles_data_envelope(taskmaster, event_buffer):
+    """get_statuses unwraps {data: {tasks: [...]}} envelope like get_task does."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'data': {
+            'tasks': [
+                {'id': 10, 'status': 'blocked'},
+                {'id': 11, 'status': 'done'},
+            ]
+        }
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project')
+
+    assert result == {'10': 'blocked', '11': 'done'}
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_raises_when_taskmaster_not_configured(event_buffer):
+    """TaskInterceptor(None, None, buf) → get_statuses() raises RuntimeError."""
+    interceptor = TaskInterceptor(None, None, event_buffer)
+    with pytest.raises(RuntimeError, match='not configured'):
+        await interceptor.get_statuses('/project')
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_calls_ensure_connected(event_buffer):
+    """ensure_connected is called before proxying to taskmaster in get_statuses."""
+    tm = AsyncMock()
+    tm.ensure_connected = AsyncMock()
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    interceptor = TaskInterceptor(tm, None, event_buffer)
+
+    await interceptor.get_statuses('/project')
+    tm.ensure_connected.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_missing_status_key_defaults_to_unknown(
+    taskmaster, event_buffer
+):
+    """A task dict without a 'status' key is included with status='unknown'.
+
+    Contract: the sentinel 'unknown' is the documented default when the raw
+    task dict omits 'status'.  Callers that need to distinguish a genuine
+    'unknown' status from a missing field should treat any 'unknown' as
+    indeterminate.
+    """
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1},              # no 'status' key
+            {'id': 2, 'status': 'done'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project')
+
+    assert result == {'1': 'unknown', '2': 'done'}
+
+
 # ── Tests for None / disconnected taskmaster ───────────────────────
 
 
