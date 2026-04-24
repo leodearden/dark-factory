@@ -488,3 +488,32 @@ class TestReconciliationConfigTimeouts:
         # stage == cycle is the degenerate-but-valid co-terminal case
         cfg = ReconciliationConfig(stage_timeout_seconds=3600, cycle_timeout_seconds=3600)
         assert cfg.stage_timeout_seconds == 3600
+
+
+class TestReconciliationConfigDeadLetterFields:
+    """Tests for event_dead_letter_max_bytes and event_dead_letter_keep_rotations."""
+
+    def test_default_max_bytes(self):
+        cfg = ReconciliationConfig()
+        assert cfg.event_dead_letter_max_bytes == 10 * 1024 * 1024
+
+    def test_default_keep_rotations(self):
+        cfg = ReconciliationConfig()
+        assert cfg.event_dead_letter_keep_rotations == 3
+
+    def test_max_bytes_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(event_dead_letter_max_bytes=0)
+
+    def test_max_bytes_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(event_dead_letter_max_bytes=-1)
+
+    def test_keep_rotations_zero_accepted(self):
+        # zero means "don't keep any rotations" — valid boundary value
+        cfg = ReconciliationConfig(event_dead_letter_keep_rotations=0)
+        assert cfg.event_dead_letter_keep_rotations == 0
+
+    def test_keep_rotations_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(event_dead_letter_keep_rotations=-1)
