@@ -3711,3 +3711,51 @@ async def test_expand_task_intra_batch_remove_is_locked(
     assert tracker.peak.get('p', 0) == 1, (
         f'overlap detected during expand + intra-batch remove: peak={tracker.peak}'
     )
+
+
+@pytest.mark.asyncio
+async def test_no_intra_batch_duplicates_preserves_existing_behaviour(
+    curator_interceptor, taskmaster,
+):
+    """Regression guard: when no intra-batch duplicates exist the pre-pass
+    is a true no-op — removed is empty, kept has all tasks, remove_task
+    is NOT called, and curator.curate is called exactly once per unique task.
+
+    This ensures the pre-pass does not alter existing cross-task dedup
+    behaviour when the batch contains genuinely distinct tasks.
+    """
+    parent_task = {'id': '1', 'title': 'Parent', 'status': 'pending'}
+    pre_snapshot = {'tasks': [parent_task]}
+    post_snapshot = {'tasks': [{
+        **parent_task,
+        'subtasks': [
+            {'id': '1.1', 'title': 'Task Alpha', 'description': 'does alpha work'},
+            {'id': '1.2', 'title': 'Task Beta', 'description': 'does beta work'},
+        ],
+    }]}
+
+    taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='new')
+    )
+
+    result = await curator_interceptor.expand_task('1', '/project')
+
+    dedup = result['dedup']
+
+    # No intra-batch removals
+    assert dedup['removed'] == [], f"expected no removals, got: {dedup['removed']}"
+
+    # Both tasks kept
+    kept_ids = {k['task_id'] for k in dedup['kept']}
+    assert kept_ids == {'1.1', '1.2'}, f"kept_ids={kept_ids}"
+
+    # remove_task NOT called at all
+    assert taskmaster.remove_task.await_count == 0, (
+        f'remove_task should not have been called: {taskmaster.remove_task.call_args_list}'
+    )
+
+    # curator.curate called for both tasks (2 unique survivors)
+    assert curator_interceptor._curator.curate.await_count == 2
