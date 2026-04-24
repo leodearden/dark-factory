@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from unittest.mock import MagicMock
 
 from orchestrator.agents.triage import (
@@ -9,6 +10,7 @@ from orchestrator.agents.triage import (
     build_triage_prompt,
     format_pretriaged_detail,
     parse_triage_result,
+    sha256_16,
     suggestion_hash,
 )
 
@@ -265,3 +267,30 @@ class TestSuggestionHash:
 
     def test_combine_single_returns_self(self):
         assert _combine_suggestion_hashes(['abcd1234abcd1234']) == 'abcd1234abcd1234'
+
+
+# ---------------------------------------------------------------------------
+# sha256_16 — canonical 16-char sha256-hex helper
+# ---------------------------------------------------------------------------
+
+class TestSha256_16:
+    """sha256_16 is the shared 16-char sha256 helper that both suggestion_hash
+    and the escalation-watcher skill's cleanup_needed snippet depend on.
+    """
+
+    def test_length_is_16(self):
+        assert len(sha256_16('anything')) == 16
+
+    def test_deterministic(self):
+        assert sha256_16('hello') == sha256_16('hello')
+
+    def test_differs_across_inputs(self):
+        assert sha256_16('hello') != sha256_16('world')
+
+    def test_matches_raw_hashlib_reference(self):
+        """Pins the exact construction so the skill's legacy snippet is byte-compatible."""
+        assert sha256_16('test') == hashlib.sha256(b'test').hexdigest()[:16]
+
+    def test_empty_string_is_fixed_prefix(self):
+        """Documents the collision callers must avoid — blank detail must not be passed raw."""
+        assert sha256_16('') == 'e3b0c44298fc1c14'
