@@ -2680,6 +2680,85 @@ class TestRecoverIfAlreadyMerged:
             f'{workflow.state!r}'
         )
 
+    async def test_returns_none_for_inherited_iterations_log_on_fresh_worktree(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Fresh worktree with inherited iterations.jsonl contamination must return None.
+
+        Regression test for the false-DONE bug in pre-PLAN
+        _recover_if_already_merged(): a freshly-created worktree whose HEAD
+        equals base_commit (no implementation commits) but whose
+        .task/iterations.jsonl was inherited from contamination (e.g. left over
+        from a prior run on main, eval mode, race condition) must NOT return
+        WorkflowOutcome.DONE.
+
+        On unmodified code the call `self._has_prior_implementation()` (no
+        wt_head argument) falls back to the iteration-log scan, finds the
+        'implementer' entry, sets has_work=True and returns DONE — false-DONE.
+
+        After the fix (passing wt_head), `_has_prior_implementation` takes the
+        SHA-primary path: wt_head.strip() == base_commit → has_work=False →
+        recovery correctly returns None.
+
+        Design decision: we also write metadata.json (mimicking artifacts.init())
+        so that _has_prior_implementation(wt_head=...) finds a non-None
+        base_commit and takes the SHA-primary path.  Without metadata.json
+        read_base_commit() returns None → iteration-log fallback → still
+        has_work=True even after the wt_head change.
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (wt_head == base_commit, trivially ancestor of main)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Read current HEAD (= base_commit) and stamp metadata.json so the
+        #    SHA-primary path is taken in _has_prior_implementation(wt_head=...).
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+
+        # 3. Write iterations.jsonl with an implementer entry — simulates
+        #    inherited contamination (on-disk but untracked; NOT git-committed).
+        #    On unmodified code this entry causes has_work=True via the
+        #    iteration-log fallback → false-DONE.
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+        # Explicitly do NOT make any git commit: wt_head remains == base_commit.
+
+        # 4. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 5. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 6. Assertions: inherited contamination must NOT cause false-DONE
+        assert outcome is None, (
+            f'Expected None for fresh worktree with inherited iterations.jsonl '
+            f'contamination but got {outcome!r} — '
+            'iteration-log fallback would false-DONE on inherited contamination; '
+            'the SHA-primary check (wt_head != base_commit) must reject this state'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses for fresh worktree "
+            f"with only inherited contamination: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE for fresh worktree with inherited '
+            f'contamination: {workflow.state!r}'
+        )
+
     async def test_returns_none_when_branch_not_on_main(
         self, config, git_ops, task_assignment, tmp_path
     ):
@@ -2909,26 +2988,53 @@ class TestRecoverIfAlreadyMerged:
 
 @pytest.mark.asyncio
 class TestRunPrePlanRecovery:
-    """workflow.run returns DONE before PLAN when the branch is already on main.
+    """workflow.run returns DONE on already-merged branches via the two-guard model.
 
-    The pre-PLAN call to _recover_if_already_merged() must fire before the
-    architect (PLAN phase) is invoked — neither architect nor implementer
-    should be called when the recovery detects a prior merge.
+    After the SHA-primary fix (Option B), recovery uses two guards:
+
+    1. Pre-PLAN guard (_recover_if_already_merged, called before the architect):
+       uses SHA-primary (wt_head != base_commit) to reject stale states.  If the
+       worktree has no real commits relative to its base — including the case where
+       .task/iterations.jsonl was inherited from main contamination — the guard
+       returns None and the workflow falls through to PLAN.  This prevents
+       false-DONE when a fresh worktree has no implementation work.
+
+    2. Pre-EXECUTE guard (workflow.py:412-457, called after PLAN):
+       uses the iteration-log fallback (no wt_head passed).  This is the backstop
+       that detects rebased ghost-loops: if create_worktree rebased a
+       genuinely-implemented branch so that wt_head == new_base_commit, the
+       pre-PLAN guard returns None, the architect runs (one wasted invocation —
+       explicitly accepted trade-off), and then the pre-EXECUTE guard finds the
+       committed implementer entry and routes to the SUCCESS path without calling
+       the implementer.
+
+    Net invariant: DONE is always reached; implementer is never called on an
+    already-merged branch; at most one architect invocation is wasted.
     """
 
-    async def test_run_returns_done_early_via_pre_plan_recovery(
+    async def test_run_returns_done_via_pre_execute_ghost_loop_guard(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """workflow.run exits DONE before architect is called on a merged branch.
+        """workflow.run exits DONE (via pre-EXECUTE guard) on a merged branch.
 
         Set up: pre-create a worktree, stamp iterations.jsonl with an
         implementer entry, commit a real file, merge to main.
 
-        The AgentStub's _architect is overridden to raise AssertionError so
-        the test fails loudly if workflow.run enters the PLAN phase.
+        Behaviour change after the SHA-primary fix (Option B):
+        - The pre-PLAN _recover_if_already_merged() call uses wt_head passed
+          to _has_prior_implementation().  At that point artifacts.init() has
+          already written base_commit = current HEAD, so wt_head == base_commit
+          → SHA-primary → has_work=False → returns None.
+        - The workflow therefore enters the PLAN phase and the architect IS
+          invoked (one wasted invocation — explicitly accepted trade-off; see
+          the design decisions in the task plan).
+        - After PLAN, the pre-EXECUTE ghost-loop guard (workflow.py:412-457)
+          still uses the iteration-log fallback (no wt_head passed), finds the
+          committed implementer entry, sees wt_head is already on main →
+          has_work=True → skips EXECUTE → falls through to the SUCCESS path →
+          marks DONE.
 
-        After step-14 adds the pre-PLAN recovery call in workflow.run, the
-        recovery fires before PLAN and the architect is never invoked.
+        Net: outcome == DONE, architect called once, implementer NOT called.
         """
         import json as _json
 
@@ -2949,18 +3055,15 @@ class TestRunPrePlanRecovery:
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
-        # 2. Build workflow with a stub that raises if architect/implementer called
+        # 2. Build workflow with a stub that raises if implementer called.
+        #    NOTE: architect is NOT overridden — it IS called now (one wasted
+        #    invocation after the SHA-primary fix); the pre-EXECUTE guard
+        #    catches the ghost-loop and prevents the implementer from running.
         class _NoCallStub(AgentStub):
-            async def _architect(self, cwd):
-                raise AssertionError(
-                    'architect must NOT be called when branch is already on main '
-                    '— pre-PLAN recovery should have short-circuited'
-                )
-
             async def _implementer(self, cwd):
                 raise AssertionError(
                     'implementer must NOT be called when branch is already on main '
-                    '— pre-PLAN recovery should have short-circuited'
+                    '— the pre-EXECUTE ghost-loop guard should short-circuit EXECUTE'
                 )
 
         stub = _NoCallStub()
@@ -2974,18 +3077,21 @@ class TestRunPrePlanRecovery:
             )),
         )
 
-        # 3. Run workflow — should detect prior merge before PLAN
+        # 3. Run workflow — enters PLAN (architect runs once), then pre-EXECUTE
+        #    guard detects the already-merged branch and routes to SUCCESS.
         outcome = await workflow.run()
 
-        # 4. Assert DONE with no agent calls
+        # 4. Assert DONE; architect WAS called (once), implementer was NOT called.
         assert outcome == WorkflowOutcome.DONE, (
             f'Expected DONE but got {outcome!r}'
         )
-        assert 'architect' not in stub.calls, (
-            f'architect was unexpectedly called: {stub.calls}'
+        assert stub.calls.count('architect') == 1, (
+            f'architect should have been called exactly once (SHA-primary fix trade-off — '
+            f'bounded cost invariant): {stub.calls}'
         )
         assert 'implementer' not in stub.calls, (
-            f'implementer was unexpectedly called: {stub.calls}'
+            f'implementer must NOT be called — pre-EXECUTE ghost-loop guard should '
+            f'have prevented it: {stub.calls}'
         )
 
     async def test_run_proceeds_to_plan_when_recovery_returns_none(

@@ -439,6 +439,15 @@ class TaskWorkflow:
                 # but never implemented, or a freshly-created worktree) also
                 # satisfies the ancestor check.  Only skip if there's
                 # evidence of prior implementation work.
+                #
+                # WT_HEAD INTENTIONALLY OMITTED — see _has_prior_implementation()
+                # docstring.  This caller is reached after a genuine rebase, so
+                # wt_head may equal the new base_commit even on a
+                # genuinely-implemented branch.  The iteration-log fallback is the
+                # correct signal here: if there's an implementer entry in the log,
+                # the branch has real work and we should skip to DONE.  Passing
+                # wt_head would cause the SHA-primary check to return has_work=False
+                # on any rebased branch, silently discarding completed work.
                 has_work = (
                     self._has_prior_implementation().has_work
                     or await self.git_ops.has_uncommitted_work(self.worktree)
@@ -518,6 +527,15 @@ class TaskWorkflow:
                     # Defense-in-depth: same stale-branch-point guard as
                     # the pre-EXECUTE check.  Should rarely fire since
                     # we just ran execute, but guards against edge cases.
+                    #
+                    # WT_HEAD INTENTIONALLY OMITTED — see _has_prior_implementation()
+                    # docstring.  At this call site we have just run EXECUTE and
+                    # any prior rebase already happened; the iteration-log fallback
+                    # is the right signal.  The base_commit rebased-head problem
+                    # does not apply here because we are checking for the ABSENCE
+                    # of implementation work (i.e. a spurious merge signal), and a
+                    # freshly-rebased branch that completed EXECUTE will always have
+                    # iteration-log entries.
                     if already_merged and not self._has_prior_implementation().has_work:
                         logger.warning(
                             f'Task {self.task_id}: branch appears merged at '
@@ -2384,16 +2402,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         may rebase a reused worktree onto main, so wt_head == base_commit even
         though the branch was genuinely implemented.  The fallback correctly
         returns True here because the earlier implementer run wrote its entries
-        before the rebase.  This is the scenario exploited by
-        ``_recover_if_already_merged()`` and the pre-MERGE guard; it is safe.
+        before the rebase.  This is the scenario exploited by the pre-EXECUTE
+        guard and the pre-MERGE guard; it is safe for those callers.
 
         *Dangerous* — orphaned log: if iterations.jsonl were somehow copied
-        from a different task's branch, the fallback would return True for an
-        empty branch → false-done.  This is why callers that hold a reliable
-        post-execution wt_head (i.e. callers that have not rebased yet) must
-        pass it explicitly to use the SHA-primary path.
-        ``_recover_if_already_merged()`` intentionally omits wt_head (the
-        branch may have been rebased) — see the comment there for rationale.
+        from a different task's branch or inherited from main contamination,
+        the fallback would return True for an empty branch → false-done.
+        This is why callers that hold a reliable wt_head must pass it
+        explicitly.  ``_recover_if_already_merged()`` passes wt_head to
+        use the SHA-primary path, preventing false-DONE on inherited
+        .task/iterations.jsonl contamination — see the comment there for
+        the full trade-off analysis.
         """
         if self.artifacts is None:
             return _PriorImplStatus(has_work=False, entries=[], base_commit=None)
@@ -2461,15 +2480,29 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # try/except from the git layer so operators can distinguish the
         # root cause from the log message.
         #
-        # Note: we call _has_prior_implementation() WITHOUT wt_head so that
-        # the iteration-log fallback is used.  SHA-primary is unreliable here
-        # because create_worktree may have rebased the branch onto main before
-        # this call — after rebase, wt_head == base_commit even on a genuinely
-        # implemented branch, causing a false-negative.  The iteration-log scan
-        # correctly identifies prior implementer/debugger entries regardless of
-        # rebasing.  See _has_prior_implementation() docstring.
+        # We pass wt_head to _has_prior_implementation() so the SHA-primary
+        # path is taken: has_work = (wt_head != base_commit).  This prevents
+        # false-DONE when a fresh worktree (wt_head == base_commit, no real
+        # commits) has inherited an on-disk .task/iterations.jsonl written
+        # directly to the worktree's .task/ directory (e.g. main-branch
+        # contamination where the file exists on disk but is untracked by git).
+        # Without wt_head the iteration-log fallback finds the implementer entry
+        # and incorrectly returns DONE for an unimplemented task — catastrophic
+        # silent failure.  See test_returns_none_for_inherited_iterations_log_on_fresh_worktree
+        # for the regression case this guards.
+        #
+        # Trade-off: if create_worktree rebased a genuinely-implemented branch
+        # onto a new main tip so that wt_head == new_base_commit, the SHA-primary
+        # check returns has_work=False and this guard returns None (the workflow
+        # proceeds to PLAN).  The pre-EXECUTE guard at workflow.py:412-457 still
+        # uses the iteration-log fallback and will catch the rebased ghost-loop
+        # before EXECUTE, routing the workflow to the SUCCESS path.  Only one
+        # architect invocation is wasted — bounded cost, far preferable to a
+        # silent false-DONE that marks an unimplemented task complete with no
+        # code written.  See _has_prior_implementation() for SHA-primary vs.
+        # fallback semantics.
         try:
-            status = self._has_prior_implementation()
+            status = self._has_prior_implementation(wt_head=wt_head)
             if not status.has_work:
                 logger.warning(
                     'Task %s: branch HEAD %s is ancestor '
