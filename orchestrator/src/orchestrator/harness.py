@@ -362,18 +362,18 @@ class Harness:
             # 2. Parse PRD into tasks (skipped when no PRD given)
             if prd_path is not None:
                 logger.info(f'Parsing PRD: {prd_path}')
-                pre_ids = set((await self.scheduler.get_statuses()).keys())
+                _pre_statuses, _ = await self.scheduler.get_statuses()
+                pre_ids = set(_pre_statuses.keys())
                 await self._populate_tasks(prd_path)
 
                 # 2a. Tag newly-created tasks with PRD source
                 await self._tag_prd_metadata(prd_path, pre_ids)
             else:
                 logger.info('No PRD given — running existing tasks')
-                existing_statuses = await self.scheduler.get_statuses()
+                existing_statuses, err = await self.scheduler.get_statuses()
                 if 'pending' not in existing_statuses.values():
                     if not existing_statuses:
                         # Distinguish transport failure from genuinely empty tree.
-                        err = self.scheduler.last_get_statuses_error
                         if err is not None:
                             raise RuntimeError(
                                 f'Failed to reach fused-memory: '
@@ -401,7 +401,7 @@ class Harness:
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
             await self._reconcile_stranded_in_progress()
 
-            statuses = await self.scheduler.get_statuses()
+            statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
             logger.info(f'Task tree populated: {self.report.total_tasks} pending tasks')
 
@@ -901,7 +901,7 @@ Output JSON matching the schema. Every task must appear in the output.
         plan.lock for recovered worktrees) and BEFORE the first
         scheduler.acquire_next() call, so self._dispatched is always empty here.
         """
-        statuses = await self.scheduler.get_statuses()
+        statuses, _ = await self.scheduler.get_statuses()
         reverted = 0
 
         for tid, status in statuses.items():
