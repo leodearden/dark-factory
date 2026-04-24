@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -2024,17 +2025,53 @@ class TaskInterceptor:
                     batch_decisions = await curator.curate_batch(
                         non_none_candidates, project_id, project_root,
                     )
-                    # Map decisions back to candidate indices (some may be None).
+                    # Map decisions back to ticket_data-space (some candidates are None).
+                    # batch_target_index emitted by curate_batch is in non_none-space
+                    # (positions within non_none_candidates, which is what the LLM saw).
+                    # We must remap it to ticket_data-space (positions in candidates)
+                    # before the topological dispatch loop, which keys resolved_task_ids
+                    # by ticket_data-space indices.
+                    non_none_to_ticket_data = [
+                        i for i, c in enumerate(candidates) if c is not None
+                    ]
                     batch_idx = 0
                     decisions = []
                     for c in candidates:
                         if c is None:
                             decisions.append(None)
                         else:
-                            decisions.append(
-                                batch_decisions[batch_idx] if batch_idx < len(batch_decisions)
+                            bd = (
+                                batch_decisions[batch_idx]
+                                if batch_idx < len(batch_decisions)
                                 else None
                             )
+                            # Remap batch_target_index: non_none-space → ticket_data-space.
+                            # Single-item curate() calls in the fallback path cannot emit
+                            # batch_target_index, so no remap is needed there.
+                            if bd is not None and bd.batch_target_index is not None:
+                                local_bti = bd.batch_target_index
+                                if 0 <= local_bti < len(non_none_to_ticket_data):
+                                    remapped_bti = non_none_to_ticket_data[local_bti]
+                                    bd = dataclasses.replace(
+                                        bd, batch_target_index=remapped_bti,
+                                    )
+                                else:
+                                    # Out-of-range in non_none-space: degrade to create
+                                    # to avoid substituting a wrong task_id.
+                                    logger.warning(
+                                        '_process_add_tickets_batch: batch_target_index=%d '
+                                        'out of non_none range [0, %d) for ticket %d; '
+                                        'degrading to create',
+                                        local_bti, len(non_none_to_ticket_data), batch_idx,
+                                    )
+                                    bd = CuratorDecision(
+                                        action='create',
+                                        justification=(
+                                            f'batch-target-out-of-range: '
+                                            f'local={local_bti}'
+                                        ),
+                                    )
+                            decisions.append(bd)
                             batch_idx += 1
                 except (CuratorFailureError, AllAccountsCappedException) as exc:
                     # Whole batch LLM failure: fall back to individual curate() calls.
