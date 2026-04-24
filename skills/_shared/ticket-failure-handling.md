@@ -128,13 +128,22 @@ Use this when the caller already holds a real `escalation_id` from context (for
 example, escalation-watcher processing a `cleanup_needed` info item already has
 the escalation id; only the suggestion hash must be derived).
 
+**Empty-payload collision hazard:** `hashlib.sha256(b'').hexdigest()[:16]`
+always returns the fixed prefix `e3b0c44298fc1c14`.  If the field you hash
+(e.g. `escalation['detail']`) may be blank, every blank-detail escalation
+produces the same `suggestion_hash` and they all collapse into the same R4
+follow-up task.  Always use a fallback chain that terminates at a field
+guaranteed to be non-empty.  For `Escalation` objects, `id` is always
+`"esc-{task_id}-{seq}"` by the dataclass contract, so it is the safe terminal
+fallback:
+
 ```python
 import hashlib
 
-# suggestion_hash — sha256 of a stable payload, truncated to 16 hex chars.
-# The payload must be the same on every retry for the same logical work item
-# (e.g. the full suggestion text, or a canonical key).
-suggestion_hash = hashlib.sha256("<stable-payload>".encode()).hexdigest()[:16]
+# stable_payload — first non-empty field; 'id' is the guaranteed-non-empty
+# fallback (always "esc-{task_id}-{seq}" by the Escalation dataclass contract).
+stable_payload = escalation['detail'] or escalation['summary'] or escalation['id']
+suggestion_hash = hashlib.sha256(stable_payload.encode()).hexdigest()[:16]
 
 submit_task(
     title=...,
