@@ -1458,3 +1458,81 @@ async def test_verdict_carries_tripped_kind(tmp_path):
         f'in-progress counter trip: expected kind=in_progress_to_pending, '
         f'got {v_ip_trip.kind!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-13: acceptance scenario — startup reconcile must not trip
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_acceptance_scenario_startup_reconcile_does_not_trip(tmp_path):
+    """Regression pin for the 2026-04-24 reify incident.
+
+    Incident: esc-bulk-reset-reify-2026-04-24T070944_6456580000
+    The startup stranded-task reconciler reverted 27 in-progress→pending tasks
+    in ~2 s.  The single-threshold guard (threshold=10) tripped even though
+    zero done→pending transitions occurred — a false positive.
+
+    Acceptance criteria (task 1016):
+    (a) 27 in-progress→pending attempts within 2 s must ALL return outcome='ok'
+        with the production defaults (done_threshold=10,
+        in_progress_threshold=100, window_seconds=60.0).
+    (b) A subsequent burst of 11 done→pending attempts within 2 s must trip the
+        done counter on the 11th attempt, with kind=='done_to_pending'.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        done_threshold=10,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    esc_dir = tmp_path / 'data' / 'escalations'
+
+    # (a) Simulate the incident: 27 in-progress→pending within 2 s — must not trip.
+    for i in range(27):
+        clock[0] += 2.0 / 27  # spread 27 transitions over 2 s
+        v = await guard.observe_attempt(
+            project_id='reify',
+            task_id=f'stranded-{i}',
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', (
+            f'Incident regression FAIL: in-progress reversal {i} returned '
+            f'{v.outcome!r} — startup reconcile must never trip the guard'
+        )
+
+    # No escalation file must have been written.
+    if esc_dir.exists():
+        esc_files = list(esc_dir.glob('*.json'))
+        assert esc_files == [], (
+            f'No escalation expected for 27 in-progress reversals; '
+            f'found: {esc_files}'
+        )
+
+    # (b) A done→pending burst of 11 must trip on the 11th attempt.
+    v_done = None
+    for i in range(11):
+        clock[0] += 0.1
+        v_done = await guard.observe_attempt(
+            project_id='reify',
+            task_id=f'done-task-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_done is not None
+    assert v_done.is_rejection is True, (
+        f'Expected rejection on 11th done→pending, got {v_done.outcome!r}'
+    )
+    assert v_done.kind == 'done_to_pending', (
+        f'Expected kind=done_to_pending, got {v_done.kind!r}'
+    )
