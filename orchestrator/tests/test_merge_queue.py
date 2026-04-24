@@ -285,6 +285,65 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_file_deleted_by_done_step_is_not_reported_as_dropped(
+        self, git_ops: GitOps,
+    ):
+        """File missing from merge tree but deleted in a done step → excluded from result.
+
+        This guards against false-positive drop reports when a TDD task's later
+        steps intentionally delete files that earlier steps created.  The file
+        appears in plan['files'] (it was a planned target) but it was legitimately
+        removed by a done step whose commit is recorded in the plan.
+        """
+        worktree = (await git_ops.create_worktree('plan-deleted-done')).path
+
+        # Step 1: create the file and commit it
+        (worktree / 'created_then_deleted.py').write_text('# created\n')
+        create_sha = await git_ops.commit(worktree, 'Create created_then_deleted.py')
+        assert create_sha is not None
+
+        # Step 2: delete the file and commit the deletion
+        (worktree / 'created_then_deleted.py').unlink()
+        delete_sha = await git_ops.commit(worktree, 'Delete created_then_deleted.py')
+        assert delete_sha is not None
+
+        # Plan still lists the file (it was a planned target), but one done
+        # step deleted it — so it should NOT be reported as a drop.
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-del', 'T-del', 'desc')
+        artifacts.write_plan({
+            'files': ['created_then_deleted.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'create',
+                    'status': 'done',
+                    'commit': create_sha,
+                },
+                {
+                    'id': 'step-2',
+                    'description': 'delete',
+                    'status': 'done',
+                    'commit': delete_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-deleted-done')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # File is absent from merge tree but was intentionally deleted →
+            # must NOT appear in the dropped list.
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
