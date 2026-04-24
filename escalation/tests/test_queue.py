@@ -926,11 +926,15 @@ class TestGetByTaskDedupAcrossArchive:
             f'Expected exactly 1 result (pending queue_dir copy), got {len(results)}'
         )
 
-        # (b) The returned copy is the queue_dir pending one, NOT the archive copy
+        # (b) The returned copy is the queue_dir pending one, NOT the archive copy.
+        # Positive identity check: the pending copy has resolution=None (the dataclass
+        # default).  If the archive copy leaked instead, resolution would be
+        # 'archive_copy', making this assertion fail distinctly.
         assert results[0].id == 'esc-42-1'
         assert results[0].status == 'pending'
-        assert results[0].resolution != 'archive_copy', (
-            'Archive copy must NOT be surfaced when status="pending" skips the archive'
+        assert results[0].resolution is None, (
+            'Pending copy must have resolution=None; '
+            f'got {results[0].resolution!r} — archive copy may have leaked'
         )
 
         # (c) No WARNING from the pre-scan — archive was never scanned, so the
