@@ -2555,7 +2555,7 @@ async def test_two_projects_do_not_serialise(
                 projA_entered.set()
                 try:
                     await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pytest.fail(
                         f"project A entered but B never did — "
                         f"projA_entered={projA_entered.is_set()} "
@@ -2565,7 +2565,7 @@ async def test_two_projects_do_not_serialise(
                 projB_entered.set()
                 try:
                     await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pytest.fail(
                         f"project B entered but A never did — "
                         f"projA_entered={projA_entered.is_set()} "
@@ -2641,7 +2641,7 @@ async def test_rendezvous_timeout_surfaces_per_project_diagnostic(
     with pytest.raises(pytest.fail.Exception) as exc_info:
         try:
             await asyncio.wait_for(other_event.wait(), timeout=0.05)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail(
                 f"project {setter} entered but {waiter} never did — "
                 f"projA_entered={projA_entered.is_set()} "
