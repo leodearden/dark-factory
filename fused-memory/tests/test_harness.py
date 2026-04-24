@@ -3177,6 +3177,12 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     Uses a 2+1=3 event setup as a minimal lower bound: N=2 events without the key
     before the override proves the resolver iterates past multiple eventless entries
     (not just peeks-last), while staying far below any realistic peek-window size.
+
+    Scope note: this test does **not** guard against accidental narrowing of
+    ``_PROJECT_ROOT_PEEK_LIMIT``.  Detecting constant-narrowing is intentionally
+    out of scope so the test stays decoupled from the constant's specific value.
+    It will only fail for pathologically small windows (fewer than 3 events) — i.e.,
+    implementations that cannot scan past more than one eventless entry.
     """
     # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 2 events that
     # LACK _project_root with monotonically-increasing timestamps, then 1 event
