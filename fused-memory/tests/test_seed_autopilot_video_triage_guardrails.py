@@ -12,18 +12,70 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+
+@pytest.fixture
+def guardrails_source(tmp_path: Path) -> Path:
+    """Write a minimal autopilot-video guardrails.py stub and return its path.
+
+    The stub mirrors the real source's public contract: the two constants
+    with all routing-critical keys (category, project_id, dual_write,
+    metadata.{type,target,name}), plus a get_guardrail_payloads helper
+    that shallow-copies metadata (Task 416 regression guard). Content
+    strings are intentionally short — the loader tests assert on
+    structure, not prose.
+    """
+    stub = tmp_path / "guardrails.py"
+    stub.write_text(
+        '"""Fixture stub of autopilot-video guardrails.py for test isolation."""\n'
+        'from __future__ import annotations\n'
+        '\n'
+        'ATTRIBUTION_STUB_GUARDRAIL = {\n'
+        '    "content": "stub content for attribution guardrail",\n'
+        '    "category": "preferences_and_norms",\n'
+        '    "project_id": "autopilot_video",\n'
+        '    "dual_write": True,\n'
+        '    "metadata": {\n'
+        '        "type": "behavioral_guardrail",\n'
+        '        "target": "triage_agent",\n'
+        '        "name": "attribution_stub_anti_pattern",\n'
+        '    },\n'
+        '}\n'
+        '\n'
+        'NAV_HINTS_GUARDRAIL = {\n'
+        '    "content": "stub content for nav hints guardrail",\n'
+        '    "category": "preferences_and_norms",\n'
+        '    "project_id": "autopilot_video",\n'
+        '    "dual_write": True,\n'
+        '    "metadata": {\n'
+        '        "type": "behavioral_guardrail",\n'
+        '        "target": "triage_agent",\n'
+        '        "name": "nav_hints_anti_pattern",\n'
+        '    },\n'
+        '}\n'
+        '\n'
+        '\n'
+        'def get_guardrail_payloads(agent_id):\n'
+        '    payloads = []\n'
+        '    for g in (ATTRIBUTION_STUB_GUARDRAIL, NAV_HINTS_GUARDRAIL):\n'
+        '        payload = {**g, "metadata": dict(g["metadata"]), "agent_id": agent_id}\n'
+        '        payloads.append(payload)\n'
+        '    return payloads\n'
+    )
+    return stub
+
+
 # ---------------------------------------------------------------------------
 # loader tests
 # ---------------------------------------------------------------------------
 
 
-def test_load_guardrail_payloads_returns_two_dicts():
+def test_load_guardrail_payloads_returns_two_dicts(guardrails_source: Path):
     """load_guardrail_payloads returns a list of exactly two dicts."""
     from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
         load_guardrail_payloads,
     )
 
-    payloads = load_guardrail_payloads(agent_id="test-agent")
+    payloads = load_guardrail_payloads(agent_id="test-agent", source_path=guardrails_source)
 
     assert isinstance(payloads, list)
     assert len(payloads) == 2
@@ -31,13 +83,13 @@ def test_load_guardrail_payloads_returns_two_dicts():
         assert isinstance(p, dict)
 
 
-def test_load_guardrail_payloads_routing_values():
+def test_load_guardrail_payloads_routing_values(guardrails_source: Path):
     """Each payload must have routing-critical values for Mem0 add_memory."""
     from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
         load_guardrail_payloads,
     )
 
-    payloads = load_guardrail_payloads(agent_id="test-agent")
+    payloads = load_guardrail_payloads(agent_id="test-agent", source_path=guardrails_source)
 
     for p in payloads:
         assert isinstance(p["content"], str) and p["content"], (
@@ -57,13 +109,13 @@ def test_load_guardrail_payloads_routing_values():
         )
 
 
-def test_load_guardrail_payloads_metadata_names():
+def test_load_guardrail_payloads_metadata_names(guardrails_source: Path):
     """The metadata name set must be exactly the two expected guardrail names."""
     from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
         load_guardrail_payloads,
     )
 
-    payloads = load_guardrail_payloads(agent_id="test-agent")
+    payloads = load_guardrail_payloads(agent_id="test-agent", source_path=guardrails_source)
 
     names = {p["metadata"]["name"] for p in payloads}
     assert names == {"attribution_stub_anti_pattern", "nav_hints_anti_pattern"}, (
@@ -71,13 +123,15 @@ def test_load_guardrail_payloads_metadata_names():
     )
 
 
-def test_load_guardrail_payloads_agent_id_injected():
+def test_load_guardrail_payloads_agent_id_injected(guardrails_source: Path):
     """agent_id is injected into every returned payload."""
     from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
         load_guardrail_payloads,
     )
 
-    payloads = load_guardrail_payloads(agent_id="claude-task-1040-implementer")
+    payloads = load_guardrail_payloads(
+        agent_id="claude-task-1040-implementer", source_path=guardrails_source
+    )
 
     for p in payloads:
         assert p["agent_id"] == "claude-task-1040-implementer", (
@@ -100,7 +154,7 @@ def test_load_guardrail_payloads_missing_source_raises():
     )
 
 
-def test_load_guardrail_payloads_metadata_not_aliased_across_calls():
+def test_load_guardrail_payloads_metadata_not_aliased_across_calls(guardrails_source: Path):
     """Two successive calls return independent metadata dict objects.
 
     Mutating call-A's metadata must not alter call-B's (regression guard
@@ -110,8 +164,8 @@ def test_load_guardrail_payloads_metadata_not_aliased_across_calls():
         load_guardrail_payloads,
     )
 
-    payloads_a = load_guardrail_payloads(agent_id="agent-a")
-    payloads_b = load_guardrail_payloads(agent_id="agent-b")
+    payloads_a = load_guardrail_payloads(agent_id="agent-a", source_path=guardrails_source)
+    payloads_b = load_guardrail_payloads(agent_id="agent-b", source_path=guardrails_source)
 
     # Mutate call-A's metadata dicts in place
     for p in payloads_a:
@@ -131,7 +185,7 @@ def test_load_guardrail_payloads_metadata_not_aliased_across_calls():
 
 class TestSeedManager:
     @pytest.mark.asyncio
-    async def test_seed_calls_add_memory_per_payload(self):
+    async def test_seed_calls_add_memory_per_payload(self, guardrails_source: Path):
         """SeedManager.seed() calls service.add_memory once per payload."""
         from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
             SeedManager,
@@ -144,12 +198,12 @@ class TestSeedManager:
         )
 
         manager = SeedManager(mock_service)
-        await manager.seed(agent_id="agent-X")
+        await manager.seed(agent_id="agent-X", source_path=guardrails_source)
 
         assert mock_service.add_memory.await_count == 2
 
         # Compare each call's kwargs against the expected payloads
-        expected_payloads = load_guardrail_payloads("agent-X")
+        expected_payloads = load_guardrail_payloads("agent-X", source_path=guardrails_source)
         actual_calls = mock_service.add_memory.call_args_list
         assert len(actual_calls) == 2
 
@@ -170,7 +224,7 @@ class TestSeedManager:
                 )
 
     @pytest.mark.asyncio
-    async def test_seed_returns_report_with_memory_ids(self):
+    async def test_seed_returns_report_with_memory_ids(self, guardrails_source: Path):
         """seed() returns a SeedReport whose memory_ids_by_name has exactly two entries."""
         from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
             SeedManager,
@@ -183,7 +237,7 @@ class TestSeedManager:
         )
 
         manager = SeedManager(mock_service)
-        report = await manager.seed(agent_id="agent-X")
+        report = await manager.seed(agent_id="agent-X", source_path=guardrails_source)
 
         assert isinstance(report, SeedReport)
         assert set(report.memory_ids_by_name.keys()) == {
@@ -196,7 +250,7 @@ class TestSeedManager:
             )
 
     @pytest.mark.asyncio
-    async def test_seed_raises_on_empty_memory_ids(self):
+    async def test_seed_raises_on_empty_memory_ids(self, guardrails_source: Path):
         """seed() raises RuntimeError naming the failing guardrail when memory_ids=[]."""
         from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
             SeedManager,
@@ -214,7 +268,7 @@ class TestSeedManager:
         manager = SeedManager(mock_service)
 
         with pytest.raises(RuntimeError) as exc_info:
-            await manager.seed(agent_id="agent-X")
+            await manager.seed(agent_id="agent-X", source_path=guardrails_source)
 
         error_msg = str(exc_info.value)
         assert "attribution_stub_anti_pattern" in error_msg, (
@@ -225,7 +279,7 @@ class TestSeedManager:
         )
 
     @pytest.mark.asyncio
-    async def test_seed_does_not_proceed_after_empty_memory_ids(self):
+    async def test_seed_does_not_proceed_after_empty_memory_ids(self, guardrails_source: Path):
         """seed() fast-fails after the first empty memory_ids — does not call add_memory a second time."""
         from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
             SeedManager,
@@ -242,7 +296,7 @@ class TestSeedManager:
         manager = SeedManager(mock_service)
 
         with pytest.raises(RuntimeError):
-            await manager.seed(agent_id="agent-X")
+            await manager.seed(agent_id="agent-X", source_path=guardrails_source)
 
         assert mock_service.add_memory.await_count == 1, (
             f"Expected exactly 1 add_memory call after fast-fail, "
