@@ -159,10 +159,21 @@ class EscalationQueue:
         self, escalation_id: str, resolution: str, dismiss: bool = False,
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
     ) -> Escalation | None:
-        """Update an escalation's status to resolved or dismissed."""
+        """Update an escalation's status to resolved or dismissed.
+
+        Idempotent: if the escalation is already resolved or dismissed, this
+        method returns the existing escalation unchanged without re-archiving
+        or re-firing the _resolve_callback.
+        """
         esc = self.get(escalation_id)
         if esc is None:
             return None
+
+        if esc.status != 'pending':
+            logger.info(
+                f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
+            )
+            return esc
 
         esc.status = 'dismissed' if dismiss else 'resolved'
         esc.resolution = resolution
