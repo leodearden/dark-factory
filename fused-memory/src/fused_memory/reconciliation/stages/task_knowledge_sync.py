@@ -295,8 +295,8 @@ def _format_flagged(
     """Render flagged items as a bullet list, capped by *budget_chars*.
 
     Returns ``(text, rendered_count)`` where *rendered_count* is the number of
-    items whose JSON appears in full in *text*.  Emits a single structured
-    ``logger.warning`` when the budget truncates items.
+    items whose JSON appears IN FULL (not fragmented) in *text*.  Emits a
+    single structured ``logger.warning`` when the budget truncates items.
 
     When *run_stage* is provided it is embedded in the warning's ``extra`` dict
     so ops can correlate the drop to its call site without a separate
@@ -305,15 +305,19 @@ def _format_flagged(
     Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
     truncated fragment is always rendered (with a ``… [item truncated]`` marker)
     so the LLM receives at least some signal rather than an opaque footer-only
-    body.
+    body.  In this case *rendered_count* remains 0 (the fragment is not a full
+    render) and the warning's ``extra`` includes ``first_item_fragmented=True``
+    so callers/telemetry can distinguish fragmented-first-item from all-dropped.
     """
     if not items:
         return ('No flagged items.', 0)
     lines: list[str] = []
     running_chars = 0
     rendered_count = 0
+    first_item_fragmented = False
     for item in items:
-        line = f'- {json.dumps(item, default=str)}'
+        json_str = json.dumps(item, default=str)
+        line = f'- {json_str}'
         # +1 for the '\n' separator between lines
         separator = 1 if lines else 0
         if running_chars + separator + len(line) > budget_chars:
@@ -325,17 +329,20 @@ def _format_flagged(
                 marker = '… [item truncated]'
                 available = budget_chars - len('- ') - len(marker)
                 if available > 0:
-                    json_str = json.dumps(item, default=str)
                     lines.append(f'- {json_str[:available]}{marker}')
-                    rendered_count = 1
+                    first_item_fragmented = True
             dropped = len(items) - rendered_count
-            if dropped > 0:
-                lines.append(f'... and {dropped} more (truncated: char budget)')
+            # Footer shows only items that are completely absent (not the
+            # fragmented first item, which already appears as a truncated line).
+            completely_missing = dropped - (1 if first_item_fragmented else 0)
+            if completely_missing > 0:
+                lines.append(f'... and {completely_missing} more (truncated: char budget)')
             extra: dict = {
                 'total': len(items),
                 'rendered': rendered_count,
                 'dropped': dropped,
                 'budget_chars': budget_chars,
+                'first_item_fragmented': first_item_fragmented,
             }
             if run_stage is not None:
                 extra['run_stage'] = run_stage

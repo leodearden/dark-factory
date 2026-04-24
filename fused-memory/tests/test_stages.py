@@ -2842,7 +2842,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            text = _format_flagged(items)
+            text, _ = _format_flagged(items)
 
         # Footer shows only completely_missing items (not the fragmented first item)
         assert '... and 1 more (truncated: char budget)' in text, (
