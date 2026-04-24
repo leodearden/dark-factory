@@ -184,6 +184,9 @@ class CandidateTask:
         h.update('\n'.join(sorted(self.files_to_modify)).encode())
         h.update(b'\x00')
         h.update((self.spawned_from or '').encode())
+        # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
+        # Any change to length or algorithm must be mirrored there and at the other
+        # task_curator.py mirror sites (_intra_batch_key, _normalize_key).
         return h.hexdigest()[:16]
 
     @classmethod
@@ -529,6 +532,9 @@ class TaskCurator:
         h.update(_norm(title).encode())
         h.update(b'|')
         h.update(_norm(description).encode())
+        # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
+        # Any change to length or algorithm must be mirrored there and at the other
+        # task_curator.py mirror sites (payload_hash, _normalize_key).
         return h.hexdigest()[:16]
 
     @staticmethod
@@ -546,6 +552,9 @@ class TaskCurator:
         h.update(title.encode())
         h.update(b'|')
         h.update(files.encode())
+        # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
+        # Any change to length or algorithm must be mirrored there and at the other
+        # task_curator.py mirror sites (payload_hash, _intra_batch_key).
         return h.hexdigest()[:16]
 
     def _evict_stale_recent_creates(self, project_id: str, now: float) -> None:
