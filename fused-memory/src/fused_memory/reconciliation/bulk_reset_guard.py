@@ -1,22 +1,52 @@
-"""Defence-in-depth bulk-reset circuit-breaker (task 918).
+"""Defence-in-depth bulk-reset circuit-breaker (task 918, refined task 1016).
 
-Detects bursts of done→pending or in-progress→pending task-status reversals
-within a sliding time window and halts further reversals once the configured
-threshold is crossed.
+Detects bursts of task-status reversals within a sliding time window and
+halts further reversals once the configured per-kind threshold is crossed.
 
-Background: Two autopilot_video bulk resets on 2026-04-21 and 2026-04-22
-pushed large batches of tasks from done/in-progress back to pending despite
-the orchestrator's ``_safe_stash_pop_with_recovery`` fix already being
-deployed.  This guard is a second line of defence at the fused-memory
-reconciliation layer: it limits blast radius when the primary prevention fails.
+Background
+----------
+Two autopilot_video bulk resets on 2026-04-21 and 2026-04-22 pushed large
+batches of tasks from done/in-progress back to pending despite the
+orchestrator's ``_safe_stash_pop_with_recovery`` fix already being deployed.
+This guard is a second line of defence at the fused-memory reconciliation
+layer: it limits blast radius when the primary prevention fails.
+
+Task 1016 motivation
+--------------------
+The 2026-04-24 reify startup-stranded-task reconciler reverted 27
+in-progress tasks to pending in ~2 s (escalation id:
+``esc-bulk-reset-reify-2026-04-24T070944_6456580000``).  The original
+single shared threshold (10 / 60 s) fired even though zero done→pending
+transitions occurred.  Task 1016 splits the shared counter into two
+independent per-kind counters with independent thresholds:
+  - ``done_to_pending`` (default 10/60 s): catches the March-2026
+    ``advance_main`` data-loss pattern (task 918).
+  - ``in_progress_to_pending`` (default 100/60 s): allows the 27-task
+    startup stranded-task reconcile while still catching pathological runaways.
 
 Architecture mirrors :class:`~fused_memory.reconciliation.backlog_policy.BacklogPolicy`:
-  - Constructed with config knobs (enabled, threshold, window_seconds, …).
+  - Constructed with config knobs (enabled, done_threshold,
+    in_progress_threshold, window_seconds, …).
   - Passed into :class:`~fused_memory.middleware.task_interceptor.TaskInterceptor`.
   - Called via ``observe_attempt`` in ``_apply_status_transition`` *before*
     the terminal-exit gate so it catches both legitimate and illegitimate
     reversal patterns.
-  - Emits L1 escalation JSON under ``<project_root>/data/escalations/``.
+  - Emits L1 escalation JSON under ``<project_root>/data/escalations/``
+    with a kind slug (``done`` or ``in-progress``) in the filename and a
+    ``kind`` field in the JSON body for at-a-glance triage.
+
+Split-counter design
+--------------------
+Each ``_GuardState`` holds two independent sliding-window deques:
+  - ``done_entries``        — accumulates done→pending reversals
+  - ``in_progress_entries`` — accumulates in-progress→pending reversals
+
+The shared per-project scalars ``last_escalation_ts`` and
+``last_write_failure_ts`` are NOT split per-kind: a simultaneous storm of
+both kinds would, with per-kind rate limits, emit two escalations within
+seconds.  Sharing the rate limit preserves the "no escalation-directory
+flood" guarantee; the ``kind`` field on the verdict and escalation file
+still lets operators distinguish which counter tripped.
 """
 
 from __future__ import annotations
