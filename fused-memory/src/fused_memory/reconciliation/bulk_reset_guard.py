@@ -346,13 +346,23 @@ class BulkResetGuard:
                 return BulkResetVerdict(outcome='ok', project_id=project_id)
 
             # 7. Threshold crossed — collect window contents for the verdict.
-            # Only entries from the tripped deque are included; the other
-            # deque's entries do not leak into the rejection payload.
+            # Only entries from the tripped deque are included in
+            # affected_task_ids; the other deque's IDs are captured separately
+            # so the escalation JSON can surface cross-kind context for
+            # operators triaging the incident without mixing the two counters.
             affected_ids = tuple(e.task_id for e in entries)
             trig_ts = tuple(
                 datetime.fromtimestamp(e.ts, tz=UTC).isoformat()
                 for e in entries
             )
+            # Cross-kind window context (may be empty if the other counter has
+            # not accumulated any entries within the current window).
+            other_entries = (
+                state.in_progress_entries
+                if kind == 'done_to_pending'
+                else state.done_entries
+            )
+            other_kind_ids = tuple(e.task_id for e in other_entries)
 
         # 8. Try to write escalation (outside lock to avoid I/O under lock).
         esc_path = await self._maybe_write_escalation(
@@ -360,6 +370,7 @@ class BulkResetGuard:
             project_root=project_root,
             affected_task_ids=affected_ids,
             triggering_timestamps=trig_ts,
+            other_kind_task_ids=other_kind_ids,
             kind=kind,
         )
 
@@ -405,12 +416,22 @@ class BulkResetGuard:
         project_root: str,
         affected_task_ids: tuple[str, ...],
         triggering_timestamps: tuple[str, ...],
+        other_kind_task_ids: tuple[str, ...] = (),
         kind: Literal['done_to_pending', 'in_progress_to_pending'],
     ) -> Path | None:
         """Write an L1 escalation JSON unless rate-limited.
 
         Returns the path on success, or ``None`` when rate-limited / write
         failed (callers produce ``outcome='rejection'`` in that case).
+
+        Parameters
+        ----------
+        other_kind_task_ids:
+            Task IDs from the *other* reversal kind's deque that were active
+            in the current window at trip time.  Recorded in the escalation
+            JSON as ``other_kind_task_ids_in_window`` so operators triaging
+            the incident have full window context without needing to inspect
+            the guard's in-memory state.
         """
         now = self._now()
 
@@ -420,11 +441,20 @@ class BulkResetGuard:
             # so that a disk failure does not silently suppress the next escalation
             # for the full rate-limit period (900 s by default).
             if (now - state.last_escalation_ts) < self._rate_limit_seconds:
-                logger.info(
-                    'bulk_reset_guard: rate-limited escalation for %s '
-                    '(%.0fs since last)',
+                # Use WARNING (not INFO) because the suppressed escalation is a
+                # real incident event — an operator may be investigating why no
+                # file was written for a kind that tripped inside the rate-limit
+                # window.  The log message names the kind explicitly so the
+                # operator knows which counter was silenced.
+                logger.warning(
+                    'bulk_reset_guard: escalation suppressed (rate-limited) for %s '
+                    '[kind=%s, %.0fs since last write, limit=%.0fs] — '
+                    'no new escalation file will be written; '
+                    'check the most recent escalation file for this project',
                     project_id,
+                    kind,
                     now - state.last_escalation_ts,
+                    self._rate_limit_seconds,
                 )
                 return None
             # Write-failure backoff: suppress I/O retries for
@@ -511,6 +541,11 @@ class BulkResetGuard:
             'workflow_state': 'infra',
             'affected_task_ids': list(affected_task_ids),
             'triggering_timestamps': list(triggering_timestamps),
+            # Cross-kind context: task IDs from the other reversal kind that
+            # were active in the same window at trip time.  May be empty when
+            # only one kind was active.  Provided so operators can see the full
+            # window picture without needing the guard's in-memory state.
+            'other_kind_task_ids_in_window': list(other_kind_task_ids),
             'threshold': tripped_threshold,
             'thresholds': {
                 'done_to_pending': self._done_threshold,

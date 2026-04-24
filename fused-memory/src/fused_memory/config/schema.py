@@ -202,6 +202,32 @@ class TaskmasterConfig(BaseModel):
 class ReconciliationConfig(BaseModel):
     """Sleep mode reconciliation settings."""
 
+    @model_validator(mode='before')
+    @classmethod
+    def _reject_legacy_bulk_reset_threshold(cls, data: object) -> object:
+        """Detect the legacy ``bulk_reset_guard_threshold`` key and raise.
+
+        In task 1016 the single shared threshold was split into two independent
+        per-kind fields.  The old key name is unknown to pydantic and would be
+        silently dropped by ``extra='ignore'``, leaving the done→pending data-
+        loss guard at the default of 10 regardless of any operator tuning.
+        Because this is a security-relevant guard, silent default-fallback is
+        the worst failure mode — raise instead so the operator knows to update
+        their config to ``bulk_reset_guard_done_to_pending_threshold``.
+        """
+        if isinstance(data, dict) and 'bulk_reset_guard_threshold' in data:
+            raise ValueError(
+                "ReconciliationConfig: 'bulk_reset_guard_threshold' is no longer "
+                "a valid field (renamed in task 1016). Use "
+                "'bulk_reset_guard_done_to_pending_threshold' for the done→pending "
+                "threshold (default 10) and/or "
+                "'bulk_reset_guard_in_progress_to_pending_threshold' for the "
+                "in-progress→pending threshold (default 100). The old key would "
+                "be silently dropped, leaving the data-loss guard at its default "
+                "threshold regardless of your configured value."
+            )
+        return data
+
     enabled: bool = Field(default=True)
     data_dir: str = Field(default='./data/reconciliation')
 

@@ -62,6 +62,27 @@ def test_reconciliation_config_bulk_reset_guard_defaults():
 
 
 # ---------------------------------------------------------------------------
+# amend-1: ReconciliationConfig rejects the legacy threshold key explicitly
+# ---------------------------------------------------------------------------
+
+def test_reconciliation_config_rejects_legacy_threshold_key():
+    """ReconciliationConfig must raise ValidationError when the legacy
+    ``bulk_reset_guard_threshold`` key is present in the raw input dict.
+
+    Without this validator the key would be silently dropped by
+    ``extra='ignore'``, leaving the done→pending data-loss guard at its
+    default threshold of 10 regardless of any operator tuning — the worst
+    failure mode for a security-relevant guard.
+    """
+    from pydantic import ValidationError
+
+    from fused_memory.config.schema import ReconciliationConfig
+
+    with pytest.raises(ValidationError, match='bulk_reset_guard_threshold'):
+        ReconciliationConfig.model_validate({'bulk_reset_guard_threshold': 5})
+
+
+# ---------------------------------------------------------------------------
 # step-2b: BulkResetGuard constructor accepts split thresholds
 # ---------------------------------------------------------------------------
 
@@ -510,6 +531,14 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
     assert data['project_id'] == 'proj-esc'
     # kind must be present in the JSON record (step-12 writes it).
     assert 'kind' in data, f"escalation JSON missing 'kind' key; keys: {list(data)}"
+    # Cross-kind context field must be present (amend-3).  Only done→pending
+    # reversals were fired in this test, so the in-progress deque is empty.
+    assert 'other_kind_task_ids_in_window' in data, (
+        f"escalation JSON missing 'other_kind_task_ids_in_window'; keys: {list(data)}"
+    )
+    assert data['other_kind_task_ids_in_window'] == [], (
+        f"Expected empty cross-kind list, got {data['other_kind_task_ids_in_window']!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +698,11 @@ async def test_escalation_filename_and_body_include_kind(tmp_path):
     assert data_a.get('kind') == 'done_to_pending', (
         f"(a) JSON kind: expected 'done_to_pending', got {data_a.get('kind')!r}"
     )
+    # Cross-kind context (amend-3): only done→pending fired so in-progress deque empty.
+    assert 'other_kind_task_ids_in_window' in data_a, (
+        "(a) escalation JSON missing 'other_kind_task_ids_in_window'"
+    )
+    assert data_a['other_kind_task_ids_in_window'] == []
 
     # --- (b) in-progress counter trips (fresh project avoids rate-limit) ---
     guard_b = BulkResetGuard(
@@ -700,6 +734,11 @@ async def test_escalation_filename_and_body_include_kind(tmp_path):
     assert data_b.get('kind') == 'in_progress_to_pending', (
         f"(b) JSON kind: expected 'in_progress_to_pending', got {data_b.get('kind')!r}"
     )
+    # Cross-kind context (amend-3): only in-progress→pending fired so done deque empty.
+    assert 'other_kind_task_ids_in_window' in data_b, (
+        "(b) escalation JSON missing 'other_kind_task_ids_in_window'"
+    )
+    assert data_b['other_kind_task_ids_in_window'] == []
 
 
 # ---------------------------------------------------------------------------
