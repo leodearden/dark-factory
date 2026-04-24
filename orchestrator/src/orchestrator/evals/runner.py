@@ -566,7 +566,8 @@ class _StubMcpSession:
         """Dispatch an in-memory MCP tool call and return a JSON-RPC envelope.
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
-        ``update_task``.  Unknown tool names raise ``NotImplementedError``.
+        ``get_statuses``, ``update_task``.  Unknown tool names raise
+        ``NotImplementedError``.
 
         .. note::
             Terminal-state enforcement is intentionally **not** simulated.
@@ -589,6 +590,13 @@ class _StubMcpSession:
             return self._envelope(json.dumps(payload))
         if name == 'get_tasks':
             return self._envelope(json.dumps({'tasks': []}))
+        if name == 'get_statuses':
+            ids_filter = arguments.get('ids')
+            if ids_filter is not None:
+                mapping = {k: v for k, v in self._statuses.items() if k in ids_filter}
+            else:
+                mapping = dict(self._statuses)
+            return self._envelope(json.dumps({'statuses': mapping}))
         if name == 'update_task':
             task_id = arguments['id']
             return self._envelope(json.dumps({'id': task_id}))
