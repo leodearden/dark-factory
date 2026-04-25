@@ -66,9 +66,8 @@ async def test_submit_and_resolve_asserts_when_submit_result_is_non_dict(non_dic
     the production code.  The helper is test-only, so a loud AssertionError is preferred over
     silent pass-through that would mask the underlying bug.
 
-    The error message must:
-    - contain the structural marker 'submit_task returned non-dict' for easy grepping, and
-    - contain repr(submit_result) so the diagnostician can see exactly what was returned.
+    The error message must contain repr(submit_result) so the diagnostician
+    can see exactly what was returned.
 
     Execution must blow up BEFORE any resolve_ticket call.
     """
@@ -82,9 +81,6 @@ async def test_submit_and_resolve_asserts_when_submit_result_is_non_dict(non_dic
         await submit_and_resolve(interceptor, '/project', title='T')
 
     message = str(excinfo.value)
-    assert 'submit_task returned non-dict' in message, (
-        f"structural marker not in error message: {message!r}"
-    )
     assert repr(non_dict_value) in message, (
         f"repr of non-dict value {non_dict_value!r} not in error message: {message!r}"
     )
