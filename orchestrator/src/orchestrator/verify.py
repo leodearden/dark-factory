@@ -360,9 +360,9 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
     # mc.test_command.  Passing conftest.py directly to pytest finds 0 tests
     # (pytest >= 9 exits 1 with "no tests ran").
     has_conftest = any(_is_conftest(f) for f in scoped)
-    # Strip conftest.py from test_files so _scope_command never receives it;
-    # it is handled by the has_conftest branch above.
-    test_files = [f for f in scoped if _is_test_file(f) and not _is_conftest(f)]
+    # conftest.py is already excluded by _is_test_file at any depth;
+    # conftest files are handled by the has_conftest branch above.
+    test_files = [f for f in scoped if _is_test_file(f)]
 
     # Build scoped commands with worktree-relative paths, then strip
     # --directory so tools resolve paths from the worktree root
@@ -411,8 +411,8 @@ def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
     # parent) maps to '.' so we never produce 'pytest conftest.py'.  Sorted
     # deduped set gives deterministic output.
     has_conftest = any(_is_conftest(f) for f in py_files)
-    # Strip conftest.py from test_files so it never reaches 'pytest <files>'.
-    test_files = [f for f in py_files if _is_test_file(f) and not _is_conftest(f)]
+    # conftest.py is already excluded by _is_test_file at any depth.
+    test_files = [f for f in py_files if _is_test_file(f)]
 
     lint_cmd = 'ruff check ' + ' '.join(py_files)
     type_cmd = 'pyright ' + ' '.join(py_files)

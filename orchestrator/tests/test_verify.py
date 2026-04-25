@@ -709,9 +709,15 @@ class TestIsTestFile:
         """
         assert _is_test_file('tests/conftest.py') is False
 
-    def test_returns_false_for_root_conftest(self):
-        """conftest.py at the worktree root must return False (sanity guard)."""
-        assert _is_test_file('conftest.py') is False
+    def test_returns_false_for_tests_data_conftest(self):
+        """conftest.py inside a 'tests_data/' directory must return False.
+
+        Guards the startswith('tests/') prefix boundary: 'tests_data/' starts
+        with 'tests' but not 'tests/', so it must not be mistaken for a tests/
+        directory.  Without the trailing-slash boundary the path would falsely
+        match and expose a conftest to pytest.
+        """
+        assert _is_test_file('tests_data/conftest.py') is False
 
     def test_returns_true_for_test_file_under_tests_dir(self):
         """A real test file under tests/ must still return True after the fix."""
