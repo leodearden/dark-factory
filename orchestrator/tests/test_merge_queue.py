@@ -1840,6 +1840,8 @@ class TestCheckPlanTargetsInTree:
           3. Asserts that the stored stderr / cat_file_stderr lengths equal
              ``UNRESOLVED_STDERR_MAX + len(' <truncated>')`` and
              ``UNRESOLVED_CAT_STDERR_MAX + len(' <truncated>')``.
+          4. Asserts both _intercept branches fired (converts silent shim fall-through
+             under future probe-shape refactor into a self-describing failure).
         """
         from orchestrator.merge_queue import (  # noqa: PLC0415
             UNRESOLVED_CAT_STDERR_MAX,
@@ -1875,9 +1877,14 @@ class TestCheckPlanTargetsInTree:
             from orchestrator import merge_queue as mq
             original_run = mq._run
 
+            diff_tree_fired = False
+            cat_file_fired = False
+
             async def _intercept(cmd, cwd=None, **kwargs):
+                nonlocal diff_tree_fired, cat_file_fired
                 if '--diff-filter=D' in cmd:
                     # Inject long stderr for diff-tree failure
+                    diff_tree_fired = True
                     return (128, '', 'X' * 1500)
                 if (
                     len(cmd) >= 4
@@ -1885,6 +1892,7 @@ class TestCheckPlanTargetsInTree:
                     and cmd[-1].endswith('^{commit}')
                 ):
                     # Inject long stderr for cat-file commit-probe failure
+                    cat_file_fired = True
                     return (1, '', 'Y' * 600)
                 # Merge-tree cat-file probes and all other calls fall through
                 return await original_run(cmd, cwd=cwd, **kwargs)
@@ -1894,6 +1902,15 @@ class TestCheckPlanTargetsInTree:
                     merge_result.merge_commit, worktree, git_ops,
                     task_id='t-issue6',
                 )
+
+            assert diff_tree_fired, (
+                '_intercept shim did not match diff-tree probe; '
+                'check probe shape in merge_queue.py'
+            )
+            assert cat_file_fired, (
+                '_intercept shim did not match cat-file commit-probe; '
+                'check probe shape in merge_queue.py'
+            )
 
             assert result.unresolved_steps, 'Expected at least one UnresolvedStep'
             us = result.unresolved_steps[0]
