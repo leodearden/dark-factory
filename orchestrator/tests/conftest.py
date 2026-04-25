@@ -10,8 +10,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from shared.config_models import UsageCapConfig
 
-from orchestrator.config import GitConfig
+from orchestrator.config import FusedMemoryConfig, GitConfig, ReviewConfig, SandboxConfig
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -76,6 +77,15 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
 
     Apply test-specific overrides directly on the returned mock, e.g.:
         mock_orch_config.orphan_l0_reaper_enabled = True
+
+    Sub-section mocks for ``usage_cap``, ``review``, ``sandbox``, and
+    ``fused_memory`` are created explicitly so callers can access nested
+    attributes (e.g. ``mock_orch_config.fused_memory.project_id = 'test'``)
+    without auto-creation side-effects.  Pydantic v2's metaclass does not
+    expose model-field names in ``dir(ClassName)``, so passing
+    ``spec=OrchestratorConfig`` to the top-level ``MagicMock`` would block
+    legitimate field access (e.g. ``orphan_l0_reaper_enabled``).  The top-
+    level mock is therefore left unspecced.
     """
     config = MagicMock()
     config.git = GitConfig(
@@ -85,7 +95,11 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
         worktree_dir='.worktrees',
     )
     config.project_root = tmp_path
+    config.usage_cap = MagicMock(spec=UsageCapConfig)
     config.usage_cap.enabled = False
+    config.review = MagicMock(spec=ReviewConfig)
     config.review.enabled = False
+    config.sandbox = MagicMock(spec=SandboxConfig)
     config.sandbox.backend = 'auto'
+    config.fused_memory = MagicMock(spec=FusedMemoryConfig)
     return config
