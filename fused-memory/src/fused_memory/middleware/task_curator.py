@@ -395,6 +395,16 @@ additional rules for duplicates that exist WITHIN the batch:
 """
 
 
+def _normalize_title(title: str | None) -> str:
+    """Lowercase + collapse whitespace for forgiving title comparison.
+
+    Accepts ``str | None``; a ``None`` or empty input returns ``''``.
+    Used by both the combine-guard fingerprint check (task_interceptor.py)
+    and the intra-batch dedup key helper (``TaskCurator._intra_batch_key``).
+    """
+    return ' '.join((title or '').strip().lower().split())
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 

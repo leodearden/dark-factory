@@ -33,6 +33,7 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
+    _normalize_title,
     _to_pool_entry,
     flatten_task_tree,
 )
@@ -2942,16 +2943,6 @@ def _extract_task_dict(raw: Any) -> dict | None:
     path is no longer needed.
     """
     return raw if isinstance(raw, dict) else None
-
-
-def _normalize_title(title: str) -> str:
-    """Lowercase + collapse whitespace for forgiving title comparison.
-
-    Used by the combine-guard fingerprint check — the LLM echoes the target's
-    title verbatim, but accepting case/whitespace drift costs us nothing
-    while avoiding false-negative aborts on trivial formatting noise.
-    """
-    return ' '.join(title.strip().lower().split())
 
 
 def _combine_audit_path() -> Path:
