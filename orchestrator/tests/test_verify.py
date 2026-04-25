@@ -11,6 +11,7 @@ from orchestrator.verify import (
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
+    _build_fallback_config,
     _extract_cause_hint,
     _run_cmd,
     _scope_cargo_workspace,
@@ -721,6 +722,43 @@ class TestScopeModuleConfigReturnsNone:
         assert 'shared/tests/test_x.py' in result.test_command
         assert result.lint_command is not None
         assert 'shared/src/y.py' in result.lint_command
+
+    def test_conftest_only_uses_full_test_suite(self):
+        """conftest.py alone should return the full unscoped test_command.
+
+        conftest.py defines fixtures/hooks that affect every test in the
+        directory subtree, so the correct scope is the full unscoped suite
+        already expressed by mc.test_command.
+        """
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
+        assert result is not None
+        assert result.test_command == mc.test_command
+        assert result.test_command is not None and 'conftest.py' not in result.test_command
+
+    def test_conftest_with_test_files_uses_full_suite(self):
+        """conftest.py mixed with test files should still use the full suite.
+
+        Even when a task touches both conftest.py and concrete test files,
+        the full unscoped suite is the correct scope — conftest may shadow
+        tests that aren't in the diff.
+        """
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        result = scope_module_config(
+            mc,
+            ['orchestrator/tests/conftest.py', 'orchestrator/tests/test_foo.py'],
+        )
+        assert result is not None
+        assert result.test_command == mc.test_command
+        assert result.test_command is not None and 'conftest.py' not in result.test_command
 
 
 class TestRunScopedVerificationSkipsUntouched:
@@ -1625,3 +1663,72 @@ class TestFailureReportCauseHint:
             f'Expected ## Verify Timed Out (pos {timeout_pos}) before '
             f'## Failure Cause (pos {cause_pos})'
         )
+
+
+class TestBuildFallbackConfigConftest:
+    """`_build_fallback_config` handles conftest.py correctly.
+
+    The fallback path has no parent ModuleConfig, so it cannot reuse
+    mc.test_command as the full suite.  Instead it uses the parent directory
+    of each conftest.py as the pytest target — that directory contains every
+    test the conftest can affect and pytest discovers them correctly.
+    """
+
+    def test_conftest_only_uses_directory_not_conftest_file(self):
+        """conftest.py alone → pytest targets its parent directory."""
+        result = _build_fallback_config(['orchestrator/tests/conftest.py'])
+        assert result is not None
+        assert result.test_command is not None
+        assert 'conftest.py' not in result.test_command
+        assert result.test_command == 'pytest orchestrator/tests'
+
+    def test_conftest_with_test_files_uses_directory(self):
+        """conftest.py mixed with test files → directory scope, no conftest.py token.
+
+        Even when concrete test files are present, the conftest directory scope
+        takes priority — conftest may affect tests outside the diff, and pytest
+        discovers them correctly from the directory.
+        """
+        result = _build_fallback_config(
+            ['orchestrator/tests/conftest.py', 'orchestrator/tests/test_foo.py'],
+        )
+        assert result is not None
+        assert result.test_command is not None
+        assert result.test_command == 'pytest orchestrator/tests'
+        assert 'conftest.py' not in result.test_command
+
+    def test_multiple_conftest_dirs_sorted_deterministically(self):
+        """Multiple conftest.py files in distinct dirs → sorted unique parent dirs."""
+        result = _build_fallback_config([
+            'shared/tests/conftest.py',
+            'orchestrator/tests/conftest.py',
+        ])
+        assert result is not None
+        assert result.test_command is not None
+        # sorted: orchestrator/tests before shared/tests
+        assert result.test_command == 'pytest orchestrator/tests shared/tests'
+        assert 'conftest.py' not in result.test_command
+
+    def test_conftest_with_test_file_in_different_directory(self):
+        """Test files outside the conftest directory are included alongside it.
+
+        e.g. ['a/conftest.py', 'b/test_x.py'] → 'pytest a b/test_x.py', so
+        tests in b/ are not silently skipped.
+        """
+        result = _build_fallback_config([
+            'a/tests/conftest.py',
+            'b/tests/test_x.py',
+        ])
+        assert result is not None
+        assert result.test_command is not None
+        assert 'a/tests' in result.test_command
+        assert 'b/tests/test_x.py' in result.test_command
+        assert 'conftest.py' not in result.test_command
+
+    def test_root_conftest_maps_to_dot(self):
+        """A conftest.py at the worktree root uses '.' as target, not the file itself."""
+        result = _build_fallback_config(['conftest.py'])
+        assert result is not None
+        assert result.test_command is not None
+        assert result.test_command == 'pytest .'
+        assert 'conftest.py' not in result.test_command

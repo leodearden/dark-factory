@@ -49,15 +49,24 @@ def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str 
 
 
 def _is_test_file(path: str) -> bool:
-    """Return True when *path* looks like a test file."""
+    """Return True when *path* looks like a concrete test file.
+
+    ``conftest.py`` is intentionally excluded here — use :func:`_is_conftest`
+    for that.  conftest files are not directly runnable by pytest, so mixing
+    them into file lists passed to pytest causes "no tests ran" failures.
+    """
     name = path.rsplit('/', 1)[-1]
     return (
         name.startswith('test_')
         or name.endswith('_test.py')
-        or name == 'conftest.py'
         or '/tests/' in path
         or path.startswith('tests/')
     )
+
+
+def _is_conftest(path: str) -> bool:
+    """Return True when *path* is a ``conftest.py`` file."""
+    return path.rsplit('/', 1)[-1] == 'conftest.py'
 
 
 def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
@@ -343,7 +352,14 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
     if not scoped:
         return None
 
-    test_files = [f for f in scoped if _is_test_file(f)]
+    # conftest.py defines fixtures/hooks that affect every test in the directory
+    # subtree — the only correct scope is the full unscoped suite expressed by
+    # mc.test_command.  Passing conftest.py directly to pytest finds 0 tests
+    # (pytest >= 9 exits 1 with "no tests ran").
+    has_conftest = any(_is_conftest(f) for f in scoped)
+    # Strip conftest.py from test_files so _scope_command never receives it;
+    # it is handled by the has_conftest branch above.
+    test_files = [f for f in scoped if _is_test_file(f) and not _is_conftest(f)]
 
     # Build scoped commands with worktree-relative paths, then strip
     # --directory so tools resolve paths from the worktree root
@@ -351,8 +367,14 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
         _scope_command(mc.lint_command, 'ruff check', scoped), mc.prefix)
     type_cmd = _strip_directory_flag(
         _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
-    test_cmd = _strip_directory_flag(
-        _scope_command(mc.test_command, 'pytest', test_files), mc.prefix) if test_files else None
+    if has_conftest:
+        # Full unscoped suite: conftest changes affect everything it shadows.
+        test_cmd = mc.test_command
+    elif test_files:
+        test_cmd = _strip_directory_flag(
+            _scope_command(mc.test_command, 'pytest', test_files), mc.prefix)
+    else:
+        test_cmd = None
 
     return ModuleConfig(
         prefix=mc.prefix,
@@ -379,11 +401,41 @@ def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
     if not py_files:
         return None
 
-    test_files = [f for f in py_files if _is_test_file(f)]
+    # conftest.py cannot be passed directly to pytest (pytest >= 9 exits 1 with
+    # "no tests ran").  The fallback path has no mc.test_command to reuse, so
+    # we target the *parent directory* of each conftest instead — that directory
+    # contains every test the conftest can affect.  A root-level conftest (no
+    # parent) maps to '.' so we never produce 'pytest conftest.py'.  Sorted
+    # deduped set gives deterministic output.
+    has_conftest = any(_is_conftest(f) for f in py_files)
+    # Strip conftest.py from test_files so it never reaches 'pytest <files>'.
+    test_files = [f for f in py_files if _is_test_file(f) and not _is_conftest(f)]
 
     lint_cmd = 'ruff check ' + ' '.join(py_files)
     type_cmd = 'pyright ' + ' '.join(py_files)
-    test_cmd = ('pytest ' + ' '.join(test_files)) if test_files else None
+    if has_conftest:
+        conftest_dirs = sorted({
+            f.rsplit('/', 1)[0] if '/' in f else '.'
+            for f in py_files
+            if _is_conftest(f)
+        })
+        # Also include test files that live *outside* every conftest directory.
+        # e.g. ['a/conftest.py', 'b/test_x.py'] → 'pytest a b/test_x.py' so
+        # tests in b/ are not silently skipped.  A root-level conftest ('.')
+        # shadows everything, so in that case no files are "outside".
+        if '.' not in conftest_dirs:
+            outside = [
+                t for t in test_files
+                if not any(t.startswith(d + '/') for d in conftest_dirs)
+            ]
+        else:
+            outside = []
+        targets = conftest_dirs + outside
+        test_cmd = 'pytest ' + ' '.join(targets)
+    elif test_files:
+        test_cmd = 'pytest ' + ' '.join(test_files)
+    else:
+        test_cmd = None
 
     return ModuleConfig(
         prefix='__fallback__',
