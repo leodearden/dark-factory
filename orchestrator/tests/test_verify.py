@@ -13,6 +13,7 @@ from orchestrator.verify import (
     _apply_cargo_scope,
     _build_fallback_config,
     _extract_cause_hint,
+    _is_test_file,
     _run_cmd,
     _scope_cargo_workspace,
     run_scoped_verification,
@@ -685,6 +686,56 @@ def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: 
     assert result.verify_cold_command_timeout_secs == 6000.0
 
 
+class TestIsTestFile:
+    """`_is_test_file` returns True only for concrete test files, never for conftest.py.
+
+    The docstring contract: conftest.py is excluded at any depth so callers can
+    pass the result straight to pytest without a follow-up filter.
+    """
+
+    def test_returns_false_for_conftest_under_tests_dir(self):
+        """conftest.py under a tests/ directory must not be treated as a test file.
+
+        Tracing the old code: '/tests/' in 'orchestrator/tests/conftest.py' is
+        True, so the function returned True — violating the docstring invariant.
+        """
+        assert _is_test_file('orchestrator/tests/conftest.py') is False
+
+    def test_returns_false_for_conftest_under_root_tests_prefix(self):
+        """conftest.py at the root tests/ prefix must not be treated as a test file.
+
+        'tests/conftest.py'.startswith('tests/') is True in the old code, so
+        this also returned True erroneously.
+        """
+        assert _is_test_file('tests/conftest.py') is False
+
+    def test_returns_false_for_tests_data_conftest(self):
+        """conftest.py inside a 'tests_data/' directory must return False.
+
+        Guards the startswith('tests/') prefix boundary: 'tests_data/' starts
+        with 'tests' but not 'tests/', so it must not be mistaken for a tests/
+        directory.  Without the trailing-slash boundary the path would falsely
+        match and expose a conftest to pytest.
+        """
+        assert _is_test_file('tests_data/conftest.py') is False
+
+    def test_returns_true_for_test_file_under_tests_dir(self):
+        """A real test file under tests/ must still return True after the fix."""
+        assert _is_test_file('orchestrator/tests/test_foo.py') is True
+
+    def test_returns_true_for_test_prefixed_file(self):
+        """A test_*.py file matched by name prefix must return True."""
+        assert _is_test_file('src/test_x.py') is True
+
+    def test_returns_true_for_test_suffixed_file(self):
+        """A *_test.py file matched by name suffix must return True."""
+        assert _is_test_file('src/foo_test.py') is True
+
+    def test_returns_false_for_regular_source_file(self):
+        """A regular source file must return False (negative baseline)."""
+        assert _is_test_file('orchestrator/src/orchestrator/verify.py') is False
+
+
 class TestScopeModuleConfigReturnsNone:
     """`scope_module_config` returns None when no task_files match the prefix.
 
@@ -738,7 +789,6 @@ class TestScopeModuleConfigReturnsNone:
         result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
         assert result is not None
         assert result.test_command == mc.test_command
-        assert result.test_command is not None and 'conftest.py' not in result.test_command
 
     def test_conftest_with_test_files_uses_full_suite(self):
         """conftest.py mixed with test files should still use the full suite.
@@ -758,7 +808,6 @@ class TestScopeModuleConfigReturnsNone:
         )
         assert result is not None
         assert result.test_command == mc.test_command
-        assert result.test_command is not None and 'conftest.py' not in result.test_command
 
 
 class TestRunScopedVerificationSkipsUntouched:
@@ -1731,4 +1780,30 @@ class TestBuildFallbackConfigConftest:
         assert result is not None
         assert result.test_command is not None
         assert result.test_command == 'pytest .'
+        assert 'conftest.py' not in result.test_command
+
+    def test_nested_test_under_conftest_dir_uses_directory_only(self):
+        """A test file inside the conftest's directory subtree is NOT added redundantly.
+
+        ['a/conftest.py', 'a/sub/test_x.py'] → 'pytest a' because 'a/sub/test_x.py'
+        starts with 'a/' and is therefore covered by the conftest directory target.
+        Regression guard for the `t.startswith(d + '/')` boundary check.
+        """
+        result = _build_fallback_config(['a/conftest.py', 'a/sub/test_x.py'])
+        assert result is not None
+        assert result.test_command == 'pytest a'
+        assert 'a/sub/test_x.py' not in result.test_command
+        assert 'conftest.py' not in result.test_command
+
+    def test_sibling_prefix_test_file_included_alongside_conftest_dir(self):
+        """Directory 'a' does NOT swallow a sibling 'ab/test_x.py'.
+
+        ['a/conftest.py', 'ab/test_x.py'] → 'pytest a ab/test_x.py' because
+        'ab/test_x.py'.startswith('a/') is False — the `d + '/'` boundary check
+        correctly distinguishes directory 'a' from sibling prefix 'ab'.
+        Regression guard for the boundary-check contract.
+        """
+        result = _build_fallback_config(['a/conftest.py', 'ab/test_x.py'])
+        assert result is not None
+        assert result.test_command == 'pytest a ab/test_x.py'
         assert 'conftest.py' not in result.test_command
