@@ -1605,9 +1605,10 @@ class TestCheckPlanTargetsInTree:
           - file_b.py is intentionally deleted by step_idx=1
 
         After the fix, ``step_diagnostics`` is sorted by step_idx before the
-        structured WARNING fires.  Assertion: ``'(0,'`` appears before ``'(1,'``
-        in the rendered WARNING message.  Currently fails because the
-        in-line/failures split produces the reverse order.
+        structured WARNING fires.  Assertion: ``[t[0] for t in record.args[3]] == [0, 1]``
+        on the structured WARNING's positional args (avoids depending on %r repr
+        formatting).  Currently fails because the in-line/failures split produces
+        the reverse order.
         """
         worktree = (await git_ops.create_worktree('issue2-diag-order')).path
 
@@ -1666,18 +1667,30 @@ class TestCheckPlanTargetsInTree:
             # Find the structured-warning record
             warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert warn_records, 'Expected at least one WARNING when dropped is non-empty'
-            all_messages = ' '.join(r.getMessage() for r in warn_records)
 
-            # Both step indices must appear in the WARNING
-            assert '(0,' in all_messages, f'"(0," not found in WARNING: {all_messages!r}'
-            assert '(1,' in all_messages, f'"(1," not found in WARNING: {all_messages!r}'
+            # Locate the single drop-guard structured WARNING by message prefix
+            structured = [r for r in warn_records if 'dropped_plan_targets' in r.getMessage()]
+            assert len(structured) == 1, (
+                f'Expected exactly one structured drop-guard WARNING, '
+                f'got {len(structured)}: {[r.getMessage() for r in warn_records]!r}'
+            )
+            # Pull the unrepr'd step_diagnostics list directly from the LogRecord's positional args:
+            # logger.warning(fmt, task_id, merge_commit_sha, dropped_files, step_diagnostics)
+            # → record.args == (task_id, merge_commit_sha, dropped_files, step_diagnostics)
+            raw_args = structured[0].args
+            assert isinstance(raw_args, tuple), (
+                f'Expected positional-args tuple on LogRecord, got {type(raw_args)!r}'
+            )
+            step_diagnostics = raw_args[3]  # 4th positional arg
 
-            # Plan-step order: (0, ...) must precede (1, ...)
-            pos_0 = all_messages.index('(0,')
-            pos_1 = all_messages.index('(1,')
-            assert pos_0 < pos_1, (
-                f'Expected step_diagnostics in plan order (0 before 1), '
-                f'but (0, appears at {pos_0}, (1, appears at {pos_1}): {all_messages!r}'
+            # Assert exact plan order (also pins list length to 2 with exactly indices 0 and 1)
+            assert hasattr(step_diagnostics, '__iter__'), (
+                f'Expected step_diagnostics to be iterable, got {type(step_diagnostics)!r}'
+            )
+            step_indices = [t[0] for t in step_diagnostics]  # type: ignore[union-attr]
+            assert step_indices == [0, 1], (
+                f'Expected step_diagnostics in plan order [0, 1]; '
+                f'got {step_indices!r} (full diagnostics: {step_diagnostics!r})'
             )
         finally:
             if merge_result.merge_worktree:
@@ -1834,6 +1847,8 @@ class TestCheckPlanTargetsInTree:
           3. Asserts that the stored stderr / cat_file_stderr lengths equal
              ``UNRESOLVED_STDERR_MAX + len(' <truncated>')`` and
              ``UNRESOLVED_CAT_STDERR_MAX + len(' <truncated>')``.
+          4. Asserts both _intercept branches fired (converts silent shim fall-through
+             under future probe-shape refactor into a self-describing failure).
         """
         from orchestrator.merge_queue import (  # noqa: PLC0415
             UNRESOLVED_CAT_STDERR_MAX,
@@ -1869,9 +1884,14 @@ class TestCheckPlanTargetsInTree:
             from orchestrator import merge_queue as mq
             original_run = mq._run
 
+            diff_tree_fired = False
+            cat_file_fired = False
+
             async def _intercept(cmd, cwd=None, **kwargs):
+                nonlocal diff_tree_fired, cat_file_fired
                 if '--diff-filter=D' in cmd:
                     # Inject long stderr for diff-tree failure
+                    diff_tree_fired = True
                     return (128, '', 'X' * 1500)
                 if (
                     len(cmd) >= 4
@@ -1879,6 +1899,7 @@ class TestCheckPlanTargetsInTree:
                     and cmd[-1].endswith('^{commit}')
                 ):
                     # Inject long stderr for cat-file commit-probe failure
+                    cat_file_fired = True
                     return (1, '', 'Y' * 600)
                 # Merge-tree cat-file probes and all other calls fall through
                 return await original_run(cmd, cwd=cwd, **kwargs)
@@ -1888,6 +1909,15 @@ class TestCheckPlanTargetsInTree:
                     merge_result.merge_commit, worktree, git_ops,
                     task_id='t-issue6',
                 )
+
+            assert diff_tree_fired, (
+                '_intercept shim did not match diff-tree probe; '
+                'check probe shape in merge_queue.py'
+            )
+            assert cat_file_fired, (
+                '_intercept shim did not match cat-file commit-probe; '
+                'check probe shape in merge_queue.py'
+            )
 
             assert result.unresolved_steps, 'Expected at least one UnresolvedStep'
             us = result.unresolved_steps[0]
