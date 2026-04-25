@@ -384,12 +384,19 @@ class BulkResetGuard:
     # Escalation write
     # ------------------------------------------------------------------
 
-    async def _record_write_failure(self, project_id: str, now: float) -> None:
+    async def _record_write_failure(self, project_id: str) -> None:
         """Record a write-failure timestamp for per-project backoff tracking.
+
+        The timestamp is captured fresh at call time (i.e. after the failed I/O
+        has already returned) so the post-I/O elapsed time is included in the
+        backoff window.  This prevents a long, slow I/O failure from appearing
+        'recent' when measured against a stale timestamp captured before the
+        operation started.
 
         Acquires the lock briefly so the update is visible to all concurrent
         callers of ``_maybe_write_escalation``.
         """
+        now = self._now()
         async with self._lock:
             state = self._state.setdefault(project_id, _GuardState())
             state.last_write_failure_ts = now
@@ -474,7 +481,7 @@ class BulkResetGuard:
             logger.error(
                 'bulk_reset_guard: failed to create escalation dir %s: %s', esc_dir, exc,
             )
-            await self._record_write_failure(project_id, now)
+            await self._record_write_failure(project_id)
             return None
 
         ts = datetime.fromtimestamp(now, tz=UTC).isoformat()
@@ -553,7 +560,7 @@ class BulkResetGuard:
             logger.error(
                 'bulk_reset_guard: failed to write escalation %s: %s', path, exc,
             )
-            await self._record_write_failure(project_id, now)
+            await self._record_write_failure(project_id)
             return None
 
         # Only advance the rate-limit timestamp AFTER a successful write.
