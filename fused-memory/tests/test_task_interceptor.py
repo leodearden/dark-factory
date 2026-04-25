@@ -1581,13 +1581,22 @@ async def test_get_statuses_returns_all_id_to_status_mapping(taskmaster, event_b
             {'id': 3, 'status': 'in-progress'},
         ]
     })
+    # Spy on the canonical add path (EventBuffer.push at event_buffer.py:201).
+    # AsyncMock(wraps=...) preserves real behaviour while recording calls, so a
+    # rogue push attempt would still flow through to the buffer (caught by the
+    # belt-and-suspenders stats['size']==0 check below) AND show up here.
+    event_buffer.push = AsyncMock(wraps=event_buffer.push)
     interceptor = TaskInterceptor(taskmaster, None, event_buffer)
 
     result = await interceptor.get_statuses('/project')
 
+    # Primary contract: pure read — no event-emit path is invoked.
+    event_buffer.push.assert_not_called()
+
     assert result == {'1': 'pending', '2': 'done', '3': 'in-progress'}
 
-    # Pure read — must not emit any events
+    # Belt-and-suspenders: even if a future refactor bypasses push() and
+    # writes directly to the underlying store, the buffer remains empty.
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 0
 
