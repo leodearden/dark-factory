@@ -722,6 +722,23 @@ class TestScopeModuleConfigReturnsNone:
         assert result.lint_command is not None
         assert 'shared/src/y.py' in result.lint_command
 
+    def test_conftest_only_uses_full_test_suite(self):
+        """conftest.py alone should return the full unscoped test_command.
+
+        conftest.py defines fixtures/hooks that affect every test in the
+        directory subtree, so the correct scope is the full unscoped suite
+        already expressed by mc.test_command.
+        """
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
+        assert result is not None
+        assert result.test_command == mc.test_command
+        assert 'conftest.py' not in result.test_command
+
 
 class TestRunScopedVerificationSkipsUntouched:
     """End-to-end: run_scoped_verification skips subprojects with no matching files."""
