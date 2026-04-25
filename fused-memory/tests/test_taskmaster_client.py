@@ -386,3 +386,74 @@ async def test_is_alive_reprobes_after_ttl(config):
     await c.is_alive()
 
     assert session.call_tool.call_count == 2
+
+
+# ── close() lifecycle tests ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_suppresses_session_ctx_aexit_exception(config):
+    """close() must not raise when _session_ctx.__aexit__ raises, and must
+    still tear down _stdio_ctx and clear all three state attributes."""
+    c = TaskmasterBackend(config)
+    session_ctx = MagicMock()
+    session_ctx.__aexit__ = AsyncMock(side_effect=RuntimeError('boom'))
+    stdio_ctx = MagicMock()
+    stdio_ctx.__aexit__ = AsyncMock(return_value=False)
+    c._session_ctx = session_ctx
+    c._stdio_ctx = stdio_ctx
+    c._session = AsyncMock()
+
+    # Must not raise despite session_ctx.__aexit__ raising
+    await c.close()
+
+    # stdio_ctx.__aexit__ must still have been awaited
+    stdio_ctx.__aexit__.assert_awaited_once()
+    # All three state attributes must be cleared
+    assert c._session is None
+    assert c._session_ctx is None
+    assert c._stdio_ctx is None
+
+
+@pytest.mark.asyncio
+async def test_close_suppresses_stdio_ctx_aexit_exception(config):
+    """close() must not raise when _stdio_ctx.__aexit__ raises, and must
+    clear all three state attributes."""
+    c = TaskmasterBackend(config)
+    session_ctx = MagicMock()
+    session_ctx.__aexit__ = AsyncMock(return_value=False)
+    stdio_ctx = MagicMock()
+    stdio_ctx.__aexit__ = AsyncMock(side_effect=RuntimeError('stdio gone'))
+    c._session_ctx = session_ctx
+    c._stdio_ctx = stdio_ctx
+    c._session = AsyncMock()
+
+    # Must not raise despite stdio_ctx.__aexit__ raising
+    await c.close()
+
+    # All three state attributes must be cleared
+    assert c._session is None
+    assert c._session_ctx is None
+    assert c._stdio_ctx is None
+
+
+@pytest.mark.asyncio
+async def test_close_clears_state_attributes_on_normal_teardown(config):
+    """close() must await both __aexit__ calls and clear all three
+    state attributes on a clean (non-raising) teardown."""
+    c = TaskmasterBackend(config)
+    session_ctx = MagicMock()
+    session_ctx.__aexit__ = AsyncMock(return_value=False)
+    stdio_ctx = MagicMock()
+    stdio_ctx.__aexit__ = AsyncMock(return_value=False)
+    c._session_ctx = session_ctx
+    c._stdio_ctx = stdio_ctx
+    c._session = AsyncMock()
+
+    await c.close()
+
+    session_ctx.__aexit__.assert_awaited_once()
+    stdio_ctx.__aexit__.assert_awaited_once()
+    assert c._session is None
+    assert c._session_ctx is None
+    assert c._stdio_ctx is None
