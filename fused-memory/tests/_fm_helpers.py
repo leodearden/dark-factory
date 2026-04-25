@@ -154,6 +154,9 @@ async def submit_and_resolve(
         on ``result.get('error')`` / ``result.get('error_type')``.
 
     Raises:
+        AssertionError: When ``submit_task`` returns a non-dict value (e.g.
+            ``None``).  Helper is test-only; loud failure is preferred over
+            silent pass-through of an invalid contract.
         AssertionError: When the ticket resolved but the worker never wrote a
             ``result_json`` (row is None or result_json is empty).  The message
             names the ticket id and dumps ``resolve_result`` so the failure is
@@ -170,7 +173,10 @@ async def submit_and_resolve(
         **kwargs: Forwarded verbatim to ``submit_task``.
     """
     submit_result = await interceptor.submit_task(project_root, **kwargs)
-    if not isinstance(submit_result, dict) or 'ticket' not in submit_result:
+    assert isinstance(submit_result, dict), (
+        f'submit_and_resolve: submit_task returned non-dict: {submit_result!r}'
+    )
+    if 'ticket' not in submit_result:
         return submit_result
     ticket = submit_result['ticket']
     resolve_result = await interceptor.resolve_ticket(
