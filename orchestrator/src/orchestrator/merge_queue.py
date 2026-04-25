@@ -30,6 +30,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Truncation limits for UnresolvedStep stderr fields.
+# diff-tree stderr can carry multi-line pack-rewrite traces (legitimately long),
+# while cat-file -e stderr on a missing object is typically a single-line
+# "fatal: not a valid object name" message — different bounds reflect the
+# realistic max signal in each field.
+_UNRESOLVED_STDERR_MAX = 500
+_UNRESOLVED_CAT_STDERR_MAX = 200
+
 
 @dataclass
 class UnresolvedStep:
@@ -334,11 +342,13 @@ async def _check_plan_targets_in_tree(
                 # Truncate stored stderr once at construction; the formatter
                 # prints verbatim so the elision marker is always honest.
                 stderr_stored = (
-                    (stderr[:500] + ' <truncated>') if len(stderr) > 500 else stderr
+                    (stderr[:_UNRESOLVED_STDERR_MAX] + ' <truncated>')
+                    if len(stderr) > _UNRESOLVED_STDERR_MAX
+                    else stderr
                 )
                 cat_stderr_stored = (
-                    (cat_stderr[:200] + ' <truncated>')
-                    if len(cat_stderr) > 200
+                    (cat_stderr[:_UNRESOLVED_CAT_STDERR_MAX] + ' <truncated>')
+                    if len(cat_stderr) > _UNRESOLVED_CAT_STDERR_MAX
                     else cat_stderr
                 )
                 raw_step_id = step.get('id')

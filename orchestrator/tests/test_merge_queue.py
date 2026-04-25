@@ -1809,6 +1809,91 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_unresolved_step_stderr_truncated_at_module_constants(
+        self, git_ops: GitOps,
+    ):
+        """Truncation of stderr/cat_file_stderr uses named module-level constants.
+
+        Issue 6: the thresholds 500 and 200 are inline magic numbers.  After the
+        fix, ``_UNRESOLVED_STDERR_MAX`` and ``_UNRESOLVED_CAT_STDERR_MAX`` are
+        exported from the module and used in the truncation expression.
+
+        This test:
+          1. Imports the constants (ImportError if not yet defined → currently fails).
+          2. Monkey-patches ``_run`` so diff-tree returns 1500 X's as stderr and
+             cat-file commit-probe returns 600 Y's.  Merge-tree cat-file probes
+             (``<sha>:<path>`` arg form) fall through to the real subprocess.
+          3. Asserts that the stored stderr / cat_file_stderr lengths equal
+             ``_UNRESOLVED_STDERR_MAX + len(' <truncated>')`` and
+             ``_UNRESOLVED_CAT_STDERR_MAX + len(' <truncated>')``.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            _UNRESOLVED_CAT_STDERR_MAX,
+            _UNRESOLVED_STDERR_MAX,
+        )
+
+        worktree = (await git_ops.create_worktree('issue6-trunc-const')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # non-existent → diff-tree rc != 0
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue6', 'T-issue6', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue6-trunc-const')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            from orchestrator import merge_queue as mq
+            original_run = mq._run
+
+            async def _intercept(cmd, cwd=None, **kwargs):
+                if '--diff-filter=D' in cmd:
+                    # Inject long stderr for diff-tree failure
+                    return (128, '', 'X' * 1500)
+                if cmd and '^{commit}' in cmd[-1]:
+                    # Inject long stderr for cat-file commit-probe failure
+                    return (1, '', 'Y' * 600)
+                # Merge-tree cat-file probes and all other calls fall through
+                return await original_run(cmd, cwd=cwd, **kwargs)
+
+            with patch('orchestrator.merge_queue._run', new=_intercept):
+                result = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                    task_id='t-issue6',
+                )
+
+            assert result.unresolved_steps, 'Expected at least one UnresolvedStep'
+            us = result.unresolved_steps[0]
+
+            elision = ' <truncated>'
+            assert len(us.stderr) == _UNRESOLVED_STDERR_MAX + len(elision), (
+                f'Expected stderr length {_UNRESOLVED_STDERR_MAX + len(elision)}, '
+                f'got {len(us.stderr)}: {us.stderr!r}'
+            )
+            assert len(us.cat_file_stderr) == _UNRESOLVED_CAT_STDERR_MAX + len(elision), (
+                f'Expected cat_file_stderr length '
+                f'{_UNRESOLVED_CAT_STDERR_MAX + len(elision)}, '
+                f'got {len(us.cat_file_stderr)}: {us.cat_file_stderr!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
