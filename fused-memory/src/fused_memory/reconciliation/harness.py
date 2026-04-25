@@ -206,19 +206,41 @@ class ReconciliationHarness:
 
         Currently-running project loops complete their current cycle.
         The server continues serving reads/writes — only new cycles are suppressed.
+
+        If no project loops are active at the moment of the call, emits
+        ``'Harness fully drained — safe to restart'`` synchronously so that
+        ``scripts/restart-fused-memory.sh --drain`` detects completion in <5 s
+        rather than waiting up to 120 s for the main loop to observe idle state.
+        When at least one loop is still in flight the marker is suppressed here;
+        the main reconciliation loop emits it after all loops finish (existing
+        behaviour, task 1053).
         """
         if self._draining:
             logger.info('Harness already draining')
             return
         self._draining = True
         logger.info('Harness drain requested — will finish current cycles, no new ones')
+        # Task 1053: short-circuit when no project loops are active at drain time.
+        # Delegates to _no_active_loops() so drain(), is_drained, and the main-loop
+        # emission site (harness.py ~line 591) stay semantically coupled.
+        # When at least one loop is still running, the main loop emits the marker
+        # after all loops finish (existing behaviour, up to the 120-s timeout).
+        if self._no_active_loops():
+            logger.info('Harness fully drained — safe to restart')
+
+    def _no_active_loops(self) -> bool:
+        """Return True when no project loops are currently running.
+
+        A task is considered active when ``.done()`` returns False.
+        Shared by :meth:`drain`, :attr:`is_drained`, and the main reconciliation
+        loop so the three sites stay semantically coupled (task 1053).
+        """
+        return all(t.done() for t in self._project_tasks.values())
 
     @property
     def is_drained(self) -> bool:
         """True when draining and all project loops have completed."""
-        return self._draining and not any(
-            not t.done() for t in self._project_tasks.values()
-        )
+        return self._draining and self._no_active_loops()
 
     def _make_stages(self) -> list:
         """Create a fresh set of stage instances for one reconciliation cycle."""
@@ -575,11 +597,15 @@ class ReconciliationHarness:
 
                     # Drain status logging
                     if self._draining:
-                        active = sum(1 for t in self._project_tasks.values() if not t.done())
-                        if active == 0:
+                        if self._no_active_loops():
                             logger.info('Harness fully drained — safe to restart')
                         else:
-                            logger.info(f'Harness draining: {active} project loop(s) still running')
+                            active = sum(
+                                1 for t in self._project_tasks.values() if not t.done()
+                            )
+                            logger.info(
+                                f'Harness draining: {active} project loop(s) still running'
+                            )
 
                     # Periodic cleanup of drained events (~every 50s / 10 iterations)
                     loop_count += 1
