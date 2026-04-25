@@ -771,11 +771,17 @@ class TestApplyChangesDependencyUpdates:
             ],
         }
         # Should NOT raise; partial failure is tolerated.
-        await apply_changes(backend, '/project', plan)
+        result = await apply_changes(backend, '/project', plan)
 
         # Dep updates still proceed despite cancel failure.
         backend.remove_dependency.assert_awaited_once()
         backend.add_dependency.assert_awaited_once()
+
+        # Return counters must reflect: 1 cancel error, 1 dep update applied, 0 dep errors.
+        assert result['cancelled'] == 0
+        assert result['cancel_errors'] == 1
+        assert result['dep_updates_applied'] == 1
+        assert result['dep_update_errors'] == 0
 
     async def test_remove_failure_skips_add_and_counts_one_error(self):
         """When remove_dependency raises, add_dependency must NOT be called and the error is counted once."""
