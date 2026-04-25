@@ -4012,3 +4012,98 @@ async def test_dedupe_bulk_intra_batch_partial_failure_under_batched_lock_contin
     assert curator_interceptor._curator.curate.await_count == 2, (
         f'curate call count wrong: {curator_interceptor._curator.curate.call_args_list}'
     )
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_intra_batch_partial_failure_curator_drop_routes_to_removed(
+    curator_interceptor, taskmaster,
+):
+    """Partial-failure with curator='drop' must land the failing task in removed, not kept.
+
+    Pins the corrected docstring contract: when tm.remove_task raises during
+    pass-1 for a duplicate, the task falls through to pass-2 (unique_new_tasks).
+    If the curator then returns action='drop', pass-2 re-issues tm.remove_task
+    and the task lands in ``removed`` with reason='curator_drop' — NOT in
+    ``kept``.  The task also appears in ``errors`` (dual-append contract).
+
+    This is the curator='drop' sibling of
+    test_dedupe_bulk_intra_batch_partial_failure_under_batched_lock_continues_remaining
+    (which only exercises curator='create', so the failing task lands in kept).
+    Together the two tests pin both branches of the ``errors ∪ (kept ∪ removed)``
+    contract described in the _dedupe_bulk_created docstring.
+    """
+    PROJECT = '/project'
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
+        {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
+        {'id': '12', 'title': 'fix Foo', 'description': 'BAR '},
+        {'id': '13', 'title': 'Fix  foo', 'description': 'bar'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+
+    # '12' raises on its first removal (pass-1); succeeds on the second call
+    # (pass-2 curator-drop re-removal).  '11' and '13' succeed immediately.
+    _remove_call_count: dict[str, int] = {}
+
+    def _side_effect(tid, _project_root):
+        _remove_call_count[tid] = _remove_call_count.get(tid, 0) + 1
+        if tid == '12' and _remove_call_count[tid] == 1:
+            raise RuntimeError('transient backend failure')
+        return {'success': True}
+
+    taskmaster.remove_task = AsyncMock(side_effect=_side_effect)
+
+    # Per-candidate routing: '12' (title='fix Foo') is dropped onto '10';
+    # '10' (title='Fix foo') is novel and kept.
+    async def _route(candidate, *a, **kw):
+        if candidate.title == 'fix Foo':
+            return CuratorDecision(
+                action='drop', target_id='10',
+                justification='subsumed by intra-batch original',
+            )
+        return CuratorDecision(action='create', justification='novel')
+
+    curator = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    curator.curate = AsyncMock(side_effect=_route)
+    curator_interceptor._curator = curator
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        PROJECT, pre_snapshot={'tasks': []},
+    )
+
+    # (a) remove_task called 4 times: 3 from pass-1 (one per dup, including the
+    # failing '12') + 1 from pass-2's curator-drop re-removal of '12'.
+    assert taskmaster.remove_task.await_count == 4, (
+        f'remove_task call count wrong (expected 4): {taskmaster.remove_task.call_args_list}'
+    )
+
+    # (b) Exactly one error entry, for '12', mentioning the backend failure.
+    assert len(result['errors']) == 1, f"expected 1 error, got: {result['errors']}"
+    assert result['errors'][0]['task_id'] == '12'
+    assert 'transient backend failure' in result['errors'][0]['error']
+
+    # (c) '12' appears in removed with reason='curator_drop' and matched_task_id='10'.
+    # PINS the corrected docstring contract: partial-failure + curator='drop' routes
+    # the task to removed (not to kept, as the old docstring incorrectly claimed).
+    removed_12 = next((r for r in result['removed'] if r['task_id'] == '12'), None)
+    assert removed_12 is not None, f"expected '12' in removed, got: {result['removed']}"
+    assert removed_12['reason'] == 'curator_drop'
+    assert removed_12['matched_task_id'] == '10'
+
+    # (d) '12' does NOT appear in kept (dual-append means errors + removed, not errors + kept).
+    assert all(k['task_id'] != '12' for k in result['kept']), (
+        f"unexpected '12' in kept: {result['kept']}"
+    )
+
+    # (e) '11' and '13' appear in removed with reason='intra_batch_duplicate'.
+    for dup_id in ('11', '13'):
+        dup = next((r for r in result['removed'] if r['task_id'] == dup_id), None)
+        assert dup is not None, f"expected '{dup_id}' in removed, got: {result['removed']}"
+        assert dup['reason'] == 'intra_batch_duplicate'
+        assert dup['matched_task_id'] == '10'
+
+    # curator.curate called twice: pass-2 receives '10' and the fall-through '12'.
+    assert curator.curate.await_count == 2, (
+        f'curate call count wrong: {curator.curate.call_args_list}'
+    )
