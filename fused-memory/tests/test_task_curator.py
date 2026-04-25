@@ -15,7 +15,7 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
-    _normalize_title,
+    normalize_title,
     _parse_decision,
     _parse_decision_dict,
     _PoolEntry,
@@ -1903,30 +1903,30 @@ class TestIntraBatchKey:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _normalize_title module-level helper
+# normalize_title module-level helper
 # ─────────────────────────────────────────────────────────────────────
 
 
 class TestNormalizeTitle:
-    """Unit tests for the module-level _normalize_title helper."""
+    """Unit tests for the module-level normalize_title helper."""
 
     def test_normalises_to_expected_output(self):
         """(a) normalised output is lowercase with collapsed whitespace."""
-        assert _normalize_title('Fix the parser') == 'fix the parser'
+        assert normalize_title('Fix the parser') == 'fix the parser'
 
     def test_case_folding(self):
         """(b) case difference is normalised away."""
-        assert _normalize_title('Fix Bug') == _normalize_title('fix bug')
+        assert normalize_title('Fix Bug') == normalize_title('fix bug')
 
     def test_whitespace_collapse(self):
         """(c) leading/trailing and internal whitespace collapse."""
-        assert _normalize_title('  Fix   bug ') == 'fix bug'
-        assert _normalize_title('  Fix   bug ') == _normalize_title('fix bug')
+        assert normalize_title('  Fix   bug ') == 'fix bug'
+        assert normalize_title('  Fix   bug ') == normalize_title('fix bug')
 
     def test_none_input_returns_empty_string(self):
         """(d) None input → empty string (defensive None handling)."""
-        assert _normalize_title(None) == ''  # type: ignore[arg-type]
+        assert normalize_title(None) == ''  # type: ignore[arg-type]
 
     def test_empty_input_returns_empty_string(self):
         """(e) empty string → empty string."""
-        assert _normalize_title('') == ''
+        assert normalize_title('') == ''

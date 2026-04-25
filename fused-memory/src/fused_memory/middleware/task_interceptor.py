@@ -33,7 +33,7 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
-    _normalize_title,
+    normalize_title,
     _to_pool_entry,
     flatten_task_tree,
 )
@@ -937,8 +937,8 @@ class TaskInterceptor:
             return None
 
         target_title = str(target.get('title', '') or '')
-        expected_fp = _normalize_title(target_title)
-        got_fp = _normalize_title(decision.target_fingerprint or '')
+        expected_fp = normalize_title(target_title)
+        got_fp = normalize_title(decision.target_fingerprint or '')
         if not got_fp or expected_fp != got_fp:
             logger.warning(
                 'combine-guard: fingerprint mismatch for target=%s: '

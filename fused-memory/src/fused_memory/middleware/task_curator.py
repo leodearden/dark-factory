@@ -395,7 +395,7 @@ additional rules for duplicates that exist WITHIN the batch:
 """
 
 
-def _normalize_title(title: str | None) -> str:
+def normalize_title(title: str | None) -> str:
     """Lowercase + collapse whitespace for forgiving title comparison.
 
     Accepts ``str | None``; a ``None`` or empty input returns ``''``.
@@ -524,7 +524,7 @@ class TaskCurator:
         the same batch.
 
         Normalisation delegates to the shared module-level
-        :func:`_normalize_title` helper — lowercase, strip, and collapse
+        :func:`normalize_title` helper — lowercase, strip, and collapse
         internal whitespace — making the key case- and whitespace-insensitive.
 
         Does NOT include files_to_modify because Taskmaster-generated
@@ -532,9 +532,9 @@ class TaskCurator:
         false negatives for otherwise-identical tasks.
         """
         h = hashlib.sha256()
-        h.update(_normalize_title(title).encode())
+        h.update(normalize_title(title).encode())
         h.update(b'|')
-        h.update(_normalize_title(description).encode())
+        h.update(normalize_title(description).encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the other
         # task_curator.py mirror sites (payload_hash, _normalize_key).
