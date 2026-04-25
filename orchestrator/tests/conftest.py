@@ -25,10 +25,10 @@ _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
-from _orch_helpers import pydantic_spec
-from shared.config_models import UsageCapConfig
+from _orch_helpers import pydantic_spec  # noqa: E402
+from shared.config_models import UsageCapConfig  # noqa: E402
 
-from orchestrator.config import (
+from orchestrator.config import (  # noqa: E402
     EscalationConfig,
     FusedMemoryConfig,
     GitConfig,
