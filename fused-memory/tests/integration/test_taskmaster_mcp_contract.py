@@ -12,6 +12,15 @@ hand-crafted wire envelopes to cover all 12 wrapper methods.  These live tests
 exist exclusively to catch wire-shape drift between Taskmaster's JS tools and the
 canned mocks — drift that static mocks cannot detect.
 
+**Intentional scope**: only the basic CRUD path (``add_task``, ``get_task``,
+``set_task_status``, ``remove_task``) and one error path are tested here.
+Methods like ``update_task``, ``add_subtask``, ``expand_task``,
+``add_dependency``, and ``parse_prd`` are fully covered by the canned suite;
+adding live calls for each would not meaningfully raise drift-detection probability
+(wire shapes are symmetric — if ``add_task`` round-trips correctly the others
+overwhelmingly will too).  Expand this suite only when a specific wrapper's wire
+shape has been observed to drift in the field.
+
 **Skip semantics**: this suite is skipped automatically unless
 ``taskmaster-ai/dist/mcp-server.js`` is present.  To enable it::
 
@@ -28,7 +37,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
-from fused_memory.backends.taskmaster_types import TaskmasterError  # noqa: F401
+from fused_memory.backends.taskmaster_types import TaskmasterError
 from fused_memory.config.schema import TaskmasterConfig
 
 # ── Dist path resolution ─────────────────────────────────────────────
@@ -97,12 +106,11 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
 
     # (b) get_task returns the task with matching id/title and a known start-state
     task = await backend.get_task(task_id, project_root=project_root)
-    assert task['id'] == task_id or str(task.get('id')) == task_id
+    assert task['id'] == task_id
     assert task.get('title') == 'Integration test task'
-    known_start_states = {'pending', 'todo', 'in-progress', 'in_progress'}
-    assert task.get('status') in known_start_states, (
+    assert task.get('status') == 'pending', (
         f"Unexpected initial status {task.get('status')!r}; "
-        f'known start states: {known_start_states}'
+        f"expected 'pending' — update this assertion if Taskmaster changes its default"
     )
 
     # (c) set_task_status returns a message containing 'done'
