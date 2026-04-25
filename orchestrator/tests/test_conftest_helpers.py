@@ -6,8 +6,6 @@ callers can rely on it without reading conftest.py implementation details.
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from orchestrator.config import GitConfig
 
 
