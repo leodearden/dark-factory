@@ -426,11 +426,12 @@ class BulkResetGuard:
         failed (callers produce ``outcome='rejection'`` in that case).
 
         The I/O try/except blocks catch ``Exception`` (not ``OSError``) on
-        purpose so that any unexpected error (e.g. ValueError from an odd
-        encoding, AttributeError from a stub Path subclass) is converted to a
-        ``'rejection'`` verdict rather than propagating out of
-        ``observe_attempt``.  ``KeyboardInterrupt`` and ``SystemExit`` are NOT
-        caught — ``Exception`` (not ``BaseException``) is used deliberately.
+        purpose so that any unexpected error (e.g. a ValueError from an odd
+        encoding or an unexpected runtime error from a patched Path or a
+        malformed argument) is converted to a ``'rejection'`` verdict rather
+        than propagating out of ``observe_attempt``.  ``KeyboardInterrupt``
+        and ``SystemExit`` are NOT caught — ``Exception`` (not
+        ``BaseException``) is used deliberately.
 
         Parameters
         ----------
@@ -466,8 +467,8 @@ class BulkResetGuard:
                 )
                 return None
             # Write-failure backoff: suppress I/O retries for
-            # write_failure_backoff_seconds after an OSError from mkdir or
-            # write_text.  last_write_failure_ts is set by _record_write_failure
+            # write_failure_backoff_seconds after a failed mkdir or write_text
+            # (any Exception).  last_write_failure_ts is set by _record_write_failure
             # and is per-project so a flaky mount for one project does not
             # block sibling projects.
             if (now - state.last_write_failure_ts) < self._write_failure_backoff_seconds:
