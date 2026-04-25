@@ -118,3 +118,4 @@ class TestCorpusSanityCostDisplay:
             f'Expected "$3.80" in Total cost line (combined 1.3 + 2.5).\n'
             f'Output:\n{result.output}'
         )
+
