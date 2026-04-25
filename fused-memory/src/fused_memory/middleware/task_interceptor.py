@@ -1265,10 +1265,13 @@ class TaskInterceptor:
     def _write_lock(self, project_id: str) -> asyncio.Lock:
         """Per-project lock for tasks.json mutations.
 
-        Short-held; covers only the Taskmaster stdio write. Every mutating
-        op (set_task_status, update_task, add_dependency, remove_dependency,
-        the actual tm.add_task/tm.add_subtask/tm.remove_task calls, and the
-        bulk expand/parse_prd pre-snapshot+mutation) takes this lock.
+        Short-held; covers a single Taskmaster stdio write, OR a back-to-back
+        batch of mechanical writes with no LLM/IO between them — see
+        ``_dedupe_bulk_created`` Phase B for the canonical batched usage.
+        Every mutating op (set_task_status, update_task, add_dependency,
+        remove_dependency, the actual tm.add_task/tm.add_subtask/tm.remove_task
+        calls, and the bulk expand/parse_prd pre-snapshot+mutation) takes this
+        lock.
         """
         lock = self._write_locks.get(project_id)
         if lock is None:
