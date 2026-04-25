@@ -809,59 +809,67 @@ class TestCheckPlanTargetsInTree:
     async def test_real_commit_no_diff_produces_no_unresolved_steps(
         self, git_ops: GitOps,
     ):
-        """Real commit with empty diff → rc == 0 → no UnresolvedStep recorded.
+        """Genuinely empty-diff commit (--allow-empty) → diff-tree rc=0 with empty stdout.
 
-        Paired sub-case for test_diff_tree_failure_records_unresolved_step_with_object_missing_flag:
-        when diff-tree succeeds (rc == 0), unresolved_steps must be empty even
-        if the commit's diff happens to be empty (e.g. a no-op amend).  This
-        confirms object_missing is only set on genuine diff-tree failures.
+        Tests the boundary case: a done-step commit that touches nothing
+        (``git commit --allow-empty``).  ``git diff-tree --diff-filter=D``
+        returns rc=0 with empty stdout — the ``for line in stdout.splitlines()``
+        loop is a no-op, ``expected_absent`` is unchanged, and no ``UnresolvedStep``
+        is created.
+
+        This was previously untested.  The deletion case that this slot formerly
+        exercised is already covered by
+        ``test_check_plan_targets_returns_drop_guard_result`` and
+        ``test_orphan_done_step_commit_object_in_odb_resolves_deletion_as_expected_absent``,
+        so repurposing this slot gives coverage of the rc=0-with-empty-stdout
+        edge case without losing anything.
+
+        No ``merge_queue.py`` change is needed — the implementation already
+        handles empty stdout correctly.
         """
-        worktree = (await git_ops.create_worktree('no-unresolved-real-sha')).path
+        worktree = (await git_ops.create_worktree('no-unresolved-empty-diff')).path
 
-        (worktree / 'anchor.py').write_text('anchor = 1\n')
-        await git_ops.commit(worktree, 'Add anchor.py')
+        # present.py will be present in the merge tree → no drops
+        (worktree / 'present.py').write_text('p = 1\n')
+        await git_ops.commit(worktree, 'Add present.py')
 
-        # Create then delete gone.py — the deletion commit is the done-step commit
-        (worktree / 'gone.py').write_text('g = 1\n')
-        await git_ops.commit(worktree, 'Add gone.py')
-        (worktree / 'gone.py').unlink()
-        await _run(['git', 'add', '-A'], cwd=worktree)
-        await _run(['git', 'commit', '-m', 'Delete gone.py'], cwd=worktree)
-        rc, del_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        # TRUE empty commit (--allow-empty): diff-tree returns rc=0 with no output
+        await _run(['git', 'commit', '--allow-empty', '-m', 'empty step'], cwd=worktree)
+        rc, empty_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         assert rc == 0
-        del_sha = del_sha_out.strip()
+        empty_sha = empty_sha_out.strip()
 
         artifacts = TaskArtifacts(worktree)
-        artifacts.init('t-real-sha', 'T-real-sha', 'desc')
+        artifacts.init('t-empty-diff', 'T-empty-diff', 'desc')
         artifacts.write_plan({
-            'files': ['gone.py'],
+            'files': ['present.py'],
             'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
-                    'description': 'deleted gone.py',
+                    'description': 'empty-diff commit (allow-empty)',
                     'status': 'done',
-                    'commit': del_sha,
+                    'commit': empty_sha,
                 },
             ],
         })
 
-        merge_result = await git_ops.merge_to_main(worktree, 'no-unresolved-real-sha')
+        merge_result = await git_ops.merge_to_main(worktree, 'no-unresolved-empty-diff')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
-                task_id='t-real-sha',
+                task_id='t-empty-diff',
             )
-            # diff-tree succeeded → no unresolved steps
+            # diff-tree rc=0 with empty stdout → no unresolved steps
             assert result.unresolved_steps == [], (
-                f'Expected no unresolved steps (real SHA, diff-tree rc=0), '
+                f'Expected no unresolved steps (empty-diff commit, rc=0), '
                 f'got {result.unresolved_steps!r}'
             )
-            # gone.py was intentionally deleted → not flagged as dropped
+            # present.py is in the merge tree → not flagged as dropped
             assert result.dropped == [], (
-                f'Expected no drops (done-step deletion recognized), '
+                f'Expected no drops (present.py in merge tree), '
                 f'got {result.dropped!r}'
             )
         finally:
