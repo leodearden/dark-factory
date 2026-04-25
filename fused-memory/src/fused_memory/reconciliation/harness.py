@@ -206,12 +206,21 @@ class ReconciliationHarness:
 
         Currently-running project loops complete their current cycle.
         The server continues serving reads/writes — only new cycles are suppressed.
+
+        If no project loops are active at the moment of the call, emits
+        ``'Harness fully drained — safe to restart'`` synchronously so that
+        ``scripts/restart-fused-memory.sh --drain`` detects completion in <5 s
+        rather than waiting up to 120 s for the main loop to observe idle state.
+        When at least one loop is still in flight the marker is suppressed here;
+        the main reconciliation loop emits it after all loops finish (existing
+        behaviour, task 1053).
         """
         if self._draining:
             logger.info('Harness already draining')
             return
         self._draining = True
         logger.info('Harness drain requested — will finish current cycles, no new ones')
+        logger.info('Harness fully drained — safe to restart')
 
     @property
     def is_drained(self) -> bool:
