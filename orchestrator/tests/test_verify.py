@@ -11,6 +11,7 @@ from orchestrator.verify import (
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
+    _build_fallback_config,
     _extract_cause_hint,
     _run_cmd,
     _scope_cargo_workspace,
@@ -1662,3 +1663,21 @@ class TestFailureReportCauseHint:
             f'Expected ## Verify Timed Out (pos {timeout_pos}) before '
             f'## Failure Cause (pos {cause_pos})'
         )
+
+
+class TestBuildFallbackConfigConftest:
+    """`_build_fallback_config` handles conftest.py correctly.
+
+    The fallback path has no parent ModuleConfig, so it cannot reuse
+    mc.test_command as the full suite.  Instead it uses the parent directory
+    of each conftest.py as the pytest target — that directory contains every
+    test the conftest can affect and pytest discovers them correctly.
+    """
+
+    def test_conftest_only_uses_directory_not_conftest_file(self):
+        """conftest.py alone → pytest targets its parent directory."""
+        result = _build_fallback_config(['orchestrator/tests/conftest.py'])
+        assert result is not None
+        assert result.test_command is not None
+        assert 'conftest.py' not in result.test_command
+        assert result.test_command == 'pytest orchestrator/tests'
