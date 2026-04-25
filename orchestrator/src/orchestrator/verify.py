@@ -426,6 +426,13 @@ def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
         # e.g. ['a/conftest.py', 'b/test_x.py'] → 'pytest a b/test_x.py' so
         # tests in b/ are not silently skipped.  A root-level conftest ('.')
         # shadows everything, so in that case no files are "outside".
+        #
+        # `test_files` always contains file paths (e.g. 'a/sub/test_x.py'),
+        # never bare directory paths — _is_test_file gates on filename
+        # suffixes/prefixes and a /tests/ substring, none of which match a
+        # directory entry.  That guarantees `t.startswith(d + '/')` reliably
+        # means "t is inside directory d" without false positives from a
+        # sibling directory like 'ab/' matching the prefix 'a'.
         if '.' not in conftest_dirs:
             outside = [
                 t for t in test_files
