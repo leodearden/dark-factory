@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _submit_and_resolve
+from _fm_helpers import submit_and_resolve
 
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -424,7 +424,7 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
             ticket_store=store,
         )
         project_root = str(tmp_path / 'proj_root')
-        result = await _submit_and_resolve(
+        result = await submit_and_resolve(
             interceptor, project_root,
             title='Under the limit',
             timeout_seconds=5.0,

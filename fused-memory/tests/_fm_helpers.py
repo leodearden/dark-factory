@@ -132,7 +132,7 @@ def extract_params(call_args: Any) -> dict:
     return call_args.kwargs.get('params', {})
 
 
-async def _submit_and_resolve(
+async def submit_and_resolve(
     interceptor,
     project_root: str,
     *,
@@ -162,13 +162,17 @@ async def _submit_and_resolve(
     resolve_result = await interceptor.resolve_ticket(
         ticket, project_root, timeout_seconds=timeout_seconds,
     )
+    # TODO: reaching into interceptor._ticket_store is private-attribute coupling.
+    # If TaskInterceptor ever exposes a stable accessor (e.g. get_ticket_result(ticket))
+    # or if resolve_ticket starts returning the parsed result_json directly, prefer that
+    # and remove the _ticket_store access here.
     row = await interceptor._ticket_store.get(ticket)
     if row is not None and row.get('result_json'):
         try:
             return json.loads(row['result_json'])
         except json.JSONDecodeError as exc:
             raise AssertionError(
-                f'_submit_and_resolve: malformed result_json for ticket {ticket!r}: '
+                f'submit_and_resolve: malformed result_json for ticket {ticket!r}: '
                 f'{row["result_json"]!r}'
             ) from exc
     return resolve_result
