@@ -121,3 +121,20 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     assert task_id in remove_result['removed_ids'], (
         f'Expected {task_id!r} in removed_ids: {remove_result["removed_ids"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_get_task_unknown_id_raises_taskmaster_error(taskmaster_backend):
+    """Error path: get_task with an unknown id raises TaskmasterError(TASKMASTER_TOOL_ERROR).
+
+    Taskmaster emits ``createErrorResponse`` for unknown task ids, which the
+    ``_unwrap`` adapter surfaces as ``TaskmasterError(code='TASKMASTER_TOOL_ERROR')``.
+    """
+    backend, project_root = taskmaster_backend
+
+    with pytest.raises(TaskmasterError) as exc_info:
+        await backend.get_task('99999', project_root=project_root)
+
+    assert exc_info.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected code=TASKMASTER_TOOL_ERROR, got: {exc_info.value.code!r}'
+    )
