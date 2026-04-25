@@ -23,6 +23,9 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     directly to ``spec_set=`` would only expose BaseModel/BaseSettings methods.
     The returned proxy has each field name as a class attribute, so MagicMock
     sees them and rejects typos on both get and set.
+
+    Pydantic methods (model_dump, model_validate, …) are intentionally NOT
+    exposed; if a test needs them, mock them explicitly.
     """
     return type(
         f'_{model.__name__}Spec',

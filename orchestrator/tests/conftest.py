@@ -14,6 +14,7 @@ from _orch_helpers import pydantic_spec
 from shared.config_models import UsageCapConfig
 
 from orchestrator.config import (
+    EscalationConfig,
     FusedMemoryConfig,
     GitConfig,
     OrchestratorConfig,
@@ -81,10 +82,11 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``review.enabled`` = False
       - ``sandbox.backend`` = 'auto'
       - ``fused_memory`` = pre-created sub-section mock (no default value)
+      - ``escalation`` = pre-created sub-section mock (no default value)
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
-    fused_memory) are spec_set'd against their pydantic model's fields so
-    typos raise AttributeError on both get and set.
+    fused_memory, escalation) are spec_set'd against their pydantic model's
+    fields so typos raise AttributeError on both get and set.
 
     Apply test-specific overrides directly on the returned object.
     """
@@ -103,4 +105,5 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     config.sandbox = MagicMock(spec_set=pydantic_spec(SandboxConfig))
     config.sandbox.backend = 'auto'
     config.fused_memory = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+    config.escalation = MagicMock(spec_set=pydantic_spec(EscalationConfig))
     return config

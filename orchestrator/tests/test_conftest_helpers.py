@@ -13,26 +13,18 @@ consume the fixture in earnest are the de-facto contract for those.
 import pytest
 
 
-def test_top_level_typo_rejected(mock_orch_config):
+@pytest.mark.parametrize('attr_path', [
+    ['projcet_root'],
+    ['usage_cap', 'enabld'],
+    ['review', 'enabld'],
+    ['sandbox', 'bakcend'],
+    ['fused_memory', 'projcet_id'],
+    ['escalation', 'hsot'],
+])
+def test_typo_rejected(mock_orch_config, attr_path):
+    """Typos on spec_set'd sub-sections raise AttributeError on assignment."""
+    obj = mock_orch_config
+    for attr in attr_path[:-1]:
+        obj = getattr(obj, attr)
     with pytest.raises(AttributeError):
-        mock_orch_config.projcet_root = '/tmp/typo'
-
-
-def test_usage_cap_typo_rejected(mock_orch_config):
-    with pytest.raises(AttributeError):
-        mock_orch_config.usage_cap.enabld = True
-
-
-def test_review_typo_rejected(mock_orch_config):
-    with pytest.raises(AttributeError):
-        mock_orch_config.review.enabld = True
-
-
-def test_sandbox_typo_rejected(mock_orch_config):
-    with pytest.raises(AttributeError):
-        mock_orch_config.sandbox.bakcend = 'auto'
-
-
-def test_fused_memory_typo_rejected(mock_orch_config):
-    with pytest.raises(AttributeError):
-        mock_orch_config.fused_memory.projcet_id = 'oops'
+        setattr(obj, attr_path[-1], 'anything')
