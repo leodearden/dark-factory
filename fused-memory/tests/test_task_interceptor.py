@@ -3918,9 +3918,11 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     await inside_first.wait()
 
     # Probe 1: lock must be held (TimeoutError proves the batched scope is active).
+    # The 0.5 s timeout is only spent in the failure branch (lock unexpectedly free);
+    # the happy path exits the moment the lock attempt blocks — no CI slowdown.
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
-            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.05
+            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
         )
 
     # Advance to the second removal.
@@ -3930,14 +3932,22 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     # Probe 2: lock must STILL be held between consecutive removals.
     # Under the old per-item form the lock would have been released here and
     # the probe would succeed, distinguishing the two implementations.
+    # Same reasoning for the 0.5 s timeout as Probe 1 above.
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
-            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.05
+            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
         )
 
     # Release the second removal and let the batch complete.
     release_second.set()
     result = await dedupe_task
+
+    # Anchor that the gating counter was incremented for every pass-1 removal —
+    # if pass-1 batches differently in the future, the Event barriers would
+    # cover different calls and this assertion would catch the divergence first.
+    assert _call_count == 3, (
+        f'_gated_remove called {_call_count} times; expected 3 (one per intra-batch dup)'
+    )
 
     # (a) 3 tasks removed (the 3 intra-batch duplicates of '10').
     assert len(result['removed']) == 3, f"expected 3 removals, got: {result['removed']}"
@@ -4138,4 +4148,12 @@ async def test_dedupe_bulk_intra_batch_partial_failure_curator_drop_routes_to_re
     # curator.curate called twice: pass-2 receives '10' and the fall-through '12'.
     assert curator.curate.await_count == 2, (
         f'curate call count wrong: {curator.curate.call_args_list}'
+    )
+    # Pin the routing inputs so a title-key change fails loudly rather than
+    # silently flipping the drop→create routing (CandidateTask has no id field;
+    # call_args_list is the stable way to verify which candidates were routed).
+    curate_call_titles = {c.args[0].title for c in curator.curate.call_args_list}
+    assert curate_call_titles == {'Fix foo', 'fix Foo'}, (
+        f'curator.curate received unexpected candidate titles {curate_call_titles!r}; '
+        f'routing-key mismatch: task 12 must reach curator with title "fix Foo"'
     )
