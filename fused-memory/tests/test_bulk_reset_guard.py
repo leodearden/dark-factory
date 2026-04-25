@@ -1653,3 +1653,68 @@ def test_guard_accepts_cfg_write_failure_backoff(tmp_path):
         f'Expected _write_failure_backoff_seconds=42.0, got '
         f'{guard._write_failure_backoff_seconds}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1021 item-1: no-op eviction removal — state object identity
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fresh_project_state_object_identity_persists_across_window_reset(tmp_path):
+    """_GuardState object identity for a never-tripped project is preserved
+    across two observe_attempt calls separated by a window reset.
+
+    Pre-fix (no-op eviction block at bulk_reset_guard.py lines 314-327 present):
+      On call #2 the deques are empty after pruning AND both timestamps are 0.0,
+      so the eviction block fires: it pops the dict entry, creates a NEW
+      _GuardState, and re-inserts it.  The `is` comparison is False — FAIL.
+
+    Post-fix (eviction block removed):
+      The same _GuardState object is preserved in the dict — the `is` comparison
+      is True — PASS.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        done_threshold=10,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Call #1: add an entry at t=1001 (inside the 60s window).
+    clock[0] = 1001.0
+    await guard.observe_attempt(
+        project_id='proj-fresh',
+        task_id='t0',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    initial_state = guard._state['proj-fresh']
+
+    # Advance clock to 1100.0: cutoff = 1100 - 60 = 1040 > 1001, so the
+    # t=1001 entry is pruned on call #2.  Both timestamps are still 0.0
+    # (no trip occurred), so the no-op eviction predicate is satisfied.
+    clock[0] = 1100.0
+    await guard.observe_attempt(
+        project_id='proj-fresh',
+        task_id='t1',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+
+    # The dead eviction block (bulk_reset_guard.py lines 314-327) would have
+    # popped and re-inserted a fresh _GuardState here.  After removal the same
+    # object is preserved.
+    assert guard._state['proj-fresh'] is initial_state, (
+        'State object was replaced — the no-op eviction block (lines 314-327 of '
+        'bulk_reset_guard.py) fired, popped the dict entry, and inserted a fresh '
+        '_GuardState.  Remove that block to fix this.'
+    )
