@@ -53,8 +53,10 @@ class UnresolvedStep:
     ``git cat-file -e <sha>^{commit}`` probe so an operator can distinguish
     "definitely pruned" (cat-file succeeded with a clean 'missing' response)
     from "cat-file also failed weirdly" (cat-file rc != 0 but stderr shows
-    an ODB lock or fs error).  Defaults to 0 / '' to keep existing
-    :class:`UnresolvedStep` constructions in tests backward-compatible.
+    an ODB lock or fs error).  Defaults to 0 / '' so callers can construct
+    an :class:`UnresolvedStep` without the cat-file probe context — e.g.
+    tests that exercise the warning formatter directly with a hand-built
+    dataclass.
     """
 
     step_idx: int
