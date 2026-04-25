@@ -408,7 +408,7 @@ async def test_dead_letter_rotation_basic(tmp_path):
         # After rotation dl.jsonl starts fresh with event 3 only (~300 bytes < 500).
         for _ in range(3):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await q._drain_for_test(timeout=2.0)
 
         # (a) Current dead_letter.jsonl must exist and be under 500 bytes.
         assert dl.exists(), 'dead_letter.jsonl must exist'
@@ -448,7 +448,7 @@ async def test_dead_letter_rotation_drops_beyond_keep(tmp_path):
         # Enqueue many events to trigger 3+ rotations.
         for _ in range(15):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # (c) .jsonl.2 may exist (keep_rotations=2 means keep up to .2).
         #     .jsonl.3 must NOT exist (dropped beyond keep_rotations).
@@ -487,7 +487,7 @@ async def test_dead_letter_rotation_zero_keep_discards_file(tmp_path):
         # Enqueue enough events to exceed the 200-byte cap several times over.
         for _ in range(20):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # No archived sibling should exist.
         assert not (tmp_path / 'dead_letter.jsonl.1').exists(), (
@@ -536,7 +536,7 @@ async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
         # Enqueue enough events to trigger at least one _rotate_dead_letter call.
         for _ in range(10):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # Rotation must have fired at least once.  With max_bytes=200 and
         # each dead-letter record being ~300 bytes, the first write fills the
@@ -594,7 +594,7 @@ async def test_rotation_purges_orphan_rotations(tmp_path):
         # Enqueue enough events to trigger at least one rotation.
         for _ in range(5):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # Orphan files beyond keep_rotations must be purged.
         assert not orphan_3.exists(), 'dead_letter.jsonl.3 must be purged after rotation'
