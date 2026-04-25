@@ -1696,3 +1696,39 @@ class TestBuildFallbackConfigConftest:
         assert result.test_command is not None
         assert result.test_command == 'pytest orchestrator/tests'
         assert 'conftest.py' not in result.test_command
+
+    def test_multiple_conftest_dirs_sorted_deterministically(self):
+        """Multiple conftest.py files in distinct dirs → sorted unique parent dirs."""
+        result = _build_fallback_config([
+            'shared/tests/conftest.py',
+            'orchestrator/tests/conftest.py',
+        ])
+        assert result is not None
+        assert result.test_command is not None
+        # sorted: orchestrator/tests before shared/tests
+        assert result.test_command == 'pytest orchestrator/tests shared/tests'
+        assert 'conftest.py' not in result.test_command
+
+    def test_conftest_with_test_file_in_different_directory(self):
+        """Test files outside the conftest directory are included alongside it.
+
+        e.g. ['a/conftest.py', 'b/test_x.py'] → 'pytest a b/test_x.py', so
+        tests in b/ are not silently skipped.
+        """
+        result = _build_fallback_config([
+            'a/tests/conftest.py',
+            'b/tests/test_x.py',
+        ])
+        assert result is not None
+        assert result.test_command is not None
+        assert 'a/tests' in result.test_command
+        assert 'b/tests/test_x.py' in result.test_command
+        assert 'conftest.py' not in result.test_command
+
+    def test_root_conftest_maps_to_dot(self):
+        """A conftest.py at the worktree root uses '.' as target, not the file itself."""
+        result = _build_fallback_config(['conftest.py'])
+        assert result is not None
+        assert result.test_command is not None
+        assert result.test_command == 'pytest .'
+        assert 'conftest.py' not in result.test_command
