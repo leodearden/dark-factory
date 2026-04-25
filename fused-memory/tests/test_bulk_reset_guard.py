@@ -1629,20 +1629,21 @@ def test_server_wires_split_thresholds(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# task-1032: server wires write_failure_backoff_seconds
+# task-1032: guard accepts write_failure_backoff_seconds from config
 # ---------------------------------------------------------------------------
 
-def test_server_wires_write_failure_backoff_seconds(tmp_path):
-    """Validate the construction pattern server/main.py is expected to use
-    after task-1032 — passing
-    write_failure_backoff_seconds=cfg.bulk_reset_guard_write_failure_backoff_seconds —
-    flows the value through to the guard.
+def test_guard_accepts_cfg_write_failure_backoff(tmp_path):
+    """Prove that BulkResetGuard accepts write_failure_backoff_seconds from
+    a ReconciliationConfig instance and stores it as _write_failure_backoff_seconds.
+
+    This is a construction-contract witness: it confirms the config field exists,
+    that BulkResetGuard accepts the kwarg, and that the value flows through to
+    the guard instance attribute.  It mirrors the kwarg pattern that server/main.py
+    uses after task-1032 (see main.py:426-437), but does NOT exercise main.py
+    directly — code review verifies the main.py call site.
 
     Mirrors test_server_wires_split_thresholds (the post-step-20 replacement
     for the fragile inspect.getsource meta-test, see commit da8e5a4c96).
-    Constructs BulkResetGuard with all config-derived kwargs including the new
-    write_failure_backoff_seconds with a bumped value, and asserts the
-    instance attribute matches.  This pins the contract main.py must honor.
     """
     from fused_memory.config.schema import ReconciliationConfig
 
