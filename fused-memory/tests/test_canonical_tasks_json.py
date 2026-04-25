@@ -146,7 +146,10 @@ async def test_submit_task_creates_tasks_json_in_main_not_worktree(tmp_path):
     taskmaster = AsyncMock()
     taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
+    add_task_calls: list[dict] = []
+
     async def fake_add_task(**kwargs):
+        add_task_calls.append(dict(kwargs))
         project_root = kwargs.get('project_root', '')
         tasks_file = Path(project_root) / TASKS_REL_PATH
         tasks_file.parent.mkdir(parents=True, exist_ok=True)
@@ -187,6 +190,13 @@ async def test_submit_task_creates_tasks_json_in_main_not_worktree(tmp_path):
 
         assert resolve_result.get('status') == 'created', (
             f'resolve_ticket did not return created: {resolve_result}'
+        )
+        assert len(add_task_calls) == 1, (
+            f'tm.add_task expected exactly 1 call, got {len(add_task_calls)}: {add_task_calls}'
+        )
+        assert add_task_calls[0].get('project_root') == str(main), (
+            f'tm.add_task received project_root={add_task_calls[0].get("project_root")!r}, '
+            f'expected normalised main path {str(main)!r}'
         )
         assert (Path(main) / TASKS_REL_PATH).exists(), (
             'tasks.json must exist in main checkout after submit_task from worktree'
