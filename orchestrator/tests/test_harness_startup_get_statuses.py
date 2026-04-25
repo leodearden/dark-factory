@@ -39,6 +39,7 @@ def startup_harness(tmp_path: Path) -> Harness:
     config.sandbox.backend = 'auto'
     config.max_concurrent_tasks = 2
     config.fused_memory.project_id = 'test'
+    config.sandbox.backend = 'auto'
 
     # Patch constructors so __init__ doesn't spin up real infrastructure.
     with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \

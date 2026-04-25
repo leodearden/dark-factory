@@ -8,7 +8,9 @@ DTO declared in :mod:`fused_memory.backends.taskmaster_types`.
 
 These tests are the primary tripwire for Taskmaster wire-shape drift.
 Integration-level coverage against a real Taskmaster MCP subprocess
-lives in ``tests/integration/test_taskmaster_mcp_contract.py``.
+lives in ``tests/integration/test_taskmaster_mcp_contract.py`` — that
+suite is skipped automatically until ``taskmaster-ai/dist/mcp-server.js``
+is built; see its module docstring for the bootstrap command.
 """
 
 from __future__ import annotations

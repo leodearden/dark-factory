@@ -23,6 +23,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
+    normalize_title,
 )
 
 # ----------------------------------------------------------------------
@@ -1899,3 +1900,33 @@ class TestIntraBatchKey:
         """(e) both empty — no raise, returns 16-char string."""
         k = TaskCurator._intra_batch_key('', '')
         assert len(k) == 16
+
+
+# ─────────────────────────────────────────────────────────────────────
+# normalize_title module-level helper
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestNormalizeTitle:
+    """Unit tests for the module-level normalize_title helper."""
+
+    def test_normalises_to_expected_output(self):
+        """(a) normalised output is lowercase with collapsed whitespace."""
+        assert normalize_title('Fix the parser') == 'fix the parser'
+
+    def test_case_folding(self):
+        """(b) case difference is normalised away."""
+        assert normalize_title('Fix Bug') == normalize_title('fix bug')
+
+    def test_whitespace_collapse(self):
+        """(c) leading/trailing and internal whitespace collapse."""
+        assert normalize_title('  Fix   bug ') == 'fix bug'
+        assert normalize_title('  Fix   bug ') == normalize_title('fix bug')
+
+    def test_none_input_returns_empty_string(self):
+        """(d) None input → empty string (defensive None handling)."""
+        assert normalize_title(None) == ''  # type: ignore[arg-type]
+
+    def test_empty_input_returns_empty_string(self):
+        """(e) empty string → empty string."""
+        assert normalize_title('') == ''

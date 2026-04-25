@@ -43,6 +43,7 @@ def harness(tmp_path: Path, git_config: GitConfig) -> Harness:
     config.review.enabled = False
     config.sandbox.backend = 'auto'
     config.orphan_l0_reaper_enabled = False
+    config.sandbox.backend = 'auto'
 
     with (
         patch('orchestrator.harness.McpLifecycle'),

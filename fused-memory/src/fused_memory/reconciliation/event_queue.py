@@ -212,6 +212,18 @@ class EventQueue:
                 'EventQueue: dead-lettered %d events on shutdown', len(residue),
             )
 
+    # ── test helper ───────────────────────────────────────────────────
+
+    async def _drain_for_test(self, *, timeout: float = 5.0) -> None:
+        """Wait until the internal queue is fully drained (all task_done calls made).
+
+        This method exists so that rotation/integration tests do not reach into
+        ``self._queue`` directly.  It is NOT part of the public contract of
+        EventQueue — do not call it in production code.  If ``self._queue`` is
+        ever renamed or restructured, only this one line needs to change.
+        """
+        await asyncio.wait_for(self._queue.join(), timeout=timeout)
+
     # ── enqueue (sync, non-blocking) ───────────────────────────────────
 
     def enqueue(self, event: ReconciliationEvent) -> bool:

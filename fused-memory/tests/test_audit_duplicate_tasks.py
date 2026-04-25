@@ -6,6 +6,7 @@ sys.path pollution — mirrors the pattern in test_check_asyncmock_assertion_sty
 from __future__ import annotations
 
 import importlib.util
+import logging
 import types
 from pathlib import Path
 
@@ -45,6 +46,8 @@ compute_dependency_updates = _mod.compute_dependency_updates
 DependencyUpdate = _mod.DependencyUpdate
 apply_changes = _mod.apply_changes
 build_audit_plan = _mod.build_audit_plan
+_extract_tasks = _mod._extract_tasks
+_sort_groups_deterministically = _mod._sort_groups_deterministically
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,62 @@ def _task(
     if dependencies is not None:
         t['dependencies'] = dependencies
     return t
+
+
+# ===========================================================================
+# _sort_groups_deterministically — immutability contract
+# ===========================================================================
+
+class TestSortGroupsDeterministicallyImmutability:
+    """_sort_groups_deterministically must NOT mutate its input."""
+
+    def _make_unsorted_groups(self):
+        """Return two groups with members in non-ascending ID order and
+        groups in non-min-ID order (group_b has a higher min ID than group_a
+        but appears first).
+        """
+        group_a = [_task('1003', 'X'), _task('1001', 'X'), _task('1002', 'X')]
+        group_b = [_task('2002', 'Y'), _task('2001', 'Y')]
+        # Deliberately non-sorted outer order: high-min-ID group first.
+        return [group_b, group_a]
+
+    def test_input_outer_list_not_mutated(self):
+        """After the call, the input outer list is still in its original order."""
+        groups = self._make_unsorted_groups()
+        original_outer_ids = [g[0]['id'] for g in groups]  # ['2002', '1003']
+        _sort_groups_deterministically(groups)
+        assert [g[0]['id'] for g in groups] == original_outer_ids
+
+    def test_input_inner_lists_not_mutated(self):
+        """After the call, each inner list is still in its original (non-sorted) order."""
+        groups = self._make_unsorted_groups()
+        original_inner_orders = [[t['id'] for t in g] for g in groups]
+        _sort_groups_deterministically(groups)
+        assert [[t['id'] for t in g] for g in groups] == original_inner_orders
+
+    def test_returned_value_is_sorted_and_distinct(self):
+        """The returned list is a NEW object, with inner lists that are new objects,
+        members within each group sorted ascending by ID, and groups ordered by min ID.
+        """
+        groups = self._make_unsorted_groups()
+        result = _sort_groups_deterministically(groups)
+
+        # Must be a distinct object from the input.
+        assert result is not groups
+
+        # Each returned inner list must be a new object (not one of the originals).
+        original_inner_ids = [id(g) for g in groups]
+        for rg in result:
+            assert id(rg) not in original_inner_ids
+
+        # Members within each returned group must be ascending by ID.
+        for rg in result:
+            ids = [t['id'] for t in rg]
+            assert ids == sorted(ids), f'Expected ascending IDs, got {ids}'
+
+        # Groups ordered by min ID: group_a (min=1001) before group_b (min=2001).
+        assert result[0][0]['id'] == '1001'
+        assert result[1][0]['id'] == '2001'
 
 
 # ===========================================================================
@@ -380,6 +439,38 @@ class TestFindNearDuplicateGroupsEdgeCases:
         ids_a = sorted(sorted(t['id'] for t in g) for g in result_a)
         ids_b = sorted(sorted(t['id'] for t in g) for g in result_b)
         assert ids_a == ids_b
+
+    def test_non_numeric_ids_do_not_raise_near_duplicate(self):
+        """find_near_duplicate_groups handles non-numeric/dotted IDs without raising.
+
+        Regression guard mirroring test_non_numeric_ids_do_not_raise on the
+        exact-duplicate path: both find_*_duplicate_groups functions delegate
+        to _sort_groups_deterministically, which uses _id_as_int (fallback=0)
+        so dotted subtask IDs like '1.2' do not raise ValueError. If the sort
+        is ever inlined in find_near_duplicate_groups using int() directly, or
+        the near-duplicate path stops calling the helper, dotted-ID inputs
+        would raise — this test catches that regression.
+
+        Locks in:
+        - No exception during near-duplicate sorting.
+        - Two groups returned (each pair of identical titles → ratio 1.0;
+          cross-pair < 0.90 → no merge).
+        - Dotted-ID group sorts before numeric group (both dotted IDs map to
+          fallback=0 via _id_as_int, which is < 1001).
+        """
+        tasks = [
+            _task('1001', 'Numeric task'),
+            _task('1002', 'Numeric task'),
+            _task('1.2', 'Dotted task'),
+            _task('1.3', 'Dotted task'),
+        ]
+        # Must not raise — int('1.2') would raise ValueError.
+        result = find_near_duplicate_groups(tasks, threshold=0.90)
+        assert len(result) == 2
+        dotted_ids = {t['id'] for t in result[0]}
+        numeric_ids = {t['id'] for t in result[1]}
+        assert dotted_ids == {'1.2', '1.3'}
+        assert numeric_ids == {'1001', '1002'}
 
 
 # ===========================================================================
@@ -950,3 +1041,166 @@ class TestBuildAuditPlanPlanShape:
         assert plan['auto_cancel'] == []
         assert plan['needs_human_review'] == []
         assert plan['dependency_updates'] == []
+
+
+# ===========================================================================
+# _extract_tasks: Taskmaster response unwrapping
+# ===========================================================================
+
+
+class TestExtractTasksValidShapes:
+    """Valid input shapes return the task list; no WARNING is emitted."""
+
+    def test_documented_shape_data_tasks(self, caplog):
+        """{'data': {'tasks': [...]}} (documented 2026-04-25 shape) → inner list; no warning."""
+        tasks = [{'id': '1', 'title': 'First'}, {'id': '2', 'title': 'Second'}]
+        raw = {
+            'data': {'tasks': tasks, 'filter': None, 'stats': {}},
+            'version': {},
+            'tag': 'master',
+        }
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_legacy_top_level_tasks(self, caplog):
+        """{'tasks': [...]} (legacy shape without 'data' wrapper) → the list; no warning."""
+        tasks = [{'id': '10', 'title': 'Legacy task'}]
+        raw = {'tasks': tasks}
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_legacy_data_as_list(self, caplog):
+        """{'data': [...]} (data key holds a list directly) → the list; no warning."""
+        tasks = [{'id': '20', 'title': 'Data list task'}]
+        raw = {'data': tasks}
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_bare_list(self, caplog):
+        """A bare list → returns the same list; no warning."""
+        tasks = [{'id': '30', 'title': 'Bare list task'}]
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(tasks)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_documented_shape_empty_tasks(self, caplog):
+        """{'data': {'tasks': []}} (empty database) → [] with NO warning (recognised shape)."""
+        raw = {
+            'data': {'tasks': [], 'filter': None, 'stats': {}},
+            'version': {},
+            'tag': 'master',
+        }
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == []
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+class TestExtractTasksCorruptionShapes:
+    """Non-recognisable but truthy inputs return [] and emit a WARNING with shape hint."""
+
+    @pytest.mark.parametrize('raw', [
+        {'data': {'items': [{'id': '1'}]}},
+        {'unexpected_key': 'some_value'},
+        42,
+        'non_list_string',
+        {'data': None},  # data key present but null
+        {'data': {'tasks': 'not_a_list'}},  # nested-data path, tasks is a string
+        {'data': {'tasks': {'nested': True}}},  # nested-data path, tasks is a dict
+        {'tasks': 'not_a_list'},  # legacy top-level path, tasks is a string
+        {'tasks': {'nested': True}},  # legacy top-level path, tasks is a dict
+    ])
+    def test_returns_empty_list(self, raw):
+        """Result is always [] for corruption shapes."""
+        result = _extract_tasks(raw)
+        assert result == []
+
+    @pytest.mark.parametrize('raw,expected_hint_fragment', [
+        (
+            # dict data with no 'tasks' key — unrecognised inner shape
+            {'data': {'items': [{'id': '1'}]}},
+            "['data']",
+        ),
+        (
+            # no 'data' or 'tasks' key at top level
+            {'unexpected_key': 'some_value'},
+            "['unexpected_key']",
+        ),
+        (
+            # non-dict, non-list truthy value (int)
+            42,
+            'int',
+        ),
+        (
+            # non-dict, non-list truthy value (str)
+            'non_list_string',
+            'str',
+        ),
+        (
+            # data key present but null
+            {'data': None},
+            "['data']",
+        ),
+        (
+            # nested-data path, tasks is a string (not a list)
+            {'data': {'tasks': 'not_a_list'}},
+            "['data']",
+        ),
+        (
+            # nested-data path, tasks is a dict (not a list)
+            {'data': {'tasks': {'nested': True}}},
+            "['data']",
+        ),
+        (
+            # legacy top-level path, tasks is a string (not a list)
+            {'tasks': 'not_a_list'},
+            "['tasks']",
+        ),
+        (
+            # legacy top-level path, tasks is a dict (not a list)
+            {'tasks': {'nested': True}},
+            "['tasks']",
+        ),
+    ])
+    def test_warning_logged_with_shape_hint(self, raw, expected_hint_fragment, caplog):
+        """A WARNING identifying the mismatch and the top-level keys/type is emitted."""
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            _extract_tasks(raw)
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'audit_duplicate_tasks'
+        ]
+        assert len(warnings) >= 1
+        msg = warnings[0].getMessage()
+        assert 'response-shape mismatch' in msg
+        assert expected_hint_fragment in msg
+
+
+@pytest.mark.parametrize('raw', [
+    {},
+    [],
+    None,
+])
+class TestExtractTasksFalsyInputs:
+    """Falsy inputs return [] and must NOT trigger any WARNING."""
+
+    def test_returns_empty_list(self, raw):
+        """[] for any falsy input."""
+        assert _extract_tasks(raw) == []
+
+    def test_no_warning_logged(self, raw, caplog):
+        """No WARNING emitted for falsy inputs (they represent 'nothing returned')."""
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            _extract_tasks(raw)
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'audit_duplicate_tasks'
+        ]
+        assert warnings == []

@@ -40,6 +40,7 @@ def harness(tmp_path: Path, git_config: GitConfig) -> Harness:
     config.orphan_l0_reaper_enabled = True
     config.orphan_l0_timeout_secs = 60.0
     config.orphan_l0_check_interval_secs = 1.0
+    config.sandbox.backend = 'auto'
 
     with (
         patch('orchestrator.harness.McpLifecycle'),

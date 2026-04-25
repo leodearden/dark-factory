@@ -57,5 +57,3 @@ def repo_root() -> Path | None:
 def _clear_orch_config_path(monkeypatch):
     """Remove ORCH_CONFIG_PATH so tests don't inadvertently load the real config."""
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
-
-
