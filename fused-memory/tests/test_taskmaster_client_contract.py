@@ -340,8 +340,8 @@ async def test_get_tasks_returns_flat_dto(client):
     c, session = client
     session.call_tool = AsyncMock(return_value=_success_result({
         'tasks': [
-            {'id': 1, 'title': 'A', 'status': 'pending'},
-            {'id': 2, 'title': 'B', 'status': 'done'},
+            {'id': '1', 'title': 'A', 'status': 'pending'},
+            {'id': '2', 'title': 'B', 'status': 'done'},
         ],
         'filter': 'all',
         'stats': {'total': 2},
@@ -351,11 +351,11 @@ async def test_get_tasks_returns_flat_dto(client):
 
     assert isinstance(dto['tasks'], list)
     assert len(dto['tasks']) == 2
-    # Live JS (taskmaster-ai v0.27.0) returns id as int in get_tasks (same raw
-    # passthrough as get_task — no wrapper coercion on task items).  Keep int
-    # here so static and live suites mirror the same wire shape.
-    assert dto['tasks'][0]['id'] == 1
-    assert dto['tasks'][1]['id'] == 2
+    # Live JS returns id as str in get_tasks (raw passthrough — no wrapper
+    # coercion on task items).  Note: get_task (singular) returns int; this
+    # str vs int asymmetry is a JS-side inconsistency in the live wire format.
+    assert dto['tasks'][0]['id'] == '1'
+    assert dto['tasks'][1]['id'] == '2'
 
 
 # ── get_task ────────────────────────────────────────────────────────

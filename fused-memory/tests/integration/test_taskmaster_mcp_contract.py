@@ -137,10 +137,10 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
         f"expected 'pending' — update this assertion if Taskmaster changes its default"
     )
 
-    # (b2) get_tasks list path: verify that task ids in the list are also int.
-    # Both get_task and get_tasks are raw passthroughs (no wrapper coercion on
-    # task items), so id types must agree.  A type disagreement between the two
-    # endpoints would indicate a JS-side inconsistency worth investigating.
+    # (b2) get_tasks list path: verify that task ids in the list are also str.
+    # Note: get_task (singular) returns id as int, but get_tasks (list) returns id
+    # as str — a JS-side inconsistency in the live Taskmaster wire format.
+    # Both are raw passthroughs (no wrapper coercion on task items).
     tasks_result = await backend.get_tasks(project_root=project_root)
     found = [t for t in tasks_result['tasks'] if str(t['id']) == task_id]
     assert found, (
@@ -148,9 +148,9 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
         f'tasks: {tasks_result["tasks"]!r}'
     )
     list_task = found[0]
-    assert isinstance(list_task['id'], int), (
+    assert isinstance(list_task['id'], str), (
         f"get_tasks task['id'] has unexpected type {type(list_task['id']).__name__!r}; "
-        'expected int — if the wire type changed update the canned mocks '
+        'expected str — if the wire type changed update the canned mocks '
         'in tests/test_taskmaster_client_contract.py (test_get_tasks_returns_flat_dto)'
     )
     assert list_task.get('title') == 'Integration test task'
