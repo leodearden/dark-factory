@@ -140,6 +140,10 @@ class ReconciliationHarness:
 
         # Drain mode: stop starting new cycles, let current ones finish
         self._draining: bool = False
+        # One-shot gate shared by drain() and run_loop()'s drain-status block.
+        # Whichever site fires the 'Harness fully drained' marker first sets this
+        # to True so subsequent drain() calls and main-loop iterations are silent.
+        self._drain_complete_logged: bool = False
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
@@ -225,7 +229,8 @@ class ReconciliationHarness:
         # emission site (harness.py ~line 591) stay semantically coupled.
         # When at least one loop is still running, the main loop emits the marker
         # after all loops finish (existing behaviour, up to the 120-s timeout).
-        if self._no_active_loops():
+        if self._no_active_loops() and not self._drain_complete_logged:
+            self._drain_complete_logged = True
             logger.info('Harness fully drained — safe to restart')
 
     def _no_active_loops(self) -> bool:
