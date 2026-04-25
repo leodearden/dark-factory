@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import submit_and_resolve as _submit_and_resolve
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
@@ -68,53 +69,6 @@ async def interceptor_facade(taskmaster, reconciler, event_buffer, tmp_path):
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await t
-
-
-# ---------------------------------------------------------------------------
-# Module-level test helper: two-phase task creation (submit → resolve → shape)
-# ---------------------------------------------------------------------------
-
-
-async def _submit_and_resolve(
-    interceptor,
-    project_root: str,
-    *,
-    timeout_seconds: float = 30.0,
-    **kwargs,
-) -> dict:
-    """Submit a task ticket and wait for the worker to resolve it.
-
-    Reconstructs the legacy facade result shape from ``result_json`` so that
-    migrated test assertions (``result['id']``, ``result['action']``, etc.)
-    remain verbatim.  Designed as a mechanical drop-in for the removed
-    ``TaskInterceptor.add_task`` facade in test code.
-
-    Args:
-        interceptor: A ``TaskInterceptor`` instance (or compatible).
-        project_root: Absolute path to the project root.
-        timeout_seconds: How long to wait for the worker to resolve the ticket.
-            Defaults to 30 s — generous enough for heavy-concurrency tests on
-            loaded CI without being an indefinite wait.  Pass a smaller value
-            for tests that intentionally exercise timeout paths.
-        **kwargs: Forwarded verbatim to ``submit_task``.
-    """
-    submit_result = await interceptor.submit_task(project_root, **kwargs)
-    if 'error' in submit_result:
-        return submit_result
-    ticket = submit_result['ticket']
-    resolve_result = await interceptor.resolve_ticket(
-        ticket, project_root, timeout_seconds=timeout_seconds,
-    )
-    row = await interceptor._ticket_store.get(ticket)
-    if row is not None and row.get('result_json'):
-        try:
-            return json.loads(row['result_json'])
-        except json.JSONDecodeError as exc:
-            raise AssertionError(
-                f'_submit_and_resolve: malformed result_json for ticket {ticket!r}: '
-                f'{row["result_json"]!r}'
-            ) from exc
-    return resolve_result
 
 
 def test_task_interceptor_has_no_add_task_method():

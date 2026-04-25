@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import submit_and_resolve
 
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -423,14 +424,11 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
             ticket_store=store,
         )
         project_root = str(tmp_path / 'proj_root')
-        submit_result = await interceptor.submit_task(
-            project_root=project_root, title='Under the limit',
+        result = await submit_and_resolve(
+            interceptor, project_root,
+            title='Under the limit',
+            timeout_seconds=5.0,
         )
-        ticket = submit_result['ticket']
-        await interceptor.resolve_ticket(ticket, project_root, timeout_seconds=5.0)
-        row = await store.get(ticket)
-        assert row is not None
-        result = json.loads(row['result_json'])
         assert result == {'id': '2', 'title': 'New'}
         _taskmaster_mock.add_task.assert_called_once()
     finally:
