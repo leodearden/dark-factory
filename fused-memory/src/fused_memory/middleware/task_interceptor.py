@@ -1054,10 +1054,20 @@ class TaskInterceptor:
         # Key: normalised (title, description) hash — case + whitespace
         # insensitive, excluding files_to_modify (often absent).
         # First occurrence wins (matches curate_batch hash_to_first_idx
-        # convention).  Each removal acquires _write_lock independently to
-        # match WP-E discipline (same pattern as post-hoc drop/combine).
+        # convention).
+        #
+        # Two-phase discipline:
+        #   Phase A (outside the lock): hash each task, update seen_keys /
+        #   unique_new_tasks, and collect duplicates into dups_to_remove.
+        #   All work here is pure local-state; no I/O.
+        #   Phase B (inside ONE _write_lock scope): issue all tm.remove_task
+        #   calls with per-item try/except so a transient backend failure on
+        #   one removal does not abort the rest of the batch.  The
+        #   dual-append-on-error fall-through (failing task → both errors and
+        #   unique_new_tasks/kept) is preserved inside the lock.
         seen_keys: dict[str, str] = {}   # key → first-occurrence task_id
         unique_new_tasks: list[dict] = []
+        dups_to_remove: list[tuple] = []  # (tid, title, t, first_id)
         for t in new_task_dicts:
             tid = str(t.get('id', ''))
             title = str(t.get('title', ''))
@@ -1077,27 +1087,34 @@ class TaskInterceptor:
                 seen_keys[key] = tid
                 unique_new_tasks.append(t)
             else:
-                # Duplicate — remove it under the write lock.
                 first_id = seen_keys[key]
-                try:
-                    async with self._write_lock(project_id):
+                dups_to_remove.append((tid, title, t, first_id))
+
+        # Phase B: issue all removals inside a single lock scope to amortise
+        # lock-handoff cost.  Per-item try/except inside the lock preserves
+        # the partial-failure dual-append fall-through: a transient backend
+        # error on one removal does not abort the rest of the batch.
+        if dups_to_remove:
+            async with self._write_lock(project_id):
+                for tid, title, t, first_id in dups_to_remove:
+                    try:
                         await tm.remove_task(tid, project_root)
-                    removed.append({
-                        'task_id': tid,
-                        'title': title,
-                        'reason': 'intra_batch_duplicate',
-                        'matched_task_id': first_id,
-                    })
-                    logger.info(
-                        'bulk_dedup: intra-batch duplicate %s removed (matches %s)',
-                        tid, first_id,
-                    )
-                except Exception as exc:
-                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
-                    # Removal failed transiently — fall through to curator so
-                    # this task still appears in `kept` rather than silently
-                    # disappearing from both `removed` and `kept`.
-                    unique_new_tasks.append(t)
+                        removed.append({
+                            'task_id': tid,
+                            'title': title,
+                            'reason': 'intra_batch_duplicate',
+                            'matched_task_id': first_id,
+                        })
+                        logger.info(
+                            'bulk_dedup: intra-batch duplicate %s removed (matches %s)',
+                            tid, first_id,
+                        )
+                    except Exception as exc:
+                        errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+                        # Removal failed transiently — fall through to curator so
+                        # this task still appears in `kept` rather than silently
+                        # disappearing from both `removed` and `kept`.
+                        unique_new_tasks.append(t)
 
         curator = await self._get_curator()
         if curator is None:
