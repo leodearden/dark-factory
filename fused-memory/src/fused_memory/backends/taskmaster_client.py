@@ -197,11 +197,7 @@ class TaskmasterBackend:
 
     async def close(self) -> None:
         """Shut down client session and server process."""
-        if self._session_ctx:
-            await self._session_ctx.__aexit__(None, None, None)
-        if self._stdio_ctx:
-            await self._stdio_ctx.__aexit__(None, None, None)
-        self._session = None
+        await self._cleanup_contexts()
         logger.info('Taskmaster MCP client disconnected')
 
     def _require_session(self) -> ClientSession:
