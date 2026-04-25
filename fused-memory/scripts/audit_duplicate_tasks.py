@@ -68,21 +68,20 @@ def _id_as_int(task: dict, fallback: int = 0) -> int:
 
 
 def _sort_groups_deterministically(groups: list[list[dict]]) -> list[list[dict]]:
-    """Sort *groups* in place for deterministic output and return them.
+    """Return a new list of groups in deterministic order without mutating *groups*.
 
-    Members within each group are sorted by numeric task ID (using
-    ``_id_as_int`` with ``fallback=0`` so dotted subtask IDs like ``'1.2'``
+    Members within each returned group are sorted by numeric task ID via
+    ``_id_as_int`` (with ``fallback=0`` so dotted subtask IDs like ``'1.2'``
     do not raise ``ValueError``).  The list of groups is then sorted by the
-    minimum ID in each group (``_id_as_int(g[0])`` after the inner sort).
+    minimum ID in each group.
 
     Called by both :func:`find_exact_duplicate_groups` and
     :func:`find_near_duplicate_groups` so the two functions stay in sync
     if the ordering convention ever changes.
     """
-    for g in groups:
-        g.sort(key=lambda t: _id_as_int(t))
-    groups.sort(key=lambda g: _id_as_int(g[0]))
-    return groups
+    sorted_groups = [sorted(g, key=_id_as_int) for g in groups]
+    sorted_groups.sort(key=lambda g: _id_as_int(g[0]))
+    return sorted_groups
 
 
 # ---------------------------------------------------------------------------
