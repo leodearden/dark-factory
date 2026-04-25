@@ -40,8 +40,9 @@ def test_syspath_block_precedes_guarded_imports():
     imports, Python would resolve to the installed-package version and this
     test would fail with a path mismatch.
     """
-    import orchestrator.config
     import shared.config_models
+
+    import orchestrator.config
 
     _src = (Path(__file__).parent.parent / 'src').resolve()
     _shared_src = (Path(__file__).parent.parent.parent / 'shared' / 'src').resolve()
@@ -71,7 +72,7 @@ def test_toplevel_typo_rejected(mock_orch_config):
     ``spec_set`` were removed — this test does not.
     """
     with pytest.raises(AttributeError):
-        setattr(mock_orch_config, 'projcet_root', 'anything')
+        mock_orch_config.projcet_root = 'anything'
 
 
 @pytest.mark.parametrize('attr_path', [
