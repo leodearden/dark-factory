@@ -17,11 +17,13 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    DropGuardResult,
     MergeOutcome,
     MergeRequest,
     MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    UnresolvedStep,
     _check_plan_targets_in_tree,
 )
 
@@ -205,9 +207,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             assert missing == []
         finally:
             if merge_result.merge_worktree:
@@ -240,9 +243,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             assert missing == []
         finally:
             if merge_result.merge_worktree:
@@ -281,9 +285,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             assert missing == []
         finally:
             if merge_result.merge_worktree:
@@ -324,9 +329,10 @@ class TestCheckPlanTargetsInTree:
 
         # pre_drop_sha has retained.py but not dropped.py, and task HEAD
         # has both — so only dropped.py should be flagged as a merge drop.
-        missing = await _check_plan_targets_in_tree(
+        result = await _check_plan_targets_in_tree(
             pre_drop_sha, worktree, git_ops,
         )
+        missing = result.dropped
         assert missing == ['dropped.py']
 
     async def test_real_conflict_resolution_drop_is_flagged(
@@ -398,9 +404,10 @@ class TestCheckPlanTargetsInTree:
 
             # Detector must flag contested.py (on task HEAD, absent from merge)
             # but leave other.py (present on both) alone.
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_sha, worktree, git_ops,
             )
+            missing = result.dropped
             assert missing == ['contested.py']
         finally:
             await _run(
@@ -421,9 +428,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             assert missing == []
         finally:
             if merge_result.merge_worktree:
@@ -449,9 +457,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             assert missing == []
         finally:
             if merge_result.merge_worktree:
@@ -506,9 +515,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             # File is absent from merge tree but was intentionally deleted →
             # must NOT appear in the dropped list.
             assert missing == []
@@ -562,9 +572,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             # kept.py is present, deleted.py is expected_absent, only the
             # true drop remains.
             assert missing == ['never_created.py']
@@ -610,9 +621,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             # pending step → deletion not trusted → file is a real drop
             assert missing == ['would_delete.py']
         finally:
@@ -656,9 +668,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             # done but commit=None → deletion not trusted → file is a real drop
             assert missing == ['would_delete.py']
         finally:
@@ -704,9 +717,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-                missing = await _check_plan_targets_in_tree(
+                result = await _check_plan_targets_in_tree(
                     merge_result.merge_commit, worktree, git_ops,
                 )
+                missing = result.dropped
             # (a) git log fails → file stays as dropped (fail-closed)
             assert missing == ['gone.py']
             # (b) a warning was emitted mentioning the bad commit
@@ -781,9 +795,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             # f.py was intentionally deleted inside the done step's merge commit.
             # It must NOT be reported as a drop.
             assert missing == []
@@ -834,9 +849,10 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
+            missing = result.dropped
             # a.py was legitimately renamed to b.py in the done step.
             # It must NOT be reported as a drop.
             assert missing == []
@@ -1000,9 +1016,10 @@ class TestCheckPlanTargetsInTree:
                 return await original_run(cmd, cwd=cwd, **kwargs)
 
             with patch('orchestrator.merge_queue._run', new=_intercept):
-                missing = await _check_plan_targets_in_tree(
+                result = await _check_plan_targets_in_tree(
                     merge_result.merge_commit, worktree, git_ops,
                 )
+                missing = result.dropped
 
             # phantom.py is absent from the merge tree → correctly reported as dropped
             assert 'phantom.py' in missing
@@ -1091,10 +1108,11 @@ class TestCheckPlanTargetsInTree:
         try:
             # (b) Drop-guard must NOT flag F.py as dropped — sha_del's
             # deletion is still resolvable via the shared ODB
-            missing = await _check_plan_targets_in_tree(
+            result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
                 task_id='orphan-test',
             )
+            missing = result.dropped
             assert missing == [], (
                 f'Expected no drops (orphan sha_del deletion resolved from ODB), '
                 f'got: {missing!r}'
@@ -1233,7 +1251,7 @@ class TestMergeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         async def _fake_drop_check(*_args, **_kwargs):
-            return ['dropped.py']
+            return DropGuardResult(dropped=['dropped.py'])
 
         with patch(
             'orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass(),
