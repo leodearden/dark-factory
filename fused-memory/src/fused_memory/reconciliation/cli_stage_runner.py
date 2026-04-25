@@ -26,7 +26,6 @@ DISALLOW_BUILTIN = ['Bash', 'Edit', 'Write', 'NotebookEdit']
 # Task write tools (disallowed in Stage 1 — memory consolidation only)
 DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__set_task_status',
-    'mcp__fused-memory__add_task',
     'mcp__fused-memory__submit_task',
     'mcp__fused-memory__resolve_ticket',
     'mcp__fused-memory__update_task',
