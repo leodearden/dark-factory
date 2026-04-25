@@ -3858,20 +3858,21 @@ async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
 async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     curator_interceptor, taskmaster,
 ):
-    """Intra-batch pre-pass must acquire _write_lock exactly ONCE for N>1 duplicates.
+    """Intra-batch pre-pass must hold _write_lock continuously across all N removals.
 
     Pins the batched-lock discipline introduced by task-981 item 1: all N
     intra-batch removals are grouped first (outside the lock) and then
     issued inside a single ``async with self._write_lock(project_id):``
     block, rather than serially entering/releasing the lock N times.
 
-    Verification strategy: wrap ``interceptor._write_lock`` with a counter
-    callable that delegates to the original method but increments a counter
-    on each call.  A call count of 1 after driving 4 tasks (3 are dups of
-    the first) proves the batched form.  Under the old per-item form the
-    counter would be 3.
+    Verification strategy (contract pin for lock-hold semantics across the batch):
+    Gate tm.remove_task on paired asyncio.Events and probe the write lock between
+    consecutive calls.  Under the batched form the lock is held continuously so
+    both probes raise TimeoutError; under the old per-item form the lock would
+    be released and re-acquired between items, so the first probe would succeed.
     """
     PROJECT = '/project'
+    PROJECT_ID = resolve_project_id(PROJECT)  # 'project' (resolve strips leading slash)
     post_snapshot = {'tasks': [
         {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
         {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
@@ -3880,27 +3881,72 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     ]}
 
     taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
-    taskmaster.remove_task = AsyncMock(return_value={'success': True})
 
     curator_interceptor._curator = _mock_curator(
         CuratorDecision(action='create', justification='novel')
     )
 
-    # Wrap _write_lock with a counter that delegates to the original bound method.
-    # Setting an instance attribute shadows the class method; the nonlocal counter
-    # increments on each call so we can assert exactly one lock-scope entry per batch.
-    _original_write_lock = curator_interceptor._write_lock
-    _lock_call_count = 0
+    # Gate the first two remove_task calls on paired Events so the test can
+    # observe the lock state between consecutive removals without polling.
+    # The lock is acquired under PROJECT_ID (not PROJECT) — _dedupe_bulk_created
+    # calls resolve_project_id(project_root) before locking.
+    inside_first = asyncio.Event()
+    release_first = asyncio.Event()
+    inside_second = asyncio.Event()
+    release_second = asyncio.Event()
+    _call_count = 0
 
-    def _counting_write_lock(project_id: str):
-        nonlocal _lock_call_count
-        _lock_call_count += 1
-        return _original_write_lock(project_id)
+    async def _gated_remove(tid, _project_root):
+        nonlocal _call_count
+        _call_count += 1
+        if _call_count == 1:
+            inside_first.set()
+            await release_first.wait()
+        elif _call_count == 2:
+            inside_second.set()
+            await release_second.wait()
+        return {'success': True}
 
-    curator_interceptor._write_lock = _counting_write_lock
+    taskmaster.remove_task = AsyncMock(side_effect=_gated_remove)
 
-    result = await curator_interceptor._dedupe_bulk_created(
-        PROJECT, pre_snapshot={'tasks': []},
+    # Schedule the dedupe as a background task so this coroutine can interleave.
+    dedupe_task = asyncio.create_task(
+        curator_interceptor._dedupe_bulk_created(PROJECT, pre_snapshot={'tasks': []})
+    )
+
+    # Wait until we are inside the first removal — the batched lock is held.
+    await inside_first.wait()
+
+    # Probe 1: lock must be held (TimeoutError proves the batched scope is active).
+    # The 0.5 s timeout is only spent in the failure branch (lock unexpectedly free);
+    # the happy path exits the moment the lock attempt blocks — no CI slowdown.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
+        )
+
+    # Advance to the second removal.
+    release_first.set()
+    await inside_second.wait()
+
+    # Probe 2: lock must STILL be held between consecutive removals.
+    # Under the old per-item form the lock would have been released here and
+    # the probe would succeed, distinguishing the two implementations.
+    # Same reasoning for the 0.5 s timeout as Probe 1 above.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
+        )
+
+    # Release the second removal and let the batch complete.
+    release_second.set()
+    result = await dedupe_task
+
+    # Anchor that the gating counter was incremented for every pass-1 removal —
+    # if pass-1 batches differently in the future, the Event barriers would
+    # cover different calls and this assertion would catch the divergence first.
+    assert _call_count == 3, (
+        f'_gated_remove called {_call_count} times; expected 3 (one per intra-batch dup)'
     )
 
     # (a) 3 tasks removed (the 3 intra-batch duplicates of '10').
@@ -3915,23 +3961,19 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
         f'remove_task called with unexpected args: {actual_calls}'
     )
 
-    # (c) _write_lock was acquired exactly ONCE for the entire batch.
-    # Under the old per-item form this would be 3 — one lock entry per duplicate.
+    # (c) Sanity check: the lock is released once the batch exits its scope.
+    assert not curator_interceptor._write_lock(PROJECT_ID).locked(), (
+        'write lock must be released after the batch completes'
+    )
     #
-    # NOTE — intentional structural/contract pin: this assertion pins the
-    # implementation shape (one `async with self._write_lock(project_id):`
-    # wrapping all N removals), not merely observable lock semantics.  A
-    # future refactor that, for example, switched to a cached asynccontextmanager
-    # yielding the same underlying lock object on every call would break this
-    # test even if the external lock-hold semantics were equivalent.  That is
-    # deliberate: the "single scope" structure is the contract — it determines
-    # the blast radius for concurrent writers and must not regress silently.
+    # NOTE — contract pin for lock-hold semantics across the batch: the two
+    # TimeoutError probes above pin the key invariant — the lock is held
+    # continuously across all N removals, not released and re-acquired per item.
+    # A regression to per-item locking would be caught by probe 2 succeeding
+    # instead of raising TimeoutError.
     # See the two-phase discipline comment in _dedupe_bulk_created for the
     # rationale (no LLM calls between removals → safe to batch; pass-2 stays
     # per-item because LLM calls happen between its removals).
-    assert _lock_call_count == 1, (
-        f'_write_lock was called {_lock_call_count} times (expected 1 for batched form)'
-    )
 
 
 @pytest.mark.asyncio
@@ -4011,4 +4053,107 @@ async def test_dedupe_bulk_intra_batch_partial_failure_under_batched_lock_contin
     # removed in pass-1.
     assert curator_interceptor._curator.curate.await_count == 2, (
         f'curate call count wrong: {curator_interceptor._curator.curate.call_args_list}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_intra_batch_partial_failure_curator_drop_routes_to_removed(
+    curator_interceptor, taskmaster,
+):
+    """Partial-failure with curator='drop' must land the failing task in removed, not kept.
+
+    Pins the corrected docstring contract: when tm.remove_task raises during
+    pass-1 for a duplicate, the task falls through to pass-2 (unique_new_tasks).
+    If the curator then returns action='drop', pass-2 re-issues tm.remove_task
+    and the task lands in ``removed`` with reason='curator_drop' — NOT in
+    ``kept``.  The task also appears in ``errors`` (dual-append contract).
+
+    This is the curator='drop' sibling of
+    test_dedupe_bulk_intra_batch_partial_failure_under_batched_lock_continues_remaining
+    (which only exercises curator='create', so the failing task lands in kept).
+    Together the two tests pin both branches of the ``errors ∪ (kept ∪ removed)``
+    contract described in the _dedupe_bulk_created docstring.
+    """
+    PROJECT = '/project'
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
+        {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
+        {'id': '12', 'title': 'fix Foo', 'description': 'BAR '},
+        {'id': '13', 'title': 'Fix  foo', 'description': 'bar'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+
+    # '12' raises on its first removal (pass-1); succeeds on the second call
+    # (pass-2 curator-drop re-removal).  '11' and '13' succeed immediately.
+    _remove_call_count: dict[str, int] = {}
+
+    def _side_effect(tid, _project_root):
+        _remove_call_count[tid] = _remove_call_count.get(tid, 0) + 1
+        if tid == '12' and _remove_call_count[tid] == 1:
+            raise RuntimeError('transient backend failure')
+        return {'success': True}
+
+    taskmaster.remove_task = AsyncMock(side_effect=_side_effect)
+
+    # Per-candidate routing: '12' (title='fix Foo') is dropped onto '10';
+    # '10' (title='Fix foo') is novel and kept.
+    async def _route(candidate, *a, **kw):
+        if candidate.title == 'fix Foo':
+            return CuratorDecision(
+                action='drop', target_id='10',
+                justification='subsumed by intra-batch original',
+            )
+        return CuratorDecision(action='create', justification='novel')
+
+    curator = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    curator.curate = AsyncMock(side_effect=_route)
+    curator_interceptor._curator = curator
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        PROJECT, pre_snapshot={'tasks': []},
+    )
+
+    # (a) remove_task called 4 times: 3 from pass-1 (one per dup, including the
+    # failing '12') + 1 from pass-2's curator-drop re-removal of '12'.
+    assert taskmaster.remove_task.await_count == 4, (
+        f'remove_task call count wrong (expected 4): {taskmaster.remove_task.call_args_list}'
+    )
+
+    # (b) Exactly one error entry, for '12', mentioning the backend failure.
+    assert len(result['errors']) == 1, f"expected 1 error, got: {result['errors']}"
+    assert result['errors'][0]['task_id'] == '12'
+    assert 'transient backend failure' in result['errors'][0]['error']
+
+    # (c) '12' appears in removed with reason='curator_drop' and matched_task_id='10'.
+    # PINS the corrected docstring contract: partial-failure + curator='drop' routes
+    # the task to removed (not to kept, as the old docstring incorrectly claimed).
+    removed_12 = next((r for r in result['removed'] if r['task_id'] == '12'), None)
+    assert removed_12 is not None, f"expected '12' in removed, got: {result['removed']}"
+    assert removed_12['reason'] == 'curator_drop'
+    assert removed_12['matched_task_id'] == '10'
+
+    # (d) '12' does NOT appear in kept (dual-append means errors + removed, not errors + kept).
+    assert all(k['task_id'] != '12' for k in result['kept']), (
+        f"unexpected '12' in kept: {result['kept']}"
+    )
+
+    # (e) '11' and '13' appear in removed with reason='intra_batch_duplicate'.
+    for dup_id in ('11', '13'):
+        dup = next((r for r in result['removed'] if r['task_id'] == dup_id), None)
+        assert dup is not None, f"expected '{dup_id}' in removed, got: {result['removed']}"
+        assert dup['reason'] == 'intra_batch_duplicate'
+        assert dup['matched_task_id'] == '10'
+
+    # curator.curate called twice: pass-2 receives '10' and the fall-through '12'.
+    assert curator.curate.await_count == 2, (
+        f'curate call count wrong: {curator.curate.call_args_list}'
+    )
+    # Pin the routing inputs so a title-key change fails loudly rather than
+    # silently flipping the drop→create routing (CandidateTask has no id field;
+    # call_args_list is the stable way to verify which candidates were routed).
+    curate_call_titles = {c.args[0].title for c in curator.curate.call_args_list}
+    assert curate_call_titles == {'Fix foo', 'fix Foo'}, (
+        f'curator.curate received unexpected candidate titles {curate_call_titles!r}; '
+        f'routing-key mismatch: task 12 must reach curator with title "fix Foo"'
     )

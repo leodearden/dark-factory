@@ -489,16 +489,8 @@ class TaskInterceptor:
             # unguarded.  The guard's _reversal_kind classifier handles its own
             # filtering; the interceptor must not pre-filter by old_status.
             if self._bulk_reset_guard is not None:
-                # Lock-order contract: we are currently holding
-                # ``_write_lock(project_id)`` (a per-project asyncio.Lock).
-                # ``observe_attempt`` will acquire ``BulkResetGuard._lock``
-                # (a guard-internal global asyncio.Lock shared across all
-                # projects).  The established acquisition order is therefore:
-                #   per-project write_lock → BulkResetGuard global lock
-                # — NEVER the reverse.  Any future change to
-                # ``observe_attempt`` MUST NOT itself try to acquire any
-                # per-project lock or it will deadlock under contention with
-                # concurrent writers on the same project.
+                # Lock-order contract: see BulkResetGuard.observe_attempt —
+                # guard-global lock acquired under per-project write_lock, never the reverse.
                 _brg_verdict = await self._bulk_reset_guard.observe_attempt(
                     project_id=project_id,
                     task_id=task_id,
@@ -1038,13 +1030,13 @@ class TaskInterceptor:
 
         **Partial-failure dual-append contract**: when ``tm.remove_task``
         raises during the intra-batch pre-pass for a duplicate, that task
-        is appended to BOTH ``errors`` (with the exception text) AND
-        ``kept`` (via the fall-through that re-adds it to the unique
-        survivor list, which then passes through pass 2 and lands in
-        ``kept``).  This is intentional defence-in-depth: a transient
-        backend failure must not silently lose the task from both lists,
-        so the caller can detect the anomaly via ``errors`` while the
-        task is still present in ``kept``.
+        is appended to ``errors`` (with the exception text) and re-enters
+        pass 2 via the unique-survivor list, so it lands in either ``kept``
+        or ``removed`` depending on the curator decision — never silently
+        lost from all three outputs.  This is intentional defence-in-depth:
+        a transient backend failure must not silently lose the task, so the
+        caller can detect the anomaly via ``errors`` while the task is still
+        present in exactly one of ``kept`` or ``removed``.
         """
         removed: list[dict] = []
         kept: list[dict] = []
@@ -1083,8 +1075,9 @@ class TaskInterceptor:
         #   Phase B (inside ONE _write_lock scope): issue all tm.remove_task
         #   calls with per-item try/except so a transient backend failure on
         #   one removal does not abort the rest of the batch.  The
-        #   dual-append-on-error fall-through (failing task → both errors and
-        #   unique_new_tasks/kept) is preserved inside the lock.
+        #   dual-append-on-error fall-through (failing task → errors AND
+        #   unique_new_tasks, landing in kept or removed per curator) is
+        #   preserved inside the lock.
         #
         #   Why pass-1 batches but pass-2 (curator drop/combine, lines below)
         #   stays per-item: duplicates here are removed by back-to-back
@@ -1151,8 +1144,8 @@ class TaskInterceptor:
                     except Exception as exc:
                         errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
                         # Removal failed transiently — fall through to curator so
-                        # this task still appears in `kept` rather than silently
-                        # disappearing from both `removed` and `kept`.
+                        # this task appears in either `kept` or `removed` depending
+                        # on the curator decision, rather than silently disappearing.
                         unique_new_tasks.append(t)
 
         curator = await self._get_curator()
@@ -1264,10 +1257,13 @@ class TaskInterceptor:
     def _write_lock(self, project_id: str) -> asyncio.Lock:
         """Per-project lock for tasks.json mutations.
 
-        Short-held; covers only the Taskmaster stdio write. Every mutating
-        op (set_task_status, update_task, add_dependency, remove_dependency,
-        the actual tm.add_task/tm.add_subtask/tm.remove_task calls, and the
-        bulk expand/parse_prd pre-snapshot+mutation) takes this lock.
+        Short-held; covers a single Taskmaster stdio write, OR a back-to-back
+        batch of mechanical writes with no LLM/IO between them — see
+        ``_dedupe_bulk_created`` Phase B for the canonical batched usage.
+        Every mutating op (set_task_status, update_task, add_dependency,
+        remove_dependency, the actual tm.add_task/tm.add_subtask/tm.remove_task
+        calls, and the bulk expand/parse_prd pre-snapshot+mutation) takes this
+        lock.
         """
         lock = self._write_locks.get(project_id)
         if lock is None:
