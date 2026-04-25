@@ -158,6 +158,43 @@ async def _check_plan_targets_in_tree(
     # `-m` on `git rev-list --parents -n 1 <sha> | wc -w > 2` and skip
     # done-step commits that are themselves merges.
 
+    # ── Orphaned-commit failure mode (task 1068) ─────────────────────────────
+    #
+    # Background (task 1058 escalations esc-1058-170..173):
+    #   After `git commit --amend`, the pre-amend SHA is orphaned — it is no
+    #   longer reachable from any branch ref — but it remains queryable via the
+    #   shared ODB until the next `git gc` / pack prune runs.  If the plan.json
+    #   records the pre-amend SHA as a done-step commit (because the plan was
+    #   written before the amend happened), `git diff-tree` can still resolve
+    #   the deletion stored in that orphan commit.  This is the HAPPY PATH:
+    #   orphan-but-not-pruned is fine and does not trigger a false positive.
+    #
+    # Latent failure mode:
+    #   If `git diff-tree` returns rc != 0 for a done-step commit for ANY
+    #   reason (ODB lock during pack rewrite, environment anomaly, host
+    #   contention, or the commit has been pruned after `git gc`), the
+    #   silent `continue` below drops that step's expected-absent contribution.
+    #   Any file the step legitimately deleted is then mis-flagged as a real
+    #   drop — the original symptom in task 1058 was
+    #   `orchestrator/tests/test_conftest_helpers.py` being flagged as dropped.
+    #
+    # Rejected alternatives:
+    #   (a) Search-by-commit-message / step-id: fragile — depends on message
+    #       conventions not enforced in the codebase; could match wrong commits
+    #       and would mask real bugs by silently substituting similar commits.
+    #   (b) Rewrite plan-step commit SHAs after amend: iteration-loop concern
+    #       explicitly noted in task 1068 as out of scope for the drop-guard.
+    #
+    # Diagnostic strategy (implemented below):
+    #   When diff-tree fails, run `git cat-file -e <sha>^{commit}` to determine
+    #   whether the object is missing/pruned (rc != 0 → object_missing=True) or
+    #   failed for a different reason (rc == 0 → some other transient error).
+    #   Record the failure as an UnresolvedStep on the returned DropGuardResult
+    #   so the merge worker can surface it in the MergeOutcome.reason and the
+    #   steward can distinguish the two failure modes.  See task 1068 for full
+    #   rationale.
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Pass 1: collect (step_idx, commit) for every qualifying done step.
     steps_to_query: list[tuple[int, str]] = []
     for step_idx, step in enumerate(plan.get('steps') or []):
