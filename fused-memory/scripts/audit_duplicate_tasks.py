@@ -81,7 +81,10 @@ def find_exact_duplicate_groups(tasks: list[dict]) -> list[list[dict]]:
     for task in tasks:
         key = (task.get('title') or '').strip().lower()
         by_title.setdefault(key, []).append(task)
-    return [group for group in by_title.values() if len(group) >= 2]
+    result = [group for group in by_title.values() if len(group) >= 2]
+    for g in result:
+        g.sort(key=lambda t: _id_as_int(t))
+    return result
 
 
 def find_near_duplicate_groups(
