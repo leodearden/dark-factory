@@ -213,6 +213,65 @@ class TestFindExactDuplicateGroupsNoStatusFiltering:
 
 
 # ===========================================================================
+# Deterministic ordering: find_exact_duplicate_groups
+# ===========================================================================
+
+class TestFindExactDuplicateGroupsDeterministicOrdering:
+    """find_exact_duplicate_groups sorts members by ID and groups by min ID."""
+
+    def test_members_within_group_sorted_by_id(self):
+        """Members of the same duplicate group are returned sorted by numeric ID."""
+        # Deliberately insert in non-ascending order: 1003, 1001, 1002
+        tasks = [
+            _task('1003', 'Sync database'),
+            _task('1001', 'Sync database'),
+            _task('1002', 'Sync database'),
+        ]
+        result = find_exact_duplicate_groups(tasks)
+        assert len(result) == 1
+        assert [t['id'] for t in result[0]] == ['1001', '1002', '1003']
+
+    def test_groups_sorted_by_min_id(self):
+        """Groups are returned sorted by the minimum (first) ID within each group."""
+        # Interleave two duplicate pairs: 'Beta' group (min 2001) first in input,
+        # 'Alpha' group (min 1001) second — expected output reverses that order.
+        tasks = [
+            _task('2001', 'Beta task'),
+            _task('2002', 'Beta task'),
+            _task('1001', 'Alpha task'),
+            _task('1002', 'Alpha task'),
+        ]
+        result = find_exact_duplicate_groups(tasks)
+        assert len(result) == 2
+        assert result[0][0]['id'] == '1001'
+        assert result[1][0]['id'] == '2001'
+
+    def test_non_numeric_ids_do_not_raise(self):
+        """Non-numeric/dotted IDs (e.g. '1.2') are handled via _id_as_int fallback=0.
+
+        Regression guard: if int() were used directly instead of _id_as_int, sorting
+        would raise ValueError on dotted subtask IDs. This test locks in:
+        - No exception is raised during sorting.
+        - The dotted-ID group (both members map to fallback=0) sorts before the
+          numeric group (min ID=1001 > 0), consistent with the documented ordering.
+        """
+        tasks = [
+            _task('1001', 'Numeric task'),
+            _task('1002', 'Numeric task'),
+            _task('1.2', 'Dotted task'),
+            _task('1.3', 'Dotted task'),
+        ]
+        # Must not raise (int('1.2') would raise ValueError).
+        result = find_exact_duplicate_groups(tasks)
+        assert len(result) == 2
+        # Dotted-ID group: _id_as_int → 0 for both members, so g[0] min = 0 < 1001.
+        dotted_ids = {t['id'] for t in result[0]}
+        numeric_ids = {t['id'] for t in result[1]}
+        assert dotted_ids == {'1.2', '1.3'}
+        assert numeric_ids == {'1001', '1002'}
+
+
+# ===========================================================================
 # Step-3: find_near_duplicate_groups
 # ===========================================================================
 

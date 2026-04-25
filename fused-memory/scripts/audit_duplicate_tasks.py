@@ -67,6 +67,24 @@ def _id_as_int(task: dict, fallback: int = 0) -> int:
     return int(raw) if raw.isdecimal() else fallback
 
 
+def _sort_groups_deterministically(groups: list[list[dict]]) -> list[list[dict]]:
+    """Sort *groups* in place for deterministic output and return them.
+
+    Members within each group are sorted by numeric task ID (using
+    ``_id_as_int`` with ``fallback=0`` so dotted subtask IDs like ``'1.2'``
+    do not raise ``ValueError``).  The list of groups is then sorted by the
+    minimum ID in each group (``_id_as_int(g[0])`` after the inner sort).
+
+    Called by both :func:`find_exact_duplicate_groups` and
+    :func:`find_near_duplicate_groups` so the two functions stay in sync
+    if the ordering convention ever changes.
+    """
+    for g in groups:
+        g.sort(key=lambda t: _id_as_int(t))
+    groups.sort(key=lambda g: _id_as_int(g[0]))
+    return groups
+
+
 # ---------------------------------------------------------------------------
 # Pure-function core (no I/O — fully testable without a live Taskmaster)
 # ---------------------------------------------------------------------------
@@ -76,12 +94,18 @@ def find_exact_duplicate_groups(tasks: list[dict]) -> list[list[dict]]:
 
     Normalisation: ``(task.get('title') or '').strip().lower()``.
     No status filtering — the caller is responsible for pre-filtering.
+
+    Returns:
+        List of groups (each a list of ≥ 2 tasks) whose normalised titles are
+        identical.  Groups are sorted by the minimum task ID within the group
+        so output is deterministic.
     """
     by_title: dict[str, list[dict]] = {}
     for task in tasks:
         key = (task.get('title') or '').strip().lower()
         by_title.setdefault(key, []).append(task)
-    return [group for group in by_title.values() if len(group) >= 2]
+    result = [group for group in by_title.values() if len(group) >= 2]
+    return _sort_groups_deterministically(result)
 
 
 def find_near_duplicate_groups(
@@ -142,12 +166,7 @@ def find_near_duplicate_groups(
         groups.setdefault(root, []).append(candidates[i])
 
     result = [g for g in groups.values() if len(g) >= 2]
-    # Sort each group and the list of groups for determinism.
-    # Use _id_as_int to handle non-numeric IDs (e.g. subtask '1.2') safely.
-    for g in result:
-        g.sort(key=lambda t: _id_as_int(t))
-    result.sort(key=lambda g: _id_as_int(g[0]))
-    return result
+    return _sort_groups_deterministically(result)
 
 
 def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
