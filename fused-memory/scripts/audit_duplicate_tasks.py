@@ -89,6 +89,52 @@ def _sort_groups_deterministically(groups: list[list[dict]]) -> list[list[dict]]
 # Pure-function core (no I/O — fully testable without a live Taskmaster)
 # ---------------------------------------------------------------------------
 
+def _extract_tasks(raw: Any) -> list[dict]:
+    """Unwrap the Taskmaster get_tasks response and return the task list.
+
+    # Taskmaster response shape (verified 2026-04-25):
+    #   {'data': {'tasks': [...], 'filter': ..., 'stats': ...},
+    #    'version': {...}, 'tag': 'master'}
+    # Unwrap defensively to handle future shape changes.
+
+    Supported shapes (in priority order):
+    - ``{'data': {'tasks': [...], ...}, ...}``  — documented/current shape
+    - ``{'tasks': [...], ...}``                 — legacy top-level shape
+    - ``{'data': [...], ...}``                  — legacy data-as-list shape
+    - ``[...]``                                 — bare list
+
+    For falsy *raw* (``None``, ``{}``, ``[]``) returns ``[]`` silently.
+    For any other non-empty response that cannot be unwrapped to a list, returns
+    ``[]`` and emits a WARNING on the ``'audit_duplicate_tasks'`` logger so the
+    caller can distinguish a genuine "no tasks" result from a shape mismatch.
+    """
+    tasks: list[dict] = []
+    if isinstance(raw, dict):
+        data = raw.get('data') or raw.get('tasks') or raw
+        if isinstance(data, list):
+            tasks = data
+        elif isinstance(data, dict):
+            tasks = data.get('tasks') or []
+    elif isinstance(raw, list):
+        tasks = raw
+
+    # Warn when the response had content but no tasks could be extracted —
+    # silently producing an empty plan would look like "no duplicates found"
+    # when the real issue is an unexpected Taskmaster response shape.
+    if not tasks and raw:
+        shape_hint: Any = (
+            list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
+        )
+        logger.warning(
+            'get_tasks returned a non-empty response but 0 tasks were '
+            'extracted — possible response-shape mismatch.  '
+            'Top-level keys/type: %s',
+            shape_hint,
+        )
+
+    return tasks
+
+
 def find_exact_duplicate_groups(tasks: list[dict]) -> list[list[dict]]:
     """Group tasks by normalised title; return groups with ≥ 2 members.
 
@@ -447,35 +493,8 @@ async def _run(args: argparse.Namespace) -> int:
     await backend.initialize()
     try:
         raw = await backend.get_tasks(args.project_root, args.tag)
-        # Taskmaster response shape (verified 2026-04-25):
-        #   {'data': {'tasks': [...], 'filter': ..., 'stats': ...},
-        #    'version': {...}, 'tag': 'master'}
-        # Unwrap defensively to handle future shape changes.
-        tasks: list[dict] = []
-        if isinstance(raw, dict):
-            data = raw.get('data') or raw.get('tasks') or raw
-            if isinstance(data, list):
-                tasks = data
-            elif isinstance(data, dict):
-                tasks = data.get('tasks') or []
-        elif isinstance(raw, list):
-            tasks = raw
-
+        tasks = _extract_tasks(raw)
         logger.info('Fetched %d task(s) from Taskmaster', len(tasks))
-
-        # Warn when the response had content but no tasks could be extracted —
-        # silently producing an empty plan would look like "no duplicates found"
-        # when the real issue is an unexpected Taskmaster response shape.
-        if not tasks and raw:
-            shape_hint: Any = (
-                list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
-            )
-            logger.warning(
-                'get_tasks returned a non-empty response but 0 tasks were '
-                'extracted — possible response-shape mismatch.  '
-                'Top-level keys/type: %s',
-                shape_hint,
-            )
 
         plan = build_audit_plan(tasks, threshold=args.threshold, min_id=args.min_id)
         print(json.dumps(plan, indent=2, default=str))
