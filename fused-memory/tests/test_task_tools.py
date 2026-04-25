@@ -174,10 +174,18 @@ def test_task_tools_registered_without_interceptor():
     mock_service = AsyncMock()
     server = create_mcp_server(mock_service)  # No task_interceptor
     tool_names = [t.name for t in server._tool_manager.list_tools()]
-    for name in ['get_tasks', 'get_task', 'set_task_status', 'add_task',
+    for name in ['get_tasks', 'get_task', 'set_task_status',
                  'update_task', 'add_subtask', 'remove_task', 'add_dependency',
                  'remove_dependency', 'expand_task', 'parse_prd']:
         assert name in tool_names, f'{name} should be registered'
+
+
+def test_add_task_mcp_tool_not_registered():
+    """The deprecated add_task MCP tool binding must not exist after facade removal."""
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)
+    tool_names = [t.name for t in server._tool_manager.list_tools()]
+    assert 'add_task' not in tool_names, 'add_task MCP tool must be removed'
 
 
 @pytest.mark.asyncio
