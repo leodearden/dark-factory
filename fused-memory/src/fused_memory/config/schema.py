@@ -290,6 +290,15 @@ class ReconciliationConfig(BaseModel):
     bulk_reset_guard_in_progress_to_pending_threshold: int = Field(default=100, ge=1)
     bulk_reset_guard_window_seconds: float = Field(default=60.0, gt=0)
     bulk_reset_guard_escalation_rate_limit_seconds: float = Field(default=900.0, ge=0)
+    bulk_reset_guard_write_failure_backoff_seconds: float = Field(
+        default=60.0,
+        ge=0,
+        description=(
+            'Minimum seconds between escalation-write retries after an OSError '
+            'from mkdir/write_text. Primarily for operators on flaky mounts. '
+            'Zero disables the backoff (retry every trip). Per task 979.'
+        ),
+    )
 
     # Agent settings
     agent_llm_provider: str = Field(default='claude_cli')
