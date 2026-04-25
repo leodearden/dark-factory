@@ -1,13 +1,13 @@
 """Unit tests for sandbox_dispatch.set_backend() input contract.
 
-Tests pin the validation behaviour added in task 1049:
+Pins the validation contract of set_backend():
 - valid Backend Literal values are accepted and round-trip through get_backend()
-- unknown strings raise TypeError
-- non-string inputs raise TypeError
+- unknown-but-correctly-typed strings (e.g. 'docker') raise ValueError
+- non-string inputs (MagicMock, int, None) raise TypeError
 
 A module-scoped autouse fixture saves/restores _preferred around each test so
-these tests are fully isolated without relying on the project-wide
-_reset_sandbox_backend autouse fixture (which is retired in step 4).
+these tests are fully isolated without relying on any project-wide autouse
+fixture.
 """
 from __future__ import annotations
 
@@ -50,17 +50,17 @@ class TestSetBackendAcceptsValidValues:
 
 
 # ---------------------------------------------------------------------------
-# Reject tests — non-Literal inputs must raise TypeError.
-# These tests FAIL before step 3 adds validation.
+# Reject tests — invalid inputs must raise the appropriate exception.
+# Wrong-value-but-correct-type strings raise ValueError; non-strings raise TypeError.
 # ---------------------------------------------------------------------------
 
 class TestSetBackendRejectsInvalidInput:
     def test_rejects_docker_string(self):
-        with pytest.raises(TypeError):
+        with pytest.raises(ValueError):
             sandbox_dispatch.set_backend('docker')  # type: ignore[arg-type]
 
     def test_rejects_empty_string(self):
-        with pytest.raises(TypeError):
+        with pytest.raises(ValueError):
             sandbox_dispatch.set_backend('')  # type: ignore[arg-type]
 
     def test_rejects_magicmock(self):
