@@ -97,8 +97,7 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
     h = startup_harness
     get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
     get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
-    # Both seeded empty so the no-pending RuntimeError path fires.
-    get_tasks_mock.return_value = []
+    # get_statuses seeded empty so the no-pending RuntimeError path fires.
     get_statuses_mock.return_value = ({}, None)
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):

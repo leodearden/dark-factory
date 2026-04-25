@@ -400,16 +400,9 @@ class TestParseToolTextResultWarning:
         warning_text = ' '.join(r.getMessage() for r in warnings)
 
         # (3) The log contains a truncated prefix of the offending text.
-        import re  # local import — matches the existing `import logging as _logging` style
         truncated_prefix = bad_text[:200]
-        # Format-spec-agnostic match: scheduler.py uses %r today, which wraps the
-        # prefix in repr quotes; allow optional surrounding quotes so the
-        # assertion survives a benign edit to %s or f-string formatting and does
-        # not silently misreport on format-string churn unrelated to the
-        # behaviour-under-test (truncation + WARNING emission).
-        pattern = re.compile(r"['\"]?" + re.escape(truncated_prefix) + r"['\"]?")
-        assert pattern.search(warning_text), (
-            f'Expected truncated prefix in log (format-agnostic). Got: {warning_text}'
+        assert truncated_prefix in warning_text, (
+            f'Expected log to contain truncated text prefix. Got: {warning_text}'
         )
 
         # (4) The full original text is NOT present in the log (validates truncation).
