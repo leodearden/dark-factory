@@ -416,6 +416,13 @@ class BulkResetGuard:
         Returns the path on success, or ``None`` when rate-limited / write
         failed (callers produce ``outcome='rejection'`` in that case).
 
+        The I/O try/except blocks catch ``Exception`` (not ``OSError``) on
+        purpose so that any unexpected error (e.g. ValueError from an odd
+        encoding, AttributeError from a stub Path subclass) is converted to a
+        ``'rejection'`` verdict rather than propagating out of
+        ``observe_attempt``.  ``KeyboardInterrupt`` and ``SystemExit`` are NOT
+        caught — ``Exception`` (not ``BaseException``) is used deliberately.
+
         Parameters
         ----------
         other_kind_task_ids:
@@ -477,9 +484,14 @@ class BulkResetGuard:
         esc_dir = _esc_base
         try:
             await asyncio.to_thread(esc_dir.mkdir, parents=True, exist_ok=True)
-        except OSError as exc:
-            logger.error(
-                'bulk_reset_guard: failed to create escalation dir %s: %s', esc_dir, exc,
+        except Exception:
+            # Intentional broad catch: the guard's contract is 'never let
+            # reconciliation fail because escalation I/O failed'.  A non-OSError
+            # (e.g. unexpected encoding, AttributeError from a stub Path subclass)
+            # must NOT propagate out of observe_attempt.  logger.exception preserves
+            # the full traceback so operators can still diagnose the root cause.
+            logger.exception(
+                'bulk_reset_guard: failed to create escalation dir %s', esc_dir,
             )
             await self._record_write_failure(project_id)
             return None
@@ -556,9 +568,10 @@ class BulkResetGuard:
                 len(affected_task_ids),
                 tripped_threshold,
             )
-        except OSError as exc:
-            logger.error(
-                'bulk_reset_guard: failed to write escalation %s: %s', path, exc,
+        except Exception:
+            # Same intentional broad catch as the mkdir block above — see docstring.
+            logger.exception(
+                'bulk_reset_guard: failed to write escalation %s', path,
             )
             await self._record_write_failure(project_id)
             return None
