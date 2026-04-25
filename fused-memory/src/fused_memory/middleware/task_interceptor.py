@@ -35,6 +35,7 @@ from fused_memory.middleware.task_curator import (
     TaskCurator,
     _to_pool_entry,
     flatten_task_tree,
+    normalize_title,
 )
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -936,8 +937,8 @@ class TaskInterceptor:
             return None
 
         target_title = str(target.get('title', '') or '')
-        expected_fp = _normalize_title(target_title)
-        got_fp = _normalize_title(decision.target_fingerprint or '')
+        expected_fp = normalize_title(target_title)
+        got_fp = normalize_title(decision.target_fingerprint or '')
         if not got_fp or expected_fp != got_fp:
             logger.warning(
                 'combine-guard: fingerprint mismatch for target=%s: '
@@ -2942,16 +2943,6 @@ def _extract_task_dict(raw: Any) -> dict | None:
     path is no longer needed.
     """
     return raw if isinstance(raw, dict) else None
-
-
-def _normalize_title(title: str) -> str:
-    """Lowercase + collapse whitespace for forgiving title comparison.
-
-    Used by the combine-guard fingerprint check — the LLM echoes the target's
-    title verbatim, but accepting case/whitespace drift costs us nothing
-    while avoiding false-negative aborts on trivial formatting noise.
-    """
-    return ' '.join(title.strip().lower().split())
 
 
 def _combine_audit_path() -> Path:
