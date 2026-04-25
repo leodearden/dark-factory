@@ -246,6 +246,30 @@ class TestFindExactDuplicateGroupsDeterministicOrdering:
         assert result[0][0]['id'] == '1001'
         assert result[1][0]['id'] == '2001'
 
+    def test_non_numeric_ids_do_not_raise(self):
+        """Non-numeric/dotted IDs (e.g. '1.2') are handled via _id_as_int fallback=0.
+
+        Regression guard: if int() were used directly instead of _id_as_int, sorting
+        would raise ValueError on dotted subtask IDs. This test locks in:
+        - No exception is raised during sorting.
+        - The dotted-ID group (both members map to fallback=0) sorts before the
+          numeric group (min ID=1001 > 0), consistent with the documented ordering.
+        """
+        tasks = [
+            _task('1001', 'Numeric task'),
+            _task('1002', 'Numeric task'),
+            _task('1.2', 'Dotted task'),
+            _task('1.3', 'Dotted task'),
+        ]
+        # Must not raise (int('1.2') would raise ValueError).
+        result = find_exact_duplicate_groups(tasks)
+        assert len(result) == 2
+        # Dotted-ID group: _id_as_int → 0 for both members, so g[0] min = 0 < 1001.
+        dotted_ids = {t['id'] for t in result[0]}
+        numeric_ids = {t['id'] for t in result[1]}
+        assert dotted_ids == {'1.2', '1.3'}
+        assert numeric_ids == {'1001', '1002'}
+
 
 # ===========================================================================
 # Step-3: find_near_duplicate_groups
