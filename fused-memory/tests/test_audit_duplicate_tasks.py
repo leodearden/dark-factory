@@ -6,6 +6,7 @@ sys.path pollution — mirrors the pattern in test_check_asyncmock_assertion_sty
 from __future__ import annotations
 
 import importlib.util
+import logging
 import types
 from pathlib import Path
 
@@ -45,6 +46,7 @@ compute_dependency_updates = _mod.compute_dependency_updates
 DependencyUpdate = _mod.DependencyUpdate
 apply_changes = _mod.apply_changes
 build_audit_plan = _mod.build_audit_plan
+_extract_tasks = _mod._extract_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -950,3 +952,136 @@ class TestBuildAuditPlanPlanShape:
         assert plan['auto_cancel'] == []
         assert plan['needs_human_review'] == []
         assert plan['dependency_updates'] == []
+
+
+# ===========================================================================
+# _extract_tasks: Taskmaster response unwrapping
+# ===========================================================================
+
+
+class TestExtractTasksValidShapes:
+    """Valid input shapes return the task list; no WARNING is emitted."""
+
+    def test_documented_shape_data_tasks(self, caplog):
+        """{'data': {'tasks': [...]}} (documented 2026-04-25 shape) → inner list; no warning."""
+        tasks = [{'id': '1', 'title': 'First'}, {'id': '2', 'title': 'Second'}]
+        raw = {
+            'data': {'tasks': tasks, 'filter': None, 'stats': {}},
+            'version': {},
+            'tag': 'master',
+        }
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_legacy_top_level_tasks(self, caplog):
+        """{'tasks': [...]} (legacy shape without 'data' wrapper) → the list; no warning."""
+        tasks = [{'id': '10', 'title': 'Legacy task'}]
+        raw = {'tasks': tasks}
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_legacy_data_as_list(self, caplog):
+        """{'data': [...]} (data key holds a list directly) → the list; no warning."""
+        tasks = [{'id': '20', 'title': 'Data list task'}]
+        raw = {'data': tasks}
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_bare_list(self, caplog):
+        """A bare list → returns the same list; no warning."""
+        tasks = [{'id': '30', 'title': 'Bare list task'}]
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(tasks)
+        assert result == tasks
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_documented_shape_empty_tasks(self, caplog):
+        """{'data': {'tasks': []}} (empty database) → [] with NO warning (recognised shape)."""
+        raw = {
+            'data': {'tasks': [], 'filter': None, 'stats': {}},
+            'version': {},
+            'tag': 'master',
+        }
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            result = _extract_tasks(raw)
+        assert result == []
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+class TestExtractTasksCorruptionShapes:
+    """Non-recognisable but truthy inputs return [] and emit a WARNING with shape hint."""
+
+    @pytest.mark.parametrize('raw', [
+        {'data': {'items': [{'id': '1'}]}},
+        {'unexpected_key': 'some_value'},
+        42,
+        'non_list_string',
+    ])
+    def test_returns_empty_list(self, raw):
+        """Result is always [] for corruption shapes."""
+        result = _extract_tasks(raw)
+        assert result == []
+
+    @pytest.mark.parametrize('raw,expected_hint_fragment', [
+        (
+            # dict data with no 'tasks' key — unrecognised inner shape
+            {'data': {'items': [{'id': '1'}]}},
+            "['data']",
+        ),
+        (
+            # no 'data' or 'tasks' key at top level
+            {'unexpected_key': 'some_value'},
+            "['unexpected_key']",
+        ),
+        (
+            # non-dict, non-list truthy value (int)
+            42,
+            'int',
+        ),
+        (
+            # non-dict, non-list truthy value (str)
+            'non_list_string',
+            'str',
+        ),
+    ])
+    def test_warning_logged_with_shape_hint(self, raw, expected_hint_fragment, caplog):
+        """A WARNING identifying the mismatch and the top-level keys/type is emitted."""
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            _extract_tasks(raw)
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'audit_duplicate_tasks'
+        ]
+        assert len(warnings) >= 1
+        msg = warnings[0].getMessage()
+        assert 'response-shape mismatch' in msg
+        assert expected_hint_fragment in msg
+
+
+@pytest.mark.parametrize('raw', [
+    {},
+    [],
+    None,
+])
+class TestExtractTasksFalsyInputs:
+    """Falsy inputs return [] and must NOT trigger any WARNING."""
+
+    def test_returns_empty_list(self, raw):
+        """[] for any falsy input."""
+        assert _extract_tasks(raw) == []
+
+    def test_no_warning_logged(self, raw, caplog):
+        """No WARNING emitted for falsy inputs (they represent 'nothing returned')."""
+        with caplog.at_level(logging.WARNING, logger='audit_duplicate_tasks'):
+            _extract_tasks(raw)
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'audit_duplicate_tasks'
+        ]
+        assert warnings == []
