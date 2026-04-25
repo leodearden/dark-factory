@@ -259,6 +259,10 @@ async def _check_plan_targets_in_tree(
         if isinstance(step, dict)
     }
     unresolved: list[UnresolvedStep] = []
+    # Per-step diagnostics for the structured WARNING: tracks every queried done
+    # step (both successful and failed) so the steward sees the full audit trail.
+    # Tuple: (step_idx, commit_short, rc, object_missing)
+    step_diagnostics: list[tuple[int, str, int, bool]] = []
     if steps_to_query:
         unique_commits: list[str] = list(dict.fromkeys(c for _, c in steps_to_query))
         commit_results = await asyncio.gather(*[
@@ -283,6 +287,7 @@ async def _check_plan_targets_in_tree(
         )
         for step_idx, commit in steps_to_query:
             rc, stdout, stderr = commit_to_result[commit]
+            commit_short = commit[:12]
             if rc != 0:
                 logger.warning(
                     'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
@@ -296,15 +301,18 @@ async def _check_plan_targets_in_tree(
                     ['git', 'cat-file', '-e', f'{commit}^{{commit}}'],
                     cwd=git_ops.project_root,
                 )
+                object_missing = (rc_cat != 0)
+                step_diagnostics.append((step_idx, commit_short, rc, object_missing))
                 unresolved.append(UnresolvedStep(
                     step_idx=step_idx,
                     step_id=step_info.get(step_idx, {}).get('id'),
                     commit=commit,
                     rc=rc,
                     stderr=stderr[:500],
-                    object_missing=(rc_cat != 0),
+                    object_missing=object_missing,
                 ))
                 continue
+            step_diagnostics.append((step_idx, commit_short, rc, False))
             for line in stdout.splitlines():
                 path = line.strip()
                 if path:
@@ -314,10 +322,15 @@ async def _check_plan_targets_in_tree(
                         path, step_idx, commit,
                     )
 
-    return DropGuardResult(
-        dropped=[f for f in missing if f not in expected_absent],
-        unresolved_steps=unresolved,
-    )
+    dropped_files = [f for f in missing if f not in expected_absent]
+    if dropped_files:
+        logger.warning(
+            'drop-guard: dropped_plan_targets '
+            'task_id=%s merge_commit_sha=%s dropped_files=%r step_diagnostics=%r',
+            task_id or '<unknown>', merge_commit_sha, dropped_files, step_diagnostics,
+        )
+
+    return DropGuardResult(dropped=dropped_files, unresolved_steps=unresolved)
 
 
 ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
