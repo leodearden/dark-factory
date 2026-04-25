@@ -1718,3 +1718,83 @@ async def test_fresh_project_state_object_identity_persists_across_window_reset(
         'bulk_reset_guard.py) fired, popped the dict entry, and inserted a fresh '
         '_GuardState.  Remove that block to fix this.'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1021 item-2: _record_write_failure must use fresh _now() after I/O
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_record_write_failure_uses_fresh_now_after_io(tmp_path, monkeypatch):
+    """last_write_failure_ts is set to a fresh _now() reading taken AFTER the
+    slow I/O attempt, not the stale 'now' captured at the top of
+    _maybe_write_escalation (step-3 polish test for task-1021, item 2).
+
+    Sequence of _now() calls in the trip path:
+      call #1 (1004.0) → now at top of observe_attempt
+      call #2 (1005.0) → now at top of _maybe_write_escalation
+      call #3 (1099.0) → fresh now inside _record_write_failure (post-fix only)
+
+    Pre-fix: _record_write_failure uses the 'now' parameter (1005.0, stale) →
+      assertion '1005.0 == 1099.0' fails.
+    Post-fix: _record_write_failure calls self._now() itself (1099.0, fresh) →
+      assertion passes.
+
+    The finite iterator raises StopIteration on any unexpected 4th _now() call,
+    surfacing accidental extra calls as a clear test failure.
+    """
+    # Seed phase: 3 ok done→pending reversals with a simple counter clock.
+    clock = [1000.0]
+
+    def seed_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        write_failure_backoff_seconds=60.0,
+        time_provider=seed_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    for i in range(3):
+        clock[0] += 1.0
+        await guard.observe_attempt(
+            project_id='proj-fresh-now',
+            task_id=f's{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+
+    # Trip phase: replace _now with a finite iterator that returns explicit values.
+    # StopIteration on an unexpected 4th call surfaces extra _now() calls as a
+    # clear failure rather than a silent assertion mismatch.
+    trip_values = iter([1004.0, 1005.0, 1099.0])
+    guard._now = lambda: next(trip_values)
+
+    # Monkeypatch write_text to raise OSError (simulates a slow failed write).
+    def failing_write_text(self, data, *args, **kwargs):
+        raise OSError('simulated slow-then-failed write')
+
+    monkeypatch.setattr(Path, 'write_text', failing_write_text)
+
+    verdict = await guard.observe_attempt(
+        project_id='proj-fresh-now',
+        task_id='t-trip',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+
+    assert verdict.outcome == 'rejection', (
+        f'Expected rejection (write failed), got {verdict.outcome!r}'
+    )
+    assert guard._state['proj-fresh-now'].last_write_failure_ts == 1099.0, (
+        f'Expected last_write_failure_ts=1099.0 (fresh _now() after I/O), '
+        f'got {guard._state["proj-fresh-now"].last_write_failure_ts}. '
+        'Stale-now bug: _record_write_failure used the now parameter (1005.0) '
+        'captured at the top of _maybe_write_escalation rather than calling '
+        'self._now() itself after the slow I/O returned.'
+    )
