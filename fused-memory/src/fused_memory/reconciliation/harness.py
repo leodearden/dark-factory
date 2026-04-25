@@ -602,9 +602,11 @@ class ReconciliationHarness:
 
                     # Drain status logging
                     if self._draining:
-                        if self._no_active_loops() and not self._drain_complete_logged:
-                            self._drain_complete_logged = True
-                            logger.info('Harness fully drained — safe to restart')
+                        if self._no_active_loops():
+                            if not self._drain_complete_logged:
+                                self._drain_complete_logged = True
+                                logger.info('Harness fully drained — safe to restart')
+                            # else: silent — drained marker already emitted
                         else:
                             active = sum(
                                 1 for t in self._project_tasks.values() if not t.done()
