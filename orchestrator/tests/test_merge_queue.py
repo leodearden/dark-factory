@@ -726,8 +726,8 @@ class TestCheckPlanTargetsInTree:
             # (b) a warning was emitted mentioning the bad commit
             warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert warning_records, 'Expected at least one WARNING log record'
-            assert any(bad_sha in r.getMessage() for r in warning_records), (
-                f'Expected WARNING mentioning the bad SHA {bad_sha!r}; '
+            assert any(bad_sha[:12] in r.getMessage() for r in warning_records), (
+                f'Expected WARNING mentioning the truncated SHA {bad_sha[:12]!r}; '
                 f'got: {[r.getMessage() for r in warning_records]}'
             )
         finally:
@@ -1575,6 +1575,82 @@ class TestCheckPlanTargetsInTree:
             finally:
                 if merge_result2.merge_worktree:
                     await git_ops.cleanup_merge_worktree(merge_result2.merge_worktree)
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_per_step_diff_tree_failure_log_demoted_to_debug(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """Per-step diff-tree failure message must be at DEBUG, not WARNING.
+
+        After Issue 1 fix, ``logger.warning('git diff-tree --diff-filter=D
+        failed for step ...')`` must be demoted to ``logger.debug(...)``.
+        The structured WARNING (``drop-guard: dropped_plan_targets``) already
+        embeds per-step diagnostics via ``step_diagnostics``, so the per-step
+        record at WARNING is redundant and noisy for operators.
+
+        Assertions:
+          (a) At least one DEBUG record contains the per-step failure substring
+              'git diff-tree --diff-filter=D failed for step'.
+          (b) No WARNING record contains that same per-step substring
+              (only the structured drop-guard WARNING should fire at WARNING+).
+          (c) The structured WARNING message contains ``bad_sha[:12]`` (confirming
+              the truncated SHA is still visible via step_diagnostics).
+        """
+        worktree = (await git_ops.create_worktree('issue1-log-level')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # non-existent object → diff-tree rc != 0
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue1', 'T-issue1', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue1-log-level')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+                result = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                    task_id='t-issue1',
+                )
+
+            per_step_msg = 'git diff-tree --diff-filter=D failed for step'
+
+            # (a) Per-step failure message must appear at DEBUG level
+            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert any(per_step_msg in r.getMessage() for r in debug_records), (
+                f'Expected a DEBUG record containing {per_step_msg!r}; '
+                f'got DEBUG records: {[r.getMessage() for r in debug_records]!r}'
+            )
+
+            # (b) Per-step failure message must NOT appear at WARNING level
+            warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert not any(per_step_msg in r.getMessage() for r in warning_records), (
+                f'Expected per-step message absent from WARNING; '
+                f'found in: {[r.getMessage() for r in warning_records]!r}'
+            )
+
+            # (c) Structured WARNING must carry bad_sha[:12] via step_diagnostics
+            assert any(bad_sha[:12] in r.getMessage() for r in warning_records), (
+                f'Expected structured WARNING to contain {bad_sha[:12]!r}; '
+                f'got WARNING records: {[r.getMessage() for r in warning_records]!r}'
+            )
         finally:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
