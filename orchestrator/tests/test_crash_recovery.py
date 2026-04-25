@@ -27,6 +27,7 @@ def harness(tmp_path: Path, git_config: GitConfig):
     config.git = git_config
     config.project_root = tmp_path
     config.usage_cap.enabled = False
+    config.sandbox.backend = 'auto'
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \

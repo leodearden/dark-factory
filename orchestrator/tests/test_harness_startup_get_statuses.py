@@ -36,6 +36,7 @@ def startup_harness(tmp_path: Path) -> Harness:
     config.project_root = tmp_path
     config.usage_cap.enabled = False
     config.review.enabled = False
+    config.sandbox.backend = 'auto'
     config.max_concurrent_tasks = 2
     config.fused_memory.project_id = 'test'
 

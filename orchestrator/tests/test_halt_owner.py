@@ -41,6 +41,7 @@ def harness(tmp_path: Path, git_config: GitConfig) -> Harness:
     config.project_root = tmp_path
     config.usage_cap.enabled = False
     config.review.enabled = False
+    config.sandbox.backend = 'auto'
     config.orphan_l0_reaper_enabled = False
 
     with (

@@ -26,6 +26,7 @@ def config(tmp_path: Path, git_config: GitConfig):
     config.project_root = tmp_path
     config.usage_cap.enabled = False
     config.review.enabled = False
+    config.sandbox.backend = 'auto'
     return config
 
 
