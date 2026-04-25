@@ -3597,3 +3597,94 @@ class TestHarnessDrainIdleShortCircuit:
             f"Expected NO 'Harness fully drained' log when a project loop is active, "
             f"but got: {[r.message for r in drained_records]}"
         )
+
+    def test_drain_twice_idle_emits_exactly_one_marker(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """drain() called twice on an idle harness must emit 'Harness fully drained' exactly once.
+
+        The second call must hit the 'Harness already draining' early-return path,
+        not re-emit the marker.  This pins the drain()-twice contract against future
+        refactors that might move the marker emission above or outside the early-return.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            harness.drain()
+            harness.drain()  # second call — must hit early return
+
+        drained_records = [
+            r for r in caplog.records if 'Harness fully drained' in r.message
+        ]
+        already_draining_records = [
+            r for r in caplog.records if 'Harness already draining' in r.message
+        ]
+        assert len(drained_records) == 1, (
+            f"Expected exactly 1 'Harness fully drained' record but got "
+            f"{len(drained_records)}: {[r.message for r in drained_records]}"
+        )
+        assert len(already_draining_records) >= 1, (
+            f"Expected at least 1 'Harness already draining' record but got "
+            f"{len(already_draining_records)}: {[r.message for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_main_loop_does_not_emit_drain_progress_after_idle_drain(
+        self, journal, event_buffer, mock_memory_service, caplog, monkeypatch
+    ):
+        """After drain() fires the marker synchronously, run_loop() must stay silent.
+
+        When drain() is called on an idle harness it emits the one-shot marker and
+        sets _drain_complete_logged=True.  Subsequent run_loop() iterations must NOT
+        emit any 'Harness draining:' progress messages — neither the fully-drained
+        marker (gated by the one-shot flag) nor the 'N project loop(s) still running'
+        progress message (gated by the else-branch that only fires while loops are
+        active).
+
+        We patch the module-local _sleep to yield immediately so the loop body runs
+        many iterations within the 0.2 s window, maximising the chance of catching
+        spurious emissions.
+        """
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            await real_sleep(0)
+
+        # Patch the module-local _sleep binding — true module-scoped patch that
+        # does not leak to other asyncio users in the same process.
+        monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Stub side-effect dependencies so the loop body runs without network calls
+        harness._recover_stale_runs = AsyncMock(return_value=None)
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        harness.buffer.get_active_projects = AsyncMock(return_value=[])
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            # Idle path: drain() fires the marker synchronously; _drain_complete_logged=True
+            harness.drain()
+            # Run the main loop; with fast_sleep many iterations execute in 0.2 s.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+        # After an idle drain all subsequent 'Harness draining:' progress messages
+        # must be absent — the gate restructuring ensures the else-branch (which emits
+        # 'N project loop(s) still running') can only fire while loops are active.
+        draining_progress_records = [
+            r for r in caplog.records if 'Harness draining:' in r.message
+        ]
+        assert len(draining_progress_records) == 0, (
+            f"Expected NO 'Harness draining:' progress records after idle drain() "
+            f"but got {len(draining_progress_records)}: "
+            f"{[r.message for r in draining_progress_records]}"
+        )
+        # The marker must have been emitted exactly once (by drain(), not by run_loop())
+        drained_records = [
+            r for r in caplog.records if 'Harness fully drained' in r.message
+        ]
+        assert len(drained_records) == 1, (
+            f"Expected exactly 1 'Harness fully drained' record but got "
+            f"{len(drained_records)}: {[r.message for r in drained_records]}"
+        )

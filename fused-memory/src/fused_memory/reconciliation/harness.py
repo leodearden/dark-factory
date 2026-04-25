@@ -51,6 +51,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Module-local sleep binding — allows tests to patch sleep without touching
+# the global asyncio namespace.
+_sleep = asyncio.sleep
+
 # Peek window size for BacklogIterator's project_root resolution.
 # Large enough that an older event lacking `_project_root` doesn't force a
 # fallback when a later buffered event carries the key (see BacklogIterator.run).
@@ -140,6 +144,10 @@ class ReconciliationHarness:
 
         # Drain mode: stop starting new cycles, let current ones finish
         self._draining: bool = False
+        # One-shot gate shared by drain() and run_loop()'s drain-status block.
+        # Whichever site fires the 'Harness fully drained' marker first sets this
+        # to True so subsequent drain() calls and main-loop iterations are silent.
+        self._drain_complete_logged: bool = False
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
@@ -225,7 +233,8 @@ class ReconciliationHarness:
         # emission site (harness.py ~line 591) stay semantically coupled.
         # When at least one loop is still running, the main loop emits the marker
         # after all loops finish (existing behaviour, up to the 120-s timeout).
-        if self._no_active_loops():
+        if self._no_active_loops() and not self._drain_complete_logged:
+            self._drain_complete_logged = True
             logger.info('Harness fully drained — safe to restart')
 
     def _no_active_loops(self) -> bool:
@@ -474,7 +483,7 @@ class ReconciliationHarness:
 
         self._escalation_task = asyncio.create_task(_serve(), name='recon-escalation-server')
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
-        await asyncio.sleep(0.5)
+        await _sleep(0.5)
 
         # Store escalation URL for _make_stages() and set on existing stages
         escalation_url = f'http://{host}:{port}/mcp'
@@ -598,7 +607,10 @@ class ReconciliationHarness:
                     # Drain status logging
                     if self._draining:
                         if self._no_active_loops():
-                            logger.info('Harness fully drained — safe to restart')
+                            if not self._drain_complete_logged:
+                                self._drain_complete_logged = True
+                                logger.info('Harness fully drained — safe to restart')
+                            # else: silent — drained marker already emitted
                         else:
                             active = sum(
                                 1 for t in self._project_tasks.values() if not t.done()
@@ -619,7 +631,7 @@ class ReconciliationHarness:
 
                 except Exception as e:
                     logger.error(f'Reconciliation loop error: {e}')
-                await asyncio.sleep(5)
+                await _sleep(5)
         finally:
             # Graceful shutdown: cancel all project loops
             for task in self._project_tasks.values():
@@ -643,13 +655,13 @@ class ReconciliationHarness:
                     if idle_ticks > 12:  # ~60s idle → exit, respawn on demand
                         logger.debug(f'Project loop idle exit for {project_id}')
                         return
-                    await asyncio.sleep(5)
+                    await _sleep(5)
                     continue
 
                 idle_ticks = 0
                 acquired = await self.buffer.mark_run_active(project_id)
                 if not acquired:
-                    await asyncio.sleep(5)
+                    await _sleep(5)
                     continue
 
                 # Halt check
@@ -703,12 +715,12 @@ class ReconciliationHarness:
             except Exception as e:
                 logger.error(f'Project loop error for {project_id}: {e}')
 
-            await asyncio.sleep(5)  # Cooldown between cycles
+            await _sleep(5)  # Cooldown between cycles
 
     async def _heartbeat_loop(self, project_id: str) -> None:
         """Keep the reconciliation lock alive while a run is in progress."""
         while True:
-            await asyncio.sleep(60)
+            await _sleep(60)
             try:
                 await self.buffer.heartbeat(project_id)
             except Exception as e:
