@@ -20,6 +20,8 @@ from orchestrator.config import (
     SandboxConfig,
 )
 
+from _orch_helpers import pydantic_spec
+
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
 # code rather than whatever editable install the uv workspace has pinned to
@@ -71,26 +73,23 @@ def _clear_orch_config_path(monkeypatch):
 
 @pytest.fixture
 def mock_orch_config(tmp_path: Path) -> MagicMock:
-    """Return a MagicMock OrchestratorConfig with five standard harness defaults.
+    """Return a MagicMock OrchestratorConfig with the standard harness defaults pre-applied.
 
-    Defaults: git=GitConfig(main_branch='main', branch_prefix='task/',
-    remote='origin', worktree_dir='.worktrees'), project_root=tmp_path,
-    usage_cap.enabled=False, review.enabled=False, sandbox.backend='auto'.
-    Sub-sections (usage_cap, review, sandbox, fused_memory) are pre-created
-    so nested attribute access works without side-effects.
+    Defaults applied:
+      - ``git`` = real ``GitConfig`` with main/task/origin/.worktrees
+      - ``project_root`` = ``tmp_path``
+      - ``usage_cap.enabled`` = False
+      - ``review.enabled`` = False
+      - ``sandbox.backend`` = 'auto'
+      - ``fused_memory`` = pre-created sub-section mock (no default value)
 
-    The top-level mock is spec_set'd against OrchestratorConfig.model_fields
-    so typos on top-level attributes raise AttributeError on both get and set.
+    The top-level mock and each sub-section (usage_cap, review, sandbox,
+    fused_memory) are spec_set'd against their pydantic model's fields so
+    typos raise AttributeError on both get and set.
 
     Apply test-specific overrides directly on the returned object.
     """
-    # spec_set built from model_fields catches top-level attribute typos on
-    # both get and set.  We can't pass spec_set=OrchestratorConfig directly:
-    # Pydantic v2 hides field names from dir(), so MagicMock would see only
-    # BaseModel/BaseSettings methods.  Building a minimal proxy class with the
-    # field names as class attributes makes dir(_ConfigSpec) include them.
-    _ConfigSpec = type('_ConfigSpec', (), {f: None for f in OrchestratorConfig.model_fields})
-    config = MagicMock(spec_set=_ConfigSpec)
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.git = GitConfig(
         main_branch='main',
         branch_prefix='task/',
@@ -98,11 +97,11 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
         worktree_dir='.worktrees',
     )
     config.project_root = tmp_path
-    config.usage_cap = MagicMock(spec=UsageCapConfig)
+    config.usage_cap = MagicMock(spec_set=pydantic_spec(UsageCapConfig))
     config.usage_cap.enabled = False
-    config.review = MagicMock(spec=ReviewConfig)
+    config.review = MagicMock(spec_set=pydantic_spec(ReviewConfig))
     config.review.enabled = False
-    config.sandbox = MagicMock(spec=SandboxConfig)
+    config.sandbox = MagicMock(spec_set=pydantic_spec(SandboxConfig))
     config.sandbox.backend = 'auto'
-    config.fused_memory = MagicMock(spec=FusedMemoryConfig)
+    config.fused_memory = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     return config

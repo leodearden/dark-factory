@@ -11,8 +11,25 @@ import asyncio
 from collections.abc import Sequence
 from unittest.mock import AsyncMock, MagicMock
 
+from pydantic import BaseModel
+
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountState, UsageGate
+
+
+def pydantic_spec(model: type[BaseModel]) -> type:
+    """Return a proxy class exposing ``model``'s fields for ``MagicMock(spec_set=...)``.
+
+    Pydantic v2 hides field names from ``dir()``, so passing a BaseModel subclass
+    directly to ``spec_set=`` would only expose BaseModel/BaseSettings methods.
+    The returned proxy has each field name as a class attribute, so MagicMock
+    sees them and rejects typos on both get and set.
+    """
+    return type(
+        f'_{model.__name__}Spec',
+        (),
+        {f: None for f in model.model_fields},
+    )
 
 
 def build_usage_gate(
