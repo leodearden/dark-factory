@@ -320,18 +320,7 @@ class ReconciliationHarness:
             return FilteredTaskTree()
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
-            # Defensively unwrap {'data': {'tasks': [...]}} wrapper shape that
-            # some Taskmaster MCP calls emit (analogous to _extract_task_dict at
-            # task_interceptor.py:2820, but applied to the list response shape).
-            wrapper_unwrapped = False
-            if (
-                isinstance(tasks_data, dict)
-                and isinstance(tasks_data.get('data'), dict)
-                and 'tasks' in tasks_data['data']
-            ):
-                tasks_data = tasks_data['data']
-                wrapper_unwrapped = True
-            raw_count = len(tasks_data.get('tasks', [])) if isinstance(tasks_data, dict) else 0
+            raw_count = len(tasks_data.get('tasks', []))
             filtered = filter_task_tree(tasks_data)
             logger.info(
                 'reconciliation.task_tree_fetched',
@@ -339,7 +328,6 @@ class ReconciliationHarness:
                     'project_root': project_root,
                     'raw_count': raw_count,
                     'total_count': filtered.total_count,
-                    'wrapper_unwrapped': wrapper_unwrapped,
                 },
             )
             return filtered

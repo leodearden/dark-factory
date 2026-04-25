@@ -8,6 +8,7 @@ import logging
 import os
 import uuid as uuid_mod
 import warnings
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -561,8 +562,11 @@ class TaskInterceptor:
                             'Failed to persist done_provenance for task %s: %s', task_id, e,
                         )
 
-            # 3. Execute status change
-            result = await tm.set_task_status(task_id, status, project_root, tag)
+            # 3. Execute status change. Convert the typed DTO to a plain
+            # dict so callers can tack on the reconciliation key below.
+            result: dict[str, Any] = dict(
+                await tm.set_task_status(task_id, status, project_root, tag)
+            )
 
         # 5. Emit event
         payload: dict[str, Any] = {
@@ -629,9 +633,9 @@ class TaskInterceptor:
                 )
                 pre_snapshot = None
 
-            result = await tm.expand_task(
-                task_id, project_root, num=num, prompt=prompt, force=force, tag=tag
-            )
+            result: dict[str, Any] = dict(await tm.expand_task(
+                task_id, project_root, num=num, prompt=prompt, force=force, tag=tag,
+            ))
             await self._await_commit(project_root, f'expand_task({task_id})')
         event = self._make_event(
             EventType.tasks_bulk_created,
@@ -696,9 +700,9 @@ class TaskInterceptor:
                 logger.warning('bulk_dedup: pre-snapshot failed for parse_prd: %s', pre_exc)
                 pre_snapshot = None
 
-            result = await tm.parse_prd(
-                input_path, project_root, num_tasks=num_tasks, tag=tag
-            )
+            result: dict[str, Any] = dict(await tm.parse_prd(
+                input_path, project_root, num_tasks=num_tasks, tag=tag,
+            ))
             await self._await_commit(project_root, 'parse_prd')
         event = self._make_event(
             EventType.tasks_bulk_created,
@@ -976,13 +980,13 @@ class TaskInterceptor:
         )
 
         try:
-            return await tm.update_task(
+            return dict(await tm.update_task(
                 task_id=decision.target_id,
                 project_root=project_root,
                 prompt=combine_prompt,
                 metadata=combine_metadata,
                 append=False,
-            )
+            ))
         except Exception as exc:
             logger.warning(
                 'task_curator: combine update failed for target=%s: %s',
@@ -993,7 +997,7 @@ class TaskInterceptor:
     async def _dedupe_bulk_created(
         self,
         project_root: str,
-        pre_snapshot: dict,
+        pre_snapshot: Mapping[str, Any],
         parent_task_id: str | None = None,
     ) -> dict:
         """Post-hoc deduplication after a bulk task-creation operation.
@@ -1703,41 +1707,19 @@ class TaskInterceptor:
                 result = await tm.add_task(project_root=project_root, **kwargs)
                 atomic_metadata_written = False
 
-            task_id_str: str = ''
-            if isinstance(result, dict):
-                task_id_str = str(result.get('id', ''))
-
-            if not task_id_str:
-                # tm.add_task returned a non-dict result or a dict without 'id'.
-                # Reserves 'created' for the case where a usable task_id exists;
-                # status='created' with task_id=None is semantically inconsistent
-                # (the `if status == "created" and task_id` gate below silently
-                # skips journal emission, and resolve_ticket callers would get
-                # {status: 'created'} with no task_id — useless).
-                reason = 'tm_add_task_returned_no_id'
-                # If taskmaster returned a non-empty dict but no 'id', the task
-                # may still exist in tasks.json (malformed response).  Persist the
-                # raw result in result_json so an operator / reconciliation sweep
-                # can identify and recover the orphaned task without grepping logs.
-                if isinstance(result, dict) and result:
-                    logger.warning(
-                        '_dispatch_ticket_decision: tm.add_task returned dict with no id '
-                        'for ticket %s; raw result persisted in result_json for '
-                        'recovery: %s',
-                        ticket_id, result,
-                    )
-                    result_dict = result
-                # status stays 'failed' (the initial default).
-            else:
-                # ── Latch success immediately — post-create errors must NOT
-                # downgrade this to 'failed'.  Once tm.add_task returns, the
-                # task exists in tasks.json; marking the ticket 'failed' would
-                # strand the task and cause duplicate-on-retry.
-                task_id = task_id_str
-                status = 'created'
-                result_dict = result if isinstance(result, dict) else {}
-                if curator_degrade_reason is not None:
-                    result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
+            # TaskmasterBackend.add_task is contractually guaranteed to return
+            # an AddTaskResult DTO with a non-empty `id` — anything else raises
+            # TaskmasterError, which propagates out of the try block above.
+            task_id_str = str(result['id'])
+            # ── Latch success immediately — post-create errors must NOT
+            # downgrade this to 'failed'. Once tm.add_task returns, the
+            # task exists in tasks.json; marking the ticket 'failed' would
+            # strand the task and cause duplicate-on-retry.
+            task_id = task_id_str
+            status = 'created'
+            result_dict = dict(result)
+            if curator_degrade_reason is not None:
+                result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
 
             if metadata_json and task_id_str and not atomic_metadata_written:
                 try:
@@ -2445,9 +2427,9 @@ class TaskInterceptor:
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
         async with self._write_lock(project_id):
-            result = await tm.update_task(
+            result: dict[str, Any] = dict(await tm.update_task(
                 task_id=task_id, project_root=project_root, **kwargs,
-            )
+            ))
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -2468,31 +2450,25 @@ class TaskInterceptor:
             if curator is not None:
                 try:
                     refreshed = await tm.get_task(task_id, project_root)
-                    task_data = (
-                        refreshed.get('data') if isinstance(refreshed, dict) else None
+                    candidate = CandidateTask(
+                        title=str(refreshed.get('title', '') or ''),
+                        description=str(refreshed.get('description', '') or ''),
+                        details=str(refreshed.get('details', '') or ''),
+                        files_to_modify=[],
+                        priority=str(refreshed.get('priority', 'medium')),
                     )
-                    if isinstance(task_data, dict):
-                        refreshed = task_data
-                    if isinstance(refreshed, dict):
-                        candidate = CandidateTask(
-                            title=str(refreshed.get('title', '') or ''),
-                            description=str(refreshed.get('description', '') or ''),
-                            details=str(refreshed.get('details', '') or ''),
-                            files_to_modify=[],
-                            priority=str(refreshed.get('priority', 'medium')),
+                    if candidate.title:
+                        project_id = resolve_project_id(project_root)
+                        bg = asyncio.create_task(
+                            curator.reembed_task(
+                                task_id, candidate, project_id,
+                            ),
+                            name=f'curator-reembed-{task_id}',
                         )
-                        if candidate.title:
-                            project_id = resolve_project_id(project_root)
-                            bg = asyncio.create_task(
-                                curator.reembed_task(
-                                    task_id, candidate, project_id,
-                                ),
-                                name=f'curator-reembed-{task_id}',
-                            )
-                            self._background_tasks.add(bg)
-                            bg.add_done_callback(
-                                lambda t: self._background_tasks.discard(t),
-                            )
+                        self._background_tasks.add(bg)
+                        bg.add_done_callback(
+                            lambda t: self._background_tasks.discard(t),
+                        )
                 except Exception:
                     logger.debug(
                         'task_curator: reembed_task on update failed for %s',
@@ -2572,9 +2548,9 @@ class TaskInterceptor:
         # set_task_status / update_task on the same project see a consistent
         # tasks.json view.
         async with self._write_lock(project_id):
-            result = await tm.add_subtask(
+            result = dict(await tm.add_subtask(
                 parent_id=parent_id, project_root=project_root, **kwargs,
-            )
+            ))
         event = self._make_event(
             EventType.task_created,
             project_root,
@@ -2585,17 +2561,17 @@ class TaskInterceptor:
 
         # Record the new subtask in the curator corpus (synchronous cache
         # update + awaited Qdrant upsert — see add_task for the rationale).
-        if curator is not None and candidate is not None and isinstance(result, dict):
-            new_id = str(result.get('id', ''))
-            if new_id:
-                curator.note_created(project_id, candidate, new_id)
-                try:
-                    await curator.record_task(new_id, candidate, project_id)
-                except Exception:
-                    logger.warning(
-                        'add_subtask: curator.record_task awaited path failed for %s',
-                        new_id, exc_info=True,
-                    )
+        # AddSubtaskResult DTO guarantees a non-empty `id` on success.
+        if curator is not None and candidate is not None:
+            new_id = str(result['id'])
+            curator.note_created(project_id, candidate, new_id)
+            try:
+                await curator.record_task(new_id, candidate, project_id)
+            except Exception:
+                logger.warning(
+                    'add_subtask: curator.record_task awaited path failed for %s',
+                    new_id, exc_info=True,
+                )
         return result
 
     async def remove_task(
@@ -2616,7 +2592,7 @@ class TaskInterceptor:
             self._curator_lock(project_id),
             self._write_lock(project_id),
         ):
-            result = await tm.remove_task(task_id, project_root, tag)
+            result = dict(await tm.remove_task(task_id, project_root, tag))
         event = self._make_event(
             EventType.task_deleted,
             project_root,
@@ -2639,9 +2615,9 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
         async with self._write_lock(project_id):
-            result = await tm.add_dependency(
-                task_id, depends_on, project_root, tag
-            )
+            result = dict(await tm.add_dependency(
+                task_id, depends_on, project_root, tag,
+            ))
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -2664,9 +2640,9 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
         async with self._write_lock(project_id):
-            result = await tm.remove_dependency(
-                task_id, depends_on, project_root, tag
-            )
+            result = dict(await tm.remove_dependency(
+                task_id, depends_on, project_root, tag,
+            ))
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -2682,7 +2658,7 @@ class TaskInterceptor:
         self, project_root: str, tag: str | None = None
     ) -> dict:
         tm = await self._ensure_taskmaster()
-        return await tm.get_tasks(project_root, tag)
+        return dict(await tm.get_tasks(project_root, tag))
 
     async def get_statuses(
         self,
@@ -2709,12 +2685,7 @@ class TaskInterceptor:
         """
         tm = await self._ensure_taskmaster()
         raw = await tm.get_tasks(project_root, tag)
-
-        # Resolve envelope: handles {tasks: [...]} and {data: {tasks: [...]}}
-        if isinstance(raw.get('data'), dict) and 'tasks' in raw['data']:
-            task_list = raw['data']['tasks']
-        else:
-            task_list = raw.get('tasks', [])
+        task_list = raw.get('tasks', [])
 
         ids_set: set[str] | None = (
             {str(i) for i in ids} if ids is not None else None
@@ -2762,15 +2733,15 @@ def _extract_status(task_data: dict) -> str:
 
 
 def _extract_metadata_files(task_data: Any) -> list[str]:
-    """Return ``metadata.files`` as a list[str] from a Taskmaster get_task response.
+    """Return ``metadata.files`` as a list[str] from a Taskmaster task dict.
 
-    Handles the two common envelope shapes (bare task dict, or ``{'data': {...}}``
-    wrapper). Silently returns ``[]`` when the field is absent, empty, or
-    malformed — the phantom-done gate only fires when files is a non-empty
-    list of strings, so defensive behaviour here means "do not gate".
+    Silently returns ``[]`` when the field is absent, empty, or malformed —
+    the phantom-done gate only fires when files is a non-empty list of
+    strings, so defensive behaviour here means "do not gate".
     """
-    inner = _extract_task_dict(task_data) or {}
-    metadata = inner.get('metadata')
+    if not isinstance(task_data, dict):
+        return []
+    metadata = task_data.get('metadata')
     if not isinstance(metadata, dict):
         return []
     files = metadata.get('files')
@@ -2963,18 +2934,14 @@ def _done_provenance_error(task_id: str, reason: str) -> dict:
 
 
 def _extract_task_dict(raw: Any) -> dict | None:
-    """Normalise a Taskmaster get_task response to the inner task dict.
+    """Return ``raw`` if it's a dict, else None.
 
-    Taskmaster's MCP responses are sometimes wrapped in ``{'data': {...}}``;
-    callers that care about the task's fields (title, description, status)
-    need the unwrapped shape.
+    Retained as a thin guard for callers that still want defensive
+    None-handling; the TaskmasterBackend adapter now returns a flat task
+    dict from ``get_task``, so the legacy ``{'data': {...}}`` unwrap
+    path is no longer needed.
     """
-    if not isinstance(raw, dict):
-        return None
-    data = raw.get('data')
-    if isinstance(data, dict) and ('title' in data or 'status' in data):
-        return data
-    return raw
+    return raw if isinstance(raw, dict) else None
 
 
 def _normalize_title(title: str) -> str:

@@ -1626,24 +1626,6 @@ async def test_get_statuses_omits_unknown_ids(taskmaster, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_get_statuses_handles_data_envelope(taskmaster, event_buffer):
-    """get_statuses unwraps {data: {tasks: [...]}} envelope like get_task does."""
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'data': {
-            'tasks': [
-                {'id': 10, 'status': 'blocked'},
-                {'id': 11, 'status': 'done'},
-            ]
-        }
-    })
-    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
-
-    result = await interceptor.get_statuses('/project')
-
-    assert result == {'10': 'blocked', '11': 'done'}
-
-
-@pytest.mark.asyncio
 async def test_get_statuses_raises_when_taskmaster_not_configured(event_buffer):
     """TaskInterceptor(None, None, buf) → get_statuses() raises RuntimeError."""
     interceptor = TaskInterceptor(None, None, event_buffer)
@@ -1911,28 +1893,6 @@ async def test_done_gate_reports_partial_missing(
         ['exists.rs', 'missing.rs', 'also_missing.ts']
     )
     taskmaster.set_task_status.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_done_gate_unwraps_data_envelope(
-    taskmaster, reconciler, event_buffer, tmp_path
-):
-    """Gate handles the {'data': {...}} wrapper shape used by some taskmaster responses."""
-    taskmaster.get_task = AsyncMock(
-        return_value={
-            'data': {
-                'id': '7',
-                'status': 'in-progress',
-                'metadata': {'files': ['ghost.py']},
-            }
-        }
-    )
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
-
-    result = await interceptor.set_task_status('7', 'done', str(tmp_path))
-
-    assert result['success'] is False
-    assert result['missing_files'] == ['ghost.py']
 
 
 @pytest.mark.asyncio

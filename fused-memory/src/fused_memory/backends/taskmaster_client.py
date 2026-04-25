@@ -16,9 +16,64 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, TextContent
 
+from fused_memory.backends.taskmaster_types import (
+    AddSubtaskResult,
+    AddTaskResult,
+    DependencyResult,
+    ExpandTaskResult,
+    GetTasksResult,
+    ParsePrdResult,
+    RemoveTaskResult,
+    SetTaskStatusResult,
+    TaskmasterError,
+    UpdateTaskResult,
+    ValidateDependenciesResult,
+)
 from fused_memory.config.schema import TaskmasterConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _unwrap(method_name: str, raw: Any) -> dict:
+    """Validate a Taskmaster wire envelope and return its ``data`` field.
+
+    Raises :class:`TaskmasterError` when the response is a tool-level
+    failure (``createErrorResponse`` emits plain text starting with
+    ``Error:``) or when the envelope is missing the expected ``data``
+    key. Tool-level errors surface with ``code='TASKMASTER_TOOL_ERROR'``;
+    shape problems with ``code='UNEXPECTED_RESPONSE_SHAPE'``.
+    """
+    if not isinstance(raw, dict):
+        raise TaskmasterError(
+            'UNEXPECTED_RESPONSE_SHAPE',
+            f'{method_name}: non-dict response: {raw!r}',
+            raw=raw,
+        )
+    # createErrorResponse path: text-only content, no JSON.
+    text = raw.get('text')
+    if isinstance(text, str) and text.startswith('Error:'):
+        first_line = text.split('\n', 1)[0]
+        message = first_line[len('Error:'):].strip() or 'taskmaster tool error'
+        raise TaskmasterError('TASKMASTER_TOOL_ERROR', message, raw=raw)
+    data = raw.get('data')
+    if not isinstance(data, dict):
+        raise TaskmasterError(
+            'UNEXPECTED_RESPONSE_SHAPE',
+            f"{method_name}: missing 'data' in envelope",
+            raw=raw,
+        )
+    return data
+
+
+def _require_field(method_name: str, data: dict, field: str, raw: Any) -> Any:
+    """Return ``data[field]`` or raise UNEXPECTED_RESPONSE_SHAPE."""
+    if field not in data:
+        raise TaskmasterError(
+            'UNEXPECTED_RESPONSE_SHAPE',
+            f"{method_name}: 'data.{field}' missing",
+            raw=raw,
+        )
+    return data[field]
 
 
 # MCP session maps TimeoutError to an McpError with this HTTP-style code
@@ -243,16 +298,36 @@ class TaskmasterBackend:
 
     async def get_tasks(
         self, project_root: str, tag: str | None = None
-    ) -> dict:
+    ) -> GetTasksResult:
         args = self._base_args(project_root, tag)
-        return await self.call_tool('get_tasks', args)
+        raw = await self.call_tool('get_tasks', args)
+        data = _unwrap('get_tasks', raw)
+        tasks = data.get('tasks', [])
+        if not isinstance(tasks, list):
+            raise TaskmasterError(
+                'UNEXPECTED_RESPONSE_SHAPE',
+                "get_tasks: 'data.tasks' is not a list",
+                raw=raw,
+            )
+        return {'tasks': tasks}
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
+        """Return the task dict directly (Taskmaster puts the task at
+        ``data`` for a single id, not ``data.task``).
+        """
         args = self._base_args(project_root, tag)
         args['id'] = task_id
-        return await self.call_tool('get_task', args)
+        raw = await self.call_tool('get_task', args)
+        data = _unwrap('get_task', raw)
+        if not isinstance(data, dict):
+            raise TaskmasterError(
+                'UNEXPECTED_RESPONSE_SHAPE',
+                f'get_task: data is not a dict: {type(data).__name__}',
+                raw=raw,
+            )
+        return data
 
     async def set_task_status(
         self,
@@ -260,11 +335,16 @@ class TaskmasterBackend:
         status: str,
         project_root: str,
         tag: str | None = None,
-    ) -> dict:
+    ) -> SetTaskStatusResult:
         args = self._base_args(project_root, tag)
         args['id'] = task_id
         args['status'] = status
-        return await self.call_tool('set_task_status', args)
+        raw = await self.call_tool('set_task_status', args)
+        data = _unwrap('set_task_status', raw)
+        return {
+            'message': str(data.get('message', '')),
+            'tasks': data.get('tasks') or [],
+        }
 
     async def add_task(
         self,
@@ -277,7 +357,7 @@ class TaskmasterBackend:
         priority: str | None = None,
         metadata: str | None = None,
         tag: str | None = None,
-    ) -> dict:
+    ) -> AddTaskResult:
         args = self._base_args(project_root, tag)
         if prompt:
             args['prompt'] = prompt
@@ -293,7 +373,13 @@ class TaskmasterBackend:
             args['priority'] = priority
         if metadata:
             args['metadata'] = metadata
-        return await self.call_tool('add_task', args)
+        raw = await self.call_tool('add_task', args)
+        data = _unwrap('add_task', raw)
+        task_id = _require_field('add_task', data, 'taskId', raw)
+        return {
+            'id': str(task_id),
+            'message': str(data.get('message', '')),
+        }
 
     async def update_task(
         self,
@@ -303,7 +389,7 @@ class TaskmasterBackend:
         metadata: str | None = None,
         append: bool = False,
         tag: str | None = None,
-    ) -> dict:
+    ) -> UpdateTaskResult:
         args = self._base_args(project_root, tag)
         args['id'] = task_id
         if prompt:
@@ -312,7 +398,18 @@ class TaskmasterBackend:
             args['metadata'] = metadata
         if append:
             args['append'] = True
-        return await self.call_tool('update_task', args)
+        raw = await self.call_tool('update_task', args)
+        data = _unwrap('update_task', raw)
+        wire_id = data.get('taskId', task_id)
+        updated_task = data.get('updatedTask')
+        if updated_task is not None and not isinstance(updated_task, dict):
+            updated_task = None
+        return {
+            'id': str(wire_id),
+            'message': str(data.get('message', '')),
+            'updated': bool(data.get('updated', False)),
+            'updated_task': updated_task,
+        }
 
     async def add_subtask(
         self,
@@ -322,7 +419,7 @@ class TaskmasterBackend:
         description: str | None = None,
         details: str | None = None,
         tag: str | None = None,
-    ) -> dict:
+    ) -> AddSubtaskResult:
         args = self._base_args(project_root, tag)
         args['id'] = parent_id
         if title:
@@ -331,18 +428,48 @@ class TaskmasterBackend:
             args['description'] = description
         if details:
             args['details'] = details
-        return await self.call_tool('add_subtask', args)
+        raw = await self.call_tool('add_subtask', args)
+        data = _unwrap('add_subtask', raw)
+        subtask = _require_field('add_subtask', data, 'subtask', raw)
+        if not isinstance(subtask, dict):
+            raise TaskmasterError(
+                'UNEXPECTED_RESPONSE_SHAPE',
+                'add_subtask: data.subtask is not a dict',
+                raw=raw,
+            )
+        subtask_id = _require_field('add_subtask', subtask, 'id', raw)
+        return {
+            'id': str(subtask_id),
+            'parent_id': str(parent_id),
+            'message': str(data.get('message', '')),
+            'subtask': subtask,
+        }
 
     async def remove_task(
         self,
         task_id: str,
         project_root: str,
         tag: str | None = None,
-    ) -> dict:
+    ) -> RemoveTaskResult:
         args = self._base_args(project_root, tag)
         args['id'] = task_id
         args['confirm'] = True
-        return await self.call_tool('remove_task', args)
+        raw = await self.call_tool('remove_task', args)
+        data = _unwrap('remove_task', raw)
+        removed = data.get('removedTasks', [])
+        removed_ids: list[str] = []
+        if isinstance(removed, list):
+            for entry in removed:
+                if isinstance(entry, dict) and 'id' in entry:
+                    removed_ids.append(str(entry['id']))
+                else:
+                    removed_ids.append(str(entry))
+        return {
+            'successful': int(data.get('successful', 0) or 0),
+            'failed': int(data.get('failed', 0) or 0),
+            'removed_ids': removed_ids,
+            'message': str(data.get('message', '')),
+        }
 
     async def add_dependency(
         self,
@@ -350,11 +477,17 @@ class TaskmasterBackend:
         depends_on: str,
         project_root: str,
         tag: str | None = None,
-    ) -> dict:
+    ) -> DependencyResult:
         args = self._base_args(project_root, tag)
         args['id'] = task_id
         args['dependsOn'] = depends_on
-        return await self.call_tool('add_dependency', args)
+        raw = await self.call_tool('add_dependency', args)
+        data = _unwrap('add_dependency', raw)
+        return {
+            'id': str(data.get('taskId', task_id)),
+            'dependency_id': str(data.get('dependencyId', depends_on)),
+            'message': str(data.get('message', '')),
+        }
 
     async def remove_dependency(
         self,
@@ -362,17 +495,25 @@ class TaskmasterBackend:
         depends_on: str,
         project_root: str,
         tag: str | None = None,
-    ) -> dict:
+    ) -> DependencyResult:
         args = self._base_args(project_root, tag)
         args['id'] = task_id
         args['dependsOn'] = depends_on
-        return await self.call_tool('remove_dependency', args)
+        raw = await self.call_tool('remove_dependency', args)
+        data = _unwrap('remove_dependency', raw)
+        return {
+            'id': str(data.get('taskId', task_id)),
+            'dependency_id': str(data.get('dependencyId', depends_on)),
+            'message': str(data.get('message', '')),
+        }
 
     async def validate_dependencies(
         self, project_root: str, tag: str | None = None
-    ) -> dict:
+    ) -> ValidateDependenciesResult:
         args = self._base_args(project_root, tag)
-        return await self.call_tool('validate_dependencies', args)
+        raw = await self.call_tool('validate_dependencies', args)
+        data = _unwrap('validate_dependencies', raw)
+        return {'message': str(data.get('message', ''))}
 
     async def expand_task(
         self,
@@ -382,7 +523,7 @@ class TaskmasterBackend:
         prompt: str | None = None,
         force: bool = False,
         tag: str | None = None,
-    ) -> dict:
+    ) -> ExpandTaskResult:
         args = self._base_args(project_root, tag)
         args['id'] = task_id
         if num:
@@ -391,7 +532,16 @@ class TaskmasterBackend:
             args['prompt'] = prompt
         if force:
             args['force'] = True
-        return await self.call_tool('expand_task', args)
+        raw = await self.call_tool('expand_task', args)
+        data = _unwrap('expand_task', raw)
+        task = data.get('task')
+        if not isinstance(task, dict):
+            task = {}
+        return {
+            'task': task,
+            'subtasks_added': int(data.get('subtasksAdded', 0) or 0),
+            'has_existing_subtasks': bool(data.get('hasExistingSubtasks', False)),
+        }
 
     async def parse_prd(
         self,
@@ -399,9 +549,14 @@ class TaskmasterBackend:
         project_root: str,
         num_tasks: str | None = None,
         tag: str | None = None,
-    ) -> dict:
+    ) -> ParsePrdResult:
         args = self._base_args(project_root, tag)
         args['input'] = input_path
         if num_tasks:
             args['numTasks'] = num_tasks
-        return await self.call_tool('parse_prd', args)
+        raw = await self.call_tool('parse_prd', args)
+        data = _unwrap('parse_prd', raw)
+        return {
+            'output_path': str(data.get('outputPath', '')),
+            'message': str(data.get('message', '')),
+        }
