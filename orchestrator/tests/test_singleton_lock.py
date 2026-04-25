@@ -5,29 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig
 from orchestrator.harness import Harness, _acquire_project_lock
-
-
-@pytest.fixture
-def git_config() -> GitConfig:
-    return GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-    )
-
-
-@pytest.fixture
-def config(tmp_path: Path, git_config: GitConfig):
-    config = MagicMock()
-    config.git = git_config
-    config.project_root = tmp_path
-    config.usage_cap.enabled = False
-    config.review.enabled = False
-    config.sandbox.backend = 'auto'
-    return config
 
 
 class TestAcquireProjectLock:
@@ -85,12 +63,12 @@ class TestHarnessSingletonIntegration:
     """Tests that Harness.run() acquires and releases the lock."""
 
     @pytest.mark.asyncio
-    async def test_dirty_tree_check_before_servers(self, config):
+    async def test_dirty_tree_check_before_servers(self, mock_orch_config):
         """Dirty-tree check must run before any server starts."""
         with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
              patch('orchestrator.harness.Scheduler'), \
              patch('orchestrator.harness.BriefingAssembler'):
-            h = Harness(config)
+            h = Harness(mock_orch_config)
 
         h.git_ops = MagicMock()
         h.git_ops.has_dirty_working_tree = AsyncMock(return_value='M dirty_file.py')
@@ -106,14 +84,14 @@ class TestHarnessSingletonIntegration:
         assert h._lock_file is None
 
     @pytest.mark.asyncio
-    async def test_escalation_port_bind_failure_raises(self, config):
+    async def test_escalation_port_bind_failure_raises(self, mock_orch_config):
         """Escalation server bind failure must raise, not silently continue."""
         import asyncio
 
         with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
              patch('orchestrator.harness.Scheduler'), \
              patch('orchestrator.harness.BriefingAssembler'):
-            h = Harness(config)
+            h = Harness(mock_orch_config)
 
         h.git_ops = MagicMock()
         h.git_ops.has_dirty_working_tree = AsyncMock(return_value=None)
