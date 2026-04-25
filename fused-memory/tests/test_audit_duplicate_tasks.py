@@ -440,6 +440,38 @@ class TestFindNearDuplicateGroupsEdgeCases:
         ids_b = sorted(sorted(t['id'] for t in g) for g in result_b)
         assert ids_a == ids_b
 
+    def test_non_numeric_ids_do_not_raise_near_duplicate(self):
+        """find_near_duplicate_groups handles non-numeric/dotted IDs without raising.
+
+        Regression guard mirroring test_non_numeric_ids_do_not_raise on the
+        exact-duplicate path: both find_*_duplicate_groups functions delegate
+        to _sort_groups_deterministically, which uses _id_as_int (fallback=0)
+        so dotted subtask IDs like '1.2' do not raise ValueError. If the sort
+        is ever inlined in find_near_duplicate_groups using int() directly, or
+        the near-duplicate path stops calling the helper, dotted-ID inputs
+        would raise — this test catches that regression.
+
+        Locks in:
+        - No exception during near-duplicate sorting.
+        - Two groups returned (each pair of identical titles → ratio 1.0;
+          cross-pair < 0.90 → no merge).
+        - Dotted-ID group sorts before numeric group (both dotted IDs map to
+          fallback=0 via _id_as_int, which is < 1001).
+        """
+        tasks = [
+            _task('1001', 'Numeric task'),
+            _task('1002', 'Numeric task'),
+            _task('1.2', 'Dotted task'),
+            _task('1.3', 'Dotted task'),
+        ]
+        # Must not raise — int('1.2') would raise ValueError.
+        result = find_near_duplicate_groups(tasks, threshold=0.90)
+        assert len(result) == 2
+        dotted_ids = {t['id'] for t in result[0]}
+        numeric_ids = {t['id'] for t in result[1]}
+        assert dotted_ids == {'1.2', '1.3'}
+        assert numeric_ids == {'1001', '1002'}
+
 
 # ===========================================================================
 # Step-5: pick_survivor
