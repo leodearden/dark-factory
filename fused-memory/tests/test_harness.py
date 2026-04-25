@@ -3669,6 +3669,14 @@ class TestHarnessDrainIdleShortCircuit:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(harness.run_loop(), timeout=0.2)
 
+        # Guard: ensure the loop body actually ran enough iterations to make the
+        # absence-assertions below meaningful.  On a heavily-loaded CI host the 0.2 s
+        # window could expire before any iteration runs, making the absence-assertions
+        # pass vacuously.  This fails loudly with a diagnostic when that happens.
+        assert harness._recover_stale_runs.call_count >= 3, (
+            f"Loop body must run multiple times to make the absence assertion meaningful; "
+            f"only ran {harness._recover_stale_runs.call_count} times"
+        )
         # After an idle drain all subsequent 'Harness draining:' progress messages
         # must be absent — the gate restructuring ensures the else-branch (which emits
         # 'N project loop(s) still running') can only fire while loops are active.
