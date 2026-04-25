@@ -3,12 +3,18 @@
 Two test classes:
 - TestSetBackendAcceptsValidValues: one test per Backend Literal member;
   these pass with the current (permissive) implementation.
-- TestSetBackendRejectsInvalidInput: five tests asserting TypeError for bad
-  inputs; these FAIL before the validator is added in step-2.
+- TestSetBackendRejectsInvalidInput: five tests asserting the correct
+  exception for bad inputs:
+    - TypeError  for wrong-type values (not a str): MagicMock, int, None
+    - ValueError for right-type-but-invalid strings: 'docker', ''
+  This split lets callers distinguish 'caller passed garbage type' from
+  'caller passed a typo string'.
 
 Module-local autouse fixture _restore_backend snapshots and restores
 _preferred around each test so this file is independent of the
-project-wide _reset_sandbox_backend autouse fixture (which step-3 retires).
+project-wide _reset_sandbox_backend autouse fixture (which was retired
+once the validator makes corruption impossible via fail-fast TypeError/
+ValueError rather than silent global poisoning).
 """
 
 from __future__ import annotations
@@ -49,15 +55,19 @@ class TestSetBackendAcceptsValidValues:
 
 
 class TestSetBackendRejectsInvalidInput:
-    """set_backend() must raise TypeError for any non-Literal value."""
+    """set_backend() raises TypeError for wrong-type args, ValueError for bad strings."""
+
+    # --- string inputs (right type, wrong value) → ValueError ---
 
     def test_rejects_unknown_string(self):
-        with pytest.raises(TypeError):
+        with pytest.raises(ValueError):
             sandbox_dispatch.set_backend('docker')  # type: ignore[arg-type]
 
     def test_rejects_empty_string(self):
-        with pytest.raises(TypeError):
+        with pytest.raises(ValueError):
             sandbox_dispatch.set_backend('')  # type: ignore[arg-type]
+
+    # --- non-string inputs (wrong type entirely) → TypeError ---
 
     def test_rejects_magicmock(self):
         with pytest.raises(TypeError):

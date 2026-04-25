@@ -22,11 +22,16 @@ _preferred: Backend = 'auto'
 def set_backend(name: Backend) -> None:
     """Set the preferred sandbox backend. Called once at orchestrator startup.
 
-    Raises TypeError if ``name`` is not one of the Backend Literal values.
+    Raises TypeError if ``name`` is not a ``str``.
+    Raises ValueError if ``name`` is a ``str`` but not in the Backend Literal.
     """
     valid = get_args(Backend)
-    if name not in valid:
+    if not isinstance(name, str):
         raise TypeError(
+            f'set_backend: expected a str, got {type(name).__name__!r}'
+        )
+    if name not in valid:
+        raise ValueError(
             f'set_backend: invalid backend {name!r}; expected one of {valid}'
         )
     global _preferred
