@@ -362,7 +362,7 @@ async def test_get_task_returns_task_dict_directly(client):
     """For a single id, Taskmaster puts the task dict at ``data`` (no wrapper)."""
     c, session = client
     session.call_tool = AsyncMock(return_value=_success_result({
-        'id': '7',
+        'id': 7,
         'title': 'Real task',
         'status': 'in-progress',
         'description': 'desc',
