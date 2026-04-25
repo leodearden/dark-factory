@@ -54,6 +54,44 @@ async def test_submit_and_resolve_proceeds_when_ticket_present_regardless_of_oth
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'non_dict_value',
+    [None, [], 'err', 42],
+    ids=['none', 'list', 'str', 'int'],
+)
+async def test_submit_and_resolve_asserts_when_submit_result_is_non_dict(non_dict_value):
+    """submit_and_resolve must raise AssertionError (not silently return) when submit_task returns a non-dict.
+
+    submit_task is contract-bound to always return a dict; a non-dict indicates a regression in
+    the production code.  The helper is test-only, so a loud AssertionError is preferred over
+    silent pass-through that would mask the underlying bug.
+
+    The error message must:
+    - contain the structural marker 'submit_task returned non-dict' for easy grepping, and
+    - contain repr(submit_result) so the diagnostician can see exactly what was returned.
+
+    Execution must blow up BEFORE any resolve_ticket call.
+    """
+    interceptor = _make_stub_interceptor(
+        submit_result=non_dict_value,  # type: ignore[arg-type]
+        resolve_result={},
+        ticket_store_row=None,
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        await submit_and_resolve(interceptor, '/project', title='T')
+
+    message = str(excinfo.value)
+    assert 'submit_task returned non-dict' in message, (
+        f"structural marker not in error message: {message!r}"
+    )
+    assert repr(non_dict_value) in message, (
+        f"repr of non-dict value {non_dict_value!r} not in error message: {message!r}"
+    )
+    interceptor.resolve_ticket.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_submit_and_resolve_returns_submit_error_when_no_ticket():
     """submit_and_resolve must return the submit-error dict verbatim and NOT call resolve_ticket.
 
