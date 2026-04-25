@@ -3917,6 +3917,18 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
 
     # (c) _write_lock was acquired exactly ONCE for the entire batch.
     # Under the old per-item form this would be 3 — one lock entry per duplicate.
+    #
+    # NOTE — intentional structural/contract pin: this assertion pins the
+    # implementation shape (one `async with self._write_lock(project_id):`
+    # wrapping all N removals), not merely observable lock semantics.  A
+    # future refactor that, for example, switched to a cached asynccontextmanager
+    # yielding the same underlying lock object on every call would break this
+    # test even if the external lock-hold semantics were equivalent.  That is
+    # deliberate: the "single scope" structure is the contract — it determines
+    # the blast radius for concurrent writers and must not regress silently.
+    # See the two-phase discipline comment in _dedupe_bulk_created for the
+    # rationale (no LLM calls between removals → safe to batch; pass-2 stays
+    # per-item because LLM calls happen between its removals).
     assert _lock_call_count == 1, (
         f'_write_lock was called {_lock_call_count} times (expected 1 for batched form)'
     )

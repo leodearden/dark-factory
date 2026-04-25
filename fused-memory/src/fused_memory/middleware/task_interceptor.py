@@ -1085,6 +1085,25 @@ class TaskInterceptor:
         #   one removal does not abort the rest of the batch.  The
         #   dual-append-on-error fall-through (failing task → both errors and
         #   unique_new_tasks/kept) is preserved inside the lock.
+        #
+        #   Why pass-1 batches but pass-2 (curator drop/combine, lines below)
+        #   stays per-item: duplicates here are removed by back-to-back
+        #   tm.remove_task() calls with no LLM round-trips between them.
+        #   Holding the lock across the whole batch prevents partial
+        #   interleaving with concurrent writers on the same project without
+        #   adding latency beyond the cumulative tm.remove_task time.
+        #   Pass-2 MUST remain per-item because curator.curate() is a full
+        #   LLM round-trip that happens between each removal — serialising
+        #   those under the write lock would block all concurrent writers for
+        #   the entire LLM sequence, which is unacceptable.
+        #
+        #   Lock-hold trade-off: the lock is held for the duration of all N
+        #   mechanical remove_task() calls.  This blocks concurrent writers
+        #   on the same project longer than the old per-item form, but
+        #   eliminates N-1 redundant lock-handoff round-trips and prevents
+        #   partial interleaving.  No LLM calls are made under the lock;
+        #   tail-latency risk is bounded solely by tm.remove_task backend
+        #   latency.
         seen_keys: dict[str, str] = {}   # key → first-occurrence task_id
         unique_new_tasks: list[dict] = []
         dups_to_remove: list[tuple] = []  # (tid, title, t, first_id)
@@ -1110,10 +1129,10 @@ class TaskInterceptor:
                 first_id = seen_keys[key]
                 dups_to_remove.append((tid, title, t, first_id))
 
-        # Phase B: issue all removals inside a single lock scope to amortise
-        # lock-handoff cost.  Per-item try/except inside the lock preserves
-        # the partial-failure dual-append fall-through: a transient backend
-        # error on one removal does not abort the rest of the batch.
+        # Phase B: issue all removals inside a single lock scope (see trade-off
+        # discussion in the two-phase comment above).  Per-item try/except
+        # inside the lock preserves the partial-failure dual-append fall-through:
+        # a transient backend error on one removal does not abort the rest.
         if dups_to_remove:
             async with self._write_lock(project_id):
                 for tid, title, t, first_id in dups_to_remove:
