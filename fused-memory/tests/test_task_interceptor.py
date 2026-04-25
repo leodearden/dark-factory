@@ -3920,3 +3920,83 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     assert _lock_call_count == 1, (
         f'_write_lock was called {_lock_call_count} times (expected 1 for batched form)'
     )
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_intra_batch_partial_failure_under_batched_lock_continues_remaining(
+    curator_interceptor, taskmaster,
+):
+    """Partial-failure under the batched lock must not abort the rest of the batch.
+
+    Generalises test_dedupe_bulk_remove_failure_keeps_task_in_both_errors_and_kept
+    (N=1) to the N>1 batched-lock case.  With per-item try/except INSIDE the
+    lock, a transient backend failure on the middle duplicate ('12') must not
+    prevent the other two ('11', '13') from being removed.
+
+    A single try/except wrapping the ENTIRE loop would abort after the first
+    failure — remove_task would only be called twice (for '11' and '12'),
+    and '13' would silently slip through to kept instead of removed.
+    This test catches that tempting-but-wrong refactor by asserting
+    remove_task.await_count == 3 and '13' in result['removed'].
+    """
+    PROJECT = '/project'
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
+        {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
+        {'id': '12', 'title': 'fix Foo', 'description': 'BAR '},
+        {'id': '13', 'title': 'Fix  foo', 'description': 'bar'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+
+    # '12' raises transiently; '11' and '13' succeed.
+    def _side_effect(tid, _project_root):
+        if tid == '12':
+            raise RuntimeError('transient backend failure')
+        return {'success': True}
+
+    taskmaster.remove_task = AsyncMock(side_effect=_side_effect)
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='novel')
+    )
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        PROJECT, pre_snapshot={'tasks': []},
+    )
+
+    # (a) remove_task called for all three duplicates — the failure on '12'
+    # did NOT abort the rest of the batch.  A single try/except wrapping the
+    # whole loop would call it only twice (stop after '12' raises).
+    assert taskmaster.remove_task.await_count == 3, (
+        f'remove_task call count wrong (expected 3): {taskmaster.remove_task.call_args_list}'
+    )
+
+    # (b) Exactly one error entry, for '12', mentioning the backend failure.
+    assert len(result['errors']) == 1, f"expected 1 error, got: {result['errors']}"
+    assert result['errors'][0]['task_id'] == '12'
+    assert 'transient backend failure' in result['errors'][0]['error']
+
+    # (c) '12' appears in kept (dual-append fall-through).
+    assert any(k['task_id'] == '12' for k in result['kept']), (
+        f"expected '12' in kept, got: {result['kept']}"
+    )
+
+    # (d) '12' does NOT appear in removed (removal failed).
+    assert all(r['task_id'] != '12' for r in result['removed']), (
+        f"unexpected '12' in removed: {result['removed']}"
+    )
+
+    # (e) '11' and '13' appear in removed with correct metadata.
+    removed_ids = {r['task_id'] for r in result['removed']}
+    assert removed_ids == {'11', '13'}, f"removed_ids={removed_ids}"
+    for r in result['removed']:
+        assert r['reason'] == 'intra_batch_duplicate'
+        assert r['matched_task_id'] == '10'
+
+    # (f) curator.curate called twice: pass-2 receives '10' and '12' (the
+    # fall-through re-added '12' to unique_new_tasks); '11' and '13' were
+    # removed in pass-1.
+    assert curator_interceptor._curator.curate.await_count == 2, (
+        f'curate call count wrong: {curator_interceptor._curator.curate.call_args_list}'
+    )
