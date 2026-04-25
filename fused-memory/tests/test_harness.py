@@ -2281,11 +2281,19 @@ class TestHarnessFetchFilteredTaskTree:
     ):
         """raw_count>0 AND total_count==0 is an anomaly and must emit INFO.
 
-        When taskmaster returns tasks but filter_task_tree drops all of them
-        (e.g. bare ints that fail the isinstance(task, dict) guard in
-        task_filter.py:191), raw_count>0 while total_count==0.  This signals
-        a filter/unknown-status mismatch that operators should see without
-        enabling DEBUG logging.
+        When taskmaster returns tasks but every top-level entry fails the
+        defensive isinstance(task, dict) guard in filter_task_tree (task_filter.py:191
+        — e.g. bare ints, malformed entries), raw_count>0 while total_count==0.
+        This signals a complete dict-guard drop — an anomaly operators should see
+        without enabling DEBUG logging.
+
+        Scope is intentionally narrow per the task-985 policy: PARTIAL drops
+        (raw_count >> total_count when only some entries are non-dict, or all
+        survivors land in other_count via unknown status) remain at DEBUG by
+        design.  See sibling test
+        test_fetch_filtered_task_tree_distinguishes_fetch_zero_from_filter_zero_in_logs
+        for the contrapositive — the anomaly predicate is False there even though
+        raw_count>0, because total_count>0.
 
         Construction: pass bare ints as task elements so filter drops them all.
         len(tasks_data['tasks'])==3 → raw_count=3; filter skips all ints →

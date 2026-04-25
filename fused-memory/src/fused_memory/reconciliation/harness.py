@@ -306,9 +306,11 @@ class ReconciliationHarness:
             Anomaly branches (taskmaster disabled, empty/non-absolute project_root)
             always log at INFO.  Successful fetches log at DEBUG unless
             ``raw_count > 0 and total_count == 0``, which indicates the filter
-            silently dropped every task (e.g. all tasks have unknown status) and
-            warrants an INFO-level alert.  Healthy-but-empty projects
-            (``raw_count == 0``) are classified as DEBUG (non-anomalous).
+            silently dropped every task (e.g. all task entries are non-dict and
+            skipped by the defensive isinstance guard in filter_task_tree —
+            bare ints, malformed entries) and warrants an INFO-level alert.
+            Healthy-but-empty projects (``raw_count == 0``) are classified as
+            DEBUG (non-anomalous).
         """
         if not self.taskmaster:
             logger.info(
@@ -333,6 +335,17 @@ class ReconciliationHarness:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             raw_count = len(tasks_data.get('tasks', []))
             filtered = filter_task_tree(tasks_data)
+            # Anomaly predicate is intentionally narrow (task-985 policy): only the
+            # full-drop case (every top-level entry skipped by filter_task_tree's
+            # defensive isinstance guard) is escalated to INFO.  Partial drops
+            # (raw_count >> total_count when only some entries are skipped) remain at
+            # DEBUG by design — the structured fields raw_count/total_count carry the
+            # differentiating signal, and operators can grep DEBUG when investigating.
+            # Broadening to a `raw_count > N * total_count` heuristic was considered and
+            # rejected because total_count is post-flatten (includes subtasks) while
+            # raw_count is the top-level pre-flatten count, making any threshold
+            # semantically muddy without exposing a new skipped_count field from
+            # filter_task_tree.
             is_anomaly = raw_count > 0 and filtered.total_count == 0
             logger.log(
                 logging.INFO if is_anomaly else logging.DEBUG,
