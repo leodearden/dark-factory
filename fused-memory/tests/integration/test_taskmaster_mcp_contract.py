@@ -106,7 +106,11 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
 
     # (b) get_task returns the task with matching id/title and a known start-state
     task = await backend.get_task(task_id, project_root=project_root)
-    assert task['id'] == task_id
+    # `add_task` (the wrapper) forces str(taskId) at taskmaster_client.py:380 so
+    # task_id is always a str.  `get_task` is a raw passthrough — the JS payload
+    # may return the id as int.  Cast LHS so the round-trip assertion doesn't
+    # spuriously fail on a type mismatch when the wire path is healthy.
+    assert str(task['id']) == task_id
     assert task.get('title') == 'Integration test task'
     assert task.get('status') == 'pending', (
         f"Unexpected initial status {task.get('status')!r}; "
