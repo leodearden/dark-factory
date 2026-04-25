@@ -146,6 +146,20 @@ async def submit_and_resolve(
     remain verbatim.  Designed as a mechanical drop-in for the removed
     ``TaskInterceptor.add_task`` facade in test code.
 
+    Returns:
+        The parsed ``result_json`` dict on success (keys: ``id``, ``title``,
+        ``action``, etc. — the legacy add_task shape).
+        When ``submit_task`` rejects the request (e.g. backlog gate, closed
+        server), returns the submit-error dict directly so callers can assert
+        on ``result.get('error')`` / ``result.get('error_type')``.
+
+    Raises:
+        AssertionError: When the ticket resolved but the worker never wrote a
+            ``result_json`` (row is None or result_json is empty).  The message
+            names the ticket id and dumps ``resolve_result`` so the failure is
+            diagnosable without digging through logs.
+        AssertionError: When ``result_json`` exists but is not valid JSON.
+
     Args:
         interceptor: A ``TaskInterceptor`` instance (or compatible).
         project_root: Absolute path to the project root.
@@ -156,7 +170,7 @@ async def submit_and_resolve(
         **kwargs: Forwarded verbatim to ``submit_task``.
     """
     submit_result = await interceptor.submit_task(project_root, **kwargs)
-    if 'error' in submit_result:
+    if not isinstance(submit_result, dict) or 'ticket' not in submit_result:
         return submit_result
     ticket = submit_result['ticket']
     resolve_result = await interceptor.resolve_ticket(
@@ -175,4 +189,7 @@ async def submit_and_resolve(
                 f'submit_and_resolve: malformed result_json for ticket {ticket!r}: '
                 f'{row["result_json"]!r}'
             ) from exc
-    return resolve_result
+    raise AssertionError(
+        f'submit_and_resolve: ticket {ticket!r} resolved with no result_json '
+        f'(resolve_result={resolve_result!r})'
+    )
