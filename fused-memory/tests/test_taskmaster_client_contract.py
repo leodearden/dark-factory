@@ -340,8 +340,8 @@ async def test_get_tasks_returns_flat_dto(client):
     c, session = client
     session.call_tool = AsyncMock(return_value=_success_result({
         'tasks': [
-            {'id': '1', 'title': 'A', 'status': 'pending'},
-            {'id': '2', 'title': 'B', 'status': 'done'},
+            {'id': 1, 'title': 'A', 'status': 'pending'},
+            {'id': 2, 'title': 'B', 'status': 'done'},
         ],
         'filter': 'all',
         'stats': {'total': 2},
@@ -351,7 +351,10 @@ async def test_get_tasks_returns_flat_dto(client):
 
     assert isinstance(dto['tasks'], list)
     assert len(dto['tasks']) == 2
-    assert dto['tasks'][0]['id'] == '1'
+    # Live JS (taskmaster-ai v0.27.0) returns id as int in get_tasks (same raw
+    # passthrough as get_task — no wrapper coercion on task items).  Keep int
+    # here so static and live suites mirror the same wire shape.
+    assert dto['tasks'][0]['id'] == 1
 
 
 # ── get_task ────────────────────────────────────────────────────────
@@ -362,7 +365,7 @@ async def test_get_task_returns_task_dict_directly(client):
     """For a single id, Taskmaster puts the task dict at ``data`` (no wrapper)."""
     c, session = client
     session.call_tool = AsyncMock(return_value=_success_result({
-        'id': '7',
+        'id': 7,
         'title': 'Real task',
         'status': 'in-progress',
         'description': 'desc',
@@ -373,7 +376,7 @@ async def test_get_task_returns_task_dict_directly(client):
 
     dto = await c.get_task('7', project_root='/project')
 
-    assert dto['id'] == '7'
+    assert dto['id'] == 7
     assert dto['title'] == 'Real task'
     assert dto['status'] == 'in-progress'
 

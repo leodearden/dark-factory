@@ -98,15 +98,18 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     backend, project_root = taskmaster_backend
 
     # (a) add_task returns a non-empty id.
-    # Use title= + description= (not prompt=) to get a deterministic title.
-    # Taskmaster's JS add_task tool accepts either `prompt` alone or both
-    # `title` and `description` together.  `prompt=` lets the AI generate a
-    # title, which is non-deterministic and causes the title assertion in (b)
-    # to fail intermittently.  Explicit title+description is the stable path.
+    # Use title= + description= (not prompt=): prompt= triggers AI-generated
+    # title/description which is non-deterministic and breaks the round-trip
+    # assertion at (b).  Taskmaster requires either `prompt` alone OR both
+    # `title` and `description` together; passing title-only is rejected
+    # server-side ("Either the prompt parameter or both title and description
+    # are required").  The canned suite (test_taskmaster_client_contract.py:84)
+    # uses prompt= because its session.call_tool is mocked — input doesn't
+    # affect the canned response.
     add_result = await backend.add_task(
         project_root=project_root,
         title='Integration test task',
-        description='Integration test task description.',
+        description='Round-trip integration test task',
     )
     task_id = add_result['id']
     assert task_id, f'add_task returned empty id: {add_result!r}'
@@ -118,19 +121,37 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     # may return the id as int.  Cast LHS so the round-trip assertion doesn't
     # spuriously fail on a type mismatch when the wire path is healthy.
     assert str(task['id']) == task_id
-    # Pin the observed wire type: str or int are both valid (JS may return either).
-    # A flip in observed type is an intentional contract change — it must also
-    # update the canned mocks in tests/test_taskmaster_client_contract.py so that
-    # static and live suites stay in sync.
-    assert isinstance(task['id'], (str, int)), (
+    # Pin the observed wire type: live JS (taskmaster-ai v0.27.0) returns id as
+    # int for get_task (raw passthrough — no wrapper coercion).  A flip in
+    # observed type is an intentional contract change — it must also update the
+    # canned mocks in tests/test_taskmaster_client_contract.py so that static
+    # and live suites stay in lockstep.
+    assert isinstance(task['id'], int), (
         f"task['id'] has unexpected type {type(task['id']).__name__!r}; "
-        'expected str or int — if the wire type changed update the canned mocks '
+        'expected int — if the wire type changed update the canned mocks '
         'in tests/test_taskmaster_client_contract.py'
     )
     assert task.get('title') == 'Integration test task'
     assert task.get('status') == 'pending', (
         f"Unexpected initial status {task.get('status')!r}; "
         f"expected 'pending' — update this assertion if Taskmaster changes its default"
+    )
+
+    # (b2) get_tasks list path: verify that task ids in the list are also int.
+    # Both get_task and get_tasks are raw passthroughs (no wrapper coercion on
+    # task items), so id types must agree.  A type disagreement between the two
+    # endpoints would indicate a JS-side inconsistency worth investigating.
+    tasks_result = await backend.get_tasks(project_root=project_root)
+    found = [t for t in tasks_result['tasks'] if str(t['id']) == task_id]
+    assert found, (
+        f'get_tasks did not return the just-added task (id={task_id!r}); '
+        f'tasks: {tasks_result["tasks"]!r}'
+    )
+    list_task = found[0]
+    assert isinstance(list_task['id'], int), (
+        f"get_tasks task['id'] has unexpected type {type(list_task['id']).__name__!r}; "
+        'expected int — if the wire type changed update the canned mocks '
+        'in tests/test_taskmaster_client_contract.py (test_get_tasks_returns_flat_dto)'
     )
 
     # (c) set_task_status returns a message containing 'done'
