@@ -301,6 +301,15 @@ class BulkResetGuard:
 
         now = self._now()
 
+        # Lock-order contract: callers (notably
+        # ``TaskInterceptor._apply_status_transition``) may already hold a
+        # per-project ``_write_lock`` when invoking this method.
+        # ``observe_attempt`` therefore acquires only ``self._lock`` (a
+        # guard-internal global asyncio.Lock) and MUST NOT attempt to
+        # acquire any per-project lock — doing so would invert the
+        # established order (per-project → guard-global) and risk deadlock
+        # under contention with concurrent writers on other projects.
+        # All work inside ``self._lock`` is bounded O(window) deque ops.
         async with self._lock:
             state = self._state.setdefault(project_id, _GuardState())
 

@@ -489,6 +489,16 @@ class TaskInterceptor:
             # unguarded.  The guard's _reversal_kind classifier handles its own
             # filtering; the interceptor must not pre-filter by old_status.
             if self._bulk_reset_guard is not None:
+                # Lock-order contract: we are currently holding
+                # ``_write_lock(project_id)`` (a per-project asyncio.Lock).
+                # ``observe_attempt`` will acquire ``BulkResetGuard._lock``
+                # (a guard-internal global asyncio.Lock shared across all
+                # projects).  The established acquisition order is therefore:
+                #   per-project write_lock → BulkResetGuard global lock
+                # — NEVER the reverse.  Any future change to
+                # ``observe_attempt`` MUST NOT itself try to acquire any
+                # per-project lock or it will deadlock under contention with
+                # concurrent writers on the same project.
                 _brg_verdict = await self._bulk_reset_guard.observe_attempt(
                     project_id=project_id,
                     task_id=task_id,
@@ -1025,6 +1035,16 @@ class TaskInterceptor:
           but no ``justification``.
         - ``'curator_drop'`` — removed in pass 2 by the curator.
         - ``'curator_combine'`` — merged into an existing task in pass 2.
+
+        **Partial-failure dual-append contract**: when ``tm.remove_task``
+        raises during the intra-batch pre-pass for a duplicate, that task
+        is appended to BOTH ``errors`` (with the exception text) AND
+        ``kept`` (via the fall-through that re-adds it to the unique
+        survivor list, which then passes through pass 2 and lands in
+        ``kept``).  This is intentional defence-in-depth: a transient
+        backend failure must not silently lose the task from both lists,
+        so the caller can detect the anomaly via ``errors`` while the
+        task is still present in ``kept``.
         """
         removed: list[dict] = []
         kept: list[dict] = []
@@ -1054,10 +1074,39 @@ class TaskInterceptor:
         # Key: normalised (title, description) hash — case + whitespace
         # insensitive, excluding files_to_modify (often absent).
         # First occurrence wins (matches curate_batch hash_to_first_idx
-        # convention).  Each removal acquires _write_lock independently to
-        # match WP-E discipline (same pattern as post-hoc drop/combine).
+        # convention).
+        #
+        # Two-phase discipline:
+        #   Phase A (outside the lock): hash each task, update seen_keys /
+        #   unique_new_tasks, and collect duplicates into dups_to_remove.
+        #   All work here is pure local-state; no I/O.
+        #   Phase B (inside ONE _write_lock scope): issue all tm.remove_task
+        #   calls with per-item try/except so a transient backend failure on
+        #   one removal does not abort the rest of the batch.  The
+        #   dual-append-on-error fall-through (failing task → both errors and
+        #   unique_new_tasks/kept) is preserved inside the lock.
+        #
+        #   Why pass-1 batches but pass-2 (curator drop/combine, lines below)
+        #   stays per-item: duplicates here are removed by back-to-back
+        #   tm.remove_task() calls with no LLM round-trips between them.
+        #   Holding the lock across the whole batch prevents partial
+        #   interleaving with concurrent writers on the same project without
+        #   adding latency beyond the cumulative tm.remove_task time.
+        #   Pass-2 MUST remain per-item because curator.curate() is a full
+        #   LLM round-trip that happens between each removal — serialising
+        #   those under the write lock would block all concurrent writers for
+        #   the entire LLM sequence, which is unacceptable.
+        #
+        #   Lock-hold trade-off: the lock is held for the duration of all N
+        #   mechanical remove_task() calls.  This blocks concurrent writers
+        #   on the same project longer than the old per-item form, but
+        #   eliminates N-1 redundant lock-handoff round-trips and prevents
+        #   partial interleaving.  No LLM calls are made under the lock;
+        #   tail-latency risk is bounded solely by tm.remove_task backend
+        #   latency.
         seen_keys: dict[str, str] = {}   # key → first-occurrence task_id
         unique_new_tasks: list[dict] = []
+        dups_to_remove: list[tuple] = []  # (tid, title, t, first_id)
         for t in new_task_dicts:
             tid = str(t.get('id', ''))
             title = str(t.get('title', ''))
@@ -1077,27 +1126,34 @@ class TaskInterceptor:
                 seen_keys[key] = tid
                 unique_new_tasks.append(t)
             else:
-                # Duplicate — remove it under the write lock.
                 first_id = seen_keys[key]
-                try:
-                    async with self._write_lock(project_id):
+                dups_to_remove.append((tid, title, t, first_id))
+
+        # Phase B: issue all removals inside a single lock scope (see trade-off
+        # discussion in the two-phase comment above).  Per-item try/except
+        # inside the lock preserves the partial-failure dual-append fall-through:
+        # a transient backend error on one removal does not abort the rest.
+        if dups_to_remove:
+            async with self._write_lock(project_id):
+                for tid, title, t, first_id in dups_to_remove:
+                    try:
                         await tm.remove_task(tid, project_root)
-                    removed.append({
-                        'task_id': tid,
-                        'title': title,
-                        'reason': 'intra_batch_duplicate',
-                        'matched_task_id': first_id,
-                    })
-                    logger.info(
-                        'bulk_dedup: intra-batch duplicate %s removed (matches %s)',
-                        tid, first_id,
-                    )
-                except Exception as exc:
-                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
-                    # Removal failed transiently — fall through to curator so
-                    # this task still appears in `kept` rather than silently
-                    # disappearing from both `removed` and `kept`.
-                    unique_new_tasks.append(t)
+                        removed.append({
+                            'task_id': tid,
+                            'title': title,
+                            'reason': 'intra_batch_duplicate',
+                            'matched_task_id': first_id,
+                        })
+                        logger.info(
+                            'bulk_dedup: intra-batch duplicate %s removed (matches %s)',
+                            tid, first_id,
+                        )
+                    except Exception as exc:
+                        errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+                        # Removal failed transiently — fall through to curator so
+                        # this task still appears in `kept` rather than silently
+                        # disappearing from both `removed` and `kept`.
+                        unique_new_tasks.append(t)
 
         curator = await self._get_curator()
         if curator is None:

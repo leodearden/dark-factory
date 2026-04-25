@@ -3852,3 +3852,163 @@ async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
     assert curator.curate.await_count == 2, (
         f'curate call count wrong: {curator.curate.call_args_list}'
     )
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
+    curator_interceptor, taskmaster,
+):
+    """Intra-batch pre-pass must acquire _write_lock exactly ONCE for N>1 duplicates.
+
+    Pins the batched-lock discipline introduced by task-981 item 1: all N
+    intra-batch removals are grouped first (outside the lock) and then
+    issued inside a single ``async with self._write_lock(project_id):``
+    block, rather than serially entering/releasing the lock N times.
+
+    Verification strategy: wrap ``interceptor._write_lock`` with a counter
+    callable that delegates to the original method but increments a counter
+    on each call.  A call count of 1 after driving 4 tasks (3 are dups of
+    the first) proves the batched form.  Under the old per-item form the
+    counter would be 3.
+    """
+    PROJECT = '/project'
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
+        {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
+        {'id': '12', 'title': 'fix Foo', 'description': 'BAR '},
+        {'id': '13', 'title': 'Fix  foo', 'description': 'bar'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='novel')
+    )
+
+    # Wrap _write_lock with a counter that delegates to the original bound method.
+    # Setting an instance attribute shadows the class method; the nonlocal counter
+    # increments on each call so we can assert exactly one lock-scope entry per batch.
+    _original_write_lock = curator_interceptor._write_lock
+    _lock_call_count = 0
+
+    def _counting_write_lock(project_id: str):
+        nonlocal _lock_call_count
+        _lock_call_count += 1
+        return _original_write_lock(project_id)
+
+    curator_interceptor._write_lock = _counting_write_lock
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        PROJECT, pre_snapshot={'tasks': []},
+    )
+
+    # (a) 3 tasks removed (the 3 intra-batch duplicates of '10').
+    assert len(result['removed']) == 3, f"expected 3 removals, got: {result['removed']}"
+
+    # (b) remove_task called 3 times, once per duplicate.
+    assert taskmaster.remove_task.await_count == 3, (
+        f'remove_task call count wrong: {taskmaster.remove_task.call_args_list}'
+    )
+    actual_calls = {tuple(c.args) for c in taskmaster.remove_task.call_args_list}
+    assert actual_calls == {('11', PROJECT), ('12', PROJECT), ('13', PROJECT)}, (
+        f'remove_task called with unexpected args: {actual_calls}'
+    )
+
+    # (c) _write_lock was acquired exactly ONCE for the entire batch.
+    # Under the old per-item form this would be 3 — one lock entry per duplicate.
+    #
+    # NOTE — intentional structural/contract pin: this assertion pins the
+    # implementation shape (one `async with self._write_lock(project_id):`
+    # wrapping all N removals), not merely observable lock semantics.  A
+    # future refactor that, for example, switched to a cached asynccontextmanager
+    # yielding the same underlying lock object on every call would break this
+    # test even if the external lock-hold semantics were equivalent.  That is
+    # deliberate: the "single scope" structure is the contract — it determines
+    # the blast radius for concurrent writers and must not regress silently.
+    # See the two-phase discipline comment in _dedupe_bulk_created for the
+    # rationale (no LLM calls between removals → safe to batch; pass-2 stays
+    # per-item because LLM calls happen between its removals).
+    assert _lock_call_count == 1, (
+        f'_write_lock was called {_lock_call_count} times (expected 1 for batched form)'
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_intra_batch_partial_failure_under_batched_lock_continues_remaining(
+    curator_interceptor, taskmaster,
+):
+    """Partial-failure under the batched lock must not abort the rest of the batch.
+
+    Generalises test_dedupe_bulk_remove_failure_keeps_task_in_both_errors_and_kept
+    (N=1) to the N>1 batched-lock case.  With per-item try/except INSIDE the
+    lock, a transient backend failure on the middle duplicate ('12') must not
+    prevent the other two ('11', '13') from being removed.
+
+    A single try/except wrapping the ENTIRE loop would abort after the first
+    failure — remove_task would only be called twice (for '11' and '12'),
+    and '13' would silently slip through to kept instead of removed.
+    This test catches that tempting-but-wrong refactor by asserting
+    remove_task.await_count == 3 and '13' in result['removed'].
+    """
+    PROJECT = '/project'
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
+        {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
+        {'id': '12', 'title': 'fix Foo', 'description': 'BAR '},
+        {'id': '13', 'title': 'Fix  foo', 'description': 'bar'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+
+    # '12' raises transiently; '11' and '13' succeed.
+    def _side_effect(tid, _project_root):
+        if tid == '12':
+            raise RuntimeError('transient backend failure')
+        return {'success': True}
+
+    taskmaster.remove_task = AsyncMock(side_effect=_side_effect)
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='novel')
+    )
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        PROJECT, pre_snapshot={'tasks': []},
+    )
+
+    # (a) remove_task called for all three duplicates — the failure on '12'
+    # did NOT abort the rest of the batch.  A single try/except wrapping the
+    # whole loop would call it only twice (stop after '12' raises).
+    assert taskmaster.remove_task.await_count == 3, (
+        f'remove_task call count wrong (expected 3): {taskmaster.remove_task.call_args_list}'
+    )
+
+    # (b) Exactly one error entry, for '12', mentioning the backend failure.
+    assert len(result['errors']) == 1, f"expected 1 error, got: {result['errors']}"
+    assert result['errors'][0]['task_id'] == '12'
+    assert 'transient backend failure' in result['errors'][0]['error']
+
+    # (c) '12' appears in kept (dual-append fall-through).
+    assert any(k['task_id'] == '12' for k in result['kept']), (
+        f"expected '12' in kept, got: {result['kept']}"
+    )
+
+    # (d) '12' does NOT appear in removed (removal failed).
+    assert all(r['task_id'] != '12' for r in result['removed']), (
+        f"unexpected '12' in removed: {result['removed']}"
+    )
+
+    # (e) '11' and '13' appear in removed with correct metadata.
+    removed_ids = {r['task_id'] for r in result['removed']}
+    assert removed_ids == {'11', '13'}, f"removed_ids={removed_ids}"
+    for r in result['removed']:
+        assert r['reason'] == 'intra_batch_duplicate'
+        assert r['matched_task_id'] == '10'
+
+    # (f) curator.curate called twice: pass-2 receives '10' and '12' (the
+    # fall-through re-added '12' to unique_new_tasks); '11' and '13' were
+    # removed in pass-1.
+    assert curator_interceptor._curator.curate.await_count == 2, (
+        f'curate call count wrong: {curator_interceptor._curator.curate.call_args_list}'
+    )
