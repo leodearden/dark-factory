@@ -3512,6 +3512,88 @@ class TestSpeculativeMergeWorker:
             f'merge_sha is not a hex string: {outcome_n.merge_sha!r}'
         )
 
+    async def test_speculative_merge_worker_surfaces_unresolved_steps_in_dropped_outcome_reason(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """SpeculativeMergeWorker includes unresolved-step diagnostics in the blocked reason.
+
+        Mirrors test_merge_worker_surfaces_unresolved_steps_in_dropped_outcome_reason
+        but drives SpeculativeMergeWorker instead of MergeWorker.  Both worker
+        paths must emit identical diagnostic text — downstream consumers (steward,
+        dashboard) parse the same reason format regardless of which path produced it.
+
+        Will fail until step 10 wires _format_unresolved_steps_suffix into
+        SpeculativeMergeWorker._merger_loop.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-drop-unresolved', 'kept.py', 'kept = 1\n',
+        )
+        artifacts = TaskArtifacts(wt)
+        artifacts.init('spec-drop-unresolved', 'Spec drop unresolved', 'desc')
+        artifacts.write_plan({
+            'files': ['kept.py', 'dropped.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        bad_commit = 'cf82ae6815'
+
+        async def _fake_drop_check_speculative(*_args, **_kwargs):
+            return DropGuardResult(
+                dropped=['dropped.py'],
+                unresolved_steps=[
+                    UnresolvedStep(
+                        step_idx=2,
+                        step_id='step-3',
+                        commit=bad_commit,
+                        rc=128,
+                        stderr='fatal: bad object cf82ae6815',
+                        object_missing=True,
+                    )
+                ],
+            )
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass(),
+        ), patch(
+            'orchestrator.merge_queue._check_plan_targets_in_tree',
+            _fake_drop_check_speculative,
+        ):
+            req = _make_request(
+                'spec-drop-unresolved', 'spec-drop-unresolved', wt, config,
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+
+        await worker.stop()
+        await worker_task
+
+        # (a) Still blocked (fail-closed)
+        assert outcome.status == 'blocked', f'Expected blocked, got {outcome.status!r}'
+        # (b) Existing drop-guard reason contract preserved
+        assert 'dropped.py' in outcome.reason, f'Missing dropped.py in reason: {outcome.reason!r}'
+        assert 'plan target' in outcome.reason.lower(), (
+            f'Missing "plan target" in reason: {outcome.reason!r}'
+        )
+        # (c) Unresolved-step diagnostics included — same format as MergeWorker
+        assert 'step-3' in outcome.reason, (
+            f'Expected step_id "step-3" in reason: {outcome.reason!r}'
+        )
+        assert bad_commit in outcome.reason, (
+            f'Expected commit {bad_commit!r} in reason: {outcome.reason!r}'
+        )
+        assert 'object_missing' in outcome.reason, (
+            f'Expected "object_missing" in reason: {outcome.reason!r}'
+        )
+        reason_lower = outcome.reason.lower()
+        assert 'drop-guard' in reason_lower or 'could not query' in reason_lower, (
+            f'Expected drop-guard failure phrase in reason: {outcome.reason!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
