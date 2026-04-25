@@ -1729,7 +1729,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
-                result = await _check_plan_targets_in_tree(
+                await _check_plan_targets_in_tree(
                     merge_result.merge_commit, worktree, git_ops,
                     task_id='t-issue1',
                 )
