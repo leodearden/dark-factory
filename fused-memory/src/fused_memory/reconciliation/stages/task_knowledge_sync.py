@@ -68,7 +68,8 @@ class TaskKnowledgeSync(BaseStage):
             filtered = self.filtered_task_tree
         else:
             # Fallback path: self-fetch via taskmaster
-            tasks_data: dict = {}
+            # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
+            tasks_data: object = {}
             if self.taskmaster:
                 try:
                     tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)

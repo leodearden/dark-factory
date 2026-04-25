@@ -57,6 +57,7 @@ class TestModuleLevelAll:
             'AgentFailureKind',
             'AgentResult',
             'AllAccountsCappedException',
+            'build_failure_message',
             'classify_agent_failure',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
