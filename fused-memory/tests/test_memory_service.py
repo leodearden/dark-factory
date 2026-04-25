@@ -959,6 +959,41 @@ class TestGraphitiBackendRemoveEdge:
             mock_edge.delete.assert_called_once_with(mock_cloned_driver)
 
 
+class TestMem0BackendAddInferContract:
+    """Mem0Backend.add must pin infer=False so Mem0 stores distilled
+    content verbatim instead of silently dropping it when its LLM
+    fact-extractor finds no declarative facts (the Task-360/1040 bug).
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_passes_infer_false_to_async_memory(self, mock_config):
+        from fused_memory.backends.mem0_client import Mem0Backend
+
+        backend = Mem0Backend(mock_config)
+
+        mock_instance = MagicMock()
+        mock_instance.add = AsyncMock(
+            return_value={'results': [{'id': 'mem0-new', 'event': 'ADD'}]}
+        )
+        backend._instances = {'autopilot_video': mock_instance}
+
+        scope = Scope(project_id='autopilot_video', agent_id='t')
+        result = await backend.add(
+            content='ATTRIBUTION_STUB_GUARDRAIL: do not fabricate...',
+            scope=scope,
+            metadata={'category': 'preferences_and_norms'},
+        )
+
+        mock_instance.add.assert_awaited_once()
+        call_kwargs = mock_instance.add.call_args.kwargs
+        assert call_kwargs.get('infer') is False, (
+            'Mem0Backend.add must call AsyncMemory.add with infer=False; '
+            'otherwise the LLM fact-extractor silently drops '
+            'normative/procedural content and returns empty results.'
+        )
+        assert result == {'results': [{'id': 'mem0-new', 'event': 'ADD'}]}
+
+
 class TestMem0BackendClose:
     @pytest.mark.asyncio
     async def test_close_awaits_client_close(self, mock_config):
