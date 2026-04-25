@@ -1038,13 +1038,13 @@ class TaskInterceptor:
 
         **Partial-failure dual-append contract**: when ``tm.remove_task``
         raises during the intra-batch pre-pass for a duplicate, that task
-        is appended to BOTH ``errors`` (with the exception text) AND
-        ``kept`` (via the fall-through that re-adds it to the unique
-        survivor list, which then passes through pass 2 and lands in
-        ``kept``).  This is intentional defence-in-depth: a transient
-        backend failure must not silently lose the task from both lists,
-        so the caller can detect the anomaly via ``errors`` while the
-        task is still present in ``kept``.
+        is appended to ``errors`` (with the exception text) and re-enters
+        pass 2 via the unique-survivor list, so it lands in either ``kept``
+        or ``removed`` depending on the curator decision — never silently
+        lost from all three outputs.  This is intentional defence-in-depth:
+        a transient backend failure must not silently lose the task, so the
+        caller can detect the anomaly via ``errors`` while the task is still
+        present in exactly one of ``kept`` or ``removed``.
         """
         removed: list[dict] = []
         kept: list[dict] = []
@@ -1083,8 +1083,9 @@ class TaskInterceptor:
         #   Phase B (inside ONE _write_lock scope): issue all tm.remove_task
         #   calls with per-item try/except so a transient backend failure on
         #   one removal does not abort the rest of the batch.  The
-        #   dual-append-on-error fall-through (failing task → both errors and
-        #   unique_new_tasks/kept) is preserved inside the lock.
+        #   dual-append-on-error fall-through (failing task → errors AND
+        #   unique_new_tasks, landing in kept or removed per curator) is
+        #   preserved inside the lock.
         #
         #   Why pass-1 batches but pass-2 (curator drop/combine, lines below)
         #   stays per-item: duplicates here are removed by back-to-back
@@ -1151,8 +1152,8 @@ class TaskInterceptor:
                     except Exception as exc:
                         errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
                         # Removal failed transiently — fall through to curator so
-                        # this task still appears in `kept` rather than silently
-                        # disappearing from both `removed` and `kept`.
+                        # this task appears in either `kept` or `removed` depending
+                        # on the curator decision, rather than silently disappearing.
                         unique_new_tasks.append(t)
 
         curator = await self._get_curator()
