@@ -76,14 +76,22 @@ def find_exact_duplicate_groups(tasks: list[dict]) -> list[list[dict]]:
 
     Normalisation: ``(task.get('title') or '').strip().lower()``.
     No status filtering — the caller is responsible for pre-filtering.
+
+    Returns:
+        List of groups (each a list of ≥ 2 tasks) whose normalised titles are
+        identical.  Groups are sorted by the minimum task ID within the group
+        so output is deterministic.
     """
     by_title: dict[str, list[dict]] = {}
     for task in tasks:
         key = (task.get('title') or '').strip().lower()
         by_title.setdefault(key, []).append(task)
     result = [group for group in by_title.values() if len(group) >= 2]
+    # Sort each group and the list of groups for determinism.
+    # Use _id_as_int to handle non-numeric IDs (e.g. subtask '1.2') safely.
     for g in result:
         g.sort(key=lambda t: _id_as_int(t))
+    result.sort(key=lambda g: _id_as_int(g[0]))
     return result
 
 
