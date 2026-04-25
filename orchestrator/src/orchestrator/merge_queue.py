@@ -1321,20 +1321,22 @@ class SpeculativeMergeWorker:
                             f'targets: {dropped}'
                         )
                         _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
+                        reason = (
+                            f'Merge commit is missing plan target '
+                            f'files: {", ".join(dropped)}. '
+                            f'Conflict resolution likely dropped '
+                            f'planned work. Review the merge commit '
+                            f'and restore missing files.'
+                        )
+                        if drop_result.unresolved_steps:
+                            reason += _format_unresolved_steps_suffix(
+                                drop_result.unresolved_steps
+                            )
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=MergeOutcome(
-                                'blocked',
-                                reason=(
-                                    f'Merge commit is missing plan target '
-                                    f'files: {", ".join(dropped)}. '
-                                    f'Conflict resolution likely dropped '
-                                    f'planned work. Review the merge commit '
-                                    f'and restore missing files.'
-                                ),
-                            ),
+                            immediate_outcome=MergeOutcome('blocked', reason=reason),
                             started_monotonic=t0,
                         ))
                         spec_base = None
