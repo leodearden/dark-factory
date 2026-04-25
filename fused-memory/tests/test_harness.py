@@ -1,6 +1,8 @@
 """Tests for reconciliation harness (pipeline orchestration)."""
 
+import asyncio
 import contextlib
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3515,3 +3517,47 @@ async def test_run_full_cycle_with_relative_config_and_memory_only_events_still_
         f"Stage 2 must receive a non-empty FilteredTaskTree (total_count={stage2_tree.total_count}); "
         "got empty tree — init normalization or fetcher pipeline is broken"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1053 — Harness.drain() idle short-circuit
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessDrainIdleShortCircuit:
+    """drain() must emit 'Harness fully drained' synchronously when idle."""
+
+    @pytest.mark.parametrize(
+        'project_tasks',
+        [
+            pytest.param({}, id='no_tasks_ever_spawned'),
+            pytest.param('one_done_task', id='one_completed_task'),
+        ],
+    )
+    def test_drain_emits_fully_drained_when_idle(
+        self, project_tasks, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """drain() must synchronously log 'Harness fully drained' when no active loops.
+
+        Two cases:
+        (a) _project_tasks={} — no loops ever spawned (constructor default).
+        (b) _project_tasks populated with a done() Task — loops ran but are finished.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        if project_tasks == 'one_done_task':
+            done_task = MagicMock(spec=asyncio.Task)
+            done_task.done.return_value = True
+            harness._project_tasks['some-project'] = done_task
+        # else: leave _project_tasks as {} (constructor default)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            harness.drain()
+
+        drained_records = [
+            r for r in caplog.records if 'Harness fully drained' in r.message
+        ]
+        assert drained_records, (
+            f"Expected at least one log record containing 'Harness fully drained — safe to restart' "
+            f"but got records: {[r.message for r in caplog.records]}"
+        )
