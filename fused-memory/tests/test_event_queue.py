@@ -349,6 +349,38 @@ async def test_stats_tracks_commits(queue, real_buffer):
     assert stats['last_commit_ts'] is not None
 
 
+# ── Test helpers ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
+    """_drain_for_test() waits until every enqueued event has been processed.
+
+    Constructs an EventQueue wired to a real SQLite buffer, enqueues 5 events,
+    then awaits q._drain_for_test(timeout=1.0).  After the call returns the
+    buffer must contain exactly 5 committed events (stats['size'] == 5).
+    """
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dead_letter.jsonl',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(5):
+            q.enqueue(_make_event())
+        await q._drain_for_test(timeout=1.0)
+        stats = await real_buffer.get_buffer_stats('test-project')
+        assert stats['size'] == 5, (
+            f"Expected 5 events in buffer after _drain_for_test, got {stats['size']}"
+        )
+    finally:
+        await q.close()
+
+
 # ── Rotation ────────────────────────────────────────────────────────────
 
 
