@@ -51,6 +51,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Module-local sleep binding — allows tests to patch sleep without touching
+# the global asyncio namespace.
+_sleep = asyncio.sleep
+
 # Peek window size for BacklogIterator's project_root resolution.
 # Large enough that an older event lacking `_project_root` doesn't force a
 # fallback when a later buffered event carries the key (see BacklogIterator.run).
@@ -479,7 +483,7 @@ class ReconciliationHarness:
 
         self._escalation_task = asyncio.create_task(_serve(), name='recon-escalation-server')
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
-        await asyncio.sleep(0.5)
+        await _sleep(0.5)
 
         # Store escalation URL for _make_stages() and set on existing stages
         escalation_url = f'http://{host}:{port}/mcp'
@@ -627,7 +631,7 @@ class ReconciliationHarness:
 
                 except Exception as e:
                     logger.error(f'Reconciliation loop error: {e}')
-                await asyncio.sleep(5)
+                await _sleep(5)
         finally:
             # Graceful shutdown: cancel all project loops
             for task in self._project_tasks.values():
@@ -651,13 +655,13 @@ class ReconciliationHarness:
                     if idle_ticks > 12:  # ~60s idle → exit, respawn on demand
                         logger.debug(f'Project loop idle exit for {project_id}')
                         return
-                    await asyncio.sleep(5)
+                    await _sleep(5)
                     continue
 
                 idle_ticks = 0
                 acquired = await self.buffer.mark_run_active(project_id)
                 if not acquired:
-                    await asyncio.sleep(5)
+                    await _sleep(5)
                     continue
 
                 # Halt check
@@ -711,12 +715,12 @@ class ReconciliationHarness:
             except Exception as e:
                 logger.error(f'Project loop error for {project_id}: {e}')
 
-            await asyncio.sleep(5)  # Cooldown between cycles
+            await _sleep(5)  # Cooldown between cycles
 
     async def _heartbeat_loop(self, project_id: str) -> None:
         """Keep the reconciliation lock alive while a run is in progress."""
         while True:
-            await asyncio.sleep(60)
+            await _sleep(60)
             try:
                 await self.buffer.heartbeat(project_id)
             except Exception as e:
