@@ -857,9 +857,9 @@ async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, m
 async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
     """read_dead_letters never raises when a dead-letter file cannot be opened.
 
-    The OSError handler at event_queue.py:481 catches OSError raised by
-    _iter_lines_reversed() (which opens the file via path.open('rb')), emits a
-    WARNING containing 'cannot read', and continues.  The result is an empty
+    The OSError handler inside `read_dead_letters` catches OSError raised by
+    `_iter_lines_reversed()` (which opens the file via path.open('rb')), emits
+    a WARNING containing 'cannot read', and continues.  The result is an empty
     list rather than a raised exception.
 
     The monkeypatch is selective: only the dead-letter path's open() raises;
