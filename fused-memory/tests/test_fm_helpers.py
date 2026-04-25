@@ -31,17 +31,17 @@ def _make_stub_interceptor(
 
 @pytest.mark.asyncio
 async def test_submit_and_resolve_proceeds_when_ticket_present_regardless_of_other_keys():
-    """submit_and_resolve must route on 'ticket' presence, not 'error' absence.
+    """submit_and_resolve must route on 'ticket' presence, not on the absence of other keys.
 
     Forward-compatibility test: a future evolution of submit_task may return a success dict
-    that also carries a non-fatal advisory field (e.g. {'ticket': ..., 'error': 'non-fatal
-    warning'}).  The helper must use the *presence of 'ticket'* — not the *absence of 'error'*
-    — to decide whether to proceed to resolve_ticket.  An 'error'-absent guard would silently
-    return the success-with-warning dict verbatim and never resolve the ticket.
+    that carries an additional advisory key alongside 'ticket'.  The helper must use the
+    *presence of 'ticket'* to decide whether to proceed to resolve_ticket, regardless of what
+    other keys appear in the dict.  A guard that required the dict to have *only* 'ticket'
+    would break when an extra key is added.
     """
     expected = {'id': '99', 'title': 'Done'}
     interceptor = _make_stub_interceptor(
-        submit_result={'ticket': 'tkt_x', 'error': 'non-fatal warning'},
+        submit_result={'ticket': 'tkt_x', 'unrelated_advisory_field': 'foo'},
         resolve_result={'status': 'created', 'task_id': '99'},
         ticket_store_row={'result_json': json.dumps(expected)},
     )
