@@ -373,7 +373,7 @@ async def test_get_task_returns_task_dict_directly(client):
 
     dto = await c.get_task('7', project_root='/project')
 
-    assert dto['id'] == '7'
+    assert dto['id'] == 7
     assert dto['title'] == 'Real task'
     assert dto['status'] == 'in-progress'
 
