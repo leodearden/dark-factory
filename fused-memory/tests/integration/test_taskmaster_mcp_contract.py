@@ -97,7 +97,13 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     """Happy-path: full CRUD round-trip against the live Taskmaster subprocess."""
     backend, project_root = taskmaster_backend
 
-    # (a) add_task returns a non-empty id
+    # (a) add_task returns a non-empty id.
+    # Use prompt= (not title=): Taskmaster's JS add_task tool requires either
+    # `prompt` alone or both `title` and `description` together.  `prompt=` is
+    # the AI-generated happy path and mirrors the canned suite convention at
+    # tests/test_taskmaster_client_contract.py:84.  Passing title-only compiles
+    # but is rejected server-side ("Either the prompt parameter or both title
+    # and description are required").
     add_result = await backend.add_task(
         project_root=project_root,
         prompt='Integration test task',
@@ -112,6 +118,15 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     # may return the id as int.  Cast LHS so the round-trip assertion doesn't
     # spuriously fail on a type mismatch when the wire path is healthy.
     assert str(task['id']) == task_id
+    # Pin the observed wire type: str or int are both valid (JS may return either).
+    # A flip in observed type is an intentional contract change — it must also
+    # update the canned mocks in tests/test_taskmaster_client_contract.py so that
+    # static and live suites stay in sync.
+    assert isinstance(task['id'], (str, int)), (
+        f"task['id'] has unexpected type {type(task['id']).__name__!r}; "
+        'expected str or int — if the wire type changed update the canned mocks '
+        'in tests/test_taskmaster_client_contract.py'
+    )
     assert task.get('title') == 'Integration test task'
     assert task.get('status') == 'pending', (
         f"Unexpected initial status {task.get('status')!r}; "
