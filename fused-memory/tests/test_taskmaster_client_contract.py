@@ -355,6 +355,7 @@ async def test_get_tasks_returns_flat_dto(client):
     # passthrough as get_task — no wrapper coercion on task items).  Keep int
     # here so static and live suites mirror the same wire shape.
     assert dto['tasks'][0]['id'] == 1
+    assert dto['tasks'][1]['id'] == 2
 
 
 # ── get_task ────────────────────────────────────────────────────────

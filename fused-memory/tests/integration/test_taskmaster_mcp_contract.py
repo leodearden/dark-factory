@@ -153,6 +153,7 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
         'expected int — if the wire type changed update the canned mocks '
         'in tests/test_taskmaster_client_contract.py (test_get_tasks_returns_flat_dto)'
     )
+    assert list_task.get('title') == 'Integration test task'
 
     # (c) set_task_status returns a message containing 'done'
     status_result = await backend.set_task_status(
