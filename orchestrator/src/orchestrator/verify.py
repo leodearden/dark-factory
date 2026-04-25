@@ -395,11 +395,31 @@ def _build_fallback_config(task_files: list[str]) -> ModuleConfig | None:
     if not py_files:
         return None
 
-    test_files = [f for f in py_files if _is_test_file(f)]
+    # conftest.py cannot be passed directly to pytest (pytest >= 9 exits 1 with
+    # "no tests ran").  The fallback path has no mc.test_command to reuse, so
+    # we target the *parent directory* of each conftest instead — that directory
+    # contains every test the conftest can affect.  Sorted deduped set gives
+    # deterministic output.
+    has_conftest = any(f.rsplit('/', 1)[-1] == 'conftest.py' for f in py_files)
+    # Strip conftest.py from test_files so it never reaches 'pytest <files>'.
+    test_files = [
+        f for f in py_files
+        if _is_test_file(f) and f.rsplit('/', 1)[-1] != 'conftest.py'
+    ]
 
     lint_cmd = 'ruff check ' + ' '.join(py_files)
     type_cmd = 'pyright ' + ' '.join(py_files)
-    test_cmd = ('pytest ' + ' '.join(test_files)) if test_files else None
+    if has_conftest:
+        conftest_dirs = sorted({
+            f.rsplit('/', 1)[0]
+            for f in py_files
+            if f.rsplit('/', 1)[-1] == 'conftest.py'
+        })
+        test_cmd = 'pytest ' + ' '.join(conftest_dirs)
+    elif test_files:
+        test_cmd = 'pytest ' + ' '.join(test_files)
+    else:
+        test_cmd = None
 
     return ModuleConfig(
         prefix='__fallback__',
