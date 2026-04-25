@@ -3662,3 +3662,56 @@ class TestHarnessDrainIdleShortCircuit:
             f"Expected exactly 1 'Harness fully drained' record across drain() + run_loop() "
             f"but got {len(drained_records)}: {[r.message for r in drained_records]}"
         )
+
+    @pytest.mark.asyncio
+    async def test_main_loop_does_not_log_zero_project_status_after_drain(
+        self, journal, event_buffer, mock_memory_service, caplog, monkeypatch
+    ):
+        """After drain() fires the marker, run_loop() must NOT emit 'draining: 0 loops'.
+
+        The drain-status else-branch (progress message) must only fire while real
+        project loops are in flight.  Once _no_active_loops() is True and
+        _drain_complete_logged is True, the main loop iteration should be silent —
+        not emit a misleading '0 project loop(s) still running' message.
+
+        We patch asyncio.sleep to yield immediately so the loop body runs many
+        iterations within the 0.2 s window, maximising the chance of catching
+        spurious emissions.
+        """
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr('fused_memory.reconciliation.harness.asyncio.sleep', fast_sleep)
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Stub side-effect dependencies so the loop body runs without network calls
+        harness._recover_stale_runs = AsyncMock(return_value=None)
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        harness.buffer.get_active_projects = AsyncMock(return_value=[])
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            # Idle path: drain() fires the marker synchronously; _drain_complete_logged=True
+            harness.drain()
+            # Run the main loop; with fast_sleep many iterations execute in 0.2 s.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+        zero_status_records = [
+            r for r in caplog.records if 'Harness draining: 0 project loop(s)' in r.message
+        ]
+        assert len(zero_status_records) == 0, (
+            f"Expected NO 'Harness draining: 0 project loop(s)' records after drain() "
+            f"but got {len(zero_status_records)}: {[r.message for r in zero_status_records]}"
+        )
+        # Regression belt: the marker must still have been emitted exactly once by drain()
+        drained_records = [
+            r for r in caplog.records if 'Harness fully drained' in r.message
+        ]
+        assert len(drained_records) == 1, (
+            f"Expected exactly 1 'Harness fully drained' record but got "
+            f"{len(drained_records)}: {[r.message for r in drained_records]}"
+        )
