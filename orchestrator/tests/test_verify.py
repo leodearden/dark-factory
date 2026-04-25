@@ -1681,3 +1681,18 @@ class TestBuildFallbackConfigConftest:
         assert result.test_command is not None
         assert 'conftest.py' not in result.test_command
         assert result.test_command == 'pytest orchestrator/tests'
+
+    def test_conftest_with_test_files_uses_directory(self):
+        """conftest.py mixed with test files → directory scope, no conftest.py token.
+
+        Even when concrete test files are present, the conftest directory scope
+        takes priority — conftest may affect tests outside the diff, and pytest
+        discovers them correctly from the directory.
+        """
+        result = _build_fallback_config(
+            ['orchestrator/tests/conftest.py', 'orchestrator/tests/test_foo.py'],
+        )
+        assert result is not None
+        assert result.test_command is not None
+        assert result.test_command == 'pytest orchestrator/tests'
+        assert 'conftest.py' not in result.test_command
