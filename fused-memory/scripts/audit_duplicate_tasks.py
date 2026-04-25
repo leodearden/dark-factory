@@ -109,19 +109,29 @@ def _extract_tasks(raw: Any) -> list[dict]:
     caller can distinguish a genuine "no tasks" result from a shape mismatch.
     """
     tasks: list[dict] = []
+    recognised = False
     if isinstance(raw, dict):
-        data = raw.get('data') or raw.get('tasks') or raw
-        if isinstance(data, list):
-            tasks = data
-        elif isinstance(data, dict):
-            tasks = data.get('tasks') or []
+        if 'data' in raw:
+            data = raw['data']
+            if isinstance(data, list):
+                tasks = data
+                recognised = True
+            elif isinstance(data, dict) and 'tasks' in data:
+                tasks = data.get('tasks') or []
+                recognised = True
+            # else: 'data' key present but unrecognised sub-shape
+        elif 'tasks' in raw:
+            tasks = raw.get('tasks') or []
+            recognised = True
+        # else: neither 'data' nor 'tasks' key present
     elif isinstance(raw, list):
         tasks = raw
+        recognised = True
 
     # Warn when the response had content but no tasks could be extracted —
     # silently producing an empty plan would look like "no duplicates found"
     # when the real issue is an unexpected Taskmaster response shape.
-    if not tasks and raw:
+    if not tasks and raw and not recognised:
         shape_hint: Any = (
             list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
         )
