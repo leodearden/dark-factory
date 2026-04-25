@@ -1321,6 +1321,151 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_check_plan_targets_emits_structured_warning_when_dropped_non_empty(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """Structured WARNING is emitted when dropped is non-empty, silent when empty.
+
+        Step 12 contract:
+        - When result.dropped is non-empty, exactly one new WARNING record is emitted
+          whose message includes: task_id, merge_commit_sha, the dropped file list,
+          AND per-step diagnostic info for ALL queried done steps (both successful
+          and failed), not just the failing ones.
+        - When result.dropped is empty (all planned files present), no new WARNING
+          records are emitted — the structured warning is gated on drops.
+
+        Setup: two done steps (one real SHA that deletes file1.py, one bad SHA that
+        supposedly deleted file2.py) + file3.py as a real drop (present on task HEAD
+        but absent from the merge commit).  This gives:
+          dropped = ['file2.py', 'file3.py'] (fail-closed)
+          unresolved_steps = [UnresolvedStep for the bad SHA]
+        The WARNING must mention diagnostics for BOTH done steps.
+
+        Will fail until step 12 adds the always-on structured warning.
+        """
+        worktree = (await git_ops.create_worktree('struct-warn-test')).path
+
+        # file3.py is the real drop: present on task HEAD, will be absent from merge
+        # (it is never committed to the worktree — simulates a conflict-resolution drop)
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        # good_step: real commit that deletes file1.py
+        (worktree / 'file1.py').write_text('f1 = 1\n')
+        await git_ops.commit(worktree, 'Add file1.py')
+        (worktree / 'file1.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Delete file1.py'], cwd=worktree)
+        rc, good_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+        good_sha = good_sha_out.strip()
+
+        bad_sha = '0' * 40  # non-existent object
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('struct-warn', 'Struct warn', 'desc')
+        artifacts.write_plan({
+            'files': ['file1.py', 'file2.py', 'file3.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-good',
+                    'description': 'deleted file1.py (real commit)',
+                    'status': 'done',
+                    'commit': good_sha,
+                },
+                {
+                    'id': 'step-bad',
+                    'description': 'supposedly deleted file2.py (bad SHA)',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'struct-warn-test')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            merge_sha = merge_result.merge_commit
+
+            # ── Sub-case 1: dropped is non-empty → structured WARNING ──────────
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                result = await _check_plan_targets_in_tree(
+                    merge_sha, worktree, git_ops,
+                    task_id='1068-test',
+                )
+
+            # file1.py is expected_absent (good_step deleted it); file2.py and
+            # file3.py are dropped (fail-closed on bad_sha, real drop on file3.py)
+            assert set(result.dropped) == {'file2.py', 'file3.py'}, (
+                f'Unexpected dropped: {result.dropped!r}'
+            )
+
+            warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert warn_records, 'Expected at least one WARNING when dropped is non-empty'
+
+            # Find the structured-warning record (may coexist with per-step warnings)
+            all_messages = ' '.join(r.getMessage() for r in warn_records)
+            assert '1068-test' in all_messages, (
+                f'Expected task_id "1068-test" in WARNING; got: {all_messages!r}'
+            )
+            assert merge_sha in all_messages or merge_sha[:12] in all_messages, (
+                f'Expected merge_commit_sha in WARNING; got: {all_messages!r}'
+            )
+            # Dropped file list
+            assert 'file2.py' in all_messages or 'file3.py' in all_messages, (
+                f'Expected dropped files in WARNING; got: {all_messages!r}'
+            )
+            # Per-step diagnostics for the good step (rc=0, diff-tree succeeded)
+            assert good_sha[:12] in all_messages, (
+                f'Expected good_sha[:12] in WARNING step_diagnostics; '
+                f'got: {all_messages!r}'
+            )
+            # Per-step diagnostics for the bad step (rc!=0, object_missing=True)
+            assert bad_sha[:12] in all_messages, (
+                f'Expected bad_sha[:12] in WARNING step_diagnostics; '
+                f'got: {all_messages!r}'
+            )
+
+            # ── Sub-case 2: dropped is empty → no new WARNING ────────────────
+            # Build a plan where all files are present in the merge tree.
+            worktree2 = (await git_ops.create_worktree('struct-warn-empty')).path
+            (worktree2 / 'present.py').write_text('p = 1\n')
+            await git_ops.commit(worktree2, 'Add present.py')
+            artifacts2 = TaskArtifacts(worktree2)
+            artifacts2.init('sw-empty', 'SW empty', 'desc')
+            artifacts2.write_plan({
+                'files': ['present.py'],
+                'modules': [],
+                'steps': [],
+            })
+            merge_result2 = await git_ops.merge_to_main(worktree2, 'struct-warn-empty')
+            assert merge_result2.success
+            assert merge_result2.merge_commit is not None
+            try:
+                caplog.clear()
+                with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                    result2 = await _check_plan_targets_in_tree(
+                        merge_result2.merge_commit, worktree2, git_ops,
+                        task_id='1068-test-empty',
+                    )
+                assert result2.dropped == [], (
+                    f'Expected empty dropped for present plan, got {result2.dropped!r}'
+                )
+                new_warn = [r for r in caplog.records if r.levelno >= logging.WARNING]
+                assert not new_warn, (
+                    f'Expected no WARNING when dropped is empty; '
+                    f'got: {[r.getMessage() for r in new_warn]!r}'
+                )
+            finally:
+                if merge_result2.merge_worktree:
+                    await git_ops.cleanup_merge_worktree(merge_result2.merge_worktree)
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
