@@ -1908,16 +1908,11 @@ class TestIntraBatchKey:
 
 
 class TestNormalizeTitle:
-    """Unit tests for the module-level _normalize_title helper.
+    """Unit tests for the module-level _normalize_title helper."""
 
-    These tests are written before the implementation is moved to
-    task_curator (TDD step-1); they FAIL initially with ImportError
-    until _normalize_title is added to task_curator in step-2.
-    """
-
-    def test_identical_strings_produce_identical_output(self):
-        """(a) identical inputs → identical normalised output."""
-        assert _normalize_title('Fix the parser') == _normalize_title('Fix the parser')
+    def test_normalises_to_expected_output(self):
+        """(a) normalised output is lowercase with collapsed whitespace."""
+        assert _normalize_title('Fix the parser') == 'fix the parser'
 
     def test_case_folding(self):
         """(b) case difference is normalised away."""
