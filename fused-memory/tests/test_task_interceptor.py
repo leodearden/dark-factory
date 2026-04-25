@@ -188,7 +188,7 @@ async def test_read_operations_no_events(interceptor, taskmaster, event_buffer):
 @pytest.mark.asyncio
 async def test_add_task_emits_event(interceptor_facade, event_buffer):
     """add_task (facade path) emits a task_created event after the worker resolves."""
-    await interceptor_facade.add_task('/project', prompt='Test')
+    await _submit_and_resolve(interceptor_facade, '/project', prompt='Test')
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
 
@@ -208,7 +208,7 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     import json
 
     metadata = {'source': 'review-cycle', 'modules': ['fused-memory/src']}
-    result = await interceptor_facade.add_task('/project', prompt='Test', metadata=metadata)
+    result = await _submit_and_resolve(interceptor_facade, '/project', prompt='Test', metadata=metadata)
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -222,7 +222,7 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
 async def test_add_task_metadata_string_passed_through(interceptor_facade, taskmaster):
     """Pre-serialised metadata JSON is forwarded unchanged."""
     metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
-    await interceptor_facade.add_task(
+    await _submit_and_resolve(interceptor_facade, 
         '/project', prompt='Test', metadata=metadata_json,
     )
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -232,7 +232,7 @@ async def test_add_task_metadata_string_passed_through(interceptor_facade, taskm
 @pytest.mark.asyncio
 async def test_add_task_without_metadata_skips_update(interceptor_facade, taskmaster):
     """add_task without metadata does not call update_task."""
-    await interceptor_facade.add_task('/project', prompt='Test')
+    await _submit_and_resolve(interceptor_facade, '/project', prompt='Test')
     taskmaster.update_task.assert_not_called()
     # Backend still receives metadata=None kwarg but the value is falsy.
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -275,7 +275,7 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer, tmp_pa
     try:
         interceptor = TaskInterceptor(tm, None, event_buffer, ticket_store=store)
         metadata = {'escalation_id': 'esc-x', 'suggestion_hash': 'h'}
-        await interceptor.add_task('/project', prompt='Test', metadata=metadata)
+        await _submit_and_resolve(interceptor, '/project', prompt='Test', metadata=metadata)
 
         # Two add_task attempts: atomic first (with metadata), retry without.
         assert len(call_log) == 2
@@ -327,7 +327,7 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
     await store.initialize()
     interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue, ticket_store=store)
     try:
-        await interceptor.add_task('/project', prompt='Test 1')
+        await _submit_and_resolve(interceptor, '/project', prompt='Test 1')
         await interceptor.set_task_status('1', 'in-progress', '/project')
         await interceptor.remove_task('1', '/project')
         # Let the drainer catch up.
@@ -386,7 +386,7 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
     interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue, ticket_store=store)
     try:
         t0 = time.perf_counter()
-        result = await interceptor.add_task('/project', prompt='Test')
+        result = await _submit_and_resolve(interceptor, '/project', prompt='Test')
         elapsed = time.perf_counter() - t0
         # Canonical write returned successfully — no exception from lock.
         assert result == {'id': '2', 'title': 'New Task'}
@@ -509,7 +509,7 @@ async def test_curator_drop_short_circuits_add_task(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project',
         title='Fix parser bug',
         description='The parser explodes on empty input',
@@ -542,7 +542,7 @@ async def test_curator_combine_updates_target_and_returns_id(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project',
         title='Fix parser on empty input',
         description='Parser panics on empty string',
@@ -567,7 +567,7 @@ async def test_curator_create_proceeds_with_add_task(
     decision = CuratorDecision(action='create', justification='genuinely new')
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project', title='Novel unrelated work',
     )
 
@@ -593,7 +593,7 @@ async def test_curator_combine_failure_falls_through_to_create(
     curator_interceptor._curator = _mock_curator(decision)
     taskmaster.update_task.side_effect = RuntimeError('taskmaster failed')
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project', title='Fix x',
     )
 
@@ -666,7 +666,7 @@ async def test_curator_combine_fingerprint_match_proceeds(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='candidate')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
     assert result['action'] == 'combine'
     assert result['id'] == '50'
@@ -698,7 +698,7 @@ async def test_curator_combine_fingerprint_mismatch_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     # Fell through to create path — combine rejected.
     assert result == {'id': '2', 'title': 'New Task'}
@@ -723,7 +723,7 @@ async def test_curator_combine_missing_fingerprint_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
@@ -749,7 +749,7 @@ async def test_curator_combine_target_done_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
@@ -775,7 +775,7 @@ async def test_curator_combine_target_cancelled_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
@@ -803,7 +803,7 @@ async def test_curator_combine_fingerprint_normalization(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='c')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='c')
 
     assert result['action'] == 'combine'
     taskmaster.update_task.assert_called_once()
@@ -927,8 +927,8 @@ async def test_concurrent_add_task_produces_single_task(
 
     try:
         results = await asyncio.gather(
-            interceptor.add_task('/project', **candidate_kwargs),
-            interceptor.add_task('/project', **candidate_kwargs),
+            _submit_and_resolve(interceptor, '/project', **candidate_kwargs),
+            _submit_and_resolve(interceptor, '/project', **candidate_kwargs),
         )
     finally:
         await store.close()
@@ -956,7 +956,7 @@ async def test_note_created_is_called_inside_lock(curator_interceptor, taskmaste
     curator_mock = _mock_curator(decision)
     curator_interceptor._curator = curator_mock
 
-    await curator_interceptor.add_task('/project', title='Fresh work')
+    await _submit_and_resolve(curator_interceptor, '/project', title='Fresh work')
 
     curator_mock.note_created.assert_called_once()
     args, _ = curator_mock.note_created.call_args
@@ -1043,7 +1043,7 @@ async def test_r4_idempotency_hit_add_task(
         'modules': ['fused-memory/src'],
     }
     try:
-        result = await interceptor.add_task(
+        result = await _submit_and_resolve(interceptor, 
             '/project',
             title='T',
             description='D',
@@ -1163,7 +1163,7 @@ async def test_idempotency_accepts_metadata_as_json_string(
 
     try:
         meta_str = json.dumps({'escalation_id': 'esc-x', 'suggestion_hash': 'hash1'})
-        result = await interceptor.add_task('/project', title='T', metadata=meta_str)
+        result = await _submit_and_resolve(interceptor, '/project', title='T', metadata=meta_str)
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
@@ -1206,7 +1206,7 @@ async def test_idempotency_miss_falls_through_to_curator(
     interceptor._curator = curator_mock
 
     try:
-        await interceptor.add_task(
+        await _submit_and_resolve(interceptor, 
             '/project', title='New',
             metadata={'escalation_id': 'esc-new', 'suggestion_hash': 'fresh'},
         )
@@ -1252,7 +1252,7 @@ async def test_idempotency_skips_cancelled_match(
     interceptor._curator = curator_mock
 
     try:
-        await interceptor.add_task(
+        await _submit_and_resolve(interceptor, 
             '/project', title='Retry',
             metadata={'escalation_id': 'esc-y', 'suggestion_hash': 'hash-y'},
         )
@@ -1284,7 +1284,7 @@ async def test_idempotency_requires_both_keys(
 
     try:
         # Only escalation_id, no suggestion_hash → not eligible.
-        await interceptor.add_task(
+        await _submit_and_resolve(interceptor, 
             '/project', title='T', metadata={'escalation_id': 'esc-x'},
         )
     finally:
@@ -1315,7 +1315,7 @@ async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buff
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg, ticket_store=store)
 
     try:
-        result = await interceptor.add_task('/project', title='T')
+        result = await _submit_and_resolve(interceptor, '/project', title='T')
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
@@ -1457,7 +1457,7 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_
     try:
         # Multiple operations
         await interceptor.set_task_status('1', 'in-progress', project_path)
-        await interceptor.add_task(project_path, prompt='New task')
+        await _submit_and_resolve(interceptor, project_path, prompt='New task')
         await interceptor.update_task('1', project_path, prompt='Updated')
 
         # Buffer queryable by resolved id
@@ -2157,7 +2157,7 @@ async def test_write_methods_commit(interceptor_with_committer, committer):
     pr = '/project'
 
     await i.set_task_status('1', 'in-progress', pr)
-    await i.add_task(pr, prompt='T')
+    await _submit_and_resolve(i, pr, prompt='T')
     await i.update_task('1', pr, prompt='U')
     await i.add_subtask('1', pr, title='S')
     await i.remove_task('1', pr)
@@ -2203,7 +2203,7 @@ async def test_no_committer_still_works(taskmaster, event_buffer, tmp_path):
     await store.initialize()
     interceptor = TaskInterceptor(taskmaster, None, event_buffer, None, ticket_store=store)
     try:
-        result = await interceptor.add_task('/project', prompt='T')
+        result = await _submit_and_resolve(interceptor, '/project', prompt='T')
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
@@ -2301,8 +2301,8 @@ async def test_drain_awaits_pending_commits(taskmaster, event_buffer, tmp_path):
 
     try:
         # Fire-and-forget commits
-        await interceptor.add_task('/project', prompt='A')
-        await interceptor.add_task('/project', prompt='B')
+        await _submit_and_resolve(interceptor, '/project', prompt='A')
+        await _submit_and_resolve(interceptor, '/project', prompt='B')
         await asyncio.sleep(0)  # let tasks start
 
         # Background tasks should be pending
@@ -2427,7 +2427,7 @@ async def test_concurrent_add_task_burst_all_distinct(
     try:
         N = 20
         results = await asyncio.gather(*[
-            interceptor.add_task('/project', title=f'Task {i}')
+            _submit_and_resolve(interceptor, '/project', title=f'Task {i}')
             for i in range(N)
         ])
     finally:
@@ -2499,7 +2499,7 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
     coros = []
     # N adds
     for i in range(5):
-        coros.append(interceptor.add_task('/project', title=f'A{i}'))
+        coros.append(_submit_and_resolve(interceptor, '/project', title=f'A{i}'))
     # M set_task_status (force an 'in-progress' transition — non-noop)
     for i in range(5):
         coros.append(interceptor.set_task_status(str(i), 'in-progress', '/project'))
@@ -2589,8 +2589,8 @@ async def test_two_projects_do_not_serialise(
 
     coros = []
     for i in range(5):
-        coros.append(interceptor.add_task('/projA', title=f'a{i}'))
-        coros.append(interceptor.add_task('/projB', title=f'b{i}'))
+        coros.append(_submit_and_resolve(interceptor, '/projA', title=f'a{i}'))
+        coros.append(_submit_and_resolve(interceptor, '/projB', title=f'b{i}'))
     try:
         await asyncio.gather(*coros)
     finally:
@@ -2726,7 +2726,7 @@ async def test_expand_task_dedup_mutations_are_locked(
     # mutating; the lock must prevent overlap.
     results = await asyncio.gather(
         interceptor.expand_task('1', '/project'),
-        interceptor.add_task('/project', title='concurrent add'),
+        _submit_and_resolve(interceptor, '/project', title='concurrent add'),
     )
 
     assert results[0] is not None
@@ -2826,7 +2826,7 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
 
     try:
         add_result, (status_result, status_elapsed) = await asyncio.gather(
-            interceptor.add_task('/project', title='concurrent add'),
+            _submit_and_resolve(interceptor, '/project', title='concurrent add'),
             timed_set_status(),
         )
     finally:
@@ -3053,7 +3053,7 @@ async def test_add_task_worker_takes_curator_lock_for_r3(
     interceptor_facade._curator_lock = lambda project_id: counting_lock
 
     # --- add_task (facade via submit_task → worker): MUST acquire curator_lock once ---
-    await interceptor_facade.add_task(project_root='/project', title='CL guard test')
+    await _submit_and_resolve(interceptor_facade, project_root='/project', title='CL guard test')
     assert acquisition_count == 1, (
         f'add_task worker should acquire _curator_lock exactly once; got {acquisition_count}'
     )
@@ -3598,7 +3598,7 @@ async def test_expand_task_intra_batch_remove_is_locked(
     # tracked mutations from overlapping.
     results = await asyncio.gather(
         interceptor.expand_task('1', '/project'),
-        interceptor.add_task('/project', title='concurrent add'),
+        _submit_and_resolve(interceptor, '/project', title='concurrent add'),
     )
 
     assert results[0] is not None

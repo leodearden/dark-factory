@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-import warnings
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -193,9 +192,6 @@ class TaskInterceptor:
         # so multiple concurrent waiters (e.g. reconnect/retry patterns) each
         # get their own event.  _signal_ticket_event sets and removes all of them.
         self._ticket_events: dict[str, list[asyncio.Event]] = {}
-        # Tracks which project_ids have already received a DeprecationWarning
-        # from the add_task facade so we only warn once per project.
-        self._deprecation_warned_projects: set[str] = set()
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -1390,7 +1386,7 @@ class TaskInterceptor:
         ticket: str,
         timeout_seconds: float | None = None,
     ) -> tuple[dict, dict | None]:
-        """Core resolve logic shared by ``resolve_ticket`` and the ``add_task`` facade.
+        """Core resolve logic called by ``resolve_ticket``.
 
         Returns ``(public_result, raw_row)`` where:
 
@@ -1399,9 +1395,6 @@ class TaskInterceptor:
         - *raw_row* is the full ticket-store row dict (including ``result_json``)
           when the ticket reached a terminal state, or ``None`` for sentinel
           outcomes (unknown ticket, timeout, store not configured, server-closed).
-
-        Exposing *raw_row* lets the :meth:`add_task` facade reconstruct the
-        legacy result dict without a second SQLite round-trip.
 
         Lost-wakeup safety
         ------------------
@@ -2341,82 +2334,6 @@ class TaskInterceptor:
         if events:
             for event in events:
                 event.set()
-
-    async def add_task(self, project_root: str, **kwargs: Any) -> dict:
-        """Deprecated facade: submit a ticket then block until the worker decides.
-
-        Callers should migrate to ``submit_task`` + ``resolve_ticket`` for
-        explicit control over the blocking behaviour. This facade waits up to
-        115 s (under the MCP 120 s hard limit) and raises ``RuntimeError`` on
-        timeout — there is no silent fallback.
-
-        Serialisation is now primarily provided by the per-project worker
-        ticket queue in ``_curator_worker``; the worker additionally acquires
-        ``_curator_lock(project_id)`` so add_subtask / remove_task curator
-        calls stay mutually exclusive with the worker's curate() step (R3).
-
-        .. deprecated::
-            Migrate callers to ``submit_task`` / ``resolve_ticket``.
-        """
-        project_id = resolve_project_id(project_root)
-        # Emit a logger.warning + DeprecationWarning on the FIRST call per project
-        # so tooling (e.g. pytest -W error) and logs both surface the migration
-        # signal without flooding the warning log on deployments that have many
-        # not-yet-migrated callers.  Subsequent calls log at DEBUG only.
-        if project_id not in self._deprecation_warned_projects:
-            self._deprecation_warned_projects.add(project_id)
-            logger.warning(
-                'add_task: deprecated facade — migrate to submit_task/resolve_ticket '
-                '(project=%s)',
-                project_id,
-            )
-            warnings.warn(
-                f'TaskInterceptor.add_task is deprecated — migrate to '
-                f'submit_task/resolve_ticket (project={project_id})',
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        else:
-            logger.debug(
-                'add_task: deprecated facade — migrate to submit_task/resolve_ticket '
-                '(project=%s)',
-                project_id,
-            )
-
-        # Delegate entirely to the two-phase path.
-        submit_result = await self.submit_task(project_root, **kwargs)
-        if 'error' in submit_result:
-            return submit_result
-
-        ticket = submit_result['ticket']
-        # Use _resolve_ticket_raw so the facade receives the full ticket row
-        # (including result_json) in a single DB read — no second get() needed.
-        resolve_result, row = await self._resolve_ticket_raw(ticket, timeout_seconds=115)
-
-        # Raise on timeout — no silent fallback.  Callers that need to
-        # tolerate long waits should migrate to submit_task+resolve_ticket.
-        if (
-            resolve_result.get('status') == 'failed'
-            and resolve_result.get('reason') == 'timeout'
-        ):
-            raise RuntimeError(
-                f'add_task facade timeout after 115 s waiting for ticket '
-                f'{ticket}; migrate to submit_task+resolve_ticket for explicit control'
-            )
-
-        # Reconstruct the legacy result dict from result_json so in-flight
-        # callers receive the same shape they observed before this rewrite.
-        # ``row`` is already the terminal row — no second DB read.
-        if row is not None and row.get('result_json'):
-            try:
-                return json.loads(row['result_json'])
-            except Exception:
-                logger.warning(
-                    'add_task facade: failed to decode result_json for %s', ticket,
-                )
-
-        # Fallback: return what _resolve_ticket_raw gave us (status/task_id/reason).
-        return resolve_result
 
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any,
