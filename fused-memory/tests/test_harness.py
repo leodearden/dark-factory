@@ -2105,61 +2105,21 @@ class TestHarnessFetchFilteredTaskTree:
             f"Expected INFO record containing 'reconciliation.task_tree_empty_project_root';"
             f" got INFO messages: {[r.getMessage() for r in info_records]}"
         )
+        assert len(empty_root_records) == 1, (
+            f"Expected exactly one such record; got {len(empty_root_records)}"
+        )
 
-        # (a2) project_root must be in extra dict (cross-pins the step-6 contract)
+        # (a2) project_root_repr must be in extra dict; repr('') == "''" vs repr(None) == 'None'
+        # disambiguates empty-string from None at the log level.
         rec = empty_root_records[0]
         _MISSING = object()
-        assert getattr(rec, 'project_root', _MISSING) == '', (
-            f"Expected project_root='' in extra dict; got record __dict__: {rec.__dict__}"
+        assert getattr(rec, 'project_root_repr', _MISSING) == repr(''), (
+            f"Expected project_root_repr={repr('')!r} in extra dict;"
+            f" got record __dict__: {rec.__dict__}"
         )
 
         # (b) short-circuit must NOT call taskmaster.get_tasks
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
-
-    @pytest.mark.asyncio
-    async def test_fetch_filtered_task_tree_empty_project_root_log_carries_project_root_extra(
-        self,
-        journal,
-        event_buffer,
-        mock_memory_service,
-        caplog,
-    ):
-        """INFO log for empty project_root carries project_root='' in the extra dict.
-
-        When project_root is '' the short-circuit branch at harness.py:311
-        fires.  The log record must carry project_root in its extra dict so
-        operators can correlate the event with the (weird/empty) input value
-        rather than guessing from an empty record.
-
-        Asserts:
-        (a) exactly one INFO record with marker
-            'reconciliation.task_tree_empty_project_root'
-        (b) getattr(record, 'project_root') == '' (the extra-dict contribution)
-        """
-        import logging
-
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-        with caplog.at_level(logging.INFO):
-            await harness._fetch_filtered_task_tree('')
-
-        info_empty = [
-            r for r in caplog.records
-            if r.levelno == logging.INFO
-            and 'reconciliation.task_tree_empty_project_root' in r.getMessage()
-        ]
-        # (a) exactly one record
-        assert len(info_empty) == 1, (
-            f"Expected exactly one INFO record with marker; got {len(info_empty)}: "
-            f"{[r.getMessage() for r in info_empty]}"
-        )
-        rec = info_empty[0]
-
-        # (b) project_root attribute present and equal to ''
-        _MISSING = object()
-        assert getattr(rec, 'project_root', _MISSING) == '', (
-            f"Expected project_root='' in extra dict; got record __dict__: {rec.__dict__}"
-        )
 
     @pytest.mark.asyncio
     async def test_fetch_filtered_task_tree_logs_debug_after_successful_happy_path_fetch_with_both_counts(
