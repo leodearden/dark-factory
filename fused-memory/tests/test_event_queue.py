@@ -1027,8 +1027,9 @@ def test_iter_lines_reversed_handles_chunk_boundaries(tmp_path):
 def test_iter_lines_reversed_max_line_bytes_overflow(tmp_path, caplog):
     """Carry-buffer overflow guard fires when a single line exceeds max_line_bytes.
 
-    The guard at event_queue.py:86-94 logs a WARNING containing 'carry buffer exceeded'
-    and yields the accumulated bytes as a malformed fragment rather than raising.
+    The `max_line_bytes` overflow guard inside `_iter_lines_reversed` logs a
+    WARNING containing 'carry buffer exceeded' and yields the accumulated bytes
+    as a malformed fragment rather than raising.
     With the default max_line_bytes=1_048_576 (1 MiB) the branch is unreachable
     in production; this test drives it with chunk_size=50 and max_line_bytes=100.
 
