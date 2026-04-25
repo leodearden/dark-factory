@@ -777,6 +777,35 @@ class TestApplyChangesDependencyUpdates:
         backend.remove_dependency.assert_awaited_once()
         backend.add_dependency.assert_awaited_once()
 
+    async def test_remove_failure_skips_add_and_counts_one_error(self):
+        """When remove_dependency raises, add_dependency must NOT be called and the error is counted once."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        backend = MagicMock()
+        backend.set_task_status = AsyncMock(return_value={})
+        backend.remove_dependency = AsyncMock(side_effect=RuntimeError('backend offline'))
+        backend.add_dependency = AsyncMock(return_value={})
+
+        plan = {
+            'cancellations': [],
+            'dependency_updates': [
+                {'dependent_id': '450', 'remove_dep': '499', 'add_dep': '400'},
+            ],
+        }
+        result = await apply_changes(backend, '/project', plan)
+
+        # remove was attempted
+        backend.remove_dependency.assert_awaited_once_with('450', '499', '/project', None)
+        # add must be skipped entirely when remove fails
+        backend.add_dependency.assert_not_awaited()
+        # failure counted exactly once, not as applied
+        assert result == {
+            'cancelled': 0,
+            'cancel_errors': 0,
+            'dep_updates_applied': 0,
+            'dep_update_errors': 1,
+        }
+
 
 # ===========================================================================
 # Step-11: build_audit_plan
