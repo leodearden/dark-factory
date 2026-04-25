@@ -2259,6 +2259,72 @@ class TestHarnessFetchFilteredTaskTree:
         )
 
     @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_raw_gt_zero_total_zero_logs_info_anomaly(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """raw_count>0 AND total_count==0 is an anomaly and must emit INFO.
+
+        When taskmaster returns tasks but filter_task_tree drops all of them
+        (e.g. bare ints that fail the isinstance(task, dict) guard in
+        task_filter.py:191), raw_count>0 while total_count==0.  This signals
+        a filter/unknown-status mismatch that operators should see without
+        enabling DEBUG logging.
+
+        Construction: pass bare ints as task elements so filter drops them all.
+        len(tasks_data['tasks'])==3 → raw_count=3; filter skips all ints →
+        total_count=0.
+
+        Asserts:
+        (a) one record with marker 'reconciliation.task_tree_fetched' at INFO
+            level, carrying raw_count=3, total_count=0
+        (b) no DEBUG record with that marker (DEBUG is for non-anomaly paths)
+        """
+        import logging
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Bare ints — filter skips all of them via isinstance(task, dict) guard
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [1, 2, 3]
+        }
+
+        with caplog.at_level(logging.DEBUG):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # (a) INFO record with marker and correct structured fields
+        info_fetched = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert info_fetched, (
+            f"Expected INFO record with 'reconciliation.task_tree_fetched' for anomaly;"
+            f" got records: {[(r.levelno, r.getMessage()) for r in caplog.records]}"
+        )
+        rec = info_fetched[0]
+        assert getattr(rec, 'raw_count', None) == 3, (
+            f"Expected raw_count=3; got {rec.__dict__}"
+        )
+        assert getattr(rec, 'total_count', None) == 0, (
+            f"Expected total_count=0; got {rec.__dict__}"
+        )
+
+        # (b) no DEBUG record with the marker
+        debug_fetched = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert not debug_fetched, (
+            f"Expected NO DEBUG record with 'reconciliation.task_tree_fetched';"
+            f" got: {[r.getMessage() for r in debug_fetched]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_fetch_filtered_task_tree_distinguishes_fetch_zero_from_filter_zero_in_logs(
         self,
         journal,
