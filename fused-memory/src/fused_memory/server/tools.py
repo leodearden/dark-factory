@@ -52,7 +52,7 @@ Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
-- add_task / update_task / add_subtask / remove_task: Task CRUD
+- update_task / add_subtask / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
 - expand_task / parse_prd: Bulk task generation
 
@@ -1422,61 +1422,6 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
-    async def add_task(
-        project_root: str,
-        prompt: str | None = None,
-        title: str | None = None,
-        description: str | None = None,
-        details: str | None = None,
-        dependencies: str | None = None,
-        priority: str | None = None,
-        metadata: str | dict[str, Any] | None = None,
-        tag: str | None = None,
-    ) -> dict[str, Any]:
-        """Add a new task to the project.
-
-        Consider including memory_hints in the description or details so future
-        agents can prefetch relevant context (e.g. entity names to look up,
-        search queries to run).
-
-        Args:
-            project_root: Absolute path to project root
-            prompt: Task description for AI generation
-            title: Manual task title
-            description: Manual task description
-            details: Manual task details
-            dependencies: Comma-separated dependency task IDs
-            priority: critical, high, medium, low, or polish (default medium).
-                Tiers are strictly ordered: critical > high > medium > low > polish.
-                Scheduler uses priority inheritance — a medium task with a critical
-                dependent schedules as critical. Unknown values coerce to medium.
-            metadata: Task metadata (e.g. {"source": "review-cycle", "modules": ["path/to/module"]}).
-                Persisted via a follow-up update_task call after creation.
-            tag: Tag context (optional)
-        """
-        _normalized = _normalize_project_root(project_root)
-        if isinstance(_normalized, dict):
-            return _normalized
-        project_root = _normalized
-        try:
-            return await task_interceptor.add_task(
-                project_root=project_root,
-                prompt=prompt,
-                title=title,
-                description=description,
-                details=details,
-                dependencies=dependencies,
-                priority=priority,
-                metadata=metadata,
-                tag=tag,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'add_task error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
-
-    @mcp.tool()
     async def submit_task(
         project_root: str,
         prompt: str | None = None,
@@ -1547,8 +1492,7 @@ def create_mcp_server(
           reasons: ``timeout``, ``server_restart``, ``expired``.
 
         Callers that receive ``status=failed, reason=timeout`` should either
-        retry or report an error — the legacy ``add_task`` facade raises
-        ``RuntimeError`` in this case.
+        retry or report an error.
 
         Args:
             ticket: Ticket id returned by ``submit_task`` (must start with ``tkt_``)
@@ -1567,7 +1511,7 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
         # Apply a safe default timeout at the MCP layer so external callers
-        # cannot block indefinitely — mirrors the add_task facade's 115 s budget.
+        # cannot block indefinitely.
         effective_timeout = 115.0 if timeout_seconds is None else timeout_seconds
         try:
             return await task_interceptor.resolve_ticket(
