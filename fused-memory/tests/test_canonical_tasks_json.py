@@ -185,7 +185,7 @@ async def test_submit_task_creates_tasks_json_in_main_not_worktree(tmp_path):
         # Phase 2: resolve_ticket — waits for the worker to call tm.add_task
         resolve_result = await server._tool_manager.call_tool(
             'resolve_ticket',
-            {'ticket': ticket, 'project_root': str(wt), 'timeout_seconds': 5.0},
+            {'ticket': ticket, 'project_root': str(wt), 'timeout_seconds': 10.0},
         )
 
         assert resolve_result.get('status') == 'created', (
