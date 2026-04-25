@@ -394,24 +394,22 @@ async def apply_changes(
         dep_id = upd['dependent_id']
         remove_dep = upd['remove_dep']
         add_dep = upd.get('add_dep')
-        op_ok = True
         try:
             await backend.remove_dependency(dep_id, remove_dep, project_root, tag)
             logger.info('Removed dep %s→%s', dep_id, remove_dep)
         except Exception as exc:
             logger.error('Failed to remove dep %s→%s: %s', dep_id, remove_dep, exc)
-            op_ok = False
             dep_update_errors += 1
+            continue
         if add_dep is not None:
             try:
                 await backend.add_dependency(dep_id, add_dep, project_root, tag)
                 logger.info('Added dep %s→%s', dep_id, add_dep)
             except Exception as exc:
                 logger.error('Failed to add dep %s→%s: %s', dep_id, add_dep, exc)
-                op_ok = False
                 dep_update_errors += 1
-        if op_ok:
-            dep_updates_applied += 1
+                continue
+        dep_updates_applied += 1
 
     return {
         'cancelled': cancelled,
