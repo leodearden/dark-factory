@@ -579,6 +579,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.project_root = tmp_path
     config.usage_cap.enabled = False
     config.review.enabled = False
+    config.sandbox.backend = 'auto'
     config.max_concurrent_tasks = 2
     config.fused_memory.project_id = 'test'
     config.sandbox.backend = 'auto'

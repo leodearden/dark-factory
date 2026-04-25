@@ -1,14 +1,22 @@
-"""Unit tests for sandbox_dispatch.set_backend() input contract.
+"""Tests for sandbox_dispatch.set_backend() input contract.
 
-Pins the validation contract of set_backend():
-- valid Backend Literal values are accepted and round-trip through get_backend()
-- unknown-but-correctly-typed strings (e.g. 'docker') raise ValueError
-- non-string inputs (MagicMock, int, None) raise TypeError
+Two test classes:
+- TestSetBackendAcceptsValidValues: one test per Backend Literal member;
+  these pass with the current (permissive) implementation.
+- TestSetBackendRejectsInvalidInput: five tests asserting the correct
+  exception for bad inputs:
+    - TypeError  for wrong-type values (not a str): MagicMock, int, None
+    - ValueError for right-type-but-invalid strings: 'docker', ''
+  This split lets callers distinguish 'caller passed garbage type' from
+  'caller passed a typo string'.
 
-A module-scoped autouse fixture saves/restores _preferred around each test so
-these tests are fully isolated without relying on any project-wide autouse
-fixture.
+Module-local autouse fixture _restore_backend snapshots and restores
+_preferred around each test so this file is independent of the
+project-wide _reset_sandbox_backend autouse fixture (which was retired
+once the validator makes corruption impossible via fail-fast TypeError/
+ValueError rather than silent global poisoning).
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -20,18 +28,15 @@ from orchestrator.agents import sandbox_dispatch
 
 @pytest.fixture(autouse=True)
 def _restore_backend():
-    """Snapshot _preferred before each test and restore it after."""
+    """Snapshot and restore sandbox_dispatch._preferred around every test."""
     saved = sandbox_dispatch.get_backend()
     yield
     sandbox_dispatch.set_backend(saved)
 
 
-# ---------------------------------------------------------------------------
-# Accept tests — each valid Literal value must be accepted and returned by
-# get_backend() immediately after the call.
-# ---------------------------------------------------------------------------
-
 class TestSetBackendAcceptsValidValues:
+    """set_backend() must accept every member of the Backend Literal."""
+
     def test_accepts_auto(self):
         sandbox_dispatch.set_backend('auto')
         assert sandbox_dispatch.get_backend() == 'auto'
@@ -49,19 +54,20 @@ class TestSetBackendAcceptsValidValues:
         assert sandbox_dispatch.get_backend() == 'none'
 
 
-# ---------------------------------------------------------------------------
-# Reject tests — invalid inputs must raise the appropriate exception.
-# Wrong-value-but-correct-type strings raise ValueError; non-strings raise TypeError.
-# ---------------------------------------------------------------------------
-
 class TestSetBackendRejectsInvalidInput:
-    def test_rejects_docker_string(self):
+    """set_backend() raises TypeError for wrong-type args, ValueError for bad strings."""
+
+    # --- string inputs (right type, wrong value) → ValueError ---
+
+    def test_rejects_unknown_string(self):
         with pytest.raises(ValueError):
             sandbox_dispatch.set_backend('docker')  # type: ignore[arg-type]
 
     def test_rejects_empty_string(self):
         with pytest.raises(ValueError):
             sandbox_dispatch.set_backend('')  # type: ignore[arg-type]
+
+    # --- non-string inputs (wrong type entirely) → TypeError ---
 
     def test_rejects_magicmock(self):
         with pytest.raises(TypeError):
@@ -71,6 +77,6 @@ class TestSetBackendRejectsInvalidInput:
         with pytest.raises(TypeError):
             sandbox_dispatch.set_backend(42)  # type: ignore[arg-type]
 
-    def test_rejects_none(self):
+    def test_rejects_none_value(self):
         with pytest.raises(TypeError):
             sandbox_dispatch.set_backend(None)  # type: ignore[arg-type]
