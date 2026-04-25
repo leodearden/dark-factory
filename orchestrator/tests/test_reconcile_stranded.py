@@ -77,28 +77,12 @@ class TestPidAlive:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def git_config() -> GitConfig:
-    return GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-    )
-
-
-@pytest.fixture
-def harness(tmp_path: Path, git_config: GitConfig):
+def harness(tmp_path: Path, mock_orch_config):
     """Create a Harness with mocked internals for unit testing reconciliation."""
-    config = MagicMock()
-    config.git = git_config
-    config.project_root = tmp_path
-    config.usage_cap.enabled = False
-    config.sandbox.backend = 'auto'
-
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
          patch('orchestrator.harness.BriefingAssembler'):
-        h = Harness(config)
+        h = Harness(mock_orch_config)
 
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
