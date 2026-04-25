@@ -93,6 +93,7 @@ def harness(tmp_path: Path, git_config: GitConfig):
     config.git = git_config
     config.project_root = tmp_path
     config.usage_cap.enabled = False
+    config.sandbox.backend = 'auto'
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -580,6 +581,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.review.enabled = False
     config.max_concurrent_tasks = 2
     config.fused_memory.project_id = 'test'
+    config.sandbox.backend = 'auto'
 
     with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
          patch('orchestrator.harness.Scheduler'), \
