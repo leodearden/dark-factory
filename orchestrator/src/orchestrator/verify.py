@@ -49,18 +49,21 @@ def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str 
 
 
 def _is_test_file(path: str) -> bool:
-    """Return True when *path* looks like a concrete test file.
+    """Return True for concrete test files (test_*.py, *_test.py, anything under tests/).
 
-    ``conftest.py`` is intentionally excluded here — use :func:`_is_conftest`
-    for that.  conftest files are not directly runnable by pytest, so mixing
-    them into file lists passed to pytest causes "no tests ran" failures.
+    Returns False for conftest.py at any depth — conftest files are not directly
+    runnable by pytest, so excluding them here means callers can pass the result
+    straight to pytest without a follow-up filter.
     """
     name = path.rsplit('/', 1)[-1]
     return (
-        name.startswith('test_')
-        or name.endswith('_test.py')
-        or '/tests/' in path
-        or path.startswith('tests/')
+        (
+            name.startswith('test_')
+            or name.endswith('_test.py')
+            or '/tests/' in path
+            or path.startswith('tests/')
+        )
+        and not _is_conftest(path)
     )
 
 
