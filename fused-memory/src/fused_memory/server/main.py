@@ -431,6 +431,9 @@ async def run_server():
             escalation_rate_limit_seconds=(
                 config.reconciliation.bulk_reset_guard_escalation_rate_limit_seconds
             ),
+            write_failure_backoff_seconds=(
+                config.reconciliation.bulk_reset_guard_write_failure_backoff_seconds
+            ),
         )
 
         task_committer = TaskFileCommitter()
