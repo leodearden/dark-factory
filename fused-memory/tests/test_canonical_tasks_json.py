@@ -158,12 +158,15 @@ async def test_submit_task_creates_tasks_json_in_main_not_worktree(tmp_path):
 
     # Build real TicketStore + EventBuffer + TaskInterceptor (no curator, no committer).
     # Without a curator, _dispatch_ticket_decision falls straight through to the
-    # create branch (verified in task_interceptor.py:1627, 1645, 1679).
+    # create branch.
+    # Note: interceptor.close() owns the ticket_store and closes it (see close() docstring
+    # point 6); no separate store.close() call is needed in the finally block.
     store = TicketStore(tmp_path / 'e2e_tickets.db')
     await store.initialize()
     event_buffer = EventBuffer(db_path=tmp_path / 'e2e_eb.db', buffer_size_threshold=100)
     await event_buffer.initialize()
     interceptor = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=store)
+    await interceptor.start()  # mirrors production lifecycle: start() before submit_task
 
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
 
