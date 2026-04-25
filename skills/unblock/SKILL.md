@@ -149,8 +149,6 @@ Everything else: group into logically coherent tasks and queue them.
 - Not too small (don't create a task for a single rename)
 - Include specific file locations and what the reviewers flagged
 
-> **Note:** The `add_task` facade is deprecated and will be removed — use `submit_task` + `resolve_ticket`.
-
 ```
 # Phase 1: submit — returns immediately with a ticket id
 submit_result = submit_task(

@@ -31,10 +31,6 @@ Interpreting the status:
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 
-> **Deprecated**: `mcp__fused-memory__add_task` is a deprecated facade that bypasses the
-> curator queue. It is tolerated in Stage 2 for backward compatibility but must not be used
-> for new task creation — always use `submit_task` + `resolve_ticket` instead.
-
 ## Your Reconciliation Tasks
 1. **Completed tasks with no knowledge captured**: For tasks marked done that lack corresponding \
 memories, search for related context, then write appropriate memories capturing what was accomplished.

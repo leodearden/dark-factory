@@ -143,8 +143,6 @@ Use the `TARGET_PROJECT` you captured at the top of the session as `project_root
 
 Write each task via fused-memory MCP tools using the two-phase pattern:
 
-> **Note:** The `add_task` facade is deprecated and will be removed — always use the two-phase pattern shown below.
-
 ```
 # Phase 1: submit — returns immediately with a ticket id
 submit_result = submit_task(

@@ -77,8 +77,6 @@ Suggest unblocking these.
 
 For each finding classified as "auto-fix" or "clear-cut issue":
 
-> **Note:** `add_task` is a deprecated facade being removed; always use `submit_task` + `resolve_ticket`.
-
 ```
 # Phase 1: submit — returns immediately with a ticket id
 submit_result = submit_task(
