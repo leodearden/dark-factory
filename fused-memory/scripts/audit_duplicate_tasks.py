@@ -408,8 +408,10 @@ async def apply_changes(
             except Exception as exc:
                 logger.error('Failed to add dep %s→%s: %s', dep_id, add_dep, exc)
                 dep_update_errors += 1
-                continue
-        dep_updates_applied += 1
+            else:
+                dep_updates_applied += 1
+        else:
+            dep_updates_applied += 1
 
     return {
         'cancelled': cancelled,
