@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -69,6 +70,85 @@ async def interceptor_facade(taskmaster, reconciler, event_buffer, tmp_path):
                 await t
 
 
+# ---------------------------------------------------------------------------
+# Module-level test helper: two-phase task creation (submit → resolve → shape)
+# ---------------------------------------------------------------------------
+
+
+async def _submit_and_resolve(
+    interceptor,
+    project_root: str,
+    *,
+    timeout_seconds: float = 30.0,
+    **kwargs,
+) -> dict:
+    """Submit a task ticket and wait for the worker to resolve it.
+
+    Reconstructs the legacy facade result shape from ``result_json`` so that
+    migrated test assertions (``result['id']``, ``result['action']``, etc.)
+    remain verbatim.  Designed as a mechanical drop-in for the removed
+    ``TaskInterceptor.add_task`` facade in test code.
+
+    Args:
+        interceptor: A ``TaskInterceptor`` instance (or compatible).
+        project_root: Absolute path to the project root.
+        timeout_seconds: How long to wait for the worker to resolve the ticket.
+            Defaults to 30 s — generous enough for heavy-concurrency tests on
+            loaded CI without being an indefinite wait.  Pass a smaller value
+            for tests that intentionally exercise timeout paths.
+        **kwargs: Forwarded verbatim to ``submit_task``.
+    """
+    submit_result = await interceptor.submit_task(project_root, **kwargs)
+    if 'error' in submit_result:
+        return submit_result
+    ticket = submit_result['ticket']
+    resolve_result = await interceptor.resolve_ticket(
+        ticket, project_root, timeout_seconds=timeout_seconds,
+    )
+    row = await interceptor._ticket_store.get(ticket)
+    if row is not None and row.get('result_json'):
+        try:
+            return json.loads(row['result_json'])
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f'_submit_and_resolve: malformed result_json for ticket {ticket!r}: '
+                f'{row["result_json"]!r}'
+            ) from exc
+    return resolve_result
+
+
+def test_task_interceptor_has_no_add_task_method():
+    """Facade removal contract: TaskInterceptor must no longer expose add_task.
+
+    This test is RED until step-4 deletes the method from task_interceptor.py.
+    """
+    assert not hasattr(TaskInterceptor, 'add_task'), (
+        'TaskInterceptor.add_task must be removed; migrate callers to '
+        'submit_task + resolve_ticket'
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_and_resolve_helper_returns_legacy_shape(
+    interceptor_facade, taskmaster,
+):
+    """_submit_and_resolve returns the same dict shape the old add_task facade returned.
+
+    Verifies that the helper correctly reconstructs result_json into a dict
+    with the 'id' and 'title' keys that downstream assertions rely on.
+    """
+    from fused_memory.middleware.task_curator import CuratorDecision
+
+    # _mock_curator is defined later in the module; Python resolves at call-time.
+    interceptor_facade._curator = _mock_curator(CuratorDecision(action='create'))
+    result = await _submit_and_resolve(interceptor_facade, '/project', title='Test')
+    # taskmaster.add_task fixture returns {'id': '2', 'title': 'New Task'}
+    assert 'id' in result, f'result missing id key: {result}'
+    assert 'title' in result, f'result missing title key: {result}'
+    assert result['id'] == '2'
+    assert result['title'] == 'New Task'
+
+
 @pytest.mark.asyncio
 async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, event_buffer):
     """Non-triggering status change: emits event, no reconciliation."""
@@ -127,7 +207,7 @@ async def test_read_operations_no_events(interceptor, taskmaster, event_buffer):
 @pytest.mark.asyncio
 async def test_add_task_emits_event(interceptor_facade, event_buffer):
     """add_task (facade path) emits a task_created event after the worker resolves."""
-    await interceptor_facade.add_task('/project', prompt='Test')
+    await _submit_and_resolve(interceptor_facade, '/project', prompt='Test')
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
 
@@ -147,7 +227,7 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     import json
 
     metadata = {'source': 'review-cycle', 'modules': ['fused-memory/src']}
-    result = await interceptor_facade.add_task('/project', prompt='Test', metadata=metadata)
+    result = await _submit_and_resolve(interceptor_facade, '/project', prompt='Test', metadata=metadata)
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -158,153 +238,10 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
 
 
 @pytest.mark.asyncio
-async def test_add_task_facade_delegates_to_submit_and_resolve(
-    interceptor_facade, taskmaster,
-):
-    """add_task facade calls submit_task then _resolve_ticket_raw in order,
-    passing the ticket from submit to resolve with a 115s timeout.
-
-    The facade calls the internal _resolve_ticket_raw (not the public resolve_ticket)
-    so it gets both the public result and the raw row in one DB read.
-    """
-    submit_calls = []
-    resolve_raw_calls = []
-    original_submit = interceptor_facade.submit_task
-    original_resolve_raw = interceptor_facade._resolve_ticket_raw
-
-    async def spy_submit(*args, **kwargs):
-        submit_calls.append({'args': args, 'kwargs': kwargs})
-        return await original_submit(*args, **kwargs)
-
-    async def spy_resolve_raw(*args, **kwargs):
-        resolve_raw_calls.append({'args': args, 'kwargs': kwargs})
-        return await original_resolve_raw(*args, **kwargs)
-
-    interceptor_facade.submit_task = spy_submit
-    interceptor_facade._resolve_ticket_raw = spy_resolve_raw
-
-    await interceptor_facade.add_task(project_root='/p', title='T')
-
-    # submit_task called once
-    assert len(submit_calls) == 1, f'submit_task should be called once: {submit_calls}'
-    # _resolve_ticket_raw called once
-    assert len(resolve_raw_calls) == 1, (
-        f'_resolve_ticket_raw should be called once: {resolve_raw_calls}'
-    )
-    # _resolve_ticket_raw should receive the ticket id from submit and timeout=115
-    resolve_entry = resolve_raw_calls[0]
-    r_args = resolve_entry['args']
-    r_kwargs = resolve_entry['kwargs']
-    ticket = r_args[0] if r_args else r_kwargs.get('ticket')
-    assert ticket is not None and ticket.startswith('tkt_'), (
-        f'_resolve_ticket_raw first arg should be the ticket id: {resolve_entry}'
-    )
-    timeout = r_kwargs.get('timeout_seconds', r_args[1] if len(r_args) > 1 else None)
-    assert timeout == 115, (
-        f'_resolve_ticket_raw should be called with timeout_seconds=115: {resolve_entry}'
-    )
-
-
-@pytest.mark.asyncio
-async def test_add_task_facade_emits_deprecation_warning_once_per_project(
-    interceptor_facade, caplog,
-):
-    """add_task emits a DeprecationWarning + logger.warning once per project_id; logger.debug on repeat.
-
-    - First call on /p1 → DeprecationWarning raised + logger.warning
-    - Second call on /p1 → NO DeprecationWarning, NO logger.warning (logger.debug instead)
-    - First call on /p2 → DeprecationWarning raised again + logger.warning
-    - Subsequent calls on /p1 still emit logger.debug mentioning 'deprecated'
-    """
-    import logging
-    import warnings
-
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter('always')
-        # First call on /p1 — should warn.
-        await interceptor_facade.add_task('/p1', prompt='Task 1')
-    dep_warnings_p1_first = [
-        w for w in captured
-        if issubclass(w.category, DeprecationWarning)
-    ]
-    assert len(dep_warnings_p1_first) == 1, (
-        f'Expected exactly one DeprecationWarning on first /p1 call: {dep_warnings_p1_first}'
-    )
-    assert 'deprecated' in str(dep_warnings_p1_first[0].message).lower()
-
-    with warnings.catch_warnings(record=True) as captured2:
-        warnings.simplefilter('always')
-        # Second call on /p1 — should NOT re-warn.
-        await interceptor_facade.add_task('/p1', prompt='Task 2')
-    dep_warnings_p1_second = [
-        w for w in captured2
-        if issubclass(w.category, DeprecationWarning)
-    ]
-    assert len(dep_warnings_p1_second) == 0, (
-        f'Expected no DeprecationWarning on second /p1 call: {dep_warnings_p1_second}'
-    )
-
-    with warnings.catch_warnings(record=True) as captured3:
-        warnings.simplefilter('always')
-        # First call on /p2 — different project, should warn again.
-        await interceptor_facade.add_task('/p2', prompt='Task 3')
-    dep_warnings_p2 = [
-        w for w in captured3
-        if issubclass(w.category, DeprecationWarning)
-    ]
-    assert len(dep_warnings_p2) == 1, (
-        f'Expected exactly one DeprecationWarning on first /p2 call: {dep_warnings_p2}'
-    )
-
-    # Subsequent calls on an already-warned project emit logger.debug (not warning),
-    # so capture at DEBUG level to detect the per-call log entry.
-    with caplog.at_level(logging.DEBUG, logger='fused_memory.middleware.task_interceptor'):
-        await interceptor_facade.add_task('/p1', prompt='Task 4')
-    deprecation_logs = [r for r in caplog.records if 'deprecated' in r.message.lower()]
-    assert len(deprecation_logs) >= 1, (
-        f'Expected at least one log entry mentioning deprecated: {caplog.records}'
-    )
-
-
-@pytest.mark.asyncio
-async def test_add_task_facade_timeout_raises_no_fallback(interceptor_facade, taskmaster):
-    """add_task raises RuntimeError on timeout — no silent fallback to tm.add_task directly.
-
-    If resolve_ticket returns {status: 'failed', reason: 'timeout'} the facade must
-    raise a RuntimeError mentioning 'timeout' and the ticket id.  tm.add_task must
-    NOT have been called directly (outside the worker path).
-    """
-    from unittest.mock import patch
-
-    # Patch _resolve_ticket_raw (called by the facade) to return a timeout sentinel.
-    # It returns (public_result, raw_row) — raw_row is None for sentinel outcomes.
-    async def _fake_resolve_raw(ticket, timeout_seconds=None):
-        return ({'status': 'failed', 'reason': 'timeout', 'task_id': None}, None)
-
-    with (
-        patch.object(interceptor_facade, '_resolve_ticket_raw', side_effect=_fake_resolve_raw),
-        pytest.raises(RuntimeError) as exc_info,
-    ):
-        await interceptor_facade.add_task('/project', prompt='Timeout test')
-
-    error_msg = str(exc_info.value)
-    assert 'timeout' in error_msg.lower(), f'RuntimeError should mention timeout: {error_msg}'
-    assert 'tkt_' in error_msg, f'RuntimeError should contain the ticket id: {error_msg}'
-    # The worker may have been called (submit_task enqueues it), but tm.add_task
-    # must NOT have been called directly by the facade itself — only via the worker.
-    # The facade does NOT call tm.add_task; the worker does. We verify by checking
-    # that the call originated from within _process_add_ticket, not from add_task.
-    # The simplest proxy: if add_task itself called tm.add_task directly, it would
-    # bypass the ticket path entirely — we check this by ensuring submit_task was
-    # the only path used (i.e. error came from resolve_ticket, not tm.add_task).
-    # (tm.add_task may have been called by the background worker; that's fine.)
-
-
-@pytest.mark.asyncio
 async def test_add_task_metadata_string_passed_through(interceptor_facade, taskmaster):
     """Pre-serialised metadata JSON is forwarded unchanged."""
     metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
-    await interceptor_facade.add_task(
+    await _submit_and_resolve(interceptor_facade, 
         '/project', prompt='Test', metadata=metadata_json,
     )
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -314,7 +251,7 @@ async def test_add_task_metadata_string_passed_through(interceptor_facade, taskm
 @pytest.mark.asyncio
 async def test_add_task_without_metadata_skips_update(interceptor_facade, taskmaster):
     """add_task without metadata does not call update_task."""
-    await interceptor_facade.add_task('/project', prompt='Test')
+    await _submit_and_resolve(interceptor_facade, '/project', prompt='Test')
     taskmaster.update_task.assert_not_called()
     # Backend still receives metadata=None kwarg but the value is falsy.
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -357,7 +294,7 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer, tmp_pa
     try:
         interceptor = TaskInterceptor(tm, None, event_buffer, ticket_store=store)
         metadata = {'escalation_id': 'esc-x', 'suggestion_hash': 'h'}
-        await interceptor.add_task('/project', prompt='Test', metadata=metadata)
+        await _submit_and_resolve(interceptor, '/project', prompt='Test', metadata=metadata)
 
         # Two add_task attempts: atomic first (with metadata), retry without.
         assert len(call_log) == 2
@@ -409,7 +346,7 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
     await store.initialize()
     interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue, ticket_store=store)
     try:
-        await interceptor.add_task('/project', prompt='Test 1')
+        await _submit_and_resolve(interceptor, '/project', prompt='Test 1')
         await interceptor.set_task_status('1', 'in-progress', '/project')
         await interceptor.remove_task('1', '/project')
         # Let the drainer catch up.
@@ -468,7 +405,7 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
     interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue, ticket_store=store)
     try:
         t0 = time.perf_counter()
-        result = await interceptor.add_task('/project', prompt='Test')
+        result = await _submit_and_resolve(interceptor, '/project', prompt='Test')
         elapsed = time.perf_counter() - t0
         # Canonical write returned successfully — no exception from lock.
         assert result == {'id': '2', 'title': 'New Task'}
@@ -591,7 +528,7 @@ async def test_curator_drop_short_circuits_add_task(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project',
         title='Fix parser bug',
         description='The parser explodes on empty input',
@@ -624,7 +561,7 @@ async def test_curator_combine_updates_target_and_returns_id(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project',
         title='Fix parser on empty input',
         description='Parser panics on empty string',
@@ -649,7 +586,7 @@ async def test_curator_create_proceeds_with_add_task(
     decision = CuratorDecision(action='create', justification='genuinely new')
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project', title='Novel unrelated work',
     )
 
@@ -675,7 +612,7 @@ async def test_curator_combine_failure_falls_through_to_create(
     curator_interceptor._curator = _mock_curator(decision)
     taskmaster.update_task.side_effect = RuntimeError('taskmaster failed')
 
-    result = await curator_interceptor.add_task(
+    result = await _submit_and_resolve(curator_interceptor, 
         '/project', title='Fix x',
     )
 
@@ -748,7 +685,7 @@ async def test_curator_combine_fingerprint_match_proceeds(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='candidate')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
 
     assert result['action'] == 'combine'
     assert result['id'] == '50'
@@ -780,7 +717,7 @@ async def test_curator_combine_fingerprint_mismatch_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     # Fell through to create path — combine rejected.
     assert result == {'id': '2', 'title': 'New Task'}
@@ -805,7 +742,7 @@ async def test_curator_combine_missing_fingerprint_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
@@ -831,7 +768,7 @@ async def test_curator_combine_target_done_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
@@ -857,7 +794,7 @@ async def test_curator_combine_target_cancelled_aborts(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='Fix x')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
@@ -885,7 +822,7 @@ async def test_curator_combine_fingerprint_normalization(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await curator_interceptor.add_task('/project', title='c')
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='c')
 
     assert result['action'] == 'combine'
     taskmaster.update_task.assert_called_once()
@@ -1002,15 +939,15 @@ async def test_concurrent_add_task_produces_single_task(
 
     taskmaster.add_task = fake_add_task
 
-    candidate_kwargs = dict(
+    candidate_kwargs: dict[str, Any] = dict(
         title='Log release-mode warning on duplicate template names',
         description='...',
     )
 
     try:
         results = await asyncio.gather(
-            interceptor.add_task('/project', **candidate_kwargs),
-            interceptor.add_task('/project', **candidate_kwargs),
+            _submit_and_resolve(interceptor, '/project', **candidate_kwargs),
+            _submit_and_resolve(interceptor, '/project', **candidate_kwargs),
         )
     finally:
         await store.close()
@@ -1038,7 +975,7 @@ async def test_note_created_is_called_inside_lock(curator_interceptor, taskmaste
     curator_mock = _mock_curator(decision)
     curator_interceptor._curator = curator_mock
 
-    await curator_interceptor.add_task('/project', title='Fresh work')
+    await _submit_and_resolve(curator_interceptor, '/project', title='Fresh work')
 
     curator_mock.note_created.assert_called_once()
     args, _ = curator_mock.note_created.call_args
@@ -1125,7 +1062,7 @@ async def test_r4_idempotency_hit_add_task(
         'modules': ['fused-memory/src'],
     }
     try:
-        result = await interceptor.add_task(
+        result = await _submit_and_resolve(interceptor, 
             '/project',
             title='T',
             description='D',
@@ -1245,7 +1182,7 @@ async def test_idempotency_accepts_metadata_as_json_string(
 
     try:
         meta_str = json.dumps({'escalation_id': 'esc-x', 'suggestion_hash': 'hash1'})
-        result = await interceptor.add_task('/project', title='T', metadata=meta_str)
+        result = await _submit_and_resolve(interceptor, '/project', title='T', metadata=meta_str)
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
@@ -1288,7 +1225,7 @@ async def test_idempotency_miss_falls_through_to_curator(
     interceptor._curator = curator_mock
 
     try:
-        await interceptor.add_task(
+        await _submit_and_resolve(interceptor, 
             '/project', title='New',
             metadata={'escalation_id': 'esc-new', 'suggestion_hash': 'fresh'},
         )
@@ -1334,7 +1271,7 @@ async def test_idempotency_skips_cancelled_match(
     interceptor._curator = curator_mock
 
     try:
-        await interceptor.add_task(
+        await _submit_and_resolve(interceptor, 
             '/project', title='Retry',
             metadata={'escalation_id': 'esc-y', 'suggestion_hash': 'hash-y'},
         )
@@ -1366,7 +1303,7 @@ async def test_idempotency_requires_both_keys(
 
     try:
         # Only escalation_id, no suggestion_hash → not eligible.
-        await interceptor.add_task(
+        await _submit_and_resolve(interceptor, 
             '/project', title='T', metadata={'escalation_id': 'esc-x'},
         )
     finally:
@@ -1397,7 +1334,7 @@ async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buff
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg, ticket_store=store)
 
     try:
-        result = await interceptor.add_task('/project', title='T')
+        result = await _submit_and_resolve(interceptor, '/project', title='T')
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
@@ -1539,7 +1476,7 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_
     try:
         # Multiple operations
         await interceptor.set_task_status('1', 'in-progress', project_path)
-        await interceptor.add_task(project_path, prompt='New task')
+        await _submit_and_resolve(interceptor, project_path, prompt='New task')
         await interceptor.update_task('1', project_path, prompt='Updated')
 
         # Buffer queryable by resolved id
@@ -2239,7 +2176,7 @@ async def test_write_methods_commit(interceptor_with_committer, committer):
     pr = '/project'
 
     await i.set_task_status('1', 'in-progress', pr)
-    await i.add_task(pr, prompt='T')
+    await _submit_and_resolve(i, pr, prompt='T')
     await i.update_task('1', pr, prompt='U')
     await i.add_subtask('1', pr, title='S')
     await i.remove_task('1', pr)
@@ -2285,7 +2222,7 @@ async def test_no_committer_still_works(taskmaster, event_buffer, tmp_path):
     await store.initialize()
     interceptor = TaskInterceptor(taskmaster, None, event_buffer, None, ticket_store=store)
     try:
-        result = await interceptor.add_task('/project', prompt='T')
+        result = await _submit_and_resolve(interceptor, '/project', prompt='T')
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
@@ -2383,8 +2320,8 @@ async def test_drain_awaits_pending_commits(taskmaster, event_buffer, tmp_path):
 
     try:
         # Fire-and-forget commits
-        await interceptor.add_task('/project', prompt='A')
-        await interceptor.add_task('/project', prompt='B')
+        await _submit_and_resolve(interceptor, '/project', prompt='A')
+        await _submit_and_resolve(interceptor, '/project', prompt='B')
         await asyncio.sleep(0)  # let tasks start
 
         # Background tasks should be pending
@@ -2509,7 +2446,7 @@ async def test_concurrent_add_task_burst_all_distinct(
     try:
         N = 20
         results = await asyncio.gather(*[
-            interceptor.add_task('/project', title=f'Task {i}')
+            _submit_and_resolve(interceptor, '/project', title=f'Task {i}')
             for i in range(N)
         ])
     finally:
@@ -2581,7 +2518,7 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
     coros = []
     # N adds
     for i in range(5):
-        coros.append(interceptor.add_task('/project', title=f'A{i}'))
+        coros.append(_submit_and_resolve(interceptor, '/project', title=f'A{i}'))
     # M set_task_status (force an 'in-progress' transition — non-noop)
     for i in range(5):
         coros.append(interceptor.set_task_status(str(i), 'in-progress', '/project'))
@@ -2671,8 +2608,8 @@ async def test_two_projects_do_not_serialise(
 
     coros = []
     for i in range(5):
-        coros.append(interceptor.add_task('/projA', title=f'a{i}'))
-        coros.append(interceptor.add_task('/projB', title=f'b{i}'))
+        coros.append(_submit_and_resolve(interceptor, '/projA', title=f'a{i}'))
+        coros.append(_submit_and_resolve(interceptor, '/projB', title=f'b{i}'))
     try:
         await asyncio.gather(*coros)
     finally:
@@ -2808,7 +2745,7 @@ async def test_expand_task_dedup_mutations_are_locked(
     # mutating; the lock must prevent overlap.
     results = await asyncio.gather(
         interceptor.expand_task('1', '/project'),
-        interceptor.add_task('/project', title='concurrent add'),
+        _submit_and_resolve(interceptor, '/project', title='concurrent add'),
     )
 
     assert results[0] is not None
@@ -2908,7 +2845,7 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
 
     try:
         add_result, (status_result, status_elapsed) = await asyncio.gather(
-            interceptor.add_task('/project', title='concurrent add'),
+            _submit_and_resolve(interceptor, '/project', title='concurrent add'),
             timed_set_status(),
         )
     finally:
@@ -3135,7 +3072,7 @@ async def test_add_task_worker_takes_curator_lock_for_r3(
     interceptor_facade._curator_lock = lambda project_id: counting_lock
 
     # --- add_task (facade via submit_task → worker): MUST acquire curator_lock once ---
-    await interceptor_facade.add_task(project_root='/project', title='CL guard test')
+    await _submit_and_resolve(interceptor_facade, project_root='/project', title='CL guard test')
     assert acquisition_count == 1, (
         f'add_task worker should acquire _curator_lock exactly once; got {acquisition_count}'
     )
@@ -3680,7 +3617,7 @@ async def test_expand_task_intra_batch_remove_is_locked(
     # tracked mutations from overlapping.
     results = await asyncio.gather(
         interceptor.expand_task('1', '/project'),
-        interceptor.add_task('/project', title='concurrent add'),
+        _submit_and_resolve(interceptor, '/project', title='concurrent add'),
     )
 
     assert results[0] is not None

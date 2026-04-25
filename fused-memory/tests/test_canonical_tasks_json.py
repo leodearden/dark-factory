@@ -53,42 +53,31 @@ def _add_worktree(main: Path, wt_dir: Path, branch: str) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_add_task_from_worktree_path_writes_to_main(tmp_path):
-    """MCP add_task called with a worktree path must forward the main path
-    to the TaskInterceptor, so the canonical tasks.json lives only in main."""
+async def test_submit_task_normalises_worktree_path_to_main(tmp_path):
+    """MCP submit_task called with a worktree path must normalise to the main
+    checkout path before forwarding to TaskInterceptor.
+
+    Note: this test verifies path normalisation only (project_root_seen == main).
+    End-to-end file-creation coverage (tasks.json appearing in main, not worktree)
+    is handled by test_committer_commits_to_main_from_worktree_path below.
+    """
     main = _init_repo(tmp_path / 'repo')
     wt = _add_worktree(main, tmp_path / 'wt', 'feature')
 
-    async def fake_add_task(*, project_root: str, **kwargs):
-        tasks_file = Path(project_root) / TASKS_REL_PATH
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        existing = (
-            json.loads(tasks_file.read_text()) if tasks_file.exists() else {'master': {'tasks': []}}
-        )
-        existing['master']['tasks'].append({'id': 1, 'title': kwargs.get('title', 'new')})
-        tasks_file.write_text(json.dumps(existing))
-        return {'success': True, 'project_root_seen': project_root}
+    async def fake_submit_task(*, project_root: str, **kwargs):
+        return {'ticket': 'tkt_1', 'project_root_seen': project_root}
 
     task_interceptor = AsyncMock()
-    task_interceptor.add_task = AsyncMock(side_effect=fake_add_task)
+    task_interceptor.submit_task = AsyncMock(side_effect=fake_submit_task)
 
     server = create_mcp_server(AsyncMock(), task_interceptor=task_interceptor)
     result = await server._tool_manager.call_tool(
-        'add_task',
+        'submit_task',
         {'project_root': str(wt), 'title': 'from worktree'},
     )
 
-    assert result.get('success') is True
+    assert result.get('ticket') == 'tkt_1'
     assert result['project_root_seen'] == str(main)
-
-    main_tasks = Path(main) / TASKS_REL_PATH
-    wt_tasks = Path(wt) / TASKS_REL_PATH
-    assert main_tasks.exists(), 'main checkout must own tasks.json'
-    assert not wt_tasks.exists(), 'worktree must not have its own tasks.json'
-
-    data = json.loads(main_tasks.read_text())
-    titles = [t['title'] for t in data['master']['tasks']]
-    assert 'from worktree' in titles
 
 
 @pytest.mark.asyncio

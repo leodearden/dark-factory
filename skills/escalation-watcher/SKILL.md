@@ -234,8 +234,6 @@ After the sub-agent returns:
 1. Review the groupings (sanity check — don't re-triage, just confirm the groupings make sense)
 2. Create follow-up tasks using the two-phase pattern for each task group:
 
-   > **Note:** `mcp__fused-memory__add_task` is a deprecated facade being removed — always use `mcp__fused-memory__submit_task` + `mcp__fused-memory__resolve_ticket`.
-
    ```
    # Phase 1: submit — returns immediately with a ticket id
    submit_result = mcp__fused-memory__submit_task(
