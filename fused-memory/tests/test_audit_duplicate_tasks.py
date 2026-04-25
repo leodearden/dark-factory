@@ -771,11 +771,46 @@ class TestApplyChangesDependencyUpdates:
             ],
         }
         # Should NOT raise; partial failure is tolerated.
-        await apply_changes(backend, '/project', plan)
+        result = await apply_changes(backend, '/project', plan)
 
         # Dep updates still proceed despite cancel failure.
         backend.remove_dependency.assert_awaited_once()
         backend.add_dependency.assert_awaited_once()
+
+        # Return counters must reflect: 1 cancel error, 1 dep update applied, 0 dep errors.
+        assert result['cancelled'] == 0
+        assert result['cancel_errors'] == 1
+        assert result['dep_updates_applied'] == 1
+        assert result['dep_update_errors'] == 0
+
+    async def test_remove_failure_skips_add_and_counts_one_error(self):
+        """When remove_dependency raises, add_dependency must NOT be called and the error is counted once."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        backend = MagicMock()
+        backend.set_task_status = AsyncMock(return_value={})
+        backend.remove_dependency = AsyncMock(side_effect=RuntimeError('backend offline'))
+        backend.add_dependency = AsyncMock(return_value={})
+
+        plan = {
+            'cancellations': [],
+            'dependency_updates': [
+                {'dependent_id': '450', 'remove_dep': '499', 'add_dep': '400'},
+            ],
+        }
+        result = await apply_changes(backend, '/project', plan)
+
+        # remove was attempted
+        backend.remove_dependency.assert_awaited_once_with('450', '499', '/project', None)
+        # add must be skipped entirely when remove fails
+        backend.add_dependency.assert_not_awaited()
+        # failure counted exactly once, not as applied
+        assert result == {
+            'cancelled': 0,
+            'cancel_errors': 0,
+            'dep_updates_applied': 0,
+            'dep_update_errors': 1,
+        }
 
 
 # ===========================================================================
