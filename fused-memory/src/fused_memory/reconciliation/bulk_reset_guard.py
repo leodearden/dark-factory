@@ -311,21 +311,6 @@ class BulkResetGuard:
             while state.in_progress_entries and state.in_progress_entries[0].ts < cutoff:
                 state.in_progress_entries.popleft()
 
-            # 3a. Safe eviction: remove idle project state when BOTH entry
-            # deques are empty AND neither rate-limit timestamp has been set,
-            # preventing unbounded dict growth for high-cardinality project_id
-            # sets.  Requires both deques to be empty because done_entries and
-            # in_progress_entries track independent counters.
-            if (
-                not state.done_entries
-                and not state.in_progress_entries
-                and state.last_escalation_ts == 0.0
-                and state.last_write_failure_ts == 0.0
-            ):
-                self._state.pop(project_id, None)
-                state = _GuardState()
-                self._state[project_id] = state
-
             # 4. Route to the per-kind deque and select the matching threshold.
             if kind == 'done_to_pending':
                 entries = state.done_entries
@@ -399,12 +384,19 @@ class BulkResetGuard:
     # Escalation write
     # ------------------------------------------------------------------
 
-    async def _record_write_failure(self, project_id: str, now: float) -> None:
+    async def _record_write_failure(self, project_id: str) -> None:
         """Record a write-failure timestamp for per-project backoff tracking.
+
+        The timestamp is captured fresh at call time (i.e. after the failed I/O
+        has already returned) so the post-I/O elapsed time is included in the
+        backoff window.  This prevents a long, slow I/O failure from appearing
+        'recent' when measured against a stale timestamp captured before the
+        operation started.
 
         Acquires the lock briefly so the update is visible to all concurrent
         callers of ``_maybe_write_escalation``.
         """
+        now = self._now()
         async with self._lock:
             state = self._state.setdefault(project_id, _GuardState())
             state.last_write_failure_ts = now
@@ -423,6 +415,13 @@ class BulkResetGuard:
 
         Returns the path on success, or ``None`` when rate-limited / write
         failed (callers produce ``outcome='rejection'`` in that case).
+
+        The I/O try/except blocks catch ``Exception`` (not ``OSError``) on
+        purpose so that any unexpected error (e.g. ValueError from an odd
+        encoding, AttributeError from a stub Path subclass) is converted to a
+        ``'rejection'`` verdict rather than propagating out of
+        ``observe_attempt``.  ``KeyboardInterrupt`` and ``SystemExit`` are NOT
+        caught — ``Exception`` (not ``BaseException``) is used deliberately.
 
         Parameters
         ----------
@@ -485,11 +484,16 @@ class BulkResetGuard:
         esc_dir = _esc_base
         try:
             await asyncio.to_thread(esc_dir.mkdir, parents=True, exist_ok=True)
-        except OSError as exc:
-            logger.error(
-                'bulk_reset_guard: failed to create escalation dir %s: %s', esc_dir, exc,
+        except Exception:
+            # Intentional broad catch: the guard's contract is 'never let
+            # reconciliation fail because escalation I/O failed'.  A non-OSError
+            # (e.g. unexpected encoding, AttributeError from a stub Path subclass)
+            # must NOT propagate out of observe_attempt.  logger.exception preserves
+            # the full traceback so operators can still diagnose the root cause.
+            logger.exception(
+                'bulk_reset_guard: failed to create escalation dir %s', esc_dir,
             )
-            await self._record_write_failure(project_id, now)
+            await self._record_write_failure(project_id)
             return None
 
         ts = datetime.fromtimestamp(now, tz=UTC).isoformat()
@@ -564,11 +568,12 @@ class BulkResetGuard:
                 len(affected_task_ids),
                 tripped_threshold,
             )
-        except OSError as exc:
-            logger.error(
-                'bulk_reset_guard: failed to write escalation %s: %s', path, exc,
+        except Exception:
+            # Same intentional broad catch as the mkdir block above — see docstring.
+            logger.exception(
+                'bulk_reset_guard: failed to write escalation %s', path,
             )
-            await self._record_write_failure(project_id, now)
+            await self._record_write_failure(project_id)
             return None
 
         # Only advance the rate-limit timestamp AFTER a successful write.
