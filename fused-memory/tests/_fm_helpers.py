@@ -170,7 +170,7 @@ async def submit_and_resolve(
         **kwargs: Forwarded verbatim to ``submit_task``.
     """
     submit_result = await interceptor.submit_task(project_root, **kwargs)
-    if 'ticket' not in submit_result:
+    if not isinstance(submit_result, dict) or 'ticket' not in submit_result:
         return submit_result
     ticket = submit_result['ticket']
     resolve_result = await interceptor.resolve_ticket(

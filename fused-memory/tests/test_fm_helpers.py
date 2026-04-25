@@ -26,17 +26,18 @@ def _make_stub_interceptor(
 
 
 # ---------------------------------------------------------------------------
-# Step-1: guard test — success-dict carrying a non-fatal 'error' field
+# Guard tests — submit_task return-shape routing
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_submit_and_resolve_proceeds_when_submit_result_carries_nonfatal_error_with_ticket():
-    """submit_and_resolve must not bail out on a success-with-warning submit_result.
+async def test_submit_and_resolve_proceeds_when_ticket_present_regardless_of_other_keys():
+    """submit_and_resolve must route on 'ticket' presence, not 'error' absence.
 
-    A future evolution of submit_task may return {'ticket': ..., 'error': 'non-fatal warning'}.
-    The helper should use the presence of 'ticket' (not the absence of 'error') to decide
-    whether to proceed.  Currently the guard `if 'error' in submit_result` bails out early,
-    which is why this test is RED until step 2 fixes the guard.
+    Forward-compatibility test: a future evolution of submit_task may return a success dict
+    that also carries a non-fatal advisory field (e.g. {'ticket': ..., 'error': 'non-fatal
+    warning'}).  The helper must use the *presence of 'ticket'* — not the *absence of 'error'*
+    — to decide whether to proceed to resolve_ticket.  An 'error'-absent guard would silently
+    return the success-with-warning dict verbatim and never resolve the ticket.
     """
     expected = {'id': '99', 'title': 'Done'}
     interceptor = _make_stub_interceptor(
@@ -50,6 +51,28 @@ async def test_submit_and_resolve_proceeds_when_submit_result_carries_nonfatal_e
     # Must have proceeded past the guard and returned the parsed result_json
     assert result == expected, f'expected {expected!r}, got {result!r}'
     interceptor.resolve_ticket.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_submit_and_resolve_returns_submit_error_when_no_ticket():
+    """submit_and_resolve must return the submit-error dict verbatim and NOT call resolve_ticket.
+
+    This is the current-production behavior: submit_task returns an error dict with no 'ticket'
+    key (e.g. backlog gate rejection or closed-server error) and the helper passes it through
+    immediately.  All callers in test_task_interceptor.py and test_backlog_policy.py assert on
+    result.get('error') / result.get('error_type') in this path.
+    """
+    submit_result = {'error': 'closed', 'error_type': 'ClosedError'}
+    interceptor = _make_stub_interceptor(
+        submit_result=submit_result,
+        resolve_result={},
+        ticket_store_row=None,
+    )
+
+    result = await submit_and_resolve(interceptor, '/project', title='T')
+
+    assert result == submit_result, f'expected submit-error dict {submit_result!r}, got {result!r}'
+    interceptor.resolve_ticket.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -81,5 +104,9 @@ async def test_submit_and_resolve_raises_when_no_result_json(row_value):
 
     message = str(excinfo.value)
     assert 'tkt_y' in message, f"ticket id 'tkt_y' not in error message: {message!r}"
-    # resolve_result must be surfaced so the diagnostician can see what the worker returned
-    assert 'timeout' in message, f"resolve_result evidence not in error message: {message!r}"
+    # resolve_result must be dumped verbatim so the diagnostician can see what the worker returned.
+    # Check for the structural marker 'resolve_result=' (from the format string) AND 'failed'
+    # (from resolve_result['status']), rather than a coincidental inner-value substring.
+    assert 'resolve_result=' in message and 'failed' in message, (
+        f"resolve_result not surfaced in error message: {message!r}"
+    )
