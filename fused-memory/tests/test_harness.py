@@ -2109,25 +2109,29 @@ class TestHarnessFetchFilteredTaskTree:
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
-    async def test_fetch_filtered_task_tree_logs_info_after_successful_fetch_with_both_counts(
+    async def test_fetch_filtered_task_tree_logs_debug_after_successful_happy_path_fetch_with_both_counts(
         self,
         journal,
         event_buffer,
         mock_memory_service,
         caplog,
     ):
-        """_fetch_filtered_task_tree emits an INFO log with both raw_count and total_count.
+        """_fetch_filtered_task_tree emits a DEBUG log with both raw_count and total_count.
 
-        After a successful get_tasks call the log must include:
-        (a) the distinct event marker 'reconciliation.task_tree_fetched' at INFO level
+        After a successful non-anomalous get_tasks call the log must include:
+        (a) the distinct event marker 'reconciliation.task_tree_fetched' at DEBUG level
         (b) raw_count = 4 (number of tasks before filtering)
         (c) total_count = 4 (post-filter total from FilteredTaskTree)
         (d) the project_root
 
+        Under the task-985 policy, INFO is reserved for anomalies; healthy
+        fetches (raw>0, total>0) stay at DEBUG.  The structured fields are
+        still present so operators can grep them at DEBUG when needed.
+
         This gives ops the exact signal to distinguish:
           - raw=0, total=0  → Taskmaster returned empty (upstream issue)
-          - raw>0, total=0  → filter_task_tree shape mismatch
-          - raw>0, total>0  → data flowing correctly
+          - raw>0, total=0  → filter_task_tree shape mismatch (anomaly → INFO)
+          - raw>0, total>0  → data flowing correctly (happy-path → DEBUG)
         """
         import logging
 
@@ -2145,7 +2149,7 @@ class TestHarnessFetchFilteredTaskTree:
             ]
         }
 
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             result = await harness._fetch_filtered_task_tree('/abs/path')
 
         # Result is correct
@@ -2154,15 +2158,15 @@ class TestHarnessFetchFilteredTaskTree:
         assert result.done_count == 1
         assert result.cancelled_count == 1
 
-        # (a) INFO log with the distinct event marker
-        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        # (a) DEBUG log with the distinct event marker
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
         fetched_records = [
-            r for r in info_records
+            r for r in debug_records
             if 'reconciliation.task_tree_fetched' in r.getMessage()
         ]
         assert fetched_records, (
-            f"Expected INFO record containing 'reconciliation.task_tree_fetched';"
-            f" got INFO messages: {[r.getMessage() for r in info_records]}"
+            f"Expected DEBUG record containing 'reconciliation.task_tree_fetched';"
+            f" got DEBUG messages: {[r.getMessage() for r in debug_records]}"
         )
 
         rec = fetched_records[0]
@@ -2262,18 +2266,24 @@ class TestHarnessFetchFilteredTaskTree:
         mock_memory_service,
         caplog,
     ):
-        """INFO log unambiguously distinguishes zero-from-upstream vs zero-from-filter.
+        """DEBUG log unambiguously distinguishes zero-from-upstream vs zero-from-filter.
+
+        Under the task-985 policy, both sub-scenarios below are non-anomalies
+        (the anomaly predicate is raw_count>0 AND total_count==0), so both emit
+        at DEBUG.  Structured fields (raw_count, total_count) carry the signal
+        that differentiates them — operators can grep at DEBUG when needed.
 
         Two sub-scenarios:
         (a) Taskmaster returns genuinely empty tasks list:
-            → raw_count=0, total_count=0 in log.
+            → raw_count=0, total_count=0 in log — empty-but-healthy (DEBUG).
         (b) Taskmaster returns tasks but filter_task_tree partitions all into
             other_count (unknown status):
-            → raw_count=1, total_count=1, result.other_count=1, active/done/cancelled empty.
+            → raw_count=1, total_count=1, result.other_count=1, active/done/cancelled empty
+            (anomaly predicate raw>0 AND total==0 is False here since total==1 → DEBUG).
 
-        This is the exact signal Step 4 of the task description calls for:
-        operators can read a single log line and know whether the zero came
-        from upstream Taskmaster or from filter_task_tree's partitioning.
+        Operators can read a single log line and know whether the zero came
+        from upstream Taskmaster or from filter_task_tree's partitioning
+        because the extra dict carries both raw_count and total_count.
         """
         import logging
 
@@ -2282,16 +2292,16 @@ class TestHarnessFetchFilteredTaskTree:
         # ── Sub-scenario (a): Taskmaster returned genuinely empty ──────────
         harness.taskmaster.get_tasks.return_value = {'tasks': []}  # type: ignore[union-attr,attr-defined]
 
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             result_a = await harness._fetch_filtered_task_tree('/abs/path')
 
-        info_records_a = [
+        debug_records_a = [
             r for r in caplog.records
-            if r.levelno == logging.INFO
+            if r.levelno == logging.DEBUG
             and 'reconciliation.task_tree_fetched' in r.getMessage()
         ]
-        assert info_records_a, "Expected reconciliation.task_tree_fetched for empty-tasks scenario"
-        rec_a = info_records_a[0]
+        assert debug_records_a, "Expected reconciliation.task_tree_fetched at DEBUG for empty-tasks scenario"
+        rec_a = debug_records_a[0]
         assert getattr(rec_a, 'raw_count', None) == 0, (
             f"Scenario (a): expected raw_count=0; got {rec_a.__dict__}"
         )
@@ -2310,16 +2320,16 @@ class TestHarnessFetchFilteredTaskTree:
             ]
         }
 
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             result_b = await harness._fetch_filtered_task_tree('/abs/path')
 
-        info_records_b = [
+        debug_records_b = [
             r for r in caplog.records
-            if r.levelno == logging.INFO
+            if r.levelno == logging.DEBUG
             and 'reconciliation.task_tree_fetched' in r.getMessage()
         ]
-        assert info_records_b, "Expected reconciliation.task_tree_fetched for unknown-status scenario"
-        rec_b = info_records_b[0]
+        assert debug_records_b, "Expected reconciliation.task_tree_fetched at DEBUG for unknown-status scenario"
+        rec_b = debug_records_b[0]
         assert getattr(rec_b, 'raw_count', None) == 1, (
             f"Scenario (b): expected raw_count=1; got {rec_b.__dict__}"
         )
