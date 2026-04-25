@@ -1626,3 +1626,37 @@ def test_server_wires_split_thresholds(tmp_path):
     assert guard._done_threshold == 10, (
         f'Expected _done_threshold=10 (default), got {guard._done_threshold}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1032: server wires write_failure_backoff_seconds
+# ---------------------------------------------------------------------------
+
+def test_server_wires_write_failure_backoff_seconds(tmp_path):
+    """Validate the construction pattern server/main.py is expected to use
+    after task-1032 — passing
+    write_failure_backoff_seconds=cfg.bulk_reset_guard_write_failure_backoff_seconds —
+    flows the value through to the guard.
+
+    Mirrors test_server_wires_split_thresholds (the post-step-20 replacement
+    for the fragile inspect.getsource meta-test, see commit da8e5a4c96).
+    Constructs BulkResetGuard with all config-derived kwargs including the new
+    write_failure_backoff_seconds with a bumped value, and asserts the
+    instance attribute matches.  This pins the contract main.py must honor.
+    """
+    from fused_memory.config.schema import ReconciliationConfig
+
+    cfg = ReconciliationConfig(bulk_reset_guard_write_failure_backoff_seconds=42.0)
+    guard = BulkResetGuard(
+        enabled=cfg.bulk_reset_guard_enabled,
+        done_threshold=cfg.bulk_reset_guard_done_to_pending_threshold,
+        in_progress_threshold=cfg.bulk_reset_guard_in_progress_to_pending_threshold,
+        window_seconds=cfg.bulk_reset_guard_window_seconds,
+        escalation_rate_limit_seconds=cfg.bulk_reset_guard_escalation_rate_limit_seconds,
+        write_failure_backoff_seconds=cfg.bulk_reset_guard_write_failure_backoff_seconds,
+        escalations_fallback_dir=tmp_path,
+    )
+    assert guard._write_failure_backoff_seconds == 42.0, (
+        f'Expected _write_failure_backoff_seconds=42.0, got '
+        f'{guard._write_failure_backoff_seconds}'
+    )
