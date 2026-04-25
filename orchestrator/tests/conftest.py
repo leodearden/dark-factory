@@ -57,3 +57,19 @@ def repo_root() -> Path | None:
 def _clear_orch_config_path(monkeypatch):
     """Remove ORCH_CONFIG_PATH so tests don't inadvertently load the real config."""
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_sandbox_backend():
+    """Restore sandbox_dispatch._preferred to its pre-test value after each test.
+
+    Harness.__init__ calls set_backend(config.sandbox.backend).  When tests
+    use config = MagicMock(), config.sandbox.backend is a MagicMock, which
+    poisons the module-level _preferred global.  This fixture isolates that
+    side-effect so later tests (e.g. TestSandboxCallerPropagatesTimedOut) see
+    a clean 'auto' default.
+    """
+    from orchestrator.agents import sandbox_dispatch
+    saved = sandbox_dispatch.get_backend()
+    yield
+    sandbox_dispatch.set_backend(saved)
