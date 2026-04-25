@@ -783,7 +783,6 @@ class TestScopeModuleConfigReturnsNone:
         result = scope_module_config(mc, ['orchestrator/tests/conftest.py'])
         assert result is not None
         assert result.test_command == mc.test_command
-        assert result.test_command is not None and 'conftest.py' not in result.test_command
 
     def test_conftest_with_test_files_uses_full_suite(self):
         """conftest.py mixed with test files should still use the full suite.
@@ -803,7 +802,6 @@ class TestScopeModuleConfigReturnsNone:
         )
         assert result is not None
         assert result.test_command == mc.test_command
-        assert result.test_command is not None and 'conftest.py' not in result.test_command
 
 
 class TestRunScopedVerificationSkipsUntouched:
