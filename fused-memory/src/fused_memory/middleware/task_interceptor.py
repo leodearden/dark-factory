@@ -489,16 +489,8 @@ class TaskInterceptor:
             # unguarded.  The guard's _reversal_kind classifier handles its own
             # filtering; the interceptor must not pre-filter by old_status.
             if self._bulk_reset_guard is not None:
-                # Lock-order contract: we are currently holding
-                # ``_write_lock(project_id)`` (a per-project asyncio.Lock).
-                # ``observe_attempt`` will acquire ``BulkResetGuard._lock``
-                # (a guard-internal global asyncio.Lock shared across all
-                # projects).  The established acquisition order is therefore:
-                #   per-project write_lock → BulkResetGuard global lock
-                # — NEVER the reverse.  Any future change to
-                # ``observe_attempt`` MUST NOT itself try to acquire any
-                # per-project lock or it will deadlock under contention with
-                # concurrent writers on the same project.
+                # Lock-order contract: see BulkResetGuard.observe_attempt —
+                # guard-global lock acquired under per-project write_lock, never the reverse.
                 _brg_verdict = await self._bulk_reset_guard.observe_attempt(
                     project_id=project_id,
                     task_id=task_id,
