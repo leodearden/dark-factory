@@ -40,6 +40,13 @@ class UnresolvedStep:
     ``object_missing`` flag distinguishes a pruned/never-existed object
     (``True``) from some other transient failure (``False``), giving the
     steward the data needed to investigate the next misfire.
+
+    ``cat_file_rc`` and ``cat_file_stderr`` capture the raw outcome of the
+    ``git cat-file -e <sha>^{commit}`` probe so an operator can distinguish
+    "definitely pruned" (cat-file succeeded with a clean 'missing' response)
+    from "cat-file also failed weirdly" (cat-file rc != 0 but stderr shows
+    an ODB lock or fs error).  Defaults to 0 / '' to keep existing
+    :class:`UnresolvedStep` constructions in tests backward-compatible.
     """
 
     step_idx: int
@@ -48,6 +55,8 @@ class UnresolvedStep:
     rc: int
     stderr: str
     object_missing: bool
+    cat_file_rc: int = 0
+    cat_file_stderr: str = ''
 
 
 @dataclass
@@ -236,8 +245,10 @@ async def _check_plan_targets_in_tree(
     #   rationale.
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Pass 1: collect (step_idx, commit) for every qualifying done step.
-    steps_to_query: list[tuple[int, str]] = []
+    # Pass 1: collect (step_idx, commit, step) for every qualifying done step.
+    # The step dict is threaded through so Pass 2 can read step['id'] without
+    # a second enumeration over the full steps list.
+    steps_to_query: list[tuple[int, str, dict]] = []
     for step_idx, step in enumerate(plan.get('steps') or []):
         if not isinstance(step, dict):
             continue
@@ -246,25 +257,19 @@ async def _check_plan_targets_in_tree(
         commit = step.get('commit')
         if not isinstance(commit, str) or not commit:
             continue
-        steps_to_query.append((step_idx, commit))
+        steps_to_query.append((step_idx, commit, step))
 
     # Pass 2: fire all diff-tree queries concurrently, then process results.
     # Deduplicate commit SHAs (preserving first-occurrence order) so each
     # unique SHA is queried only once even when multiple done steps share it.
     expected_absent: set[str] = set()
-    # Build a mapping of step info for diagnostics (step_idx → step dict)
-    step_info: dict[int, dict] = {
-        step_idx: step
-        for step_idx, step in enumerate(plan.get('steps') or [])
-        if isinstance(step, dict)
-    }
     unresolved: list[UnresolvedStep] = []
     # Per-step diagnostics for the structured WARNING: tracks every queried done
     # step (both successful and failed) so the steward sees the full audit trail.
     # Tuple: (step_idx, commit_short, rc, object_missing)
     step_diagnostics: list[tuple[int, str, int, bool]] = []
     if steps_to_query:
-        unique_commits: list[str] = list(dict.fromkeys(c for _, c in steps_to_query))
+        unique_commits: list[str] = list(dict.fromkeys(c for _, c, _ in steps_to_query))
         commit_results = await asyncio.gather(*[
             _run(
                 [
@@ -285,42 +290,67 @@ async def _check_plan_targets_in_tree(
         commit_to_result: dict[str, tuple[int, str, str]] = dict(
             zip(unique_commits, commit_results, strict=True),
         )
-        for step_idx, commit in steps_to_query:
+
+        # First pass over results: collect successes and accumulate failures for
+        # concurrent cat-file probing below.
+        failures: list[tuple[int, str, dict, int, str]] = []
+        for step_idx, commit, step in steps_to_query:
             rc, stdout, stderr = commit_to_result[commit]
-            commit_short = commit[:12]
             if rc != 0:
                 logger.warning(
                     'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
                     step_idx, commit, stderr.strip(),
                 )
-                # Probe whether the failure is due to a missing/pruned object
-                # or some other transient error (ODB lock, env issue, etc.).
-                # `git cat-file -e <sha>^{commit}` exits 0 if the object exists
-                # as a commit, non-zero if it is absent from the ODB.
-                rc_cat, _, _ = await _run(
+                failures.append((step_idx, commit, step, rc, stderr))
+            else:
+                step_diagnostics.append((step_idx, commit[:12], rc, False))
+                for line in stdout.splitlines():
+                    path = line.strip()
+                    if path:
+                        expected_absent.add(path)
+                        logger.debug(
+                            'File %s expected absent (deleted in step %d: %s)',
+                            path, step_idx, commit,
+                        )
+
+        # Probe whether each failed diff-tree is due to a missing/pruned object
+        # or some other transient error (ODB lock, env issue, etc.).
+        # `git cat-file -e <sha>^{commit}` exits 0 if the object exists as a
+        # commit, non-zero if it is absent from the ODB.  All probes run
+        # concurrently to mirror the existing diff-tree gather pattern.
+        if failures:
+            cat_file_results = await asyncio.gather(*[
+                _run(
                     ['git', 'cat-file', '-e', f'{commit}^{{commit}}'],
                     cwd=git_ops.project_root,
                 )
+                for _, commit, _, _, _ in failures
+            ])
+            for (step_idx, commit, step, rc, stderr), (rc_cat, _, cat_stderr) in zip(
+                failures, cat_file_results, strict=True,
+            ):
                 object_missing = (rc_cat != 0)
-                step_diagnostics.append((step_idx, commit_short, rc, object_missing))
+                step_diagnostics.append((step_idx, commit[:12], rc, object_missing))
+                # Truncate stored stderr once at construction; the formatter
+                # prints verbatim so the elision marker is always honest.
+                stderr_stored = (
+                    (stderr[:500] + ' <truncated>') if len(stderr) > 500 else stderr
+                )
+                cat_stderr_stored = (
+                    (cat_stderr[:200] + ' <truncated>')
+                    if len(cat_stderr) > 200
+                    else cat_stderr
+                )
                 unresolved.append(UnresolvedStep(
                     step_idx=step_idx,
-                    step_id=step_info.get(step_idx, {}).get('id'),
+                    step_id=step.get('id'),
                     commit=commit,
                     rc=rc,
-                    stderr=stderr[:500],
+                    stderr=stderr_stored,
                     object_missing=object_missing,
+                    cat_file_rc=rc_cat,
+                    cat_file_stderr=cat_stderr_stored,
                 ))
-                continue
-            step_diagnostics.append((step_idx, commit_short, rc, False))
-            for line in stdout.splitlines():
-                path = line.strip()
-                if path:
-                    expected_absent.add(path)
-                    logger.debug(
-                        'File %s expected absent (deleted in step %d: %s)',
-                        path, step_idx, commit,
-                    )
 
     dropped_files = [f for f in missing if f not in expected_absent]
     if dropped_files:
@@ -352,6 +382,13 @@ def _format_unresolved_steps_suffix(unresolved: list[UnresolvedStep]) -> str:
 
     Both ``MergeWorker._do_merge`` and ``SpeculativeMergeWorker._merger_loop``
     call this helper so the diagnostic text is identical across both paths.
+
+    ``stderr`` and ``cat_file_stderr`` are printed verbatim — truncation and
+    elision markers are applied once at :class:`UnresolvedStep` construction
+    so the displayed value is always honest (no double-truncation).
+    ``cat_file_rc`` lets the steward distinguish "object definitely pruned"
+    (cat-file exited cleanly with a missing-object response) from "cat-file
+    also failed weirdly" (non-zero but stderr shows an ODB lock or fs error).
     """
     lines = [
         '\n\nDrop-guard could not query the following done-step commits '
@@ -359,11 +396,12 @@ def _format_unresolved_steps_suffix(unresolved: list[UnresolvedStep]) -> str:
     ]
     for us in unresolved:
         sha_short = us.commit[:12] if len(us.commit) > 12 else us.commit
-        stderr_trunc = us.stderr[:200] + '...' if len(us.stderr) > 200 else us.stderr
         lines.append(
             f'  step {us.step_id!r} commit {sha_short} '
             f'(rc={us.rc}, object_missing={us.object_missing}, '
-            f'stderr={stderr_trunc!r})'
+            f'cat_file_rc={us.cat_file_rc}, '
+            f'diff_tree_stderr={us.stderr!r}, '
+            f'cat_file_stderr={us.cat_file_stderr!r})'
         )
     return '\n'.join(lines)
 

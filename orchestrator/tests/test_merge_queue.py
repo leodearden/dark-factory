@@ -1255,6 +1255,119 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_pruned_orphan_commit_produces_unresolved_step_with_object_missing(
+        self, git_ops: GitOps,
+    ):
+        """After git gc --prune=now a pruned orphan produces UnresolvedStep(object_missing=True).
+
+        Companion to test_orphan_done_step_commit_object_in_odb_resolves_deletion_as_expected_absent
+        which pins the happy path (orphan still in ODB → deletion resolved, no false positive).
+
+        This test covers the actual failure scenario:
+        - Create a commit that deletes F.py (sha_del)
+        - Orphan it via ``git commit --amend``
+        - Run ``git gc --prune=now`` to evict the orphan from the ODB
+        - Verify ``_check_plan_targets_in_tree`` correctly records an UnresolvedStep
+          with ``object_missing=True`` and non-zero ``cat_file_rc``
+
+        If GC does not prune the orphan in the test environment (very unlikely for
+        objects with no reflog protection and ``--prune=now``) the test is skipped
+        so it does not produce a spurious failure on exotic git configurations.
+        """
+        worktree = (await git_ops.create_worktree('gc-prune-test')).path
+
+        # anchor.py keeps the branch non-empty after F.py is deleted
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        # Create then delete F.py — capture the deletion commit SHA (sha_del)
+        (worktree / 'F.py').write_text('f = 1\n')
+        await git_ops.commit(worktree, 'Add F.py')
+        (worktree / 'F.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Delete F.py'], cwd=worktree)
+        rc, sha_del_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+        sha_del = sha_del_out.strip()
+
+        # Amend to orphan sha_del — stage an extra file so the tree changes and
+        # git produces a genuinely different SHA (not a no-op amend).
+        (worktree / 'amend_marker.py').write_text('# amend marker\n')
+        await _run(['git', 'add', 'amend_marker.py'], cwd=worktree)
+        await _run(['git', 'commit', '--amend', '--no-edit'], cwd=worktree)
+        rc2, sha_del_prime_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc2 == 0
+        assert sha_del_prime_out.strip() != sha_del, 'amend must produce a new SHA'
+
+        # Expire all reflog entries then prune — this is what makes the orphan
+        # truly unreachable and eligible for GC collection.
+        await _run(
+            ['git', 'reflog', 'expire', '--expire=now', '--all'],
+            cwd=git_ops.project_root,
+        )
+        await _run(['git', 'gc', '--prune=now'], cwd=git_ops.project_root)
+
+        # Verify sha_del is now absent from the ODB; if GC kept it (unusual
+        # config), skip rather than fail — the happy-path test covers that case.
+        rc_cat, _, _ = await _run(
+            ['git', 'cat-file', '-t', sha_del],
+            cwd=git_ops.project_root,
+        )
+        if rc_cat == 0:
+            pytest.skip(
+                'git gc --prune=now did not prune the orphan; '
+                'skipping (happy-path covered by test_orphan_done_step_commit_object_in_odb_resolves_deletion_as_expected_absent)'
+            )
+
+        # Plan records sha_del (now pruned) as the done-step commit
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('gc-prune', 'GC prune', 'desc')
+        artifacts.write_plan({
+            'files': ['F.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'Delete F.py (orphaned, now pruned)',
+                    'status': 'done',
+                    'commit': sha_del,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'gc-prune-test')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='gc-prune',
+            )
+            # F.py is in dropped (fail-closed — orphan pruned, deletion evidence lost)
+            assert 'F.py' in result.dropped, (
+                f'Expected F.py in dropped (pruned orphan), got {result.dropped!r}'
+            )
+            # Exactly one UnresolvedStep
+            assert len(result.unresolved_steps) == 1, (
+                f'Expected 1 unresolved step, got {len(result.unresolved_steps)}: '
+                f'{result.unresolved_steps!r}'
+            )
+            us = result.unresolved_steps[0]
+            assert us.step_id == 'step-1', f'Expected step_id=step-1, got {us.step_id!r}'
+            assert us.commit == sha_del, f'Expected commit={sha_del!r}, got {us.commit!r}'
+            assert us.rc != 0, f'Expected diff-tree rc != 0 for pruned object, got {us.rc}'
+            # object_missing=True: cat-file confirmed the object is gone
+            assert us.object_missing is True, (
+                f'Expected object_missing=True for pruned commit, got {us.object_missing!r}'
+            )
+            # cat_file_rc populated: non-zero because the object is absent
+            assert us.cat_file_rc != 0, (
+                f'Expected cat_file_rc != 0 for pruned commit, got {us.cat_file_rc!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
     async def test_check_plan_targets_returns_drop_guard_result_dataclass(
         self, git_ops: GitOps,
     ):
