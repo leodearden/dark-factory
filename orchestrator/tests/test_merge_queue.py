@@ -1823,7 +1823,7 @@ class TestCheckPlanTargetsInTree:
         """Truncation of stderr/cat_file_stderr uses named module-level constants.
 
         Issue 6: the thresholds 500 and 200 are inline magic numbers.  After the
-        fix, ``_UNRESOLVED_STDERR_MAX`` and ``_UNRESOLVED_CAT_STDERR_MAX`` are
+        fix, ``UNRESOLVED_STDERR_MAX`` and ``UNRESOLVED_CAT_STDERR_MAX`` are
         exported from the module and used in the truncation expression.
 
         This test:
@@ -1832,12 +1832,12 @@ class TestCheckPlanTargetsInTree:
              cat-file commit-probe returns 600 Y's.  Merge-tree cat-file probes
              (``<sha>:<path>`` arg form) fall through to the real subprocess.
           3. Asserts that the stored stderr / cat_file_stderr lengths equal
-             ``_UNRESOLVED_STDERR_MAX + len(' <truncated>')`` and
-             ``_UNRESOLVED_CAT_STDERR_MAX + len(' <truncated>')``.
+             ``UNRESOLVED_STDERR_MAX + len(' <truncated>')`` and
+             ``UNRESOLVED_CAT_STDERR_MAX + len(' <truncated>')``.
         """
         from orchestrator.merge_queue import (  # noqa: PLC0415
-            _UNRESOLVED_CAT_STDERR_MAX,
-            _UNRESOLVED_STDERR_MAX,
+            UNRESOLVED_CAT_STDERR_MAX,
+            UNRESOLVED_STDERR_MAX,
         )
 
         worktree = (await git_ops.create_worktree('issue6-trunc-const')).path
@@ -1873,7 +1873,11 @@ class TestCheckPlanTargetsInTree:
                 if '--diff-filter=D' in cmd:
                     # Inject long stderr for diff-tree failure
                     return (128, '', 'X' * 1500)
-                if cmd and '^{commit}' in cmd[-1]:
+                if (
+                    len(cmd) >= 4
+                    and cmd[:3] == ['git', 'cat-file', '-e']
+                    and cmd[-1].endswith('^{commit}')
+                ):
                     # Inject long stderr for cat-file commit-probe failure
                     return (1, '', 'Y' * 600)
                 # Merge-tree cat-file probes and all other calls fall through
@@ -1889,13 +1893,13 @@ class TestCheckPlanTargetsInTree:
             us = result.unresolved_steps[0]
 
             elision = ' <truncated>'
-            assert len(us.stderr) == _UNRESOLVED_STDERR_MAX + len(elision), (
-                f'Expected stderr length {_UNRESOLVED_STDERR_MAX + len(elision)}, '
+            assert len(us.stderr) == UNRESOLVED_STDERR_MAX + len(elision), (
+                f'Expected stderr length {UNRESOLVED_STDERR_MAX + len(elision)}, '
                 f'got {len(us.stderr)}: {us.stderr!r}'
             )
-            assert len(us.cat_file_stderr) == _UNRESOLVED_CAT_STDERR_MAX + len(elision), (
+            assert len(us.cat_file_stderr) == UNRESOLVED_CAT_STDERR_MAX + len(elision), (
                 f'Expected cat_file_stderr length '
-                f'{_UNRESOLVED_CAT_STDERR_MAX + len(elision)}, '
+                f'{UNRESOLVED_CAT_STDERR_MAX + len(elision)}, '
                 f'got {len(us.cat_file_stderr)}: {us.cat_file_stderr!r}'
             )
         finally:

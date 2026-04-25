@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # while cat-file -e stderr on a missing object is typically a single-line
 # "fatal: not a valid object name" message — different bounds reflect the
 # realistic max signal in each field.
-_UNRESOLVED_STDERR_MAX = 500
-_UNRESOLVED_CAT_STDERR_MAX = 200
+UNRESOLVED_STDERR_MAX = 500
+UNRESOLVED_CAT_STDERR_MAX = 200
 
 
 @dataclass
@@ -344,13 +344,13 @@ async def _check_plan_targets_in_tree(
                 # Truncate stored stderr once at construction; the formatter
                 # prints verbatim so the elision marker is always honest.
                 stderr_stored = (
-                    (stderr[:_UNRESOLVED_STDERR_MAX] + ' <truncated>')
-                    if len(stderr) > _UNRESOLVED_STDERR_MAX
+                    (stderr[:UNRESOLVED_STDERR_MAX] + ' <truncated>')
+                    if len(stderr) > UNRESOLVED_STDERR_MAX
                     else stderr
                 )
                 cat_stderr_stored = (
-                    (cat_stderr[:_UNRESOLVED_CAT_STDERR_MAX] + ' <truncated>')
-                    if len(cat_stderr) > _UNRESOLVED_CAT_STDERR_MAX
+                    (cat_stderr[:UNRESOLVED_CAT_STDERR_MAX] + ' <truncated>')
+                    if len(cat_stderr) > UNRESOLVED_CAT_STDERR_MAX
                     else cat_stderr
                 )
                 raw_step_id = step.get('id')
