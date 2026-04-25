@@ -1751,6 +1751,64 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_unresolved_step_step_id_is_none_when_plan_id_is_not_string(
+        self, git_ops: GitOps,
+    ):
+        """Non-string step id (e.g. integer) must be coerced to None in UnresolvedStep.
+
+        ``step.get('id')`` returns ``Any``.  When the plan stores an integer id
+        (e.g. ``123``), the value silently flows into ``UnresolvedStep.step_id``
+        which is annotated ``str | None`` — a silent type violation.
+
+        After the fix, a non-string id is replaced with ``None`` before
+        constructing the ``UnresolvedStep``.
+
+        Setup: done step with ``id=123`` (integer) and a bad commit SHA.
+        The bad SHA forces an ``UnresolvedStep`` to be created.  The plan
+        file ``gone.py`` is never committed → absent from merge tree → drop.
+
+        Assertion: ``result.unresolved_steps[0].step_id is None``.
+        Currently fails because 123 flows through unmodified.
+        """
+        worktree = (await git_ops.create_worktree('issue5-int-step-id')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # non-existent → forces UnresolvedStep creation
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue5', 'T-issue5', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 123,                  # integer, not str → must become None
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue5-int-step-id')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='t-issue5',
+            )
+            assert result.unresolved_steps, 'Expected at least one UnresolvedStep'
+            us = result.unresolved_steps[0]
+            assert us.step_id is None, (
+                f'Expected step_id=None for integer plan id, got {us.step_id!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:

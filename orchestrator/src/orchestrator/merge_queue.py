@@ -341,9 +341,11 @@ async def _check_plan_targets_in_tree(
                     if len(cat_stderr) > 200
                     else cat_stderr
                 )
+                raw_step_id = step.get('id')
+                step_id = raw_step_id if isinstance(raw_step_id, str) else None
                 unresolved.append(UnresolvedStep(
                     step_idx=step_idx,
-                    step_id=step.get('id'),
+                    step_id=step_id,
                     commit=commit,
                     rc=rc,
                     stderr=stderr_stored,
