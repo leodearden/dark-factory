@@ -3858,20 +3858,21 @@ async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
 async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     curator_interceptor, taskmaster,
 ):
-    """Intra-batch pre-pass must acquire _write_lock exactly ONCE for N>1 duplicates.
+    """Intra-batch pre-pass must hold _write_lock continuously across all N removals.
 
     Pins the batched-lock discipline introduced by task-981 item 1: all N
     intra-batch removals are grouped first (outside the lock) and then
     issued inside a single ``async with self._write_lock(project_id):``
     block, rather than serially entering/releasing the lock N times.
 
-    Verification strategy: wrap ``interceptor._write_lock`` with a counter
-    callable that delegates to the original method but increments a counter
-    on each call.  A call count of 1 after driving 4 tasks (3 are dups of
-    the first) proves the batched form.  Under the old per-item form the
-    counter would be 3.
+    Verification strategy (contract pin for lock-hold semantics across the batch):
+    Gate tm.remove_task on paired asyncio.Events and probe the write lock between
+    consecutive calls.  Under the batched form the lock is held continuously so
+    both probes raise TimeoutError; under the old per-item form the lock would
+    be released and re-acquired between items, so the first probe would succeed.
     """
     PROJECT = '/project'
+    PROJECT_ID = resolve_project_id(PROJECT)  # 'project' (resolve strips leading slash)
     post_snapshot = {'tasks': [
         {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
         {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
@@ -3880,28 +3881,63 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     ]}
 
     taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
-    taskmaster.remove_task = AsyncMock(return_value={'success': True})
 
     curator_interceptor._curator = _mock_curator(
         CuratorDecision(action='create', justification='novel')
     )
 
-    # Wrap _write_lock with a counter that delegates to the original bound method.
-    # Setting an instance attribute shadows the class method; the nonlocal counter
-    # increments on each call so we can assert exactly one lock-scope entry per batch.
-    _original_write_lock = curator_interceptor._write_lock
-    _lock_call_count = 0
+    # Gate the first two remove_task calls on paired Events so the test can
+    # observe the lock state between consecutive removals without polling.
+    # The lock is acquired under PROJECT_ID (not PROJECT) — _dedupe_bulk_created
+    # calls resolve_project_id(project_root) before locking.
+    inside_first = asyncio.Event()
+    release_first = asyncio.Event()
+    inside_second = asyncio.Event()
+    release_second = asyncio.Event()
+    _call_count = 0
 
-    def _counting_write_lock(project_id: str):
-        nonlocal _lock_call_count
-        _lock_call_count += 1
-        return _original_write_lock(project_id)
+    async def _gated_remove(tid, _project_root):
+        nonlocal _call_count
+        _call_count += 1
+        if _call_count == 1:
+            inside_first.set()
+            await release_first.wait()
+        elif _call_count == 2:
+            inside_second.set()
+            await release_second.wait()
+        return {'success': True}
 
-    curator_interceptor._write_lock = _counting_write_lock
+    taskmaster.remove_task = AsyncMock(side_effect=_gated_remove)
 
-    result = await curator_interceptor._dedupe_bulk_created(
-        PROJECT, pre_snapshot={'tasks': []},
+    # Schedule the dedupe as a background task so this coroutine can interleave.
+    dedupe_task = asyncio.create_task(
+        curator_interceptor._dedupe_bulk_created(PROJECT, pre_snapshot={'tasks': []})
     )
+
+    # Wait until we are inside the first removal — the batched lock is held.
+    await inside_first.wait()
+
+    # Probe 1: lock must be held (TimeoutError proves the batched scope is active).
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.05
+        )
+
+    # Advance to the second removal.
+    release_first.set()
+    await inside_second.wait()
+
+    # Probe 2: lock must STILL be held between consecutive removals.
+    # Under the old per-item form the lock would have been released here and
+    # the probe would succeed, distinguishing the two implementations.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.05
+        )
+
+    # Release the second removal and let the batch complete.
+    release_second.set()
+    result = await dedupe_task
 
     # (a) 3 tasks removed (the 3 intra-batch duplicates of '10').
     assert len(result['removed']) == 3, f"expected 3 removals, got: {result['removed']}"
@@ -3915,23 +3951,19 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
         f'remove_task called with unexpected args: {actual_calls}'
     )
 
-    # (c) _write_lock was acquired exactly ONCE for the entire batch.
-    # Under the old per-item form this would be 3 — one lock entry per duplicate.
+    # (c) Sanity check: the lock is released once the batch exits its scope.
+    assert not curator_interceptor._write_lock(PROJECT_ID).locked(), (
+        'write lock must be released after the batch completes'
+    )
     #
-    # NOTE — intentional structural/contract pin: this assertion pins the
-    # implementation shape (one `async with self._write_lock(project_id):`
-    # wrapping all N removals), not merely observable lock semantics.  A
-    # future refactor that, for example, switched to a cached asynccontextmanager
-    # yielding the same underlying lock object on every call would break this
-    # test even if the external lock-hold semantics were equivalent.  That is
-    # deliberate: the "single scope" structure is the contract — it determines
-    # the blast radius for concurrent writers and must not regress silently.
+    # NOTE — contract pin for lock-hold semantics across the batch: the two
+    # TimeoutError probes above pin the key invariant — the lock is held
+    # continuously across all N removals, not released and re-acquired per item.
+    # A regression to per-item locking would be caught by probe 2 succeeding
+    # instead of raising TimeoutError.
     # See the two-phase discipline comment in _dedupe_bulk_created for the
     # rationale (no LLM calls between removals → safe to batch; pass-2 stays
     # per-item because LLM calls happen between its removals).
-    assert _lock_call_count == 1, (
-        f'_write_lock was called {_lock_call_count} times (expected 1 for batched form)'
-    )
 
 
 @pytest.mark.asyncio
