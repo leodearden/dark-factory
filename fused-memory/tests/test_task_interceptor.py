@@ -3927,6 +3927,12 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
         await asyncio.wait_for(
             curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
         )
+    assert curator_interceptor._write_lock(PROJECT_ID).locked(), (
+        'lock must still be held after the probe — asyncio.Lock cancellation race '
+        '(pre-3.11) could leave the lock free if a waiter was cancelled just as it '
+        'became available; gating closes that window here but this assertion catches '
+        'any future refactor that re-opens it'
+    )
 
     # Advance to the second removal.
     release_first.set()
@@ -3941,6 +3947,11 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
         await asyncio.wait_for(
             curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
         )
+    assert curator_interceptor._write_lock(PROJECT_ID).locked(), (
+        'lock must still be held after the probe — same cancellation-race rationale '
+        'as Probe 1; gating closes the window but the assertion fails loudly if a '
+        'future edit re-opens it'
+    )
 
     # Release the second removal and let the batch complete.
     release_second.set()
