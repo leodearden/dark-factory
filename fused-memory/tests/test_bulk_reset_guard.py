@@ -954,9 +954,9 @@ async def test_idle_project_state_is_not_evicted_across_attempts(tmp_path):
     — proving the state dict entry was NOT replaced with a fresh _GuardState
     (which would reset last_escalation_ts to 0.0).
 
-    This test FAILS under the current inline eviction code (lines 243-250 of
-    bulk_reset_guard.py) which pops and re-inserts a fresh _GuardState, and
-    PASSES after that block is removed.
+    This test FAILS under the inline eviction block in ``observe_attempt``
+    (that checked both deques empty and both timestamps 0.0) which pops and
+    re-inserts a fresh _GuardState, and PASSES after that block is removed.
     """
     clock = [1000.0]
 
@@ -1010,7 +1010,8 @@ async def test_idle_project_state_is_not_evicted_across_attempts(tmp_path):
     assert guard._state['proj'].last_escalation_ts == trip_ts, (
         f'last_escalation_ts was reset! Expected {trip_ts}, '
         f'got {guard._state["proj"].last_escalation_ts}. '
-        'The dead eviction block (lines 243-250) replaced state with a fresh _GuardState.'
+        'The dead eviction block in observe_attempt (checking both deques empty and both '
+        'timestamps 0.0) replaced state with a fresh _GuardState.'
     )
 
 
@@ -1664,14 +1665,21 @@ async def test_fresh_project_state_object_identity_persists_across_window_reset(
     """_GuardState object identity for a never-tripped project is preserved
     across two observe_attempt calls separated by a window reset.
 
-    Pre-fix (no-op eviction block at bulk_reset_guard.py lines 314-327 present):
+    Object identity (``is``) is the right assertion here because the dead
+    eviction block in ``observe_attempt`` performed ``pop()`` then
+    ``_state[pid] = _GuardState()``, which is the *only* production path that
+    swaps the dataclass instance behind the dict.  A behavioral assertion (e.g.
+    checking deque length) would not catch a re-introduction of the swap.
+
+    Pre-fix (no-op eviction block in ``observe_attempt`` present — checking both
+    deques empty AND both timestamps 0.0):
       On call #2 the deques are empty after pruning AND both timestamps are 0.0,
       so the eviction block fires: it pops the dict entry, creates a NEW
-      _GuardState, and re-inserts it.  The `is` comparison is False — FAIL.
+      _GuardState, and re-inserts it.  The ``is`` comparison is False — FAIL.
 
     Post-fix (eviction block removed):
-      The same _GuardState object is preserved in the dict — the `is` comparison
-      is True — PASS.
+      The same _GuardState object is preserved in the dict — the ``is``
+      comparison is True — PASS.
     """
     clock = [1000.0]
 
@@ -1710,13 +1718,15 @@ async def test_fresh_project_state_object_identity_persists_across_window_reset(
         project_root=str(tmp_path),
     )
 
-    # The dead eviction block (bulk_reset_guard.py lines 314-327) would have
-    # popped and re-inserted a fresh _GuardState here.  After removal the same
-    # object is preserved.
+    # The dead eviction block in observe_attempt (that checked both deques empty
+    # and both timestamps 0.0) would have popped and re-inserted a fresh
+    # _GuardState here.  After removal the same object is preserved.
     assert guard._state['proj-fresh'] is initial_state, (
-        'State object was replaced — the no-op eviction block (lines 314-327 of '
-        'bulk_reset_guard.py) fired, popped the dict entry, and inserted a fresh '
-        '_GuardState.  Remove that block to fix this.'
+        'State object was replaced — the no-op eviction block in observe_attempt '
+        '(that checked not state.done_entries and not state.in_progress_entries '
+        'and state.last_escalation_ts == 0.0 and state.last_write_failure_ts == 0.0) '
+        'fired, popped the dict entry, and inserted a fresh _GuardState.  '
+        'Remove that block to fix this.'
     )
 
 
