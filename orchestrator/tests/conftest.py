@@ -7,8 +7,11 @@ without conflicting with sibling subprojects' conftests under
 """
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+
+from orchestrator.config import GitConfig
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -57,3 +60,32 @@ def repo_root() -> Path | None:
 def _clear_orch_config_path(monkeypatch):
     """Remove ORCH_CONFIG_PATH so tests don't inadvertently load the real config."""
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+
+
+@pytest.fixture
+def mock_orch_config(tmp_path: Path) -> MagicMock:
+    """Return a MagicMock OrchestratorConfig with the five standard defaults.
+
+    Default attributes set:
+    - config.git            — GitConfig(main_branch='main', branch_prefix='task/',
+                                         remote='origin', worktree_dir='.worktrees')
+    - config.project_root   — tmp_path (the test's temporary directory)
+    - config.usage_cap.enabled — False
+    - config.review.enabled    — False
+    - config.sandbox.backend   — 'auto'
+
+    Apply test-specific overrides directly on the returned mock, e.g.:
+        mock_orch_config.orphan_l0_reaper_enabled = True
+    """
+    config = MagicMock()
+    config.git = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+    )
+    config.project_root = tmp_path
+    config.usage_cap.enabled = False
+    config.review.enabled = False
+    config.sandbox.backend = 'auto'
+    return config
