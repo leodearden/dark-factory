@@ -69,6 +69,67 @@ async def interceptor_facade(taskmaster, reconciler, event_buffer, tmp_path):
                 await t
 
 
+# ---------------------------------------------------------------------------
+# Module-level test helper: two-phase task creation (submit → resolve → shape)
+# ---------------------------------------------------------------------------
+
+
+async def _submit_and_resolve(interceptor, project_root: str, **kwargs) -> dict:
+    """Submit a task ticket and wait for the worker to resolve it.
+
+    Reconstructs the legacy facade result shape from ``result_json`` so that
+    migrated test assertions (``result['id']``, ``result['action']``, etc.)
+    remain verbatim.  Designed as a mechanical drop-in for the removed
+    ``TaskInterceptor.add_task`` facade in test code.
+    """
+    submit_result = await interceptor.submit_task(project_root, **kwargs)
+    if 'error' in submit_result:
+        return submit_result
+    ticket = submit_result['ticket']
+    resolve_result = await interceptor.resolve_ticket(
+        ticket, project_root, timeout_seconds=5.0,
+    )
+    row = await interceptor._ticket_store.get(ticket)
+    if row is not None and row.get('result_json'):
+        try:
+            return json.loads(row['result_json'])
+        except Exception:
+            pass
+    return resolve_result
+
+
+def test_task_interceptor_has_no_add_task_method():
+    """Facade removal contract: TaskInterceptor must no longer expose add_task.
+
+    This test is RED until step-4 deletes the method from task_interceptor.py.
+    """
+    assert not hasattr(TaskInterceptor, 'add_task'), (
+        'TaskInterceptor.add_task must be removed; migrate callers to '
+        'submit_task + resolve_ticket'
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_and_resolve_helper_returns_legacy_shape(
+    interceptor_facade, taskmaster,
+):
+    """_submit_and_resolve returns the same dict shape the old add_task facade returned.
+
+    Verifies that the helper correctly reconstructs result_json into a dict
+    with the 'id' and 'title' keys that downstream assertions rely on.
+    """
+    from fused_memory.middleware.task_curator import CuratorDecision
+
+    # _mock_curator is defined later in the module; Python resolves at call-time.
+    interceptor_facade._curator = _mock_curator(CuratorDecision(action='create'))
+    result = await _submit_and_resolve(interceptor_facade, '/project', title='Test')
+    # taskmaster.add_task fixture returns {'id': '2', 'title': 'New Task'}
+    assert 'id' in result, f'result missing id key: {result}'
+    assert 'title' in result, f'result missing title key: {result}'
+    assert result['id'] == '2'
+    assert result['title'] == 'New Task'
+
+
 @pytest.mark.asyncio
 async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, event_buffer):
     """Non-triggering status change: emits event, no reconciliation."""
@@ -155,149 +216,6 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     assert kwargs.get('metadata') == json.dumps(metadata)
     # No follow-up update_task for metadata — the atomic path wrote it.
     taskmaster.update_task.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_add_task_facade_delegates_to_submit_and_resolve(
-    interceptor_facade, taskmaster,
-):
-    """add_task facade calls submit_task then _resolve_ticket_raw in order,
-    passing the ticket from submit to resolve with a 115s timeout.
-
-    The facade calls the internal _resolve_ticket_raw (not the public resolve_ticket)
-    so it gets both the public result and the raw row in one DB read.
-    """
-    submit_calls = []
-    resolve_raw_calls = []
-    original_submit = interceptor_facade.submit_task
-    original_resolve_raw = interceptor_facade._resolve_ticket_raw
-
-    async def spy_submit(*args, **kwargs):
-        submit_calls.append({'args': args, 'kwargs': kwargs})
-        return await original_submit(*args, **kwargs)
-
-    async def spy_resolve_raw(*args, **kwargs):
-        resolve_raw_calls.append({'args': args, 'kwargs': kwargs})
-        return await original_resolve_raw(*args, **kwargs)
-
-    interceptor_facade.submit_task = spy_submit
-    interceptor_facade._resolve_ticket_raw = spy_resolve_raw
-
-    await interceptor_facade.add_task(project_root='/p', title='T')
-
-    # submit_task called once
-    assert len(submit_calls) == 1, f'submit_task should be called once: {submit_calls}'
-    # _resolve_ticket_raw called once
-    assert len(resolve_raw_calls) == 1, (
-        f'_resolve_ticket_raw should be called once: {resolve_raw_calls}'
-    )
-    # _resolve_ticket_raw should receive the ticket id from submit and timeout=115
-    resolve_entry = resolve_raw_calls[0]
-    r_args = resolve_entry['args']
-    r_kwargs = resolve_entry['kwargs']
-    ticket = r_args[0] if r_args else r_kwargs.get('ticket')
-    assert ticket is not None and ticket.startswith('tkt_'), (
-        f'_resolve_ticket_raw first arg should be the ticket id: {resolve_entry}'
-    )
-    timeout = r_kwargs.get('timeout_seconds', r_args[1] if len(r_args) > 1 else None)
-    assert timeout == 115, (
-        f'_resolve_ticket_raw should be called with timeout_seconds=115: {resolve_entry}'
-    )
-
-
-@pytest.mark.asyncio
-async def test_add_task_facade_emits_deprecation_warning_once_per_project(
-    interceptor_facade, caplog,
-):
-    """add_task emits a DeprecationWarning + logger.warning once per project_id; logger.debug on repeat.
-
-    - First call on /p1 → DeprecationWarning raised + logger.warning
-    - Second call on /p1 → NO DeprecationWarning, NO logger.warning (logger.debug instead)
-    - First call on /p2 → DeprecationWarning raised again + logger.warning
-    - Subsequent calls on /p1 still emit logger.debug mentioning 'deprecated'
-    """
-    import logging
-    import warnings
-
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter('always')
-        # First call on /p1 — should warn.
-        await interceptor_facade.add_task('/p1', prompt='Task 1')
-    dep_warnings_p1_first = [
-        w for w in captured
-        if issubclass(w.category, DeprecationWarning)
-    ]
-    assert len(dep_warnings_p1_first) == 1, (
-        f'Expected exactly one DeprecationWarning on first /p1 call: {dep_warnings_p1_first}'
-    )
-    assert 'deprecated' in str(dep_warnings_p1_first[0].message).lower()
-
-    with warnings.catch_warnings(record=True) as captured2:
-        warnings.simplefilter('always')
-        # Second call on /p1 — should NOT re-warn.
-        await interceptor_facade.add_task('/p1', prompt='Task 2')
-    dep_warnings_p1_second = [
-        w for w in captured2
-        if issubclass(w.category, DeprecationWarning)
-    ]
-    assert len(dep_warnings_p1_second) == 0, (
-        f'Expected no DeprecationWarning on second /p1 call: {dep_warnings_p1_second}'
-    )
-
-    with warnings.catch_warnings(record=True) as captured3:
-        warnings.simplefilter('always')
-        # First call on /p2 — different project, should warn again.
-        await interceptor_facade.add_task('/p2', prompt='Task 3')
-    dep_warnings_p2 = [
-        w for w in captured3
-        if issubclass(w.category, DeprecationWarning)
-    ]
-    assert len(dep_warnings_p2) == 1, (
-        f'Expected exactly one DeprecationWarning on first /p2 call: {dep_warnings_p2}'
-    )
-
-    # Subsequent calls on an already-warned project emit logger.debug (not warning),
-    # so capture at DEBUG level to detect the per-call log entry.
-    with caplog.at_level(logging.DEBUG, logger='fused_memory.middleware.task_interceptor'):
-        await interceptor_facade.add_task('/p1', prompt='Task 4')
-    deprecation_logs = [r for r in caplog.records if 'deprecated' in r.message.lower()]
-    assert len(deprecation_logs) >= 1, (
-        f'Expected at least one log entry mentioning deprecated: {caplog.records}'
-    )
-
-
-@pytest.mark.asyncio
-async def test_add_task_facade_timeout_raises_no_fallback(interceptor_facade, taskmaster):
-    """add_task raises RuntimeError on timeout — no silent fallback to tm.add_task directly.
-
-    If resolve_ticket returns {status: 'failed', reason: 'timeout'} the facade must
-    raise a RuntimeError mentioning 'timeout' and the ticket id.  tm.add_task must
-    NOT have been called directly (outside the worker path).
-    """
-    from unittest.mock import patch
-
-    # Patch _resolve_ticket_raw (called by the facade) to return a timeout sentinel.
-    # It returns (public_result, raw_row) — raw_row is None for sentinel outcomes.
-    async def _fake_resolve_raw(ticket, timeout_seconds=None):
-        return ({'status': 'failed', 'reason': 'timeout', 'task_id': None}, None)
-
-    with (
-        patch.object(interceptor_facade, '_resolve_ticket_raw', side_effect=_fake_resolve_raw),
-        pytest.raises(RuntimeError) as exc_info,
-    ):
-        await interceptor_facade.add_task('/project', prompt='Timeout test')
-
-    error_msg = str(exc_info.value)
-    assert 'timeout' in error_msg.lower(), f'RuntimeError should mention timeout: {error_msg}'
-    assert 'tkt_' in error_msg, f'RuntimeError should contain the ticket id: {error_msg}'
-    # The worker may have been called (submit_task enqueues it), but tm.add_task
-    # must NOT have been called directly by the facade itself — only via the worker.
-    # The facade does NOT call tm.add_task; the worker does. We verify by checking
-    # that the call originated from within _process_add_ticket, not from add_task.
-    # The simplest proxy: if add_task itself called tm.add_task directly, it would
-    # bypass the ticket path entirely — we check this by ensuring submit_task was
-    # the only path used (i.e. error came from resolve_ticket, not tm.add_task).
-    # (tm.add_task may have been called by the background worker; that's fine.)
 
 
 @pytest.mark.asyncio
