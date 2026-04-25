@@ -1267,7 +1267,7 @@ class TestCheckPlanTargetsInTree:
 
         Will fail until step 4 introduces the DropGuardResult return type.
         """
-        from orchestrator.merge_queue import DropGuardResult, UnresolvedStep
+        from orchestrator.merge_queue import DropGuardResult
 
         worktree = (await git_ops.create_worktree('drop-guard-result')).path
         (worktree / 'kept.py').write_text('kept = 1\n')
