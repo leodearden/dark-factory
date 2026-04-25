@@ -921,12 +921,12 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
 
     mkdir_calls = [
         f for f in tracked_callables
-        if getattr(getattr(f, '__func__', None), '__name__', None) == 'mkdir'
+        if getattr(f, '__func__', None) is Path.mkdir
         and getattr(f, '__self__', None) == expected_esc_dir
     ]
     write_text_calls = [
         f for f in tracked_callables
-        if getattr(getattr(f, '__func__', None), '__name__', None) == 'write_text'
+        if getattr(f, '__func__', None) is Path.write_text
         and getattr(getattr(f, '__self__', None), 'parent', None) == expected_esc_dir
     ]
     assert len(mkdir_calls) == 1, (
