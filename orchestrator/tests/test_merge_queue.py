@@ -734,6 +734,140 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_diff_tree_failure_records_unresolved_step_with_object_missing_flag(
+        self, git_ops: GitOps,
+    ):
+        """diff-tree rc != 0 → UnresolvedStep recorded with object_missing=True.
+
+        When a done-step commit SHA is non-existent (e.g. pruned after amend),
+        `git diff-tree` returns rc != 0.  The implementation must:
+          (a) keep the file in dropped (fail-closed contract unchanged),
+          (b) append exactly one UnresolvedStep to result.unresolved_steps,
+          (c) set object_missing=True because the commit object is absent.
+
+        A paired sub-case confirms that a real commit producing an empty diff
+        (rc == 0) results in unresolved_steps == [] — object_missing is only
+        set when diff-tree itself fails and cat-file confirms absence.
+        """
+        from orchestrator.merge_queue import UnresolvedStep
+
+        worktree = (await git_ops.create_worktree('unresolved-step-flag')).path
+
+        # anchor.py is needed so merge_to_main has something to merge
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # non-existent object
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-unresolved', 'T-unresolved', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'unresolved-step-flag')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='t-unresolved',
+            )
+            # (a) fail-closed: file stays in dropped
+            assert result.dropped == ['gone.py'], (
+                f'Expected fail-closed dropped=[gone.py], got {result.dropped!r}'
+            )
+            # (b) exactly one UnresolvedStep recorded
+            assert len(result.unresolved_steps) == 1, (
+                f'Expected 1 unresolved step, got {len(result.unresolved_steps)}: '
+                f'{result.unresolved_steps!r}'
+            )
+            us = result.unresolved_steps[0]
+            assert isinstance(us, UnresolvedStep)
+            assert us.step_idx == 0, f'Expected step_idx=0, got {us.step_idx}'
+            assert us.step_id == 'step-1', f'Expected step_id=step-1, got {us.step_id!r}'
+            assert us.commit == bad_sha, f'Expected commit={bad_sha!r}, got {us.commit!r}'
+            assert us.rc != 0, f'Expected rc != 0 (diff-tree must have failed), got {us.rc}'
+            assert us.stderr, f'Expected non-empty stderr, got {us.stderr!r}'
+            # (c) object_missing=True because bad_sha is absent from ODB
+            assert us.object_missing is True, (
+                f'Expected object_missing=True for non-existent SHA, got {us.object_missing!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_real_commit_no_diff_produces_no_unresolved_steps(
+        self, git_ops: GitOps,
+    ):
+        """Real commit with empty diff → rc == 0 → no UnresolvedStep recorded.
+
+        Paired sub-case for test_diff_tree_failure_records_unresolved_step_with_object_missing_flag:
+        when diff-tree succeeds (rc == 0), unresolved_steps must be empty even
+        if the commit's diff happens to be empty (e.g. a no-op amend).  This
+        confirms object_missing is only set on genuine diff-tree failures.
+        """
+        worktree = (await git_ops.create_worktree('no-unresolved-real-sha')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        # Create then delete gone.py — the deletion commit is the done-step commit
+        (worktree / 'gone.py').write_text('g = 1\n')
+        await git_ops.commit(worktree, 'Add gone.py')
+        (worktree / 'gone.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Delete gone.py'], cwd=worktree)
+        rc, del_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+        del_sha = del_sha_out.strip()
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-real-sha', 'T-real-sha', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'deleted gone.py',
+                    'status': 'done',
+                    'commit': del_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'no-unresolved-real-sha')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='t-real-sha',
+            )
+            # diff-tree succeeded → no unresolved steps
+            assert result.unresolved_steps == [], (
+                f'Expected no unresolved steps (real SHA, diff-tree rc=0), '
+                f'got {result.unresolved_steps!r}'
+            )
+            # gone.py was intentionally deleted → not flagged as dropped
+            assert result.dropped == [], (
+                f'Expected no drops (done-step deletion recognized), '
+                f'got {result.dropped!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
     async def test_merge_commit_done_step_deletions_are_detected(
         self, git_ops: GitOps,
     ):
