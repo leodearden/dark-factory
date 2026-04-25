@@ -31,14 +31,64 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class UnresolvedStep:
+    """A done plan-step whose ``git diff-tree`` query returned rc != 0.
+
+    Recorded on :class:`DropGuardResult` when the drop-guard cannot fully
+    determine whether a planned-file deletion was intentional.  The
+    ``object_missing`` flag distinguishes a pruned/never-existed object
+    (``True``) from some other transient failure (``False``), giving the
+    steward the data needed to investigate the next misfire.
+
+    ``cat_file_rc`` and ``cat_file_stderr`` capture the raw outcome of the
+    ``git cat-file -e <sha>^{commit}`` probe so an operator can distinguish
+    "definitely pruned" (cat-file succeeded with a clean 'missing' response)
+    from "cat-file also failed weirdly" (cat-file rc != 0 but stderr shows
+    an ODB lock or fs error).  Defaults to 0 / '' to keep existing
+    :class:`UnresolvedStep` constructions in tests backward-compatible.
+    """
+
+    step_idx: int
+    step_id: str | None
+    commit: str
+    rc: int
+    stderr: str
+    object_missing: bool
+    cat_file_rc: int = 0
+    cat_file_stderr: str = ''
+
+
+@dataclass
+class DropGuardResult:
+    """Structured return value from :func:`_check_plan_targets_in_tree`.
+
+    Replaces the previous ``list[str]`` return so that unresolved-step
+    diagnostics can be propagated to the ``MergeOutcome.reason`` text
+    without side channels.
+
+    Attributes:
+        dropped: Plan-file paths that are absent from the merge commit and
+            could not be explained by a trusted done-step deletion.  Empty
+            list means no drops detected.
+        unresolved_steps: Done plan-steps for which the ``git diff-tree``
+            probe returned rc != 0.  A non-empty list means the guard may
+            have missed some expected-absent files — the steward should
+            investigate whether a real deletion was silently discarded.
+    """
+
+    dropped: list[str] = field(default_factory=list)
+    unresolved_steps: list[UnresolvedStep] = field(default_factory=list)
+
+
 async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
     git_ops: GitOps,
     *,
     task_id: str | None = None,
-) -> list[str]:
-    """Return plan.json `files` entries dropped by the merge.
+) -> DropGuardResult:
+    """Return a :class:`DropGuardResult` describing plan files dropped by the merge.
 
     A "drop" means the file was on the task branch tip but is absent from
     the merge commit — i.e. conflict resolution discarded work the task
@@ -51,7 +101,7 @@ async def _check_plan_targets_in_tree(
     Reads the plan from the task worktree (plan.json lives in gitignored
     .task/, so it's only in the source worktree — not the merge worktree).
 
-    Returns an empty list when:
+    Returns a DropGuardResult with empty ``dropped`` when:
     - no plan.json exists (architect never ran — nothing to check)
     - plan['files'] is empty or missing
     - every planned file is present in the merge commit, or is explained
@@ -62,7 +112,7 @@ async def _check_plan_targets_in_tree(
     plan = artifacts.read_plan()
     files = plan.get('files') or []
     if not files:
-        return []
+        return DropGuardResult()
 
     # Narrow-against-task-HEAD filter only applies when plan has no
     # structured steps. When steps exist, the done-step cross-reference below
@@ -121,7 +171,7 @@ async def _check_plan_targets_in_tree(
             missing.append(f)
 
     if not missing:
-        return []
+        return DropGuardResult()
 
     # Cross-reference missing files against intentional deletions performed
     # by done plan-steps.  A file absent from the merge tree but deleted by
@@ -158,8 +208,47 @@ async def _check_plan_targets_in_tree(
     # `-m` on `git rev-list --parents -n 1 <sha> | wc -w > 2` and skip
     # done-step commits that are themselves merges.
 
-    # Pass 1: collect (step_idx, commit) for every qualifying done step.
-    steps_to_query: list[tuple[int, str]] = []
+    # ── Orphaned-commit failure mode (task 1068) ─────────────────────────────
+    #
+    # Background (task 1058 escalations esc-1058-170..173):
+    #   After `git commit --amend`, the pre-amend SHA is orphaned — it is no
+    #   longer reachable from any branch ref — but it remains queryable via the
+    #   shared ODB until the next `git gc` / pack prune runs.  If the plan.json
+    #   records the pre-amend SHA as a done-step commit (because the plan was
+    #   written before the amend happened), `git diff-tree` can still resolve
+    #   the deletion stored in that orphan commit.  This is the HAPPY PATH:
+    #   orphan-but-not-pruned is fine and does not trigger a false positive.
+    #
+    # Latent failure mode:
+    #   If `git diff-tree` returns rc != 0 for a done-step commit for ANY
+    #   reason (ODB lock during pack rewrite, environment anomaly, host
+    #   contention, or the commit has been pruned after `git gc`), the
+    #   silent `continue` below drops that step's expected-absent contribution.
+    #   Any file the step legitimately deleted is then mis-flagged as a real
+    #   drop — the original symptom in task 1058 was
+    #   `orchestrator/tests/test_conftest_helpers.py` being flagged as dropped.
+    #
+    # Rejected alternatives:
+    #   (a) Search-by-commit-message / step-id: fragile — depends on message
+    #       conventions not enforced in the codebase; could match wrong commits
+    #       and would mask real bugs by silently substituting similar commits.
+    #   (b) Rewrite plan-step commit SHAs after amend: iteration-loop concern
+    #       explicitly noted in task 1068 as out of scope for the drop-guard.
+    #
+    # Diagnostic strategy (implemented below):
+    #   When diff-tree fails, run `git cat-file -e <sha>^{commit}` to determine
+    #   whether the object is missing/pruned (rc != 0 → object_missing=True) or
+    #   failed for a different reason (rc == 0 → some other transient error).
+    #   Record the failure as an UnresolvedStep on the returned DropGuardResult
+    #   so the merge worker can surface it in the MergeOutcome.reason and the
+    #   steward can distinguish the two failure modes.  See task 1068 for full
+    #   rationale.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Pass 1: collect (step_idx, commit, step) for every qualifying done step.
+    # The step dict is threaded through so Pass 2 can read step['id'] without
+    # a second enumeration over the full steps list.
+    steps_to_query: list[tuple[int, str, dict]] = []
     for step_idx, step in enumerate(plan.get('steps') or []):
         if not isinstance(step, dict):
             continue
@@ -168,14 +257,19 @@ async def _check_plan_targets_in_tree(
         commit = step.get('commit')
         if not isinstance(commit, str) or not commit:
             continue
-        steps_to_query.append((step_idx, commit))
+        steps_to_query.append((step_idx, commit, step))
 
     # Pass 2: fire all diff-tree queries concurrently, then process results.
     # Deduplicate commit SHAs (preserving first-occurrence order) so each
     # unique SHA is queried only once even when multiple done steps share it.
     expected_absent: set[str] = set()
+    unresolved: list[UnresolvedStep] = []
+    # Per-step diagnostics for the structured WARNING: tracks every queried done
+    # step (both successful and failed) so the steward sees the full audit trail.
+    # Tuple: (step_idx, commit_short, rc, object_missing)
+    step_diagnostics: list[tuple[int, str, int, bool]] = []
     if steps_to_query:
-        unique_commits: list[str] = list(dict.fromkeys(c for _, c in steps_to_query))
+        unique_commits: list[str] = list(dict.fromkeys(c for _, c, _ in steps_to_query))
         commit_results = await asyncio.gather(*[
             _run(
                 [
@@ -196,24 +290,77 @@ async def _check_plan_targets_in_tree(
         commit_to_result: dict[str, tuple[int, str, str]] = dict(
             zip(unique_commits, commit_results, strict=True),
         )
-        for step_idx, commit in steps_to_query:
+
+        # First pass over results: collect successes and accumulate failures for
+        # concurrent cat-file probing below.
+        failures: list[tuple[int, str, dict, int, str]] = []
+        for step_idx, commit, step in steps_to_query:
             rc, stdout, stderr = commit_to_result[commit]
             if rc != 0:
                 logger.warning(
                     'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
                     step_idx, commit, stderr.strip(),
                 )
-                continue
-            for line in stdout.splitlines():
-                path = line.strip()
-                if path:
-                    expected_absent.add(path)
-                    logger.debug(
-                        'File %s expected absent (deleted in step %d: %s)',
-                        path, step_idx, commit,
-                    )
+                failures.append((step_idx, commit, step, rc, stderr))
+            else:
+                step_diagnostics.append((step_idx, commit[:12], rc, False))
+                for line in stdout.splitlines():
+                    path = line.strip()
+                    if path:
+                        expected_absent.add(path)
+                        logger.debug(
+                            'File %s expected absent (deleted in step %d: %s)',
+                            path, step_idx, commit,
+                        )
 
-    return [f for f in missing if f not in expected_absent]
+        # Probe whether each failed diff-tree is due to a missing/pruned object
+        # or some other transient error (ODB lock, env issue, etc.).
+        # `git cat-file -e <sha>^{commit}` exits 0 if the object exists as a
+        # commit, non-zero if it is absent from the ODB.  All probes run
+        # concurrently to mirror the existing diff-tree gather pattern.
+        if failures:
+            cat_file_results = await asyncio.gather(*[
+                _run(
+                    ['git', 'cat-file', '-e', f'{commit}^{{commit}}'],
+                    cwd=git_ops.project_root,
+                )
+                for _, commit, _, _, _ in failures
+            ])
+            for (step_idx, commit, step, rc, stderr), (rc_cat, _, cat_stderr) in zip(
+                failures, cat_file_results, strict=True,
+            ):
+                object_missing = (rc_cat != 0)
+                step_diagnostics.append((step_idx, commit[:12], rc, object_missing))
+                # Truncate stored stderr once at construction; the formatter
+                # prints verbatim so the elision marker is always honest.
+                stderr_stored = (
+                    (stderr[:500] + ' <truncated>') if len(stderr) > 500 else stderr
+                )
+                cat_stderr_stored = (
+                    (cat_stderr[:200] + ' <truncated>')
+                    if len(cat_stderr) > 200
+                    else cat_stderr
+                )
+                unresolved.append(UnresolvedStep(
+                    step_idx=step_idx,
+                    step_id=step.get('id'),
+                    commit=commit,
+                    rc=rc,
+                    stderr=stderr_stored,
+                    object_missing=object_missing,
+                    cat_file_rc=rc_cat,
+                    cat_file_stderr=cat_stderr_stored,
+                ))
+
+    dropped_files = [f for f in missing if f not in expected_absent]
+    if dropped_files:
+        logger.warning(
+            'drop-guard: dropped_plan_targets '
+            'task_id=%s merge_commit_sha=%s dropped_files=%r step_diagnostics=%r',
+            task_id or '<unknown>', merge_commit_sha, dropped_files, step_diagnostics,
+        )
+
+    return DropGuardResult(dropped=dropped_files, unresolved_steps=unresolved)
 
 
 ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
@@ -222,6 +369,41 @@ loop-breaker.  Downstream classifiers (task steward, dashboard) use this to
 recognise a task that has been abandoned after repeated post-merge verify
 timeouts rather than a first-time verify failure.  Kept as a module-level
 constant so tests and any future callers share a single source of truth."""
+
+
+def _format_unresolved_steps_suffix(unresolved: list[UnresolvedStep]) -> str:
+    """Format a human-readable suffix listing unresolved done-step diff-tree failures.
+
+    Appended to the ``MergeOutcome.reason`` text whenever ``dropped`` is
+    non-empty *and* one or more done-step diff-tree queries returned rc != 0.
+    The suffix tells the steward exactly which step's deletion-evidence was
+    unreachable so they can distinguish a real planned-file drop from a
+    false positive caused by an unresolvable commit.
+
+    Both ``MergeWorker._do_merge`` and ``SpeculativeMergeWorker._merger_loop``
+    call this helper so the diagnostic text is identical across both paths.
+
+    ``stderr`` and ``cat_file_stderr`` are printed verbatim — truncation and
+    elision markers are applied once at :class:`UnresolvedStep` construction
+    so the displayed value is always honest (no double-truncation).
+    ``cat_file_rc`` lets the steward distinguish "object definitely pruned"
+    (cat-file exited cleanly with a missing-object response) from "cat-file
+    also failed weirdly" (non-zero but stderr shows an ODB lock or fs error).
+    """
+    lines = [
+        '\n\nDrop-guard could not query the following done-step commits '
+        '(their planned-file deletions may have been mis-flagged as drops):'
+    ]
+    for us in unresolved:
+        sha_short = us.commit[:12] if len(us.commit) > 12 else us.commit
+        lines.append(
+            f'  step {us.step_id!r} commit {sha_short} '
+            f'(rc={us.rc}, object_missing={us.object_missing}, '
+            f'cat_file_rc={us.cat_file_rc}, '
+            f'diff_tree_stderr={us.stderr!r}, '
+            f'cat_file_stderr={us.cat_file_stderr!r})'
+        )
+    return '\n'.join(lines)
 
 
 def _elapsed_ms(start: float | None) -> int | None:
@@ -593,10 +775,11 @@ class MergeWorker:
         # Catches "accept origin" conflict resolutions that silently drop
         # planned work from the task branch.
         assert merge_result.merge_commit is not None
-        dropped = await _check_plan_targets_in_tree(
+        drop_result = await _check_plan_targets_in_tree(
             merge_result.merge_commit, req.worktree, self._git_ops,
             task_id=req.task_id,
         )
+        dropped = drop_result.dropped
         if dropped:
             if merge_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(
@@ -606,15 +789,15 @@ class MergeWorker:
                 f'Task {req.task_id}: merge dropped plan targets: {dropped}'
             )
             _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
-            return MergeOutcome(
-                'blocked',
-                reason=(
-                    f'Merge commit is missing plan target files: '
-                    f'{", ".join(dropped)}. '
-                    f'Conflict resolution likely dropped planned work. '
-                    f'Review the merge commit and restore missing files.'
-                ),
+            reason = (
+                f'Merge commit is missing plan target files: '
+                f'{", ".join(dropped)}. '
+                f'Conflict resolution likely dropped planned work. '
+                f'Review the merge commit and restore missing files.'
             )
+            if drop_result.unresolved_steps:
+                reason += _format_unresolved_steps_suffix(drop_result.unresolved_steps)
+            return MergeOutcome('blocked', reason=reason)
 
         # 4. Verify (skip if pre-rebased and main unchanged)
         merge_wt = merge_result.merge_worktree
@@ -1174,10 +1357,11 @@ class SpeculativeMergeWorker:
                     merge_commit = merge_commit.strip()
 
                     # Drop-guard: every file the task planned must survive.
-                    dropped = await _check_plan_targets_in_tree(
+                    drop_result = await _check_plan_targets_in_tree(
                         merge_commit, req.worktree, self._git_ops,
                         task_id=req.task_id,
                     )
+                    dropped = drop_result.dropped
                     if dropped:
                         if merge_result.merge_worktree:
                             await self._git_ops.cleanup_merge_worktree(
@@ -1188,20 +1372,22 @@ class SpeculativeMergeWorker:
                             f'targets: {dropped}'
                         )
                         _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
+                        reason = (
+                            f'Merge commit is missing plan target '
+                            f'files: {", ".join(dropped)}. '
+                            f'Conflict resolution likely dropped '
+                            f'planned work. Review the merge commit '
+                            f'and restore missing files.'
+                        )
+                        if drop_result.unresolved_steps:
+                            reason += _format_unresolved_steps_suffix(
+                                drop_result.unresolved_steps
+                            )
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=MergeOutcome(
-                                'blocked',
-                                reason=(
-                                    f'Merge commit is missing plan target '
-                                    f'files: {", ".join(dropped)}. '
-                                    f'Conflict resolution likely dropped '
-                                    f'planned work. Review the merge commit '
-                                    f'and restore missing files.'
-                                ),
-                            ),
+                            immediate_outcome=MergeOutcome('blocked', reason=reason),
                             started_monotonic=t0,
                         ))
                         spec_base = None
