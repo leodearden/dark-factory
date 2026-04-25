@@ -147,6 +147,10 @@ class ReconciliationHarness:
         # One-shot gate shared by drain() and run_loop()'s drain-status block.
         # Whichever site fires the 'Harness fully drained' marker first sets this
         # to True so subsequent drain() calls and main-loop iterations are silent.
+        # Lifecycle is tied to process lifetime: there is no undrain path today,
+        # but if one is ever added it MUST reset _drain_complete_logged together
+        # with _draining, otherwise the next drain will silently fail to re-emit
+        # the 'Harness fully drained' marker.
         self._drain_complete_logged: bool = False
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
