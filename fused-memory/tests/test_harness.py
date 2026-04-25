@@ -3561,3 +3561,29 @@ class TestHarnessDrainIdleShortCircuit:
             f"Expected at least one log record containing 'Harness fully drained — safe to restart' "
             f"but got records: {[r.message for r in caplog.records]}"
         )
+
+    def test_drain_suppresses_fully_drained_when_loop_active(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """drain() must NOT emit 'Harness fully drained' when a project loop is still running.
+
+        The main reconciliation loop emits the marker after loops finish (existing
+        behaviour). Synchronous emission in drain() must be suppressed when at least
+        one _project_tasks entry has .done() == False.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        active_task = MagicMock(spec=asyncio.Task)
+        active_task.done.return_value = False
+        harness._project_tasks['some-project'] = active_task
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            harness.drain()
+
+        drained_records = [
+            r for r in caplog.records if 'Harness fully drained' in r.message
+        ]
+        assert not drained_records, (
+            f"Expected NO 'Harness fully drained' log when a project loop is active, "
+            f"but got: {[r.message for r in drained_records]}"
+        )
