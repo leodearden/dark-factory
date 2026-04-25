@@ -1478,6 +1478,90 @@ class TestMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    async def test_merge_worker_surfaces_unresolved_steps_in_dropped_outcome_reason(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """MergeWorker includes unresolved-step diagnostics in the blocked outcome reason.
+
+        When _check_plan_targets_in_tree returns a DropGuardResult with both
+        dropped files AND unresolved steps (steps whose diff-tree query failed),
+        the MergeOutcome.reason must mention the specific unresolved step details
+        (step_id, commit SHA, object_missing flag) so the steward can investigate
+        whether a real planned-file deletion was mis-flagged as a drop.
+
+        Will fail until step 8 adds the unresolved-step suffix to the reason text.
+        """
+        worktree = (await git_ops.create_worktree('drop-unresolved-mw')).path
+        (worktree / 'kept.py').write_text('kept = True\n')
+        await git_ops.commit(worktree, 'Add kept.py')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('drop-unresolved', 'Drop unresolved', 'desc')
+        artifacts.write_plan({
+            'files': ['kept.py', 'dropped.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        bad_commit = 'cf82ae6815'
+
+        async def _fake_drop_check_with_unresolved(*_args, **_kwargs):
+            return DropGuardResult(
+                dropped=['dropped.py'],
+                unresolved_steps=[
+                    UnresolvedStep(
+                        step_idx=2,
+                        step_id='step-3',
+                        commit=bad_commit,
+                        rc=128,
+                        stderr='fatal: bad object cf82ae6815',
+                        object_missing=True,
+                    )
+                ],
+            )
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass(),
+        ), patch(
+            'orchestrator.merge_queue._check_plan_targets_in_tree',
+            _fake_drop_check_with_unresolved,
+        ):
+            req = _make_request('drop-unresolved', 'drop-unresolved-mw', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        # (a) Still blocked (fail-closed)
+        assert outcome.status == 'blocked', f'Expected blocked, got {outcome.status!r}'
+        # (b) Existing drop-guard reason contract preserved
+        assert 'dropped.py' in outcome.reason, f'Missing dropped.py in reason: {outcome.reason!r}'
+        assert 'plan target' in outcome.reason.lower(), (
+            f'Missing "plan target" in reason: {outcome.reason!r}'
+        )
+        # (c) Unresolved-step diagnostics included
+        assert 'step-3' in outcome.reason, (
+            f'Expected step_id "step-3" in reason: {outcome.reason!r}'
+        )
+        assert bad_commit in outcome.reason, (
+            f'Expected commit {bad_commit!r} in reason: {outcome.reason!r}'
+        )
+        assert 'object_missing' in outcome.reason, (
+            f'Expected "object_missing" in reason: {outcome.reason!r}'
+        )
+        # Must indicate the diff-tree query failed (exact phrase from _format_unresolved_steps_suffix)
+        reason_lower = outcome.reason.lower()
+        assert 'drop-guard' in reason_lower or 'could not query' in reason_lower, (
+            f'Expected drop-guard failure phrase in reason: {outcome.reason!r}'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
     async def test_already_merged_returns_done(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
