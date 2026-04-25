@@ -739,6 +739,26 @@ class TestScopeModuleConfigReturnsNone:
         assert result.test_command == mc.test_command
         assert 'conftest.py' not in result.test_command
 
+    def test_conftest_with_test_files_uses_full_suite(self):
+        """conftest.py mixed with test files should still use the full suite.
+
+        Even when a task touches both conftest.py and concrete test files,
+        the full unscoped suite is the correct scope — conftest may shadow
+        tests that aren't in the diff.
+        """
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        result = scope_module_config(
+            mc,
+            ['orchestrator/tests/conftest.py', 'orchestrator/tests/test_foo.py'],
+        )
+        assert result is not None
+        assert result.test_command == mc.test_command
+        assert 'conftest.py' not in result.test_command
+
 
 class TestRunScopedVerificationSkipsUntouched:
     """End-to-end: run_scoped_verification skips subprojects with no matching files."""
