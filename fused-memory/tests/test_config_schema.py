@@ -517,3 +517,24 @@ class TestReconciliationConfigDeadLetterFields:
     def test_keep_rotations_negative_rejected(self):
         with pytest.raises(ValidationError):
             ReconciliationConfig(event_dead_letter_keep_rotations=-1)
+
+
+class TestReconciliationConfigBulkResetGuardFields:
+    """Tests for bulk_reset_guard_write_failure_backoff_seconds (task 1032)."""
+
+    def test_default_write_failure_backoff_seconds(self):
+        cfg = ReconciliationConfig()
+        assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 60.0
+
+    def test_write_failure_backoff_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(bulk_reset_guard_write_failure_backoff_seconds=-0.001)
+
+    def test_write_failure_backoff_zero_accepted(self):
+        # zero disables the backoff — valid boundary value
+        cfg = ReconciliationConfig(bulk_reset_guard_write_failure_backoff_seconds=0.0)
+        assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 0.0
+
+    def test_write_failure_backoff_override_accepted(self):
+        cfg = ReconciliationConfig(bulk_reset_guard_write_failure_backoff_seconds=120.5)
+        assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
