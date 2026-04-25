@@ -1158,7 +1158,7 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     real_write_text = Path.write_text
 
     def intercepting_mkdir(self, *args, **kwargs):
-        is_outer = self == expected_esc_dir and kwargs.get('parents', False)
+        is_outer = self == expected_esc_dir and kwargs.get('parents', False)  # relies on production passing parents=True as a kwarg (bulk_reset_guard.py:487)
         if is_outer:
             outer_mkdir_calls[0] += 1
             if outer_mkdir_calls[0] == 1:
