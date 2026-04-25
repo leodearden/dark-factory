@@ -61,8 +61,11 @@ async def test_submit_task_normalises_worktree_path_to_main(tmp_path):
     checkout path before forwarding to TaskInterceptor.
 
     Note: this test verifies path normalisation only (project_root_seen == main).
-    End-to-end file-creation coverage (tasks.json appearing in main, not worktree)
-    is handled by test_committer_commits_to_main_from_worktree_path below.
+    End-to-end file-creation coverage (tasks.json appearing in main, not worktree,
+    after a full submit_task → curator worker → tm.add_task round-trip) is handled
+    by test_submit_task_creates_tasks_json_in_main_not_worktree below.
+    ``test_committer_commits_to_main_from_worktree_path`` is NOT that test — it
+    seeds tasks.json on disk first and exercises only ``TaskFileCommitter.commit()``.
     """
     main = _init_repo(tmp_path / 'repo')
     wt = _add_worktree(main, tmp_path / 'wt', 'feature')
