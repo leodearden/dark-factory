@@ -1677,10 +1677,17 @@ class TestCheckPlanTargetsInTree:
             # Pull the unrepr'd step_diagnostics list directly from the LogRecord's positional args:
             # logger.warning(fmt, task_id, merge_commit_sha, dropped_files, step_diagnostics)
             # → record.args == (task_id, merge_commit_sha, dropped_files, step_diagnostics)
-            step_diagnostics = structured[0].args[3]  # 4th positional arg
+            raw_args = structured[0].args
+            assert isinstance(raw_args, tuple), (
+                f'Expected positional-args tuple on LogRecord, got {type(raw_args)!r}'
+            )
+            step_diagnostics = raw_args[3]  # 4th positional arg
 
             # Assert exact plan order (also pins list length to 2 with exactly indices 0 and 1)
-            step_indices = [t[0] for t in step_diagnostics]
+            assert hasattr(step_diagnostics, '__iter__'), (
+                f'Expected step_diagnostics to be iterable, got {type(step_diagnostics)!r}'
+            )
+            step_indices = [t[0] for t in step_diagnostics]  # type: ignore[union-attr]
             assert step_indices == [0, 1], (
                 f'Expected step_diagnostics in plan order [0, 1]; '
                 f'got {step_indices!r} (full diagnostics: {step_diagnostics!r})'
