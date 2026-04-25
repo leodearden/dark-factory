@@ -21,13 +21,15 @@ canned mocks — drift that static mocks cannot detect.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
-from fused_memory.backends.taskmaster_client import TaskmasterBackend  # noqa: F401
+from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.backends.taskmaster_types import TaskmasterError  # noqa: F401
-from fused_memory.config.schema import TaskmasterConfig  # noqa: F401
+from fused_memory.config.schema import TaskmasterConfig
 
 # ── Dist path resolution ─────────────────────────────────────────────
 # parents[3]: tests/integration/<file>.py → tests/integration → tests → fused-memory → repo-root
@@ -42,6 +44,39 @@ pytestmark = pytest.mark.skipif(
         '&& cd taskmaster-ai && npm install && npm run build'
     ),
 )
+
+
+# ── Fixtures ─────────────────────────────────────────────────────────
+
+
+@pytest_asyncio.fixture
+async def taskmaster_backend(tmp_path):
+    """Function-scoped fixture: start a live Taskmaster MCP subprocess.
+
+    Creates a temporary project_root pre-seeded with an empty
+    ``.taskmaster/tasks/tasks.json`` (``{"master": {"tasks": []}}``),
+    initializes the backend, yields ``(backend, project_root_str)``, then
+    closes the backend in a finally block.
+    """
+    # Pre-seed the tasks file so the first Taskmaster call doesn't hit
+    # non-deterministic first-write behaviour.
+    tasks_dir = tmp_path / '.taskmaster' / 'tasks'
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / 'tasks.json').write_text(json.dumps({'master': {'tasks': []}}))
+
+    config = TaskmasterConfig(
+        transport='stdio',
+        command='node',
+        args=[str(_TASKMASTER_DIST)],
+        project_root=str(tmp_path),
+        tool_mode='all',
+    )
+    backend = TaskmasterBackend(config)
+    try:
+        await backend.initialize()
+        yield backend, str(tmp_path)
+    finally:
+        await backend.close()
 
 
 # ── Tests ─────────────────────────────────────────────────────────────
