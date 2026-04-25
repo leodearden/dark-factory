@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,15 @@ _preferred: Backend = 'auto'
 
 
 def set_backend(name: Backend) -> None:
-    """Set the preferred sandbox backend. Called once at orchestrator startup."""
+    """Set the preferred sandbox backend. Called once at orchestrator startup.
+
+    Raises TypeError if ``name`` is not one of the Backend Literal values.
+    """
+    valid = get_args(Backend)
+    if name not in valid:
+        raise TypeError(
+            f'set_backend: invalid backend {name!r}; expected one of {valid}'
+        )
     global _preferred
     _preferred = name
 
