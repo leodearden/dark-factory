@@ -1777,3 +1777,29 @@ class TestBuildFallbackConfigConftest:
         assert result.test_command is not None
         assert result.test_command == 'pytest .'
         assert 'conftest.py' not in result.test_command
+
+    def test_nested_test_under_conftest_dir_uses_directory_only(self):
+        """A test file inside the conftest's directory subtree is NOT added redundantly.
+
+        ['a/conftest.py', 'a/sub/test_x.py'] → 'pytest a' because 'a/sub/test_x.py'
+        starts with 'a/' and is therefore covered by the conftest directory target.
+        Regression guard for the `t.startswith(d + '/')` boundary check.
+        """
+        result = _build_fallback_config(['a/conftest.py', 'a/sub/test_x.py'])
+        assert result is not None
+        assert result.test_command == 'pytest a'
+        assert 'a/sub/test_x.py' not in result.test_command
+        assert 'conftest.py' not in result.test_command
+
+    def test_sibling_prefix_test_file_included_alongside_conftest_dir(self):
+        """Directory 'a' does NOT swallow a sibling 'ab/test_x.py'.
+
+        ['a/conftest.py', 'ab/test_x.py'] → 'pytest a ab/test_x.py' because
+        'ab/test_x.py'.startswith('a/') is False — the `d + '/'` boundary check
+        correctly distinguishes directory 'a' from sibling prefix 'ab'.
+        Regression guard for the boundary-check contract.
+        """
+        result = _build_fallback_config(['a/conftest.py', 'ab/test_x.py'])
+        assert result is not None
+        assert result.test_command == 'pytest a ab/test_x.py'
+        assert 'conftest.py' not in result.test_command
