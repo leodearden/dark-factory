@@ -65,8 +65,8 @@ async def taskmaster_backend(tmp_path):
     Creates a temporary project_root pre-seeded with an empty
     ``.taskmaster/tasks/tasks.json`` (``{"master": {"tasks": []}}``),
     initializes the backend, yields ``(backend, project_root_str)``, then
-    tears down via ``_cleanup_contexts()`` in a finally block (suppresses
-    cleanup exceptions so test failures surface their real cause).
+    tears down via ``close()`` in a finally block (close() suppresses
+    teardown exceptions so test failures surface their real cause).
     """
     # Pre-seed the tasks file so the first Taskmaster call doesn't hit
     # non-deterministic first-write behaviour.
@@ -86,7 +86,7 @@ async def taskmaster_backend(tmp_path):
         await backend.initialize()
         yield backend, str(tmp_path)
     finally:
-        await backend._cleanup_contexts()
+        await backend.close()
 
 
 # ── Tests ─────────────────────────────────────────────────────────────
