@@ -1605,9 +1605,10 @@ class TestCheckPlanTargetsInTree:
           - file_b.py is intentionally deleted by step_idx=1
 
         After the fix, ``step_diagnostics`` is sorted by step_idx before the
-        structured WARNING fires.  Assertion: ``'(0,'`` appears before ``'(1,'``
-        in the rendered WARNING message.  Currently fails because the
-        in-line/failures split produces the reverse order.
+        structured WARNING fires.  Assertion: ``[t[0] for t in record.args[3]] == [0, 1]``
+        on the structured WARNING's positional args (avoids depending on %r repr
+        formatting).  Currently fails because the in-line/failures split produces
+        the reverse order.
         """
         worktree = (await git_ops.create_worktree('issue2-diag-order')).path
 
@@ -1666,18 +1667,23 @@ class TestCheckPlanTargetsInTree:
             # Find the structured-warning record
             warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert warn_records, 'Expected at least one WARNING when dropped is non-empty'
-            all_messages = ' '.join(r.getMessage() for r in warn_records)
 
-            # Both step indices must appear in the WARNING
-            assert '(0,' in all_messages, f'"(0," not found in WARNING: {all_messages!r}'
-            assert '(1,' in all_messages, f'"(1," not found in WARNING: {all_messages!r}'
+            # Locate the single drop-guard structured WARNING by message prefix
+            structured = [r for r in warn_records if 'dropped_plan_targets' in r.getMessage()]
+            assert len(structured) == 1, (
+                f'Expected exactly one structured drop-guard WARNING, '
+                f'got {len(structured)}: {[r.getMessage() for r in warn_records]!r}'
+            )
+            # Pull the unrepr'd step_diagnostics list directly from the LogRecord's positional args:
+            # logger.warning(fmt, task_id, merge_commit_sha, dropped_files, step_diagnostics)
+            # → record.args == (task_id, merge_commit_sha, dropped_files, step_diagnostics)
+            step_diagnostics = structured[0].args[3]  # 4th positional arg
 
-            # Plan-step order: (0, ...) must precede (1, ...)
-            pos_0 = all_messages.index('(0,')
-            pos_1 = all_messages.index('(1,')
-            assert pos_0 < pos_1, (
-                f'Expected step_diagnostics in plan order (0 before 1), '
-                f'but (0, appears at {pos_0}, (1, appears at {pos_1}): {all_messages!r}'
+            # Assert exact plan order (also pins list length to 2 with exactly indices 0 and 1)
+            step_indices = [t[0] for t in step_diagnostics]
+            assert step_indices == [0, 1], (
+                f'Expected step_diagnostics in plan order [0, 1]; '
+                f'got {step_indices!r} (full diagnostics: {step_diagnostics!r})'
             )
         finally:
             if merge_result.merge_worktree:
