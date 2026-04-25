@@ -343,7 +343,17 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
     if not scoped:
         return None
 
-    test_files = [f for f in scoped if _is_test_file(f)]
+    # conftest.py defines fixtures/hooks that affect every test in the directory
+    # subtree — the only correct scope is the full unscoped suite expressed by
+    # mc.test_command.  Passing conftest.py directly to pytest finds 0 tests
+    # (pytest >= 9 exits 1 with "no tests ran").
+    has_conftest = any(f.rsplit('/', 1)[-1] == 'conftest.py' for f in scoped)
+    # Strip conftest.py from test_files so _scope_command never receives it;
+    # it is handled by the has_conftest branch above.
+    test_files = [
+        f for f in scoped
+        if _is_test_file(f) and f.rsplit('/', 1)[-1] != 'conftest.py'
+    ]
 
     # Build scoped commands with worktree-relative paths, then strip
     # --directory so tools resolve paths from the worktree root
@@ -351,8 +361,14 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
         _scope_command(mc.lint_command, 'ruff check', scoped), mc.prefix)
     type_cmd = _strip_directory_flag(
         _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
-    test_cmd = _strip_directory_flag(
-        _scope_command(mc.test_command, 'pytest', test_files), mc.prefix) if test_files else None
+    if has_conftest:
+        # Full unscoped suite: conftest changes affect everything it shadows.
+        test_cmd = mc.test_command
+    elif test_files:
+        test_cmd = _strip_directory_flag(
+            _scope_command(mc.test_command, 'pytest', test_files), mc.prefix)
+    else:
+        test_cmd = None
 
     return ModuleConfig(
         prefix=mc.prefix,
