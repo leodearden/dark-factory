@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 from shared.config_models import UsageCapConfig
 
 from orchestrator.config import (
@@ -19,8 +20,6 @@ from orchestrator.config import (
     ReviewConfig,
     SandboxConfig,
 )
-
-from _orch_helpers import pydantic_spec
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)

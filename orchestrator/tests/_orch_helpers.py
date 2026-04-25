@@ -12,7 +12,6 @@ from collections.abc import Sequence
 from unittest.mock import AsyncMock, MagicMock
 
 from pydantic import BaseModel
-
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountState, UsageGate
 
