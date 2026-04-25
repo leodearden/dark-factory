@@ -53,9 +53,14 @@ def _add_worktree(main: Path, wt_dir: Path, branch: str) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_submit_task_from_worktree_path_writes_to_main(tmp_path):
-    """MCP submit_task called with a worktree path must forward the main path
-    to the TaskInterceptor, so path normalisation applies before hand-off."""
+async def test_submit_task_normalises_worktree_path_to_main(tmp_path):
+    """MCP submit_task called with a worktree path must normalise to the main
+    checkout path before forwarding to TaskInterceptor.
+
+    Note: this test verifies path normalisation only (project_root_seen == main).
+    End-to-end file-creation coverage (tasks.json appearing in main, not worktree)
+    is handled by test_committer_commits_to_main_from_worktree_path below.
+    """
     main = _init_repo(tmp_path / 'repo')
     wt = _add_worktree(main, tmp_path / 'wt', 'feature')
 
