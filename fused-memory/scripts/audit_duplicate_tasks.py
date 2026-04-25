@@ -116,12 +116,18 @@ def _extract_tasks(raw: Any) -> list[dict]:
                 tasks = data
                 recognised = True
             elif isinstance(data, dict) and 'tasks' in data:
-                tasks = data.get('tasks') or []
-                recognised = True
+                value = data.get('tasks')
+                if isinstance(value, list):
+                    tasks = value
+                    recognised = True
+                # else: 'tasks' key present but not a list — fall through to warning
             # else: 'data' key present but unrecognised sub-shape
         elif 'tasks' in raw:
-            tasks = raw.get('tasks') or []
-            recognised = True
+            value = raw.get('tasks')
+            if isinstance(value, list):
+                tasks = value
+                recognised = True
+            # else: 'tasks' key present but not a list — fall through to warning
         # else: neither 'data' nor 'tasks' key present
     elif isinstance(raw, list):
         tasks = raw
