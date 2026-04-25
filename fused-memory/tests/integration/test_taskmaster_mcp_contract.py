@@ -65,7 +65,8 @@ async def taskmaster_backend(tmp_path):
     Creates a temporary project_root pre-seeded with an empty
     ``.taskmaster/tasks/tasks.json`` (``{"master": {"tasks": []}}``),
     initializes the backend, yields ``(backend, project_root_str)``, then
-    closes the backend in a finally block.
+    tears down via ``_cleanup_contexts()`` in a finally block (suppresses
+    cleanup exceptions so test failures surface their real cause).
     """
     # Pre-seed the tasks file so the first Taskmaster call doesn't hit
     # non-deterministic first-write behaviour.
@@ -85,7 +86,7 @@ async def taskmaster_backend(tmp_path):
         await backend.initialize()
         yield backend, str(tmp_path)
     finally:
-        await backend.close()
+        await backend._cleanup_contexts()
 
 
 # ── Tests ─────────────────────────────────────────────────────────────
@@ -96,17 +97,36 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     """Happy-path: full CRUD round-trip against the live Taskmaster subprocess."""
     backend, project_root = taskmaster_backend
 
-    # (a) add_task returns a non-empty id
+    # (a) add_task returns a non-empty id.
+    # Use prompt= (not title=): Taskmaster's JS add_task tool requires either
+    # `prompt` alone or both `title` and `description` together.  `prompt=` is
+    # the AI-generated happy path and mirrors the canned suite convention at
+    # tests/test_taskmaster_client_contract.py:84.  Passing title-only compiles
+    # but is rejected server-side ("Either the prompt parameter or both title
+    # and description are required").
     add_result = await backend.add_task(
         project_root=project_root,
-        title='Integration test task',
+        prompt='Integration test task',
     )
     task_id = add_result['id']
     assert task_id, f'add_task returned empty id: {add_result!r}'
 
     # (b) get_task returns the task with matching id/title and a known start-state
     task = await backend.get_task(task_id, project_root=project_root)
-    assert task['id'] == task_id
+    # `add_task` (the wrapper) forces str(taskId) at taskmaster_client.py:380 so
+    # task_id is always a str.  `get_task` is a raw passthrough — the JS payload
+    # may return the id as int.  Cast LHS so the round-trip assertion doesn't
+    # spuriously fail on a type mismatch when the wire path is healthy.
+    assert str(task['id']) == task_id
+    # Pin the observed wire type: str or int are both valid (JS may return either).
+    # A flip in observed type is an intentional contract change — it must also
+    # update the canned mocks in tests/test_taskmaster_client_contract.py so that
+    # static and live suites stay in sync.
+    assert isinstance(task['id'], (str, int)), (
+        f"task['id'] has unexpected type {type(task['id']).__name__!r}; "
+        'expected str or int — if the wire type changed update the canned mocks '
+        'in tests/test_taskmaster_client_contract.py'
+    )
     assert task.get('title') == 'Integration test task'
     assert task.get('status') == 'pending', (
         f"Unexpected initial status {task.get('status')!r}; "
