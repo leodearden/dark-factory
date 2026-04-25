@@ -11,13 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import _submit_and_resolve
 
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.services.orchestrator_detector import (
     is_orchestrator_live_for,
 )
-from _fm_helpers import _submit_and_resolve
 
 if TYPE_CHECKING:
     pass
