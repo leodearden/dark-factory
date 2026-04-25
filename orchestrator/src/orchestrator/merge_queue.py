@@ -30,6 +30,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Truncation limits for UnresolvedStep stderr fields.
+# diff-tree stderr can carry multi-line pack-rewrite traces (legitimately long),
+# while cat-file -e stderr on a missing object is typically a single-line
+# "fatal: not a valid object name" message — different bounds reflect the
+# realistic max signal in each field.
+UNRESOLVED_STDERR_MAX = 500
+UNRESOLVED_CAT_STDERR_MAX = 200
+
 
 @dataclass
 class UnresolvedStep:
@@ -45,8 +53,10 @@ class UnresolvedStep:
     ``git cat-file -e <sha>^{commit}`` probe so an operator can distinguish
     "definitely pruned" (cat-file succeeded with a clean 'missing' response)
     from "cat-file also failed weirdly" (cat-file rc != 0 but stderr shows
-    an ODB lock or fs error).  Defaults to 0 / '' to keep existing
-    :class:`UnresolvedStep` constructions in tests backward-compatible.
+    an ODB lock or fs error).  Defaults to 0 / '' so callers can construct
+    an :class:`UnresolvedStep` without the cat-file probe context — e.g.
+    tests that exercise the warning formatter directly with a hand-built
+    dataclass.
     """
 
     step_idx: int
@@ -297,7 +307,7 @@ async def _check_plan_targets_in_tree(
         for step_idx, commit, step in steps_to_query:
             rc, stdout, stderr = commit_to_result[commit]
             if rc != 0:
-                logger.warning(
+                logger.debug(
                     'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
                     step_idx, commit, stderr.strip(),
                 )
@@ -334,16 +344,20 @@ async def _check_plan_targets_in_tree(
                 # Truncate stored stderr once at construction; the formatter
                 # prints verbatim so the elision marker is always honest.
                 stderr_stored = (
-                    (stderr[:500] + ' <truncated>') if len(stderr) > 500 else stderr
+                    (stderr[:UNRESOLVED_STDERR_MAX] + ' <truncated>')
+                    if len(stderr) > UNRESOLVED_STDERR_MAX
+                    else stderr
                 )
                 cat_stderr_stored = (
-                    (cat_stderr[:200] + ' <truncated>')
-                    if len(cat_stderr) > 200
+                    (cat_stderr[:UNRESOLVED_CAT_STDERR_MAX] + ' <truncated>')
+                    if len(cat_stderr) > UNRESOLVED_CAT_STDERR_MAX
                     else cat_stderr
                 )
+                raw_step_id = step.get('id')
+                step_id = raw_step_id if isinstance(raw_step_id, str) else None
                 unresolved.append(UnresolvedStep(
                     step_idx=step_idx,
-                    step_id=step.get('id'),
+                    step_id=step_id,
                     commit=commit,
                     rc=rc,
                     stderr=stderr_stored,
@@ -351,6 +365,11 @@ async def _check_plan_targets_in_tree(
                     cat_file_rc=rc_cat,
                     cat_file_stderr=cat_stderr_stored,
                 ))
+
+    # Restore plan-step order: successes are appended inline during the first
+    # pass and failures after the cat-file gather, so without sorting the list
+    # is [successes…, failures…] rather than sequential plan order.
+    step_diagnostics.sort(key=lambda t: t[0])
 
     dropped_files = [f for f in missing if f not in expected_absent]
     if dropped_files:

@@ -726,8 +726,8 @@ class TestCheckPlanTargetsInTree:
             # (b) a warning was emitted mentioning the bad commit
             warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert warning_records, 'Expected at least one WARNING log record'
-            assert any(bad_sha in r.getMessage() for r in warning_records), (
-                f'Expected WARNING mentioning the bad SHA {bad_sha!r}; '
+            assert any(bad_sha[:12] in r.getMessage() for r in warning_records), (
+                f'Expected WARNING mentioning the truncated SHA {bad_sha[:12]!r}; '
                 f'got: {[r.getMessage() for r in warning_records]}'
             )
         finally:
@@ -809,59 +809,67 @@ class TestCheckPlanTargetsInTree:
     async def test_real_commit_no_diff_produces_no_unresolved_steps(
         self, git_ops: GitOps,
     ):
-        """Real commit with empty diff → rc == 0 → no UnresolvedStep recorded.
+        """Genuinely empty-diff commit (--allow-empty) → diff-tree rc=0 with empty stdout.
 
-        Paired sub-case for test_diff_tree_failure_records_unresolved_step_with_object_missing_flag:
-        when diff-tree succeeds (rc == 0), unresolved_steps must be empty even
-        if the commit's diff happens to be empty (e.g. a no-op amend).  This
-        confirms object_missing is only set on genuine diff-tree failures.
+        Tests the boundary case: a done-step commit that touches nothing
+        (``git commit --allow-empty``).  ``git diff-tree --diff-filter=D``
+        returns rc=0 with empty stdout — the ``for line in stdout.splitlines()``
+        loop is a no-op, ``expected_absent`` is unchanged, and no ``UnresolvedStep``
+        is created.
+
+        This was previously untested.  The deletion case that this slot formerly
+        exercised is already covered by
+        ``test_check_plan_targets_returns_drop_guard_result`` and
+        ``test_orphan_done_step_commit_object_in_odb_resolves_deletion_as_expected_absent``,
+        so repurposing this slot gives coverage of the rc=0-with-empty-stdout
+        edge case without losing anything.
+
+        No ``merge_queue.py`` change is needed — the implementation already
+        handles empty stdout correctly.
         """
-        worktree = (await git_ops.create_worktree('no-unresolved-real-sha')).path
+        worktree = (await git_ops.create_worktree('no-unresolved-empty-diff')).path
 
-        (worktree / 'anchor.py').write_text('anchor = 1\n')
-        await git_ops.commit(worktree, 'Add anchor.py')
+        # present.py will be present in the merge tree → no drops
+        (worktree / 'present.py').write_text('p = 1\n')
+        await git_ops.commit(worktree, 'Add present.py')
 
-        # Create then delete gone.py — the deletion commit is the done-step commit
-        (worktree / 'gone.py').write_text('g = 1\n')
-        await git_ops.commit(worktree, 'Add gone.py')
-        (worktree / 'gone.py').unlink()
-        await _run(['git', 'add', '-A'], cwd=worktree)
-        await _run(['git', 'commit', '-m', 'Delete gone.py'], cwd=worktree)
-        rc, del_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        # TRUE empty commit (--allow-empty): diff-tree returns rc=0 with no output
+        await _run(['git', 'commit', '--allow-empty', '-m', 'empty step'], cwd=worktree)
+        rc, empty_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         assert rc == 0
-        del_sha = del_sha_out.strip()
+        empty_sha = empty_sha_out.strip()
 
         artifacts = TaskArtifacts(worktree)
-        artifacts.init('t-real-sha', 'T-real-sha', 'desc')
+        artifacts.init('t-empty-diff', 'T-empty-diff', 'desc')
         artifacts.write_plan({
-            'files': ['gone.py'],
+            'files': ['present.py'],
             'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
-                    'description': 'deleted gone.py',
+                    'description': 'empty-diff commit (allow-empty)',
                     'status': 'done',
-                    'commit': del_sha,
+                    'commit': empty_sha,
                 },
             ],
         })
 
-        merge_result = await git_ops.merge_to_main(worktree, 'no-unresolved-real-sha')
+        merge_result = await git_ops.merge_to_main(worktree, 'no-unresolved-empty-diff')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
-                task_id='t-real-sha',
+                task_id='t-empty-diff',
             )
-            # diff-tree succeeded → no unresolved steps
+            # diff-tree rc=0 with empty stdout → no unresolved steps
             assert result.unresolved_steps == [], (
-                f'Expected no unresolved steps (real SHA, diff-tree rc=0), '
+                f'Expected no unresolved steps (empty-diff commit, rc=0), '
                 f'got {result.unresolved_steps!r}'
             )
-            # gone.py was intentionally deleted → not flagged as dropped
+            # present.py is in the merge tree → not flagged as dropped
             assert result.dropped == [], (
-                f'Expected no drops (done-step deletion recognized), '
+                f'Expected no drops (present.py in merge tree), '
                 f'got {result.dropped!r}'
             )
         finally:
@@ -1575,6 +1583,325 @@ class TestCheckPlanTargetsInTree:
             finally:
                 if merge_result2.merge_worktree:
                     await git_ops.cleanup_merge_worktree(merge_result2.merge_worktree)
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_step_diagnostics_emitted_in_plan_step_order(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """step_diagnostics in the structured WARNING must appear in plan-step order.
+
+        Current bug: success diagnostics are appended inline (in plan-step
+        iteration order) and failure diagnostics are appended after the
+        concurrent cat-file gather.  With step_idx=0 failing and step_idx=1
+        succeeding, the rendered list is ``[(1, ...), (0, ...)]`` rather than
+        plan order.
+
+        Setup:
+          - step_idx=0 has ``bad_sha = '0'*40`` (diff-tree rc!=0 → failure)
+          - step_idx=1 has a real deletion commit for file_b.py (rc==0 → success)
+          - file_a.py is never committed → absent from merge tree → real drop
+          - file_b.py is intentionally deleted by step_idx=1
+
+        After the fix, ``step_diagnostics`` is sorted by step_idx before the
+        structured WARNING fires.  Assertion: ``'(0,'`` appears before ``'(1,'``
+        in the rendered WARNING message.  Currently fails because the
+        in-line/failures split produces the reverse order.
+        """
+        worktree = (await git_ops.create_worktree('issue2-diag-order')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        # step_idx=1: real deletion commit for file_b.py
+        (worktree / 'file_b.py').write_text('b = 1\n')
+        await git_ops.commit(worktree, 'Add file_b.py')
+        (worktree / 'file_b.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Delete file_b.py'], cwd=worktree)
+        rc, good_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+        good_sha = good_sha_out.strip()
+
+        bad_sha = '0' * 40  # non-existent → diff-tree rc != 0
+
+        # file_a.py never committed → real drop from merge tree
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue2', 'T-issue2', 'desc')
+        artifacts.write_plan({
+            'files': ['file_a.py', 'file_b.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-0',
+                    'description': 'supposedly deleted file_a.py (bad SHA)',
+                    'status': 'done',
+                    'commit': bad_sha,          # step_idx=0, failure
+                },
+                {
+                    'id': 'step-1',
+                    'description': 'deleted file_b.py (real commit)',
+                    'status': 'done',
+                    'commit': good_sha,         # step_idx=1, success
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue2-diag-order')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                result = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                    task_id='t-issue2',
+                )
+
+            # file_a.py is a real drop (bad_sha fail-closed); file_b.py is expected absent
+            assert 'file_a.py' in result.dropped, (
+                f'Expected file_a.py in dropped; got {result.dropped!r}'
+            )
+
+            # Find the structured-warning record
+            warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert warn_records, 'Expected at least one WARNING when dropped is non-empty'
+            all_messages = ' '.join(r.getMessage() for r in warn_records)
+
+            # Both step indices must appear in the WARNING
+            assert '(0,' in all_messages, f'"(0," not found in WARNING: {all_messages!r}'
+            assert '(1,' in all_messages, f'"(1," not found in WARNING: {all_messages!r}'
+
+            # Plan-step order: (0, ...) must precede (1, ...)
+            pos_0 = all_messages.index('(0,')
+            pos_1 = all_messages.index('(1,')
+            assert pos_0 < pos_1, (
+                f'Expected step_diagnostics in plan order (0 before 1), '
+                f'but (0, appears at {pos_0}, (1, appears at {pos_1}): {all_messages!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_per_step_diff_tree_failure_log_demoted_to_debug(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """Per-step diff-tree failure message must be at DEBUG, not WARNING.
+
+        After Issue 1 fix, ``logger.warning('git diff-tree --diff-filter=D
+        failed for step ...')`` must be demoted to ``logger.debug(...)``.
+        The structured WARNING (``drop-guard: dropped_plan_targets``) already
+        embeds per-step diagnostics via ``step_diagnostics``, so the per-step
+        record at WARNING is redundant and noisy for operators.
+
+        Assertions:
+          (a) At least one DEBUG record contains the per-step failure substring
+              'git diff-tree --diff-filter=D failed for step'.
+          (b) No WARNING record contains that same per-step substring
+              (only the structured drop-guard WARNING should fire at WARNING+).
+          (c) The structured WARNING message contains ``bad_sha[:12]`` (confirming
+              the truncated SHA is still visible via step_diagnostics).
+        """
+        worktree = (await git_ops.create_worktree('issue1-log-level')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # non-existent object → diff-tree rc != 0
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue1', 'T-issue1', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue1-log-level')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+                await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                    task_id='t-issue1',
+                )
+
+            per_step_msg = 'git diff-tree --diff-filter=D failed for step'
+
+            # (a) Per-step failure message must appear at DEBUG level
+            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert any(per_step_msg in r.getMessage() for r in debug_records), (
+                f'Expected a DEBUG record containing {per_step_msg!r}; '
+                f'got DEBUG records: {[r.getMessage() for r in debug_records]!r}'
+            )
+
+            # (b) Per-step failure message must NOT appear at WARNING level
+            warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert not any(per_step_msg in r.getMessage() for r in warning_records), (
+                f'Expected per-step message absent from WARNING; '
+                f'found in: {[r.getMessage() for r in warning_records]!r}'
+            )
+
+            # (c) Structured WARNING must carry bad_sha[:12] via step_diagnostics
+            assert any(bad_sha[:12] in r.getMessage() for r in warning_records), (
+                f'Expected structured WARNING to contain {bad_sha[:12]!r}; '
+                f'got WARNING records: {[r.getMessage() for r in warning_records]!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_unresolved_step_step_id_is_none_when_plan_id_is_not_string(
+        self, git_ops: GitOps,
+    ):
+        """Non-string step id (e.g. integer) must be coerced to None in UnresolvedStep.
+
+        ``step.get('id')`` returns ``Any``.  When the plan stores an integer id
+        (e.g. ``123``), the value silently flows into ``UnresolvedStep.step_id``
+        which is annotated ``str | None`` — a silent type violation.
+
+        After the fix, a non-string id is replaced with ``None`` before
+        constructing the ``UnresolvedStep``.
+
+        Setup: done step with ``id=123`` (integer) and a bad commit SHA.
+        The bad SHA forces an ``UnresolvedStep`` to be created.  The plan
+        file ``gone.py`` is never committed → absent from merge tree → drop.
+
+        Assertion: ``result.unresolved_steps[0].step_id is None``.
+        Currently fails because 123 flows through unmodified.
+        """
+        worktree = (await git_ops.create_worktree('issue5-int-step-id')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # non-existent → forces UnresolvedStep creation
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue5', 'T-issue5', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 123,                  # integer, not str → must become None
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue5-int-step-id')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='t-issue5',
+            )
+            assert result.unresolved_steps, 'Expected at least one UnresolvedStep'
+            us = result.unresolved_steps[0]
+            assert us.step_id is None, (
+                f'Expected step_id=None for integer plan id, got {us.step_id!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_unresolved_step_stderr_truncated_at_module_constants(
+        self, git_ops: GitOps,
+    ):
+        """Truncation of stderr/cat_file_stderr uses named module-level constants.
+
+        Issue 6: the thresholds 500 and 200 are inline magic numbers.  After the
+        fix, ``UNRESOLVED_STDERR_MAX`` and ``UNRESOLVED_CAT_STDERR_MAX`` are
+        exported from the module and used in the truncation expression.
+
+        This test:
+          1. Imports the constants (ImportError if not yet defined → currently fails).
+          2. Monkey-patches ``_run`` so diff-tree returns 1500 X's as stderr and
+             cat-file commit-probe returns 600 Y's.  Merge-tree cat-file probes
+             (``<sha>:<path>`` arg form) fall through to the real subprocess.
+          3. Asserts that the stored stderr / cat_file_stderr lengths equal
+             ``UNRESOLVED_STDERR_MAX + len(' <truncated>')`` and
+             ``UNRESOLVED_CAT_STDERR_MAX + len(' <truncated>')``.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            UNRESOLVED_CAT_STDERR_MAX,
+            UNRESOLVED_STDERR_MAX,
+        )
+
+        worktree = (await git_ops.create_worktree('issue6-trunc-const')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # non-existent → diff-tree rc != 0
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue6', 'T-issue6', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue6-trunc-const')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            from orchestrator import merge_queue as mq
+            original_run = mq._run
+
+            async def _intercept(cmd, cwd=None, **kwargs):
+                if '--diff-filter=D' in cmd:
+                    # Inject long stderr for diff-tree failure
+                    return (128, '', 'X' * 1500)
+                if (
+                    len(cmd) >= 4
+                    and cmd[:3] == ['git', 'cat-file', '-e']
+                    and cmd[-1].endswith('^{commit}')
+                ):
+                    # Inject long stderr for cat-file commit-probe failure
+                    return (1, '', 'Y' * 600)
+                # Merge-tree cat-file probes and all other calls fall through
+                return await original_run(cmd, cwd=cwd, **kwargs)
+
+            with patch('orchestrator.merge_queue._run', new=_intercept):
+                result = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                    task_id='t-issue6',
+                )
+
+            assert result.unresolved_steps, 'Expected at least one UnresolvedStep'
+            us = result.unresolved_steps[0]
+
+            elision = ' <truncated>'
+            assert len(us.stderr) == UNRESOLVED_STDERR_MAX + len(elision), (
+                f'Expected stderr length {UNRESOLVED_STDERR_MAX + len(elision)}, '
+                f'got {len(us.stderr)}: {us.stderr!r}'
+            )
+            assert len(us.cat_file_stderr) == UNRESOLVED_CAT_STDERR_MAX + len(elision), (
+                f'Expected cat_file_stderr length '
+                f'{UNRESOLVED_CAT_STDERR_MAX + len(elision)}, '
+                f'got {len(us.cat_file_stderr)}: {us.cat_file_stderr!r}'
+            )
         finally:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
