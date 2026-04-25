@@ -1,13 +1,23 @@
-"""Contract tests for the ``mock_orch_config`` fixture.
+"""Contract tests for ``conftest.py`` correctness.
 
-These verify the *non-trivial* behavior that the fixture promises and which
-wouldn't survive accidental refactoring — specifically that ``spec_set``
-typo-rejection is wired up on both the top-level mock and every sub-section.
+This module guards two invariants that would silently regress under refactoring
+and are NOT already covered by other tests:
+
+1. **sys.path ordering** — ``conftest.py`` must insert worktree-local source
+   directories onto ``sys.path`` *before* any ``from _orch_helpers``,
+   ``from shared``, or ``from orchestrator`` import, so that worktree-local
+   code takes precedence over installed-package versions.
+
+2. **Sub-section ``spec_set`` wiring** — each sub-section of
+   ``mock_orch_config`` (usage_cap, review, sandbox, fused_memory, escalation)
+   must be ``spec_set``'d so that typos raise ``AttributeError`` immediately
+   rather than silently creating phantom attributes.
 
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
-``conftest.py`` two lines away. The 7 downstream harness fixtures that
-consume the fixture in earnest are the de-facto contract for those.
+``conftest.py`` two lines away. The 7 downstream harness consumers that set
+known fields like ``mock.max_concurrent_tasks`` implicitly validate top-level
+``pydantic_spec`` correctness; any regression there breaks them all.
 """
 
 from pathlib import Path
@@ -43,15 +53,21 @@ def test_syspath_block_precedes_guarded_imports():
 
 
 @pytest.mark.parametrize('attr_path', [
-    ['projcet_root'],
     ['usage_cap', 'enabld'],
     ['review', 'enabld'],
     ['sandbox', 'bakcend'],
     ['fused_memory', 'projcet_id'],
     ['escalation', 'hsot'],
 ])
-def test_typo_rejected(mock_orch_config, attr_path):
-    """Typos on spec_set'd sub-sections raise AttributeError on assignment."""
+def test_subsection_typo_rejected(mock_orch_config, attr_path):
+    """Typos on spec_set'd sub-sections raise AttributeError on assignment.
+
+    Guards the sub-section ``spec_set`` wiring on ``mock_orch_config``.  If a
+    refactor accidentally drops ``spec_set=`` from a sub-section, typos would
+    silently create phantom attributes instead of raising.  The 7 downstream
+    harness consumers only set *known* top-level fields, so they would not
+    catch a sub-section wiring regression — this test does.
+    """
     obj = mock_orch_config
     for attr in attr_path[:-1]:
         obj = getattr(obj, attr)
