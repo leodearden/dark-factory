@@ -364,6 +364,7 @@ async def test_task_interceptor_add_task_rejects_when_over_limit(
     )
     store = TicketStore(tmp_path / 'reject_tickets.db')
     await store.initialize()
+    interceptor = None
     try:
         interceptor = TaskInterceptor(
             _taskmaster_mock,
@@ -383,11 +384,12 @@ async def test_task_interceptor_add_task_rejects_when_over_limit(
         _taskmaster_mock.add_task.assert_not_called()
     finally:
         await store.close()
-        for _wt in list(interceptor._worker_tasks.values()):
-            if not _wt.done():
-                _wt.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await _wt
+        if interceptor is not None:
+            for _wt in list(interceptor._worker_tasks.values()):
+                if not _wt.done():
+                    _wt.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await _wt
 
 
 @pytest.mark.asyncio
@@ -410,6 +412,7 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
     config.curator.enabled = False
     store = TicketStore(tmp_path / 'ok_tickets.db')
     await store.initialize()
+    interceptor = None
     try:
         interceptor = TaskInterceptor(
             _taskmaster_mock,
@@ -425,14 +428,16 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
         )
         ticket = submit_result['ticket']
         await interceptor.resolve_ticket(ticket, project_root, timeout_seconds=5.0)
-        row = await interceptor._ticket_store.get(ticket)
+        row = await store.get(ticket)
+        assert row is not None
         result = json.loads(row['result_json'])
         assert result == {'id': '2', 'title': 'New'}
         _taskmaster_mock.add_task.assert_called_once()
     finally:
         await store.close()
-        for _wt in list(interceptor._worker_tasks.values()):
-            if not _wt.done():
-                _wt.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await _wt
+        if interceptor is not None:
+            for _wt in list(interceptor._worker_tasks.values()):
+                if not _wt.done():
+                    _wt.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await _wt
