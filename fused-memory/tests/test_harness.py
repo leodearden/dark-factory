@@ -3673,6 +3673,16 @@ class TestHarnessDrainIdleShortCircuit:
         # absence-assertions below meaningful.  On a heavily-loaded CI host the 0.2 s
         # window could expire before any iteration runs, making the absence-assertions
         # pass vacuously.  This fails loudly with a diagnostic when that happens.
+        #
+        # Why _recover_stale_runs.call_count is a reliable iteration proxy:
+        # `await self._recover_stale_runs()` is the FIRST awaited call inside the
+        # per-iteration try-block of run_loop()'s while-True loop (harness.py:588).
+        # It runs unconditionally on every iteration regardless of self._draining —
+        # unlike buffer.get_active_projects, which is gated by `if not self._draining:`
+        # (harness.py:591) and would have call_count == 0 in this test (drain() is
+        # called before run_loop()).  REFACTOR NOTE: if _recover_stale_runs is ever
+        # made conditional or moved below another awaited call, update this proxy to
+        # something that remains unconditional at the top of each iteration.
         assert harness._recover_stale_runs.call_count >= 3, (
             f"Loop body must run multiple times to make the absence assertion meaningful; "
             f"only ran {harness._recover_stale_runs.call_count} times"
