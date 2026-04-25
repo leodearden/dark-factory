@@ -99,7 +99,7 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     # (a) add_task returns a non-empty id
     add_result = await backend.add_task(
         project_root=project_root,
-        title='Integration test task',
+        prompt='Integration test task',
     )
     task_id = add_result['id']
     assert task_id, f'add_task returned empty id: {add_result!r}'
