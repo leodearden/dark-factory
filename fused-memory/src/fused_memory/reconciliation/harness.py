@@ -220,7 +220,13 @@ class ReconciliationHarness:
             return
         self._draining = True
         logger.info('Harness drain requested — will finish current cycles, no new ones')
-        logger.info('Harness fully drained — safe to restart')
+        # Task 1053: short-circuit when no project loops are active at drain time.
+        # Uses the same predicate as is_drained and the main-loop emission site
+        # (harness.py ~line 567) so the three stay semantically coupled.
+        # When at least one loop is still running, the main loop emits the marker
+        # after all loops finish (existing behaviour, up to the 120-s timeout).
+        if not any(not t.done() for t in self._project_tasks.values()):
+            logger.info('Harness fully drained — safe to restart')
 
     @property
     def is_drained(self) -> bool:
