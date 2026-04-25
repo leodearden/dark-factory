@@ -47,6 +47,7 @@ DependencyUpdate = _mod.DependencyUpdate
 apply_changes = _mod.apply_changes
 build_audit_plan = _mod.build_audit_plan
 _extract_tasks = _mod._extract_tasks
+_sort_groups_deterministically = _mod._sort_groups_deterministically
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,62 @@ def _task(
     if dependencies is not None:
         t['dependencies'] = dependencies
     return t
+
+
+# ===========================================================================
+# _sort_groups_deterministically — immutability contract
+# ===========================================================================
+
+class TestSortGroupsDeterministicallyImmutability:
+    """_sort_groups_deterministically must NOT mutate its input."""
+
+    def _make_unsorted_groups(self):
+        """Return two groups with members in non-ascending ID order and
+        groups in non-min-ID order (group_b has a higher min ID than group_a
+        but appears first).
+        """
+        group_a = [_task('1003', 'X'), _task('1001', 'X'), _task('1002', 'X')]
+        group_b = [_task('2002', 'Y'), _task('2001', 'Y')]
+        # Deliberately non-sorted outer order: high-min-ID group first.
+        return [group_b, group_a]
+
+    def test_input_outer_list_not_mutated(self):
+        """After the call, the input outer list is still in its original order."""
+        groups = self._make_unsorted_groups()
+        original_outer_ids = [g[0]['id'] for g in groups]  # ['2002', '1003']
+        _sort_groups_deterministically(groups)
+        assert [g[0]['id'] for g in groups] == original_outer_ids
+
+    def test_input_inner_lists_not_mutated(self):
+        """After the call, each inner list is still in its original (non-sorted) order."""
+        groups = self._make_unsorted_groups()
+        original_inner_orders = [[t['id'] for t in g] for g in groups]
+        _sort_groups_deterministically(groups)
+        assert [[t['id'] for t in g] for g in groups] == original_inner_orders
+
+    def test_returned_value_is_sorted_and_distinct(self):
+        """The returned list is a NEW object, with inner lists that are new objects,
+        members within each group sorted ascending by ID, and groups ordered by min ID.
+        """
+        groups = self._make_unsorted_groups()
+        result = _sort_groups_deterministically(groups)
+
+        # Must be a distinct object from the input.
+        assert result is not groups
+
+        # Each returned inner list must be a new object (not one of the originals).
+        original_inner_ids = [id(g) for g in groups]
+        for rg in result:
+            assert id(rg) not in original_inner_ids
+
+        # Members within each returned group must be ascending by ID.
+        for rg in result:
+            ids = [t['id'] for t in rg]
+            assert ids == sorted(ids), f'Expected ascending IDs, got {ids}'
+
+        # Groups ordered by min ID: group_a (min=1001) before group_b (min=2001).
+        assert result[0][0]['id'] == '1001'
+        assert result[1][0]['id'] == '2001'
 
 
 # ===========================================================================
