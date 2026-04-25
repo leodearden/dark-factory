@@ -349,6 +349,38 @@ async def test_stats_tracks_commits(queue, real_buffer):
     assert stats['last_commit_ts'] is not None
 
 
+# ── Test helpers ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
+    """_drain_for_test() waits until every enqueued event has been processed.
+
+    Constructs an EventQueue wired to a real SQLite buffer, enqueues 5 events,
+    then awaits q._drain_for_test(timeout=1.0).  After the call returns the
+    buffer must contain exactly 5 committed events (stats['size'] == 5).
+    """
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dead_letter.jsonl',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(5):
+            q.enqueue(_make_event())
+        await q._drain_for_test(timeout=1.0)
+        stats = await real_buffer.get_buffer_stats('test-project')
+        assert stats['size'] == 5, (
+            f"Expected 5 events in buffer after _drain_for_test, got {stats['size']}"
+        )
+    finally:
+        await q.close()
+
+
 # ── Rotation ────────────────────────────────────────────────────────────
 
 
@@ -376,7 +408,7 @@ async def test_dead_letter_rotation_basic(tmp_path):
         # After rotation dl.jsonl starts fresh with event 3 only (~300 bytes < 500).
         for _ in range(3):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        await q._drain_for_test(timeout=2.0)
 
         # (a) Current dead_letter.jsonl must exist and be under 500 bytes.
         assert dl.exists(), 'dead_letter.jsonl must exist'
@@ -416,7 +448,7 @@ async def test_dead_letter_rotation_drops_beyond_keep(tmp_path):
         # Enqueue many events to trigger 3+ rotations.
         for _ in range(15):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # (c) .jsonl.2 may exist (keep_rotations=2 means keep up to .2).
         #     .jsonl.3 must NOT exist (dropped beyond keep_rotations).
@@ -455,7 +487,7 @@ async def test_dead_letter_rotation_zero_keep_discards_file(tmp_path):
         # Enqueue enough events to exceed the 200-byte cap several times over.
         for _ in range(20):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # No archived sibling should exist.
         assert not (tmp_path / 'dead_letter.jsonl.1').exists(), (
@@ -504,7 +536,7 @@ async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
         # Enqueue enough events to trigger at least one _rotate_dead_letter call.
         for _ in range(10):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # Rotation must have fired at least once.  With max_bytes=200 and
         # each dead-letter record being ~300 bytes, the first write fills the
@@ -562,7 +594,7 @@ async def test_rotation_purges_orphan_rotations(tmp_path):
         # Enqueue enough events to trigger at least one rotation.
         for _ in range(5):
             q.enqueue(_make_event())
-        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+        await q._drain_for_test(timeout=5.0)
 
         # Orphan files beyond keep_rotations must be purged.
         assert not orphan_3.exists(), 'dead_letter.jsonl.3 must be purged after rotation'
@@ -825,9 +857,9 @@ async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, m
 async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
     """read_dead_letters never raises when a dead-letter file cannot be opened.
 
-    The OSError handler at event_queue.py:481 catches OSError raised by
-    _iter_lines_reversed() (which opens the file via path.open('rb')), emits a
-    WARNING containing 'cannot read', and continues.  The result is an empty
+    The OSError handler inside `read_dead_letters` catches OSError raised by
+    `_iter_lines_reversed()` (which opens the file via path.open('rb')), emits
+    a WARNING containing 'cannot read', and continues.  The result is an empty
     list rather than a raised exception.
 
     The monkeypatch is selective: only the dead-letter path's open() raises;
@@ -995,8 +1027,9 @@ def test_iter_lines_reversed_handles_chunk_boundaries(tmp_path):
 def test_iter_lines_reversed_max_line_bytes_overflow(tmp_path, caplog):
     """Carry-buffer overflow guard fires when a single line exceeds max_line_bytes.
 
-    The guard at event_queue.py:86-94 logs a WARNING containing 'carry buffer exceeded'
-    and yields the accumulated bytes as a malformed fragment rather than raising.
+    The `max_line_bytes` overflow guard inside `_iter_lines_reversed` logs a
+    WARNING containing 'carry buffer exceeded' and yields the accumulated bytes
+    as a malformed fragment rather than raising.
     With the default max_line_bytes=1_048_576 (1 MiB) the branch is unreachable
     in production; this test drives it with chunk_size=50 and max_line_bytes=100.
 
