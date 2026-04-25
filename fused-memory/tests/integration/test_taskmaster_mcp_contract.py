@@ -118,13 +118,14 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
     # may return the id as int.  Cast LHS so the round-trip assertion doesn't
     # spuriously fail on a type mismatch when the wire path is healthy.
     assert str(task['id']) == task_id
-    # Pin the observed wire type: str or int are both valid (JS may return either).
-    # A flip in observed type is an intentional contract change — it must also
-    # update the canned mocks in tests/test_taskmaster_client_contract.py so that
-    # static and live suites stay in sync.
-    assert isinstance(task['id'], (str, int)), (
+    # Pin the observed wire type: live JS (taskmaster-ai v0.27.0) returns id as
+    # int for get_task (raw passthrough — no wrapper coercion).  A flip in
+    # observed type is an intentional contract change — it must also update the
+    # canned mocks in tests/test_taskmaster_client_contract.py so that static
+    # and live suites stay in lockstep.
+    assert isinstance(task['id'], int), (
         f"task['id'] has unexpected type {type(task['id']).__name__!r}; "
-        'expected str or int — if the wire type changed update the canned mocks '
+        'expected int — if the wire type changed update the canned mocks '
         'in tests/test_taskmaster_client_contract.py'
     )
     assert task.get('title') == 'Integration test task'
