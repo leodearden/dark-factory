@@ -10,17 +10,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
-from shared.config_models import UsageCapConfig
-
-from orchestrator.config import (
-    EscalationConfig,
-    FusedMemoryConfig,
-    GitConfig,
-    OrchestratorConfig,
-    ReviewConfig,
-    SandboxConfig,
-)
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -35,6 +24,18 @@ if str(_SHARED_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+
+from _orch_helpers import pydantic_spec  # noqa: E402
+from shared.config_models import UsageCapConfig  # noqa: E402
+
+from orchestrator.config import (  # noqa: E402
+    EscalationConfig,
+    FusedMemoryConfig,
+    GitConfig,
+    OrchestratorConfig,
+    ReviewConfig,
+    SandboxConfig,
+)
 
 
 @pytest.fixture(scope="session")
@@ -89,6 +90,22 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     fields so typos raise AttributeError on both get and set.
 
     Apply test-specific overrides directly on the returned object.
+
+    Gotcha — pydantic_spec hides BaseModel methods
+    -----------------------------------------------
+    ``pydantic_spec`` (see ``_orch_helpers.py``) intentionally exposes *only*
+    ``model.model_fields`` names to ``MagicMock(spec_set=...)``.  BaseModel
+    methods — ``model_dump``, ``model_validate``, ``model_copy``, etc. — are
+    NOT in the proxy class, so ``spec_set`` rejects them on both *read* and
+    *write*::
+
+        mock_orch_config.model_dump()           # raises AttributeError
+        mock_orch_config.model_dump = MagicMock(...)  # also raises AttributeError
+
+    If a test genuinely needs BaseModel API access, use a real
+    ``OrchestratorConfig`` (or the relevant sub-section model) instance
+    instead of this fixture.  See ``_orch_helpers.pydantic_spec`` for the
+    underlying rationale.
     """
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.git = GitConfig(
