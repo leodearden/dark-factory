@@ -311,21 +311,6 @@ class BulkResetGuard:
             while state.in_progress_entries and state.in_progress_entries[0].ts < cutoff:
                 state.in_progress_entries.popleft()
 
-            # 3a. Safe eviction: remove idle project state when BOTH entry
-            # deques are empty AND neither rate-limit timestamp has been set,
-            # preventing unbounded dict growth for high-cardinality project_id
-            # sets.  Requires both deques to be empty because done_entries and
-            # in_progress_entries track independent counters.
-            if (
-                not state.done_entries
-                and not state.in_progress_entries
-                and state.last_escalation_ts == 0.0
-                and state.last_write_failure_ts == 0.0
-            ):
-                self._state.pop(project_id, None)
-                state = _GuardState()
-                self._state[project_id] = state
-
             # 4. Route to the per-kind deque and select the matching threshold.
             if kind == 'done_to_pending':
                 entries = state.done_entries
