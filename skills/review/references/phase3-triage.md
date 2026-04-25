@@ -99,8 +99,8 @@ submit_result = submit_task(
 )
 ticket = submit_result["ticket"]
 
-# Phase 2: block until the curator decides (default 115 s)
-resolve = resolve_ticket(ticket=ticket, project_root="/home/leo/src/dark-factory")
+# Phase 2: block until the curator decides
+resolve = resolve_ticket(ticket=ticket, project_root="/home/leo/src/dark-factory", timeout_seconds=<see _shared/ticket-failure-handling.md>)
 
 if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task — use for add_dependency calls

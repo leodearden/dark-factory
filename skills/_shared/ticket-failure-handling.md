@@ -15,8 +15,12 @@ pattern.  Four skills reference it:
 
 ```
 ticket = submit_task(title=..., description=..., metadata=...)
-resolve = resolve_ticket(ticket=ticket, project_root=...)
+resolve = resolve_ticket(ticket=ticket, project_root=..., timeout_seconds=60)
 ```
+
+`timeout_seconds=60` is set below the server default (115 s) so that a timeout failure
+returns before MCP's ~120 s transport window closes — producing an explicit retryable error
+instead of a silently dropped result.  See the [`timeout`](#timeout) failure section.
 
 `resolve["status"]` is one of `"created"`, `"combined"`, or `"failed"`.
 When `"failed"`, `resolve["reason"]` names the failure class.
@@ -58,8 +62,9 @@ duplicate into an existing task via `"combined"`, but this is not guaranteed.
 
 ### `timeout`
 
-The `resolve_ticket` call hit its timeout limit (default 115 s); the worker
-may still be processing the original ticket.
+The `resolve_ticket` call hit its configured timeout (60 s by convention;
+115 s is the server default if omitted); the worker may still be processing
+the original ticket.
 
 **Policy:**
 1. First, retry `resolve_ticket(ticket=same_ticket, ...)` with the **original
