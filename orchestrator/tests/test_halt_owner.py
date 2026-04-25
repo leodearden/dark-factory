@@ -13,7 +13,7 @@ original failure shape (two wip_conflict escalations; only one owns the halt).
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from escalation.models import Escalation
