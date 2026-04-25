@@ -1,14 +1,10 @@
-"""Tests for the Harness.run() startup block migration to get_statuses.
+"""Tests for the Harness.run() startup block "pure read" contract.
 
-These tests cover the three sites in run() that should use get_statuses
-instead of get_tasks after the step-16 migration:
-
-  (a) Line 365: pre_ids snapshot before PRD parse
-  (b) Lines 372-377: pending-task check when no PRD given
-  (c) Lines 389-390: total_tasks count after reconcile
-
-Each test is RED against the current harness (which still calls get_tasks)
-and GREEN after the step-16 impl migrates those three sites.
+Harness.run() must use scheduler.get_statuses (not get_tasks) at the three
+startup sites: the pre_ids snapshot before PRD parse, the pending-task check
+when no PRD is given, and the total_tasks count after reconcile.  Two
+companion tests cover the transport-failure vs genuinely-empty distinction
+introduced by task 1010.
 """
 
 from __future__ import annotations
@@ -69,9 +65,10 @@ def startup_harness(tmp_path: Path) -> Harness:
     h._populate_tasks = AsyncMock()
     h._tag_prd_metadata = AsyncMock()
 
-    # Scheduler mock: get_tasks returns one pending task so the pre-migration
-    # "no pending tasks" guard lets tests (b) and (c) proceed far enough to
-    # be meaningful.  get_statuses is seeded empty — each test overrides it.
+    # Scheduler mock: get_tasks is seeded with a non-empty list as a trap value.
+    # Each test asserts get_tasks is NOT called; a non-empty seed would surface
+    # (via false-positive logic) any harness regression that re-introduces a
+    # get_tasks code path.  get_statuses is seeded empty — each test overrides it.
     h.scheduler = MagicMock()
     h.scheduler.get_tasks = AsyncMock(return_value=[
         {'id': '99', 'status': 'pending'},
@@ -92,26 +89,24 @@ def startup_harness(tmp_path: Path) -> Harness:
 async def test_startup_noprd_uses_get_statuses_to_check_pending(
     startup_harness: Harness,
 ):
-    """No-PRD startup: get_statuses (not get_tasks) used for the pending check.
+    """No-PRD startup uses get_statuses (not get_tasks) for the pending-task check.
 
-    RED — harness currently calls get_tasks for this check.
-    After step-16 migration: get_statuses is called; get_tasks is not.
+    Both mocks are seeded "no tasks" so the no-pending RuntimeError path is
+    exercised: get_statuses returns {} → 'pending' not in values → RuntimeError.
     """
     h = startup_harness
     get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
     get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
-    # Signal "no tasks" via both mocks.
-    # Pre-migration: get_tasks returns [] → any(...) is False → RuntimeError.
-    # Post-migration: get_statuses returns {} → 'pending' not in values → RuntimeError.
+    # Both seeded empty so the no-pending RuntimeError path fires.
     get_tasks_mock.return_value = []
     get_statuses_mock.return_value = ({}, None)
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
         await h.run(prd_path=None)
 
-    # After migration: get_statuses used for the check.
+    # get_statuses IS the call site for the pending-task check.
     get_statuses_mock.assert_called()
-    # After migration: get_tasks NOT called in the startup block.
+    # get_tasks must NOT be called in the startup block.
     get_tasks_mock.assert_not_called()
 
 
@@ -123,11 +118,7 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
 async def test_startup_total_tasks_counted_via_get_statuses(
     startup_harness: Harness,
 ):
-    """total_tasks report field is derived from get_statuses pending count, not get_tasks.
-
-    RED — harness currently calls get_tasks to count pending tasks at line 389.
-    After step-16 migration: get_statuses is used instead.
-    """
+    """total_tasks report field is derived from get_statuses pending count, not get_tasks."""
     h = startup_harness
     get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
     get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
@@ -141,7 +132,9 @@ async def test_startup_total_tasks_counted_via_get_statuses(
         await h.run(prd_path=None)
 
     assert h.report.total_tasks == 2
-    # After migration: get_tasks never called for the startup block.
+    # get_statuses IS the call site for the count.
+    get_statuses_mock.assert_called()
+    # get_tasks must NOT be called for the startup block.
     get_tasks_mock.assert_not_called()
 
 
@@ -154,11 +147,7 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
     startup_harness: Harness,
     tmp_path: Path,
 ):
-    """With prd_path: pre_ids snapshot taken from get_statuses.keys(), not get_tasks.
-
-    RED — harness currently calls get_tasks to build pre_ids at line 365.
-    After step-16 migration: get_statuses is called and pre_ids = set(statuses.keys()).
-    """
+    """With prd_path: pre_ids snapshot is taken from get_statuses.keys(), not get_tasks."""
     prd = tmp_path / 'feature.md'
     prd.write_text('# PRD')
 
@@ -182,7 +171,9 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
         await h.run(prd_path=prd)
 
     assert captured_pre_ids == {'10', '20'}
-    # After migration: get_tasks NOT called for the pre_ids snapshot.
+    # get_statuses IS the call site for the pre_ids snapshot.
+    get_statuses_mock.assert_called()
+    # get_tasks must NOT be called for the pre_ids snapshot.
     get_tasks_mock.assert_not_called()
 
 
