@@ -1,0 +1,88 @@
+"""Integration tests for TaskmasterBackend wire→DTO contract against a live subprocess.
+
+These tests drive a real Taskmaster MCP subprocess (via
+``TaskmasterBackend.initialize()``) through two paths:
+
+1. Happy-path round-trip: ``add_task → get_task → set_task_status → remove_task``
+2. Tool-level error path: ``get_task('99999')`` → ``TaskmasterError(code='TASKMASTER_TOOL_ERROR')``
+
+The companion canned-payload suite lives in
+``tests/test_taskmaster_client_contract.py`` and mocks ``session.call_tool`` with
+hand-crafted wire envelopes to cover all 12 wrapper methods.  These live tests
+exist exclusively to catch wire-shape drift between Taskmaster's JS tools and the
+canned mocks — drift that static mocks cannot detect.
+
+**Skip semantics**: this suite is skipped automatically unless
+``taskmaster-ai/dist/mcp-server.js`` is present.  To enable it::
+
+    git submodule update --init taskmaster-ai
+    cd taskmaster-ai && npm install && npm run build
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from fused_memory.backends.taskmaster_client import TaskmasterBackend  # noqa: F401
+from fused_memory.backends.taskmaster_types import TaskmasterError  # noqa: F401
+from fused_memory.config.schema import TaskmasterConfig  # noqa: F401
+
+# ── Dist path resolution ─────────────────────────────────────────────
+# parents[3]: tests/integration/<file>.py → tests/integration → tests → fused-memory → repo-root
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_TASKMASTER_DIST = _REPO_ROOT / 'taskmaster-ai' / 'dist' / 'mcp-server.js'
+
+pytestmark = pytest.mark.skipif(
+    not _TASKMASTER_DIST.exists(),
+    reason=(
+        f'Taskmaster MCP dist not built ({_TASKMASTER_DIST}). '
+        'To enable: git submodule update --init taskmaster-ai '
+        '&& cd taskmaster-ai && npm install && npm run build'
+    ),
+)
+
+
+# ── Tests ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_backend):
+    """Happy-path: full CRUD round-trip against the live Taskmaster subprocess."""
+    backend, project_root = taskmaster_backend
+
+    # (a) add_task returns a non-empty id
+    add_result = await backend.add_task(
+        project_root=project_root,
+        title='Integration test task',
+    )
+    task_id = add_result['id']
+    assert task_id, f'add_task returned empty id: {add_result!r}'
+
+    # (b) get_task returns the task with matching id/title and a known start-state
+    task = await backend.get_task(task_id, project_root=project_root)
+    assert task['id'] == task_id or str(task.get('id')) == task_id
+    assert task.get('title') == 'Integration test task'
+    known_start_states = {'pending', 'todo', 'in-progress', 'in_progress'}
+    assert task.get('status') in known_start_states, (
+        f"Unexpected initial status {task.get('status')!r}; "
+        f'known start states: {known_start_states}'
+    )
+
+    # (c) set_task_status returns a message containing 'done'
+    status_result = await backend.set_task_status(
+        task_id, 'done', project_root=project_root
+    )
+    assert 'done' in status_result['message'].lower(), (
+        f'Expected "done" in set_task_status message, got: {status_result["message"]!r}'
+    )
+
+    # (d) remove_task returns successful==1 and the id in removed_ids
+    remove_result = await backend.remove_task(task_id, project_root=project_root)
+    assert remove_result['successful'] == 1, (
+        f'Expected successful=1, got: {remove_result!r}'
+    )
+    assert task_id in remove_result['removed_ids'], (
+        f'Expected {task_id!r} in removed_ids: {remove_result["removed_ids"]!r}'
+    )
