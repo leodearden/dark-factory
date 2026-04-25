@@ -3918,12 +3918,21 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     await inside_first.wait()
 
     # Probe 1: lock must be held (TimeoutError proves the batched scope is active).
-    # The 0.5 s timeout is only spent in the failure branch (lock unexpectedly free);
-    # the happy path exits the moment the lock attempt blocks — no CI slowdown.
+    # In the happy path the lock IS held by the gated _dedupe_bulk_created task, so
+    # asyncio.wait_for(lock.acquire(), timeout=0.5) blocks the FULL 0.5 s before
+    # raising TimeoutError — TimeoutError is the pass condition, not the failure branch.
+    # The value is sized for slow-CI robustness (e.g. coverage-instrumented runs);
+    # two probes add ~1 s total wall-clock, kept acceptable by the bounded timeout.
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
             curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
         )
+    assert curator_interceptor._write_lock(PROJECT_ID).locked(), (
+        'lock must still be held after the probe — asyncio.Lock cancellation race '
+        '(pre-3.11) could leave the lock free if a waiter was cancelled just as it '
+        'became available; gating closes that window here but this assertion catches '
+        'any future refactor that re-opens it'
+    )
 
     # Advance to the second removal.
     release_first.set()
@@ -3932,11 +3941,17 @@ async def test_dedupe_bulk_intra_batch_acquires_write_lock_once_for_batch(
     # Probe 2: lock must STILL be held between consecutive removals.
     # Under the old per-item form the lock would have been released here and
     # the probe would succeed, distinguishing the two implementations.
-    # Same reasoning for the 0.5 s timeout as Probe 1 above.
+    # Same reasoning as Probe 1: the full 0.5 s is spent in the happy path because
+    # the lock is still held; TimeoutError is the pass condition.
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
             curator_interceptor._write_lock(PROJECT_ID).acquire(), timeout=0.5
         )
+    assert curator_interceptor._write_lock(PROJECT_ID).locked(), (
+        'lock must still be held after the probe — same cancellation-race rationale '
+        'as Probe 1; gating closes the window but the assertion fails loudly if a '
+        'future edit re-opens it'
+    )
 
     # Release the second removal and let the batch complete.
     release_second.set()
