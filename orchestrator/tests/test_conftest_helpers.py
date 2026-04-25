@@ -10,7 +10,36 @@ are deliberately omitted — they would just duplicate literals from
 consume the fixture in earnest are the de-facto contract for those.
 """
 
+from pathlib import Path
+
 import pytest
+
+
+def test_syspath_block_precedes_guarded_imports():
+    """sys.path.insert must appear in conftest.py before the guarded imports.
+
+    Ensures that worktree-local source is on sys.path before Python resolves
+    ``from _orch_helpers``, ``from shared.config_models``, and
+    ``from orchestrator.config`` imports — otherwise the installed-package
+    version may be loaded instead of the local worktree copy.
+    """
+    conftest_text = (Path(__file__).parent / 'conftest.py').read_text()
+
+    syspath_pos = conftest_text.index('sys.path.insert')
+
+    guarded_imports = [
+        'from _orch_helpers import',
+        'from shared.config_models import',
+        'from orchestrator.config import',
+    ]
+
+    for stmt in guarded_imports:
+        stmt_pos = conftest_text.index(stmt)
+        assert syspath_pos < stmt_pos, (
+            f'sys.path.insert (at offset {syspath_pos}) must appear before '
+            f'{stmt!r} (at offset {stmt_pos}) in conftest.py — '
+            f'move the sys.path block above the guarded imports'
+        )
 
 
 @pytest.mark.parametrize('attr_path', [
