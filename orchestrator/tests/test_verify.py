@@ -13,6 +13,7 @@ from orchestrator.verify import (
     _apply_cargo_scope,
     _build_fallback_config,
     _extract_cause_hint,
+    _is_test_file,
     _run_cmd,
     _scope_cargo_workspace,
     run_scoped_verification,
@@ -683,6 +684,50 @@ def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: 
 
     assert result.verify_command_timeout_secs == 2000.0
     assert result.verify_cold_command_timeout_secs == 6000.0
+
+
+class TestIsTestFile:
+    """`_is_test_file` returns True only for concrete test files, never for conftest.py.
+
+    The docstring contract: conftest.py is excluded at any depth so callers can
+    pass the result straight to pytest without a follow-up filter.
+    """
+
+    def test_returns_false_for_conftest_under_tests_dir(self):
+        """conftest.py under a tests/ directory must not be treated as a test file.
+
+        Tracing the old code: '/tests/' in 'orchestrator/tests/conftest.py' is
+        True, so the function returned True — violating the docstring invariant.
+        """
+        assert _is_test_file('orchestrator/tests/conftest.py') is False
+
+    def test_returns_false_for_conftest_under_root_tests_prefix(self):
+        """conftest.py at the root tests/ prefix must not be treated as a test file.
+
+        'tests/conftest.py'.startswith('tests/') is True in the old code, so
+        this also returned True erroneously.
+        """
+        assert _is_test_file('tests/conftest.py') is False
+
+    def test_returns_false_for_root_conftest(self):
+        """conftest.py at the worktree root must return False (sanity guard)."""
+        assert _is_test_file('conftest.py') is False
+
+    def test_returns_true_for_test_file_under_tests_dir(self):
+        """A real test file under tests/ must still return True after the fix."""
+        assert _is_test_file('orchestrator/tests/test_foo.py') is True
+
+    def test_returns_true_for_test_prefixed_file(self):
+        """A test_*.py file matched by name prefix must return True."""
+        assert _is_test_file('src/test_x.py') is True
+
+    def test_returns_true_for_test_suffixed_file(self):
+        """A *_test.py file matched by name suffix must return True."""
+        assert _is_test_file('src/foo_test.py') is True
+
+    def test_returns_false_for_regular_source_file(self):
+        """A regular source file must return False (negative baseline)."""
+        assert _is_test_file('orchestrator/src/orchestrator/verify.py') is False
 
 
 class TestScopeModuleConfigReturnsNone:
