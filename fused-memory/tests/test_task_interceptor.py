@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -938,7 +939,7 @@ async def test_concurrent_add_task_produces_single_task(
 
     taskmaster.add_task = fake_add_task
 
-    candidate_kwargs = dict(
+    candidate_kwargs: dict[str, Any] = dict(
         title='Log release-mode warning on duplicate template names',
         description='...',
     )
