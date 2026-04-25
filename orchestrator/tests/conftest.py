@@ -12,7 +12,13 @@ from unittest.mock import MagicMock
 import pytest
 from shared.config_models import UsageCapConfig
 
-from orchestrator.config import FusedMemoryConfig, GitConfig, ReviewConfig, SandboxConfig
+from orchestrator.config import (
+    FusedMemoryConfig,
+    GitConfig,
+    OrchestratorConfig,
+    ReviewConfig,
+    SandboxConfig,
+)
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -73,9 +79,18 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     Sub-sections (usage_cap, review, sandbox, fused_memory) are pre-created
     so nested attribute access works without side-effects.
 
+    The top-level mock is spec_set'd against OrchestratorConfig.model_fields
+    so typos on top-level attributes raise AttributeError on both get and set.
+
     Apply test-specific overrides directly on the returned object.
     """
-    config = MagicMock()  # unspecced: Pydantic v2 hides field names from dir()
+    # spec_set built from model_fields catches top-level attribute typos on
+    # both get and set.  We can't pass spec_set=OrchestratorConfig directly:
+    # Pydantic v2 hides field names from dir(), so MagicMock would see only
+    # BaseModel/BaseSettings methods.  Building a minimal proxy class with the
+    # field names as class attributes makes dir(_ConfigSpec) include them.
+    _ConfigSpec = type('_ConfigSpec', (), {f: None for f in OrchestratorConfig.model_fields})
+    config = MagicMock(spec_set=_ConfigSpec)
     config.git = GitConfig(
         main_branch='main',
         branch_prefix='task/',
