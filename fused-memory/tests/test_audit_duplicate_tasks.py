@@ -1111,6 +1111,11 @@ class TestExtractTasksCorruptionShapes:
         {'unexpected_key': 'some_value'},
         42,
         'non_list_string',
+        {'data': None},  # data key present but null
+        {'data': {'tasks': 'not_a_list'}},  # nested-data path, tasks is a string
+        {'data': {'tasks': {'nested': True}}},  # nested-data path, tasks is a dict
+        {'tasks': 'not_a_list'},  # legacy top-level path, tasks is a string
+        {'tasks': {'nested': True}},  # legacy top-level path, tasks is a dict
     ])
     def test_returns_empty_list(self, raw):
         """Result is always [] for corruption shapes."""
@@ -1137,6 +1142,31 @@ class TestExtractTasksCorruptionShapes:
             # non-dict, non-list truthy value (str)
             'non_list_string',
             'str',
+        ),
+        (
+            # data key present but null
+            {'data': None},
+            "['data']",
+        ),
+        (
+            # nested-data path, tasks is a string (not a list)
+            {'data': {'tasks': 'not_a_list'}},
+            "['data']",
+        ),
+        (
+            # nested-data path, tasks is a dict (not a list)
+            {'data': {'tasks': {'nested': True}}},
+            "['data']",
+        ),
+        (
+            # legacy top-level path, tasks is a string (not a list)
+            {'tasks': 'not_a_list'},
+            "['tasks']",
+        ),
+        (
+            # legacy top-level path, tasks is a dict (not a list)
+            {'tasks': {'nested': True}},
+            "['tasks']",
         ),
     ])
     def test_warning_logged_with_shape_hint(self, raw, expected_hint_fragment, caplog):
