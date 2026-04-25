@@ -2141,7 +2141,7 @@ class TestHarnessFetchFilteredTaskTree:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         with caplog.at_level(logging.INFO):
-            result = await harness._fetch_filtered_task_tree('')
+            await harness._fetch_filtered_task_tree('')
 
         info_empty = [
             r for r in caplog.records
@@ -2346,7 +2346,7 @@ class TestHarnessFetchFilteredTaskTree:
         }
 
         with caplog.at_level(logging.DEBUG):
-            result = await harness._fetch_filtered_task_tree('/abs/path')
+            await harness._fetch_filtered_task_tree('/abs/path')
 
         # (a) INFO record with marker and correct structured fields
         info_fetched = [
