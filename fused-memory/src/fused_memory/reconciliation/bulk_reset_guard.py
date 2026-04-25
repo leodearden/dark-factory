@@ -1,22 +1,52 @@
-"""Defence-in-depth bulk-reset circuit-breaker (task 918).
+"""Defence-in-depth bulk-reset circuit-breaker (task 918, refined task 1016).
 
-Detects bursts of done→pending or in-progress→pending task-status reversals
-within a sliding time window and halts further reversals once the configured
-threshold is crossed.
+Detects bursts of task-status reversals within a sliding time window and
+halts further reversals once the configured per-kind threshold is crossed.
 
-Background: Two autopilot_video bulk resets on 2026-04-21 and 2026-04-22
-pushed large batches of tasks from done/in-progress back to pending despite
-the orchestrator's ``_safe_stash_pop_with_recovery`` fix already being
-deployed.  This guard is a second line of defence at the fused-memory
-reconciliation layer: it limits blast radius when the primary prevention fails.
+Background
+----------
+Two autopilot_video bulk resets on 2026-04-21 and 2026-04-22 pushed large
+batches of tasks from done/in-progress back to pending despite the
+orchestrator's ``_safe_stash_pop_with_recovery`` fix already being deployed.
+This guard is a second line of defence at the fused-memory reconciliation
+layer: it limits blast radius when the primary prevention fails.
+
+Task 1016 motivation
+--------------------
+The 2026-04-24 reify startup-stranded-task reconciler reverted 27
+in-progress tasks to pending in ~2 s (escalation id:
+``esc-bulk-reset-reify-2026-04-24T070944_6456580000``).  The original
+single shared threshold (10 / 60 s) fired even though zero done→pending
+transitions occurred.  Task 1016 splits the shared counter into two
+independent per-kind counters with independent thresholds:
+  - ``done_to_pending`` (default 10/60 s): catches the March-2026
+    ``advance_main`` data-loss pattern (task 918).
+  - ``in_progress_to_pending`` (default 100/60 s): allows the 27-task
+    startup stranded-task reconcile while still catching pathological runaways.
 
 Architecture mirrors :class:`~fused_memory.reconciliation.backlog_policy.BacklogPolicy`:
-  - Constructed with config knobs (enabled, threshold, window_seconds, …).
+  - Constructed with config knobs (enabled, done_threshold,
+    in_progress_threshold, window_seconds, …).
   - Passed into :class:`~fused_memory.middleware.task_interceptor.TaskInterceptor`.
   - Called via ``observe_attempt`` in ``_apply_status_transition`` *before*
     the terminal-exit gate so it catches both legitimate and illegitimate
     reversal patterns.
-  - Emits L1 escalation JSON under ``<project_root>/data/escalations/``.
+  - Emits L1 escalation JSON under ``<project_root>/data/escalations/``
+    with a kind slug (``done`` or ``in-progress``) in the filename and a
+    ``kind`` field in the JSON body for at-a-glance triage.
+
+Split-counter design
+--------------------
+Each ``_GuardState`` holds two independent sliding-window deques:
+  - ``done_entries``        — accumulates done→pending reversals
+  - ``in_progress_entries`` — accumulates in-progress→pending reversals
+
+The shared per-project scalars ``last_escalation_ts`` and
+``last_write_failure_ts`` are NOT split per-kind: a simultaneous storm of
+both kinds would, with per-kind rate limits, emit two escalations within
+seconds.  Sharing the rate limit preserves the "no escalation-directory
+flood" guarantee; the ``kind`` field on the verdict and escalation file
+still lets operators distinguish which counter tripped.
 """
 
 from __future__ import annotations
@@ -39,17 +69,25 @@ logger = logging.getLogger(__name__)
 # Public helpers
 # ---------------------------------------------------------------------------
 
-def _is_reversal(old_status: str, new_status: str) -> bool:
-    """Return True iff the transition is a guarded reversal.
+def _reversal_kind(
+    old_status: str, new_status: str
+) -> Literal['done_to_pending', 'in_progress_to_pending'] | None:
+    """Classify a status transition into a guarded reversal kind, or None.
 
     Exactly two patterns qualify:
-      * ``done``        → ``pending``
-      * ``in-progress`` → ``pending``
+      * ``done``        → ``pending``  → ``'done_to_pending'``
+      * ``in-progress`` → ``pending``  → ``'in_progress_to_pending'``
 
-    All other transitions (including blocked→pending) are not reversals and
-    do not consume window slots.
+    All other transitions (including ``blocked``→``pending``) are not
+    reversals and do not consume window slots.  Returns ``None`` for those.
     """
-    return new_status == 'pending' and old_status in ('done', 'in-progress')
+    if new_status != 'pending':
+        return None
+    if old_status == 'done':
+        return 'done_to_pending'
+    if old_status == 'in-progress':
+        return 'in_progress_to_pending'
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +96,15 @@ def _is_reversal(old_status: str, new_status: str) -> bool:
 
 @dataclass(frozen=True)
 class BulkResetVerdict:
-    """Outcome of a single :meth:`BulkResetGuard.observe_attempt` call."""
+    """Outcome of a single :meth:`BulkResetGuard.observe_attempt` call.
+
+    Attributes
+    ----------
+    kind:
+        The reversal kind that tripped the guard: ``'done_to_pending'`` or
+        ``'in_progress_to_pending'``.  ``None`` for ``outcome='ok'`` verdicts
+        where the circuit-breaker was not tripped.
+    """
 
     outcome: Literal['ok', 'rejection', 'escalated']
     affected_task_ids: tuple[str, ...] = ()
@@ -68,6 +114,7 @@ class BulkResetVerdict:
     project_id: str = ''
     error_type: str = 'BulkResetGuardTripped'
     escalation_path: str | None = None
+    kind: Literal['done_to_pending', 'in_progress_to_pending'] | None = None
 
     @property
     def is_rejection(self) -> bool:
@@ -121,6 +168,8 @@ class BulkResetVerdict:
         }
         if self.outcome == 'escalated' and self.escalation_path is not None:
             payload['escalation_path'] = self.escalation_path
+        if self.kind is not None:
+            payload['kind'] = self.kind
         return payload
 
 
@@ -136,7 +185,8 @@ class _Entry:
 
 @dataclass
 class _GuardState:
-    entries: deque[_Entry] = field(default_factory=deque)
+    done_entries: deque[_Entry] = field(default_factory=deque)
+    in_progress_entries: deque[_Entry] = field(default_factory=deque)
     last_escalation_ts: float = 0.0
     last_write_failure_ts: float = 0.0
 
@@ -153,12 +203,18 @@ class BulkResetGuard:
     enabled:
         When ``False`` every call returns ``ok`` immediately; no state is
         mutated.  Lets operators disable the guard without code changes.
-    threshold:
-        Number of reversal attempts within ``window_seconds`` that trips the
-        circuit.  Up to ``threshold`` reversals are allowed; the
-        ``(threshold+1)``-th attempt in the window is the first to be
-        rejected.  For example, ``threshold=10`` means the 11th reversal in
-        the window is the first rejection.
+    done_threshold:
+        Number of ``done``→``pending`` reversal attempts within
+        ``window_seconds`` that trips the circuit.  Up to ``done_threshold``
+        reversals are allowed; the ``(done_threshold+1)``-th attempt is the
+        first rejection.  Default 10 — inherited from the original
+        single-threshold design (task 918).
+    in_progress_threshold:
+        Number of ``in-progress``→``pending`` reversal attempts within
+        ``window_seconds`` that trips the circuit.  Default 100 — set
+        comfortably above the 27-task startup stranded-task reconcile seen
+        in the 2026-04-24 reify incident while still catching pathological
+        runaways.
     window_seconds:
         Length of the sliding window in seconds.  Entries older than
         ``now - window_seconds`` are pruned before each check.
@@ -189,7 +245,8 @@ class BulkResetGuard:
         self,
         *,
         enabled: bool = True,
-        threshold: int = 10,
+        done_threshold: int = 10,
+        in_progress_threshold: int = 100,
         window_seconds: float = 60.0,
         escalation_rate_limit_seconds: float = 900.0,
         write_failure_backoff_seconds: float = 60.0,
@@ -197,7 +254,8 @@ class BulkResetGuard:
         escalations_fallback_dir: Path | None = None,
     ) -> None:
         self._enabled = enabled
-        self._threshold = threshold
+        self._done_threshold = done_threshold
+        self._in_progress_threshold = in_progress_threshold
         self._window_seconds = window_seconds
         self._rate_limit_seconds = escalation_rate_limit_seconds
         self._write_failure_backoff_seconds = write_failure_backoff_seconds
@@ -237,7 +295,8 @@ class BulkResetGuard:
             return BulkResetVerdict(outcome='ok', project_id=project_id)
 
         # 2. Non-reversal fast-path — ignore; do not touch the deque.
-        if not _is_reversal(old_status, new_status):
+        kind = _reversal_kind(old_status, new_status)
+        if kind is None:
             return BulkResetVerdict(outcome='ok', project_id=project_id)
 
         now = self._now()
@@ -247,17 +306,19 @@ class BulkResetGuard:
 
             # 3. Prune expired entries.
             cutoff = now - self._window_seconds
-            while state.entries and state.entries[0].ts < cutoff:
-                state.entries.popleft()
+            while state.done_entries and state.done_entries[0].ts < cutoff:
+                state.done_entries.popleft()
+            while state.in_progress_entries and state.in_progress_entries[0].ts < cutoff:
+                state.in_progress_entries.popleft()
 
-            # 3a. Safe eviction: remove idle project state when entries is
-            # empty AND neither rate-limit timestamp has been set, preventing
-            # unbounded dict growth for high-cardinality project_id sets.
-            # Unlike the removed unconditional eviction (commit 7d7b3dd16a),
-            # this only fires when there is truly no state worth preserving
-            # (project was never escalated and never suffered a write failure).
+            # 3a. Safe eviction: remove idle project state when BOTH entry
+            # deques are empty AND neither rate-limit timestamp has been set,
+            # preventing unbounded dict growth for high-cardinality project_id
+            # sets.  Requires both deques to be empty because done_entries and
+            # in_progress_entries track independent counters.
             if (
-                not state.entries
+                not state.done_entries
+                and not state.in_progress_entries
                 and state.last_escalation_ts == 0.0
                 and state.last_write_failure_ts == 0.0
             ):
@@ -265,31 +326,52 @@ class BulkResetGuard:
                 state = _GuardState()
                 self._state[project_id] = state
 
-            # 4. Record this attempt (always, even if we will reject it).
-            state.entries.append(_Entry(ts=now, task_id=task_id))
+            # 4. Route to the per-kind deque and select the matching threshold.
+            if kind == 'done_to_pending':
+                entries = state.done_entries
+                threshold = self._done_threshold
+            else:
+                entries = state.in_progress_entries
+                threshold = self._in_progress_threshold
 
-            # 5. Check threshold.
+            # 5. Record this attempt (always, even if we will reject it).
+            entries.append(_Entry(ts=now, task_id=task_id))
+
+            # 6. Check threshold.
             # Trip fires when the count EXCEEDS threshold (len > threshold),
             # i.e. the (threshold+1)-th attempt in the window is the first
             # rejection.  This means "up to threshold reversals are allowed;
-            # the next one trips the circuit-breaker."  Steps 5, 13, 15 all
-            # assume threshold=3 allows exactly three ok reversals.
-            if len(state.entries) <= self._threshold:
+            # the next one trips the circuit-breaker."
+            if len(entries) <= threshold:
                 return BulkResetVerdict(outcome='ok', project_id=project_id)
 
-            # 6. Threshold crossed — collect window contents for the verdict.
-            affected_ids = tuple(e.task_id for e in state.entries)
+            # 7. Threshold crossed — collect window contents for the verdict.
+            # Only entries from the tripped deque are included in
+            # affected_task_ids; the other deque's IDs are captured separately
+            # so the escalation JSON can surface cross-kind context for
+            # operators triaging the incident without mixing the two counters.
+            affected_ids = tuple(e.task_id for e in entries)
             trig_ts = tuple(
                 datetime.fromtimestamp(e.ts, tz=UTC).isoformat()
-                for e in state.entries
+                for e in entries
             )
+            # Cross-kind window context (may be empty if the other counter has
+            # not accumulated any entries within the current window).
+            other_entries = (
+                state.in_progress_entries
+                if kind == 'done_to_pending'
+                else state.done_entries
+            )
+            other_kind_ids = tuple(e.task_id for e in other_entries)
 
-        # 7. Try to write escalation (outside lock to avoid I/O under lock).
+        # 8. Try to write escalation (outside lock to avoid I/O under lock).
         esc_path = await self._maybe_write_escalation(
             project_id=project_id,
             project_root=project_root,
             affected_task_ids=affected_ids,
             triggering_timestamps=trig_ts,
+            other_kind_task_ids=other_kind_ids,
+            kind=kind,
         )
 
         if esc_path is not None:
@@ -297,18 +379,20 @@ class BulkResetGuard:
                 outcome='escalated',
                 affected_task_ids=affected_ids,
                 triggering_timestamps=trig_ts,
-                threshold=self._threshold,
+                threshold=threshold,
                 window_seconds=self._window_seconds,
                 project_id=project_id,
                 escalation_path=str(esc_path),
+                kind=kind,
             )
         return BulkResetVerdict(
             outcome='rejection',
             affected_task_ids=affected_ids,
             triggering_timestamps=trig_ts,
-            threshold=self._threshold,
+            threshold=threshold,
             window_seconds=self._window_seconds,
             project_id=project_id,
+            kind=kind,
         )
 
     # ------------------------------------------------------------------
@@ -332,11 +416,22 @@ class BulkResetGuard:
         project_root: str,
         affected_task_ids: tuple[str, ...],
         triggering_timestamps: tuple[str, ...],
+        other_kind_task_ids: tuple[str, ...] = (),
+        kind: Literal['done_to_pending', 'in_progress_to_pending'],
     ) -> Path | None:
         """Write an L1 escalation JSON unless rate-limited.
 
         Returns the path on success, or ``None`` when rate-limited / write
         failed (callers produce ``outcome='rejection'`` in that case).
+
+        Parameters
+        ----------
+        other_kind_task_ids:
+            Task IDs from the *other* reversal kind's deque that were active
+            in the current window at trip time.  Recorded in the escalation
+            JSON as ``other_kind_task_ids_in_window`` so operators triaging
+            the incident have full window context without needing to inspect
+            the guard's in-memory state.
         """
         now = self._now()
 
@@ -346,11 +441,20 @@ class BulkResetGuard:
             # so that a disk failure does not silently suppress the next escalation
             # for the full rate-limit period (900 s by default).
             if (now - state.last_escalation_ts) < self._rate_limit_seconds:
-                logger.info(
-                    'bulk_reset_guard: rate-limited escalation for %s '
-                    '(%.0fs since last)',
+                # Use WARNING (not INFO) because the suppressed escalation is a
+                # real incident event — an operator may be investigating why no
+                # file was written for a kind that tripped inside the rate-limit
+                # window.  The log message names the kind explicitly so the
+                # operator knows which counter was silenced.
+                logger.warning(
+                    'bulk_reset_guard: escalation suppressed (rate-limited) for %s '
+                    '[kind=%s, %.0fs since last write, limit=%.0fs] — '
+                    'no new escalation file will be written; '
+                    'check the most recent escalation file for this project',
                     project_id,
+                    kind,
                     now - state.last_escalation_ts,
+                    self._rate_limit_seconds,
                 )
                 return None
             # Write-failure backoff: suppress I/O retries for
@@ -390,11 +494,19 @@ class BulkResetGuard:
 
         ts = datetime.fromtimestamp(now, tz=UTC).isoformat()
         safe_ts = ts.replace(':', '').replace('+', '').replace('.', '_')
+        # Build a kind slug for the filename so operators can distinguish
+        # data-loss events (done) from benign startup-reconcile runaways
+        # (in-progress) without opening the file.
+        kind_slug = 'done' if kind == 'done_to_pending' else 'in-progress'
+        tripped_threshold = (
+            self._done_threshold if kind == 'done_to_pending'
+            else self._in_progress_threshold
+        )
         # Include a sanitised project_id in the filename so two projects that trip
         # within the same microsecond (or whose timestamps collide after stripping)
         # do not silently overwrite each other.
         safe_pid = ''.join(c if c.isalnum() or c in '-_' else '_' for c in project_id)
-        esc_id = f'esc-bulk-reset-{safe_pid}-{safe_ts}'
+        esc_id = f'esc-bulk-reset-{kind_slug}-{safe_pid}-{safe_ts}'
         path = esc_dir / f'{esc_id}.json'
 
         record = {
@@ -403,17 +515,18 @@ class BulkResetGuard:
             'agent_role': 'fused-memory',
             'severity': 'blocking',
             'category': 'infra_issue',
+            'kind': kind,
             'summary': (
                 f'Bulk task-status reversal detected for {project_id}: '
-                f'{len(affected_task_ids)} reversals in {self._window_seconds}s '
-                f'(threshold={self._threshold})'
+                f'{len(affected_task_ids)} {kind_slug}→pending reversals in '
+                f'{self._window_seconds}s (threshold={tripped_threshold})'
             ),
             'detail': (
                 f'The bulk-reset circuit-breaker (task 918) tripped for project '
-                f'{project_id}. {len(affected_task_ids)} done→pending or '
-                f'in-progress→pending reversal attempts landed within a '
-                f'{self._window_seconds}s window, exceeding the threshold of '
-                f'{self._threshold}. The first triggering attempt was at '
+                f'{project_id}. {len(affected_task_ids)} {kind_slug}→pending '
+                f'reversal attempts landed within a {self._window_seconds}s window, '
+                f'exceeding the {kind_slug}→pending threshold of {tripped_threshold}. '
+                f'The first triggering attempt was at '
                 f'{triggering_timestamps[0] if triggering_timestamps else "unknown"}.'
             ),
             'suggested_action': (
@@ -428,7 +541,16 @@ class BulkResetGuard:
             'workflow_state': 'infra',
             'affected_task_ids': list(affected_task_ids),
             'triggering_timestamps': list(triggering_timestamps),
-            'threshold': self._threshold,
+            # Cross-kind context: task IDs from the other reversal kind that
+            # were active in the same window at trip time.  May be empty when
+            # only one kind was active.  Provided so operators can see the full
+            # window picture without needing the guard's in-memory state.
+            'other_kind_task_ids_in_window': list(other_kind_task_ids),
+            'threshold': tripped_threshold,
+            'thresholds': {
+                'done_to_pending': self._done_threshold,
+                'in_progress_to_pending': self._in_progress_threshold,
+            },
             'window_seconds': self._window_seconds,
             'project_id': project_id,
         }
@@ -436,10 +558,11 @@ class BulkResetGuard:
             await asyncio.to_thread(path.write_text, json.dumps(record, indent=2), encoding='utf-8')
             logger.warning(
                 'bulk_reset_guard: wrote L1 escalation %s '
-                '(affected=%d, threshold=%d)',
+                '(kind=%s, affected=%d, threshold=%d)',
                 path,
+                kind,
                 len(affected_task_ids),
-                self._threshold,
+                tripped_threshold,
             )
         except OSError as exc:
             logger.error(

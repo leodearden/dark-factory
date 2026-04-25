@@ -453,30 +453,43 @@ class TaskInterceptor:
             if status == old_status:
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
-            # 2a-pre. Bulk-reset circuit-breaker (task 918): observe the attempt
-            # before the terminal-exit gate so the guard catches reversal patterns
-            # regardless of whether individual attempts carry a reopen_reason.
-            # The 2026-04 bulk resets DID carry reopen_reason — the guard fires on
-            # the *pattern*, not the per-id legitimacy check.
+            # 2a-pre. Bulk-reset circuit-breaker (task 918, refined task 1016):
+            # observe the attempt before the terminal-exit gate so the guard
+            # catches reversal patterns regardless of whether individual attempts
+            # carry a reopen_reason.  The 2026-04 bulk resets DID carry
+            # reopen_reason — the guard fires on the *pattern*, not the per-id
+            # legitimacy check.
             #
-            # Trade-off: placing the guard BEFORE the terminal-exit gate means that
-            # done→pending attempts *without* a reopen_reason also consume window
-            # slots, even though the terminal-exit gate below would reject them
-            # anyway.  In a pathological burst of unauthorised (no-reopen_reason)
-            # done→pending attempts, the guard will trip and emit an escalation even
-            # though no actual reversals were allowed.  This is intentional: the
-            # *attempt pattern* is the signal.  False-positive trips from such bursts
-            # are acceptable because (a) the escalation text names the affected task
-            # IDs so a steward can distinguish legitimate from illegitimate reversals,
-            # and (b) the guard's primary goal is limiting blast radius, not
+            # Split-counter design (task 1016): the two reversal kinds
+            # (done→pending and in-progress→pending) are tracked against
+            # independent thresholds, so a legitimate startup stranded-task
+            # reconcile (e.g. the 2026-04-24 reify incident,
+            # esc-bulk-reset-reify-2026-04-24T070944_6456580000: 27
+            # in-progress→pending reversals in ~2 s) does not trip the
+            # done→pending counter, which is tuned to catch data-loss patterns
+            # (task 918, default threshold 10/60 s).  The in-progress→pending
+            # counter has a higher default (100/60 s) to allow large startup
+            # reconciles while still catching pathological runaways.
+            #
+            # Trade-off: placing the guard BEFORE the terminal-exit gate means
+            # that done→pending attempts *without* a reopen_reason also consume
+            # window slots, even though the terminal-exit gate below would
+            # reject them anyway.  In a pathological burst of unauthorised
+            # (no-reopen_reason) done→pending attempts, the guard will trip and
+            # emit an escalation even though no actual reversals were allowed.
+            # This is intentional: the *attempt pattern* is the signal.
+            # False-positive trips from such bursts are acceptable because
+            # (a) the escalation text names the affected task IDs so a steward
+            # can distinguish legitimate from illegitimate reversals, and
+            # (b) the guard's primary goal is limiting blast radius, not
             # distinguishing authorised from unauthorised reversals.
             #
             # IMPORTANT: This block MUST remain outside (before) the
             # ``if old_status in TERMINAL_STATUSES:`` check below.  Moving it
-            # inside that branch would leave in-progress→pending reversals (which
-            # are non-terminal and bypass that gate entirely) completely unguarded.
-            # The guard's _is_reversal predicate handles its own filtering; the
-            # interceptor must not pre-filter by old_status.
+            # inside that branch would leave in-progress→pending reversals
+            # (which are non-terminal and bypass that gate entirely) completely
+            # unguarded.  The guard's _reversal_kind classifier handles its own
+            # filtering; the interceptor must not pre-filter by old_status.
             if self._bulk_reset_guard is not None:
                 _brg_verdict = await self._bulk_reset_guard.observe_attempt(
                     project_id=project_id,

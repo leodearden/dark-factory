@@ -202,6 +202,32 @@ class TaskmasterConfig(BaseModel):
 class ReconciliationConfig(BaseModel):
     """Sleep mode reconciliation settings."""
 
+    @model_validator(mode='before')
+    @classmethod
+    def _reject_legacy_bulk_reset_threshold(cls, data: object) -> object:
+        """Detect the legacy ``bulk_reset_guard_threshold`` key and raise.
+
+        In task 1016 the single shared threshold was split into two independent
+        per-kind fields.  The old key name is unknown to pydantic and would be
+        silently dropped by ``extra='ignore'``, leaving the done→pending data-
+        loss guard at the default of 10 regardless of any operator tuning.
+        Because this is a security-relevant guard, silent default-fallback is
+        the worst failure mode — raise instead so the operator knows to update
+        their config to ``bulk_reset_guard_done_to_pending_threshold``.
+        """
+        if isinstance(data, dict) and 'bulk_reset_guard_threshold' in data:
+            raise ValueError(
+                "ReconciliationConfig: 'bulk_reset_guard_threshold' is no longer "
+                "a valid field (renamed in task 1016). Use "
+                "'bulk_reset_guard_done_to_pending_threshold' for the done→pending "
+                "threshold (default 10) and/or "
+                "'bulk_reset_guard_in_progress_to_pending_threshold' for the "
+                "in-progress→pending threshold (default 100). The old key would "
+                "be silently dropped, leaving the data-loss guard at its default "
+                "threshold regardless of your configured value."
+            )
+        return data
+
     enabled: bool = Field(default=True)
     data_dir: str = Field(default='./data/reconciliation')
 
@@ -240,16 +266,28 @@ class ReconciliationConfig(BaseModel):
     backlog_hard_limit: int = Field(default=500)
     backlog_escalation_rate_limit_seconds: float = Field(default=900.0)
 
-    # Defence-in-depth bulk-reset circuit-breaker (task 918).
+    # Defence-in-depth bulk-reset circuit-breaker (task 918, refined task 1016).
     # Two autopilot_video incidents (2026-04-21, 2026-04-22) pushed large
     # batches of tasks from done/in-progress back to pending despite the
     # orchestrator's _safe_stash_pop_with_recovery fix being deployed.  This
-    # guard refuses ≥threshold simultaneous done→pending or in-progress→pending
-    # reversals within window_seconds, halts further reversals, and emits an
-    # L1 escalation.  Enabled by default because the primary fix owns
-    # prevention; the guard limits blast radius when prevention fails.
+    # guard limits blast radius when the primary prevention fails.
+    #
+    # The guard tracks two reversal kinds with independent counters and
+    # thresholds sharing a single sliding window and rate limit:
+    #   done→pending        (bulk_reset_guard_done_to_pending_threshold, default 10)
+    #     — catches the March-2026 advance_main data-loss pattern (task 918).
+    #   in-progress→pending (bulk_reset_guard_in_progress_to_pending_threshold, default 100)
+    #     — catches pathological runaways while allowing the 27-task startup
+    #       stranded-task reconcile seen in the 2026-04-24 reify incident
+    #       (esc-bulk-reset-reify-2026-04-24T070944_6456580000).
+    #
+    # The shared per-project escalation rate limit (bulk_reset_guard_escalation_
+    # rate_limit_seconds) prevents the escalations directory from filling up
+    # when both kinds trip in quick succession; the escalation filename and JSON
+    # body include a kind slug so operators can distinguish at a glance.
     bulk_reset_guard_enabled: bool = Field(default=True)
-    bulk_reset_guard_threshold: int = Field(default=10, ge=1)
+    bulk_reset_guard_done_to_pending_threshold: int = Field(default=10, ge=1)
+    bulk_reset_guard_in_progress_to_pending_threshold: int = Field(default=100, ge=1)
     bulk_reset_guard_window_seconds: float = Field(default=60.0, gt=0)
     bulk_reset_guard_escalation_rate_limit_seconds: float = Field(default=900.0, ge=0)
 

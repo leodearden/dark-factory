@@ -425,7 +425,8 @@ async def run_server():
         # disabled the guard is left as None in the TaskInterceptor (no guard).
         bulk_reset_guard = BulkResetGuard(
             enabled=config.reconciliation.bulk_reset_guard_enabled,
-            threshold=config.reconciliation.bulk_reset_guard_threshold,
+            done_threshold=config.reconciliation.bulk_reset_guard_done_to_pending_threshold,
+            in_progress_threshold=config.reconciliation.bulk_reset_guard_in_progress_to_pending_threshold,
             window_seconds=config.reconciliation.bulk_reset_guard_window_seconds,
             escalation_rate_limit_seconds=(
                 config.reconciliation.bulk_reset_guard_escalation_rate_limit_seconds

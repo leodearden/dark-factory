@@ -12,6 +12,15 @@ Covers:
   - Escalation rate-limiting (step-15)
   - Guard disabled short-circuits everything (step-17)
   - BulkResetVerdict.to_error_dict() shape (step-19)
+  - task-979: async I/O offloading, idle-state preservation, write-failure backoff
+  - task-1016: per-kind counter isolation (test_per_kind_counter_isolation)
+  - task-1016: _reversal_kind classifier (test_reversal_kind_classifier)
+  - task-1016: BulkResetVerdict.kind field (test_verdict_carries_tripped_kind)
+  - task-1016: kind slug in escalation filename/JSON
+    (test_escalation_filename_and_body_include_kind)
+  - task-1016: acceptance regression — 2026-04-24 reify incident
+    esc-bulk-reset-reify-2026-04-24T070944_6456580000
+    (test_acceptance_scenario_startup_reconcile_does_not_trip)
 """
 
 from __future__ import annotations
@@ -21,22 +30,113 @@ from pathlib import Path
 
 import pytest
 
-from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard, BulkResetVerdict
+from fused_memory.reconciliation.bulk_reset_guard import (
+    BulkResetGuard,
+    BulkResetVerdict,
+    _reversal_kind,
+)
 
 # ---------------------------------------------------------------------------
 # step-1: ReconciliationConfig defaults
 # ---------------------------------------------------------------------------
 
 def test_reconciliation_config_bulk_reset_guard_defaults():
-    """ReconciliationConfig() must carry the four new bulk-reset-guard fields
-    with their specified default values."""
+    """ReconciliationConfig() must carry the split-threshold bulk-reset-guard
+    fields with their specified default values.
+
+    The legacy single-field ``bulk_reset_guard_threshold`` was split into two
+    independent per-kind thresholds in task 1016 to distinguish the benign
+    startup-stranded-task reconcile pattern (in-progress→pending) from the
+    data-loss pattern caught by task 918 (done→pending).
+    """
     from fused_memory.config.schema import ReconciliationConfig
 
     cfg = ReconciliationConfig()
     assert cfg.bulk_reset_guard_enabled is True
-    assert cfg.bulk_reset_guard_threshold == 10
+    assert cfg.bulk_reset_guard_done_to_pending_threshold == 10
+    assert cfg.bulk_reset_guard_in_progress_to_pending_threshold == 100
     assert cfg.bulk_reset_guard_window_seconds == 60.0
     assert cfg.bulk_reset_guard_escalation_rate_limit_seconds == 900.0
+    # The legacy single-threshold field must be gone.
+    assert not hasattr(cfg, 'bulk_reset_guard_threshold')
+
+
+# ---------------------------------------------------------------------------
+# amend-1: ReconciliationConfig rejects the legacy threshold key explicitly
+# ---------------------------------------------------------------------------
+
+def test_reconciliation_config_rejects_legacy_threshold_key():
+    """ReconciliationConfig must raise ValidationError when the legacy
+    ``bulk_reset_guard_threshold`` key is present in the raw input dict.
+
+    Without this validator the key would be silently dropped by
+    ``extra='ignore'``, leaving the done→pending data-loss guard at its
+    default threshold of 10 regardless of any operator tuning — the worst
+    failure mode for a security-relevant guard.
+    """
+    from pydantic import ValidationError
+
+    from fused_memory.config.schema import ReconciliationConfig
+
+    with pytest.raises(ValidationError, match='bulk_reset_guard_threshold'):
+        ReconciliationConfig.model_validate({'bulk_reset_guard_threshold': 5})
+
+
+# ---------------------------------------------------------------------------
+# step-2b: BulkResetGuard constructor accepts split thresholds
+# ---------------------------------------------------------------------------
+
+def test_guard_constructor_accepts_split_thresholds(tmp_path):
+    """BulkResetGuard must accept done_threshold/in_progress_threshold kwargs.
+
+    (a) The new signature constructs without error.
+    (b) The legacy ``threshold=`` kwarg raises TypeError — it is no longer
+        accepted so callers cannot silently wire only one counter.
+    """
+    # (a) New split-threshold signature succeeds.
+    guard = BulkResetGuard(
+        done_threshold=10,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        escalations_fallback_dir=tmp_path,
+    )
+    assert guard is not None
+
+    # (b) Legacy ``threshold=`` kwarg must be rejected.
+    with pytest.raises(TypeError, match="threshold"):
+        BulkResetGuard(threshold=10, window_seconds=60.0)  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# step-4b: _reversal_kind classifier
+# ---------------------------------------------------------------------------
+
+def test_reversal_kind_classifier():
+    """_reversal_kind returns the correct kind string for guarded transitions
+    and None for all non-guarded transitions.
+
+    Guarded:
+      - done → pending        → 'done_to_pending'
+      - in-progress → pending → 'in_progress_to_pending'
+
+    Non-guarded (must all return None):
+      - pending → in-progress
+      - in-progress → done
+      - blocked → pending     (blocked→pending is NOT guarded)
+      - pending → done
+      - done → blocked
+      - cancelled → pending
+    """
+    assert _reversal_kind('done', 'pending') == 'done_to_pending'
+    assert _reversal_kind('in-progress', 'pending') == 'in_progress_to_pending'
+
+    assert _reversal_kind('pending', 'in-progress') is None
+    assert _reversal_kind('in-progress', 'done') is None
+    assert _reversal_kind('blocked', 'pending') is None
+    assert _reversal_kind('pending', 'done') is None
+    assert _reversal_kind('done', 'blocked') is None
+    assert _reversal_kind('cancelled', 'pending') is None
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +152,8 @@ async def test_observe_attempt_returns_ok_under_threshold(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=10,
+        done_threshold=10,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -85,7 +186,8 @@ async def test_observe_attempt_rejects_at_threshold_within_window(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -136,7 +238,8 @@ async def test_observe_attempt_ignores_non_reversal_transitions(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -173,12 +276,17 @@ async def test_observe_attempt_ignores_non_reversal_transitions(tmp_path):
         )
         assert v.outcome == 'ok', f'reversal {i}: expected ok, got {v.outcome}'
 
-    # Fourth reversal should trip (non-reversals did not consume window slots)
+    # Fourth done→pending reversal should trip the done counter.
+    # (Using done→pending rather than in-progress→pending: the two counters are
+    # independent, and the in-progress threshold is 100, so an in-progress
+    # reversal here would NOT trip.  The test verifies that non-reversals do
+    # not consume done→pending window slots — the done counter is at 3 == done_threshold,
+    # so the next done→pending is the (threshold+1)-th and must be rejected.)
     clock[0] += 1.0
     v4 = await guard.observe_attempt(
         project_id='proj-a',
         task_id='rev-3',
-        old_status='in-progress',
+        old_status='done',
         new_status='pending',
         project_root=str(tmp_path),
     )
@@ -208,7 +316,8 @@ async def test_window_drains_after_expiry(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -286,7 +395,8 @@ async def test_per_project_isolation(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -358,7 +468,8 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -418,6 +529,16 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
     assert data['threshold'] == 3
     assert data['window_seconds'] == 60.0
     assert data['project_id'] == 'proj-esc'
+    # kind must be present in the JSON record (step-12 writes it).
+    assert 'kind' in data, f"escalation JSON missing 'kind' key; keys: {list(data)}"
+    # Cross-kind context field must be present (amend-3).  Only done→pending
+    # reversals were fired in this test, so the in-progress deque is empty.
+    assert 'other_kind_task_ids_in_window' in data, (
+        f"escalation JSON missing 'other_kind_task_ids_in_window'; keys: {list(data)}"
+    )
+    assert data['other_kind_task_ids_in_window'] == [], (
+        f"Expected empty cross-kind list, got {data['other_kind_task_ids_in_window']!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +555,8 @@ async def test_escalation_rate_limited(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -489,13 +611,15 @@ async def test_escalation_rate_limited(tmp_path):
     # Rate-limit is 900s; window is 60s. Move to t = 1000 + 1000 = 2000 to be safe.
     clock[0] = 2000.0
 
-    # Seed three new reversals (all ok at threshold=3).
+    # Seed three new done→pending reversals (all ok at done_threshold=3).
+    # Using done→pending (not in-progress→pending) because in_progress_threshold=100
+    # and we'd need 101 in-progress reversals to re-trip — use done_threshold=3 instead.
     for i in range(3):
         clock[0] += 1.0
         v = await guard.observe_attempt(
             project_id='proj-rl',
             task_id=f'new-{i}',
-            old_status='in-progress',
+            old_status='done',
             new_status='pending',
             project_root=str(tmp_path),
         )
@@ -506,7 +630,7 @@ async def test_escalation_rate_limited(tmp_path):
     v_new = await guard.observe_attempt(
         project_id='proj-rl',
         task_id='new-3',
-        old_status='in-progress',
+        old_status='done',
         new_status='pending',
         project_root=str(tmp_path),
     )
@@ -517,6 +641,104 @@ async def test_escalation_rate_limited(tmp_path):
     assert len(esc_files) == 2, (
         f'Expected 2 escalation files, found {len(esc_files)}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-11: escalation filename and JSON body carry kind slug
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_escalation_filename_and_body_include_kind(tmp_path):
+    """The escalation filename slug and JSON 'kind' field must reflect which
+    reversal kind tripped the guard.
+
+    (a) done counter trips: filename matches esc-bulk-reset-done-<project>-...
+        and JSON data['kind'] == 'done_to_pending'.
+    (b) in-progress counter trips (fresh project to bypass rate-limit):
+        filename matches esc-bulk-reset-in-progress-<project>-...
+        and JSON data['kind'] == 'in_progress_to_pending'.
+
+    Fails until step-12 inserts the kind slug into the filename and records
+    'kind' in the JSON body.
+    """
+    import re
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    # --- (a) done counter trips ---
+    guard = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    v: BulkResetVerdict | None = None
+    for i in range(4):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='kind-proj',
+            task_id=f'done-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v is not None
+    assert v.outcome == 'escalated', f'(a) expected escalated, got {v.outcome}'
+    assert v.escalation_path is not None
+    esc_file_a = Path(v.escalation_path)
+    assert re.search(r'esc-bulk-reset-done-kind-proj-', esc_file_a.name), (
+        f'(a) filename {esc_file_a.name!r} missing done kind slug'
+    )
+    data_a = json.loads(esc_file_a.read_text(encoding='utf-8'))
+    assert data_a.get('kind') == 'done_to_pending', (
+        f"(a) JSON kind: expected 'done_to_pending', got {data_a.get('kind')!r}"
+    )
+    # Cross-kind context (amend-3): only done→pending fired so in-progress deque empty.
+    assert 'other_kind_task_ids_in_window' in data_a, (
+        "(a) escalation JSON missing 'other_kind_task_ids_in_window'"
+    )
+    assert data_a['other_kind_task_ids_in_window'] == []
+
+    # --- (b) in-progress counter trips (fresh project avoids rate-limit) ---
+    guard_b = BulkResetGuard(
+        done_threshold=100,
+        in_progress_threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    v_b = None
+    for i in range(4):
+        clock[0] += 1.0
+        v_b = await guard_b.observe_attempt(
+            project_id='kind-proj-ip',
+            task_id=f'ip-{i}',
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_b is not None
+    assert v_b.outcome == 'escalated', f'(b) expected escalated, got {v_b.outcome}'
+    assert v_b.escalation_path is not None
+    esc_file_b = Path(v_b.escalation_path)
+    assert re.search(r'esc-bulk-reset-in-progress-kind-proj-ip-', esc_file_b.name), (
+        f'(b) filename {esc_file_b.name!r} missing in-progress kind slug'
+    )
+    data_b = json.loads(esc_file_b.read_text(encoding='utf-8'))
+    assert data_b.get('kind') == 'in_progress_to_pending', (
+        f"(b) JSON kind: expected 'in_progress_to_pending', got {data_b.get('kind')!r}"
+    )
+    # Cross-kind context (amend-3): only in-progress→pending fired so done deque empty.
+    assert 'other_kind_task_ids_in_window' in data_b, (
+        "(b) escalation JSON missing 'other_kind_task_ids_in_window'"
+    )
+    assert data_b['other_kind_task_ids_in_window'] == []
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +756,8 @@ async def test_guard_disabled_returns_ok(tmp_path):
 
     guard = BulkResetGuard(
         enabled=False,
-        threshold=1,  # Would trip on the first attempt if enabled
+        done_threshold=1,  # Would trip on the first attempt if enabled
+        in_progress_threshold=1,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -622,7 +845,9 @@ def test_verdict_to_error_dict_rejection(threshold, window_seconds):
 
 
 def test_verdict_to_error_dict_escalated():
-    """outcome='escalated' produces the same rejection payload PLUS escalation_path."""
+    """outcome='escalated' produces the same rejection payload PLUS escalation_path.
+    When the verdict carries a kind, to_error_dict() must surface it as d['kind'].
+    """
     v = BulkResetVerdict(
         outcome='escalated',
         affected_task_ids=('t1', 't2'),
@@ -632,12 +857,15 @@ def test_verdict_to_error_dict_escalated():
         project_id='proj',
         error_type='BulkResetGuardTripped',
         escalation_path='/tmp/esc-bulk-reset-xyz.json',
+        kind='done_to_pending',
     )
     d = v.to_error_dict()
     assert d['success'] is False
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert d['escalation_path'] == '/tmp/esc-bulk-reset-xyz.json'
     assert d['project_id'] == 'proj'
+    # kind must be surfaced in the error payload (step-10 wires this).
+    assert d.get('kind') == 'done_to_pending'
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +901,8 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -735,7 +964,8 @@ async def test_idle_project_state_is_not_evicted_across_attempts(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -823,7 +1053,8 @@ async def test_write_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         write_failure_backoff_seconds=60.0,
@@ -955,7 +1186,8 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         write_failure_backoff_seconds=60.0,
@@ -1035,4 +1267,362 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     )
     assert v3.outcome == 'escalated', (
         f'Phase 3: expected escalated after backoff cleared, got {v3.outcome}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-7: per-kind counter isolation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_per_kind_counter_isolation(tmp_path):
+    """done→pending and in-progress→pending counts are independent.
+
+    Scenario A (done trips first):
+      done_threshold=3, in_progress_threshold=50
+      - Fire 3 done→pending: all ok (done counter at 3, in-progress at 0).
+      - Fire 49 in-progress→pending: all ok (in-progress at 49 < 50; done untouched).
+      - Fire 4th done→pending: trips done counter;
+        affected_task_ids contains only the 4 done task-ids (no in-progress ids).
+
+    Scenario B (in-progress trips first):
+      done_threshold=50, in_progress_threshold=3
+      - Fire 3 in-progress→pending: all ok.
+      - Fire 3 done→pending: all ok (done at 3 < 50; in-progress untouched at 3).
+      - Fire 4th in-progress→pending: trips in-progress counter;
+        affected_task_ids contains only the 4 in-progress task-ids.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    # ---- Scenario A ----
+    guard_a = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=50,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    done_ids = [f'done-{i}' for i in range(4)]
+    ip_ids = [f'ip-{i}' for i in range(49)]
+
+    # (a) 3 done→pending — all ok
+    for tid in done_ids[:3]:
+        clock[0] += 1.0
+        v = await guard_a.observe_attempt(
+            project_id='scenario-a',
+            task_id=tid,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (b) 49 in-progress→pending — all ok (in-progress counter at 49 < 50)
+    for tid in ip_ids:
+        clock[0] += 0.01
+        v = await guard_a.observe_attempt(
+            project_id='scenario-a',
+            task_id=tid,
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (c) 4th done→pending trips the done counter
+    clock[0] += 1.0
+    v_trip = await guard_a.observe_attempt(
+        project_id='scenario-a',
+        task_id=done_ids[3],
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v_trip.is_rejection is True, (
+        f'Scenario A: expected rejection on 4th done→pending, got {v_trip.outcome}'
+    )
+    assert set(v_trip.affected_task_ids) == set(done_ids), (
+        f'Scenario A: affected_task_ids should contain only done ids; '
+        f'got {v_trip.affected_task_ids}'
+    )
+    for ip_id in ip_ids:
+        assert ip_id not in v_trip.affected_task_ids, (
+            f'Scenario A: in-progress id {ip_id} leaked into done verdict'
+        )
+
+    # ---- Scenario B ----
+    clock2 = [5000.0]
+
+    def fake_clock2() -> float:
+        return clock2[0]
+
+    guard_b = BulkResetGuard(
+        done_threshold=50,
+        in_progress_threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock2,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    ip2_ids = [f'ip2-{i}' for i in range(4)]
+    done2_ids = [f'done2-{i}' for i in range(3)]
+
+    # (i) 3 in-progress→pending — all ok
+    for tid in ip2_ids[:3]:
+        clock2[0] += 1.0
+        v = await guard_b.observe_attempt(
+            project_id='scenario-b',
+            task_id=tid,
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (ii) 3 done→pending — all ok (done counter at 3, well under 50)
+    for tid in done2_ids:
+        clock2[0] += 1.0
+        v = await guard_b.observe_attempt(
+            project_id='scenario-b',
+            task_id=tid,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (iii) 4th in-progress→pending trips the in-progress counter
+    clock2[0] += 1.0
+    v_trip_b = await guard_b.observe_attempt(
+        project_id='scenario-b',
+        task_id=ip2_ids[3],
+        old_status='in-progress',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v_trip_b.is_rejection is True, (
+        f'Scenario B: expected rejection on 4th in-progress→pending, got {v_trip_b.outcome}'
+    )
+    assert set(v_trip_b.affected_task_ids) == set(ip2_ids), (
+        f'Scenario B: affected_task_ids should contain only in-progress ids; '
+        f'got {v_trip_b.affected_task_ids}'
+    )
+    for d_id in done2_ids:
+        assert d_id not in v_trip_b.affected_task_ids, (
+            f'Scenario B: done id {d_id} leaked into in-progress verdict'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-9: BulkResetVerdict.kind field
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_verdict_carries_tripped_kind(tmp_path):
+    """BulkResetVerdict.kind must carry the reversal kind that tripped the guard,
+    or None on an ok outcome.
+
+    (a) Tripping the done counter yields verdict.kind == 'done_to_pending'.
+    (b) Tripping the in-progress counter yields verdict.kind == 'in_progress_to_pending'.
+    (c) An ok outcome (below threshold) has verdict.kind is None.
+
+    Fails until step-10 adds the kind field to BulkResetVerdict and populates
+    it inside observe_attempt.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    # (c) ok verdict — kind must be None
+    guard_ok = BulkResetGuard(
+        done_threshold=10,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    clock[0] += 1.0
+    v_ok = await guard_ok.observe_attempt(
+        project_id='proj-kind',
+        task_id='ok-task',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v_ok.outcome == 'ok'
+    assert v_ok.kind is None, (
+        f'ok verdict should have kind=None, got {v_ok.kind!r}'
+    )
+
+    # (a) Trip the done counter — kind must be 'done_to_pending'
+    guard_done = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    done_trip_ids = ['d0', 'd1', 'd2', 'd3']
+    v_done_trip = None
+    for tid in done_trip_ids:
+        clock[0] += 1.0
+        v_done_trip = await guard_done.observe_attempt(
+            project_id='proj-done',
+            task_id=tid,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_done_trip is not None
+    assert v_done_trip.is_rejection is True
+    assert v_done_trip.kind == 'done_to_pending', (
+        f'done counter trip: expected kind=done_to_pending, got {v_done_trip.kind!r}'
+    )
+
+    # (b) Trip the in-progress counter — kind must be 'in_progress_to_pending'
+    guard_ip = BulkResetGuard(
+        done_threshold=100,
+        in_progress_threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    ip_trip_ids = ['ip0', 'ip1', 'ip2', 'ip3']
+    v_ip_trip = None
+    for tid in ip_trip_ids:
+        clock[0] += 1.0
+        v_ip_trip = await guard_ip.observe_attempt(
+            project_id='proj-ip',
+            task_id=tid,
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_ip_trip is not None
+    assert v_ip_trip.is_rejection is True
+    assert v_ip_trip.kind == 'in_progress_to_pending', (
+        f'in-progress counter trip: expected kind=in_progress_to_pending, '
+        f'got {v_ip_trip.kind!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-13: acceptance scenario — startup reconcile must not trip
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_acceptance_scenario_startup_reconcile_does_not_trip(tmp_path):
+    """Regression pin for the 2026-04-24 reify incident.
+
+    Incident: esc-bulk-reset-reify-2026-04-24T070944_6456580000
+    The startup stranded-task reconciler reverted 27 in-progress→pending tasks
+    in ~2 s.  The single-threshold guard (threshold=10) tripped even though
+    zero done→pending transitions occurred — a false positive.
+
+    Acceptance criteria (task 1016):
+    (a) 27 in-progress→pending attempts within 2 s must ALL return outcome='ok'
+        with the production defaults (done_threshold=10,
+        in_progress_threshold=100, window_seconds=60.0).
+    (b) A subsequent burst of 11 done→pending attempts within 2 s must trip the
+        done counter on the 11th attempt, with kind=='done_to_pending'.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        done_threshold=10,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    esc_dir = tmp_path / 'data' / 'escalations'
+
+    # (a) Simulate the incident: 27 in-progress→pending within 2 s — must not trip.
+    for i in range(27):
+        clock[0] += 2.0 / 27  # spread 27 transitions over 2 s
+        v = await guard.observe_attempt(
+            project_id='reify',
+            task_id=f'stranded-{i}',
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', (
+            f'Incident regression FAIL: in-progress reversal {i} returned '
+            f'{v.outcome!r} — startup reconcile must never trip the guard'
+        )
+
+    # No escalation file must have been written.
+    if esc_dir.exists():
+        esc_files = list(esc_dir.glob('*.json'))
+        assert esc_files == [], (
+            f'No escalation expected for 27 in-progress reversals; '
+            f'found: {esc_files}'
+        )
+
+    # (b) A done→pending burst of 11 must trip on the 11th attempt.
+    v_done = None
+    for i in range(11):
+        clock[0] += 0.1
+        v_done = await guard.observe_attempt(
+            project_id='reify',
+            task_id=f'done-task-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_done is not None
+    assert v_done.is_rejection is True, (
+        f'Expected rejection on 11th done→pending, got {v_done.outcome!r}'
+    )
+    assert v_done.kind == 'done_to_pending', (
+        f'Expected kind=done_to_pending, got {v_done.kind!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-15: server wires split thresholds
+# ---------------------------------------------------------------------------
+
+def test_server_wires_split_thresholds(tmp_path):
+    """Validate that server/main.py wires BulkResetGuard with the split-threshold
+    kwarg pattern (done_threshold / in_progress_threshold) rather than the
+    legacy single threshold=.
+
+    Construct BulkResetGuard using the same kwarg pattern that server/main.py uses
+    after step-16, with a bumped in_progress_threshold, and assert the instance
+    attribute matches.  This proves the split-threshold construction pattern works
+    end-to-end from config → guard instance.
+    """
+    from fused_memory.config.schema import ReconciliationConfig
+
+    # Guard construction using the new split-threshold kwarg pattern.
+    cfg = ReconciliationConfig(bulk_reset_guard_in_progress_to_pending_threshold=7)
+    guard = BulkResetGuard(
+        enabled=cfg.bulk_reset_guard_enabled,
+        done_threshold=cfg.bulk_reset_guard_done_to_pending_threshold,
+        in_progress_threshold=cfg.bulk_reset_guard_in_progress_to_pending_threshold,
+        window_seconds=cfg.bulk_reset_guard_window_seconds,
+        escalation_rate_limit_seconds=cfg.bulk_reset_guard_escalation_rate_limit_seconds,
+        escalations_fallback_dir=tmp_path,
+    )
+    assert guard._in_progress_threshold == 7, (
+        f'Expected _in_progress_threshold=7, got {guard._in_progress_threshold}'
+    )
+    assert guard._done_threshold == 10, (
+        f'Expected _done_threshold=10 (default), got {guard._done_threshold}'
     )

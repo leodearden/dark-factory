@@ -3415,10 +3415,16 @@ async def test_csv_set_task_status_mixed_statuses_partial_success(
 
 @pytest.fixture
 def bulk_reset_guard():
-    """BulkResetGuard with test-friendly thresholds (threshold=3)."""
+    """BulkResetGuard with test-friendly thresholds.
+
+    Both done_threshold and in_progress_threshold are set to 3 so the two
+    integration tests (done→pending and in-progress→pending) both trip the
+    guard with a 4-task CSV, matching the original single-threshold=3 behaviour.
+    """
     from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
     return BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=3,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
     )
@@ -3467,6 +3473,10 @@ async def test_set_task_status_csv_done_to_pending_tripping_guard_rejects_and_es
         assert r.get('success') is False
         assert 'affected_task_ids' in r
         assert 'triggering_timestamps' in r
+        # kind must be 'done_to_pending' (step-10 wires this via to_error_dict).
+        assert r.get('kind') == 'done_to_pending', (
+            f'task {tid}: expected kind=done_to_pending, got {r.get("kind")!r}'
+        )
 
     # (d) Escalation JSON exists under <project_root>/data/escalations/
     esc_dir = tmp_path / 'data' / 'escalations'
@@ -3516,6 +3526,10 @@ async def test_set_task_status_csv_in_progress_to_pending_trips_guard(
     r4 = per_id['4']
     assert r4.get('error_type') == 'BulkResetGuardTripped', (
         f'task 4: expected BulkResetGuardTripped, got {r4}'
+    )
+    # kind must be 'in_progress_to_pending' (step-10 wires this via to_error_dict).
+    assert r4.get('kind') == 'in_progress_to_pending', (
+        f'task 4: expected kind=in_progress_to_pending, got {r4.get("kind")!r}'
     )
 
     # tm.set_task_status NOT called for task 4
