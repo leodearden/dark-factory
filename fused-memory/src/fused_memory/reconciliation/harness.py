@@ -301,6 +301,14 @@ class ReconciliationHarness:
             project_root is empty, non-absolute, or the fetch fails.
             Non-absolute paths are rejected before calling taskmaster to avoid
             silent failures from TaskmasterBackend's absolute-path validator.
+
+        Log-level policy:
+            Anomaly branches (taskmaster disabled, empty/non-absolute project_root)
+            always log at INFO.  Successful fetches log at DEBUG unless
+            ``raw_count > 0 and total_count == 0``, which indicates the filter
+            silently dropped every task (e.g. all tasks have unknown status) and
+            warrants an INFO-level alert.  Healthy-but-empty projects
+            (``raw_count == 0``) are classified as DEBUG (non-anomalous).
         """
         if not self.taskmaster:
             logger.info(
@@ -309,7 +317,10 @@ class ReconciliationHarness:
             )
             return FilteredTaskTree()
         if not project_root:
-            logger.info('reconciliation.task_tree_empty_project_root', extra={})
+            logger.info(
+                'reconciliation.task_tree_empty_project_root',
+                extra={'project_root_repr': repr(project_root)},
+            )
             return FilteredTaskTree()
         if not os.path.isabs(project_root):
             logger.warning(
@@ -322,7 +333,9 @@ class ReconciliationHarness:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             raw_count = len(tasks_data.get('tasks', []))
             filtered = filter_task_tree(tasks_data)
-            logger.info(
+            is_anomaly = raw_count > 0 and filtered.total_count == 0
+            logger.log(
+                logging.INFO if is_anomaly else logging.DEBUG,
                 'reconciliation.task_tree_fetched',
                 extra={
                     'project_root': project_root,
