@@ -328,6 +328,33 @@ timeouts rather than a first-time verify failure.  Kept as a module-level
 constant so tests and any future callers share a single source of truth."""
 
 
+def _format_unresolved_steps_suffix(unresolved: list[UnresolvedStep]) -> str:
+    """Format a human-readable suffix listing unresolved done-step diff-tree failures.
+
+    Appended to the ``MergeOutcome.reason`` text whenever ``dropped`` is
+    non-empty *and* one or more done-step diff-tree queries returned rc != 0.
+    The suffix tells the steward exactly which step's deletion-evidence was
+    unreachable so they can distinguish a real planned-file drop from a
+    false positive caused by an unresolvable commit.
+
+    Both ``MergeWorker._do_merge`` and ``SpeculativeMergeWorker._merger_loop``
+    call this helper so the diagnostic text is identical across both paths.
+    """
+    lines = [
+        '\n\nDrop-guard could not query the following done-step commits '
+        '(their planned-file deletions may have been mis-flagged as drops):'
+    ]
+    for us in unresolved:
+        sha_short = us.commit[:12] if len(us.commit) > 12 else us.commit
+        stderr_trunc = us.stderr[:200] + '...' if len(us.stderr) > 200 else us.stderr
+        lines.append(
+            f'  step {us.step_id!r} commit {sha_short} '
+            f'(rc={us.rc}, object_missing={us.object_missing}, '
+            f'stderr={stderr_trunc!r})'
+        )
+    return '\n'.join(lines)
+
+
 def _elapsed_ms(start: float | None) -> int | None:
     """Milliseconds since *start* (a ``time.monotonic()`` value).
 
@@ -711,15 +738,15 @@ class MergeWorker:
                 f'Task {req.task_id}: merge dropped plan targets: {dropped}'
             )
             _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
-            return MergeOutcome(
-                'blocked',
-                reason=(
-                    f'Merge commit is missing plan target files: '
-                    f'{", ".join(dropped)}. '
-                    f'Conflict resolution likely dropped planned work. '
-                    f'Review the merge commit and restore missing files.'
-                ),
+            reason = (
+                f'Merge commit is missing plan target files: '
+                f'{", ".join(dropped)}. '
+                f'Conflict resolution likely dropped planned work. '
+                f'Review the merge commit and restore missing files.'
             )
+            if drop_result.unresolved_steps:
+                reason += _format_unresolved_steps_suffix(drop_result.unresolved_steps)
+            return MergeOutcome('blocked', reason=reason)
 
         # 4. Verify (skip if pre-rebased and main unchanged)
         merge_wt = merge_result.merge_worktree
