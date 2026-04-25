@@ -523,26 +523,18 @@ class TaskCurator:
         a bulk-creation LLM call (expand_task / parse_prd) emits within
         the same batch.
 
-        Normalisation: lowercase, strip leading/trailing whitespace, and
-        collapse internal whitespace on both *title* and *description*.
-        This makes the key case- and whitespace-insensitive — matching the
-        ``_normalize_title`` convention used elsewhere in task_interceptor.
+        Normalisation delegates to the shared module-level
+        :func:`_normalize_title` helper — lowercase, strip, and collapse
+        internal whitespace — making the key case- and whitespace-insensitive.
 
         Does NOT include files_to_modify because Taskmaster-generated
         subtasks frequently omit that field, so including it would produce
         false negatives for otherwise-identical tasks.
         """
-        # NOTE: intentional duplication of task_interceptor._normalize_title
-        # (task_interceptor.py ~line 2945: `' '.join(title.strip().lower().split())`).
-        # Kept here to avoid a cross-module import from task_curator →
-        # task_interceptor.  If either normalisation changes, keep both in sync.
-        def _norm(s: str | None) -> str:
-            return ' '.join((s or '').strip().lower().split())
-
         h = hashlib.sha256()
-        h.update(_norm(title).encode())
+        h.update(_normalize_title(title).encode())
         h.update(b'|')
-        h.update(_norm(description).encode())
+        h.update(_normalize_title(description).encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the other
         # task_curator.py mirror sites (payload_hash, _normalize_key).
