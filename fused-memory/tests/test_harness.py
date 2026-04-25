@@ -3597,3 +3597,33 @@ class TestHarnessDrainIdleShortCircuit:
             f"Expected NO 'Harness fully drained' log when a project loop is active, "
             f"but got: {[r.message for r in drained_records]}"
         )
+
+    def test_drain_twice_idle_emits_exactly_one_marker(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """drain() called twice on an idle harness must emit 'Harness fully drained' exactly once.
+
+        The second call must hit the 'Harness already draining' early-return path,
+        not re-emit the marker.  This pins the drain()-twice contract against future
+        refactors that might move the marker emission above or outside the early-return.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            harness.drain()
+            harness.drain()  # second call — must hit early return
+
+        drained_records = [
+            r for r in caplog.records if 'Harness fully drained' in r.message
+        ]
+        already_draining_records = [
+            r for r in caplog.records if 'Harness already draining' in r.message
+        ]
+        assert len(drained_records) == 1, (
+            f"Expected exactly 1 'Harness fully drained' record but got "
+            f"{len(drained_records)}: {[r.message for r in drained_records]}"
+        )
+        assert len(already_draining_records) >= 1, (
+            f"Expected at least 1 'Harness already draining' record but got "
+            f"{len(already_draining_records)}: {[r.message for r in caplog.records]}"
+        )
