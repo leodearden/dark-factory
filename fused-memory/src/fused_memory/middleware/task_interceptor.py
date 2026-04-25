@@ -1025,6 +1025,16 @@ class TaskInterceptor:
           but no ``justification``.
         - ``'curator_drop'`` — removed in pass 2 by the curator.
         - ``'curator_combine'`` — merged into an existing task in pass 2.
+
+        **Partial-failure dual-append contract**: when ``tm.remove_task``
+        raises during the intra-batch pre-pass for a duplicate, that task
+        is appended to BOTH ``errors`` (with the exception text) AND
+        ``kept`` (via the fall-through that re-adds it to the unique
+        survivor list, which then passes through pass 2 and lands in
+        ``kept``).  This is intentional defence-in-depth: a transient
+        backend failure must not silently lose the task from both lists,
+        so the caller can detect the anomaly via ``errors`` while the
+        task is still present in ``kept``.
         """
         removed: list[dict] = []
         kept: list[dict] = []
