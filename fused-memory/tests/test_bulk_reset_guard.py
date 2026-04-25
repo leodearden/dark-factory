@@ -1798,3 +1798,99 @@ async def test_record_write_failure_uses_fresh_now_after_io(tmp_path, monkeypatc
         'captured at the top of _maybe_write_escalation rather than calling '
         'self._now() itself after the slow I/O returned.'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1021 item-3: non-OSError during escalation I/O must not propagate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('failure_site', ['mkdir', 'write_text'])
+@pytest.mark.asyncio
+async def test_non_oserror_during_escalation_io_does_not_propagate(
+    tmp_path, monkeypatch, failure_site
+):
+    """A non-OSError raised inside the escalation I/O code path is caught
+    (not propagated) and the verdict is 'rejection' (step-5 polish test for
+    task-1021, item 3).
+
+    The guard's contract is 'never let reconciliation fail because escalation
+    I/O failed'.  The original except OSError blocks only caught OSError, so
+    a ValueError (e.g. from an odd encoding) or AttributeError (from a stub
+    Path subclass) would propagate out of observe_attempt and break the contract.
+
+    Pre-fix (except OSError): ValueError is NOT caught → propagates out of
+      asyncio.to_thread → out of _maybe_write_escalation → out of
+      observe_attempt → pytest.fail fires — FAIL.
+    Post-fix (except Exception): ValueError IS caught → verdict is 'rejection'
+      → assertions pass — PASS.
+
+    Parameters
+    ----------
+    failure_site : 'mkdir' | 'write_text'
+        Which I/O site raises ValueError.
+    """
+    expected_esc_dir = tmp_path / 'data' / 'escalations'
+
+    if failure_site == 'mkdir':
+        real_mkdir = Path.mkdir
+
+        def intercepting_mkdir(self, *args, **kwargs):
+            # Only intercept the outer production call (self == esc_dir, parents=True).
+            # Pathlib's internal parent-recursion uses different self paths and/or
+            # does not pass parents=True, so those calls fall through to real mkdir.
+            if self == expected_esc_dir and kwargs.get('parents', False):
+                raise ValueError('simulated non-OSError mkdir failure')
+            return real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'mkdir', intercepting_mkdir)
+    else:
+        # failure_site == 'write_text'
+        def failing_write_text(self, data, *args, **kwargs):
+            raise ValueError('simulated non-OSError write_text failure')
+
+        monkeypatch.setattr(Path, 'write_text', failing_write_text)
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        write_failure_backoff_seconds=60.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Fire 4 done→pending reversals; the 4th trips the guard and hits the
+    # monkeypatched I/O site.  observe_attempt MUST NOT raise.
+    v = None
+    for i in range(4):
+        clock[0] += 1.0
+        try:
+            v = await guard.observe_attempt(
+                project_id='proj-non-oserror',
+                task_id=f't{i}',
+                old_status='done',
+                new_status='pending',
+                project_root=str(tmp_path),
+            )
+        except Exception as exc:
+            pytest.fail(
+                f'{type(exc).__name__} propagated out of observe_attempt: {exc} — '
+                'the escalation I/O except block must catch Exception, not just OSError'
+            )
+
+    assert v is not None
+    assert v.outcome == 'rejection', (
+        f'Expected rejection (escalation I/O failed), got {v.outcome!r}'
+    )
+
+    # No escalation JSON must have been written.
+    esc_files = sorted(expected_esc_dir.glob('*.json')) if expected_esc_dir.exists() else []
+    assert esc_files == [], (
+        f'No escalation files expected after I/O failure; found: {esc_files}'
+    )
