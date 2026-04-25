@@ -322,7 +322,9 @@ class ReconciliationHarness:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             raw_count = len(tasks_data.get('tasks', []))
             filtered = filter_task_tree(tasks_data)
-            logger.debug(
+            is_anomaly = raw_count > 0 and filtered.total_count == 0
+            logger.log(
+                logging.INFO if is_anomaly else logging.DEBUG,
                 'reconciliation.task_tree_fetched',
                 extra={
                     'project_root': project_root,
