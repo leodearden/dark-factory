@@ -309,7 +309,10 @@ class ReconciliationHarness:
             )
             return FilteredTaskTree()
         if not project_root:
-            logger.info('reconciliation.task_tree_empty_project_root', extra={})
+            logger.info(
+                'reconciliation.task_tree_empty_project_root',
+                extra={'project_root': project_root},
+            )
             return FilteredTaskTree()
         if not os.path.isabs(project_root):
             logger.warning(
