@@ -352,6 +352,11 @@ async def _check_plan_targets_in_tree(
                     cat_file_stderr=cat_stderr_stored,
                 ))
 
+    # Restore plan-step order: successes are appended inline during the first
+    # pass and failures after the cat-file gather, so without sorting the list
+    # is [successes…, failures…] rather than sequential plan order.
+    step_diagnostics.sort(key=lambda t: t[0])
+
     dropped_files = [f for f in missing if f not in expected_absent]
     if dropped_files:
         logger.warning(

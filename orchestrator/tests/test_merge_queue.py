@@ -1579,6 +1579,102 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_step_diagnostics_emitted_in_plan_step_order(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """step_diagnostics in the structured WARNING must appear in plan-step order.
+
+        Current bug: success diagnostics are appended inline (in plan-step
+        iteration order) and failure diagnostics are appended after the
+        concurrent cat-file gather.  With step_idx=0 failing and step_idx=1
+        succeeding, the rendered list is ``[(1, ...), (0, ...)]`` rather than
+        plan order.
+
+        Setup:
+          - step_idx=0 has ``bad_sha = '0'*40`` (diff-tree rc!=0 → failure)
+          - step_idx=1 has a real deletion commit for file_b.py (rc==0 → success)
+          - file_a.py is never committed → absent from merge tree → real drop
+          - file_b.py is intentionally deleted by step_idx=1
+
+        After the fix, ``step_diagnostics`` is sorted by step_idx before the
+        structured WARNING fires.  Assertion: ``'(0,'`` appears before ``'(1,'``
+        in the rendered WARNING message.  Currently fails because the
+        in-line/failures split produces the reverse order.
+        """
+        worktree = (await git_ops.create_worktree('issue2-diag-order')).path
+
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        # step_idx=1: real deletion commit for file_b.py
+        (worktree / 'file_b.py').write_text('b = 1\n')
+        await git_ops.commit(worktree, 'Add file_b.py')
+        (worktree / 'file_b.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Delete file_b.py'], cwd=worktree)
+        rc, good_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+        good_sha = good_sha_out.strip()
+
+        bad_sha = '0' * 40  # non-existent → diff-tree rc != 0
+
+        # file_a.py never committed → real drop from merge tree
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-issue2', 'T-issue2', 'desc')
+        artifacts.write_plan({
+            'files': ['file_a.py', 'file_b.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-0',
+                    'description': 'supposedly deleted file_a.py (bad SHA)',
+                    'status': 'done',
+                    'commit': bad_sha,          # step_idx=0, failure
+                },
+                {
+                    'id': 'step-1',
+                    'description': 'deleted file_b.py (real commit)',
+                    'status': 'done',
+                    'commit': good_sha,         # step_idx=1, success
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'issue2-diag-order')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                result = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                    task_id='t-issue2',
+                )
+
+            # file_a.py is a real drop (bad_sha fail-closed); file_b.py is expected absent
+            assert 'file_a.py' in result.dropped, (
+                f'Expected file_a.py in dropped; got {result.dropped!r}'
+            )
+
+            # Find the structured-warning record
+            warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert warn_records, 'Expected at least one WARNING when dropped is non-empty'
+            all_messages = ' '.join(r.getMessage() for r in warn_records)
+
+            # Both step indices must appear in the WARNING
+            assert '(0,' in all_messages, f'"(0," not found in WARNING: {all_messages!r}'
+            assert '(1,' in all_messages, f'"(1," not found in WARNING: {all_messages!r}'
+
+            # Plan-step order: (0, ...) must precede (1, ...)
+            pos_0 = all_messages.index('(0,')
+            pos_1 = all_messages.index('(1,')
+            assert pos_0 < pos_1, (
+                f'Expected step_diagnostics in plan order (0 before 1), '
+                f'but (0, appears at {pos_0}, (1, appears at {pos_1}): {all_messages!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
     async def test_per_step_diff_tree_failure_log_demoted_to_debug(
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ):
