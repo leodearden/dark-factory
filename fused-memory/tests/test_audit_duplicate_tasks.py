@@ -231,6 +231,21 @@ class TestFindExactDuplicateGroupsDeterministicOrdering:
         assert len(result) == 1
         assert [t['id'] for t in result[0]] == ['1001', '1002', '1003']
 
+    def test_groups_sorted_by_min_id(self):
+        """Groups are returned sorted by the minimum (first) ID within each group."""
+        # Interleave two duplicate pairs: 'Beta' group (min 2001) first in input,
+        # 'Alpha' group (min 1001) second — expected output reverses that order.
+        tasks = [
+            _task('2001', 'Beta task'),
+            _task('2002', 'Beta task'),
+            _task('1001', 'Alpha task'),
+            _task('1002', 'Alpha task'),
+        ]
+        result = find_exact_duplicate_groups(tasks)
+        assert len(result) == 2
+        assert result[0][0]['id'] == '1001'
+        assert result[1][0]['id'] == '2001'
+
 
 # ===========================================================================
 # Step-3: find_near_duplicate_groups
