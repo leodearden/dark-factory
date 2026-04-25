@@ -65,29 +65,17 @@ def _clear_orch_config_path(monkeypatch):
 
 @pytest.fixture
 def mock_orch_config(tmp_path: Path) -> MagicMock:
-    """Return a MagicMock OrchestratorConfig with the five standard defaults.
+    """Return a MagicMock OrchestratorConfig with five standard harness defaults.
 
-    Default attributes set:
-    - config.git            — GitConfig(main_branch='main', branch_prefix='task/',
-                                         remote='origin', worktree_dir='.worktrees')
-    - config.project_root   — tmp_path (the test's temporary directory)
-    - config.usage_cap.enabled — False
-    - config.review.enabled    — False
-    - config.sandbox.backend   — 'auto'
+    Defaults: git=GitConfig(main_branch='main', branch_prefix='task/',
+    remote='origin', worktree_dir='.worktrees'), project_root=tmp_path,
+    usage_cap.enabled=False, review.enabled=False, sandbox.backend='auto'.
+    Sub-sections (usage_cap, review, sandbox, fused_memory) are pre-created
+    so nested attribute access works without side-effects.
 
-    Apply test-specific overrides directly on the returned mock, e.g.:
-        mock_orch_config.orphan_l0_reaper_enabled = True
-
-    Sub-section mocks for ``usage_cap``, ``review``, ``sandbox``, and
-    ``fused_memory`` are created explicitly so callers can access nested
-    attributes (e.g. ``mock_orch_config.fused_memory.project_id = 'test'``)
-    without auto-creation side-effects.  Pydantic v2's metaclass does not
-    expose model-field names in ``dir(ClassName)``, so passing
-    ``spec=OrchestratorConfig`` to the top-level ``MagicMock`` would block
-    legitimate field access (e.g. ``orphan_l0_reaper_enabled``).  The top-
-    level mock is therefore left unspecced.
+    Apply test-specific overrides directly on the returned object.
     """
-    config = MagicMock()
+    config = MagicMock()  # unspecced: Pydantic v2 hides field names from dir()
     config.git = GitConfig(
         main_branch='main',
         branch_prefix='task/',
