@@ -13,44 +13,26 @@ original failure shape (two wip_conflict escalations; only one owns the halt).
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig
 from orchestrator.harness import Harness
 
 
 @pytest.fixture
-def git_config() -> GitConfig:
-    return GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-    )
-
-
-@pytest.fixture
-def harness(tmp_path: Path, git_config: GitConfig) -> Harness:
+def harness(tmp_path: Path, mock_orch_config) -> Harness:
     """Real Harness with a real EscalationQueue; other internals mocked."""
-    config = MagicMock()
-    config.git = git_config
-    config.project_root = tmp_path
-    config.usage_cap.enabled = False
-    config.review.enabled = False
-    config.sandbox.backend = 'auto'
-    config.orphan_l0_reaper_enabled = False
-    config.sandbox.backend = 'auto'
+    mock_orch_config.orphan_l0_reaper_enabled = False
 
     with (
         patch('orchestrator.harness.McpLifecycle'),
         patch('orchestrator.harness.Scheduler'),
         patch('orchestrator.harness.BriefingAssembler'),
     ):
-        h = Harness(config)
+        h = Harness(mock_orch_config)
 
     h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
     h._escalation_queue.set_resolve_callback(h._on_escalation_resolved)

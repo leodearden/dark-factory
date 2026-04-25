@@ -7,8 +7,20 @@ without conflicting with sibling subprojects' conftests under
 """
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
+from shared.config_models import UsageCapConfig
+
+from orchestrator.config import (
+    EscalationConfig,
+    FusedMemoryConfig,
+    GitConfig,
+    OrchestratorConfig,
+    ReviewConfig,
+    SandboxConfig,
+)
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -57,3 +69,41 @@ def repo_root() -> Path | None:
 def _clear_orch_config_path(monkeypatch):
     """Remove ORCH_CONFIG_PATH so tests don't inadvertently load the real config."""
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+
+
+@pytest.fixture
+def mock_orch_config(tmp_path: Path) -> MagicMock:
+    """Return a MagicMock OrchestratorConfig with the standard harness defaults pre-applied.
+
+    Defaults applied:
+      - ``git`` = real ``GitConfig`` with main/task/origin/.worktrees
+      - ``project_root`` = ``tmp_path``
+      - ``usage_cap.enabled`` = False
+      - ``review.enabled`` = False
+      - ``sandbox.backend`` = 'auto'
+      - ``fused_memory`` = pre-created sub-section mock (no default value)
+      - ``escalation`` = pre-created sub-section mock (no default value)
+
+    The top-level mock and each sub-section (usage_cap, review, sandbox,
+    fused_memory, escalation) are spec_set'd against their pydantic model's
+    fields so typos raise AttributeError on both get and set.
+
+    Apply test-specific overrides directly on the returned object.
+    """
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.git = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+    )
+    config.project_root = tmp_path
+    config.usage_cap = MagicMock(spec_set=pydantic_spec(UsageCapConfig))
+    config.usage_cap.enabled = False
+    config.review = MagicMock(spec_set=pydantic_spec(ReviewConfig))
+    config.review.enabled = False
+    config.sandbox = MagicMock(spec_set=pydantic_spec(SandboxConfig))
+    config.sandbox.backend = 'auto'
+    config.fused_memory = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+    config.escalation = MagicMock(spec_set=pydantic_spec(EscalationConfig))
+    return config

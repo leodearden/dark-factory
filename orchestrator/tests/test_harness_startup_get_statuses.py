@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig
 from orchestrator.harness import Harness
 
 # ---------------------------------------------------------------------------
@@ -23,29 +22,16 @@ from orchestrator.harness import Harness
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def startup_harness(tmp_path: Path) -> Harness:
+def startup_harness(tmp_path: Path, mock_orch_config) -> Harness:
     """Create a Harness with all run() side-effects mocked for startup tests."""
-    git_cfg = GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-    )
-    config = MagicMock()
-    config.git = git_cfg
-    config.project_root = tmp_path
-    config.usage_cap.enabled = False
-    config.review.enabled = False
-    config.sandbox.backend = 'auto'
-    config.max_concurrent_tasks = 2
-    config.fused_memory.project_id = 'test'
-    config.sandbox.backend = 'auto'
+    mock_orch_config.max_concurrent_tasks = 2
+    mock_orch_config.fused_memory.project_id = 'test'
 
     # Patch constructors so __init__ doesn't spin up real infrastructure.
     with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
          patch('orchestrator.harness.Scheduler'), \
          patch('orchestrator.harness.BriefingAssembler'):
-        h = Harness(config)
+        h = Harness(mock_orch_config)
 
     # h.mcp is mock_mcp_cls.return_value — make it awaitable.
     mock_mcp = mock_mcp_cls.return_value
