@@ -213,6 +213,26 @@ class TestFindExactDuplicateGroupsNoStatusFiltering:
 
 
 # ===========================================================================
+# Deterministic ordering: find_exact_duplicate_groups
+# ===========================================================================
+
+class TestFindExactDuplicateGroupsDeterministicOrdering:
+    """find_exact_duplicate_groups sorts members by ID and groups by min ID."""
+
+    def test_members_within_group_sorted_by_id(self):
+        """Members of the same duplicate group are returned sorted by numeric ID."""
+        # Deliberately insert in non-ascending order: 1003, 1001, 1002
+        tasks = [
+            _task('1003', 'Sync database'),
+            _task('1001', 'Sync database'),
+            _task('1002', 'Sync database'),
+        ]
+        result = find_exact_duplicate_groups(tasks)
+        assert len(result) == 1
+        assert [t['id'] for t in result[0]] == ['1001', '1002', '1003']
+
+
+# ===========================================================================
 # Step-3: find_near_duplicate_groups
 # ===========================================================================
 
