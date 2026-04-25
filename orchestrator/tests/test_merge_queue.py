@@ -1017,6 +1017,158 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_orphan_done_step_commit_object_in_odb_resolves_deletion_as_expected_absent(
+        self, git_ops: GitOps,
+    ):
+        """Orphaned commit (amend-discarded) whose object survives in ODB → not a failure.
+
+        Regression test for the failure mode discovered in task 1058:
+        after `git commit --amend`, the pre-amend SHA is orphaned but
+        remains queryable via the shared ODB until pruning.  If the plan
+        records the pre-amend SHA as a done-step commit, `git diff-tree`
+        can still resolve its deletion — so F.py should appear in
+        expected_absent and NOT be flagged as a drop.
+
+        The test documents and pins the contract:
+            orphan-but-not-pruned == happy path; no false positive.
+        """
+        worktree = (await git_ops.create_worktree('orphan-odb-test')).path
+
+        # anchor.py keeps the branch non-empty after F.py is deleted
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        # Add F.py then delete it, capturing the SHA of the deletion commit
+        (worktree / 'F.py').write_text('f = 1\n')
+        await git_ops.commit(worktree, 'Add F.py')
+        (worktree / 'F.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Delete F.py'], cwd=worktree)
+        rc, sha_del_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+        sha_del = sha_del_out.strip()
+
+        # Amend to orphan sha_del — stage an additional file to ensure the tree
+        # changes and git produces a genuinely different commit SHA.
+        (worktree / 'amend_marker.py').write_text('# amend marker\n')
+        await _run(['git', 'add', 'amend_marker.py'], cwd=worktree)
+        await _run(['git', 'commit', '--amend', '--no-edit'], cwd=worktree)
+        rc2, sha_del_prime_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc2 == 0
+        sha_del_prime = sha_del_prime_out.strip()
+        assert sha_del_prime != sha_del, 'amend must produce a new SHA'
+
+        # (a) Verify sha_del is still reachable via ODB despite being orphaned
+        rc_cat, cat_out, _ = await _run(
+            ['git', 'cat-file', '-t', sha_del],
+            cwd=git_ops.project_root,
+        )
+        assert rc_cat == 0, f'git cat-file failed (rc={rc_cat}): orphan left ODB?'
+        assert cat_out.strip() == 'commit', (
+            f'Expected "commit" type for sha_del, got {cat_out.strip()!r}'
+        )
+
+        # Write plan recording sha_del (orphaned) as the done-step commit
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('orphan-test', 'Orphan test', 'desc')
+        artifacts.write_plan({
+            'files': ['F.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'Delete F.py',
+                    'status': 'done',
+                    'commit': sha_del,
+                },
+            ],
+        })
+
+        # Merge: the merge commit will NOT contain F.py (deleted on branch)
+        merge_result = await git_ops.merge_to_main(worktree, 'orphan-odb-test')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            # (b) Drop-guard must NOT flag F.py as dropped — sha_del's
+            # deletion is still resolvable via the shared ODB
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='orphan-test',
+            )
+            assert missing == [], (
+                f'Expected no drops (orphan sha_del deletion resolved from ODB), '
+                f'got: {missing!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_check_plan_targets_returns_drop_guard_result_dataclass(
+        self, git_ops: GitOps,
+    ):
+        """_check_plan_targets_in_tree returns a DropGuardResult dataclass.
+
+        Asserts the structured return type introduced by task 1068:
+        - return value is a DropGuardResult instance
+        - has .dropped (list[str]) and .unresolved_steps (list[UnresolvedStep])
+        - .unresolved_steps is empty when all done-step diff-tree queries succeed
+
+        Will fail until step 4 introduces the DropGuardResult return type.
+        """
+        from orchestrator.merge_queue import DropGuardResult, UnresolvedStep
+
+        worktree = (await git_ops.create_worktree('drop-guard-result')).path
+        (worktree / 'kept.py').write_text('kept = 1\n')
+        await git_ops.commit(worktree, 'Add kept.py')
+
+        # Create then delete extra.py so we have a done step with a real deletion
+        (worktree / 'extra.py').write_text('extra = 1\n')
+        await git_ops.commit(worktree, 'Add extra.py')
+        (worktree / 'extra.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Delete extra.py'], cwd=worktree)
+        rc, del_sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+        del_sha = del_sha_out.strip()
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('dgr-test', 'DGR test', 'desc')
+        artifacts.write_plan({
+            'files': ['kept.py', 'extra.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'Delete extra.py',
+                    'status': 'done',
+                    'commit': del_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'drop-guard-result')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # Must be a DropGuardResult, not a plain list
+            assert isinstance(result, DropGuardResult), (
+                f'Expected DropGuardResult, got {type(result).__name__}'
+            )
+            # extra.py was intentionally deleted by done step → not dropped
+            assert result.dropped == [], f'Unexpected drops: {result.dropped}'
+            # All diff-tree queries succeeded → no unresolved steps
+            assert result.unresolved_steps == [], (
+                f'Unexpected unresolved steps: {result.unresolved_steps}'
+            )
+            # Verify type hints: unresolved_steps elements would be UnresolvedStep
+            assert isinstance(result.unresolved_steps, list)
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
