@@ -15,7 +15,6 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
-    normalize_title,
     _parse_decision,
     _parse_decision_dict,
     _PoolEntry,
@@ -24,6 +23,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
+    normalize_title,
 )
 
 # ----------------------------------------------------------------------

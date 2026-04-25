@@ -33,9 +33,9 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
-    normalize_title,
     _to_pool_entry,
     flatten_task_tree,
+    normalize_title,
 )
 from fused_memory.models.reconciliation import (
     EventSource,
