@@ -3627,3 +3627,38 @@ class TestHarnessDrainIdleShortCircuit:
             f"Expected at least 1 'Harness already draining' record but got "
             f"{len(already_draining_records)}: {[r.message for r in caplog.records]}"
         )
+
+    @pytest.mark.asyncio
+    async def test_main_loop_does_not_re_emit_marker_after_drain_synchronous(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """After drain() fires the marker synchronously, run_loop() must NOT re-emit it.
+
+        drain() emits 'Harness fully drained' on the first call when idle.
+        run_loop()'s drain-status block runs on every iteration while _draining=True
+        and _no_active_loops() is True; without the one-shot gate it re-emits on
+        every iteration.  This test asserts the gate keeps the total count to 1.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Stub side-effect dependencies so the loop body runs without network calls
+        harness._recover_stale_runs = AsyncMock(return_value=None)
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        harness.buffer.get_active_projects = AsyncMock(return_value=[])
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            # Idle path: drain() emits the marker synchronously (task 1053)
+            harness.drain()
+            # Run the main loop for ~0.2 s — enough for one full iteration before
+            # the 5 s asyncio.sleep; the loop body hits the drain-status block once.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+        drained_records = [
+            r for r in caplog.records if 'Harness fully drained' in r.message
+        ]
+        assert len(drained_records) == 1, (
+            f"Expected exactly 1 'Harness fully drained' record across drain() + run_loop() "
+            f"but got {len(drained_records)}: {[r.message for r in drained_records]}"
+        )
