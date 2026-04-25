@@ -108,9 +108,9 @@ class TestDisallowedToolLists:
         """resolve_ticket must be blocked in Stage 1/3 (only Stage 2 may create tasks)."""
         assert 'mcp__fused-memory__resolve_ticket' in DISALLOW_TASK_WRITES
 
-    def test_add_task_still_in_disallow_task_writes(self):
-        """Deprecated add_task facade must still be blocked (defence-in-depth)."""
-        assert 'mcp__fused-memory__add_task' in DISALLOW_TASK_WRITES
+    def test_add_task_not_in_disallow_task_writes(self):
+        """add_task facade has been removed — the disallow list must no longer reference a non-existent tool."""
+        assert 'mcp__fused-memory__add_task' not in DISALLOW_TASK_WRITES
 
 
 
