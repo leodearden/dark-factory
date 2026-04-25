@@ -15,6 +15,7 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
+    _normalize_title,
     _parse_decision,
     _parse_decision_dict,
     _PoolEntry,
@@ -1899,3 +1900,38 @@ class TestIntraBatchKey:
         """(e) both empty — no raise, returns 16-char string."""
         k = TaskCurator._intra_batch_key('', '')
         assert len(k) == 16
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _normalize_title module-level helper
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestNormalizeTitle:
+    """Unit tests for the module-level _normalize_title helper.
+
+    These tests are written before the implementation is moved to
+    task_curator (TDD step-1); they FAIL initially with ImportError
+    until _normalize_title is added to task_curator in step-2.
+    """
+
+    def test_identical_strings_produce_identical_output(self):
+        """(a) identical inputs → identical normalised output."""
+        assert _normalize_title('Fix the parser') == _normalize_title('Fix the parser')
+
+    def test_case_folding(self):
+        """(b) case difference is normalised away."""
+        assert _normalize_title('Fix Bug') == _normalize_title('fix bug')
+
+    def test_whitespace_collapse(self):
+        """(c) leading/trailing and internal whitespace collapse."""
+        assert _normalize_title('  Fix   bug ') == 'fix bug'
+        assert _normalize_title('  Fix   bug ') == _normalize_title('fix bug')
+
+    def test_none_input_returns_empty_string(self):
+        """(d) None input → empty string (defensive None handling)."""
+        assert _normalize_title(None) == ''  # type: ignore[arg-type]
+
+    def test_empty_input_returns_empty_string(self):
+        """(e) empty string → empty string."""
+        assert _normalize_title('') == ''
