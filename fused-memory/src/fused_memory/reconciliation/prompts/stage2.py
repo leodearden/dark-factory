@@ -101,7 +101,10 @@ After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
 `tasks_created` directly. If `task_id` is missing from the `resolve_ticket` response, \
 skip the `tasks_created` increment and flag the discrepancy in your structured report. \
-If the status is unrecognised but a `task_id` is present, call \
+`status="failed"` is never counted toward `tasks_created` regardless of whether a \
+`task_id` is present — inspect `reason` and do not retry silently. \
+If the status is anything other than `created`/`combined`/`failed` but a `task_id` \
+is present, call \
 `mcp__fused-memory__get_task` with that id to verify — only count if it returns a \
 valid record, otherwise flag the discrepancy.
 
