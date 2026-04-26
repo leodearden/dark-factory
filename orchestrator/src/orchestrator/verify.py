@@ -563,6 +563,11 @@ def _maybe_prune_archive(archive_root: Path | None) -> bool:
     - First call in a process always fires (``_LAST_PRUNE_AT is None``).
     - Subsequent calls within ``_PRUNE_THROTTLE_SECS`` are skipped.
     - After the window elapses, the next call fires and slides the window forward.
+    - If ``_prune_archive`` raises OSError (e.g. ``archive_root.exists()`` or
+      ``rglob`` fails on a permission-broken FS), the error is logged at warning
+      level and ``_LAST_PRUNE_AT`` still advances — preventing the same exception
+      from being raised on every subsequent verification call within the throttle
+      window.  Non-OSError exceptions still propagate.
     """
     global _LAST_PRUNE_AT
     if archive_root is None:
@@ -575,7 +580,13 @@ def _maybe_prune_archive(archive_root: Path | None) -> bool:
             _PRUNE_THROTTLE_SECS,
         )
         return False
-    _prune_archive(archive_root)
+    try:
+        _prune_archive(archive_root)
+    except OSError as exc:
+        logger.warning(
+            '_maybe_prune_archive: prune raised %s; advancing throttle to suppress retry storm',
+            exc,
+        )
     _LAST_PRUNE_AT = now
     return True
 
