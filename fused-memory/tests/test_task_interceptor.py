@@ -4653,12 +4653,6 @@ class TestAddSubtaskGuardrail:
 class TestExtractMetaFiles:
     """Unit tests for the TaskInterceptor._extract_meta_files static helper."""
 
-    def test_exists(self):
-        """The helper must be a staticmethod on TaskInterceptor."""
-        assert hasattr(TaskInterceptor, '_extract_meta_files'), (
-            '_extract_meta_files not found on TaskInterceptor'
-        )
-
     def test_dict_metadata_files_to_modify(self):
         """dict metadata with files_to_modify → returns the list verbatim."""
         kwargs = {'metadata': {'files_to_modify': ['orchestrator/harness.py', 'src/foo.py']}}
