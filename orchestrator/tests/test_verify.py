@@ -2613,6 +2613,212 @@ class TestRunVerificationPersistence:
         )
 
 
+class TestPersistAttemptLogsModulePrefix:
+    """Tests for the ``module_prefix`` parameter added to ``_persist_attempt_logs``.
+
+    Tests fail until step 22 adds ``module_prefix`` to ``_persist_attempt_logs``
+    and wires it through ``run_verification``.
+    """
+
+    def _persist(
+        self,
+        worktree,
+        attempt_id,
+        runs,
+        category='cargo_cli_error',
+        cause_hint='error: bad',
+        module_prefix=None,
+    ):
+        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
+
+        kwargs = {}
+        if module_prefix is not None:
+            kwargs['module_prefix'] = module_prefix
+        return _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint, **kwargs)
+
+    def _make_runs(self):
+        return [
+            {
+                'label': 'test',
+                'cmd': 'cargo test -p cratea',
+                'rc': 1,
+                'output': 'cratea test failure\n',
+                'timed_out': False,
+                'started_at': '2026-04-26T12:00:00+00:00',
+                'duration_secs': 3.0,
+            },
+            {
+                'label': 'lint',
+                'cmd': 'ruff check cratea/src/',
+                'rc': 0,
+                'output': '',
+                'timed_out': False,
+                'started_at': '2026-04-26T12:00:03+00:00',
+                'duration_secs': 0.5,
+            },
+            {
+                'label': 'type',
+                'cmd': 'mypy cratea/src/',
+                'rc': 0,
+                'output': '',
+                'timed_out': False,
+                'started_at': '2026-04-26T12:00:04+00:00',
+                'duration_secs': 0.4,
+            },
+        ]
+
+    def test_with_module_prefix_uses_infix_filenames(self, tmp_path: Path):
+        """module_prefix='cratea' → attempt-1.cratea.test.log, etc."""
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        self._persist(tmp_path, attempt_id=1, runs=runs, module_prefix='cratea')
+
+        verify_dir = tmp_path / '.task' / 'verify'
+        assert (verify_dir / 'attempt-1.cratea.test.log').exists(), 'Expected cratea test log'
+        assert (verify_dir / 'attempt-1.cratea.lint.log').exists(), 'Expected cratea lint log'
+        assert (verify_dir / 'attempt-1.cratea.type.log').exists(), 'Expected cratea type log'
+        assert (verify_dir / 'attempt-1.cratea.summary.json').exists(), 'Expected cratea summary.json'
+        # No plain (prefix-less) filenames should exist
+        assert not (verify_dir / 'attempt-1.test.log').exists(), 'Unexpected prefix-less test log'
+
+    def test_without_module_prefix_uses_plain_filenames(self, tmp_path: Path):
+        """When module_prefix is omitted, filenames are attempt-1.{test,lint,type}.log (unchanged)."""
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        self._persist(tmp_path, attempt_id=1, runs=runs)
+
+        verify_dir = tmp_path / '.task' / 'verify'
+        assert (verify_dir / 'attempt-1.test.log').exists(), 'Expected plain test log'
+        assert (verify_dir / 'attempt-1.lint.log').exists(), 'Expected plain lint log'
+        assert (verify_dir / 'attempt-1.type.log').exists(), 'Expected plain type log'
+        assert (verify_dir / 'attempt-1.summary.json').exists(), 'Expected plain summary.json'
+
+    def test_module_prefix_sanitization_slashes(self, tmp_path: Path):
+        """module_prefix='path/to/crate' → slashes replaced with underscores."""
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        self._persist(tmp_path, attempt_id=1, runs=runs, module_prefix='path/to/crate')
+
+        verify_dir = tmp_path / '.task' / 'verify'
+        assert (verify_dir / 'attempt-1.path_to_crate.test.log').exists(), (
+            'Expected slash-sanitized test log'
+        )
+        assert (verify_dir / 'attempt-1.path_to_crate.summary.json').exists(), (
+            'Expected slash-sanitized summary.json'
+        )
+
+    def test_module_prefix_sanitization_spaces(self, tmp_path: Path):
+        """module_prefix containing spaces → spaces replaced with underscores."""
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        self._persist(tmp_path, attempt_id=1, runs=runs, module_prefix='my crate')
+
+        verify_dir = tmp_path / '.task' / 'verify'
+        assert (verify_dir / 'attempt-1.my_crate.test.log').exists(), (
+            'Expected space-sanitized test log'
+        )
+
+    def test_two_prefixes_same_attempt_id_no_clobber(self, tmp_path: Path):
+        """Two calls with same attempt_id but different module_prefix produce distinct files."""
+        (tmp_path / '.task').mkdir()
+        runs_a = self._make_runs()
+        runs_b = [dict(r, output=r['output'].replace('cratea', 'crateb')) for r in self._make_runs()]
+
+        self._persist(tmp_path, attempt_id=1, runs=runs_a, module_prefix='cratea')
+        self._persist(tmp_path, attempt_id=1, runs=runs_b, module_prefix='crateb')
+
+        verify_dir = tmp_path / '.task' / 'verify'
+        assert (verify_dir / 'attempt-1.cratea.test.log').exists(), 'cratea test log missing'
+        assert (verify_dir / 'attempt-1.crateb.test.log').exists(), 'crateb test log missing'
+        # Content must differ (no last-writer-wins clobber)
+        cratea_content = (verify_dir / 'attempt-1.cratea.test.log').read_text()
+        crateb_content = (verify_dir / 'attempt-1.crateb.test.log').read_text()
+        assert 'cratea' in cratea_content
+        assert 'crateb' in crateb_content
+
+
+@pytest.mark.asyncio
+class TestRunScopedVerificationConcurrentNoClobber:
+    """Integration tests ensuring ``run_scoped_verification`` with multiple ModuleConfigs
+    writes per-module log files without last-writer-wins clobber.
+
+    Tests fail until step 22 passes ``module_prefix`` to ``_persist_attempt_logs``
+    inside ``run_verification``.
+    """
+
+    def _make_config(self, tmp_path: Path) -> 'OrchestratorConfig':
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+    def _make_module_configs(self) -> 'list[ModuleConfig]':
+        mc_a = ModuleConfig(
+            prefix='cratea',
+            test_command='cargo test -p cratea',
+            lint_command=None,
+            type_check_command=None,
+        )
+        mc_b = ModuleConfig(
+            prefix='crateb',
+            test_command='cargo test -p crateb',
+            lint_command=None,
+            type_check_command=None,
+        )
+        return [mc_a, mc_b]
+
+    async def test_concurrent_no_clobber(self, tmp_path: Path):
+        """Two ModuleConfigs write distinct per-module log files without clobber."""
+        (tmp_path / '.task').mkdir()
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = self._make_config(tmp_path)
+        module_configs = self._make_module_configs()
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cratea' in cmd:
+                return 1, 'cratea ERR\nfoo\nbar\n', False
+            if 'crateb' in cmd:
+                return 1, 'crateb ERR\nbaz\nqux\n', False
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                attempt_id=1,
+                task_id='42',
+                archive_root=archive_root,
+            )
+
+        verify_dir = tmp_path / '.task' / 'verify'
+
+        # (e) both files exist
+        cratea_log = verify_dir / 'attempt-1.cratea.test.log'
+        crateb_log = verify_dir / 'attempt-1.crateb.test.log'
+        assert cratea_log.exists(), f'cratea log missing: {list(verify_dir.iterdir())}'
+        assert crateb_log.exists(), f'crateb log missing: {list(verify_dir.iterdir())}'
+
+        # (f) content is module-specific (no clobber)
+        assert 'cratea ERR' in cratea_log.read_text(), 'cratea log has wrong content'
+        assert 'crateb ERR' in crateb_log.read_text(), 'crateb log has wrong content'
+
+        # (g) both summary.json files exist with the correct category
+        cratea_summary = verify_dir / 'attempt-1.cratea.summary.json'
+        crateb_summary = verify_dir / 'attempt-1.crateb.summary.json'
+        assert cratea_summary.exists(), 'cratea summary.json missing'
+        assert crateb_summary.exists(), 'crateb summary.json missing'
+
+        # (h) result.worktree_log_paths contains both modules' paths
+        all_paths = result.worktree_log_paths
+        assert any('cratea' in p for p in all_paths), (
+            f'cratea not in worktree_log_paths: {all_paths}'
+        )
+        assert any('crateb' in p for p in all_paths), (
+            f'crateb not in worktree_log_paths: {all_paths}'
+        )
+
+
 class TestShouldArchiveCategory:
     """Tests for ``_should_archive_category(category: str) -> bool``.
 
