@@ -113,7 +113,9 @@ is absent. Only increment the relevant task-success counter (e.g., `tasks_reopen
 if `newStatus` matches the requested status. If the response is missing or ambiguous, \
 call `mcp__fused-memory__get_task` with the same task id to confirm. If the confirmed \
 status differs from the requested one, skip the counter increment and flag the \
-discrepancy in your structured report.
+discrepancy in your structured report. If the response contains `no_op: True`, the \
+task was already in the requested status — treat as a successful no-op (do not \
+increment a success counter, do not flag as a discrepancy).
 
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
