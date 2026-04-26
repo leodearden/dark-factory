@@ -34,6 +34,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
+    _queue_briefing_refresh_tasks,
+    _run_briefing_known_gaps_script,
     _select_proactive_sample,
 )
 from fused_memory.reconciliation.task_filter import (
@@ -2995,3 +2997,35 @@ class TestStage2HandoffShortfallWarning:
             f'Expected no flagged_items_truncated WARNING (run_stage=stage2) for 5 small items; '
             f'got: {[(r.getMessage(), r.__dict__) for r in truncation_records]}'
         )
+
+
+class TestBriefingKnownGapsRefresh:
+    """Tests for _run_briefing_known_gaps_script and _queue_briefing_refresh_tasks helpers."""
+
+    @pytest.fixture
+    def mock_deps(self, tmp_path):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root=str(tmp_path))
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='reify')
+
+    # ------------------------------------------------------------------ #
+    # _run_briefing_known_gaps_script                                       #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_when_script_missing(self, tmp_path):
+        """No scripts/refresh_briefing_known_gaps.py → returns None without subprocess."""
+        # tmp_path has neither the script nor the briefing file
+        with patch('asyncio.create_subprocess_exec') as mock_subproc:
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        mock_subproc.assert_not_called()

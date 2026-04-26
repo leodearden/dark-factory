@@ -8,7 +8,9 @@ import heapq
 import itertools
 import json
 import logging
+import sys
 from collections.abc import Iterable
+from pathlib import Path
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -494,3 +496,129 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
         return (priority, -_id_key(t))
 
     return heapq.nsmallest(n, tasks, key=sort_key)
+
+
+async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | None:
+    """Run reify's refresh_briefing_known_gaps.py in --json mode.
+
+    Returns a list of mismatch dicts when mismatches are present, an empty list
+    when none are found, or None when the script is absent (non-reify project),
+    the briefing file is missing, or the subprocess fails.
+
+    Exit codes:
+    - 0: no mismatches → return []
+    - 1: mismatches present → return parsed JSON list
+    - 2+: script error → log WARNING, return None
+    """
+    script_path = Path(project_root) / 'scripts' / 'refresh_briefing_known_gaps.py'
+    if not script_path.exists():
+        return None
+
+    briefing_path = Path(project_root) / 'review' / 'briefing.yaml'
+    if not briefing_path.exists():
+        return None
+
+    tasks_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.json'
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(script_path),
+            '--briefing', str(briefing_path),
+            '--tasks', str(tasks_path),
+            '--json',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            logger.warning(
+                'briefing_known_gaps_script_timeout',
+                extra={'project_root': project_root},
+            )
+            return None
+    except FileNotFoundError:
+        logger.warning(
+            'briefing_known_gaps_script_not_found',
+            extra={'project_root': project_root},
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            'briefing_known_gaps_script_error',
+            extra={'project_root': project_root, 'error': str(exc)},
+        )
+        return None
+
+    if proc.returncode not in (0, 1):
+        logger.warning(
+            'briefing_known_gaps_script_failed',
+            extra={
+                'project_root': project_root,
+                'returncode': proc.returncode,
+                'stderr': stderr.decode('utf-8', errors='replace')[:500],
+            },
+        )
+        return None
+
+    try:
+        return json.loads(stdout.decode('utf-8', errors='replace'))
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            'briefing_known_gaps_script_bad_json',
+            extra={'project_root': project_root, 'error': str(exc)},
+        )
+        return None
+
+
+async def _queue_briefing_refresh_tasks(
+    taskmaster: object,
+    project_root: str,
+    mismatches: list[dict],
+) -> dict:
+    """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
+
+    Skips creation when a task with status 'pending' and the same canonical title
+    already exists (exact-title de-dup).
+
+    Returns ``{"created": [task_ids], "skipped": [task_ids]}``.
+    """
+    existing_raw = await taskmaster.get_tasks(project_root=project_root)
+    existing_tasks = existing_raw.get('tasks', []) if isinstance(existing_raw, dict) else []
+    pending_titles = {
+        t.get('title', '')
+        for t in existing_tasks
+        if t.get('status') == 'pending'
+    }
+
+    created: list[str] = []
+    skipped: list[str] = []
+
+    for mismatch in mismatches:
+        task_id = str(mismatch.get('task_id', ''))
+        title = f'Refresh briefing: remove task {task_id} from known_gaps'
+
+        if title in pending_titles:
+            skipped.append(task_id)
+            continue
+
+        subproject = mismatch.get('subproject', '')
+        task_title = mismatch.get('title', '')
+        what = mismatch.get('what', '')
+        description = (
+            f'Subproject: {subproject}\n'
+            f'Task title: {task_title}\n'
+            f'Gap: {what}'
+        )
+        result = await taskmaster.add_task(
+            project_root=project_root,
+            title=title,
+            description=description,
+        )
+        if isinstance(result, dict) and 'id' in result:
+            created.append(str(result['id']))
+        else:
+            created.append(task_id)
+
+    return {'created': created, 'skipped': skipped}
