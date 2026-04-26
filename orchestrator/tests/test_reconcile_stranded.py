@@ -538,6 +538,39 @@ class TestReconcileStrandedInProgress:
         # Lock file must not have been deleted
         assert lock_path.exists(), 'Lock file must survive when an unexpected exception propagates'
 
+    async def test_already_merged_branch_marked_done_with_provenance(
+        self, harness: Harness
+    ):
+        """Stranded in-progress task whose branch is already merged to main →
+        marked done with provenance; no pending revert; no cleanup_worktree.
+
+        RED state: the guard doesn't exist yet; reconcile takes the no-lock
+        branch and calls set_task_status('50', 'pending'), never calling
+        is_ancestor.
+        """
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'50': 'in-progress'}, None
+        )
+        # No worktree dir or plan.lock for task 50 — guard must fire before
+        # any worktree analysis.
+
+        await harness._reconcile_stranded_in_progress()
+
+        # is_ancestor must have been invoked with the configured branch + main_branch
+        harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
+
+        # set_task_status must be called exactly once: ('50', 'done') with note kwarg
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '50', 'done',
+            done_provenance={
+                'note': 'reconcile: branch already on main when stranded in-progress',
+            },
+        )
+
+        # cleanup_worktree must NOT have been called
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
