@@ -4565,3 +4565,92 @@ class TestAddSubtaskGuardrail:
             f'Field {field!r}: expected fused-memory/ or fused_memory/ in matched_paths: {result}'
         )
         taskmaster.add_subtask.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step-1: unit tests for TaskInterceptor._extract_meta_files (RED before step-2)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractMetaFiles:
+    """Unit tests for the TaskInterceptor._extract_meta_files static helper.
+
+    These tests MUST FAIL before step-2 (the helper does not yet exist).
+    """
+
+    def test_exists(self):
+        """The helper must be a staticmethod on TaskInterceptor."""
+        assert hasattr(TaskInterceptor, '_extract_meta_files'), (
+            '_extract_meta_files not found on TaskInterceptor'
+        )
+
+    def test_dict_metadata_files_to_modify(self):
+        """dict metadata with files_to_modify → returns the list verbatim."""
+        kwargs = {'metadata': {'files_to_modify': ['orchestrator/harness.py', 'src/foo.py']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['orchestrator/harness.py', 'src/foo.py']
+
+    def test_dict_metadata_modules_only(self):
+        """dict metadata with only modules → returns modules (fallback)."""
+        kwargs = {'metadata': {'modules': ['fused-memory/src', 'orchestrator/']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['fused-memory/src', 'orchestrator/']
+
+    def test_dict_metadata_both_keys_prefers_files_to_modify(self):
+        """dict metadata with BOTH keys → returns files_to_modify (precedence over modules)."""
+        kwargs = {'metadata': {
+            'files_to_modify': ['a.py'],
+            'modules': ['module_a'],
+        }}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['a.py']
+
+    def test_dict_metadata_scalar_string_coerced_to_list(self):
+        """dict metadata with files_to_modify as a string → coerced to single-element list."""
+        kwargs = {'metadata': {'files_to_modify': 'orchestrator/harness.py'}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['orchestrator/harness.py']
+
+    def test_json_string_metadata_parsed(self):
+        """JSON string metadata → parsed and files_to_modify extracted."""
+        import json as _json
+        meta_str = _json.dumps({'files_to_modify': ['orchestrator/harness.py']})
+        kwargs = {'metadata': meta_str}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['orchestrator/harness.py']
+
+    def test_malformed_json_string_returns_empty(self):
+        """Malformed JSON string metadata → returns []."""
+        kwargs = {'metadata': '{not valid json}'}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_none_metadata_returns_empty(self):
+        """metadata=None → returns []."""
+        kwargs = {'metadata': None}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_missing_metadata_key_returns_empty(self):
+        """Missing metadata key → returns []."""
+        kwargs = {}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_non_dict_metadata_list_returns_empty(self):
+        """Non-dict metadata (e.g. list) → returns []."""
+        kwargs = {'metadata': ['some', 'list']}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_falsy_entries_filtered_out(self):
+        """Falsy entries ('', None) inside the list → filtered out."""
+        kwargs = {'metadata': {'files_to_modify': ['', None, 'src/bar.py', '']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['src/bar.py']
+
+    def test_non_string_entries_str_coerced(self):
+        """Non-string truthy entries → str-coerced."""
+        kwargs = {'metadata': {'files_to_modify': [42, 'src/foo.py']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['42', 'src/foo.py']
