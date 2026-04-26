@@ -683,8 +683,10 @@ class TestDeleteDead:
         assert result.get('error_type') == 'TransientSqliteError'
         assert result.get('retriable') is True
         assert 'database is locked' in result.get('error', '')
-        assert 'deleted' in result
-        assert 'remaining' in result
+        # Degenerate first-chunk failure: nothing was deleted yet.
+        assert result.get('deleted') == []
+        # The single input id lands in remaining so caller can retry.
+        assert result.get('remaining') == [id1]
 
     @pytest.mark.asyncio
     async def test_operational_error_mid_batch_preserves_deleted_progress(
