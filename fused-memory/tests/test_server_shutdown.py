@@ -454,3 +454,39 @@ class TestGracefulShutdownDoesNotArmForceExitWatchdog:
             'Task 1080 regression: _graceful_shutdown armed a 45s os._exit(1) watchdog. '
             'The watchdog must only be armed by _shutdown_with_watchdog (the lifespan-only wrapper).'
         )
+
+
+class TestShutdownWithWatchdog:
+    @pytest.mark.asyncio
+    async def test_arms_force_exit_watchdog_before_invoking_graceful_shutdown(self):
+        """_shutdown_with_watchdog must arm the watchdog BEFORE delegating to _graceful_shutdown.
+
+        The spy records whether _shutdown_watchdog was set at the moment the
+        delegate was called.  A value of True in armed_state proves the arm
+        happened before the call, not after.
+        """
+        import fused_memory.server.main as main_mod
+
+        # Ensure clean state.
+        main_mod._cancel_force_exit()
+        assert main_mod._shutdown_watchdog is None, 'precondition: no watchdog before call'
+
+        armed_state: list[bool] = []
+
+        async def _spy(**kwargs):  # type: ignore[override]
+            armed_state.append(main_mod._shutdown_watchdog is not None)
+
+        try:
+            with patch.object(main_mod, '_graceful_shutdown', _spy):
+                await main_mod._shutdown_with_watchdog(
+                    memory_service=MagicMock(close=AsyncMock()),
+                    task_interceptor=None,
+                    harness_loop_task=None,
+                    recon_journal=None,
+                )
+
+            assert armed_state == [True], (
+                '_shutdown_with_watchdog must arm the watchdog before calling _graceful_shutdown'
+            )
+        finally:
+            main_mod._cancel_force_exit()
