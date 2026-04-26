@@ -2058,6 +2058,25 @@ class TestClassifyFailure:
             f"rustc uncoded 'error: invalid …' should fall through to unknown_test_failure, got {result!r}"
         )
 
+    def test_uncoded_package_diagnostic_not_cargo_cli_error(self):
+        """Uncoded 'error: package …' diagnostic must NOT → cargo_cli_error.
+
+        The `package ` token in the original allowlist was added without a
+        concrete observed cargo CLI sample.  Without a real sample grounding
+        the token, it risks mis-bucketing any future 'error: package <X>'
+        diagnostic (from rustc, cargo, or a build wrapper) as cargo_cli_error.
+        This test pins that such output falls through to unknown_test_failure
+        until a real cargo log line justifies a tighter suffix.
+        """
+        output = 'error: package metadata for foo failed validation\n'
+        result = self._classify(output, rc=1, timed_out=False)
+        assert result != 'cargo_cli_error', (
+            f"uncoded 'error: package …' must not be mis-bucketed as cargo_cli_error, got {result!r}"
+        )
+        assert result == 'unknown_test_failure', (
+            f"uncoded 'error: package …' should fall through to unknown_test_failure, got {result!r}"
+        )
+
     # (d) compile_error: rustc diagnostic error codes
     def test_compile_error_rustc_code(self):
         """'error[E0308]: mismatched types' → compile_error."""
