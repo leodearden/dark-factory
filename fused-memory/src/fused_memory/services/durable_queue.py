@@ -20,6 +20,12 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of ids per DELETE…RETURNING batch.  SQLite's legacy
+# SQLITE_MAX_VARIABLE_NUMBER default is 999 (modern builds allow 32766);
+# keeping this well below 999 leaves headroom for the trailing group_id
+# placeholder and ensures correctness across all SQLite versions.
+_DELETE_DEAD_BATCH_SIZE = 500
+
 # -- Schema ------------------------------------------------------------------
 
 _CREATE_TABLE = """\
@@ -421,9 +427,13 @@ class DurableWriteQueue:
         eligible.  Cross-project ids, non-existent ids, and non-dead-status
         ids all land in ``not_found`` without leaking information.
 
+        Large id lists are processed internally in chunks of
+        :data:`_DELETE_DEAD_BATCH_SIZE` so callers can pass arbitrarily many
+        ids without hitting SQLite's SQLITE_MAX_VARIABLE_NUMBER limit.
+
         Args:
             group_id: Project scope — only dead rows in this group are deleted.
-            ids: Integer row ids to delete.
+            ids: Integer row ids to delete.  Any size list is accepted.
 
         Returns:
             ``{'deleted': [<sorted ids removed>], 'not_found': [<sorted ids missed>]}``
@@ -432,21 +442,26 @@ class DurableWriteQueue:
             return {'deleted': [], 'not_found': []}
 
         assert self._db is not None
-        placeholders = ','.join('?' * len(ids))
-        # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
-        # The WHERE guards (status='dead', group_id=?) are enforced atomically so
-        # a concurrent replay or worker cannot slip a row past the eligibility check
-        # between a separate SELECT and DELETE.
-        cursor = await self._db.execute(
-            f"DELETE FROM write_queue "
-            f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
-            f"RETURNING id",
-            (*ids, group_id),
-        )
-        rows = await cursor.fetchall()
-        deleted: set[int] = {
-            (row[0] if isinstance(row, tuple) else row['id']) for row in rows
-        }
+        deleted: set[int] = set()
+
+        for i in range(0, len(ids), _DELETE_DEAD_BATCH_SIZE):
+            chunk = ids[i : i + _DELETE_DEAD_BATCH_SIZE]
+            placeholders = ','.join('?' * len(chunk))
+            # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
+            # The WHERE guards (status='dead', group_id=?) are enforced atomically so
+            # a concurrent replay or worker cannot slip a row past the eligibility check
+            # between a separate SELECT and DELETE.
+            cursor = await self._db.execute(
+                f"DELETE FROM write_queue "
+                f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
+                f"RETURNING id",
+                (*chunk, group_id),
+            )
+            rows = await cursor.fetchall()
+            deleted |= {
+                (row[0] if isinstance(row, tuple) else row['id']) for row in rows
+            }
+
         await self._db.commit()
 
         return {
