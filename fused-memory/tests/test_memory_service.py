@@ -762,6 +762,52 @@ class TestSearch:
         )
 
     @pytest.mark.asyncio
+    async def test_search_category_false_negative_regression_task_1083(self, service):
+        """E2E regression: category-scoped search must return the matching low-similarity
+        memory even when higher-similarity non-matching memories exist.
+
+        Without the pushdown fix (task 1083), the matching procedural_knowledge memory
+        would never reach the Python-side post-filter because Mem0 returns top-N
+        irrespective of category, saturating the result set with observations_and_summaries.
+        With the fix, categories is forwarded to Mem0 server-side so only
+        procedural_knowledge memories are returned, and the matching one is found.
+        """
+        high_sim_obs = [
+            {
+                'id': f'obs-{i}',
+                'memory': f'observation {i}',
+                'score': 0.9 - i * 0.01,
+                'metadata': {'category': 'observations_and_summaries'},
+            }
+            for i in range(10)
+        ]
+        proc_memory = {
+            'id': 'proc-1',
+            'memory': 'Deploy via: uv run python -m app.deploy',
+            'score': 0.4,
+            'metadata': {'category': 'procedural_knowledge'},
+        }
+
+        def mem0_side_effect(**kwargs):
+            cats = kwargs.get('categories') or []
+            if cats == ['procedural_knowledge']:
+                return {'results': [proc_memory]}
+            return {'results': high_sim_obs}
+
+        service.mem0.search = AsyncMock(side_effect=mem0_side_effect)
+
+        results = await service.search(
+            query='how do I deploy',
+            project_id='test',
+            categories=['procedural_knowledge'],
+            stores=['mem0'],
+        )
+        assert len(results) == 1, (
+            f'Expected 1 result but got {len(results)} — category pushdown may be broken'
+        )
+        assert results[0].id == 'proc-1'
+
+    @pytest.mark.asyncio
     async def test_search_pushes_categories_to_mem0_backend(self, service):
         """categories kwarg must be forwarded from MemoryService.search → _search_mem0
         → Mem0Backend.search so the filter is applied server-side (task 1083)."""
