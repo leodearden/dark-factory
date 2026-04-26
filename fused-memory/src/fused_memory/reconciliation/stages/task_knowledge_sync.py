@@ -11,6 +11,7 @@ import logging
 import sys
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -616,7 +617,7 @@ async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | Non
 
 
 async def _queue_briefing_refresh_tasks(
-    taskmaster: object,
+    taskmaster: Any,
     project_root: str,
     mismatches: list[dict],
 ) -> dict:

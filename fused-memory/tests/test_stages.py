@@ -3099,12 +3099,11 @@ class TestBriefingKnownGapsRefresh:
             return_value=(b'', b'ERROR: cannot parse briefing.yaml: bad syntax')
         )
 
-        with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
-            with caplog.at_level(
-                logging.WARNING,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-            ):
-                result = await _run_briefing_known_gaps_script(str(tmp_path))
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
 
         assert result is None
         warning_records = [
@@ -3132,7 +3131,7 @@ class TestBriefingKnownGapsRefresh:
             {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
         ]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
 
         assert taskmaster.add_task.call_count == 2
 
