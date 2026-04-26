@@ -14,6 +14,7 @@ from orchestrator.git_ops import (
     ScrubOutcome,
     ScrubResult,
     WorktreeInfo,
+    _merge_subject,
     _run,
     scrub_task_dir_from_tree,
 )
@@ -2736,3 +2737,73 @@ class TestFindMergeMarker:
         assert '\n' not in marker_sha   # anti-multiline regression
         assert len(marker_sha) == 40    # single-SHA shape
         assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
+
+
+@pytest.mark.asyncio
+class TestMergeSubjectContract:
+    """End-to-end contract: the merge subject written to main by merge_to_main
+    equals _merge_subject output, and find_merge_marker locates that commit.
+
+    If either the writer or reader drifts from _merge_subject (e.g. an inline
+    f-string replaces the helper call with a different format), at least one of
+    the two roundtrip assertions will fail.
+    """
+
+    async def test_merge_subject_roundtrip(
+        self, git_ops: GitOps
+    ) -> None:
+        """Assert the on-main subject equals _merge_subject output and that
+        find_merge_marker returns the same SHA.
+        """
+        tid = 'contract-1'
+        full_branch = f'task/{tid}'
+
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        result = await git_ops.merge_to_main(wt_info.path, tid)
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+
+        adv = await git_ops.advance_main(result.merge_commit)
+        assert adv == 'advanced'
+
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+
+        # End-to-end roundtrip: the subject on main must equal helper output
+        _, subject, _ = await _run(
+            ['git', 'log', '--format=%s', '-n', '1', result.merge_commit],
+            cwd=git_ops.project_root,
+        )
+        assert subject == _merge_subject(full_branch, git_ops.config.main_branch)
+
+        # find_merge_marker must locate the same commit
+        marker_sha = await git_ops.find_merge_marker(full_branch)
+        assert marker_sha == result.merge_commit
+
+
+class TestMergeSubject:
+    """Unit tests for the _merge_subject helper.
+
+    Locks the canonical format: 'Merge {branch} into {main_branch}'.
+    This helper is the single source of truth consumed by merge_to_main,
+    advance_main (retry path), and find_merge_marker.
+    """
+
+    @pytest.mark.parametrize(
+        'branch, main_branch, expected',
+        [
+            ('task/1', 'main', 'Merge task/1 into main'),
+            ('task/123', 'main', 'Merge task/123 into main'),
+            ('task/v1.0', 'develop', 'Merge task/v1.0 into develop'),
+        ],
+    )
+    def test_canonical_format(
+        self, branch: str, main_branch: str, expected: str
+    ) -> None:
+        """_merge_subject returns 'Merge {branch} into {main_branch}'."""
+        assert _merge_subject(branch, main_branch) == expected
