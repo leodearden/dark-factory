@@ -105,9 +105,17 @@ from the `resolve_ticket` response, or if `get_task` returns an unexpected paylo
 error, skip the `tasks_created` counter increment and flag the discrepancy in your \
 report's `summary` or `flagged_items`.
 
-After each `mcp__fused-memory__set_task_status` call, call \
-`mcp__fused-memory__get_task` with the same task id to confirm the new status was \
-applied. Only increment `tasks_reopened` (or other status-derived counters) after the \
-returned status matches the requested one. If the returned status differs, skip the \
-counter increment and flag the discrepancy in your structured report.
+After each `mcp__fused-memory__set_task_status` call, inspect the `tasks[n].newStatus` \
+field in the response — `set_task_status` returns per-task \
+`{{"taskId": ..., "oldStatus": ..., "newStatus": ...}}` records, so no separate \
+`get_task` round-trip is needed unless the response payload is missing or `newStatus` \
+is absent. Only increment the relevant task-success counter (e.g., `tasks_reopened`) \
+if `newStatus` matches the requested status. If the response is missing or ambiguous, \
+call `mcp__fused-memory__get_task` with the same task id to confirm. If the confirmed \
+status differs from the requested one, skip the counter increment and flag the \
+discrepancy in your structured report.
+
+This rule applies to all task-operation counters: do not increment any task-success \
+stat unless the response payload or a follow-up verification confirms the expected \
+outcome.
 """
