@@ -1,11 +1,13 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
     VerifyResult,
@@ -14,6 +16,7 @@ from orchestrator.verify import (
     _build_fallback_config,
     _extract_cause_hint,
     _is_test_file,
+    _maybe_prune_archive,
     _run_cmd,
     _scope_cargo_workspace,
     run_scoped_verification,
@@ -3341,11 +3344,6 @@ class TestPruneArchiveThrottle:
 
         Must FAIL until step-4 wraps the _prune_archive call in try/except OSError.
         """
-        import logging  # noqa: PLC0415
-
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
 
         # Pin the clock to 0.0 so both calls observe a deterministic timestamp.
@@ -3388,9 +3386,6 @@ class TestPruneArchiveThrottle:
         The OSError-only catch must not silence programming bugs (e.g. RuntimeError).
         This test will also pass after step-4 because the guard is OSError-only.
         """
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
 
         with patch.object(verify, '_prune_archive', side_effect=RuntimeError('bug')), pytest.raises(RuntimeError, match='bug'):
