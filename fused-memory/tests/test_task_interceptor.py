@@ -1016,8 +1016,10 @@ async def test_r4_idempotency_hit_add_task(
         'modules': ['fused-memory/src'],
     }
     try:
-        result = await _submit_and_resolve(interceptor, 
-            '/project',
+        result = await _submit_and_resolve(interceptor,
+            # Use /dark-factory so the path-scope guard (which rejects fused-memory/
+            # paths filed under non-dark-factory projects) does not block the ticket.
+            '/dark-factory',
             title='T',
             description='D',
             metadata=metadata,
@@ -1071,14 +1073,16 @@ async def test_r4_idempotency_hit_submit_task(
     }
     try:
         submit_result = await interceptor.submit_task(
-            '/project',
+            # Use /dark-factory so the path-scope guard (which rejects fused-memory/
+            # paths filed under non-dark-factory projects) does not block the ticket.
+            '/dark-factory',
             title='T',
             description='D',
             metadata=metadata,
         )
         # Phase 2: resolve_ticket waits for the worker and returns the R4 decision.
         ticket = submit_result['ticket']
-        result = await interceptor.resolve_ticket(ticket, '/project', timeout_seconds=5.0)
+        result = await interceptor.resolve_ticket(ticket, '/dark-factory', timeout_seconds=5.0)
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
