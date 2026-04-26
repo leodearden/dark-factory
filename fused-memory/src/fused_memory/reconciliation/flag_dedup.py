@@ -88,6 +88,22 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='reconciliation',
                 )
+            else:
+                # Novel flag — write a new marker for future dedup cycles
+                await memory_service.add_memory(
+                    content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
+                    category='observations_and_summaries',
+                    project_id=project_id,
+                    metadata={
+                        'source': 'stage1_flag_marker',
+                        'task_id': tid,
+                        'flag_type': ftype,
+                        'run_id': run_id,
+                        'last_seen_run_id': run_id,
+                    },
+                    causation_id=run_id,
+                    _source='reconciliation',
+                )
         except Exception as e:
             logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
         result.append(flag)
