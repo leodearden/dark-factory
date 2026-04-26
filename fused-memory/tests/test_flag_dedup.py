@@ -240,6 +240,90 @@ async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
     )
 
 
+# ---------------------------------------------------------------------------
+# dedup_flags — malformed prior-marker run_id uses sentinel (step-1)
+# ---------------------------------------------------------------------------
+
+_VALID_FILTER_META = {
+    'source': 'stage1_flag_marker',
+    'task_id': '42',
+    'flag_type': 'missing_deliverable',
+}
+
+
+@pytest.mark.parametrize(
+    'prior_metadata',
+    [
+        # (a) 'run_id' key absent — .get('run_id', run_id) silently returns run_id, not 'unknown'
+        pytest.param(
+            {'source': 'stage1_flag_marker', 'task_id': '42', 'flag_type': 'missing_deliverable'},
+            id='run_id-key-absent',
+        ),
+        # (c) 'run_id' key present but value is None — .get returns None (not 'unknown')
+        pytest.param(
+            {
+                'source': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': None,
+            },
+            id='run_id-is-None',
+        ),
+        # (d) 'run_id' key present but value is '' — .get returns '' (not 'unknown')
+        pytest.param(
+            {
+                'source': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': '',
+            },
+            id='run_id-is-empty-string',
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(prior_metadata):
+    """When a prior stage1_flag_marker exists but has a missing/falsy run_id, dedup_flags
+    must annotate the flag with persisted_from_run='unknown' — not the current run_id.
+
+    Three malformed shapes parametrised:
+    (a) 'run_id' key absent        → .get(key, run_id) silently returns 'r1' ≠ 'unknown'
+    (c) run_id=None                → .get returns None ≠ 'unknown'
+    (d) run_id=''                  → .get returns '' ≠ 'unknown'
+    All three must produce persisted_from_run='unknown' with the sentinel fix applied.
+
+    Note: the case where prior.metadata is None is intentionally omitted.  When
+    metadata is None, the candidate filter ((r.metadata or {}).get('source') etc.)
+    returns falsy values for all three checks, so the candidate is never selected
+    as ``prior`` — the code under test (run_id extraction) is never reached.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result(prior_metadata)
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.add_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    assert len(result) == 1
+    assert result[0]['persisted_from_run'] == 'unknown', (
+        f"persisted_from_run must fall back to sentinel 'unknown' for any falsy run_id "
+        f"in prior marker metadata, but got {result[0].get('persisted_from_run')!r}."
+    )
+    assert result[0]['last_seen_run_id'] == 'r1'
+    # No new marker write — prior was found, no accumulation
+    memory_service.add_memory.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog):
     """When memory_service.add_memory raises, dedup_flags does not raise, returns flag unchanged,
