@@ -2739,6 +2739,81 @@ class TestFindMergeMarker:
         assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
 
 
+@pytest.mark.asyncio
+class TestMergeSubjectContract:
+    """Contract test: both merge_to_main and find_merge_marker route through
+    _merge_subject.
+
+    Uses a monkeypatch spy on the module global so any future drive-by
+    refactor that reverts either call site to an inline f-string is caught
+    immediately (the spy call count assertion fails).
+
+    RED before step-4: neither call site invokes _merge_subject yet
+    (both use inline f-strings), so the '>= 2 calls' assertion fails.
+    GREEN after step-4: both call sites route through the helper.
+    """
+
+    async def test_both_callsites_use_merge_subject_helper(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spy on _merge_subject; assert merge_to_main and find_merge_marker
+        both call it with (full_branch, main_branch).
+        """
+        import orchestrator.git_ops as _module  # module ref for setattr
+
+        calls: list[tuple[str, str]] = []
+        original = _merge_subject
+
+        def _spy(branch: str, main_branch: str) -> str:
+            calls.append((branch, main_branch))
+            return original(branch, main_branch)
+
+        monkeypatch.setattr(_module, '_merge_subject', _spy)
+
+        tid = 'contract-1'
+        full_branch = f'task/{tid}'
+
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        result = await git_ops.merge_to_main(wt_info.path, tid)
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+
+        adv = await git_ops.advance_main(result.merge_commit)
+        assert adv == 'advanced'
+
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+
+        # End-to-end roundtrip: the subject on main must equal helper output
+        _, subject, _ = await _run(
+            ['git', 'log', '--format=%s', '-n', '1', result.merge_commit],
+            cwd=git_ops.project_root,
+        )
+        assert subject == original(full_branch, git_ops.config.main_branch)
+
+        # find_merge_marker must find the merge commit
+        marker_sha = await git_ops.find_merge_marker(full_branch)
+        assert marker_sha == result.merge_commit
+
+        # Contract: _merge_subject must be called at least twice total —
+        # once by merge_to_main (writes the subject) and once by find_merge_marker
+        # (builds the grep pattern).
+        target_calls = [
+            c for c in calls
+            if c == (full_branch, git_ops.config.main_branch)
+        ]
+        assert len(target_calls) >= 2, (
+            f'Expected _merge_subject called ≥2 times with '
+            f'({full_branch!r}, {git_ops.config.main_branch!r}), '
+            f'got calls: {calls!r}'
+        )
+
+
 class TestMergeSubject:
     """Unit tests for the _merge_subject helper.
 
