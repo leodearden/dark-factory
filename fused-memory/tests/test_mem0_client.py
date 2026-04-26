@@ -32,3 +32,20 @@ class TestMem0BackendSearch:
         assert filters is None, (
             f'Expected filters=None when no categories given, got filters={filters!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_single_category_builds_equality_filter(self, backend):
+        """A single category must produce an equality filter dict passed to instance.search."""
+        mock_instance = MagicMock()
+        mock_instance.search = AsyncMock(return_value={'results': []})
+        with patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)):
+            await backend.search(
+                query='q',
+                scope=Scope(project_id='p'),
+                limit=5,
+                categories=['preferences_and_norms'],
+            )
+        call_kwargs = mock_instance.search.call_args.kwargs
+        assert call_kwargs.get('filters') == {'category': 'preferences_and_norms'}, (
+            f"Expected filters={{'category': 'preferences_and_norms'}}, got {call_kwargs.get('filters')!r}"
+        )
