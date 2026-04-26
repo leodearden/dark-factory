@@ -104,4 +104,10 @@ the task as created if `get_task` returns a valid task record. If `task_id` is m
 from the `resolve_ticket` response, or if `get_task` returns an unexpected payload or an \
 error, skip the `tasks_created` counter increment and flag the discrepancy in your \
 report's `summary` or `flagged_items`.
+
+After each `mcp__fused-memory__set_task_status` call, call \
+`mcp__fused-memory__get_task` with the same task id to confirm the new status was \
+applied. Only increment `tasks_reopened` (or other status-derived counters) after the \
+returned status matches the requested one. If the returned status differs, skip the \
+counter increment and flag the discrepancy in your structured report.
 """
