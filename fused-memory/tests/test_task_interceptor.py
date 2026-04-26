@@ -4285,14 +4285,14 @@ class TestSubmitTaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_submit_task_skips_build_candidate_for_dark_factory_project(
-        self, interceptor_with_store, ticket_store, taskmaster, monkeypatch,
+        self, interceptor_with_store, taskmaster, monkeypatch,
     ):
         """Hoist optimisation: _build_candidate is not invoked for the dark_factory
         project_id, since the path guard short-circuits to 'ok' anyway.
 
-        Also pins the persisted ticket row's project_id and candidate_json blob shape
-        so a regression in observable persistence is caught even if the spy snapshot
-        stays at zero.
+        Persistence-shape coverage (project_id column, candidate_json blob fields) is
+        owned by ``test_submit_task_persists_canonical_blob`` — one place to update
+        when the blob schema intentionally changes.
         """
         calls: list[dict] = []
         original = TaskInterceptor._build_candidate
@@ -4323,10 +4323,36 @@ class TestSubmitTaskGuardrail:
             f'Expected _build_candidate to be skipped for dark_factory; got {calls_after_submit} calls'
         )
 
-        # Pin the persisted ticket row's project_id and candidate_json blob shape.
-        # This catches regressions where the blob serialisation changes (e.g. a field
-        # is dropped, or project_id diverges from 'dark_factory') even if the spy
-        # snapshot above stays at zero.
+    @pytest.mark.asyncio
+    async def test_submit_task_persists_canonical_blob(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """Persistence contract: submit_task for /dark-factory stores a row whose
+        project_id is 'dark_factory' and whose candidate_json blob contains the
+        un-mutated kwargs (title, description) and metadata=None.
+
+        This is the single owning test for the candidate_json serialisation format;
+        update here when the blob schema intentionally changes.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/dark-factory',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+            )
+        finally:
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('ticket', '').startswith('tkt_'), (
+            f'Expected tkt_-prefixed ticket, got: {result}'
+        )
+
+        # Direct _db access is intentional: we're pinning the storage-layer
+        # serialisation contract, which has no public query path.  This mirrors
+        # the pattern used by sibling tests in this class (e.g.
+        # test_submit_task_rejects_dark_factory_paths_in_wrong_project).
         db = ticket_store._db
         assert db is not None
         cursor = await db.execute(
