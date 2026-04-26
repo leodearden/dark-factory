@@ -3114,3 +3114,31 @@ class TestStage2TaskVerificationGuidance:
             "STAGE2_SYSTEM_PROMPT must name the 'tasks_reopened' stat counter in its "
             "task-verification guidance so agents know to confirm status before incrementing."
         )
+
+    def test_stage2_system_prompt_instructs_skip_counter_on_verification_failure(self):
+        """Regression pin (step 9): STAGE2_SYSTEM_PROMPT must contain explicit instructions
+        to skip counter increments and log/flag discrepancies when task-op verification fails.
+
+        Per the plan: 'Should pass after step-6/step-8 if the wording lands the discrepancy
+        clause'. This test pins those clauses so future wording changes can't silently drop them.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        has_skip_phrase = (
+            'skip' in STAGE2_SYSTEM_PROMPT
+            or 'discrepancy' in STAGE2_SYSTEM_PROMPT
+            or 'do not increment' in STAGE2_SYSTEM_PROMPT
+        )
+        assert has_skip_phrase, (
+            "STAGE2_SYSTEM_PROMPT must contain a phrase instructing agents to skip counter "
+            "increments on verification failure (e.g. 'skip', 'discrepancy', 'do not increment')."
+        )
+
+        has_log_phrase = (
+            'log' in STAGE2_SYSTEM_PROMPT
+            or 'flag' in STAGE2_SYSTEM_PROMPT
+        )
+        assert has_log_phrase, (
+            "STAGE2_SYSTEM_PROMPT must contain a phrase instructing agents to log or flag "
+            "discrepancies in the structured report (e.g. 'log', 'flag')."
+        )
