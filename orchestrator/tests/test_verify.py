@@ -2069,6 +2069,97 @@ class TestPersistAttemptLogs:
         assert log_files == [], f'Expected no log files, got {log_files}'
 
 
+class TestArchiveAttemptLog:
+    """Tests for ``_archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)``.
+
+    Tests fail until step 10 implements the helper.
+    """
+
+    def _archive(self, worktree_log_paths, archive_root, task_id, attempt_id, category):
+        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
+        return _archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)
+
+    def _make_source_logs(self, tmp_path: Path) -> list[Path]:
+        """Create two fake worktree log files and return their paths."""
+        log_dir = tmp_path / '.task' / 'verify'
+        log_dir.mkdir(parents=True)
+        test_log = log_dir / 'attempt-1.test.log'
+        lint_log = log_dir / 'attempt-1.lint.log'
+        test_log.write_text('error: --exclude ...\n')
+        lint_log.write_text('')
+        return [test_log, lint_log]
+
+    # (a) cargo_cli_error → archives created under <archive_root>/<task_id>/
+    def test_archives_for_cargo_cli_error(self, tmp_path: Path):
+        """cargo_cli_error is in the archive bucket; files are copied."""
+        sources = self._make_source_logs(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        dest_paths = self._archive(sources, archive_root, '42', 1, 'cargo_cli_error')
+        assert len(dest_paths) == len(sources), f'Expected {len(sources)} archived, got {dest_paths}'
+        for dest in dest_paths:
+            assert dest.exists(), f'Archive file missing: {dest}'
+
+    # (b) unknown_test_failure → archives created
+    def test_archives_for_unknown_test_failure(self, tmp_path: Path):
+        """unknown_test_failure is archived."""
+        sources = self._make_source_logs(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        dest_paths = self._archive(sources, archive_root, '42', 1, 'unknown_test_failure')
+        assert len(dest_paths) == len(sources)
+        for dest in dest_paths:
+            assert dest.exists()
+
+    # (c) test_failure → NO archive files created
+    def test_no_archive_for_test_failure(self, tmp_path: Path):
+        """test_failure is not archived; returns empty list."""
+        sources = self._make_source_logs(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        dest_paths = self._archive(sources, archive_root, '42', 1, 'test_failure')
+        assert dest_paths == [], f'Expected [], got {dest_paths}'
+
+    # (d) compile_error → NO archive files
+    def test_no_archive_for_compile_error(self, tmp_path: Path):
+        """compile_error is not archived."""
+        sources = self._make_source_logs(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        dest_paths = self._archive(sources, archive_root, '42', 1, 'compile_error')
+        assert dest_paths == []
+
+    # (e) infra_timeout → NO archive files
+    def test_no_archive_for_infra_timeout(self, tmp_path: Path):
+        """infra_timeout is not archived."""
+        sources = self._make_source_logs(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        dest_paths = self._archive(sources, archive_root, '42', 1, 'infra_timeout')
+        assert dest_paths == []
+
+    # (f) archive_root=None → returns [] with no error
+    def test_noop_when_archive_root_none(self, tmp_path: Path):
+        """archive_root=None returns empty list, no exception."""
+        sources = self._make_source_logs(tmp_path)
+        dest_paths = self._archive(sources, None, '42', 1, 'cargo_cli_error')
+        assert dest_paths == []
+
+    # (g) archive_root parent does not exist → function creates it
+    def test_creates_archive_root_when_missing(self, tmp_path: Path):
+        """archive_root hierarchy is created by mkdir(parents=True)."""
+        sources = self._make_source_logs(tmp_path)
+        archive_root = tmp_path / 'deep' / 'nested' / 'verify-logs'
+        assert not archive_root.exists()
+        dest_paths = self._archive(sources, archive_root, '42', 1, 'cargo_cli_error')
+        assert len(dest_paths) > 0
+        assert archive_root.exists()
+
+    # content preserved
+    def test_archived_content_matches_source(self, tmp_path: Path):
+        """The content of archived files matches the source."""
+        sources = self._make_source_logs(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        dest_paths = self._archive(sources, archive_root, '42', 1, 'cargo_cli_error')
+        for src, dest in zip(sources, dest_paths):
+            assert dest.read_text() == src.read_text(), f'Content mismatch: {src} vs {dest}'
+
+
 class TestShouldArchiveCategory:
     """Tests for ``_should_archive_category(category: str) -> bool``.
 
