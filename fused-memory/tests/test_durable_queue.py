@@ -896,6 +896,152 @@ class TestDeleteDead:
             'Expected exc_info to be captured by logger.exception(), got None for all ERROR records'
         )
 
+    @pytest.mark.parametrize('journal_mode', ['WAL', 'DELETE'])
+    @pytest.mark.asyncio
+    async def test_real_sqlite_busy_mid_batch_durable_recovery(
+        self, tmp_path, monkeypatch, journal_mode
+    ):
+        """Real SQLITE_BUSY on chunk 2: prior-chunk deletes are durable (both journal modes).
+
+        Engineers 'only chunk 2 fails' via a coordinator wrapper that:
+          1. Lets chunk-1 DELETE execute on the queue connection normally.
+          2. Force-commits the queue connection, releasing the writer lock.
+          3. Issues BEGIN IMMEDIATE on a second connection, acquiring the writer lock.
+          4. Lowers busy_timeout to 50 ms so chunk-2 fails fast.
+        The chunk-2 DELETE then hits a *real* aiosqlite.OperationalError from SQLite
+        (not a synthesised Python exception), proving genuine SQLITE_BUSY origin.
+        Parametrized over WAL and DELETE (rollback) journal modes.
+
+        Uses batch_size=3 so 7 dead rows produce chunks [0:3], [3:6], [6:7].
+        Constructs a fresh DurableWriteQueue inline so journal_mode can be switched
+        per-parametrize without colliding with the shared ``queue`` fixture's WAL pin.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-001'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        try:
+            # (2) Patch batch size to 3 so 7 rows => chunks [0:3], [3:6], [6:7].
+            monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
+            dead_ids = [await self._insert_dead_row(q, 'proj1') for _ in range(7)]
+
+            # (3) Switch the queue connection to the parametrized journal mode.
+            await q._db.execute(f'PRAGMA journal_mode={journal_mode}')
+            await q._db.commit()
+
+            db_path = q._data_dir / 'write_queue.db'
+
+            # (4) Open conn2 to the same file; confirm the matching journal mode.
+            async with aiosqlite.connect(str(db_path)) as conn2:
+                await conn2.execute(f'PRAGMA journal_mode={journal_mode}')
+                await conn2.commit()
+
+                # (5) Install the coordinator wrapper around q._db.execute.
+                #
+                # Chunk-1 path (delete_call_count == 1):
+                #   a. Execute chunk-1 DELETE and pre-fetch RETURNING rows before
+                #      the commit so the cursor is not invalidated by tx close.
+                #   b. Commit chunk 1 — releases the writer lock on the queue conn.
+                #   c. conn2 acquires the writer lock via BEGIN IMMEDIATE.
+                #   d. Lower busy_timeout to 50 ms so chunk-2 fails fast.
+                #   e. Return a proxy cursor with the pre-buffered RETURNING rows.
+                # All other calls (including chunk-2 DELETE) forward to the real execute.
+                delete_call_count = 0
+                original_execute = q._db.execute
+
+                async def coordinator(sql, *args, **kwargs):
+                    nonlocal delete_call_count
+                    if 'DELETE FROM' in sql.upper():
+                        delete_call_count += 1
+                        if delete_call_count == 1:
+                            inner_cursor = await original_execute(sql, *args, **kwargs)
+                            prefetched_rows = await inner_cursor.fetchall()
+                            await q._db.commit()
+                            await conn2.execute('BEGIN IMMEDIATE')
+                            await original_execute('PRAGMA busy_timeout=50')
+
+                            class _PreFetched:
+                                async def fetchall(self_inner):
+                                    return prefetched_rows
+
+                            return _PreFetched()
+                    return await original_execute(sql, *args, **kwargs)
+
+                monkeypatch.setattr(q._db, 'execute', coordinator)
+
+                # (6) Run delete_dead — chunk-2 DELETE hits real SQLITE_BUSY.
+                result = await q.delete_dead(group_id='proj1', ids=dead_ids)
+
+                # (7) Release conn2's write lock before the context manager closes it.
+                await conn2.rollback()
+
+            # (8) Assert the typed error envelope.
+            assert result.get('error_type') == 'TransientSqliteError', (
+                f'Expected TransientSqliteError envelope, got: {result}'
+            )
+            assert result.get('retriable') is True
+
+            # The error message must contain real-SQLite vocabulary — it must NOT
+            # be the synthesised 'database is locked' from the mock-based siblings.
+            error_msg = result.get('error', '').lower()
+            assert any(
+                token in error_msg for token in ('database is locked', 'busy', 'locked')
+            ), (
+                f'Expected real-SQLite BUSY vocabulary in error message, '
+                f'got: {result.get("error")!r}'
+            )
+
+            chunk1_ids = set(dead_ids[:3])
+            remaining_ids = set(dead_ids[3:])
+
+            assert set(result['deleted']) == chunk1_ids, (
+                f'Expected first-chunk ids in deleted, got: {sorted(result["deleted"])}'
+            )
+            assert set(result['remaining']) == remaining_ids, (
+                f'Expected last-4 ids in remaining, got: {sorted(result["remaining"])}'
+            )
+            assert result.get('not_found') == []
+
+            # Disjointness and union-completeness invariants.
+            assert set(result['deleted']).isdisjoint(set(result['remaining']))
+            assert set(result['deleted']) | set(result['remaining']) == set(dead_ids)
+
+            # (9) Durability check: close the queue, open a fresh connection, and
+            #     confirm that chunk-1 rows are physically gone while chunk-2/3 rows
+            #     still exist.  Avoids re-instantiating DurableWriteQueue to prevent
+            #     constructor-arg drift — raw aiosqlite is sufficient.
+            await q.close()
+
+            async with aiosqlite.connect(str(db_path)) as raw_db:
+                raw_db.row_factory = aiosqlite.Row
+                placeholders = ','.join('?' * len(dead_ids))
+                cursor = await raw_db.execute(
+                    f'SELECT id FROM write_queue WHERE id IN ({placeholders})',
+                    tuple(dead_ids),
+                )
+                rows = await cursor.fetchall()
+                surviving = {row['id'] for row in rows}
+
+            assert chunk1_ids.isdisjoint(surviving), (
+                'Chunk-1 ids must be durably deleted from the DB file'
+            )
+            assert remaining_ids.issubset(surviving), (
+                'Chunk-2/3 ids must still be present in the DB file'
+            )
+
+        finally:
+            try:
+                await q.close()
+            except Exception:
+                pass
+
 
 class TestStats:
     @pytest.mark.asyncio
