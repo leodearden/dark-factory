@@ -2160,6 +2160,76 @@ class TestArchiveAttemptLog:
             assert dest.read_text() == src.read_text(), f'Content mismatch: {src} vs {dest}'
 
 
+class TestPruneArchive:
+    """Tests for ``_prune_archive(archive_root, max_age_days, max_total_bytes)``.
+
+    Tests import the function locally; they are expected to pass once step 12
+    (already folded into step 10's commit) provides the implementation.
+    """
+
+    def _prune(self, archive_root, max_age_days=30, max_total_bytes=1_000_000_000):
+        from orchestrator.verify import _prune_archive  # noqa: PLC0415
+        return _prune_archive(archive_root, max_age_days=max_age_days, max_total_bytes=max_total_bytes)
+
+    # (a) old files deleted, fresh files kept
+    def test_old_files_deleted_fresh_kept(self, tmp_path: Path):
+        """Files older than max_age_days are deleted; fresh files survive."""
+        import os, time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        old = archive_root / 'old.log'
+        fresh = archive_root / 'fresh.log'
+        old.write_text('old')
+        fresh.write_text('fresh')
+        # Set old file's mtime to 31 days ago
+        old_mtime = time.time() - 31 * 86_400
+        os.utime(old, (old_mtime, old_mtime))
+        self._prune(archive_root, max_age_days=30)
+        assert not old.exists(), 'Old file should have been deleted'
+        assert fresh.exists(), 'Fresh file should remain'
+
+    # (b) size cap: oldest files deleted until under cap
+    def test_size_cap_deletes_oldest_first(self, tmp_path: Path):
+        """When total size > max_total_bytes, oldest files deleted until under cap."""
+        import os, time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        # Create 3 files of 50 bytes each; cap at 100 bytes → one must be deleted
+        t = time.time() - 60  # base mtime
+        files = []
+        for i in range(3):
+            f = archive_root / f'f{i}.log'
+            f.write_text('x' * 50)  # 50 bytes
+            os.utime(f, (t + i, t + i))
+            files.append(f)
+        # Total = 150 bytes, cap = 100 → must delete at least 1 (oldest = f0)
+        self._prune(archive_root, max_age_days=365, max_total_bytes=100)
+        assert not files[0].exists(), 'Oldest file should be deleted'
+        # At least one of the newer files must remain
+        assert files[1].exists() or files[2].exists()
+
+    # (c) non-existent archive_root → no error
+    def test_noop_on_missing_archive_root(self, tmp_path: Path):
+        """Returns silently when archive_root does not exist."""
+        missing = tmp_path / 'nonexistent'
+        self._prune(missing)  # must not raise
+
+    # (d) directory structure preserved (only files deleted, not dirs)
+    def test_directories_preserved(self, tmp_path: Path):
+        """Only log files are deleted; empty directories are left intact."""
+        import os, time
+        archive_root = tmp_path / 'archive'
+        sub = archive_root / 'sub'
+        sub.mkdir(parents=True)
+        old = sub / 'old.log'
+        old.write_text('content')
+        old_mtime = time.time() - 31 * 86_400
+        os.utime(old, (old_mtime, old_mtime))
+        self._prune(archive_root, max_age_days=30)
+        assert not old.exists(), 'Old log file should be deleted'
+        assert sub.exists(), 'Sub-directory should remain'
+
+
 class TestShouldArchiveCategory:
     """Tests for ``_should_archive_category(category: str) -> bool``.
 
