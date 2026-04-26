@@ -3205,7 +3205,7 @@ class TestPruneArchiveThrottle:
         import time as time_mod  # noqa: PLC0415
 
         from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive, _PRUNE_THROTTLE_SECS  # noqa: PLC0415
+        from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
 
         archive_root = tmp_path / 'data' / 'verify-logs'
         base_time = 0.0
@@ -3228,7 +3228,7 @@ class TestPruneArchiveThrottle:
         import time as time_mod  # noqa: PLC0415
 
         from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive, _PRUNE_THROTTLE_SECS  # noqa: PLC0415
+        from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
 
         archive_root = tmp_path / 'data' / 'verify-logs'
         base_time = 0.0
