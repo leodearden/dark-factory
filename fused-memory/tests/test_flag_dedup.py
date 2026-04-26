@@ -102,8 +102,8 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def _make_memory_result(metadata: dict) -> MagicMock:
-    """Build a minimal mock MemoryResult with .metadata and .content."""
+def _make_memory_result(metadata: dict | None) -> MagicMock:
+    """Build a minimal mock MemoryResult; metadata may be None to model a malformed memory record."""
     r = MagicMock()
     r.metadata = metadata
     r.content = 'Stage 1 flag marker'
@@ -462,6 +462,51 @@ async def test_dedup_flags_unknown_sentinel_emits_info_log(caplog):
     ), (
         f"Expected an INFO log mentioning task_id='42', flag_type='missing_deliverable', "
         f"and 'unknown'/'malformed', but got records: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_prior_marker_None_metadata_writes_new_marker():
+    """Locks in the candidate-filter rejection behavior — the `meta = r.metadata or {}`
+    guard in find_prior_memory short-circuits when metadata is None, so a refactor that
+    drops the `or {}` guard (e.g., direct attribute access on r.metadata) would silently
+    regress this path. Test passes against current impl. Companion to
+    test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel, which intentionally
+    omits this case (see its docstring).
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    # Prior result with metadata=None — survives the search but is rejected by the
+    # candidate filter because (r.metadata or {}).get('source') returns None, which
+    # doesn't equal 'stage1_flag_marker'.
+    prior_result = _make_memory_result(None)
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_result])
+    memory_service.add_memory = AsyncMock(return_value=None)
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=[{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}],
+    )
+
+    # Candidate was filtered out — flag is NOT annotated with persisted_from_run
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0], (
+        f"Expected no persisted_from_run annotation but got {result[0].get('persisted_from_run')!r}"
+    )
+
+    # The dedup logic took the else-branch (novel flag) and wrote a new marker
+    memory_service.add_memory.assert_called_once()
+
+    # New marker has a well-formed stage1_flag_marker shape
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args.kwargs,
+        task_id='42',
+        flag_type='missing_deliverable',
+        run_id='r1',
     )
 
 
