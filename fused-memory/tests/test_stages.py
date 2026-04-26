@@ -3182,3 +3182,146 @@ class TestBriefingKnownGapsRefresh:
 
         taskmaster.add_task.assert_called_once()
         assert '1751' not in result['skipped']
+
+    # ------------------------------------------------------------------ #
+    # TaskKnowledgeSync.run() integration                                   #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_run_invokes_briefing_refresh_hook_before_super_run(self, mock_deps, tmp_path):
+        """run() calls _maybe_queue_briefing_refresh_tasks then super().run()."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['taskmaster'].add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(return_value=[mismatch]),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=MagicMock(
+                    success=True, report={'summary': 'ok'},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-1086',
+            )
+
+        # The hook should have called add_task once
+        mock_deps['taskmaster'].add_task.assert_called_once()
+        call_kwargs = mock_deps['taskmaster'].add_task.call_args[1]
+        assert call_kwargs['title'] == 'Refresh briefing: remove task 1751 from known_gaps'
+
+        # And the run should have completed with a StageReport
+        assert report is not None
+
+    @pytest.mark.asyncio
+    async def test_run_dedupes_when_invoked_twice_with_same_mismatch(self, mock_deps, tmp_path):
+        """Calling run() twice: second call skips add_task because first created pending task."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        canonical_title = 'Refresh briefing: remove task 1751 from known_gaps'
+
+        # First call: no existing tasks
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['taskmaster'].add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        fake_cli_result = MagicMock(success=True, report={'summary': 'ok'})
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(return_value=[mismatch]),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=fake_cli_result),
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-1',
+            )
+
+            # Now update get_tasks to include the just-created task as pending
+            mock_deps['taskmaster'].get_tasks.return_value = {
+                'tasks': [{'id': '9001', 'status': 'pending', 'title': canonical_title}]
+            }
+            mock_deps['taskmaster'].add_task.reset_mock()
+
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-2',
+            )
+
+        # Second invocation must not call add_task again
+        mock_deps['taskmaster'].add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_swallows_helper_failure(self, mock_deps, tmp_path, caplog):
+        """If _run_briefing_known_gaps_script raises, run() still completes and logs WARNING."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        fake_cli_result = MagicMock(success=True, report={'summary': 'ok'})
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(side_effect=RuntimeError('boom')),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=fake_cli_result),
+            ),
+            caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-swallow',
+            )
+
+        assert report is not None
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'briefing_refresh_hook_failed' in r.getMessage()
+        ]
+        assert len(warning_records) == 1
+
+    # ------------------------------------------------------------------ #
+    # STAGE2_SYSTEM_PROMPT                                                  #
+    # ------------------------------------------------------------------ #
+
+    def test_stage2_system_prompt_mentions_briefing_refresh_tasks(self):
+        """STAGE2_SYSTEM_PROMPT must mention 'Refresh briefing' so Stage-2 agents know these tasks exist."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        assert 'Refresh briefing' in STAGE2_SYSTEM_PROMPT

@@ -56,6 +56,49 @@ class TaskKnowledgeSync(BaseStage):
     def get_disallowed_tools(self) -> list[str]:
         return STAGE2_DISALLOWED
 
+    async def run(
+        self,
+        events: list[ReconciliationEvent],
+        watermark: Watermark,
+        prior_reports: list[StageReport],
+        run_id: str,
+        model: str | None = None,
+    ) -> StageReport:
+        """Run the briefing-refresh hook then delegate to BaseStage.run()."""
+        await self._maybe_queue_briefing_refresh_tasks()
+        return await super().run(events, watermark, prior_reports, run_id, model=model)
+
+    async def _maybe_queue_briefing_refresh_tasks(self) -> None:
+        """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
+
+        Silently skips if project_root or taskmaster is absent, or if the reify
+        script is not present in the project. Any exception is caught and logged
+        as a WARNING so a broken script can never abort Stage 2.
+        """
+        if not self.project_root or not self.taskmaster:
+            return
+        try:
+            mismatches = await _run_briefing_known_gaps_script(self.project_root)
+            if not mismatches:
+                return
+            summary = await _queue_briefing_refresh_tasks(
+                self.taskmaster, self.project_root, mismatches,
+            )
+            logger.info(
+                'briefing_refresh_tasks_queued',
+                extra={
+                    'project_root': self.project_root,
+                    'created': summary.get('created', []),
+                    'skipped': summary.get('skipped', []),
+                },
+            )
+        except Exception:
+            logger.warning(
+                'briefing_refresh_hook_failed',
+                exc_info=True,
+                extra={'project_root': self.project_root},
+            )
+
     async def assemble_payload(
         self,
         events: list[ReconciliationEvent],
