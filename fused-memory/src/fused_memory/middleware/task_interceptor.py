@@ -875,25 +875,39 @@ class TaskInterceptor:
         return meta
 
     @staticmethod
-    def _extract_meta_files(kwargs: dict[str, Any]) -> list[str]:
-        """Extract metadata-supplied file/module list from add_task / add_subtask kwargs.
+    def _extract_meta_files_from_meta(meta: dict) -> list[str]:
+        """Extract the file/module list from an already-parsed metadata dict.
 
         Prefers ``files_to_modify`` over ``modules``, coerces the result to a
-        list of non-empty strings, and returns ``[]`` if metadata is missing,
-        malformed, or yields no entries.
+        list of non-empty strings, and returns ``[]`` when neither key is
+        present or the value is empty / falsy.
 
-        Used in two places to keep the title-bearing and prompt-only path-guard
-        branches in lockstep on which metadata keys feed the guard:
-          - ``_build_candidate`` (title-bearing branch, populates
-            ``CandidateTask.files_to_modify``)
-          - ``_path_guard_error`` prompt-only fallback branch (extends the
-            joined text passed to ``check_text_for_dark_factory_paths``)
+        Callers that have not yet parsed metadata should use the kwargs-taking
+        entry point :meth:`_extract_meta_files` instead.
         """
-        meta = TaskInterceptor._parse_metadata(kwargs)
         files = meta.get('files_to_modify') or meta.get('modules') or []
         if isinstance(files, str):
             files = [files]
         return [str(f) for f in files if f]
+
+    @staticmethod
+    def _extract_meta_files(kwargs: dict[str, Any]) -> list[str]:
+        """Extract metadata-supplied file/module list from add_task / add_subtask kwargs.
+
+        Thin wrapper around :meth:`_extract_meta_files_from_meta` that handles
+        the ``kwargs → meta`` parsing step via :meth:`_parse_metadata`.
+
+        Used in two places to keep the title-bearing and prompt-only path-guard
+        branches in lockstep on which metadata keys feed the guard:
+          - ``_build_candidate`` (title-bearing branch, populates
+            ``CandidateTask.files_to_modify``) — calls
+            :meth:`_extract_meta_files_from_meta` directly when a pre-parsed
+            ``meta`` dict is already in scope, avoiding a second parse.
+          - ``_path_guard_error`` prompt-only fallback branch (extends the
+            joined text passed to ``check_text_for_dark_factory_paths``)
+        """
+        meta = TaskInterceptor._parse_metadata(kwargs)
+        return TaskInterceptor._extract_meta_files_from_meta(meta)
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
@@ -907,7 +921,7 @@ class TaskInterceptor:
             return None
 
         meta = TaskInterceptor._parse_metadata(kwargs)
-        files = TaskInterceptor._extract_meta_files(kwargs)
+        files = TaskInterceptor._extract_meta_files_from_meta(meta)
 
         return CandidateTask(
             title=title,
