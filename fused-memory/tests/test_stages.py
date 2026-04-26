@@ -3424,7 +3424,8 @@ class TestBriefingKnownGapsRefresh:
 
     @pytest.mark.asyncio
     async def test_run_script_returns_none_on_timeout(self, tmp_path, caplog):
-        """asyncio.wait_for raises TimeoutError → proc.kill() called, returns None, WARN emitted."""
+        """asyncio.wait_for raises TimeoutError → proc.kill() called, returns None, WARN emitted
+        (timeout flows through the real wait_for call site, not from communicate())."""
         script_dir = tmp_path / 'scripts'
         script_dir.mkdir()
         (script_dir / 'refresh_briefing_known_gaps.py').touch()
@@ -3433,11 +3434,14 @@ class TestBriefingKnownGapsRefresh:
         (review_dir / 'briefing.yaml').touch()
 
         mock_proc = MagicMock()
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
 
         with patch(
             'fused_memory.reconciliation.stages.task_knowledge_sync.asyncio.create_subprocess_exec',
             return_value=mock_proc,
+        ), patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync.asyncio.wait_for',
+            side_effect=TimeoutError,
         ), caplog.at_level(
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
