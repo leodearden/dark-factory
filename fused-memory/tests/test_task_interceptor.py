@@ -180,7 +180,7 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     """
     import json
 
-    metadata = {'source': 'review-cycle', 'modules': ['fused-memory/src']}
+    metadata = {'source': 'review-cycle', 'modules': ['my-project/src']}
     result = await _submit_and_resolve(interceptor_facade, '/project', prompt='Test', metadata=metadata)
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
