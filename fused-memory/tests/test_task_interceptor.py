@@ -4253,10 +4253,9 @@ class TestSubmitTaskGuardrail:
                 description='harness deadlock referencing orchestrator/harness.py',
             )
         finally:
-            # close() cancels workers and awaits them before the TicketStore
-            # fixture closes the SQLite DB — prevents "closed database" warnings
-            # from a worker that is still mid-write at teardown.
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
@@ -4281,10 +4280,9 @@ class TestSubmitTaskGuardrail:
                 description='Generic refactor of foo/bar.py',
             )
         finally:
-            # close() cancels workers and awaits them before the TicketStore
-            # fixture closes the SQLite DB — prevents "closed database" warnings
-            # from a worker that is still mid-write at teardown.
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
@@ -4345,7 +4343,9 @@ class TestSubmitTaskGuardrail:
                 # No title — prompt-only path
             )
         finally:
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
@@ -4370,7 +4370,9 @@ class TestSubmitTaskGuardrail:
                 # No title — prompt-only path, but no dark-factory paths
             )
         finally:
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
