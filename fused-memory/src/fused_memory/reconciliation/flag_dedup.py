@@ -49,7 +49,47 @@ async def dedup_flags(
         if sig is None:
             result.append(flag)
             continue
-        # Placeholder — search/write logic added in later steps
+        tid, ftype = sig
+        try:
+            matches = await memory_service.search(
+                query=f'stage1 flag marker task {tid} type {ftype}',
+                project_id=project_id,
+                categories=['observations_and_summaries'],
+                limit=10,
+            )
+            prior = next(
+                (
+                    r for r in matches
+                    if (
+                        (r.metadata or {}).get('source') == 'stage1_flag_marker'
+                        and str((r.metadata or {}).get('task_id', '')) == tid
+                        and str((r.metadata or {}).get('flag_type', '')) == ftype
+                    )
+                ),
+                None,
+            )
+            if prior is not None:
+                prior_run_id = (prior.metadata or {}).get('run_id', run_id)
+                flag = dict(flag)
+                flag['persisted_from_run'] = prior_run_id
+                flag['last_seen_run_id'] = run_id
+                # Write a refresh marker so last_seen_run_id is up to date
+                await memory_service.add_memory(
+                    content=f'Stage 1 flag marker: task={tid} type={ftype} from run={prior_run_id}',
+                    category='observations_and_summaries',
+                    project_id=project_id,
+                    metadata={
+                        'source': 'stage1_flag_marker',
+                        'task_id': tid,
+                        'flag_type': ftype,
+                        'run_id': prior_run_id,
+                        'last_seen_run_id': run_id,
+                    },
+                    causation_id=run_id,
+                    _source='reconciliation',
+                )
+        except Exception as e:
+            logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
         result.append(flag)
     return result
 
