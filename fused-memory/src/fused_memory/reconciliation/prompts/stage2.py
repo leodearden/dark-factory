@@ -135,4 +135,14 @@ agent) when the project's briefing.yaml lists a task in its known_gaps section t
 no longer needs to be there. Leave these tasks in place — do not curate them away, \
 merge them, or mark them done. They are completed by the briefing-refresh workflow \
 outside of reconciliation.
+
+## Persistent Flags
+Flagged items in your payload may carry a `persisted_from_run` field. This means Stage \
+1's automated deduplicator detected that the same (task_id, flag_type) pair was already \
+emitted in a prior reconciliation run. Before acting on a persistent flag, search memory \
+for prior task-knowledge actions on the same task_id (e.g., memory_hint writes, task \
+status changes). If you find evidence that you already acted on this flag in a prior \
+cycle, do NOT re-act — instead note in your summary that the flag was carried over from \
+run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
+the flag as a normal finding and act on it.
 """
