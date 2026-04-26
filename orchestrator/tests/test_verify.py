@@ -1825,6 +1825,59 @@ class TestClassifyFailure:
         assert self._classify(output, rc=1, timed_out=False) == 'tree_sitter_generate_error'
 
 
+class TestShouldArchiveCategory:
+    """Tests for ``_should_archive_category(category: str) -> bool``.
+
+    Tests will fail with ImportError until step 4 implements the helper.
+    """
+
+    def _should_archive(self, category: str) -> bool:
+        from orchestrator.verify import _should_archive_category  # noqa: PLC0415
+        return _should_archive_category(category)
+
+    # Categories that MUST be archived (human triage required)
+    def test_unknown_test_failure_is_archived(self):
+        """'unknown_test_failure' → True (human must look)."""
+        assert self._should_archive('unknown_test_failure') is True
+
+    def test_cargo_cli_error_is_archived(self):
+        """'cargo_cli_error' ends with '_error' → True."""
+        assert self._should_archive('cargo_cli_error') is True
+
+    def test_npm_error_is_archived(self):
+        """'npm_error' ends with '_error' → True."""
+        assert self._should_archive('npm_error') is True
+
+    def test_flock_error_is_archived(self):
+        """'flock_error' ends with '_error' → True."""
+        assert self._should_archive('flock_error') is True
+
+    def test_tree_sitter_generate_error_is_archived(self):
+        """'tree_sitter_generate_error' ends with '_error' → True."""
+        assert self._should_archive('tree_sitter_generate_error') is True
+
+    # Categories that must NOT be archived (debugger can handle without human)
+    def test_test_failure_not_archived(self):
+        """'test_failure' does not end with '_error' → False."""
+        assert self._should_archive('test_failure') is False
+
+    def test_compile_error_not_archived(self):
+        """'compile_error' is explicitly excluded despite '_error' suffix → False."""
+        assert self._should_archive('compile_error') is False
+
+    def test_infra_timeout_not_archived(self):
+        """'infra_timeout' → False."""
+        assert self._should_archive('infra_timeout') is False
+
+    def test_passed_not_archived(self):
+        """'passed' → False."""
+        assert self._should_archive('passed') is False
+
+    def test_empty_string_not_archived(self):
+        """'' (empty) → False."""
+        assert self._should_archive('') is False
+
+
 class TestBuildFallbackConfigConftest:
     """`_build_fallback_config` handles conftest.py correctly.
 
