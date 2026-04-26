@@ -169,6 +169,54 @@ def _extract_cause_hint(output: str) -> str:
     return last.strip()[:200]
 
 
+def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
+    """Classify a command failure into a named category bucket.
+
+    Uses a pattern ladder (first match wins):
+    1. ``rc == 0``                      → ``'passed'``
+    2. ``timed_out``                    → ``'infra_timeout'``
+    3. ``error: …`` (no [E\\d+] code)  → ``'cargo_cli_error'``
+    4. ``error[E\\d+]:``               → ``'compile_error'``
+    5. ``compile error``                → ``'compile_error'``
+    6. ``… FAILED``                     → ``'test_failure'``
+    7. ``npm (ERR!|error)``             → ``'npm_error'``
+    8. ``flock:``                       → ``'flock_error'``
+    9. ``tree-sitter generate``         → ``'tree_sitter_generate_error'``
+    10. fallback (rc != 0)              → ``'unknown_test_failure'``
+
+    The ``timed_out`` flag wins over any output pattern because the root
+    cause is the wall-clock limit, not the command output.
+    """
+    if rc == 0:
+        return 'passed'
+    if timed_out:
+        return 'infra_timeout'
+
+    _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+        # rustc diagnostic codes like error[E0308] come before plain 'error:'
+        # so we can distinguish compile errors from cargo CLI errors.
+        (re.compile(r'error\[E\d+\]:', re.MULTILINE), 'compile_error'),
+        (re.compile(r'compile error', re.MULTILINE | re.IGNORECASE), 'compile_error'),
+        # cargo CLI errors (no diagnostic code) — 'error: --exclude …' etc.
+        (re.compile(r'^error: ', re.MULTILINE), 'cargo_cli_error'),
+        # Rust test runner / pytest FAILED lines
+        (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), 'test_failure'),
+        (re.compile(r'^FAILED\s', re.MULTILINE), 'test_failure'),
+        # npm errors
+        (re.compile(r'npm\s+(ERR!|error)', re.MULTILINE), 'npm_error'),
+        # flock lock failures
+        (re.compile(r'^flock:', re.MULTILINE), 'flock_error'),
+        # tree-sitter generate failures
+        (re.compile(r'tree-sitter generate', re.MULTILINE), 'tree_sitter_generate_error'),
+    ]
+
+    for pattern, category in _CLASSIFY_PATTERNS:
+        if pattern.search(output):
+            return category
+
+    return 'unknown_test_failure'
+
+
 async def _derive_task_files_from_git(
     worktree: Path, config: OrchestratorConfig,
 ) -> list[str] | None:
