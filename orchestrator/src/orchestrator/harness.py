@@ -907,9 +907,18 @@ Output JSON matching the schema. Every task must appear in the output.
         This method is called AFTER _recover_crashed_tasks() (which may unlink
         plan.lock for recovered worktrees) and BEFORE the first
         scheduler.acquire_next() call, so self._dispatched is always empty here.
+
+        Limitation: git_ops.is_ancestor returns False when the task branch does
+        not exist (e.g., merge_queue successfully merged AND deleted the branch
+        before crashing).  In that case the task falls through to the no-lock /
+        stale-lock revert path and may be re-queued even though the work is
+        already on main.  A future improvement could additionally check for a
+        merge marker on main (e.g., a commit message trailer containing the task
+        id) when is_ancestor is False and the branch ref is absent.
         """
         statuses, _ = await self.scheduler.get_statuses()
         reverted = 0
+        marked_done = 0
 
         for tid, status in statuses.items():
             if status != 'in-progress':
@@ -917,6 +926,21 @@ Output JSON matching the schema. Every task must appear in the output.
 
             branch = f'{self.git_ops.config.branch_prefix}{tid}'
             if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
+                # Branch is already on main — mark done.  If a stale worktree
+                # dir exists (orchestrator crashed after merge but before cleanup),
+                # remove it now so future re-use of the same task id doesn't
+                # collide.  Skip cleanup for recovered plans (worktree still
+                # needed for resumption, though that combination is unlikely here).
+                worktree_path = self.git_ops.worktree_base / tid
+                if worktree_path.exists() and tid not in self._recovered_plans:
+                    try:
+                        await self.git_ops.cleanup_worktree(worktree_path, tid)
+                    except Exception:
+                        logger.warning(
+                            'Reconcile: cleanup_worktree failed for task %s'
+                            ' (already-on-main); continuing',
+                            tid, exc_info=True,
+                        )
                 await self.scheduler.set_task_status(
                     tid, 'done',
                     done_provenance={
@@ -927,6 +951,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     'Reconcile: marked task %s done '
                     '(reason=branch-already-on-main)', tid,
                 )
+                marked_done += 1
                 continue
 
             worktree_path = self.git_ops.worktree_base / tid
@@ -1013,8 +1038,11 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             reverted += 1
 
-        if reverted:
-            logger.info('Reconcile: %d stranded task(s) reverted to pending', reverted)
+        if reverted or marked_done:
+            logger.info(
+                'Reconcile: %d stranded task(s) reverted to pending; %d marked done (branch already on main)',
+                reverted, marked_done,
+            )
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore

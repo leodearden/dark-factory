@@ -582,8 +582,11 @@ class TestReconcileStrandedInProgress:
         the stale-lock analysis.
 
         A task with a stale plan.lock AND is_ancestor=True must take the done
-        path (no cleanup, no pending revert, plan.lock survives). This test
-        would fail if a future refactor moved the guard below the lock analysis.
+        path (no pending revert, stale-lock analysis bypassed). The guard also
+        cleans up the stale worktree dir (amendment: prevents worktree cruft
+        accumulation when orchestrator crashed after merge but before cleanup).
+        This test would fail if a future refactor moved the guard below the
+        lock analysis (set_task_status would be called with 'pending').
         """
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
         harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
@@ -592,7 +595,8 @@ class TestReconcileStrandedInProgress:
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
         # Create a worktree with a stale plan.lock (dead PID)
-        lock_dir = harness.git_ops.worktree_base / '51' / '.task'
+        worktree_path = harness.git_ops.worktree_base / '51'
+        lock_dir = worktree_path / '.task'
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -611,11 +615,18 @@ class TestReconcileStrandedInProgress:
             },
         )
 
-        # No cleanup_worktree call — guard short-circuits before stale-lock cleanup
-        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        # cleanup_worktree IS called — the guard cleans up stale worktrees for
+        # already-merged tasks to prevent worktree cruft from accumulating
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            worktree_path, '51'
+        )
 
-        # plan.lock must still exist — stale-lock branch was bypassed entirely
-        assert lock_path.exists(), 'plan.lock must survive when the is_ancestor guard fires'
+        # plan.lock is gone — cleanup_worktree's side_effect rmtree'd the dir,
+        # proving the stale-lock analysis branch was bypassed (which would have
+        # also called set_task_status('51', 'pending') if it had run)
+        assert not lock_path.exists(), (
+            'plan.lock should be removed by cleanup_worktree in the is_ancestor guard'
+        )
 
     async def test_is_ancestor_not_invoked_for_non_in_progress_tasks(
         self, harness: Harness
