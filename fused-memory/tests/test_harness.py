@@ -3828,3 +3828,42 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
         await event_buffer.release_stale_claims(0.0)
         remaining = await event_buffer.claim_deferred_writes('test-project')
         assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    async def test_search_exception_falls_through_to_add_memory(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """If the dedup search raises, the write still proceeds (degrade to no-dedup)."""
+        mock_memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Task 777 completed.',
+            'observations_and_summaries',
+            {'task_id': '777', 'transition': 'done'},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            # (a) must NOT raise
+            await harness._replay_deferred_writes('test-project')
+
+        # (b) add_memory WAS called once — search failure falls through to write
+        mock_memory_service.add_memory.assert_called_once()
+        call_content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert call_content == 'Task 777 completed.'
+
+        # (c) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0
+
+        # (d) WARNING log mentions task 777 and the search failure
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and '777' in r.message
+        ]
+        assert warn_records, (
+            f'Expected a WARNING log mentioning task 777 but got: '
+            f'{[r.message for r in caplog.records]}'
+        )
