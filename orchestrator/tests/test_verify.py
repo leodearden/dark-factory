@@ -2006,6 +2006,17 @@ class TestClassifyFailure:
         output = 'error: no such subcommand: `tset`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
 
+    def test_cargo_cli_error_failed_to_compile(self):
+        """'error: failed to compile …' (cargo CLI wrapper) → cargo_cli_error.
+
+        Documents that the 'failed to (parse|compile|read|find)' allowlist token
+        is intentional: cargo emits this form as a CLI-level wrapper (distinct from
+        rustc's 'error: could not compile `…`').  If this token is ever removed
+        from the allowlist, this test will catch the regression.
+        """
+        output = 'error: failed to compile `my-crate` (lib)\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
+
     def test_rustc_top_level_diagnostics_not_cargo_cli_error(self):
         """rustc top-level diagnostics without error[Exxxx] code must NOT → cargo_cli_error.
 

@@ -183,6 +183,11 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # cargo CLI errors — narrow allowlist of cargo-only prefixes so rustc
     # top-level diagnostics ('error: aborting due to previous errors',
     # 'error: could not compile `…`') fall through to unknown_test_failure.
+    # Intentionally conservative: novel cargo CLI messages not listed here
+    # (e.g. 'error: unexpected argument', 'error: the manifest-path must be …',
+    # 'error: manifest path … does not exist') will fall through to
+    # unknown_test_failure until added to the allowlist.  Extend when a new
+    # cargo CLI failure mode appears in production and needs its own bucket.
     (re.compile(
         r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|package |could not find|invalid )',
         re.MULTILINE,
