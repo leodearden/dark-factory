@@ -876,7 +876,7 @@ class TestValidateIntIds:
         result = validate_int_ids(None)
         assert result is not None
         assert result['error_type'] == 'ValidationError'
-        assert 'ids must be a list of integers' in result['error']
+        assert 'ids must be a list or tuple of integers' in result['error']
         assert 'NoneType' in result['error']
 
     def test_string_returns_error(self):
@@ -1010,7 +1010,8 @@ class TestValidateIntIdsName:
         """Non-list branch uses the custom name in the error string."""
         result = validate_int_ids(None, name='row_ids')
         assert result is not None
-        assert result['error'] == 'row_ids must be a list of integers, got NoneType'
+        assert result['error'].startswith('row_ids must be a list or tuple of integers')
+        assert 'NoneType' in result['error']
 
     def test_name_kwarg_in_element_error(self):
         """Element error uses the custom name."""
@@ -1023,7 +1024,7 @@ class TestValidateIntIdsName:
         """Default name is 'ids' — regression guard against accidental hardcoding."""
         result = validate_int_ids(None)
         assert result is not None
-        assert result['error'].startswith('ids must be a list of integers')
+        assert result['error'].startswith('ids must be a list or tuple of integers')
 
     def test_default_element_name_is_ids(self):
         result = validate_int_ids([1, 'x'])

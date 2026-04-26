@@ -29,7 +29,7 @@ class InputValidationError(ValueError):
     """
 
 
-def _safe_repr(value: str, max_len: int = 200) -> str:
+def _safe_repr(value: object, max_len: int = 200) -> str:
     """Return repr(value) truncated to max_len characters.
 
     If repr(value) exceeds max_len, slices it to max_len characters and appends
@@ -118,7 +118,7 @@ def validate_int_ids(ids: object, *, name: str = 'ids') -> dict[str, str] | None
     """
     if not isinstance(ids, (list, tuple)):
         return {
-            'error': f'{name} must be a list of integers, got {type(ids).__name__}',
+            'error': f'{name} must be a list or tuple of integers, got {type(ids).__name__}',
             'error_type': 'ValidationError',
         }
     bad_idx = next(
