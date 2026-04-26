@@ -138,4 +138,11 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     config.sandbox.backend = 'auto'
     config.fused_memory = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     config.escalation = MagicMock(spec_set=pydantic_spec(EscalationConfig))
+    # Real numeric defaults for fields read by harness lifecycle loops —
+    # MagicMock values would crash ``asyncio.sleep(<MagicMock>)``.
+    config.orphan_l0_check_interval_secs = 60.0
+    config.orphan_l0_reaper_enabled = False
+    config.orphan_l0_timeout_secs = 600.0
+    config.terminal_status_watcher_enabled = False
+    config.terminal_status_poll_interval_secs = 30.0
     return config

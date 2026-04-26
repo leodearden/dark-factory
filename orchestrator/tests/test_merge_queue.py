@@ -17,6 +17,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    WORKTREE_MISSING_REASON_PREFIX,
     DropGuardResult,
     MergeOutcome,
     MergeRequest,
@@ -5751,3 +5752,79 @@ class TestPushHook:
         assert result.status == 'done'
         assert result.push_status == 'pushed'
         assert push_mock.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# TestWorktreeMissing — surface as ``blocked`` with recognisable reason
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWorktreeMissingHandling:
+    """Both merge workers tolerate a deleted task worktree.
+
+    The plan: when a human marks a task ``done`` and removes its worktree
+    while the merge queue is processing the request, the worker must NOT
+    raise an unhandled exception or emit a generic ``blocked`` outcome that
+    the workflow then re-escalates.  Instead, the outcome.reason starts with
+    ``WORKTREE_MISSING_REASON_PREFIX`` so the workflow can re-check task
+    status and short-circuit to DONE.
+    """
+
+    async def test_merge_worker_surfaces_worktree_missing(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        worktree = (await git_ops.create_worktree('worktree-missing')).path
+        (worktree / 'f.py').write_text('x=1\n')
+        await git_ops.commit(worktree, 'add f')
+        # Remove worktree directory before submission to simulate the race
+        # where the human has already deleted the worktree.
+        import shutil as _shutil
+        _shutil.rmtree(worktree)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            req = _make_request('worktree-missing', 'worktree-missing', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=15)
+        finally:
+            await worker.stop()
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(WORKTREE_MISSING_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )
+
+    async def test_speculative_merger_surfaces_worktree_missing(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        worktree = (await git_ops.create_worktree('spec-worktree-missing')).path
+        (worktree / 'f.py').write_text('y=2\n')
+        await git_ops.commit(worktree, 'add f')
+        import shutil as _shutil
+        _shutil.rmtree(worktree)
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+        try:
+            req = _make_request(
+                'spec-worktree-missing', 'spec-worktree-missing', worktree, config,
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=15)
+        finally:
+            await worker.stop()
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(WORKTREE_MISSING_REASON_PREFIX), (
+            f'unexpected reason: {outcome.reason!r}'
+        )

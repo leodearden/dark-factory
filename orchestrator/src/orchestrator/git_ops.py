@@ -253,14 +253,48 @@ class WorktreeInfo:
     stale_commits: int | None = None
 
 
+class WorktreeMissing(FileNotFoundError):
+    """Raised when a subprocess cannot start because its ``cwd`` does not exist.
+
+    The orchestrator races against humans who may delete a task's worktree
+    out-of-band.  When that happens, ``asyncio.create_subprocess_exec`` raises
+    a generic ``FileNotFoundError`` whose ``.filename`` is the missing
+    directory.  We re-raise as this typed exception so callers can distinguish
+    a missing worktree (recoverable: task may already be done) from a missing
+    binary (real bug).
+    """
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        super().__init__(f'Worktree missing: {self.path}')
+
+
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
-    """Run a git command and return (returncode, stdout, stderr)."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd) if cwd else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    """Run a git command and return (returncode, stdout, stderr).
+
+    Raises :class:`WorktreeMissing` if ``cwd`` is provided but does not exist,
+    so the caller can distinguish a deleted worktree (recoverable race) from
+    other ``FileNotFoundError``\\ s (e.g. missing binary on ``PATH``).
+    """
+    # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
+    # posix_spawn whose .filename is not reliably set.  Check explicitly so we
+    # can raise a typed exception consumers can pattern-match on.
+    if cwd is not None and not Path(cwd).is_dir():
+        raise WorktreeMissing(cwd)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as e:
+        # Race: cwd existed at the pre-flight check but vanished before spawn.
+        # Re-classify as WorktreeMissing if cwd is now gone; otherwise the
+        # error is about the binary itself.
+        if cwd is not None and not Path(cwd).is_dir():
+            raise WorktreeMissing(cwd) from e
+        raise
     stdout, stderr = await proc.communicate()
     return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
 

@@ -34,8 +34,17 @@ def create_server(
     merge_queue: asyncio.Queue | None = None,
     orch_config: Any = None,
     event_store: Any = None,
+    harness: Any = None,
 ) -> FastMCP:
-    """Create the escalation MCP server with all tools registered."""
+    """Create the escalation MCP server with all tools registered.
+
+    *harness* is the running ``orchestrator.harness.Harness``.  When passed,
+    it enables the ``release_workflow`` tool which lets external callers
+    (humans via /unblock, automation) ask the orchestrator to soft-cancel a
+    workflow whose task has been completed out-of-band.  When omitted (e.g.
+    in tests with no orchestrator), the tool reports that no workflow is
+    active.
+    """
     mcp = FastMCP('escalation')
 
     # --- Agent-side tools ---
@@ -192,6 +201,52 @@ def create_server(
             'reason': outcome.reason,
             'conflict_details': outcome.conflict_details,
             'push_status': outcome.push_status,
+        }
+
+    @mcp.tool()
+    async def release_workflow(
+        task_id: str,
+        timeout_secs: int = 30,
+    ) -> dict[str, Any]:
+        """Soft-cancel an active workflow for ``task_id``.
+
+        Use this when you have completed a task out-of-band (typical: marked
+        it ``done`` via a manual merge in /unblock) and want the orchestrator
+        to stop processing it.  The workflow re-reads task status and exits
+        ``DONE`` if terminal, ``REQUEUED`` otherwise — never creates new
+        escalations as a result of this call.
+
+        Returns:
+            ``{released, was_active, slot_cleared}``
+            - ``was_active``: True if a workflow slot was registered when
+              the call started.
+            - ``released``: True if ``cancel_workflow`` accepted the request.
+            - ``slot_cleared``: True if the workflow finished within
+              ``timeout_secs``.
+        """
+        if harness is None:
+            return {
+                'released': False, 'was_active': False, 'slot_cleared': False,
+                'error': 'No orchestrator harness wired in — running in standalone mode',
+            }
+        was_active = harness.is_workflow_active(task_id)
+        released = harness.cancel_workflow(task_id)
+        if not was_active:
+            return {
+                'released': False, 'was_active': False, 'slot_cleared': True,
+            }
+        # Wait up to timeout_secs for the slot to clear
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0, int(timeout_secs))
+        while harness.is_workflow_active(task_id):
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+        slot_cleared = not harness.is_workflow_active(task_id)
+        return {
+            'released': released,
+            'was_active': was_active,
+            'slot_cleared': slot_cleared,
         }
 
     return mcp

@@ -415,7 +415,18 @@ class TaskArtifacts:
         return entries, corrupted
 
     def write_review(self, reviewer_name: str, review: dict) -> None:
-        """Write .task/reviews/{name}.json."""
+        """Write .task/reviews/{name}.json.
+
+        Best-effort: if the artifacts root has been removed (worktree gone
+        out-of-band), skip the write rather than raising — the review JSON
+        is a debugging aid, not load-bearing for workflow correctness.
+        """
+        if not self.root.is_dir():
+            logger.info(
+                'TaskArtifacts: skipping write_review %r — root %s no longer exists',
+                reviewer_name, self.root,
+            )
+            return
         review_path = self.root / 'reviews' / f'{reviewer_name}.json'
         self._write_json(review_path, review)
 
@@ -628,4 +639,18 @@ class TaskArtifacts:
         return False
 
     def _write_json(self, path: Path, data: dict) -> None:
-        path.write_text(json.dumps(data, indent=2) + '\n')
+        # Tolerate a vanished worktree.  Callers that care about durability
+        # (init, plan, base_commit, etc.) check ``self.root`` themselves; the
+        # opportunistic writes (reviews, iteration log) just want a no-op
+        # when the worktree has been deleted out-of-band.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2) + '\n')
+        except FileNotFoundError:
+            if not self.root.is_dir():
+                logger.info(
+                    'TaskArtifacts: skipping _write_json to %s — root %s no longer exists',
+                    path, self.root,
+                )
+                return
+            raise

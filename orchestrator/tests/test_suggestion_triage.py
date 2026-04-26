@@ -247,6 +247,7 @@ class TestReviewLoopRouting:
 
 def _make_steward(*, config_overrides=None, suggestion_count=15):
     """Build a minimal TaskSteward with mocked dependencies."""
+    import tempfile
     from pathlib import Path
 
     from orchestrator.steward import TaskSteward
@@ -284,10 +285,15 @@ def _make_steward(*, config_overrides=None, suggestion_count=15):
     mcp.mcp_config_json.return_value = {}
 
     task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
+    # Create a real tmp worktree so the steward's pre-flight (added in the
+    # zombie-escalation fix) does not auto-escalate before the test gets a
+    # chance to assert.  Tests mock invoke_agent so nothing actually runs
+    # against this directory.
+    worktree = Path(tempfile.mkdtemp(prefix='test-steward-wt-'))
     steward = TaskSteward(
         task_id='42',
         task=task,
-        worktree=Path('/tmp/worktree'),
+        worktree=worktree,
         config=config,
         mcp=mcp,
         escalation_queue=queue,

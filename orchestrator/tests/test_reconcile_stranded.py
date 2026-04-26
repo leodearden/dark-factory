@@ -1209,6 +1209,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._start_merge_worker = AsyncMock()
     h._dismiss_stale_escalations = AsyncMock()
     h._start_orphan_l0_reaper = MagicMock()
+    h._start_terminal_status_watcher = MagicMock()
     h._tag_task_modules = AsyncMock()
 
     # Provide one pending task so the "no pending tasks" check passes.

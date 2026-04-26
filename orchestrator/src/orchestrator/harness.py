@@ -212,6 +212,21 @@ class Harness:
         self._escalation_task: asyncio.Task | None = None
         self._orphan_reaper_task: asyncio.Task | None = None
 
+        # Soft-cancel registry — keyed by task_id, set externally to abort
+        # long workflow waits (merge queue future, steward grace period).
+        # Mirrors ``_escalation_events``: created in ``_run_slot`` for each
+        # active task and cleared on slot exit.  Used by ``cancel_workflow``
+        # and by the reconciliation subscription that watches for terminal
+        # task status transitions.  See zombie-escalation fix Step 4.
+        self._workflow_cancel_events: dict[str, asyncio.Event] = {}
+
+        # Background poll: periodically check fused-memory for active tasks
+        # whose status has flipped to terminal out-of-band (typically a human
+        # marking a task done via /unblock).  When detected, set the cancel
+        # event so the workflow exits cleanly without churning escalations.
+        # See zombie-escalation fix Step 5.
+        self._terminal_status_watcher_task: asyncio.Task | None = None
+
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
         self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
@@ -333,6 +348,13 @@ class Harness:
             # emits against a synthetic task_id, or a workflow crashed
             # before its steward could claim them).
             self._start_orphan_l0_reaper()
+
+            # 1c1b. Start terminal-status watcher (non-fatal) — cancels
+            # active workflows whose task has been marked terminal
+            # out-of-band (e.g. by a human via /unblock).  Without this,
+            # the workflow churns through its merge/steward retry loop
+            # for tens of minutes after the human has finished the task.
+            self._start_terminal_status_watcher()
 
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
@@ -564,6 +586,10 @@ class Harness:
                 await self._stop_orphan_l0_reaper()
             except Exception as e:
                 logger.warning(f'_stop_orphan_l0_reaper() failed: {e}')
+            try:
+                await self._stop_terminal_status_watcher()
+            except Exception as e:
+                logger.warning(f'_stop_terminal_status_watcher() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -1150,6 +1176,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 esc_event = asyncio.Event()
                 self._escalation_events[assignment.task_id] = esc_event
 
+            # Soft-cancel event — exposed so external code (reconciliation
+            # subscriber, release_workflow MCP tool) can interrupt long
+            # workflow waits when the task becomes terminal out-of-band.
+            cancel_event = asyncio.Event()
+            self._workflow_cancel_events[assignment.task_id] = cancel_event
+
             recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
 
             # Build steward factory — steward starts when the workflow
@@ -1189,6 +1221,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 merge_worker=self._merge_worker,
                 event_store=self.event_store,
                 cost_store=self.cost_store,
+                cancel_event=cancel_event,
             )
 
             if self.event_store:
@@ -1252,6 +1285,7 @@ Output JSON matching the schema. Every task must appear in the output.
             )
         finally:
             self._escalation_events.pop(assignment.task_id, None)
+            self._workflow_cancel_events.pop(assignment.task_id, None)
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
             if report is not None:
                 requeued = await self._apply_retry_cap(
@@ -1480,7 +1514,13 @@ Output JSON matching the schema. Every task must appear in the output.
         if self.review_checkpoint is not None:
             self.review_checkpoint.escalation_queue = self._escalation_queue
 
-        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue, orch_config=self.config, event_store=self.event_store)  # type: ignore[possibly-undefined]
+        mcp_server = create_server(
+            self._escalation_queue,  # type: ignore[possibly-undefined]
+            merge_queue=self._merge_queue,
+            orch_config=self.config,
+            event_store=self.event_store,
+            harness=self,
+        )
         host = self.config.escalation.host
         port = self.config.escalation.port
 
@@ -1641,6 +1681,101 @@ Output JSON matching the schema. Every task must appear in the output.
                 'Orphan L0 reaper: promoted %d escalation(s) to L1', promoted,
             )
         return promoted
+
+    def cancel_workflow(self, task_id: str) -> bool:
+        """Soft-cancel an active workflow.
+
+        Sets the per-task ``cancel_event`` so any long await inside the
+        workflow (merge-queue future, steward grace period) wakes promptly.
+        The workflow re-reads task status and exits ``DONE`` if terminal,
+        ``REQUEUED`` otherwise.
+
+        Returns ``True`` iff a workflow was active for ``task_id`` (i.e. the
+        cancel event was registered).  Returns ``False`` when the task has
+        no slot — the call is a no-op and the caller can avoid waiting.
+        """
+        event = self._workflow_cancel_events.get(task_id)
+        if event is None:
+            return False
+        event.set()
+        return True
+
+    def is_workflow_active(self, task_id: str) -> bool:
+        """True iff a workflow slot is currently active for ``task_id``."""
+        return task_id in self._workflow_cancel_events
+
+    # ------------------------------------------------------------------
+    # Terminal-status watcher (zombie-escalation fix Step 5)
+    # ------------------------------------------------------------------
+
+    def _start_terminal_status_watcher(self) -> None:
+        """Start a background poll that cancels workflows whose tasks have
+        gone terminal out-of-band (e.g. a human marking a task ``done``).
+
+        Polling avoids cross-process subscription to fused-memory's event bus.
+        At expected interval (~30 s) the poll cost is one ``get_statuses``
+        round-trip per active set, which is ~30 ms for a warm fused-memory.
+        """
+        if not self.config.terminal_status_watcher_enabled:
+            return
+        if (
+            self._terminal_status_watcher_task is not None
+            and not self._terminal_status_watcher_task.done()
+        ):
+            return
+        self._terminal_status_watcher_task = asyncio.create_task(
+            self._terminal_status_watcher_loop(),
+            name='terminal-status-watcher',
+        )
+        logger.info(
+            'Terminal-status watcher started (interval=%.0fs)',
+            self.config.terminal_status_poll_interval_secs,
+        )
+
+    async def _stop_terminal_status_watcher(self) -> None:
+        """Cancel the terminal-status watcher loop."""
+        if self._terminal_status_watcher_task is not None:
+            self._terminal_status_watcher_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._terminal_status_watcher_task
+            self._terminal_status_watcher_task = None
+            logger.info('Terminal-status watcher stopped')
+
+    async def _terminal_status_watcher_loop(self) -> None:
+        """Wake periodically and cancel workflows whose task is now terminal."""
+        interval = self.config.terminal_status_poll_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._scan_for_terminal_active_tasks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Terminal-status watcher pass failed')
+
+    async def _scan_for_terminal_active_tasks(self) -> int:
+        """Single pass: cancel any active workflow whose task is terminal.
+
+        Returns the number of workflows cancelled.  Extracted so tests can
+        drive the scan deterministically.
+        """
+        from orchestrator.task_status import TERMINAL_STATUSES
+
+        active_ids = list(self._workflow_cancel_events.keys())
+        if not active_ids:
+            return 0
+        statuses, error = await self.scheduler.get_statuses(active_ids)
+        if error is not None:
+            return 0
+        cancelled = 0
+        for task_id, status in statuses.items():
+            if status in TERMINAL_STATUSES and self.cancel_workflow(task_id):
+                logger.info(
+                    'Terminal-status watcher: cancelling workflow for task '
+                    '%s (status=%s)', task_id, status,
+                )
+                cancelled += 1
+        return cancelled
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""

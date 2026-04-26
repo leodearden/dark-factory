@@ -49,6 +49,14 @@ _CAP_HIT_COOLDOWN_SECS = 5.0
 # (e.g. a mock that never settles), so we raise instead of spinning.
 _MAX_CAP_RETRIES = 16
 
+# Backstop for ``_run_loop``: if the same generic ``Exception`` keeps firing
+# this many times in a row (no progress), bail to L1 instead of churning.
+# Catches conditions the loop cannot recover from on its own — MCP unreachable,
+# system_prompt file gone, deeper invariant breakage — without requiring a
+# new typed exception per case.  Independent of ``steward_max_attempts``,
+# which guards a single escalation; this guards the loop itself.
+_MAX_LOOP_ERRORS = 3
+
 
 @dataclass
 class StewardMetrics:
@@ -124,8 +132,24 @@ class TaskSteward:
     # ------------------------------------------------------------------
 
     async def _run_loop(self) -> None:
-        """Watch for escalations, handle them, repeat until stopped."""
+        """Watch for escalations, handle them, repeat until stopped.
+
+        Terminal-error classification keeps a single permanent error from
+        becoming a tight retry storm (the prior bug burned ~150 iterations in
+        15 minutes against a deleted worktree).  The two guards are:
+
+        - ``WorktreeMissing`` / vanished ``self.worktree``: the task's
+          working directory is gone (typical: human marked the task ``done``
+          and cleaned up).  No recovery possible — escalate to L1 and stop.
+        - ``_loop_error_count``: an unconditional backstop on the generic
+          ``except Exception`` path so any other persistent failure (MCP
+          unreachable, etc.) is bounded.
+        """
+        from orchestrator.git_ops import WorktreeMissing
+
+        loop_error_count = 0
         while not self._stopped:
+            escalation: Escalation | None = None
             try:
                 escalation = await self._next_escalation()
                 if self._stopped:
@@ -136,12 +160,56 @@ class TaskSteward:
                     await asyncio.sleep(1)
                     continue
                 await self._handle_escalation(escalation)
+                loop_error_count = 0  # reset on a clean iteration
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception(
-                    f'Steward for task {self.task_id}: unhandled error in loop'
+            except WorktreeMissing as exc:
+                logger.warning(
+                    f'Steward for task {self.task_id}: worktree {exc.path} '
+                    f'missing — auto-escalating and stopping'
                 )
+                if escalation is not None:
+                    self._auto_escalate_to_human(
+                        escalation,
+                        f'Worktree missing: {exc.path} — task abandoned',
+                    )
+                self._stopped = True
+                return
+            except Exception:
+                # Treat a vanished worktree as terminal even when surfacing
+                # as a generic ``Exception`` (cli_invoke's subprocess failure
+                # is a plain ``FileNotFoundError``, not ``WorktreeMissing``).
+                if not self.worktree.is_dir():
+                    logger.warning(
+                        f'Steward for task {self.task_id}: worktree '
+                        f'{self.worktree} no longer exists — auto-escalating '
+                        f'and stopping'
+                    )
+                    if escalation is not None:
+                        self._auto_escalate_to_human(
+                            escalation,
+                            f'Worktree missing: {self.worktree} — task abandoned',
+                        )
+                    self._stopped = True
+                    return
+                loop_error_count += 1
+                logger.exception(
+                    f'Steward for task {self.task_id}: unhandled error in '
+                    f'loop ({loop_error_count}/{_MAX_LOOP_ERRORS})'
+                )
+                if loop_error_count >= _MAX_LOOP_ERRORS:
+                    logger.error(
+                        f'Steward for task {self.task_id}: loop error budget '
+                        f'exhausted ({loop_error_count}) — stopping'
+                    )
+                    if escalation is not None:
+                        self._auto_escalate_to_human(
+                            escalation,
+                            f'Steward loop error budget exhausted '
+                            f'({loop_error_count} consecutive failures)',
+                        )
+                    self._stopped = True
+                    return
                 await asyncio.sleep(2)
 
     # ------------------------------------------------------------------
@@ -223,6 +291,21 @@ class TaskSteward:
             f'Steward for task {self.task_id}: handling escalation '
             f'{escalation.id} [{escalation.category}] — {escalation.summary}'
         )
+
+        # Pre-flight: a vanished worktree is terminal.  No point invoking the
+        # subprocess (which would fail with FileNotFoundError on cwd) or
+        # consuming retry budget.  Auto-escalate and stop the loop.
+        if not self.worktree.is_dir():
+            logger.warning(
+                f'Steward for task {self.task_id}: worktree {self.worktree} '
+                f'missing — auto-escalating and stopping'
+            )
+            self._auto_escalate_to_human(
+                escalation,
+                f'Worktree missing: {self.worktree} — task abandoned',
+            )
+            self._stopped = True
+            return
 
         # Guard: lifetime budget exhausted
         if self.metrics.total_cost_usd >= self.config.steward_lifetime_budget:

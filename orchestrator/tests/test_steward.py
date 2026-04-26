@@ -2191,3 +2191,110 @@ class TestStewardWatcherProcessGroup:
             await steward._watch_for_escalation()
 
         mock_tpg.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Worktree-missing terminal classification (Step 3 of zombie-escalation fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardWorktreeMissing:
+    """A vanished worktree must be terminal — not a tight retry storm.
+
+    Replaces the ~150-iter / 15-min churn that the prior bug exhibited
+    when the worker's cwd ceased to exist mid-run.
+    """
+
+    async def test_handle_escalation_preflight_escalates_when_worktree_gone(
+        self, steward,
+    ):
+        # Remove the worktree directory before invocation
+        import shutil
+        shutil.rmtree(steward.worktree)
+        esc = _make_escalation()
+
+        with patch.object(
+            steward, '_invoke_with_session', new_callable=AsyncMock,
+        ) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        # Subprocess never invoked
+        mock_invoke.assert_not_called()
+        # L1 escalation submitted, original dismissed, loop stopped
+        assert steward._stopped is True
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert 'Worktree missing' in submitted.summary
+
+    async def test_run_loop_exits_when_worktree_disappears_mid_run(
+        self, steward,
+    ):
+        """The loop must exit on FileNotFoundError when worktree is gone — not
+        retry forever.  The bug fired ~150 iterations across 15 minutes;
+        this test caps it to a single iteration.
+        """
+        esc = _make_escalation()
+
+        async def _next_esc():
+            return esc
+
+        async def _handle_raises_filenotfound(_esc):
+            # Simulate the cwd vanishing mid-handle: remove the dir then
+            # raise FileNotFoundError as cli_invoke would.
+            import shutil
+            shutil.rmtree(steward.worktree)
+            raise FileNotFoundError(
+                2, 'No such file or directory', str(steward.worktree),
+            )
+
+        with (
+            patch.object(steward, '_next_escalation', side_effect=_next_esc),
+            patch.object(
+                steward, '_handle_escalation',
+                side_effect=_handle_raises_filenotfound,
+            ),
+        ):
+            # Without the fix this hangs / loops forever.  With the fix it
+            # detects the missing worktree and stops on the first iteration.
+            await asyncio.wait_for(steward._run_loop(), timeout=5)
+
+        assert steward._stopped is True
+        # L1 escalation submitted exactly once
+        assert steward.escalation_queue.submit.call_count == 1
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+
+    async def test_run_loop_bounds_persistent_errors_to_max_loop_errors(
+        self, steward,
+    ):
+        """A persistent error that is NOT worktree-missing still bounds the
+        loop via _MAX_LOOP_ERRORS.  Without the backstop this would spin.
+        """
+        from orchestrator import steward as steward_mod
+        esc = _make_escalation()
+        # Worktree stays present — error path is the generic backstop
+        assert steward.worktree.is_dir()
+
+        async def _next_esc():
+            return esc
+
+        async def _handle_raises_runtimeerror(_esc):
+            raise RuntimeError('persistent failure')
+
+        with (
+            patch.object(steward, '_next_escalation', side_effect=_next_esc),
+            patch.object(
+                steward, '_handle_escalation',
+                side_effect=_handle_raises_runtimeerror,
+            ),
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await asyncio.wait_for(steward._run_loop(), timeout=5)
+
+        assert steward._stopped is True
+        # Submitted L1 once via auto-escalate
+        assert steward.escalation_queue.submit.call_count == 1
+        # The loop ran up to _MAX_LOOP_ERRORS times
+        assert steward_mod._MAX_LOOP_ERRORS == 3

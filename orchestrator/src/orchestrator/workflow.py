@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import hashlib
 import json
@@ -227,6 +228,7 @@ class TaskWorkflow:
         merge_worker=None,
         event_store: EventStore | None = None,
         cost_store: CostStore | None = None,
+        cancel_event: asyncio.Event | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -261,6 +263,14 @@ class TaskWorkflow:
         self.escalation_queue = escalation_queue
         self._escalation_event = escalation_event
         self._escalation_missing_warned: bool = False
+
+        # Soft-cancel: settable from outside the workflow (e.g. by the
+        # harness when reconciliation reports the task is now terminal,
+        # or by the ``release_workflow`` MCP tool).  Long awaits in the
+        # merge queue / steward grace period race against this event so
+        # the workflow can exit promptly without waiting for a 900 s
+        # timeout.  See Step 4 of the zombie-escalation fix.
+        self._cancel_event: asyncio.Event = cancel_event or asyncio.Event()
 
         # Usage cap gate
         self.usage_gate = usage_gate
@@ -2076,7 +2086,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         await enqueue_merge_request(self.merge_queue, merge_request, self.event_store)
 
-        result = await future
+        # Race the future against the cancel event so a human marking the
+        # task done out-of-band exits the workflow promptly instead of
+        # waiting for the merge worker to finish.
+        result = await self._await_cancellable(future)
+        if result is None:
+            return await self._handle_soft_cancel('merge')
 
         if result.status == 'wip_halted':
             return await self._handle_wip_conflict(result, branch_name)
@@ -2098,6 +2113,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 branch_name, result.conflict_details,
                 merge_phase=merge_phase,
             )
+        # ``blocked`` — but first check for the worktree-missing race: if a
+        # human marked the task ``done`` and removed the worktree while the
+        # merge was in flight, the merge worker surfaces a known reason
+        # prefix.  Re-read task status; if terminal, exit cleanly without
+        # creating an escalation.
+        from orchestrator.merge_queue import WORKTREE_MISSING_REASON_PREFIX
+        if result.reason.startswith(WORKTREE_MISSING_REASON_PREFIX):
+            try:
+                status = await self.scheduler.get_status(self.task_id)
+            except Exception:
+                logger.exception(
+                    f'Task {self.task_id}: get_status failed during '
+                    f'worktree-missing fallback; falling through to blocked'
+                )
+                status = None
+            if status in TERMINAL_STATUSES:
+                logger.info(
+                    f'Task {self.task_id}: worktree missing but task '
+                    f'status={status!r} (terminal) — exiting DONE without '
+                    f'escalation'
+                )
+                return WorkflowOutcome.DONE
         # blocked — infer review category from reason
         if 'verification failed' in result.reason.lower():
             category = 'post_merge_verify'
@@ -3442,6 +3479,58 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self._steward = steward
         await steward.start()
 
+    async def _await_cancellable(self, awaitable):
+        """Race ``awaitable`` against ``self._cancel_event``.
+
+        Returns the awaitable's result, or ``None`` if the cancel event was
+        set first.  When ``None`` is returned the caller should look up the
+        scheduler's truth and decide between DONE / cancelled / normal-blocked
+        via :meth:`_handle_soft_cancel`.
+
+        If both the awaitable and the cancel event resolve in the same
+        ``asyncio.wait`` window, the awaitable's result wins — the work
+        already finished, no need to soft-cancel.
+        """
+        fut = asyncio.ensure_future(awaitable)
+        cancel_task = asyncio.create_task(self._cancel_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {fut, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if fut in done:
+                return fut.result()
+            return None
+        finally:
+            if not cancel_task.done():
+                cancel_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cancel_task
+
+    async def _handle_soft_cancel(self, phase: str) -> WorkflowOutcome:
+        """Decide an outcome after ``_cancel_event`` interrupted a long wait.
+
+        Re-reads the scheduler's view of task status: if terminal, exit
+        ``DONE`` (typically a human marked the task done); if not terminal,
+        the cancel was likely spurious (or the workflow should be requeued)
+        — fall back to ``REQUEUED`` so the harness re-runs the slot once
+        the cancel condition clears.
+        """
+        try:
+            status = await self.scheduler.get_status(self.task_id)
+        except Exception:
+            logger.exception(
+                f'Task {self.task_id}: get_status failed during soft-cancel'
+            )
+            status = None
+        logger.info(
+            f'Task {self.task_id}: soft-cancel during {phase} — '
+            f'scheduler status={status!r}'
+        )
+        if status in TERMINAL_STATUSES:
+            return WorkflowOutcome.DONE
+        return WorkflowOutcome.REQUEUED
+
     async def _await_steward_completion(self) -> None:
         """Wait for the steward to finish pending work, with grace period.
 
@@ -3478,17 +3567,41 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 logger.info(f'Task {self.task_id}: steward completed all pending work')
                 return
 
+            # Soft-cancel takes precedence over the steward grace period.
+            if self._cancel_event.is_set():
+                logger.info(
+                    f'Task {self.task_id}: cancel-event set during steward grace — '
+                    f'skipping remaining wait'
+                )
+                return
+
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
                 break
 
             self._escalation_event.clear()
+            esc_wait = asyncio.create_task(self._escalation_event.wait())
+            cancel_wait = asyncio.create_task(self._cancel_event.wait())
             try:
-                await asyncio.wait_for(
-                    self._escalation_event.wait(), timeout=remaining,
+                done, _pending = await asyncio.wait(
+                    {esc_wait, cancel_wait},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            except TimeoutError:
-                break
+            finally:
+                for t in (esc_wait, cancel_wait):
+                    if not t.done():
+                        t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await t
+            if not done:
+                break  # timeout — fall through to re-escalation
+            if cancel_wait in done:
+                logger.info(
+                    f'Task {self.task_id}: cancel-event fired during steward grace — '
+                    f'exiting completion wait'
+                )
+                return
 
         # Timeout — re-escalate remaining to level 1
         from escalation.models import Escalation
