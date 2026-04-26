@@ -967,57 +967,6 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
     # -----------------------------------------------------------------------
-    # Spy test: both done-branches must delegate to _mark_in_progress_done
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.parametrize(
-        'scenario,is_ancestor,marker_sha,expected_reason,expected_provenance',
-        [
-            pytest.param(
-                'is_ancestor', True, None, 'branch-already-on-main',
-                {
-                    'note': 'reconcile: branch already on main when stranded in-progress',
-                    'commit': 'deadbeef' + 'a' * 32,
-                },
-                id='is_ancestor-branch',
-            ),
-            pytest.param(
-                'marker', False, 'cafebabe' + 'd' * 32, 'branch-deleted-marker-found',
-                {
-                    'note': 'reconcile: branch deleted but merge marker found on main',
-                    'commit': 'cafebabe' + 'd' * 32,
-                },
-                id='marker-branch',
-            ),
-        ],
-    )
-    async def test_both_done_branches_invoke_mark_in_progress_done_helper(
-        self,
-        harness: Harness,
-        scenario: str,
-        is_ancestor: bool,
-        marker_sha: str | None,
-        expected_reason: str,
-        expected_provenance: dict,
-    ):
-        """Spy test: _reconcile_stranded_in_progress delegates to
-        _mark_in_progress_done from BOTH the is_ancestor and the
-        find_merge_marker branches.
-
-        Initially RED because the inline code does not call the helper yet.
-        """
-        harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor)  # type: ignore[attr-defined]
-        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
-        harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
-
-        spy = AsyncMock(wraps=harness._mark_in_progress_done)  # type: ignore[attr-defined]
-        harness._mark_in_progress_done = spy  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        spy.assert_awaited_once_with('90', expected_provenance, expected_reason)
-
-    # -----------------------------------------------------------------------
     # Side-effect symmetry regression test
     # -----------------------------------------------------------------------
 

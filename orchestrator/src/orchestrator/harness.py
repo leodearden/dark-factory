@@ -963,6 +963,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 # Resolve branch SHA BEFORE the helper invokes cleanup_worktree
                 # (which calls 'git branch -D' and would invalidate
                 # post-cleanup rev-parse — see git_ops.py cleanup_worktree).
+                # Build provenance before invoking the helper — the helper
+                # performs cleanup, and any post-cleanup git query (e.g.
+                # rev-parse on a deleted branch) would fail.
                 branch_sha = await self.git_ops.resolve_branch_sha(branch)
 
                 provenance: dict[str, str] = {
