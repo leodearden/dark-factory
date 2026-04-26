@@ -4380,3 +4380,30 @@ class TestAddSubtaskGuardrail:
         )
         # taskmaster.add_subtask should eventually be called (after curator)
         # We don't assert exact call count here since the curator may drop/combine.
+
+    @pytest.mark.asyncio
+    async def test_add_subtask_rejects_prompt_only_dark_factory_paths_in_wrong_project(
+        self, interceptor, taskmaster,
+    ):
+        """A prompt-only add_subtask (no title) referencing fused-memory/ under a
+        non-dark-factory project returns a DarkFactoryPathScopeViolation error
+        and does NOT call taskmaster.add_subtask.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            prompt='Edit fused-memory/src/fused_memory/middleware/task_curator.py',
+            # Deliberately NO title kwarg — this is the prompt-only path
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
+        )
+        matched = result.get('matched_paths', [])
+        assert 'fused-memory/' in matched or 'fused_memory/' in matched, (
+            f'Expected fused-memory/ or fused_memory/ in matched_paths: {result}'
+        )
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_subtask.assert_not_called()
