@@ -939,6 +939,33 @@ class TestReconcileStrandedInProgress:
         # No status changes either
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_find_merge_marker_not_invoked_for_non_in_progress_tasks(
+        self, harness: Harness
+    ):
+        """Placement-efficiency regression lock: find_merge_marker is never
+        called when there are no in-progress tasks.
+
+        Proves the guard sits below the `if status != 'in-progress': continue`
+        filter and does not waste git invocations on non-in-progress tasks.
+        """
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {
+                '80': 'pending',
+                '81': 'done',
+                '82': 'blocked',
+                '83': 'cancelled',
+                '84': 'review',
+            },
+            None,
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        # find_merge_marker must never be called (no in-progress tasks)
+        harness.git_ops.find_merge_marker.assert_not_called()  # type: ignore[attr-defined]
+        # No status changes either
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
