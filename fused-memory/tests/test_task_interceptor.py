@@ -4267,6 +4267,38 @@ class TestSubmitTaskGuardrail:
         )
 
     @pytest.mark.asyncio
+    async def test_submit_task_skips_build_candidate_for_dark_factory_project(
+        self, interceptor_with_store, taskmaster, monkeypatch,
+    ):
+        """Hoist optimisation: _build_candidate is not invoked for the dark_factory
+        project_id, since the path guard short-circuits to 'ok' anyway.
+        """
+        calls: list[dict] = []
+        original = TaskInterceptor._build_candidate
+
+        def spy(kwargs):
+            calls.append(kwargs)
+            return original(kwargs)
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(spy))
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/dark-factory',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+            )
+        finally:
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('ticket', '').startswith('tkt_')
+        assert calls == [], (
+            f'Expected _build_candidate to be skipped for dark_factory; got {len(calls)} calls'
+        )
+
+    @pytest.mark.asyncio
     async def test_submit_task_allows_clean_task_in_other_project(
         self, interceptor_with_store, taskmaster,
     ):
