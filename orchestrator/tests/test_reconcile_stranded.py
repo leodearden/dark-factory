@@ -1071,6 +1071,10 @@ class TestReconcileStrandedInProgress:
         )
 
         if cleanup_raises:
+            # cleanup_worktree must have been called (before the OSError was swallowed).
+            harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+                worktree_path, tid
+            )
             # Exception swallowed; WARNING log must contain tid and reason.
             warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert any(
