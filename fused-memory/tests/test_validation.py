@@ -9,6 +9,7 @@ from fused_memory.utils.validation import (
     require_project_id,
     require_project_root,
     require_run_id,
+    validate_int_ids,
     validate_project_id,
     validate_project_root,
     validate_run_id,
@@ -849,3 +850,74 @@ class TestNormalLengthInputsDiagnosticQuality:
         msg = str(exc_info.value)
         assert repr(bad_id) in msg
         assert '...(truncated)' not in msg
+
+
+class TestValidateIntIds:
+    """validate_int_ids returns None for valid int lists, error dict otherwise."""
+
+    # ── Happy paths ──────────────────────────────────────────────────────────
+
+    def test_empty_list_returns_none(self):
+        assert validate_int_ids([]) is None
+
+    def test_single_element_list_returns_none(self):
+        assert validate_int_ids([42]) is None
+
+    def test_multiple_elements_returns_none(self):
+        assert validate_int_ids([1, 2, 3]) is None
+
+    def test_large_list_returns_none(self):
+        assert validate_int_ids(list(range(1000))) is None
+
+    # ── Non-list inputs ──────────────────────────────────────────────────────
+
+    def test_none_returns_error(self):
+        result = validate_int_ids(None)
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'ids must be a list of integers' in result['error']
+        assert 'NoneType' in result['error']
+
+    def test_string_returns_error(self):
+        result = validate_int_ids('1,2,3')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'str' in result['error']
+
+    def test_dict_returns_error(self):
+        result = validate_int_ids({'a': 1})
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'dict' in result['error']
+
+    def test_scalar_int_returns_error(self):
+        result = validate_int_ids(42)
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'int' in result['error']
+
+    def test_set_returns_error(self):
+        result = validate_int_ids({1, 2, 3})
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'set' in result['error']
+
+    # ── Error envelope shape ─────────────────────────────────────────────────
+
+    def test_error_envelope_has_exactly_two_keys(self):
+        result = validate_int_ids(None)
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_error_type_is_validation_error(self):
+        result = validate_int_ids('bad')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_does_not_raise_returns_dict(self):
+        """validate_int_ids must not raise — it returns an error dict."""
+        try:
+            result = validate_int_ids(object())
+            assert result is not None
+        except Exception as exc:
+            pytest.fail(f'validate_int_ids raised unexpectedly: {exc}')
