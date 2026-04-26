@@ -14,6 +14,7 @@ from orchestrator.git_ops import (
     ScrubOutcome,
     ScrubResult,
     WorktreeInfo,
+    _merge_subject,
     _run,
     scrub_task_dir_from_tree,
 )
@@ -2736,3 +2737,26 @@ class TestFindMergeMarker:
         assert '\n' not in marker_sha   # anti-multiline regression
         assert len(marker_sha) == 40    # single-SHA shape
         assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
+
+
+class TestMergeSubject:
+    """Unit tests for the _merge_subject helper.
+
+    Locks the canonical format: 'Merge {branch} into {main_branch}'.
+    This helper is the single source of truth consumed by merge_to_main,
+    advance_main (retry path), and find_merge_marker.
+    """
+
+    @pytest.mark.parametrize(
+        'branch, main_branch, expected',
+        [
+            ('task/1', 'main', 'Merge task/1 into main'),
+            ('task/123', 'main', 'Merge task/123 into main'),
+            ('task/v1.0', 'develop', 'Merge task/v1.0 into develop'),
+        ],
+    )
+    def test_canonical_format(
+        self, branch: str, main_branch: str, expected: str
+    ) -> None:
+        """_merge_subject returns 'Merge {branch} into {main_branch}'."""
+        assert _merge_subject(branch, main_branch) == expected
