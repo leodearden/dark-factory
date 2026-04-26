@@ -422,3 +422,117 @@ class TestGracefulShutdownClosesEventQueue:
         )
 
         memory_service.close.assert_awaited_once()
+
+
+class TestGracefulShutdownDoesNotArmForceExitWatchdog:
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_arm_force_exit_timer(self):
+        """_graceful_shutdown must NOT arm the force-exit watchdog (Task 1080 regression).
+
+        Calling _graceful_shutdown directly (as done in every test in this file) must
+        not leave a 45s daemon threading.Timer behind.  If it does, a long pytest run
+        will be killed by os._exit(1) mid-suite — no individual test failure, just a
+        truncated run with a non-zero exit code.
+        """
+        import fused_memory.server.main as main_mod
+
+        # Ensure clean state before the call.
+        main_mod._cancel_force_exit()
+        assert main_mod._shutdown_watchdog is None, 'precondition: no watchdog before call'
+
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        try:
+            await _graceful_shutdown(
+                memory_service=memory_service,
+                task_interceptor=None,
+                harness_loop_task=None,
+                recon_journal=None,
+            )
+
+            assert main_mod._shutdown_watchdog is None, (
+                'Task 1080 regression: _graceful_shutdown armed a 45s os._exit(1) watchdog. '
+                'The watchdog must only be armed by _shutdown_with_watchdog (the lifespan-only wrapper).'
+            )
+        finally:
+            main_mod._cancel_force_exit()
+
+
+class TestShutdownWithWatchdog:
+    @pytest.mark.asyncio
+    async def test_arms_force_exit_watchdog_before_invoking_graceful_shutdown(self):
+        """_shutdown_with_watchdog must arm the watchdog BEFORE delegating to _graceful_shutdown.
+
+        The spy records whether _shutdown_watchdog was set at the moment the
+        delegate was called.  A value of True in armed_state proves the arm
+        happened before the call, not after.
+        """
+        import fused_memory.server.main as main_mod
+
+        # Ensure clean state.
+        main_mod._cancel_force_exit()
+        assert main_mod._shutdown_watchdog is None, 'precondition: no watchdog before call'
+
+        armed_state: list[bool] = []
+
+        async def _spy(**kwargs):  # type: ignore[override]
+            armed_state.append(main_mod._shutdown_watchdog is not None)
+
+        try:
+            with patch.object(main_mod, '_graceful_shutdown', _spy):
+                await main_mod._shutdown_with_watchdog(
+                    memory_service=MagicMock(close=AsyncMock()),
+                    task_interceptor=None,
+                    harness_loop_task=None,
+                    recon_journal=None,
+                )
+
+            assert armed_state == [True], (
+                '_shutdown_with_watchdog must arm the watchdog before calling _graceful_shutdown'
+            )
+        finally:
+            main_mod._cancel_force_exit()
+
+    @pytest.mark.asyncio
+    async def test_forwards_all_kwargs_to_graceful_shutdown(self):
+        """_shutdown_with_watchdog must forward all six kwargs to _graceful_shutdown unchanged.
+
+        Especially important for the optional event_queue and sqlite_watchdog args — if
+        either is dropped the production shutdown skips flushing the bounded write queue
+        or cancelling the SQLite watchdog.
+        """
+        import fused_memory.server.main as main_mod
+
+        main_mod._cancel_force_exit()
+
+        memory_service = MagicMock(close=AsyncMock())
+        task_interceptor = MagicMock(drain=AsyncMock(), close=AsyncMock())
+        recon_journal = MagicMock(close=AsyncMock())
+        event_queue = MagicMock(close=AsyncMock())
+        sqlite_watchdog = MagicMock(close=AsyncMock())
+
+        captured: dict = {}
+
+        async def _spy(**kwargs):  # type: ignore[override]
+            captured.update(kwargs)
+
+        try:
+            with patch.object(main_mod, '_graceful_shutdown', _spy):
+                await main_mod._shutdown_with_watchdog(
+                    memory_service=memory_service,
+                    task_interceptor=task_interceptor,
+                    harness_loop_task=None,
+                    recon_journal=recon_journal,
+                    event_queue=event_queue,
+                    sqlite_watchdog=sqlite_watchdog,
+                )
+
+            assert captured.get('memory_service') is memory_service
+            assert captured.get('task_interceptor') is task_interceptor
+            assert captured.get('harness_loop_task') is None
+            assert captured.get('recon_journal') is recon_journal
+            assert captured.get('event_queue') is event_queue
+            assert captured.get('sqlite_watchdog') is sqlite_watchdog
+        finally:
+            main_mod._cancel_force_exit()

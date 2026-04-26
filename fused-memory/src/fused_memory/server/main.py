@@ -565,7 +565,7 @@ async def run_server():
             watchdog_task.cancel()
             with contextlib.suppress(BaseException):
                 await watchdog_task
-        await _graceful_shutdown(
+        await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
             harness_loop_task=harness_loop_task,
@@ -652,11 +652,13 @@ async def _graceful_shutdown(
 
     Each step runs under asyncio.shield with a bounded timeout so cleanup
     makes progress even when this coroutine itself is being cancelled, and
-    one stuck step can't starve the rest. A force-exit watchdog armed at
-    entry guarantees the process dies if cleanup hangs past the total
-    budget — systemd then restarts the unit.
+    one stuck step can't starve the rest.
+
+    Note: the force-exit watchdog is NOT armed here.  It is armed by
+    _shutdown_with_watchdog (the lifespan-only entry point) so that unit
+    tests can call _graceful_shutdown directly without leaking a 45s
+    os._exit(1) daemon timer.
     """
-    _arm_force_exit()
     _sd_notify('STOPPING=1')
 
     if task_interceptor is not None:
@@ -687,6 +689,23 @@ async def _graceful_shutdown(
     if recon_journal is not None:
         await _run_shielded('recon_journal.close', recon_journal.close)
 
+
+async def _shutdown_with_watchdog(**kwargs: Any) -> None:
+    """Lifespan-only entry point: arm the force-exit watchdog, then run graceful shutdown.
+
+    The watchdog is interpreter-shutdown safety — it guarantees the process dies
+    even if cleanup hangs or non-daemon third-party threads keep the interpreter
+    alive after asyncio.run() returns.  It is armed here (not inside
+    _graceful_shutdown) so unit tests of pure cleanup orchestration don't leak a
+    45s os._exit(1) timer.  The watchdog is cancelled in main() after
+    asyncio.run() returns cleanly.
+
+    All kwargs are forwarded to _graceful_shutdown unchanged.  Using **kwargs
+    rather than repeating the explicit signature avoids the two functions
+    diverging silently if _graceful_shutdown grows a new parameter.
+    """
+    _arm_force_exit()
+    await _graceful_shutdown(**kwargs)
 
 
 _singleton_socket = None  # Module-level ref to prevent GC
