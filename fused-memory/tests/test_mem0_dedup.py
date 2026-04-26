@@ -203,3 +203,63 @@ async def test_kind_dict_requires_all_keys_to_match():
     assert result is None, (
         f'Expected None when source key fails to match but got {result!r}'
     )
+
+
+# --- Step 1132 — empty-string kind-value boundary ---
+
+
+@pytest.mark.asyncio
+async def test_empty_string_kind_value_does_not_match_missing_key():
+    """find_prior_memory returns None when the row's metadata lacks a kind key entirely.
+
+    A kind value of '' should only match rows that explicitly store that key
+    with an empty-string value — a missing key must NOT satisfy the filter.
+    This guards against the meta.get(k, '') default coercing a missing key to ''.
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    # metadata has task_id but no 'flag_type' key at all
+    row = _make_memory_result({'task_id': '42'})
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[row])
+
+    result = await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': ''},
+        query='q',
+    )
+
+    assert result is None, (
+        f'Expected None when kind key is absent from metadata but got {result!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_string_kind_value_matches_explicit_empty_string():
+    """find_prior_memory returns the row when metadata contains flag_type='' explicitly.
+
+    Regression guard: after the missing-key fix, rows that explicitly store an
+    empty-string value for a kind key must still be matched (no over-correction).
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    # metadata has task_id and flag_type explicitly set to ''
+    row = _make_memory_result({'task_id': '42', 'flag_type': ''})
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[row])
+
+    result = await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': ''},
+        query='q',
+    )
+
+    assert result is row, (
+        f'Expected the row when flag_type is explicitly empty string but got {result!r}'
+    )
