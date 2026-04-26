@@ -3706,3 +3706,218 @@ class TestHarnessDrainIdleShortCircuit:
             f"Expected exactly 1 'Harness fully drained' record but got "
             f"{len(drained_records)}: {[r.message for r in drained_records]}"
         )
+
+
+# ── Deferred-write replay deduplication (Fix 2) ───────────────────────────────
+
+
+class TestReplayDeferredWritesCompletionSummaryDedup:
+    """Tests for the completion-summary dedup check in _replay_deferred_writes."""
+
+    @pytest.mark.asyncio
+    async def test_skip_on_prior_match(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """When a prior done-summary exists in Mem0, the deferred write is skipped."""
+        from unittest.mock import MagicMock
+
+        prior_result = MagicMock()
+        prior_result.metadata = {
+            'task_id': '517',
+            'transition': 'done',
+            'source': 'targeted_reconciliation',
+        }
+        mock_memory_service.search = AsyncMock(return_value=[prior_result])
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            "Task 'X' completed. Summary here.",
+            'observations_and_summaries',
+            {
+                'task_id': '517',
+                'transition': 'done',
+                'source': 'targeted_reconciliation',
+                '_deferred': True,
+            },
+        )
+
+        with caplog.at_level(logging.INFO):
+            await harness._replay_deferred_writes('test-project')
+
+        # (a) add_memory was NOT called — dedup should have skipped the write
+        mock_memory_service.add_memory.assert_not_called()
+
+        # (b) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0, f'Expected no remaining rows but got {len(remaining)}'
+
+        # (c) INFO log mentions skipping task 517
+        skip_records = [
+            r for r in caplog.records
+            if '517' in r.message and r.levelno == logging.INFO
+        ]
+        assert skip_records, (
+            f'Expected an INFO log mentioning task 517 but got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_transition_bypasses_dedup(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Deferred writes with no transition field bypass the dedup check entirely."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Some non-done write',
+            'observations_and_summaries',
+            {},  # no task_id, no transition
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # (a) search was NOT called — bypass condition triggered before any search
+        mock_memory_service.search.assert_not_called()
+
+        # (b) add_memory WAS called once with the deferred-write content
+        mock_memory_service.add_memory.assert_called_once()
+        call_content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert call_content == 'Some non-done write'
+
+        # (c) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    async def test_task_id_only_no_transition_bypasses_dedup(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """transition='done' AND task_id are both required; task_id alone must bypass dedup.
+
+        Validates the `transition == 'done'` clause of the conjunction independently:
+        a future refactor that drops the `transition` guard would be caught here.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Blocked write for task 1',
+            'observations_and_summaries',
+            {'task_id': '1'},  # transition absent
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # search must NOT be called — only task_id present, transition guard fails
+        mock_memory_service.search.assert_not_called()
+        # write must proceed normally
+        mock_memory_service.add_memory.assert_called_once()
+        content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert content == 'Blocked write for task 1'
+
+    @pytest.mark.asyncio
+    async def test_transition_done_no_task_id_bypasses_dedup(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """transition='done' AND task_id are both required; transition alone must bypass dedup.
+
+        Validates the `tid` clause of the conjunction independently:
+        a future refactor that drops the `tid` guard would be caught here.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Done write without task_id',
+            'observations_and_summaries',
+            {'transition': 'done'},  # task_id absent
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # search must NOT be called — only transition present, tid guard fails
+        mock_memory_service.search.assert_not_called()
+        # write must proceed normally
+        mock_memory_service.add_memory.assert_called_once()
+        content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert content == 'Done write without task_id'
+
+    @pytest.mark.asyncio
+    async def test_no_prior_match_falls_through_to_add_memory(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """When Mem0 search returns no prior done-summary, the write proceeds normally."""
+        mock_memory_service.search = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Task 999 completed.',
+            'observations_and_summaries',
+            {'task_id': '999', 'transition': 'done'},
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # (a) search WAS called with project_id and '999' and 'completion'
+        mock_memory_service.search.assert_called_once()
+        search_kwargs = mock_memory_service.search.call_args.kwargs
+        assert search_kwargs.get('project_id') == 'test-project'
+        query = search_kwargs.get('query', '')
+        assert '999' in query and 'completion' in query, (
+            f"Expected query to mention '999' and 'completion', got: {query!r}"
+        )
+
+        # (b) add_memory WAS called once (no prior match — write proceeds)
+        mock_memory_service.add_memory.assert_called_once()
+        call_content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert call_content == 'Task 999 completed.'
+
+        # (c) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    async def test_search_exception_falls_through_to_add_memory(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """If the dedup search raises, the write still proceeds (degrade to no-dedup)."""
+        mock_memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Task 777 completed.',
+            'observations_and_summaries',
+            {'task_id': '777', 'transition': 'done'},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            # (a) must NOT raise
+            await harness._replay_deferred_writes('test-project')
+
+        # (b) add_memory WAS called once — search failure falls through to write
+        mock_memory_service.add_memory.assert_called_once()
+        call_content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert call_content == 'Task 777 completed.'
+
+        # (c) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0
+
+        # (d) WARNING log mentions task 777 and the search failure
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and '777' in r.message
+        ]
+        assert warn_records, (
+            f'Expected a WARNING log mentioning task 777 but got: '
+            f'{[r.message for r in caplog.records]}'
+        )

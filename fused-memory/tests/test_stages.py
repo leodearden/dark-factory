@@ -3418,3 +3418,110 @@ class TestBriefingKnownGapsRefresh:
         ]
         assert len(warning_records) == 1
 
+
+# ---------------------------------------------------------------------------
+# MemoryConsolidator.run() dedup hook tests (step-11)
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorFlagDedup:
+    """MemoryConsolidator.run() calls dedup_flags after super().run() for normal cycles."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
+        """Normal (non-remediation) cycle calls dedup_flags with the report's flagged items."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+
+        flagged = [
+            {'task_id': '1', 'flag_type': 'missing_deliverable'},
+            {'task_id': '2', 'flag_type': 'stale_metadata'},
+        ]
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(flagged),
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        deduplicated = [dict(f) for f in flagged]
+        dedup_mock = AsyncMock(return_value=deduplicated)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-uuid',
+            )
+
+        # dedup_flags must be awaited exactly once with the correct arguments
+        dedup_mock.assert_awaited_once()
+        call_args = dedup_mock.await_args
+        assert call_args is not None
+        assert call_args.kwargs.get('project_id') == 'p' or call_args.args[1] == 'p'
+        assert call_args.kwargs.get('run_id') == 'r-uuid' or call_args.args[2] == 'r-uuid'
+        flags_arg = call_args.kwargs.get('flags') or call_args.args[3]
+        assert len(flags_arg) == 2
+
+        assert report is not None
+
+    @pytest.mark.asyncio
+    async def test_remediation_run_skips_dedup_flags(self, mock_deps):
+        """Remediation runs (remediation_findings set) must NOT call dedup_flags."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.remediation_findings = [{'description': 'x'}]  # remediation mode
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[{'task_id': '1', 'flag_type': 'foo'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-uuid',
+            )
+
+        # dedup_flags must NOT have been called for remediation runs
+        dedup_mock.assert_not_awaited()
+        assert report is not None
