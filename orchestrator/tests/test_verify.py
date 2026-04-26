@@ -3245,15 +3245,14 @@ class TestPruneArchiveThrottle:
         base_time = 0.0
 
         with patch.object(verify, '_prune_archive') as spy:
-            # Patch via verify.time so the test breaks visibly if verify.py ever
-            # switches to "from time import monotonic" (instead of silently using
-            # real wall-clock time).
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
+            # Patch via verify._monotonic (module-level reference capture) so the
+            # test breaks visibly if verify.py ever drops the indirection.
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time)
             _maybe_prune_archive(archive_root)  # first call — fires
 
             # Advance time past the throttle window
             elapsed = _PRUNE_THROTTLE_SECS + 1
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time + elapsed)
             _maybe_prune_archive(archive_root)  # second call — window elapsed, fires again
 
         assert spy.call_count == 2, (
@@ -3270,10 +3269,10 @@ class TestPruneArchiveThrottle:
         elapsed = _PRUNE_THROTTLE_SECS + 1
 
         with patch.object(verify, '_prune_archive') as spy:
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time)
             _maybe_prune_archive(archive_root)  # first fire
 
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time + elapsed)
             _maybe_prune_archive(archive_root)  # second fire (window elapsed)
 
             # Third call immediately after second — still at the same "elapsed" time
@@ -3300,6 +3299,67 @@ class TestPruneArchiveThrottle:
                 f'Real call after None must fire _prune_archive; got {spy.call_count}'
             )
             assert result_real is True
+
+    def test_prune_archive_oserror_swallowed_and_throttle_advances(self, monkeypatch, caplog, tmp_path: Path):
+        """OSError from ``_prune_archive`` is swallowed and the throttle advances.
+
+        Simulates a permission-broken FS where _prune_archive raises OSError
+        (e.g. archive_root.exists() or rglob fails).  The first call must return
+        True (fired, exception swallowed), the throttle must advance (_LAST_PRUNE_AT
+        is not None), and the second call must be throttled (_prune_archive called
+        only once total).  The failure must also be logged at WARNING level so
+        operators can observe FS problems without being flooded per-verification.
+
+        Must FAIL until step-4 wraps the _prune_archive call in try/except OSError.
+        """
+        import logging  # noqa: PLC0415
+
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+            patch.object(verify, '_prune_archive', side_effect=OSError('permission denied')) as spy,
+        ):
+            result = _maybe_prune_archive(archive_root)  # first call — fires but raises
+
+        assert result is True, (
+            f'First call should return True even when _prune_archive raises; got {result!r}'
+        )
+        assert spy.call_count == 1, (
+            f'_prune_archive should be called once; got {spy.call_count}'
+        )
+        assert verify._LAST_PRUNE_AT is not None, (
+            '_LAST_PRUNE_AT must be advanced even when _prune_archive raises OSError'
+        )
+        assert any('permission denied' in r.message for r in caplog.records), (
+            'Expected a WARNING log record containing "permission denied" — '
+            'logger.warning must be called so FS errors are visible to operators'
+        )
+
+        # Second call — throttle should still apply (window not elapsed)
+        with patch.object(verify, '_prune_archive') as spy2:
+            _maybe_prune_archive(archive_root)
+
+        assert spy2.call_count == 0, (
+            f'Second call within window must be throttled; expected 0, got {spy2.call_count}'
+        )
+
+    def test_prune_archive_non_oserror_propagates(self, tmp_path: Path):
+        """Non-OSError exceptions from ``_prune_archive`` still propagate.
+
+        The OSError-only catch must not silence programming bugs (e.g. RuntimeError).
+        This test will also pass after step-4 because the guard is OSError-only.
+        """
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive', side_effect=RuntimeError('bug')), pytest.raises(RuntimeError, match='bug'):
+            _maybe_prune_archive(archive_root)
 
     @pytest.mark.asyncio
     async def test_run_scoped_verification_finally_uses_wrapper(self, monkeypatch, tmp_path: Path):

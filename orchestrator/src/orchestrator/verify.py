@@ -489,6 +489,9 @@ _DEFAULT_ARCHIVE_MAX_BYTES = 500 * 1024 * 1024
 # (e.g. asyncio.to_thread) without a threading.Lock — add one if that ever changes.
 _PRUNE_THROTTLE_SECS: float = 1800  # 30 minutes
 _LAST_PRUNE_AT: float | None = None
+# Module-level reference capture for test injection: patch `verify._monotonic`
+# instead of `verify.time.monotonic` (which would mutate the stdlib globally).
+_monotonic = time.monotonic
 
 
 def _prune_archive(
@@ -560,11 +563,16 @@ def _maybe_prune_archive(archive_root: Path | None) -> bool:
     - First call in a process always fires (``_LAST_PRUNE_AT is None``).
     - Subsequent calls within ``_PRUNE_THROTTLE_SECS`` are skipped.
     - After the window elapses, the next call fires and slides the window forward.
+    - If ``_prune_archive`` raises OSError (e.g. ``archive_root.exists()`` or
+      ``rglob`` fails on a permission-broken FS), the error is logged at warning
+      level and ``_LAST_PRUNE_AT`` still advances — preventing the same exception
+      from being raised on every subsequent verification call within the throttle
+      window.  Non-OSError exceptions still propagate.
     """
     global _LAST_PRUNE_AT
     if archive_root is None:
         return False
-    now = time.monotonic()
+    now = _monotonic()
     if _LAST_PRUNE_AT is not None and now - _LAST_PRUNE_AT < _PRUNE_THROTTLE_SECS:
         logger.debug(
             'skipping prune: %.0fs since last (throttle %ds)',
@@ -572,7 +580,17 @@ def _maybe_prune_archive(archive_root: Path | None) -> bool:
             _PRUNE_THROTTLE_SECS,
         )
         return False
-    _prune_archive(archive_root)
+    try:
+        _prune_archive(archive_root)
+    except OSError as exc:
+        # Deliberate OSError-only scope: _prune_archive uses path.unlink() (not
+        # shutil.rmtree), so shutil.Error cannot arise.  PermissionError /
+        # FileNotFoundError are OSError subclasses on Python ≥ 3.3.  Programming
+        # bugs (RuntimeError, AttributeError, etc.) still propagate uncaught.
+        logger.warning(
+            '_maybe_prune_archive: prune raised %s; advancing throttle to suppress retry storm',
+            exc,
+        )
     _LAST_PRUNE_AT = now
     return True
 
