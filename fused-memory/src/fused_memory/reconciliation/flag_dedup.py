@@ -31,6 +31,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,44 +71,38 @@ async def dedup_flags(
             result.append(flag)
             continue
         tid, ftype = sig
-        try:
-            # Limit=50 and constrain by category to reduce false-negatives from
-            # embedding-similarity ranking when the marker table is large.
-            matches = await memory_service.search(
-                query=f'stage1 flag marker task {tid} type {ftype}',
-                project_id=project_id,
-                categories=['observations_and_summaries'],
-                limit=50,
-            )
-            prior = next(
-                (
-                    r for r in matches
-                    if (
-                        (r.metadata or {}).get('source') == 'stage1_flag_marker'
-                        and str((r.metadata or {}).get('task_id', '')) == tid
-                        and str((r.metadata or {}).get('flag_type', '')) == ftype
-                    )
-                ),
-                None,
-            )
-            if prior is not None:
-                prior_run_id = (prior.metadata or {}).get('run_id') or 'unknown'
-                flag = dict(flag)
-                flag['persisted_from_run'] = prior_run_id
-                flag['last_seen_run_id'] = run_id
-                # No refresh write — the prior marker is sufficient for dedup.
-                # Appending a new marker every cycle would grow the marker table
-                # monotonically (N*M rows for M flags over N cycles).
-                #
-                # Note: last_seen_run_id is set once at marker *creation* and is
-                # NOT refreshed on subsequent hits.  A GC sweep keyed on that
-                # field would therefore expire markers that are still actively
-                # being matched — defeating the dedup purpose.  Stale markers
-                # must be purged manually (see module docstring).
-            else:
-                # Novel flag — write a new marker for future dedup cycles.
-                # _source='stage1_flag_dedup' distinguishes these from
-                # 'targeted_recon' writes in the audit journal.
+        # Delegate search+filter to the shared helper.  find_prior_memory logs a
+        # WARNING under logger on search failure and returns None so the else
+        # branch below writes a fresh marker (best-effort on transient Mem0 outage).
+        prior = await find_prior_memory(
+            memory_service,
+            project_id=project_id,
+            task_id=tid,
+            kind={'source': 'stage1_flag_marker', 'flag_type': ftype},
+            query=f'stage1 flag marker task {tid} type {ftype}',
+            categories=['observations_and_summaries'],
+            limit=50,
+            log=logger,
+        )
+        if prior is not None:
+            prior_run_id = (prior.metadata or {}).get('run_id') or 'unknown'
+            flag = dict(flag)
+            flag['persisted_from_run'] = prior_run_id
+            flag['last_seen_run_id'] = run_id
+            # No refresh write — the prior marker is sufficient for dedup.
+            # Appending a new marker every cycle would grow the marker table
+            # monotonically (N*M rows for M flags over N cycles).
+            #
+            # Note: last_seen_run_id is set once at marker *creation* and is
+            # NOT refreshed on subsequent hits.  A GC sweep keyed on that
+            # field would therefore expire markers that are still actively
+            # being matched — defeating the dedup purpose.  Stale markers
+            # must be purged manually (see module docstring).
+        else:
+            # Novel flag (or search failed) — write a new marker for future
+            # dedup cycles.  _source='stage1_flag_dedup' distinguishes these
+            # from 'targeted_recon' writes in the audit journal.
+            try:
                 await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
@@ -121,8 +117,8 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-        except Exception as e:
-            logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
+            except Exception as e:
+                logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
         result.append(flag)
     return result
 
