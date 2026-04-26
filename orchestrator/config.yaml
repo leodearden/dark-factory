@@ -4,7 +4,14 @@
 max_concurrent_tasks: 24
 
 # Verification commands (dark-factory multi-subproject layout)
-test_command: "pytest"
+# test_command fans out per-subproject so each runs in its own venv with its
+# own pyproject.toml (per-test timeout, -n auto, -m 'not integration', …).
+# Bare ``pytest`` at the worktree root collects every subproject's tests/ into
+# one process and only honours the root pyproject.toml — slow + cross-process
+# state pollution. With Fix 1's docs-only short-circuit + per-subproject
+# fan-out for non-prefixed source, this command rarely fires; when it does
+# (root conftest.py changes), the fan-out keeps it safe.
+test_command: "cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ && cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ && cd ../dashboard && uv run pytest tests/"
 lint_command: "ruff check shared escalation fused-memory orchestrator dashboard"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 

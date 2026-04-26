@@ -72,6 +72,21 @@ def _clear_orch_config_path(monkeypatch):
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _restore_sandbox_backend():
+    """Snapshot and restore sandbox_dispatch._preferred around every test.
+
+    Mirrors the worktree-root conftest's fixture so that running this
+    subproject in isolation (e.g. ``cd orchestrator && uv run pytest tests/``,
+    which is exactly how Fix 2's per-subproject test_command invokes us)
+    still restores backend state between tests.
+    """
+    from orchestrator.agents import sandbox_dispatch
+    saved = sandbox_dispatch.get_backend()
+    yield
+    sandbox_dispatch.set_backend(saved)
+
+
 @pytest.fixture
 def mock_orch_config(tmp_path: Path) -> MagicMock:
     """Return a MagicMock OrchestratorConfig with the standard harness defaults pre-applied.

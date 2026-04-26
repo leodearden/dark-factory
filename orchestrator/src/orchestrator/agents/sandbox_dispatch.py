@@ -68,8 +68,13 @@ def resolve_active_backend() -> Backend:
             return 'bwrap'
         logger.warning('sandbox backend=bwrap but unavailable — running unsandboxed')
         return 'none'
-    logger.warning('unknown sandbox backend=%s — running unsandboxed', _preferred)
-    return 'none'
+    # set_backend's input validator blocks corrupt values from entering via the
+    # public API, so reaching this branch means _preferred was mutated directly
+    # (attribute assignment) past the validator. Fail loudly rather than
+    # silently invoke the agent unsandboxed.
+    raise RuntimeError(
+        f'sandbox_dispatch._preferred is corrupted: {_preferred!r}',
+    )
 
 
 def wrap_command(
@@ -109,8 +114,13 @@ def wrap_command(
         logger.warning('sandbox backend=bwrap but unavailable — running unsandboxed')
         return inner_cmd
 
-    logger.warning('unknown sandbox backend=%s — running unsandboxed', backend)
-    return inner_cmd
+    # set_backend's input validator blocks corrupt values from entering via the
+    # public API, so reaching this branch means _preferred was mutated directly
+    # (attribute assignment) past the validator. Fail loudly rather than
+    # silently invoke the agent unsandboxed.
+    raise RuntimeError(
+        f'sandbox_dispatch._preferred is corrupted: {backend!r}',
+    )
 
 
 def _resolve_auto() -> Backend:
