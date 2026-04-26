@@ -512,7 +512,9 @@ def _prune_archive(
     2. If aggregate size still exceeds ``max_total_bytes``, delete oldest-first
        until under cap.
 
-    All errors are logged and swallowed; never raises.
+    Best-effort: per-file errors are logged and swallowed. Outer FS errors (e.g.
+    archive_root.exists() or rglob walk) may raise OSError — callers wishing to
+    ignore those should wrap the call (see _maybe_prune_archive).
     """
     if not archive_root.exists():
         return

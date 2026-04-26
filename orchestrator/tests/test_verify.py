@@ -1,19 +1,23 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    _PRUNE_THROTTLE_SECS,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
     _extract_cause_hint,
     _is_test_file,
+    _maybe_prune_archive,
     _run_cmd,
     _scope_cargo_workspace,
     run_scoped_verification,
@@ -3230,14 +3234,10 @@ class TestPruneArchiveThrottle:
 
     @pytest.fixture(autouse=True)
     def _reset_prune_throttle(self, monkeypatch):
-        from orchestrator import verify  # noqa: PLC0415
         monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
 
     def test_first_call_invokes_prune(self, tmp_path: Path):
         """First call to ``_maybe_prune_archive`` always fires ``_prune_archive``."""
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
 
         with patch.object(verify, '_prune_archive') as spy:
@@ -3252,9 +3252,6 @@ class TestPruneArchiveThrottle:
 
     def test_second_call_within_window_skips_prune(self, tmp_path: Path):
         """Second immediate call is throttled — ``_prune_archive`` called only once."""
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
 
         with patch.object(verify, '_prune_archive') as spy:
@@ -3267,9 +3264,6 @@ class TestPruneArchiveThrottle:
 
     def test_call_after_throttle_elapsed_fires_again(self, monkeypatch, tmp_path: Path):
         """After the throttle window elapses, the next call fires ``_prune_archive``."""
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
         base_time = 0.0
 
@@ -3290,9 +3284,6 @@ class TestPruneArchiveThrottle:
 
     def test_third_call_within_new_window_skips(self, monkeypatch, tmp_path: Path):
         """After second fire, the window slides — an immediate third call is throttled."""
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
         base_time = 0.0
         elapsed = _PRUNE_THROTTLE_SECS + 1
@@ -3313,9 +3304,6 @@ class TestPruneArchiveThrottle:
 
     def test_archive_root_none_no_op_does_not_update_throttle(self, tmp_path: Path):
         """None call doesn't burn the throttle — subsequent real call still fires."""
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
 
         with patch.object(verify, '_prune_archive') as spy:
@@ -3341,12 +3329,13 @@ class TestPruneArchiveThrottle:
 
         Must FAIL until step-4 wraps the _prune_archive call in try/except OSError.
         """
-        import logging  # noqa: PLC0415
-
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
+
+        # Pin the clock to 0.0 so both calls observe a deterministic timestamp.
+        # This ensures the second-call throttle check (now - _LAST_PRUNE_AT == 0)
+        # is host-timing-independent.  Reuses the sibling-test injection pattern
+        # (see test_call_after_throttle_elapsed_fires_again).
+        monkeypatch.setattr(verify, '_monotonic', lambda: 0.0)
 
         with (
             caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
@@ -3382,9 +3371,6 @@ class TestPruneArchiveThrottle:
         The OSError-only catch must not silence programming bugs (e.g. RuntimeError).
         This test will also pass after step-4 because the guard is OSError-only.
         """
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
-
         archive_root = tmp_path / 'data' / 'verify-logs'
 
         with patch.object(verify, '_prune_archive', side_effect=RuntimeError('bug')), pytest.raises(RuntimeError, match='bug'):
@@ -3396,8 +3382,6 @@ class TestPruneArchiveThrottle:
         wrapper throttles so _prune_archive fires only once across two calls."""
         (tmp_path / '.task').mkdir()
         archive_root = tmp_path / 'data' / 'verify-logs'
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
 
         config = OrchestratorConfig(
             project_root=tmp_path,
