@@ -2480,6 +2480,14 @@ class TaskInterceptor:
             _pg_verdict = check_candidate_for_dark_factory_paths(candidate, project_id)
             if _pg_verdict.is_rejection:
                 return _pg_verdict.to_error_dict()
+        else:
+            # Prompt-only fallback: _build_candidate returns None when there is no
+            # title (the caller passed a free-form prompt for AI-driven creation).
+            # Scan prompt + title text directly so this path cannot bypass the guard.
+            fallback_text = '\n'.join(str(kwargs.get(k) or '') for k in ('prompt', 'title'))
+            _pg_verdict = check_text_for_dark_factory_paths(fallback_text, project_id)
+            if _pg_verdict.is_rejection:
+                return _pg_verdict.to_error_dict()
         # curator_lock across curator.curate + note_created/record_task;
         # write_lock acquired internally for the brief tm.add_subtask call.
         async with self._curator_lock(project_id):
