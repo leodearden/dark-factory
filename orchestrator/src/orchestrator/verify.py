@@ -173,6 +173,27 @@ def _extract_cause_hint(output: str) -> str:
     return last.strip()[:200]
 
 
+# Compiled regex patterns for _classify_failure — hoisted to module scope so
+# re.compile() runs once at import time rather than on every call.
+# Order matters: rustc diagnostic codes (error[E0308]) appear before plain
+# 'error:' so compile errors are distinguished from cargo CLI errors.
+_CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r'error\[E\d+\]:', re.MULTILINE), 'compile_error'),
+    (re.compile(r'compile error', re.MULTILINE | re.IGNORECASE), 'compile_error'),
+    # cargo CLI errors (no diagnostic code) — 'error: --exclude …' etc.
+    (re.compile(r'^error: ', re.MULTILINE), 'cargo_cli_error'),
+    # Rust test runner / pytest FAILED lines
+    (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), 'test_failure'),
+    (re.compile(r'^FAILED\s', re.MULTILINE), 'test_failure'),
+    # npm errors
+    (re.compile(r'npm\s+(ERR!|error)', re.MULTILINE), 'npm_error'),
+    # flock lock failures
+    (re.compile(r'^flock:', re.MULTILINE), 'flock_error'),
+    # tree-sitter generate failures
+    (re.compile(r'tree-sitter generate', re.MULTILINE), 'tree_sitter_generate_error'),
+]
+
+
 def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     """Classify a command failure into a named category bucket.
 
@@ -195,24 +216,6 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
         return 'passed'
     if timed_out:
         return 'infra_timeout'
-
-    _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-        # rustc diagnostic codes like error[E0308] come before plain 'error:'
-        # so we can distinguish compile errors from cargo CLI errors.
-        (re.compile(r'error\[E\d+\]:', re.MULTILINE), 'compile_error'),
-        (re.compile(r'compile error', re.MULTILINE | re.IGNORECASE), 'compile_error'),
-        # cargo CLI errors (no diagnostic code) — 'error: --exclude …' etc.
-        (re.compile(r'^error: ', re.MULTILINE), 'cargo_cli_error'),
-        # Rust test runner / pytest FAILED lines
-        (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), 'test_failure'),
-        (re.compile(r'^FAILED\s', re.MULTILINE), 'test_failure'),
-        # npm errors
-        (re.compile(r'npm\s+(ERR!|error)', re.MULTILINE), 'npm_error'),
-        # flock lock failures
-        (re.compile(r'^flock:', re.MULTILINE), 'flock_error'),
-        # tree-sitter generate failures
-        (re.compile(r'tree-sitter generate', re.MULTILINE), 'tree_sitter_generate_error'),
-    ]
 
     for pattern, category in _CLASSIFY_PATTERNS:
         if pattern.search(output):
@@ -353,7 +356,14 @@ def _persist_attempt_logs(
             logger.warning('_persist_attempt_logs: could not write %s: %s', log_path, exc)
 
     # Build summary.json.
-    # Top-level fields come from the worst-failing run (highest rc).
+    # Top-level rc/cmd/timed_out/started_at/duration_secs fields come from the
+    # run with the highest numeric rc (timed_out used as a tiebreaker).  This
+    # intentionally differs from the 'category' field, which uses _worst_category
+    # priority semantics.  The rationale: rc is the most unambiguous exit-code
+    # signal for the outermost process, while category conveys semantic severity
+    # across tools that may use different rc scales.  Downstream readers should
+    # treat top-level metadata as "the loudest raw exit code" and 'category' as
+    # "the highest-severity classification".
     active_runs = [r for r in runs if r.get('cmd') is not None]
     if active_runs:
         worst = max(active_runs, key=lambda r: (r['rc'], r['timed_out']))
@@ -467,38 +477,39 @@ def _prune_archive(
     if not archive_root.exists():
         return
 
-    import time
+    # module-level `import time` is sufficient; no local import needed.
     now = time.time()
     cutoff = now - max_age_days * 86_400
 
-    def _iter_logs() -> list[tuple[Path, float, int]]:
-        entries = []
-        for path in archive_root.rglob('*.log'):
-            try:
-                st = path.stat()
-                if not path.is_file():
-                    continue
-                entries.append((path, st.st_mtime, st.st_size))
-            except OSError:
+    # Single rglob walk — collect all log files once, avoiding a second
+    # directory scan for the size-cap pass.
+    all_entries: list[tuple[Path, float, int]] = []
+    for path in archive_root.rglob('*.log'):
+        try:
+            st = path.stat()
+            if not path.is_file():
                 continue
-        return entries
+            all_entries.append((path, st.st_mtime, st.st_size))
+        except OSError:
+            continue
 
-    # Pass 1: age-based deletion.
-    entries = _iter_logs()
-    for path, mtime, _size in entries:
+    # Pass 1: age-based deletion; collect survivors for the size-cap pass.
+    survivors: list[tuple[Path, float, int]] = []
+    for path, mtime, size in all_entries:
         if mtime < cutoff:
             try:
                 path.unlink()
             except OSError as exc:
                 logger.warning('_prune_archive: could not delete %s: %s', path, exc)
+        else:
+            survivors.append((path, mtime, size))
 
-    # Pass 2: size cap.
-    entries = _iter_logs()
-    total = sum(sz for _, _, sz in entries)
+    # Pass 2: size cap on survivors (no second rglob needed).
+    total = sum(sz for _, _, sz in survivors)
     if total > max_total_bytes:
         # Sort oldest-first.
-        entries.sort(key=lambda t: t[1])
-        for path, _mtime, size in entries:
+        survivors.sort(key=lambda t: t[1])
+        for path, _mtime, size in survivors:
             if total <= max_total_bytes:
                 break
             try:
@@ -1123,8 +1134,11 @@ async def run_verification(
         rc, out, timed_out_flag = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
         return rc, out, timed_out_flag, started_at, time.monotonic() - t0
 
-    # Per-check timing for the final attempt (reset each retry; only the last values
-    # are used for persistence — internal retries collapse into the final result).
+    # Pre-loop initialisation satisfies static analysis: mypy cannot prove that
+    # `while True:` executes the body at least once before a break, so it
+    # requires these to be assigned before their first use after the loop.
+    # In practice the loop body always overwrites them on the first iteration;
+    # these sentinel values are never read by any caller.
     test_started_at: str | None = None
     test_duration: float = 0.0
     lint_started_at: str | None = None
@@ -1342,6 +1356,12 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)
 
     # Pick the worst child category by priority.
+    # Empty string is filtered out to avoid pulling the aggregate to '' when
+    # legacy callers (no-persistence path) produced results with no category.
+    # 'passed' is intentionally included when present — _worst_category correctly
+    # orders failures above 'passed', so a mix of passing and failing children
+    # still resolves to the worst failure.  If all children pass the aggregate
+    # category will be 'passed', which is the correct result.
     child_categories = [r.category for r in results if r.category]
     category = _worst_category(child_categories) if child_categories else ''
 
@@ -1435,117 +1455,109 @@ async def run_scoped_verification(
     if task_files is None:
         task_files = await _derive_task_files_from_git(worktree, config)
 
-    if module_configs:
-        # Apply file-level scoping within each subproject when task_files given
+    # _prune_archive runs exactly once in the finally block regardless of which
+    # branch returns, preventing concurrent per-module prune races and removing
+    # the repetitive guard at every return site.
+    try:
+        if module_configs:
+            # Apply file-level scoping within each subproject when task_files given
+            if task_files:
+                # Filter to files that still exist — tasks may delete files as part of their work
+                existing_files = [f for f in task_files if (worktree / f).exists()]
+                # scope_module_config returns None when no files touch the subproject;
+                # those subprojects are skipped rather than running their full suite.
+                per_module = [
+                    (mc.prefix, scope_module_config(mc, existing_files))
+                    for mc in module_configs
+                ]
+                skipped = [prefix for prefix, scoped_mc in per_module if scoped_mc is None]
+                scoped = [scoped_mc for _prefix, scoped_mc in per_module if scoped_mc is not None]
+                if skipped:
+                    logger.info(
+                        'Verification scope: skipping %d subproject(s) with no matching files: %s',
+                        len(skipped), ', '.join(skipped),
+                    )
+                if not scoped:
+                    # No subproject has matching files — fall through to global.
+                    # Otherwise we'd gather() zero coroutines and silently pass.
+                    logger.info(
+                        'Verification mode: global (file-scoped filtered every subproject)',
+                    )
+                    return await run_verification(
+                        worktree, config, max_retries=max_retries,
+                        is_merge_verify=is_merge_verify,
+                        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                    )
+                # Rewrite cargo --workspace → cargo -p <crate> when all task files
+                # are .rs and map to known workspace crates.
+                scoped = [
+                    _apply_cargo_scope(mc, existing_files, worktree, scope_cargo_enabled)
+                    for mc in scoped
+                ]
+                n_files = len(existing_files)
+                n_mods = len(scoped)
+                logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
+            else:
+                scoped = module_configs
+                logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
+            results = await asyncio.gather(
+                *(
+                    run_verification(
+                        worktree, config, mc,
+                        max_retries=max_retries,
+                        is_merge_verify=is_merge_verify,
+                        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                    )
+                    for mc in scoped
+                )
+            )
+            return _aggregate_results(list(results))
+
+        # No module_configs — try fallback or global
         if task_files:
             # Filter to files that still exist — tasks may delete files as part of their work
             existing_files = [f for f in task_files if (worktree / f).exists()]
-            # scope_module_config returns None when no files touch the subproject;
-            # those subprojects are skipped rather than running their full suite.
-            per_module = [
-                (mc.prefix, scope_module_config(mc, existing_files))
-                for mc in module_configs
-            ]
-            skipped = [prefix for prefix, scoped_mc in per_module if scoped_mc is None]
-            scoped = [scoped_mc for _prefix, scoped_mc in per_module if scoped_mc is not None]
-            if skipped:
-                logger.info(
-                    'Verification scope: skipping %d subproject(s) with no matching files: %s',
-                    len(skipped), ', '.join(skipped),
+            fallback = _build_fallback_config(existing_files)
+            if fallback is not None:
+                fallback = _apply_cargo_scope(
+                    fallback, existing_files, worktree, scope_cargo_enabled,
                 )
-            if not scoped:
-                # No subproject has matching files — fall through to global.
-                # Otherwise we'd gather() zero coroutines and silently pass.
-                logger.info(
-                    'Verification mode: global (file-scoped filtered every subproject)',
-                )
-                _result = await run_verification(
-                    worktree, config, max_retries=max_retries,
+                logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
+                return await run_verification(
+                    worktree, config, fallback, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
                     attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 )
-                if archive_root is not None:
-                    _prune_archive(archive_root)
-                return _result
-            # Rewrite cargo --workspace → cargo -p <crate> when all task files
-            # are .rs and map to known workspace crates.
-            scoped = [
-                _apply_cargo_scope(mc, existing_files, worktree, scope_cargo_enabled)
-                for mc in scoped
-            ]
-            n_files = len(existing_files)
-            n_mods = len(scoped)
-            logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
-        else:
-            scoped = module_configs
-            logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
-        results = await asyncio.gather(
-            *(
-                run_verification(
-                    worktree, config, mc,
-                    max_retries=max_retries,
-                    is_merge_verify=is_merge_verify,
-                    attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+
+            # For Rust projects with no module_configs and no Python fallback
+            # (Reify's layout), try to scope the global commands.
+            if existing_files and scope_cargo_enabled:
+                synthetic = ModuleConfig(
+                    prefix='__cargo_scoped__',
+                    test_command=config.test_command,
+                    lint_command=config.lint_command,
+                    type_check_command=config.type_check_command,
                 )
-                for mc in scoped
-            )
+                rewritten = _apply_cargo_scope(
+                    synthetic, existing_files, worktree, scope_cargo_enabled,
+                )
+                if rewritten is not synthetic:
+                    logger.info(
+                        'Verification mode: cargo-scoped (%d .rs files)',
+                        len(existing_files),
+                    )
+                    return await run_verification(
+                        worktree, config, rewritten, max_retries=max_retries,
+                        is_merge_verify=is_merge_verify,
+                        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                    )
+
+        logger.info('Verification mode: global (no scope info)')
+        return await run_verification(
+            worktree, config, max_retries=max_retries,
+            is_merge_verify=is_merge_verify,
+            attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
         )
-        _result = _aggregate_results(list(results))
+    finally:
         if archive_root is not None:
             _prune_archive(archive_root)
-        return _result
-
-    # No module_configs — try fallback or global
-    if task_files:
-        # Filter to files that still exist — tasks may delete files as part of their work
-        existing_files = [f for f in task_files if (worktree / f).exists()]
-        fallback = _build_fallback_config(existing_files)
-        if fallback is not None:
-            fallback = _apply_cargo_scope(
-                fallback, existing_files, worktree, scope_cargo_enabled,
-            )
-            logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
-            _result = await run_verification(
-                worktree, config, fallback, max_retries=max_retries,
-                is_merge_verify=is_merge_verify,
-                attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-            )
-            if archive_root is not None:
-                _prune_archive(archive_root)
-            return _result
-
-        # For Rust projects with no module_configs and no Python fallback
-        # (Reify's layout), try to scope the global commands.
-        if existing_files and scope_cargo_enabled:
-            synthetic = ModuleConfig(
-                prefix='__cargo_scoped__',
-                test_command=config.test_command,
-                lint_command=config.lint_command,
-                type_check_command=config.type_check_command,
-            )
-            rewritten = _apply_cargo_scope(
-                synthetic, existing_files, worktree, scope_cargo_enabled,
-            )
-            if rewritten is not synthetic:
-                logger.info(
-                    'Verification mode: cargo-scoped (%d .rs files)',
-                    len(existing_files),
-                )
-                _result = await run_verification(
-                    worktree, config, rewritten, max_retries=max_retries,
-                    is_merge_verify=is_merge_verify,
-                    attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-                )
-                if archive_root is not None:
-                    _prune_archive(archive_root)
-                return _result
-
-    logger.info('Verification mode: global (no scope info)')
-    _result = await run_verification(
-        worktree, config, max_retries=max_retries,
-        is_merge_verify=is_merge_verify,
-        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-    )
-    if archive_root is not None:
-        _prune_archive(archive_root)
-    return _result
