@@ -90,7 +90,7 @@ class _SchedulerLike(Protocol):
     async def update_task(
         self, task_id: str, metadata: str | dict,
     ) -> bool: ...
-    async def _dispatch_tool(
+    async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
 
@@ -1253,7 +1253,7 @@ class TaskWorkflow:
             self.task_id, dep_id, dep_status, reason[:200],
         )
         try:
-            await self.scheduler._dispatch_tool(
+            await self.scheduler.dispatch_tool(
                 'add_dependency',
                 {
                     'id': self.task_id,

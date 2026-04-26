@@ -67,7 +67,7 @@ def _make(
 
     scheduler = MagicMock()
     scheduler.get_status = get_status
-    scheduler._dispatch_tool = dispatch_tool
+    scheduler.dispatch_tool = dispatch_tool
     scheduler.set_task_status = set_task_status
 
     rebase_onto_main = AsyncMock(return_value=rebase_succeeds)

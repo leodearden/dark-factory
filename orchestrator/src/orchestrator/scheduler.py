@@ -385,7 +385,7 @@ class Scheduler:
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
-    async def _dispatch_tool(
+    async def dispatch_tool(
         self,
         name: str,
         arguments: dict,
@@ -417,7 +417,7 @@ class Scheduler:
         be parsed, or the key is absent.
 
         Args:
-            result: Raw response from ``_dispatch_tool``.
+            result: Raw response from ``dispatch_tool``.
             key: The key to retrieve from the (optionally unwrapped) payload.
         """
         content = result.get('result', {}).get('content', [])
@@ -445,7 +445,7 @@ class Scheduler:
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
         try:
-            result = await self._dispatch_tool(
+            result = await self.dispatch_tool(
                 'get_tasks',
                 {'project_root': self._project_root},
                 timeout=15,
@@ -488,7 +488,7 @@ class Scheduler:
                 arguments['done_provenance'] = done_provenance
             if reopen_reason is not None:
                 arguments['reopen_reason'] = reopen_reason
-            await self._dispatch_tool('set_task_status', arguments, timeout=15)
+            await self.dispatch_tool('set_task_status', arguments, timeout=15)
         except Exception as e:
             logger.exception(
                 'Failed to set task %s status to %s: %s: %s',
@@ -504,7 +504,7 @@ class Scheduler:
         (post-steward terminal check).
         """
         try:
-            result = await self._dispatch_tool(
+            result = await self.dispatch_tool(
                 'get_task',
                 {'id': task_id, 'project_root': self._project_root},
                 timeout=15,
@@ -541,7 +541,7 @@ class Scheduler:
             arguments: dict = {'project_root': self._project_root}
             if ids is not None:
                 arguments['ids'] = list(ids)
-            result = await self._dispatch_tool('get_statuses', arguments, timeout=15)
+            result = await self.dispatch_tool('get_statuses', arguments, timeout=15)
             statuses = self._parse_tool_text_result(result, 'statuses')
             if isinstance(statuses, dict):
                 return statuses, None
@@ -558,7 +558,7 @@ class Scheduler:
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
         try:
-            result = await self._dispatch_tool(
+            result = await self.dispatch_tool(
                 'update_task',
                 {
                     'id': task_id,

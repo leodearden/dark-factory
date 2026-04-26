@@ -382,8 +382,8 @@ class FakeScheduler:
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         return True
 
-    async def _dispatch_tool(
-        self, name: str, arguments: dict, *, timeout: float = 30.0
+    async def dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = 15
     ) -> dict:
         return {}
 
