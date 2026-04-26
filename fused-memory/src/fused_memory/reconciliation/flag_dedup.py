@@ -77,7 +77,7 @@ async def dedup_flags(
                 None,
             )
             if prior is not None:
-                prior_run_id = (prior.metadata or {}).get('run_id', run_id)
+                prior_run_id = (prior.metadata or {}).get('run_id') or 'unknown'
                 flag = dict(flag)
                 flag['persisted_from_run'] = prior_run_id
                 flag['last_seen_run_id'] = run_id
