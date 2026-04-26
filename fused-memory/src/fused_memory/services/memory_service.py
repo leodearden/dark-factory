@@ -822,7 +822,10 @@ class MemoryService:
 
         results.sort(key=sort_key)
 
-        # Filter by categories if requested
+        # Graphiti results: filter by category and infer category for ambiguous
+        # nodes.  Mem0 results are already category-scoped server-side via the
+        # pushdown in Mem0Backend.search (see task 1083), so this block is
+        # redundant-but-harmless for mem0 and acts as defence-in-depth.
         if categories:
             cat_set = {MemoryCategory(c) for c in categories}
             graphiti_overlap = cat_set & GRAPHITI_PRIMARY

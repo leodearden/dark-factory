@@ -140,7 +140,7 @@ class Mem0Backend:
         # requested category subset, eliminating the false-negative described
         # in task 1083 where post-filtering on an already-truncated top-N
         # silently drops matching memories that ranked below the limit.
-        filters: dict | None = None
+        filters: dict[str, Any] | None = None
         if categories and len(categories) == 1:
             filters = {'category': categories[0]}
         elif categories and len(categories) > 1:
