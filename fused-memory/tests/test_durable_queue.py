@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from unittest.mock import AsyncMock
@@ -926,6 +927,7 @@ class TestDeleteDead:
             write_timeout_seconds=2.0,
         )
         await q.initialize()
+        assert q._db is not None  # narrowed from Optional after initialize()
 
         try:
             # (2) Patch batch size to 3 so 7 rows => chunks [0:3], [3:6], [6:7].
@@ -954,7 +956,8 @@ class TestDeleteDead:
                 #   e. Return a proxy cursor with the pre-buffered RETURNING rows.
                 # All other calls (including chunk-2 DELETE) forward to the real execute.
                 delete_call_count = 0
-                original_execute = q._db.execute
+                q_db = q._db
+                original_execute = q_db.execute
 
                 async def coordinator(sql, *args, **kwargs):
                     nonlocal delete_call_count
@@ -963,18 +966,18 @@ class TestDeleteDead:
                         if delete_call_count == 1:
                             inner_cursor = await original_execute(sql, *args, **kwargs)
                             prefetched_rows = await inner_cursor.fetchall()
-                            await q._db.commit()
+                            await q_db.commit()
                             await conn2.execute('BEGIN IMMEDIATE')
                             await original_execute('PRAGMA busy_timeout=50')
 
                             class _PreFetched:
-                                async def fetchall(self_inner):
+                                async def fetchall(self):
                                     return prefetched_rows
 
                             return _PreFetched()
                     return await original_execute(sql, *args, **kwargs)
 
-                monkeypatch.setattr(q._db, 'execute', coordinator)
+                monkeypatch.setattr(q_db, 'execute', coordinator)
 
                 # (6) Run delete_dead — chunk-2 DELETE hits real SQLITE_BUSY.
                 result = await q.delete_dead(group_id='proj1', ids=dead_ids)
@@ -1037,10 +1040,8 @@ class TestDeleteDead:
             )
 
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 await q.close()
-            except Exception:
-                pass
 
 
 class TestStats:
