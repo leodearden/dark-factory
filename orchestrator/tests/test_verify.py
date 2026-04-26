@@ -3348,6 +3348,12 @@ class TestPruneArchiveThrottle:
 
         archive_root = tmp_path / 'data' / 'verify-logs'
 
+        # Pin the clock to 0.0 so both calls observe a deterministic timestamp.
+        # This ensures the second-call throttle check (now - _LAST_PRUNE_AT == 0)
+        # is host-timing-independent.  Reuses the sibling-test injection pattern
+        # (see test_call_after_throttle_elapsed_fires_again).
+        monkeypatch.setattr(verify, '_monotonic', lambda: 0.0)
+
         with (
             caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
             patch.object(verify, '_prune_archive', side_effect=OSError('permission denied')) as spy,
