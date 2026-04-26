@@ -3044,3 +3044,74 @@ class TestBriefingKnownGapsRefresh:
 
         assert result is None
         mock_subproc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_script_parses_json_mismatches_on_success(self, tmp_path):
+        """Both artifacts present; subprocess returns exit 1 with JSON mismatches."""
+        # Create both required artifacts
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        review_dir = tmp_path / 'review'
+        review_dir.mkdir()
+        (review_dir / 'briefing.yaml').touch()
+
+        mismatch_data = [
+            {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        ]
+        stdout_bytes = json.dumps(mismatch_data).encode()
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(stdout_bytes, b''))
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result == mismatch_data
+
+        # Verify the subprocess was called with the expected flags
+        call_args = mock_exec.call_args
+        pos_args = call_args[0]
+        assert '--briefing' in pos_args
+        assert '--tasks' in pos_args
+        assert '--json' in pos_args
+        # The briefing path must point to <project_root>/review/briefing.yaml
+        briefing_idx = pos_args.index('--briefing')
+        assert pos_args[briefing_idx + 1] == str(tmp_path / 'review' / 'briefing.yaml')
+        # The tasks path must point to <project_root>/.taskmaster/tasks/tasks.json
+        tasks_idx = pos_args.index('--tasks')
+        assert pos_args[tasks_idx + 1] == str(tmp_path / '.taskmaster' / 'tasks' / 'tasks.json')
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_on_subprocess_error(self, tmp_path, caplog):
+        """Exit code 2 → returns None and emits a WARNING naming the exit code."""
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        review_dir = tmp_path / 'review'
+        review_dir.mkdir()
+        (review_dir / 'briefing.yaml').touch()
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 2
+        mock_proc.communicate = AsyncMock(
+            return_value=(b'', b'ERROR: cannot parse briefing.yaml: bad syntax')
+        )
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ):
+                result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        # The warning must reference the exit code (2)
+        assert '2' in warning_records[0].getMessage() or getattr(warning_records[0], 'returncode', None) == 2
