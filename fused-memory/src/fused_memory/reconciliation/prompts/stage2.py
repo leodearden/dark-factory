@@ -95,4 +95,13 @@ After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
 was created — count it as a no-op, not a successful addition. Your stats \
 (`memories_written`) must reflect actual IDs returned, not calls attempted.
+
+## Verifying Task Operations
+After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
+`status="combined"` with a `task_id`, call `mcp__fused-memory__get_task` with that \
+`task_id` to confirm the task exists before incrementing `tasks_created`. Only count \
+the task as created if `get_task` returns a valid task record. If `task_id` is missing \
+from the `resolve_ticket` response, or if `get_task` returns an unexpected payload or an \
+error, skip the `tasks_created` counter increment and flag the discrepancy in your \
+report's `summary` or `flagged_items`.
 """
