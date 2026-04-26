@@ -1039,6 +1039,85 @@ class TestReconcileStrandedInProgress:
         # 4. Worktree dir must have been removed by the cleanup side-effect.
         assert not worktree_path.exists()
 
+    # -----------------------------------------------------------------------
+    # Cleanup-failure contract (public-entrypoint)
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        'scenario,is_ancestor_val,marker_sha_val,reason,expected_provenance',
+        [
+            pytest.param(
+                'is_ancestor',
+                True,
+                None,
+                'branch-already-on-main',
+                {
+                    'note': 'reconcile: branch already on main when stranded in-progress',
+                    'commit': 'deadbeef' + 'a' * 32,
+                },
+                id='is_ancestor-branch',
+            ),
+            pytest.param(
+                'marker',
+                False,
+                'cafebabe' + 'd' * 32,
+                'branch-deleted-marker-found',
+                {
+                    'note': 'reconcile: branch deleted but merge marker found on main',
+                    'commit': 'cafebabe' + 'd' * 32,
+                },
+                id='marker-branch',
+            ),
+        ],
+    )
+    async def test_cleanup_worktree_failure_swallowed_via_public_entrypoint(
+        self,
+        harness: Harness,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        scenario: str,
+        is_ancestor_val: bool,
+        marker_sha_val: str | None,
+        reason: str,
+        expected_provenance: dict,
+    ):
+        """Cleanup-failure WARNING is swallowed and set_task_status still fires
+        when cleanup_worktree raises — exercised through the public entrypoint
+        for both done-branches (is_ancestor and marker).
+        """
+        tid = '96'
+        harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
+
+        # Seed a recovered plan entry so the helper has something to pop.
+        harness._recovered_plans[tid] = {'task_id': tid, 'steps': []}  # type: ignore[attr-defined]
+
+        # Create worktree dir so the cleanup branch is entered.
+        worktree_path = harness.git_ops.worktree_base / tid
+        worktree_path.mkdir(parents=True)
+
+        # Make cleanup_worktree raise — the helper must swallow this.
+        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=OSError('boom'))  # type: ignore[attr-defined]
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # Exception must not propagate; set_task_status must still be called.
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done', done_provenance=expected_provenance
+        )
+
+        # WARNING log must mention both the tid and the reason slug.
+        warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            tid in r.getMessage() and reason in r.getMessage()
+            for r in warning_logs
+        ), (
+            f'Expected WARNING containing tid={tid!r} and reason={reason!r}; '
+            f'got: {[r.getMessage() for r in warning_logs]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
