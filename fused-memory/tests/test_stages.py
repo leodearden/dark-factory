@@ -3033,3 +3033,37 @@ class TestStage1MemoryVerificationGuidance:
             "STAGE1_SYSTEM_PROMPT must name at least one of the stat counters "
             "('memories_added' or 'memories_written') in its write-verification guidance."
         )
+
+
+class TestStage2MemoryVerificationGuidance:
+    """Regression pins for Stage 2's memory_ids write-verification guidance (step 3).
+
+    These tests assert that STAGE2_SYSTEM_PROMPT contains the discrete phrases
+    that instruct the agent to check the `memory_ids` field before counting a
+    memory write as a successful addition.  They lock in commit d6aceede2f's
+    Stage 2 guidance so accidental deletion fails CI.
+    """
+
+    def test_stage2_system_prompt_contains_memory_ids_verification_phrase(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'memory_ids' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must instruct the agent to inspect the 'memory_ids' "
+            "field in the add_memory response to verify a memory write succeeded."
+        )
+
+    def test_stage2_system_prompt_contains_no_op_phrase(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'no-op' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain the phrase 'no-op' to instruct the agent "
+            "that a write returning an empty memory_ids list is a no-op, not a success."
+        )
+
+    def test_stage2_system_prompt_contains_memories_written_counter_name(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'memories_written' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must name the 'memories_written' stat counter "
+            "in its write-verification guidance so agents know which field to correct."
+        )
