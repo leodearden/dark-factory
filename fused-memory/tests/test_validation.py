@@ -1000,3 +1000,31 @@ class TestValidateIntIds:
             'validate_int_ids must use _safe_repr to cap the bad element repr'
         )
         assert '...(truncated)' in result['error']
+
+
+class TestValidateIntIdsName:
+    """validate_int_ids `name` kwarg customises error message field label."""
+
+    def test_name_kwarg_in_non_list_error(self):
+        """Non-list branch uses the custom name in the error string."""
+        result = validate_int_ids(None, name='row_ids')
+        assert result is not None
+        assert 'row_ids must be a list of integers, got NoneType' == result['error']
+
+    def test_name_kwarg_in_element_error(self):
+        """Element error uses the custom name."""
+        result = validate_int_ids([1, 'bad'], name='task_ids')
+        assert result is not None
+        assert 'task_ids[1]' in result['error']
+        assert 'str' in result['error']
+
+    def test_default_name_is_ids(self):
+        """Default name is 'ids' — regression guard against accidental hardcoding."""
+        result = validate_int_ids(None)
+        assert result is not None
+        assert result['error'].startswith('ids must be a list of integers')
+
+    def test_default_element_name_is_ids(self):
+        result = validate_int_ids([1, 'x'])
+        assert result is not None
+        assert result['error'].startswith('ids[1]')
