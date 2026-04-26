@@ -153,3 +153,9 @@ def require_run_id(run_id: str) -> None:
     """Raise InputValidationError if run_id is empty or contains unsafe characters."""
     if err := validate_run_id(run_id):
         raise InputValidationError(err['error'])
+
+
+def require_int_ids(ids: object, *, name: str = 'ids') -> None:
+    """Raise InputValidationError if ids is not a list of plain (non-bool) integers."""
+    if err := validate_int_ids(ids, name=name):
+        raise InputValidationError(err['error'])
