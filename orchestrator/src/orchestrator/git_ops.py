@@ -698,13 +698,15 @@ class GitOps:
         This prevents finding a stale merge marker from a *previous* run of a
         re-opened task that shared the same branch name.
 
-        **Subject pattern**: ``Merge {branch} into `` matched with
-        ``--fixed-strings`` (literal match — no BRE metacharacter
-        interpretation, so branch names like ``task/v1.0`` are safe).
-        The trailing `` into `` guarantees that ``task/1`` does NOT match
-        ``Merge task/10 into main`` (substring-safety).  The subject format
-        is written by ``merge_to_main``:
-        ``f'Merge {full_branch} into {self.config.main_branch}'``.
+        **Subject pattern**: the exact output of ``_merge_subject(branch,
+        self.config.main_branch)`` matched with ``--fixed-strings`` (literal
+        match — no BRE metacharacter interpretation, so branch names like
+        ``task/v1.0`` are safe).  Because ``_merge_subject`` is also called
+        by ``merge_to_main`` and the retry path in ``advance_main``, writer
+        and reader share the same derivation and can never silently drift
+        apart.  Substring-safety is preserved: ``'Merge task/1 into main'``
+        cannot appear inside ``'Merge task/10 into main'`` because the ``0``
+        after ``task/1`` falls where the pattern has a space.
 
         Args:
             branch: Full prefixed branch name, e.g. ``'task/123'``.
@@ -720,10 +722,13 @@ class GitOps:
             return None
 
         # Branch is gone — search main for a merge commit with the expected subject.
+        # _merge_subject is the single source of truth shared with merge_to_main and
+        # advance_main, so writer and reader always use the same format.
         # --fixed-strings avoids BRE metacharacter interpretation (e.g. dots in
-        # branch names would otherwise be wildcards).  The trailing ' into '
-        # prevents task/1 from matching 'Merge task/10 into main'.
-        grep_pattern = f'Merge {branch} into '
+        # branch names would otherwise be wildcards).  The full subject pattern
+        # 'Merge task/1 into main' cannot appear inside 'Merge task/10 into main'
+        # because the '0' after 'task/1' falls where the pattern has a space.
+        grep_pattern = _merge_subject(branch, self.config.main_branch)
         rc, out, _ = await _run(
             [
                 'git', 'log', self.config.main_branch,
@@ -818,7 +823,7 @@ class GitOps:
             # Merge with no-ff
             rc, out, err = await _run(
                 ['git', 'merge', '--no-ff', full_branch,
-                 '-m', f'Merge {full_branch} into {self.config.main_branch}'],
+                 '-m', _merge_subject(full_branch, self.config.main_branch)],
                 cwd=merge_wt,
             )
 
@@ -1098,7 +1103,7 @@ class GitOps:
             )
             merge_rc, merge_out, merge_err = await _run(
                 ['git', 'merge', '--no-ff', full_branch,
-                 '-m', f'Merge {full_branch} into {self.config.main_branch}'],
+                 '-m', _merge_subject(full_branch, self.config.main_branch)],
                 cwd=merge_worktree,
             )
             if merge_rc != 0:
