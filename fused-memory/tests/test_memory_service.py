@@ -2328,7 +2328,7 @@ class TestSearchIncludePlannedPassthrough:
 
         captured_kwargs = {}
 
-        async def mock_search_mem0(query, scope, limit, include_planned=False):
+        async def mock_search_mem0(query, scope, limit, include_planned=False, categories=None):
             captured_kwargs['include_planned'] = include_planned
             return []
 
@@ -2348,7 +2348,7 @@ class TestSearchIncludePlannedPassthrough:
 
         captured_kwargs = {}
 
-        async def mock_search_mem0(query, scope, limit, include_planned=False):
+        async def mock_search_mem0(query, scope, limit, include_planned=False, categories=None):
             captured_kwargs['include_planned'] = include_planned
             return []
 
