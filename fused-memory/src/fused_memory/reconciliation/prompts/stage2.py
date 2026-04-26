@@ -115,7 +115,11 @@ call `mcp__fused-memory__get_task` with the same task id to confirm. If the conf
 status differs from the requested one, skip the counter increment and flag the \
 discrepancy in your structured report. If the response contains `no_op: True`, the \
 task was already in the requested status — treat as a successful no-op (do not \
-increment a success counter, do not flag as a discrepancy).
+increment a success counter, do not flag as a discrepancy). When `task_id` is a \
+comma-separated list, the response is wrapped as `{{"success": bool, "results": \
+[{{"task_id": ..., "result": {{...}}}}]}}` — apply the per-task `tasks[*].newStatus` \
+and `no_op: True` rules above to each `results[i].result` independently, not to the \
+top-level payload.
 
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
