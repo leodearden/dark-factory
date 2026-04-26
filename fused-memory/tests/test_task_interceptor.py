@@ -4191,6 +4191,23 @@ async def _cancel_interceptor_workers(ti) -> None:
     """Cancel any background ticket-worker tasks on *ti* and await them silently.
 
     Used in test teardown so fixture cleanup (DB close) never races a live worker.
+
+    Why partial cleanup is sufficient here:
+    The production ``TaskInterceptor.close()`` path does five additional things
+    beyond cancelling worker tasks: (1) sets ``_closed = True``, (2) signals all
+    pending ``_ticket_events`` so blocked ``resolve_ticket`` callers unblock,
+    (3) drains fire-and-forget ``_background_tasks``, (4) closes the curator's
+    Qdrant connection, and (5) closes the ``TicketStore`` SQLite connection.
+    This helper skips all five because ``TestSubmitTaskGuardrail`` intentionally
+    exercises none of those paths — no ``resolve_ticket`` waiters are registered,
+    no curator is wired up, no fire-and-forget tasks are scheduled, and the
+    ``ticket_store`` fixture (function-scoped) closes the DB in its own teardown.
+    A class-level ``close()`` hook would race the fixture's per-test DB-close and
+    risk spurious "closed database" errors.
+
+    If a future change wires the suite up to any of these paths (resolve_ticket,
+    curator, fire-and-forget tasks), or relies on close()-only side-effects to
+    surface leaks, switch this teardown to ``await ti.close()`` instead.
     """
     for t in list(ti._worker_tasks.values()):
         if not t.done():
@@ -4272,6 +4289,10 @@ class TestSubmitTaskGuardrail:
     ):
         """Hoist optimisation: _build_candidate is not invoked for the dark_factory
         project_id, since the path guard short-circuits to 'ok' anyway.
+
+        Persistence-shape coverage (project_id column, candidate_json blob fields) is
+        owned by ``test_submit_task_persists_canonical_blob`` — one place to update
+        when the blob schema intentionally changes.
         """
         calls: list[dict] = []
         original = TaskInterceptor._build_candidate
@@ -4300,6 +4321,63 @@ class TestSubmitTaskGuardrail:
         assert result.get('ticket', '').startswith('tkt_')
         assert calls_after_submit == 0, (
             f'Expected _build_candidate to be skipped for dark_factory; got {calls_after_submit} calls'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_task_persists_canonical_blob(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """Persistence contract: submit_task for /dark-factory stores a row whose
+        project_id is 'dark_factory' and whose candidate_json blob contains the
+        un-mutated kwargs (title, description) and metadata=None.
+
+        This is the single owning test for the candidate_json serialisation format;
+        update here when the blob schema intentionally changes.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/dark-factory',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+            )
+        finally:
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('ticket', '').startswith('tkt_'), (
+            f'Expected tkt_-prefixed ticket, got: {result}'
+        )
+
+        # Direct _db access is intentional: we're pinning the storage-layer
+        # serialisation contract, which has no public query path.  This mirrors
+        # the pattern used by sibling tests in this class (e.g.
+        # test_submit_task_rejects_dark_factory_paths_in_wrong_project).
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
+            (result['ticket'],),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, (
+            f'Expected persisted ticket row for ticket_id={result["ticket"]!r}'
+        )
+        assert row['project_id'] == 'dark_factory', (
+            f"Expected project_id 'dark_factory', got: {row['project_id']!r}"
+        )
+        blob = json.loads(row['candidate_json'])
+        assert blob['project_root'] == '/dark-factory', (
+            f"Expected project_root '/dark-factory' in blob, got: {blob['project_root']!r}"
+        )
+        assert blob['kwargs']['title'] == 'Investigate orchestrator/harness.py deadlock', (
+            f"Expected title in blob kwargs un-mutated, got: {blob['kwargs'].get('title')!r}"
+        )
+        assert blob['kwargs']['description'] == 'harness deadlock', (
+            f"Expected description in blob kwargs un-mutated, got: {blob['kwargs'].get('description')!r}"
+        )
+        assert blob['metadata'] is None, (
+            f"Expected metadata=None in blob (no metadata was passed), got: {blob['metadata']!r}"
         )
 
     @pytest.mark.asyncio
