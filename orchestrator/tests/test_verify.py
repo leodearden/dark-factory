@@ -2006,15 +2006,30 @@ class TestClassifyFailure:
         output = 'error: no such subcommand: `tset`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
 
-    def test_cargo_cli_error_failed_to_compile(self):
-        """'error: failed to compile …' (cargo CLI wrapper) → cargo_cli_error.
+    def test_cargo_cli_error_failed_to_parse_manifest(self):
+        """'error: failed to parse manifest at `…`' (real cargo CLI emission) → cargo_cli_error.
 
-        Documents that the 'failed to (parse|compile|read|find)' allowlist token
-        is intentional: cargo emits this form as a CLI-level wrapper (distinct from
-        rustc's 'error: could not compile `…`').  If this token is ever removed
-        from the allowlist, this test will catch the regression.
+        cargo emits this exact form from its manifest loader when it encounters a
+        malformed Cargo.toml (e.g. cargo::util::errors in the cargo source tree).
+        This is a verified real-world cargo CLI log line, not a synthetic fixture.
+
+        Anchors the 'failed to (parse|compile|read|find)' allowlist token to an
+        observed cargo output sample.  If this token is ever removed from the
+        allowlist, this test will catch the regression.
         """
-        output = 'error: failed to compile `my-crate` (lib)\n'
+        output = 'error: failed to parse manifest at `/x/Cargo.toml`\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
+
+    def test_cargo_cli_error_failed_to_compile_branch(self):
+        """'compile' branch of failed_to_(parse|compile|read|find) → cargo_cli_error.
+
+        Exercises the compile sub-case of the alternation so a future refactor
+        cannot silently drop it without a test failure.  The overall token is
+        anchored to a verified real-world cargo log line by
+        test_cargo_cli_error_failed_to_parse_manifest; this test pins just the
+        compile branch structure.
+        """
+        output = 'error: failed to compile `proc-macro-foo`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
 
     def test_rustc_top_level_diagnostics_not_cargo_cli_error(self):
@@ -2035,6 +2050,27 @@ class TestClassifyFailure:
         )
         assert result == 'unknown_test_failure', (
             f"rustc top-level diagnostics should fall through to unknown_test_failure, got {result!r}"
+        )
+
+    def test_rustc_invalid_diagnostic_not_cargo_cli_error(self):
+        """rustc uncoded 'error: invalid …' diagnostic must NOT → cargo_cli_error.
+
+        rustc occasionally emits uncoded diagnostics of the form
+        'error: invalid <attribute/value>' for argument or attribute parsing
+        errors (no error[Exxxx] code, no cargo CLI wrapper).  The `invalid `
+        token in the allowlist is too broad and would mis-bucket these as
+        cargo_cli_error; they must fall through to unknown_test_failure.
+        """
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: invalid attribute value\n'
+        )
+        result = self._classify(output, rc=1, timed_out=False)
+        assert result != 'cargo_cli_error', (
+            f"rustc uncoded 'error: invalid …' must not be mis-bucketed as cargo_cli_error, got {result!r}"
+        )
+        assert result == 'unknown_test_failure', (
+            f"rustc uncoded 'error: invalid …' should fall through to unknown_test_failure, got {result!r}"
         )
 
     # (d) compile_error: rustc diagnostic error codes

@@ -188,8 +188,22 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # 'error: manifest path … does not exist') will fall through to
     # unknown_test_failure until added to the allowlist.  Extend when a new
     # cargo CLI failure mode appears in production and needs its own bucket.
+    #
+    # Each retained token is grounded in a real observed cargo CLI log line:
+    #   --              → 'error: --exclude can only be used together with --workspace'
+    #   no such subcommand
+    #                   → 'error: no such subcommand: `tset`'
+    #   failed to (parse|compile|read|find)
+    #                   → 'error: failed to parse manifest at `/path/Cargo.toml`'
+    #                     'error: failed to read `/path/Cargo.toml`'
+    #   could not find  → 'error: could not find `Cargo.toml` in `/path` or any parent directory'
+    #
+    # Dropped tokens — no grounded cargo CLI sample available for either:
+    #   `invalid `  — see test_rustc_invalid_diagnostic_not_cargo_cli_error.
+    #   `package `  — re-add with a tighter suffix (e.g. 'package \`') once a
+    #                 real cargo log line is observed.
     (re.compile(
-        r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|package |could not find|invalid )',
+        r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|could not find)',
         re.MULTILINE,
     ), 'cargo_cli_error'),
     # Rust test runner / pytest FAILED lines
