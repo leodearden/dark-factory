@@ -887,6 +887,38 @@ class TaskInterceptor:
             spawn_context=str(meta.get('spawn_context') or 'manual'),
         )
 
+    def _path_guard_error(
+        self,
+        candidate,
+        kwargs: dict,
+        project_id: str,
+    ) -> dict | None:
+        """Run the dark-factory path-scope guard and return an error dict on rejection.
+
+        If *candidate* is not None (title-bearing submission), delegates to
+        :func:`check_candidate_for_dark_factory_paths` which scans title,
+        description, details, and files_to_modify.
+
+        Otherwise (prompt-only submission where ``_build_candidate`` returned
+        ``None``), concatenates ``prompt``, ``title``, ``description``, and
+        ``details`` from *kwargs* and delegates to
+        :func:`check_text_for_dark_factory_paths`.  All four free-form text
+        fields are included so that a path hidden in any of them cannot bypass
+        the guard.
+
+        Returns the structured error dict on rejection, or ``None`` when the
+        submission is allowed.  Call-sites pattern:
+        ``if err := self._path_guard_error(candidate, kwargs, project_id): return err``
+        """
+        if candidate is not None:
+            v = check_candidate_for_dark_factory_paths(candidate, project_id)
+        else:
+            text = '\n'.join(
+                str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
+            )
+            v = check_text_for_dark_factory_paths(text, project_id)
+        return v.to_error_dict() if v.is_rejection else None
+
     async def _execute_combine(
         self,
         project_root: str,
@@ -1412,18 +1444,8 @@ class TaskInterceptor:
         # dark-factory module paths but is being filed into a different project.
         # Placed before kwargs.pop('metadata') so _build_candidate can read metadata.
         candidate = self._build_candidate(kwargs)
-        if candidate is not None:
-            pg_verdict = check_candidate_for_dark_factory_paths(candidate, project_id)
-            if pg_verdict.is_rejection:
-                return pg_verdict.to_error_dict()
-        else:
-            # Prompt-only fallback: _build_candidate returns None when there is no
-            # title (the caller passed a free-form prompt for AI-driven creation).
-            # Scan prompt + title text directly so this path cannot bypass the guard.
-            fallback_text = '\n'.join(str(kwargs.get(k) or '') for k in ('prompt', 'title'))
-            pg_verdict = check_text_for_dark_factory_paths(fallback_text, project_id)
-            if pg_verdict.is_rejection:
-                return pg_verdict.to_error_dict()
+        if err := self._path_guard_error(candidate, kwargs, project_id):
+            return err
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
@@ -2476,18 +2498,8 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # Path-scope guard: reject before acquiring the curator lock so a
         # mis-filed task never touches the lock, ticket store, or curator.
-        if candidate is not None:
-            _pg_verdict = check_candidate_for_dark_factory_paths(candidate, project_id)
-            if _pg_verdict.is_rejection:
-                return _pg_verdict.to_error_dict()
-        else:
-            # Prompt-only fallback: _build_candidate returns None when there is no
-            # title (the caller passed a free-form prompt for AI-driven creation).
-            # Scan prompt + title text directly so this path cannot bypass the guard.
-            fallback_text = '\n'.join(str(kwargs.get(k) or '') for k in ('prompt', 'title'))
-            _pg_verdict = check_text_for_dark_factory_paths(fallback_text, project_id)
-            if _pg_verdict.is_rejection:
-                return _pg_verdict.to_error_dict()
+        if err := self._path_guard_error(candidate, kwargs, project_id):
+            return err
         # curator_lock across curator.curate + note_created/record_task;
         # write_lock acquired internally for the brief tm.add_subtask call.
         async with self._curator_lock(project_id):

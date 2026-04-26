@@ -4381,6 +4381,45 @@ class TestSubmitTaskGuardrail:
             f'Should not have error_type for clean prompt: {result}'
         )
 
+    @pytest.mark.parametrize('field', ['prompt', 'description', 'details'])
+    @pytest.mark.asyncio
+    async def test_submit_task_rejects_dark_factory_path_in_any_fallback_field(
+        self, field, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """The fallback text guard scans prompt, description, AND details — not just
+        prompt.
+
+        Each parametrised case passes a dark-factory path in ``field`` with no
+        title kwarg, routing _build_candidate to return None and engaging the
+        fallback branch.  All three channels must trigger
+        DarkFactoryPathScopeViolation and persist no ticket.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                **{field: 'Edit orchestrator/harness.py for the deadlock'},
+                # Deliberately NO title — forces _build_candidate to return None
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Field {field!r}: expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'Field {field!r}: expected orchestrator/ in matched_paths: {result}'
+        )
+
+        # Ticket store must have zero rows (guard fires before persist)
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Field {field!r}: expected 0 tickets, found {row[0]}'
+
+        taskmaster.add_task.assert_not_called()
+
 
 class TestAddSubtaskGuardrail:
     """Integration tests: path-scope guard wired into add_subtask."""
@@ -4458,4 +4497,33 @@ class TestAddSubtaskGuardrail:
         )
 
         # Taskmaster backend must never have been called
+        taskmaster.add_subtask.assert_not_called()
+
+    @pytest.mark.parametrize('field', ['prompt', 'description', 'details'])
+    @pytest.mark.asyncio
+    async def test_add_subtask_rejects_dark_factory_path_in_any_fallback_field(
+        self, field, interceptor, taskmaster,
+    ):
+        """The fallback text guard scans prompt, description, AND details in add_subtask.
+
+        Each parametrised case passes a dark-factory path in ``field`` with no
+        title kwarg, routing _build_candidate to return None and engaging the
+        fallback branch.  All three channels must trigger
+        DarkFactoryPathScopeViolation.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            **{field: 'Edit fused-memory/src/fused_memory/middleware/task_curator.py'},
+            # Deliberately NO title — forces _build_candidate to return None
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Field {field!r}: expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        matched = result.get('matched_paths', [])
+        assert 'fused-memory/' in matched or 'fused_memory/' in matched, (
+            f'Field {field!r}: expected fused-memory/ or fused_memory/ in matched_paths: {result}'
+        )
         taskmaster.add_subtask.assert_not_called()
