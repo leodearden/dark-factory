@@ -268,6 +268,8 @@ class TestLooksLikeCapacityFailure:
         # Substring boundary collisions — the narrowed markers must not match
         ('account uncapped and ready to use', ''),         # 'uncapped' must not match ' capped'
         ('service unavailable: DNS resolution failed', ''),  # generic 'unavailable' != 'account unavailable'
+        ("You've used the wrong format. Please retry.", ''),  # must NOT match loose "you've used"
+        ("You've hit a snag — try again later.", ''),         # must NOT match loose "you've hit"
         ('', ''),  # empty result
     ])
     def test_non_capacity_failure_returns_false(self, output, stderr):
