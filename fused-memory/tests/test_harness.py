@@ -3921,3 +3921,51 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             f'Expected a WARNING log mentioning task 777 but got: '
             f'{[r.message for r in caplog.records]}'
         )
+
+    @pytest.mark.asyncio
+    async def test_dedup_matches_int_task_id_in_prior_metadata(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Prior memory with int task_id=517 must match a deferred write with str task_id='517'.
+
+        Regression test for Fix 1: asymmetric coercion bug where
+        `r.metadata.get('task_id') == str(tid)` compared int 517 to str '517'
+        and returned False, causing the dedup check to miss an existing prior.
+        After the fix, both sides are coerced: `str(r.metadata.get('task_id', '')) == str(tid)`.
+        """
+        from unittest.mock import MagicMock
+
+        prior_result = MagicMock()
+        prior_result.metadata = {
+            'task_id': 517,            # int — as stored when task_id was written as int
+            'transition': 'done',
+            'source': 'targeted_reconciliation',
+        }
+        mock_memory_service.search = AsyncMock(return_value=[prior_result])
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            "Task 'Y' completed.",
+            'observations_and_summaries',
+            {
+                'task_id': '517',      # str — as stored when task_id arrives as str
+                'transition': 'done',
+                'source': 'targeted_reconciliation',
+                '_deferred': True,
+            },
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # (a) add_memory must NOT be called — int/str mismatch should not cause a miss
+        mock_memory_service.add_memory.assert_not_called()
+
+        # (b) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0, (
+            f'Expected no remaining rows but got {len(remaining)} — '
+            f'likely the int task_id was not matched by str coercion'
+        )
