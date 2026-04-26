@@ -2230,6 +2230,137 @@ class TestPruneArchive:
         assert sub.exists(), 'Sub-directory should remain'
 
 
+@pytest.mark.asyncio
+class TestRunVerificationPersistence:
+    """Tests for wire-through of persistence kwargs in ``run_verification``.
+
+    Tests will fail until step 14 adds ``attempt_id``, ``task_id``, and
+    ``archive_root`` keyword args to ``run_verification`` and
+    ``run_scoped_verification`` and calls the persistence helpers.
+    """
+
+    async def test_run_verification_with_persistence_kwargs_sets_paths(
+        self, tmp_path: Path,
+    ):
+        """When attempt_id/task_id/archive_root are passed, result carries log paths."""
+        # Pre-create .task/ so persistence is active
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config,
+                max_retries=0,
+                attempt_id=1,
+                task_id='42',
+                archive_root=archive_root,
+            )
+
+        # (a) category is set correctly
+        assert result.category == 'cargo_cli_error', (
+            f'Expected cargo_cli_error, got {result.category!r}'
+        )
+
+        # (b) worktree_log_paths lists the test log file
+        assert result.worktree_log_paths, 'Expected non-empty worktree_log_paths'
+        test_log_path = tmp_path / '.task' / 'verify' / 'attempt-1.test.log'
+        assert str(test_log_path) in result.worktree_log_paths, (
+            f'Expected {test_log_path} in {result.worktree_log_paths}'
+        )
+
+        # (c) archive_log_paths lists at least one archived file
+        assert result.archive_log_paths, 'Expected non-empty archive_log_paths (cargo_cli_error triggers archival)'
+        archived = result.archive_log_paths[0]
+        assert '42' in archived, f'Archive path should contain task_id "42": {archived}'
+        assert 'attempt-1' in archived, f'Archive path should contain attempt_id: {archived}'
+
+        # (d) worktree log content matches patched output
+        assert test_log_path.exists(), 'Worktree test log file should exist'
+        content = test_log_path.read_text()
+        assert content == test_output, (
+            f'Worktree log content mismatch: {content!r} != {test_output!r}'
+        )
+
+    async def test_run_verification_without_persistence_kwargs_no_paths(
+        self, tmp_path: Path,
+    ):
+        """(e) When attempt_id/task_id/archive_root are omitted, paths are empty (backward-compat)."""
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, 'error: --exclude bad', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert result.worktree_log_paths == [], (
+            f'Expected empty worktree_log_paths when no attempt_id; got {result.worktree_log_paths!r}'
+        )
+        assert result.archive_log_paths == [], (
+            f'Expected empty archive_log_paths when no attempt_id; got {result.archive_log_paths!r}'
+        )
+
+    async def test_run_verification_no_task_dir_no_paths(
+        self, tmp_path: Path,
+    ):
+        """When .task/ is absent, persistence is a no-op and paths are empty."""
+        # NOTE: do NOT create .task/ — simulate merge-queue / review-checkpoint paths
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, 'error: --exclude bad', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config,
+                max_retries=0,
+                attempt_id=1,
+                task_id='42',
+                archive_root=archive_root,
+            )
+
+        assert result.worktree_log_paths == [], (
+            f'Expected empty paths when .task/ absent; got {result.worktree_log_paths!r}'
+        )
+        assert result.archive_log_paths == [], (
+            f'Expected empty archive_paths when .task/ absent; got {result.archive_log_paths!r}'
+        )
+
+
 class TestShouldArchiveCategory:
     """Tests for ``_should_archive_category(category: str) -> bool``.
 
