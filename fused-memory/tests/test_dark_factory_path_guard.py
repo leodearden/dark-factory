@@ -135,6 +135,28 @@ class TestFindDarkFactoryPaths:
         result = self.find('see https://github.com/owner/orchestrator/repo')
         assert 'orchestrator/' in result
 
+    def test_nested_path_segment_matches_by_design(self):
+        """Filesystem paths like ``tests/orchestrator/harness.py`` match because
+        the slash *before* ``orchestrator/`` satisfies the lookbehind boundary
+        class ``[^A-Za-z0-9_-]``, which admits ``/``.
+
+        This over-rejection is intentional — same contract as
+        ``test_url_style_path_matches_by_design``.  If the lookbehind were
+        tightened to a whitespace-only class (``\\s``), both assertions below
+        would fail, confirming this is a meaningful contract test, not an
+        accidentally-passing assertion.
+        """
+        cases = [
+            ('tests/orchestrator/harness.py', 'orchestrator/'),
+            ('services/graphiti/core.py', 'graphiti/'),
+        ]
+        for text, expected_prefix in cases:
+            result = self.find(text)
+            assert expected_prefix in result, (
+                f'Expected {expected_prefix!r} to be detected in {text!r}; '
+                f'got {result!r}'
+            )
+
 
 # ---------------------------------------------------------------------------
 # TestPathGuardVerdict  (step-3)
