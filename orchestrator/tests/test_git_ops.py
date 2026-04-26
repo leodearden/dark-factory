@@ -2495,3 +2495,29 @@ class TestPushMain:
 
         assert result == 'error'
         assert any('Push of main to origin failed' in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+class TestResolveBranchSha:
+    async def test_returns_sha_for_existing_ref(self, git_ops: GitOps):
+        """resolve_branch_sha returns the 40-char SHA for a branch that exists.
+
+        Uses create_worktree to materialise a task/resolve-1 branch, then
+        asserts the returned SHA matches a direct rev-parse call.
+        """
+        wt_info = await git_ops.create_worktree('resolve-1')
+        # Confirm the branch was created
+        assert wt_info is not None
+
+        resolved = await git_ops.resolve_branch_sha('task/resolve-1')
+
+        # Get the expected SHA via _run
+        _, expected_sha, _ = await _run(
+            ['git', 'rev-parse', 'task/resolve-1'],
+            cwd=git_ops.project_root,
+        )
+        expected_sha = expected_sha.strip()
+
+        assert resolved is not None
+        assert resolved == expected_sha
+        assert len(resolved) == 40
