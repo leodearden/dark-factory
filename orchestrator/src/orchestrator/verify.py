@@ -1,6 +1,7 @@
 """Test/lint/typecheck runner for verification stages."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -271,6 +272,102 @@ def _should_archive_category(category: str) -> bool:
     if category == 'unknown_test_failure':
         return True
     return category.endswith('_error')
+
+
+def _persist_attempt_logs(
+    worktree: Path,
+    attempt_id: int,
+    runs: list[dict],
+    category: str,
+    cause_hint: str,
+) -> list[Path]:
+    """Write per-command outputs and a summary JSON to ``<worktree>/.task/verify/``.
+
+    Each *run* dict must have:
+        ``label``        — "test", "lint", or "type"
+        ``cmd``          — shell command string or ``None`` (skipped check)
+        ``rc``           — return code (int)
+        ``output``       — combined stdout+stderr (str)
+        ``timed_out``    — bool
+        ``started_at``   — ISO timestamp string
+        ``duration_secs``— elapsed seconds (float)
+
+    No-op (returns ``[]``) when ``(worktree / '.task')`` is absent — review-
+    checkpoint and merge-queue paths lack ``.task/`` and must not be created.
+
+    Writes:
+    - ``attempt-{N}.{label}.log`` for every run where ``cmd is not None``
+    - ``attempt-{N}.summary.json`` with the summary shape described in the
+      task description: top-level keys are from the worst-failing run plus a
+      ``commands`` list containing all per-run sub-dicts.
+
+    Returns the list of log paths actually written (summary.json excluded
+    so callers can pass the list straight to ``_archive_attempt_log``).
+    """
+    task_dir = worktree / '.task'
+    if not task_dir.is_dir():
+        return []
+
+    verify_dir = task_dir / 'verify'
+    try:
+        verify_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning('_persist_attempt_logs: could not create %s: %s', verify_dir, exc)
+        return []
+
+    written: list[Path] = []
+
+    # Write per-command log files.
+    for run in runs:
+        if run.get('cmd') is None:
+            continue
+        log_path = verify_dir / f'attempt-{attempt_id}.{run["label"]}.log'
+        try:
+            log_path.write_text(run['output'], encoding='utf-8')
+            written.append(log_path)
+        except OSError as exc:
+            logger.warning('_persist_attempt_logs: could not write %s: %s', log_path, exc)
+
+    # Build summary.json.
+    # Top-level fields come from the worst-failing run (highest rc).
+    active_runs = [r for r in runs if r.get('cmd') is not None]
+    if active_runs:
+        worst = max(active_runs, key=lambda r: (r['rc'], r['timed_out']))
+    else:
+        worst = {'rc': 0, 'timed_out': False, 'cmd': None,
+                 'started_at': '', 'duration_secs': 0.0}
+
+    summary_payload: dict = {
+        'category': category,
+        'cause_hint': cause_hint,
+        'rc': worst['rc'],
+        'timed_out': worst['timed_out'],
+        'cmd': worst['cmd'],
+        'started_at': worst['started_at'],
+        'duration_secs': worst['duration_secs'],
+        'commands': [
+            {
+                'label': r['label'],
+                'cmd': r['cmd'],
+                'rc': r['rc'],
+                'timed_out': r['timed_out'],
+                'started_at': r['started_at'],
+                'duration_secs': r['duration_secs'],
+            }
+            for r in active_runs
+        ],
+    }
+
+    summary_path = verify_dir / f'attempt-{attempt_id}.summary.json'
+    try:
+        summary_path.write_text(
+            json.dumps(summary_payload, indent=2, ensure_ascii=False),
+            encoding='utf-8',
+        )
+    except OSError as exc:
+        logger.warning('_persist_attempt_logs: could not write %s: %s', summary_path, exc)
+
+    return written
 
 
 async def _derive_task_files_from_git(
