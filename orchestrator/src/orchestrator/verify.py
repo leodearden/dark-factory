@@ -193,17 +193,23 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     #   --              → 'error: --exclude can only be used together with --workspace'
     #   no such subcommand
     #                   → 'error: no such subcommand: `tset`'
-    #   failed to (parse|compile|read|find)
+    #   failed to (parse|compile|read)
     #                   → 'error: failed to parse manifest at `/path/Cargo.toml`'
+    #                     'error: failed to compile `<name>` (lib), intermediates ...'
+    #                       (cargo_rustc / compiler job-queue orchestrator)
     #                     'error: failed to read `/path/Cargo.toml`'
     #   could not find  → 'error: could not find `Cargo.toml` in `/path` or any parent directory'
     #
-    # Dropped tokens — no grounded cargo CLI sample available for either:
+    # Dropped tokens — no grounded cargo CLI sample available:
     #   `invalid `  — see test_rustc_invalid_diagnostic_not_cargo_cli_error.
     #   `package `  — re-add with a tighter suffix (e.g. 'package \`') once a
     #                 real cargo log line is observed.
+    #   `find`      — 'failed to find' (without 'could not' prefix) has no verified
+    #                 cargo CLI sample; cargo uses 'could not find' for its typical
+    #                 find-failure case, covered by the top-level alternative above.
+    #                 See test_failed_to_find_alone_not_cargo_cli_error.
     (re.compile(
-        r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|could not find)',
+        r'^error: (--|no such subcommand|failed to (parse|compile|read)|could not find)',
         re.MULTILINE,
     ), 'cargo_cli_error'),
     # Rust test runner / pytest FAILED lines
