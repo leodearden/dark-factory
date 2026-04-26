@@ -974,10 +974,10 @@ class TaskInterceptor:
 
     def _path_guard_or_skip(
         self,
-        kwargs: dict,
+        kwargs: dict[str, Any],
         project_id: str,
-        candidate: 'CandidateTask | None' = None,
-    ) -> 'dict | None':
+        candidate: CandidateTask | None = None,
+    ) -> dict | None:
         """Run the path-scope guard with the dark_factory short-circuit applied.
 
         Returns the structured error dict on rejection, or ``None`` when the
