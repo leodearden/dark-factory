@@ -489,6 +489,9 @@ _DEFAULT_ARCHIVE_MAX_BYTES = 500 * 1024 * 1024
 # (e.g. asyncio.to_thread) without a threading.Lock — add one if that ever changes.
 _PRUNE_THROTTLE_SECS: float = 1800  # 30 minutes
 _LAST_PRUNE_AT: float | None = None
+# Module-level reference capture for test injection: patch `verify._monotonic`
+# instead of `verify.time.monotonic` (which would mutate the stdlib globally).
+_monotonic = time.monotonic
 
 
 def _prune_archive(
@@ -564,7 +567,7 @@ def _maybe_prune_archive(archive_root: Path | None) -> bool:
     global _LAST_PRUNE_AT
     if archive_root is None:
         return False
-    now = time.monotonic()
+    now = _monotonic()
     if _LAST_PRUNE_AT is not None and now - _LAST_PRUNE_AT < _PRUNE_THROTTLE_SECS:
         logger.debug(
             'skipping prune: %.0fs since last (throttle %ds)',

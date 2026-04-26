@@ -3245,15 +3245,14 @@ class TestPruneArchiveThrottle:
         base_time = 0.0
 
         with patch.object(verify, '_prune_archive') as spy:
-            # Patch via verify.time so the test breaks visibly if verify.py ever
-            # switches to "from time import monotonic" (instead of silently using
-            # real wall-clock time).
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
+            # Patch via verify._monotonic (module-level reference capture) so the
+            # test breaks visibly if verify.py ever drops the indirection.
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time)
             _maybe_prune_archive(archive_root)  # first call — fires
 
             # Advance time past the throttle window
             elapsed = _PRUNE_THROTTLE_SECS + 1
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time + elapsed)
             _maybe_prune_archive(archive_root)  # second call — window elapsed, fires again
 
         assert spy.call_count == 2, (
@@ -3270,10 +3269,10 @@ class TestPruneArchiveThrottle:
         elapsed = _PRUNE_THROTTLE_SECS + 1
 
         with patch.object(verify, '_prune_archive') as spy:
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time)
             _maybe_prune_archive(archive_root)  # first fire
 
-            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
+            monkeypatch.setattr(verify, '_monotonic', lambda: base_time + elapsed)
             _maybe_prune_archive(archive_root)  # second fire (window elapsed)
 
             # Third call immediately after second — still at the same "elapsed" time
