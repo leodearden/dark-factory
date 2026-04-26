@@ -357,27 +357,17 @@ _VALID_FILTER_META = {
     [
         # (a) 'run_id' key absent — .get('run_id', run_id) silently returns run_id, not 'unknown'
         pytest.param(
-            {'source': 'stage1_flag_marker', 'task_id': '42', 'flag_type': 'missing_deliverable'},
+            {**_VALID_FILTER_META},
             id='run_id-key-absent',
         ),
         # (c) 'run_id' key present but value is None — .get returns None (not 'unknown')
         pytest.param(
-            {
-                'source': 'stage1_flag_marker',
-                'task_id': '42',
-                'flag_type': 'missing_deliverable',
-                'run_id': None,
-            },
+            {**_VALID_FILTER_META, 'run_id': None},
             id='run_id-is-None',
         ),
         # (d) 'run_id' key present but value is '' — .get returns '' (not 'unknown')
         pytest.param(
-            {
-                'source': 'stage1_flag_marker',
-                'task_id': '42',
-                'flag_type': 'missing_deliverable',
-                'run_id': '',
-            },
+            {**_VALID_FILTER_META, 'run_id': ''},
             id='run_id-is-empty-string',
         ),
     ],
