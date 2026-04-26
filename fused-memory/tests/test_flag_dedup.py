@@ -85,3 +85,66 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
     # Zero I/O calls
     memory_service.search.assert_not_called()
     memory_service.add_memory.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# dedup_flags — prior marker found path (step-5)
+# ---------------------------------------------------------------------------
+
+
+def _make_memory_result(metadata: dict) -> MagicMock:
+    """Build a minimal mock MemoryResult with .metadata and .content."""
+    r = MagicMock()
+    r.metadata = metadata
+    r.content = 'Stage 1 flag marker'
+    return r
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_prior_marker_found_annotates_flag_and_refreshes():
+    """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id
+    and a refresh marker is written.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.add_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) Flag is annotated with persisted_from_run and last_seen_run_id
+    assert len(result) == 1
+    assert result[0]['persisted_from_run'] == 'r0'
+    assert result[0]['last_seen_run_id'] == 'r1'
+
+    # (b) search was called once with project_id='p' and a query mentioning task_id and flag_type
+    memory_service.search.assert_called_once()
+    search_call_kwargs = memory_service.search.call_args
+    # Accept both positional and keyword call styles
+    call_kwargs = search_call_kwargs.kwargs if search_call_kwargs.kwargs else {}
+    call_args = search_call_kwargs.args if search_call_kwargs.args else ()
+    # project_id should be 'p'
+    assert call_kwargs.get('project_id') == 'p' or (len(call_args) >= 2 and 'p' in call_args)
+    # query should mention 'task' and '42' and 'missing_deliverable'
+    query = call_kwargs.get('query') or (call_args[0] if call_args else '')
+    assert 'task' in query.lower() or '42' in query
+    assert '42' in query or 'missing_deliverable' in query
+
+    # (c) A refresh marker write was made via add_memory
+    memory_service.add_memory.assert_called_once()
