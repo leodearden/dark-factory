@@ -686,6 +686,84 @@ class TestDeleteDead:
         assert 'deleted' in result
         assert 'remaining' in result
 
+    @pytest.mark.asyncio
+    async def test_operational_error_mid_batch_preserves_deleted_progress(
+        self, queue, monkeypatch
+    ):
+        """Mid-batch OperationalError: prior-chunk deletions are committed and reported.
+
+        Uses batch_size=3 so 7 rows produce chunks [0:3], [3:6], [6:7].
+        The second DELETE raises OperationalError.  Assertions:
+          (a) envelope has error_type='TransientSqliteError', retriable=True
+          (b) envelope['deleted'] matches the first chunk's ids AND those rows
+              are physically gone (visible via a fresh DB read after re-open)
+          (c) envelope['remaining'] covers the un-attempted rows
+          (d) deleted ∪ remaining == all input ids (no overlap, no gap)
+        """
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
+
+        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+
+        # Track which DELETE invocation we're on.
+        delete_call_count = 0
+        original_execute = queue._db.execute
+
+        async def mock_execute(sql, *args, **kwargs):
+            nonlocal delete_call_count
+            if 'DELETE' in sql.upper():
+                delete_call_count += 1
+                if delete_call_count == 2:
+                    raise aiosqlite.OperationalError('database is locked')
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+
+        result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
+
+        # (a) Typed envelope.
+        assert result.get('error_type') == 'TransientSqliteError'
+        assert result.get('retriable') is True
+
+        envelope_deleted = set(result['deleted'])
+        envelope_remaining = set(result['remaining'])
+
+        # (b) First chunk (batch_size=3) must be reported deleted.
+        assert len(envelope_deleted) == 3
+
+        # Verify durability: close and reopen to confirm the commit landed.
+        data_dir = queue._data_dir
+        execute_write = queue._execute_write
+        await queue.close()
+
+        q2 = DurableWriteQueue(
+            data_dir=data_dir,
+            execute_write=execute_write,
+            workers_per_group=3,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=2.0,
+        )
+        await q2.initialize()
+        try:
+            surviving = {item['id'] for item in await q2.get_dead_items(group_id='proj1')}
+            # The first chunk's rows must be gone; remaining rows still exist.
+            assert not envelope_deleted.intersection(surviving), (
+                'First-chunk rows must be durably deleted'
+            )
+            assert envelope_remaining.issubset(surviving), (
+                'Remaining rows must still exist after partial commit'
+            )
+        finally:
+            await q2.close()
+
+        # (c) Remaining = un-attempted rows (~4 ids for batches 2+3).
+        assert len(envelope_remaining) == 4
+
+        # (d) No overlap, full coverage.
+        assert envelope_deleted.isdisjoint(envelope_remaining)
+        assert envelope_deleted | envelope_remaining == set(dead_ids)
+
 
 class TestStats:
     @pytest.mark.asyncio
