@@ -4268,10 +4268,14 @@ class TestSubmitTaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_submit_task_skips_build_candidate_for_dark_factory_project(
-        self, interceptor_with_store, taskmaster, monkeypatch,
+        self, interceptor_with_store, ticket_store, taskmaster, monkeypatch,
     ):
         """Hoist optimisation: _build_candidate is not invoked for the dark_factory
         project_id, since the path guard short-circuits to 'ok' anyway.
+
+        Also pins the persisted ticket row's project_id and candidate_json blob shape
+        so a regression in observable persistence is caught even if the spy snapshot
+        stays at zero.
         """
         calls: list[dict] = []
         original = TaskInterceptor._build_candidate
@@ -4300,6 +4304,37 @@ class TestSubmitTaskGuardrail:
         assert result.get('ticket', '').startswith('tkt_')
         assert calls_after_submit == 0, (
             f'Expected _build_candidate to be skipped for dark_factory; got {calls_after_submit} calls'
+        )
+
+        # Pin the persisted ticket row's project_id and candidate_json blob shape.
+        # This catches regressions where the blob serialisation changes (e.g. a field
+        # is dropped, or project_id diverges from 'dark_factory') even if the spy
+        # snapshot above stays at zero.
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
+            (result['ticket'],),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, (
+            f'Expected persisted ticket row for ticket_id={result["ticket"]!r}'
+        )
+        assert row['project_id'] == 'dark_factory', (
+            f"Expected project_id 'dark_factory', got: {row['project_id']!r}"
+        )
+        blob = json.loads(row['candidate_json'])
+        assert blob['project_root'] == '/dark-factory', (
+            f"Expected project_root '/dark-factory' in blob, got: {blob['project_root']!r}"
+        )
+        assert blob['kwargs']['title'] == 'Investigate orchestrator/harness.py deadlock', (
+            f"Expected title in blob kwargs un-mutated, got: {blob['kwargs'].get('title')!r}"
+        )
+        assert blob['kwargs']['description'] == 'harness deadlock', (
+            f"Expected description in blob kwargs un-mutated, got: {blob['kwargs'].get('description')!r}"
+        )
+        assert blob['metadata'] is None, (
+            f"Expected metadata=None in blob (no metadata was passed), got: {blob['metadata']!r}"
         )
 
     @pytest.mark.asyncio
