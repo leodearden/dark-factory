@@ -3174,3 +3174,18 @@ class TestPruneArchiveThrottle:
         assert spy.call_args[0][0] == archive_root, (
             f'First positional arg should be archive_root; got {spy.call_args[0][0]!r}'
         )
+
+    def test_second_call_within_window_skips_prune(self, tmp_path: Path):
+        """Second immediate call is throttled — ``_prune_archive`` called only once."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive') as spy:
+            _maybe_prune_archive(archive_root)
+            _maybe_prune_archive(archive_root)
+
+        assert spy.call_count == 1, (
+            f'Second immediate call must be throttled; expected 1, got {spy.call_count}'
+        )
