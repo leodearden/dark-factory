@@ -36,6 +36,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
+from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
 from fused_memory.services.memory_service import MemoryService
 
@@ -453,41 +454,26 @@ class ReconciliationHarness:
 
             # Dedup check: skip completion-summary writes that already exist in Mem0.
             # Only for transition='done' writes — other transitions are left as-is.
-            # Inner try/except: search failures degrade to "no dedup, write proceeds"
-            # rather than propagating to the outer except (which would drop the write).
+            # find_prior_memory degrades gracefully: search failures log a WARNING
+            # under logger and return None so the write proceeds normally.
             if transition == 'done' and tid:
-                try:
-                    # Constrain by category to reduce false-negatives from
-                    # embedding-similarity ranking when the corpus is large
-                    # (mirroring flag_dedup.py:73-74): after Task 1107's fix
-                    # to push category filtering to the vector store, this
-                    # constrains the corpus before top-N ranking so a matching
-                    # prior is not pushed outside the limit by unrelated rows.
-                    results = await self.memory.search(
-                        query=f'task {tid} targeted_reconciliation completion done',
-                        project_id=project_id,
-                        categories=['observations_and_summaries'],
-                        limit=20,
+                prior = await find_prior_memory(
+                    self.memory,
+                    project_id=project_id,
+                    task_id=tid,
+                    kind={'transition': 'done'},
+                    query=f'task {tid} targeted_reconciliation completion done',
+                    categories=['observations_and_summaries'],
+                    limit=20,
+                    log=logger,
+                )
+                if prior is not None:
+                    logger.info(
+                        'Skipping deferred completion-summary for task %s — already written',
+                        tid,
                     )
-                    # Both sides coerced to str so that a prior written with
-                    # int task_id (e.g. 517) matches a deferred write whose
-                    # metadata carries str task_id '517' — mirroring flag_dedup.py.
-                    prior = [
-                        r for r in results
-                        if str((r.metadata or {}).get('task_id', '')) == str(tid)
-                        and str((r.metadata or {}).get('transition', '')) == 'done'
-                    ]
-                    if prior:
-                        logger.info(
-                            'Skipping deferred completion-summary for task %s — already written',
-                            tid,
-                        )
-                        await self.buffer.delete_deferred_write(write['id'])
-                        continue
-                except Exception as e:
-                    logger.warning(
-                        'Deferred-write dedup search failed for task %s: %s', tid, e
-                    )
+                    await self.buffer.delete_deferred_write(write['id'])
+                    continue
 
             try:
                 await self.memory.add_memory(
