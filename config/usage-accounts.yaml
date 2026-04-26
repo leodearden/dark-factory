@@ -15,12 +15,13 @@ accounts:
     oauth_token_env: CLAUDE_OAUTH_TOKEN_E
   - name: max-c
     oauth_token_env: CLAUDE_OAUTH_TOKEN_C
+  - name: max-b
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
   - name: max-d
     oauth_token_env: CLAUDE_OAUTH_TOKEN_D
-# DO NOT re-add max-b: permanently dead (HTTP 403 since 2026-04-20).
-# Regression-guarded by orchestrator/tests/test_reify_multi_account.py::TestDarkFactoryProductionPool
-# (original fix: task 879; re-applied: task 941 after accidental revert 29bc506e73)
-#  - name: max-b
-#    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+# max-b previously believed permanently dead (HTTP 403 since 2026-04-20);
+# re-tested 2026-04-26 with a haiku probe and found alive (real tokens consumed).
+# max-a remains reserved for interactive + eval sessions; eval runners inject A
+# dynamically via USAGE_ACCOUNTS_FILE override.
 #  - name: max-a
 #    oauth_token_env: CLAUDE_OAUTH_TOKEN_A
