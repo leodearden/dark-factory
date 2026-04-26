@@ -1622,6 +1622,122 @@ class TestVerificationFailedLogCauseHint:
                 )
 
 
+@pytest.mark.asyncio
+class TestVerificationFailedLogIncludesPath:
+    """When run_verification persists logs, the log record format includes the path.
+
+    Tests will fail until step 16 updates the logger call to emit
+    ``Verification failed: <category> — <cause_hint> (full log: <path>)``
+    when worktree_log_paths is non-empty.
+    """
+
+    async def test_failed_log_includes_category_hint_and_path(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """When persistence is active, log line is '<category> — <hint> (full log: <path>)'."""
+        import logging
+
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, 'ok', False
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd),
+        ):
+            result = await run_verification(
+                tmp_path, config,
+                max_retries=0,
+                attempt_id=1,
+                task_id='42',
+                archive_root=archive_root,
+            )
+
+        # Result must have a worktree log path
+        assert result.worktree_log_paths, 'Persistence should have produced worktree log paths'
+        expected_path = result.worktree_log_paths[0]
+
+        # Find the 'Verification failed' log record
+        failing_records = [
+            r for r in caplog.records if 'Verification failed' in r.getMessage()
+        ]
+        assert failing_records, f'Expected a "Verification failed" log record; got {[r.getMessage() for r in caplog.records]}'
+        msg = failing_records[0].getMessage()
+
+        # Must contain category
+        assert 'cargo_cli_error' in msg, (
+            f'Expected "cargo_cli_error" in log line; got: {msg!r}'
+        )
+        # Must contain cause hint
+        assert 'error: --exclude' in msg, (
+            f'Expected cause_hint "error: --exclude" in log line; got: {msg!r}'
+        )
+        # Must contain path reference
+        assert expected_path in msg, (
+            f'Expected worktree log path {expected_path!r} in log line; got: {msg!r}'
+        )
+        # Must NOT contain a 1000+ char raw blob
+        assert len(msg) < 1000, (
+            f'Log line is suspiciously long ({len(msg)} chars) — raw blob may have leaked: {msg[:200]!r}'
+        )
+
+    async def test_failed_log_fallback_when_no_persistence(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """When no attempt_id/path, log falls back to '<summary> — <hint>' format."""
+        import logging
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, '', False
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd),
+        ):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        # No persistence kwargs → no log paths
+        assert result.worktree_log_paths == [], 'No persistence kwargs → empty paths'
+
+        # Log must still contain the summary and cause hint (original format)
+        failing_records = [
+            r for r in caplog.records if 'Verification failed' in r.getMessage()
+        ]
+        assert failing_records, 'Expected a "Verification failed" log record'
+        msg = failing_records[0].getMessage()
+        assert 'tests failed' in msg, f'Expected summary in fallback log: {msg!r}'
+        assert 'error: --exclude' in msg, f'Expected hint in fallback log: {msg!r}'
+        # Must NOT contain "(full log:" string (path-format only when paths exist)
+        assert '(full log:' not in msg, (
+            f'Fallback log should not contain path reference: {msg!r}'
+        )
+
+
 class TestFailureReportCauseHint:
     """Tests for ``VerifyResult.failure_report()`` interaction with ``cause_hint``.
 
