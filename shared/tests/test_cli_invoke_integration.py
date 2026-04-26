@@ -44,8 +44,8 @@ _CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
     'account unavailable',  # narrowed from bare 'unavailable' to avoid generic network errors
     'out of extra usage',
     'usage limit',
-    "you've hit",
-    "you've used",
+    "you've hit your usage",   # narrowed prefix to avoid matching innocuous "you've hit a snag" phrasing
+    "you've used all",         # narrowed prefix to avoid matching innocuous "you've used the wrong format" phrasing
 )
 
 
@@ -268,30 +268,11 @@ class TestLooksLikeCapacityFailure:
         # Substring boundary collisions — the narrowed markers must not match
         ('account uncapped and ready to use', ''),         # 'uncapped' must not match ' capped'
         ('service unavailable: DNS resolution failed', ''),  # generic 'unavailable' != 'account unavailable'
+        ("You've used the wrong format. Please retry.", ''),  # must NOT match loose "you've used"
+        ("You've hit a snag — try again later.", ''),         # must NOT match loose "you've hit"
         ('', ''),  # empty result
     ])
     def test_non_capacity_failure_returns_false(self, output, stderr):
         """Generic failures and substring boundary cases do not trigger a skip."""
         result = AgentResult(success=False, output=output, stderr=stderr)
         assert not _looks_like_capacity_failure(result)
-
-    def test_call_site_contract_non_capacity_raises_not_skips(self):
-        """The call-site guarantee: a non-capacity failure reaches assert, not skip.
-
-        At each call site the pattern is::
-
-            if not r.success and _looks_like_capacity_failure(r):
-                pytest.skip(...)
-            assert r.success  # ← fires for any non-capacity failure
-
-        When the helper returns False (non-capacity), the skip branch is never
-        taken and the subsequent ``assert r.success`` fires loudly.  This test
-        verifies that behavioral guarantee — a regression in the call-site
-        predicate would either break this test or the parametrize test above.
-        """
-        result = AgentResult(success=False, output='process spawn failed: ENOENT', stderr='Traceback...')
-        # Helper must return False → the skip branch is NOT taken
-        assert not _looks_like_capacity_failure(result)
-        # Therefore the call site reaches `assert r.success`, which raises
-        with pytest.raises(AssertionError):
-            assert result.success
