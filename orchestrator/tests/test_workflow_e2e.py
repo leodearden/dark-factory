@@ -383,8 +383,8 @@ class FakeScheduler:
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         return True
 
-    async def _dispatch_tool(
-        self, name: str, arguments: dict, *, timeout: float = 30.0
+    async def dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = 15
     ) -> dict:
         return {}
 
@@ -2429,7 +2429,7 @@ class TestDispatchToolPromotedToPublic:
 
     def test_protocol_declares_dispatch_tool_member(self):
         """_SchedulerLike Protocol must declare `dispatch_tool` (not `_dispatch_tool`)."""
-        attrs = _SchedulerLike.__protocol_attrs__
+        attrs = getattr(_SchedulerLike, '__protocol_attrs__', frozenset())
         assert 'dispatch_tool' in attrs, (
             f'dispatch_tool not found in _SchedulerLike.__protocol_attrs__; got: {attrs}'
         )
