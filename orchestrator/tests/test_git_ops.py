@@ -2521,3 +2521,13 @@ class TestResolveBranchSha:
         assert resolved is not None
         assert resolved == expected_sha
         assert len(resolved) == 40
+
+    async def test_returns_none_for_missing_ref(self, git_ops: GitOps):
+        """resolve_branch_sha returns None (not empty string, not an exception)
+        when the branch ref does not exist.
+
+        Regression lock: a future refactor must not silently switch to raising
+        or returning '' — both would break the harness fallback path.
+        """
+        result = await git_ops.resolve_branch_sha('task/does-not-exist')
+        assert result is None
