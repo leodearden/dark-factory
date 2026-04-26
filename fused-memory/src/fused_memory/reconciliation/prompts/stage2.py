@@ -98,12 +98,10 @@ was created — count it as a no-op, not a successful addition. Your stats \
 
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
-`status="combined"` with a `task_id`, call `mcp__fused-memory__get_task` with that \
-`task_id` to confirm the task exists before incrementing `tasks_created`. Only count \
-the task as created if `get_task` returns a valid task record. If `task_id` is missing \
-from the `resolve_ticket` response, or if `get_task` returns an unexpected payload or an \
-error, skip the `tasks_created` counter increment and flag the discrepancy in your \
-report's `summary` or `flagged_items`.
+`status="combined"` with a `task_id`, treat as authoritative success — increment \
+`tasks_created` directly. Only fall back to `mcp__fused-memory__get_task` when \
+`task_id` is missing from the `resolve_ticket` response or the status is unrecognised, \
+then skip the counter and flag the discrepancy in your structured report.
 
 After each `mcp__fused-memory__set_task_status` call, inspect the `tasks[n].newStatus` \
 field in the response — `set_task_status` returns per-task \
