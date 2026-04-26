@@ -4253,7 +4253,10 @@ class TestSubmitTaskGuardrail:
                 description='harness deadlock referencing orchestrator/harness.py',
             )
         finally:
-            await _cancel_interceptor_workers(interceptor_with_store)
+            # close() cancels workers and awaits them before the TicketStore
+            # fixture closes the SQLite DB — prevents "closed database" warnings
+            # from a worker that is still mid-write at teardown.
+            await interceptor_with_store.close()
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
@@ -4278,7 +4281,10 @@ class TestSubmitTaskGuardrail:
                 description='Generic refactor of foo/bar.py',
             )
         finally:
-            await _cancel_interceptor_workers(interceptor_with_store)
+            # close() cancels workers and awaits them before the TicketStore
+            # fixture closes the SQLite DB — prevents "closed database" warnings
+            # from a worker that is still mid-write at teardown.
+            await interceptor_with_store.close()
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
