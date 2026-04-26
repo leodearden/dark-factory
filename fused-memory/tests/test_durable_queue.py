@@ -6,9 +6,11 @@ import asyncio
 import time
 from unittest.mock import AsyncMock
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
+import fused_memory.services.durable_queue as dq_module
 from fused_memory.services.durable_queue import DurableWriteQueue
 
 
@@ -618,6 +620,43 @@ class TestDeleteDead:
 
         assert result['deleted'] == [id_dead_proj1]
         assert sorted(result['not_found']) == sorted([id_dead_proj2, id_pending, id_nonexistent])
+
+    @pytest.mark.asyncio
+    async def test_chunks_large_id_lists_without_param_limit_error(
+        self, queue, monkeypatch
+    ):
+        """Large id lists are processed in chunks without hitting SQLite variable limits.
+
+        Monkeypatches _DELETE_DEAD_BATCH_SIZE to 3 so chunking is exercised with
+        a small fixture set (7 dead rows) instead of thousands of rows.
+        """
+        # Patch batch size to 3 so our 7-row set forces multiple chunks.
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
+
+        # Insert 7 dead rows for proj1.
+        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+
+        # Insert 1 pending row for proj1 and 1 dead row for proj2 (both ineligible).
+        pending_id = await self._insert_pending_row(queue, 'proj1')
+        cross_id = await self._insert_dead_row(queue, 'proj2')
+        nonexistent_id = 999999
+
+        all_input_ids = dead_ids + [pending_id, cross_id, nonexistent_id]
+        result = await queue.delete_dead(group_id='proj1', ids=all_input_ids)
+
+        # All 7 dead proj1 rows must be deleted.
+        assert sorted(result['deleted']) == sorted(dead_ids)
+        # Ineligible ids land in not_found.
+        assert sorted(result['not_found']) == sorted([pending_id, cross_id, nonexistent_id])
+
+        # Physically verify rows are gone.
+        remaining = await queue.get_dead_items(group_id='proj1')
+        remaining_ids = {item['id'] for item in remaining}
+        assert not remaining_ids.intersection(dead_ids)
+
+        # Rows in proj2 are untouched.
+        proj2_items = await queue.get_dead_items(group_id='proj2')
+        assert any(item['id'] == cross_id for item in proj2_items)
 
 
 class TestStats:
