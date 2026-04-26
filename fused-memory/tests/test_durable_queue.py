@@ -841,6 +841,62 @@ class TestDeleteDead:
         assert result['deleted'] == [id1]
         assert result['not_found'] == []
 
+    @pytest.mark.asyncio
+    async def test_recovery_commit_failure_logs_at_error_level_with_traceback(
+        self, queue, monkeypatch, caplog
+    ):
+        """Recovery-commit failure must be logged at ERROR level with a traceback.
+
+        When the recovery commit() after an OperationalError also fails, the
+        function returns a conservative full-retry envelope.  The log record
+        must surface at ERROR level (not WARNING) and must include exc_info so
+        operators see the traceback — distinguishing logger.exception() from
+        logger.error() or logger.warning().
+        """
+        import logging
+
+        id1 = await self._insert_dead_row(queue, 'proj1')
+
+        # Raise OperationalError on any DELETE to trigger the error path.
+        original_execute = queue._db.execute
+
+        async def mock_execute(sql, *args, **kwargs):
+            if 'DELETE' in sql.upper():
+                raise aiosqlite.OperationalError('database is locked')
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+
+        # Also fail the recovery commit so we enter the double-failure branch.
+        async def mock_commit():
+            raise aiosqlite.OperationalError('disk I/O error')
+
+        monkeypatch.setattr(queue._db, 'commit', mock_commit)
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.durable_queue'):
+            result = await queue.delete_dead(group_id='proj1', ids=[id1])
+
+        # Envelope must be the conservative full-retry form.
+        assert result.get('error_type') == 'TransientSqliteError'
+        assert result.get('retriable') is True
+        assert result.get('deleted') == []
+        assert result.get('not_found') == []
+        assert result.get('remaining') == [id1]
+
+        # At least one ERROR-level record about the recovery commit failure.
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR and 'recovery commit failed' in r.getMessage()
+        ]
+        assert error_records, (
+            'Expected at least one ERROR-level log record mentioning recovery commit failure; '
+            f'got records: {[(r.levelno, r.getMessage()) for r in caplog.records]}'
+        )
+        # logger.exception() must capture exc_info (traceback) — not just logger.error().
+        assert error_records[0].exc_info is not None, (
+            'Expected exc_info to be captured (logger.exception), got None'
+        )
+
 
 class TestStats:
     @pytest.mark.asyncio
