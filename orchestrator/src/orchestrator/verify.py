@@ -470,6 +470,9 @@ _DEFAULT_ARCHIVE_MAX_AGE_DAYS = 30
 _DEFAULT_ARCHIVE_MAX_BYTES = 500 * 1024 * 1024
 # Process-local throttle: at most one rglob walk per process per 30 min.
 # Cross-process redundancy is accepted as a cost-only trade-off; see task 1102.
+# Thread-safety: _maybe_prune_archive has no awaits, so concurrent async coroutines
+# cannot interleave the check + update. This is NOT safe for multi-threaded callers
+# (e.g. asyncio.to_thread) without a threading.Lock — add one if that ever changes.
 _PRUNE_THROTTLE_SECS: float = 1800  # 30 minutes
 _LAST_PRUNE_AT: float | None = None
 

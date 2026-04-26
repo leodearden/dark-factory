@@ -3202,8 +3202,6 @@ class TestPruneArchiveThrottle:
 
     def test_call_after_throttle_elapsed_fires_again(self, monkeypatch, tmp_path: Path):
         """After the throttle window elapses, the next call fires ``_prune_archive``."""
-        import time as time_mod  # noqa: PLC0415
-
         from orchestrator import verify  # noqa: PLC0415
         from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
 
@@ -3211,12 +3209,15 @@ class TestPruneArchiveThrottle:
         base_time = 0.0
 
         with patch.object(verify, '_prune_archive') as spy:
-            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time)
+            # Patch via verify.time so the test breaks visibly if verify.py ever
+            # switches to "from time import monotonic" (instead of silently using
+            # real wall-clock time).
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
             _maybe_prune_archive(archive_root)  # first call — fires
 
             # Advance time past the throttle window
             elapsed = _PRUNE_THROTTLE_SECS + 1
-            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time + elapsed)
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
             _maybe_prune_archive(archive_root)  # second call — window elapsed, fires again
 
         assert spy.call_count == 2, (
@@ -3225,8 +3226,6 @@ class TestPruneArchiveThrottle:
 
     def test_third_call_within_new_window_skips(self, monkeypatch, tmp_path: Path):
         """After second fire, the window slides — an immediate third call is throttled."""
-        import time as time_mod  # noqa: PLC0415
-
         from orchestrator import verify  # noqa: PLC0415
         from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
 
@@ -3235,10 +3234,10 @@ class TestPruneArchiveThrottle:
         elapsed = _PRUNE_THROTTLE_SECS + 1
 
         with patch.object(verify, '_prune_archive') as spy:
-            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time)
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
             _maybe_prune_archive(archive_root)  # first fire
 
-            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time + elapsed)
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
             _maybe_prune_archive(archive_root)  # second fire (window elapsed)
 
             # Third call immediately after second — still at the same "elapsed" time
