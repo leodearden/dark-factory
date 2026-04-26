@@ -121,6 +121,8 @@ class Mem0Backend:
         """Search memories in Mem0."""
         instance = await self._get_instance(scope)
         filters: dict | None = None
+        if categories and len(categories) == 1:
+            filters = {'category': categories[0]}
         try:
             return await asyncio.wait_for(
                 instance.search(
