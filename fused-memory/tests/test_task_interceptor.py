@@ -4943,15 +4943,16 @@ class TestPathGuardOrSkip:
         build_calls: list = []
         guard_calls: list = []
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: (
-                guard_calls.append((candidate, kwargs, project_id)), None)[1],
-        )
+        def fake_build(kwargs):
+            build_calls.append(kwargs)
+            return None
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            return None
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         result = interceptor._path_guard_or_skip(
             {'title': 'Edit orchestrator/harness.py'}, 'dark_factory',
@@ -4978,15 +4979,16 @@ class TestPathGuardOrSkip:
         build_calls: list = []
         guard_calls: list = []
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: (build_calls.append(kwargs), built)[1]),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: (
-                guard_calls.append((candidate, kwargs, project_id)), None)[1],
-        )
+        def fake_build(kwargs):
+            build_calls.append(kwargs)
+            return built
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            return None
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         kwargs = {'title': 'Generic refactor'}
         result = interceptor._path_guard_or_skip(kwargs, 'some_other_project')
@@ -5017,15 +5019,16 @@ class TestPathGuardOrSkip:
         build_calls: list = []
         guard_calls: list = []
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: (
-                guard_calls.append((candidate, kwargs, project_id)), None)[1],
-        )
+        def fake_build(kwargs):
+            build_calls.append(kwargs)
+            return None
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            return None
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         kwargs = {'title': 'Generic refactor'}
         result = interceptor._path_guard_or_skip(kwargs, 'some_other_project', candidate=sentinel)
@@ -5047,14 +5050,14 @@ class TestPathGuardOrSkip:
             'matched_paths': ['orchestrator/'],
         }
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: None),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: rejection,
-        )
+        def fake_build(kwargs):
+            return None
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            return rejection
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         result = interceptor._path_guard_or_skip({'prompt': 'something'}, 'some_other_project')
         assert result is rejection
