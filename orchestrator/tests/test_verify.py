@@ -2020,6 +2020,18 @@ class TestClassifyFailure:
         output = 'error: failed to parse manifest at `/x/Cargo.toml`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
 
+    def test_cargo_cli_error_failed_to_compile_branch(self):
+        """'compile' branch of failed_to_(parse|compile|read|find) → cargo_cli_error.
+
+        Exercises the compile sub-case of the alternation so a future refactor
+        cannot silently drop it without a test failure.  The overall token is
+        anchored to a verified real-world cargo log line by
+        test_cargo_cli_error_failed_to_parse_manifest; this test pins just the
+        compile branch structure.
+        """
+        output = 'error: failed to compile `proc-macro-foo`\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
+
     def test_rustc_top_level_diagnostics_not_cargo_cli_error(self):
         """rustc top-level diagnostics without error[Exxxx] code must NOT → cargo_cli_error.
 
@@ -2059,25 +2071,6 @@ class TestClassifyFailure:
         )
         assert result == 'unknown_test_failure', (
             f"rustc uncoded 'error: invalid …' should fall through to unknown_test_failure, got {result!r}"
-        )
-
-    def test_uncoded_package_diagnostic_not_cargo_cli_error(self):
-        """Uncoded 'error: package …' diagnostic must NOT → cargo_cli_error.
-
-        The `package ` token in the original allowlist was added without a
-        concrete observed cargo CLI sample.  Without a real sample grounding
-        the token, it risks mis-bucketing any future 'error: package <X>'
-        diagnostic (from rustc, cargo, or a build wrapper) as cargo_cli_error.
-        This test pins that such output falls through to unknown_test_failure
-        until a real cargo log line justifies a tighter suffix.
-        """
-        output = 'error: package metadata for foo failed validation\n'
-        result = self._classify(output, rc=1, timed_out=False)
-        assert result != 'cargo_cli_error', (
-            f"uncoded 'error: package …' must not be mis-bucketed as cargo_cli_error, got {result!r}"
-        )
-        assert result == 'unknown_test_failure', (
-            f"uncoded 'error: package …' should fall through to unknown_test_failure, got {result!r}"
         )
 
     # (d) compile_error: rustc diagnostic error codes

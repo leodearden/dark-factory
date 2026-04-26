@@ -198,13 +198,10 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     #                     'error: failed to read `/path/Cargo.toml`'
     #   could not find  → 'error: could not find `Cargo.toml` in `/path` or any parent directory'
     #
-    # Intentionally dropped tokens (no grounded cargo CLI sample available):
-    #   `invalid `  — too broad; rustc emits uncoded 'error: invalid <attribute>'
-    #                 diagnostics that would be mis-bucketed as cargo_cli_error.
-    #                 Re-add with a tighter suffix once a real cargo sample turns up.
-    #   `package `  — too broad; no observed cargo CLI sample in this pipeline
-    #                 requires this token.  Re-add with a tighter suffix (e.g.
-    #                 'package \`') once a real cargo log line is observed.
+    # Dropped tokens — no grounded cargo CLI sample available for either:
+    #   `invalid `  — see test_rustc_invalid_diagnostic_not_cargo_cli_error.
+    #   `package `  — re-add with a tighter suffix (e.g. 'package \`') once a
+    #                 real cargo log line is observed.
     (re.compile(
         r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|could not find)',
         re.MULTILINE,
