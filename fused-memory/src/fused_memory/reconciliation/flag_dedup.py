@@ -22,6 +22,38 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+async def dedup_flags(
+    memory_service: Any,
+    project_id: str,
+    run_id: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate Stage 1 flagged items against prior ``stage1_flag_marker`` memories.
+
+    For each flag in *flags*:
+
+    - If the flag has no computable signature (missing ``task_id`` or
+      ``flag_type``), it is returned unchanged — no I/O performed.
+    - If a signature is computable, Mem0 is searched for a prior marker memory
+      with matching ``task_id`` and ``flag_type``.  On a hit the flag is
+      annotated with ``persisted_from_run`` and ``last_seen_run_id``, and a
+      refresh marker is written.  On a miss a new marker is written.
+    - All search/write exceptions are caught and logged at WARNING so that a
+      transient Mem0 outage does not abort the stage run.
+
+    Returns the (possibly annotated) flag list.
+    """
+    result: list[dict[str, Any]] = []
+    for flag in flags:
+        sig = compute_flag_signature(flag)
+        if sig is None:
+            result.append(flag)
+            continue
+        # Placeholder — search/write logic added in later steps
+        result.append(flag)
+    return result
+
+
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     """Return a (task_id_str, flag_type_str) signature for *flag*, or ``None``.
 
