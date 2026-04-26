@@ -166,3 +166,40 @@ async def test_search_kwargs_forwarded():
     assert call_kwargs.get('project_id') == 'p'
     assert call_kwargs.get('categories') == ['observations_and_summaries']
     assert call_kwargs.get('limit') == 37
+
+
+# ---------------------------------------------------------------------------
+# Step 13 — multi-key kind discriminator: ALL keys must match
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_kind_dict_requires_all_keys_to_match():
+    """Returns None when task_id and one kind key match but another kind key does not.
+
+    Locks down AND semantics: all kind keys must match simultaneously.
+    flag_dedup depends on this with kind={'source': 'stage1_flag_marker', 'flag_type': ftype}.
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    # task_id and flag_type match, but source does NOT
+    candidate = _make_memory_result({
+        'task_id': '42',
+        'flag_type': 'foo',
+        'source': 'wrong_source',
+    })
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[candidate])
+
+    result = await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': 'foo', 'source': 'stage1_flag_marker'},
+        query='q',
+    )
+
+    assert result is None, (
+        f'Expected None when source key fails to match but got {result!r}'
+    )
