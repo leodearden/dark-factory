@@ -3435,7 +3435,10 @@ class TestBriefingKnownGapsRefresh:
         mock_proc = MagicMock()
         mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
 
-        with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync.asyncio.create_subprocess_exec',
+            return_value=mock_proc,
+        ), caplog.at_level(
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
@@ -3469,7 +3472,10 @@ class TestBriefingKnownGapsRefresh:
         mock_proc.returncode = 1  # "mismatches found" exit code
         mock_proc.communicate = AsyncMock(return_value=(b'not valid json {', b''))
 
-        with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync.asyncio.create_subprocess_exec',
+            return_value=mock_proc,
+        ), caplog.at_level(
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
@@ -3524,8 +3530,8 @@ class TestBriefingKnownGapsRefresh:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'bogus_result',
-        [None, {'message': 'no id field'}, 'string-not-dict'],
-        ids=['none', 'dict_without_id', 'non_dict'],
+        [None, {'message': 'no id field'}, 'string-not-dict', {'id': None}, {'id': ''}],
+        ids=['none', 'dict_without_id', 'non_dict', 'dict_id_none', 'dict_id_empty'],
     )
     async def test_queue_refresh_tasks_treats_unexpected_shape_as_failure(
         self, bogus_result, caplog,

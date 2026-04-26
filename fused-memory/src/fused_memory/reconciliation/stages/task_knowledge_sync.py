@@ -715,7 +715,7 @@ async def _queue_briefing_refresh_tasks(
                 description=description,
                 metadata=task_metadata,
             )
-            if isinstance(result, dict) and 'id' in result:
+            if isinstance(result, dict) and result.get('id'):
                 created.append(str(result['id']))
             else:
                 logger.warning(
