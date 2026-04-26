@@ -43,7 +43,10 @@ async def find_prior_memory(
         task_id: Task identifier; compared symmetrically as ``str`` on both sides.
         kind: Extra metadata-equality filters (e.g. ``{'transition': 'done'}``).
               Values may be any type — they are str-coerced on both sides of
-              comparison.  ALL keys must match (AND semantics).
+              comparison.  ALL keys must match (AND semantics).  A key that is
+              absent from the row's metadata never matches, even when the filter
+              value is ``''``; only a row that explicitly stores the key with a
+              matching (str-coerced) value satisfies the filter.
         query: Embedding query string forwarded to ``memory_service.search``.
         categories: Optional category list forwarded to ``memory_service.search``
                     to constrain the corpus before similarity ranking.
@@ -73,7 +76,7 @@ async def find_prior_memory(
         meta = r.metadata or {}
         if str(meta.get('task_id', '')) != task_id_str:
             continue
-        if all(str(meta.get(k, '')) == str(v) for k, v in kind.items()):
+        if all(k in meta and str(meta[k]) == str(v) for k, v in kind.items()):
             return r
 
     return None
