@@ -29,6 +29,7 @@ except ImportError:
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.middleware.dark_factory_path_guard import (
     check_candidate_for_dark_factory_paths,
+    check_text_for_dark_factory_paths,
 )
 from fused_memory.middleware.task_curator import (
     CandidateTask,
@@ -1413,6 +1414,14 @@ class TaskInterceptor:
         candidate = self._build_candidate(kwargs)
         if candidate is not None:
             pg_verdict = check_candidate_for_dark_factory_paths(candidate, project_id)
+            if pg_verdict.is_rejection:
+                return pg_verdict.to_error_dict()
+        else:
+            # Prompt-only fallback: _build_candidate returns None when there is no
+            # title (the caller passed a free-form prompt for AI-driven creation).
+            # Scan prompt + title text directly so this path cannot bypass the guard.
+            fallback_text = '\n'.join(str(kwargs.get(k) or '') for k in ('prompt', 'title'))
+            pg_verdict = check_text_for_dark_factory_paths(fallback_text, project_id)
             if pg_verdict.is_rejection:
                 return pg_verdict.to_error_dict()
 
