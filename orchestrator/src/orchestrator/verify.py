@@ -468,6 +468,10 @@ def _archive_attempt_log(
 
 _DEFAULT_ARCHIVE_MAX_AGE_DAYS = 30
 _DEFAULT_ARCHIVE_MAX_BYTES = 500 * 1024 * 1024
+# Process-local throttle: at most one rglob walk per process per 30 min.
+# Cross-process redundancy is accepted as a cost-only trade-off; see task 1102.
+_PRUNE_THROTTLE_SECS: float = 1800  # 30 minutes
+_LAST_PRUNE_AT: float | None = None
 
 
 def _prune_archive(
@@ -527,12 +531,6 @@ def _prune_archive(
                 total -= size
             except OSError as exc:
                 logger.warning('_prune_archive: could not delete %s: %s', path, exc)
-
-
-# Process-local throttle: at most one rglob walk per process per 30 min.
-# Cross-process redundancy is accepted as a cost-only trade-off; see task 1102.
-_PRUNE_THROTTLE_SECS: float = 1800  # 30 minutes
-_LAST_PRUNE_AT: float | None = None
 
 
 def _maybe_prune_archive(archive_root: Path | None) -> bool:
