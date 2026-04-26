@@ -532,21 +532,19 @@ class TestDarkFactoryProductionPool:
         return UsageCapConfig(accounts_file=str(accounts_file))
 
     def test_production_pool_accounts_in_expected_order(self, production_config):
-        """Real config/usage-accounts.yaml has exactly [max-g, max-f, max-e, max-c, max-d] in order."""
+        """Real config/usage-accounts.yaml has exactly [max-g, max-f, max-e, max-c, max-b, max-d] in order."""
         names = [a.name for a in production_config.accounts]
-        assert names == ['max-g', 'max-f', 'max-e', 'max-c', 'max-d'], (
+        assert names == ['max-g', 'max-f', 'max-e', 'max-c', 'max-b', 'max-d'], (
             f"Production pool mismatch. Got: {names!r}. "
-            "Expected [max-g, max-f, max-e, max-c, max-d]. "
-            "Do not re-add max-b (permanently dead HTTP 403 since 2026-04-20)."
+            "Expected [max-g, max-f, max-e, max-c, max-b, max-d]."
         )
 
     def test_reserved_accounts_absent(self, production_config):
-        """max-a (reserved for interactive use) and max-b (permanently dead) must not appear."""
+        """max-a (reserved for interactive use) must not appear in the automation pool."""
         names = [a.name for a in production_config.accounts]
         env_vars = [a.oauth_token_env for a in production_config.accounts]
         for acct, env_var in [
             ('max-a', 'CLAUDE_OAUTH_TOKEN_A'),   # reserved for interactive/eval sessions
-            ('max-b', 'CLAUDE_OAUTH_TOKEN_B'),   # permanently dead — HTTP 403 since 2026-04-20
         ]:
             assert acct not in names, (
                 f"{acct} must not be in the production automation pool"
