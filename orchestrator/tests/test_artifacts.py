@@ -531,6 +531,81 @@ class TestBlockingDependency:
         # And contents must be JSON parseable.
         json.loads(path.read_text())
 
+
+class TestAlreadyDone:
+    """Round-trip and edge-case tests for the architect's
+    ``.task/already_done.json`` artifact."""
+
+    def test_read_returns_none_when_absent(self, artifacts: TaskArtifacts):
+        assert artifacts.read_already_done() is None
+
+    def test_round_trip(self, artifacts: TaskArtifacts):
+        artifacts.write_already_done(
+            commit='abc123def456',
+            evidence='helpers.foo introduced by task 42 (commit abc123)',
+        )
+        data = artifacts.read_already_done()
+        assert data is not None
+        assert data['commit'] == 'abc123def456'
+        assert data['evidence'] == 'helpers.foo introduced by task 42 (commit abc123)'
+        from datetime import datetime
+        datetime.fromisoformat(data['reported_at'])
+
+    def test_clear_removes_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_already_done('sha', 'e')
+        artifacts.clear_already_done()
+        assert artifacts.read_already_done() is None
+
+    def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
+        # No raise even when the artifact doesn't exist.
+        artifacts.clear_already_done()
+        artifacts.clear_already_done()
+
+    def test_write_overwrites_prior_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_already_done('first-sha', 'first evidence')
+        artifacts.write_already_done('second-sha', 'second evidence')
+        data = artifacts.read_already_done()
+        assert data is not None
+        assert data['commit'] == 'second-sha'
+        assert data['evidence'] == 'second evidence'
+
+
+class TestUnactionableTask:
+    """Round-trip and edge-case tests for the architect's
+    ``.task/unactionable_task.json`` artifact."""
+
+    def test_read_returns_none_when_absent(self, artifacts: TaskArtifacts):
+        assert artifacts.read_unactionable_task() is None
+
+    def test_round_trip(self, artifacts: TaskArtifacts):
+        artifacts.write_unactionable_task(
+            reason='spec contradicts already-merged refactor',
+            evidence='task asks to add foo() but task 31 deleted it (commit a1b2c3)',
+        )
+        data = artifacts.read_unactionable_task()
+        assert data is not None
+        assert data['reason'] == 'spec contradicts already-merged refactor'
+        assert 'task 31 deleted it' in data['evidence']
+        from datetime import datetime
+        datetime.fromisoformat(data['reported_at'])
+
+    def test_clear_removes_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_unactionable_task('r', 'e')
+        artifacts.clear_unactionable_task()
+        assert artifacts.read_unactionable_task() is None
+
+    def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
+        artifacts.clear_unactionable_task()
+        artifacts.clear_unactionable_task()
+
+    def test_write_overwrites_prior_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_unactionable_task('first', 'e1')
+        artifacts.write_unactionable_task('second', 'e2')
+        data = artifacts.read_unactionable_task()
+        assert data is not None
+        assert data['reason'] == 'second'
+        assert data['evidence'] == 'e2'
+
     def test_aggregate_reviews_all_errors(self, artifacts: TaskArtifacts):
         artifacts.write_review('reviewer1', {
             'reviewer': 'reviewer1',
