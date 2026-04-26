@@ -188,6 +188,23 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # 'error: manifest path … does not exist') will fall through to
     # unknown_test_failure until added to the allowlist.  Extend when a new
     # cargo CLI failure mode appears in production and needs its own bucket.
+    #
+    # Each retained token is grounded in a real observed cargo CLI log line:
+    #   --              → 'error: --exclude can only be used together with --workspace'
+    #   no such subcommand
+    #                   → 'error: no such subcommand: `tset`'
+    #   failed to (parse|compile|read|find)
+    #                   → 'error: failed to parse manifest at `/path/Cargo.toml`'
+    #                     'error: failed to read `/path/Cargo.toml`'
+    #   could not find  → 'error: could not find `Cargo.toml` in `/path` or any parent directory'
+    #
+    # Intentionally dropped tokens (no grounded cargo CLI sample available):
+    #   `invalid `  — too broad; rustc emits uncoded 'error: invalid <attribute>'
+    #                 diagnostics that would be mis-bucketed as cargo_cli_error.
+    #                 Re-add with a tighter suffix once a real cargo sample turns up.
+    #   `package `  — too broad; no observed cargo CLI sample in this pipeline
+    #                 requires this token.  Re-add with a tighter suffix (e.g.
+    #                 'package \`') once a real cargo log line is observed.
     (re.compile(
         r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|could not find)',
         re.MULTILINE,
