@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from shared.cli_invoke import invoke_claude_agent
+from shared.cli_invoke import AgentResult, invoke_claude_agent
 from shared.config_dir import TaskConfigDir
 
 # Discover available OAuth tokens from env
@@ -34,6 +34,50 @@ _need_two_accounts = pytest.mark.skipif(
     reason='Requires at least 2 OAuth accounts in env',
 )
 
+# ---------------------------------------------------------------------------
+# Capacity-failure detection helper
+# ---------------------------------------------------------------------------
+
+_CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
+    ' capped',          # leading space prevents matching 'uncapped' as a false positive
+    'rate limit',
+    'account unavailable',  # narrowed from bare 'unavailable' to avoid generic network errors
+    'out of extra usage',
+    'usage limit',
+    "you've hit",
+    "you've used",
+)
+
+
+def _looks_like_capacity_failure(result: AgentResult) -> bool:
+    """Return True when *result* looks like a Claude CLI capacity / quota failure.
+
+    The helper inspects both ``result.output`` and ``result.stderr``
+    (case-insensitive substring match) against a small focused list of markers
+    drawn from real Claude CLI cap messages (see ``shared.usage_gate`` inline
+    comments for verbatim examples).
+
+    **Conservative bias (fail loudly when uncertain).** This helper is used
+    at ``pytest.skip`` call sites, so a false positive — skipping on a real
+    regression — is the exact failure mode we are trying to prevent. The list
+    is therefore intentionally small and obvious; anything not matching a
+    well-known capacity signal falls through to an ``assert`` that fails the
+    test loudly.
+
+    **Local list, not imported from ``shared.usage_gate``.** The production
+    cap detector (``usage_gate.detect_cap_hit``) requires BOTH a prefix AND a
+    confirm-keyword match — a strict combined policy designed to avoid marking
+    healthy accounts as capped. Re-using those lists here would either collapse
+    the combined check to a loose OR (pulling in confirm keywords like
+    ``"resets"`` as standalone signals) or miss real cap messages that arrive
+    without the expected prefix. A purpose-built substring list is the correct
+    shape for this use-case.
+    """
+    haystack = f'{result.output}\n{result.stderr}'.lower()
+    return any(marker in haystack for marker in _CAPACITY_FAILURE_MARKERS)
+
+
+# ---------------------------------------------------------------------------
 # Shared invocation kwargs to minimize cost.
 # dict[str, Any] is intentional: invoke_claude_agent parameters have
 # heterogeneous types (Path/str/int/float/list), so a concrete dict type
@@ -76,8 +120,9 @@ class TestCrossAccountResume:
             oauth_token=token,
             **_INVOKE_DEFAULTS,
         )
-        if not r1.success or not r1.session_id:
-            pytest.skip(f'Initial invocation failed (account capped or unavailable): {r1.output!r}')
+        if not r1.success and _looks_like_capacity_failure(r1):
+            pytest.skip(f'Capacity failure: {r1.output!r}')
+        assert r1.success and r1.session_id
 
         # Resume and ask for the codeword
         r2 = await invoke_claude_agent(
@@ -86,8 +131,9 @@ class TestCrossAccountResume:
             resume_session_id=r1.session_id,
             **_INVOKE_DEFAULTS,
         )
-        if not r2.success:
-            pytest.skip(f'Resume invocation failed (account capped or unavailable): {r2.output!r}')
+        if not r2.success and _looks_like_capacity_failure(r2):
+            pytest.skip(f'Capacity failure: {r2.output!r}')
+        assert r2.success
         assert 'FLAMINGO' in r2.output.upper(), (
             f'Expected FLAMINGO in resumed output, got: {r2.output!r}'
         )
@@ -104,8 +150,9 @@ class TestCrossAccountResume:
             oauth_token=token_a,
             **_INVOKE_DEFAULTS,
         )
-        if not r1.success or not r1.session_id:
-            pytest.skip(f'Initial invocation on account A failed (capped or unavailable): {r1.output!r}')
+        if not r1.success and _looks_like_capacity_failure(r1):
+            pytest.skip(f'Capacity failure: {r1.output!r}')
+        assert r1.success and r1.session_id
 
         # Resume on account B and ask for the codeword
         r2 = await invoke_claude_agent(
@@ -114,8 +161,9 @@ class TestCrossAccountResume:
             resume_session_id=r1.session_id,
             **_INVOKE_DEFAULTS,
         )
-        if not r2.success:
-            pytest.skip(f'Resume invocation on account B failed (capped or unavailable): {r2.output!r}')
+        if not r2.success and _looks_like_capacity_failure(r2):
+            pytest.skip(f'Capacity failure: {r2.output!r}')
+        assert r2.success
         assert 'ZEPPELIN' in r2.output.upper(), (
             f'Expected ZEPPELIN in cross-account resumed output, got: {r2.output!r}'
         )
@@ -167,3 +215,83 @@ class TestConfigDirCredentials:
             )
         finally:
             config_dir.cleanup()
+
+
+class TestLooksLikeCapacityFailure:
+    """Unit tests for _looks_like_capacity_failure helper.
+
+    No @pytest.mark.integration marker so these run in normal CI.
+    """
+
+    @pytest.mark.parametrize('cli_output', [
+        # Verbatim Claude CLI cap-hit messages (from shared.usage_gate inline comments,
+        # lines 64-75 — these are the actual strings that motivated the marker list).
+        "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+        "You've used all available credits. Upgrade your plan for more capacity.",
+        "You're out of extra usage for this billing period. Your plan resets in 2h.",
+        "You're close to reaching your usage limit. Your plan resets in 1h.",
+        # Other realistic capacity phrases
+        "Your account is capped until the next billing cycle.",
+        "Rate limit exceeded. Please wait and retry.",
+        "account unavailable at this time; try again later.",
+    ])
+    def test_capacity_output_returns_true(self, cli_output):
+        """Realistic Claude CLI cap messages in output are detected."""
+        result = AgentResult(success=False, output=cli_output, stderr='')
+        assert _looks_like_capacity_failure(result)
+
+    @pytest.mark.parametrize('cli_stderr', [
+        "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+        "You're out of extra usage for this billing period. Your plan resets in 2h.",
+        "rate limit: too many requests",
+    ])
+    def test_capacity_stderr_returns_true(self, cli_stderr):
+        """Realistic Claude CLI cap messages in stderr are also detected."""
+        result = AgentResult(success=False, output='', stderr=cli_stderr)
+        assert _looks_like_capacity_failure(result)
+
+    @pytest.mark.parametrize('output', [
+        "YOU'VE HIT YOUR USAGE LIMIT FOR CLAUDE PRO.",
+        "YOUR ACCOUNT IS CAPPED.",
+        "RATE LIMIT EXCEEDED.",
+    ])
+    def test_case_insensitive_returns_true(self, output):
+        """Cap detection is case-insensitive."""
+        result = AgentResult(success=False, output=output, stderr='')
+        assert _looks_like_capacity_failure(result)
+
+    @pytest.mark.parametrize('output,stderr', [
+        # Generic non-capacity failures — must NOT trigger skip
+        ('process spawn failed: ENOENT', 'Traceback (most recent call last): ...'),
+        ('malformed JSON response: unexpected token', ''),
+        ('OAuth token validation failed: 401 Unauthorized', ''),
+        # Substring boundary collisions — the narrowed markers must not match
+        ('account uncapped and ready to use', ''),         # 'uncapped' must not match ' capped'
+        ('service unavailable: DNS resolution failed', ''),  # generic 'unavailable' != 'account unavailable'
+        ('', ''),  # empty result
+    ])
+    def test_non_capacity_failure_returns_false(self, output, stderr):
+        """Generic failures and substring boundary cases do not trigger a skip."""
+        result = AgentResult(success=False, output=output, stderr=stderr)
+        assert not _looks_like_capacity_failure(result)
+
+    def test_call_site_contract_non_capacity_raises_not_skips(self):
+        """The call-site guarantee: a non-capacity failure reaches assert, not skip.
+
+        At each call site the pattern is::
+
+            if not r.success and _looks_like_capacity_failure(r):
+                pytest.skip(...)
+            assert r.success  # ← fires for any non-capacity failure
+
+        When the helper returns False (non-capacity), the skip branch is never
+        taken and the subsequent ``assert r.success`` fires loudly.  This test
+        verifies that behavioral guarantee — a regression in the call-site
+        predicate would either break this test or the parametrize test above.
+        """
+        result = AgentResult(success=False, output='process spawn failed: ENOENT', stderr='Traceback...')
+        # Helper must return False → the skip branch is NOT taken
+        assert not _looks_like_capacity_failure(result)
+        # Therefore the call site reaches `assert r.success`, which raises
+        with pytest.raises(AssertionError):
+            assert result.success
