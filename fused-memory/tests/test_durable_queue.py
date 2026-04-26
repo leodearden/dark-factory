@@ -1001,6 +1001,7 @@ class TestDeleteDead:
 
                 # (6) Run delete_dead — chunk-2 DELETE hits real SQLITE_BUSY.
                 result = await q.delete_dead(group_id='proj1', ids=dead_ids)
+                assert delete_call_count >= 2, 'chunk-2 DELETE must have been attempted to produce a real SQLITE_BUSY'
 
                 # (7) Release conn2's write lock before the context manager closes it.
                 await conn2.rollback()
