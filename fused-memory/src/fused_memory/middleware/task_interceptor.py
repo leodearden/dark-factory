@@ -931,7 +931,11 @@ class TaskInterceptor:
         ``details`` from *kwargs* and delegates to
         :func:`check_text_for_dark_factory_paths`.  All four free-form text
         fields are included so that a path hidden in any of them cannot bypass
-        the guard.
+        the guard.  The prompt-only fallback also scans
+        ``metadata['files_to_modify']`` and ``metadata['modules']`` (via
+        :meth:`_extract_meta_files`) for parity with the title-bearing branch
+        — closing the same residual-leak class that task 1094 fixed in the
+        title-bearing path.
 
         Returns the structured error dict on rejection, or ``None`` when the
         submission is allowed.  Call-sites pattern:
@@ -943,6 +947,9 @@ class TaskInterceptor:
             text = '\n'.join(
                 str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
             )
+            meta_files = self._extract_meta_files(kwargs)
+            if meta_files:
+                text = text + '\n' + '\n'.join(meta_files)
             v = check_text_for_dark_factory_paths(text, project_id)
         return v.to_error_dict() if v.is_rejection else None
 
