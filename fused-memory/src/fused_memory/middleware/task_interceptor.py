@@ -27,6 +27,9 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
+from fused_memory.middleware.dark_factory_path_guard import (
+    check_candidate_for_dark_factory_paths,
+)
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -1404,6 +1407,15 @@ class TaskInterceptor:
 
         project_id = resolve_project_id(project_root)
 
+        # Path-scope guard: reject before persisting if the candidate references
+        # dark-factory module paths but is being filed into a different project.
+        # Placed before kwargs.pop('metadata') so _build_candidate can read metadata.
+        candidate = self._build_candidate(kwargs)
+        if candidate is not None:
+            pg_verdict = check_candidate_for_dark_factory_paths(candidate, project_id)
+            if pg_verdict.is_rejection:
+                return pg_verdict.to_error_dict()
+
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
         # No default=str: non-JSON-native values (e.g. datetime, Path, enum)
@@ -2453,6 +2465,12 @@ class TaskInterceptor:
             return err
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
+        # Path-scope guard: reject before acquiring the curator lock so a
+        # mis-filed task never touches the lock, ticket store, or curator.
+        if candidate is not None:
+            _pg_verdict = check_candidate_for_dark_factory_paths(candidate, project_id)
+            if _pg_verdict.is_rejection:
+                return _pg_verdict.to_error_dict()
         # curator_lock across curator.curate + note_created/record_task;
         # write_lock acquired internally for the brief tm.add_subtask call.
         async with self._curator_lock(project_id):
