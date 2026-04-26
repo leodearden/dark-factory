@@ -1864,6 +1864,87 @@ class TestTaskFailureEscalation:
         assert 'error: --exclude' in esc.detail
         assert '## Failure Cause' in esc.detail
 
+    async def test_verify_exhausted_escalation_carries_log_paths_and_tail(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Escalation detail includes ## Verify Logs section with worktree and archive paths."""
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        # Build a long test output (50+ lines) with FAILED to trigger ## Test Failures section
+        long_lines = [f'test line {i}: some output' for i in range(50)]
+        long_lines.append('test::my_failing_test FAILED')
+        long_test_output = '\n'.join(long_lines)
+
+        wt_path = '/tmp/wt/.task/verify/attempt-1.test.log'
+        arch_path = '/tmp/data/verify-logs/42/attempt-1-20260426T120000Z.log'
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=False,
+                test_output=long_test_output,
+                lint_output='',
+                type_output='',
+                summary='Failures: tests failed',
+                cause_hint='error: --exclude can only be used together with --workspace',
+                category='cargo_cli_error',
+                worktree_log_paths=[wt_path],
+                archive_log_paths=[arch_path],
+            )),
+        )
+
+        config_strict = OrchestratorConfig(
+            project_root=config.project_root,
+            max_verify_attempts=1,
+            git=config.git,
+        )
+        workflow.config = config_strict
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        l0 = queue.get_by_task('42', level=0)
+        assert len(l0) == 1
+        esc = l0[0]
+        assert esc.category == 'task_failure'
+        assert 'Verification attempts exhausted' in esc.summary
+
+        detail = esc.detail
+
+        # (a) ## Failure Cause section must be present (existing)
+        assert '## Failure Cause' in detail, f'Missing ## Failure Cause:\n{detail[:500]!r}'
+
+        # (b) ## Verify Logs section must be present
+        assert '## Verify Logs' in detail, f'Missing ## Verify Logs:\n{detail[:500]!r}'
+
+        # (c) worktree log path must appear in detail
+        assert wt_path in detail, f'Worktree path {wt_path!r} missing from detail:\n{detail[:500]!r}'
+
+        # (d) archive log path must appear in detail
+        assert arch_path in detail, f'Archive path {arch_path!r} missing from detail:\n{detail[:500]!r}'
+
+        # (e) at least 30 lines from the test_output blob in the detail
+        # The failure_report() includes the last 3000 chars of test_output.
+        # Our output is short so all 51 lines should appear.
+        detail_lines_from_output = [
+            line for line in long_lines if line in detail
+        ]
+        assert len(detail_lines_from_output) >= 30, (
+            f'Expected at least 30 lines from test_output in detail; '
+            f'found {len(detail_lines_from_output)}:\n{detail[:500]!r}'
+        )
+
+        # (f) category 'cargo_cli_error' surfaces somewhere in the body
+        assert 'cargo_cli_error' in detail, (
+            f'"cargo_cli_error" missing from escalation detail:\n{detail[:500]!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: Corrupted Iteration Log Escalation
