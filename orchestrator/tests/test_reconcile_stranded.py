@@ -575,6 +575,75 @@ class TestReconcileStrandedInProgress:
         # cleanup_worktree must NOT have been called
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_already_merged_takes_precedence_over_stale_lock(
+        self, harness: Harness, monkeypatch
+    ):
+        """Placement-precedence regression lock: is_ancestor guard fires BEFORE
+        the stale-lock analysis.
+
+        A task with a stale plan.lock AND is_ancestor=True must take the done
+        path (no cleanup, no pending revert, plan.lock survives). This test
+        would fail if a future refactor moved the guard below the lock analysis.
+        """
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'51': 'in-progress'}, None
+        )
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+
+        # Create a worktree with a stale plan.lock (dead PID)
+        lock_dir = harness.git_ops.worktree_base / '51' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '51-dead',
+            'locked_at': '2026-01-01T00:00:00+00:00',
+            'owner_pid': 99999,
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Must be marked done, NOT reverted to pending
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '51', 'done',
+            done_provenance={
+                'note': 'reconcile: branch already on main when stranded in-progress',
+            },
+        )
+
+        # No cleanup_worktree call — guard short-circuits before stale-lock cleanup
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+        # plan.lock must still exist — stale-lock branch was bypassed entirely
+        assert lock_path.exists(), 'plan.lock must survive when the is_ancestor guard fires'
+
+    async def test_is_ancestor_not_invoked_for_non_in_progress_tasks(
+        self, harness: Harness
+    ):
+        """Placement-efficiency regression lock: is_ancestor is never called
+        when there are no in-progress tasks.
+
+        Proves the guard sits below the `if status != 'in-progress': continue`
+        filter and does not waste git invocations on non-in-progress tasks.
+        """
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {
+                '60': 'pending',
+                '61': 'done',
+                '62': 'blocked',
+                '63': 'cancelled',
+                '64': 'review',
+            },
+            None,
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        # is_ancestor must never be called (no in-progress tasks)
+        harness.git_ops.is_ancestor.assert_not_called()  # type: ignore[attr-defined]
+        # No status changes either
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
