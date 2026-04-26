@@ -4,9 +4,9 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # compute_flag_signature tests (step-1)
@@ -202,6 +202,7 @@ async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
     and logs a WARNING.
     """
     import logging
+
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
@@ -235,6 +236,7 @@ async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog)
     and logs a WARNING.
     """
     import logging
+
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
