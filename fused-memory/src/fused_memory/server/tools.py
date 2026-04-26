@@ -1211,6 +1211,11 @@ def create_mcp_server(
         """
         if err := validate_project_id(project_id):
             return err
+        if not all(isinstance(i, int) for i in ids):
+            return {
+                'error': 'ids must be integers (event_queue UUIDs are not supported)',
+                'error_type': 'ValidationError',
+            }
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
