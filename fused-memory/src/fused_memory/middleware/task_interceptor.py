@@ -854,6 +854,35 @@ class TaskInterceptor:
             logger.warning('task_curator: _maybe_backfill_corpus raised', exc_info=True)
 
     @staticmethod
+    def _extract_meta_files(kwargs: dict[str, Any]) -> list[str]:
+        """Extract metadata-supplied file/module list from add_task / add_subtask kwargs.
+
+        Reads ``kwargs['metadata']`` (which may be a dict, a JSON string, or
+        missing/non-dict), prefers ``files_to_modify`` over ``modules``, and
+        coerces the result to a list of non-empty strings. Returns ``[]`` if
+        metadata is missing, malformed, or yields no entries.
+
+        Used in two places to keep the title-bearing and prompt-only path-guard
+        branches in lockstep on which metadata keys feed the guard:
+          - ``_build_candidate`` (title-bearing branch, populates
+            ``CandidateTask.files_to_modify``)
+          - ``_path_guard_error`` prompt-only fallback branch (extends the
+            joined text passed to ``check_text_for_dark_factory_paths``)
+        """
+        meta = kwargs.get('metadata') or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        files = meta.get('files_to_modify') or meta.get('modules') or []
+        if isinstance(files, str):
+            files = [files]
+        return [str(f) for f in files if f]
+
+    @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
         """Extract a CandidateTask from add_task / add_subtask kwargs.
 
@@ -873,10 +902,7 @@ class TaskInterceptor:
         if not isinstance(meta, dict):
             meta = {}
 
-        files = meta.get('files_to_modify') or meta.get('modules') or []
-        if isinstance(files, str):
-            files = [files]
-        files = [str(f) for f in files if f]
+        files = TaskInterceptor._extract_meta_files(kwargs)
 
         return CandidateTask(
             title=title,
