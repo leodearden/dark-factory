@@ -145,19 +145,77 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
 
     # (b) search was called once with project_id='p' and a query mentioning task_id and flag_type
     memory_service.search.assert_called_once()
-    search_call_kwargs = memory_service.search.call_args
-    # Accept both positional and keyword call styles
-    call_kwargs = search_call_kwargs.kwargs if search_call_kwargs.kwargs else {}
-    call_args = search_call_kwargs.args if search_call_kwargs.args else ()
-    # project_id should be 'p'
-    assert call_kwargs.get('project_id') == 'p' or (len(call_args) >= 2 and 'p' in call_args)
-    # query should mention 'task' and '42' and 'missing_deliverable'
-    query = call_kwargs.get('query') or (call_args[0] if call_args else '')
-    assert 'task' in query.lower() or '42' in query
-    assert '42' in query or 'missing_deliverable' in query
+    # project_id must be passed as a kwarg (production code uses kwargs throughout)
+    assert memory_service.search.call_args.kwargs['project_id'] == 'p'
+    # query must strictly mention both the task_id and the flag_type (no permissive 'or')
+    query = memory_service.search.call_args.kwargs.get('query', '')
+    assert '42' in query and 'missing_deliverable' in query
 
     # (c) No refresh write — the prior marker is sufficient; skipping avoids N*M accumulation
     memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
+    """When Mem0 search returns rows matching task_id but with wrong source or wrong
+    flag_type, the metadata predicate filters them all out, so the flag is treated as
+    fresh: not annotated, and a new stage1_flag_marker is written.
+
+    Regression coverage for flag_dedup.py:77-86 — without this test, dropping the
+    source/flag_type guards from the kind dict passed to find_prior_memory would
+    silently start treating cross-source rows as prior markers.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    # Three rows whose task_id matches but whose source and/or flag_type do not.
+    # They exercise both clauses of the kind conjunction independently:
+    wrong_source = _make_memory_result({
+        'source': 'targeted_reconciliation',  # wrong source
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+    })
+    wrong_flag_type = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'stale_metadata',  # wrong flag_type
+    })
+    both_wrong = _make_memory_result({
+        'source': 'other',  # wrong source
+        'task_id': '42',
+        'flag_type': 'unrelated',  # wrong flag_type
+    })
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[wrong_source, wrong_flag_type, both_wrong])
+    memory_service.add_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # Predicate rejected all rows — flag NOT annotated as prior-seen
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0], (
+        'Predicate should have filtered all non-matching rows; flag must not be annotated'
+    )
+
+    # No-prior-marker write path exercised: a new marker is written
+    memory_service.add_memory.assert_called_once()
+    add_kwargs = memory_service.add_memory.call_args.kwargs
+    meta = add_kwargs.get('metadata', {})
+    assert meta.get('source') == 'stage1_flag_marker'
+    assert meta.get('task_id') == '42'
+    assert meta.get('flag_type') == 'missing_deliverable'
+    assert meta.get('run_id') == 'r1'
+    assert meta.get('last_seen_run_id') == 'r1'
+
+    # Exactly one search per flag
+    memory_service.search.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

@@ -3853,6 +3853,74 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
         assert content == 'Done write without task_id'
 
     @pytest.mark.asyncio
+    async def test_metadata_predicate_filters_wrong_transition(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """When the dedup search returns rows matching task_id='517' but with
+        transition != 'done' (or missing entirely), the predicate filters them all out,
+        so the deferred completion-summary write proceeds via add_memory.
+
+        Regression coverage for harness.py:460-476 — without this test, dropping the
+        transition guard from the kind dict passed to find_prior_memory would silently
+        start skipping legitimate writes whenever any past row for the task existed.
+        """
+        from unittest.mock import MagicMock
+
+        # Three rows whose task_id matches but whose transition value is wrong.
+        # They exercise the clause independently and include the missing-key path.
+        blocked_result = MagicMock()
+        blocked_result.metadata = {
+            'task_id': '517',
+            'transition': 'blocked',
+            'source': 'targeted_reconciliation',
+        }
+        cancelled_result = MagicMock()
+        cancelled_result.metadata = {
+            'task_id': '517',
+            'transition': 'cancelled',
+            'source': 'targeted_reconciliation',
+        }
+        no_transition_result = MagicMock()
+        no_transition_result.metadata = {
+            'task_id': '517',
+            'source': 'targeted_reconciliation',
+            # transition key absent — exercises the dict.get('transition', '') default
+        }
+
+        mock_memory_service.search = AsyncMock(
+            return_value=[blocked_result, cancelled_result, no_transition_result]
+        )
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            "Task 'X' completed. Summary here.",
+            'observations_and_summaries',
+            {
+                'task_id': '517',
+                'transition': 'done',
+                'source': 'targeted_reconciliation',
+                '_deferred': True,
+            },
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # (a) search WAS called — transition='done' AND tid present, so dedup branch entered
+        mock_memory_service.search.assert_called_once()
+
+        # (b) add_memory WAS called — predicate filtered all rows out, write proceeds
+        mock_memory_service.add_memory.assert_called_once()
+        call_content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert call_content == "Task 'X' completed. Summary here."
+
+        # (c) the deferred row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0, f'Expected no remaining rows but got {len(remaining)}'
+
+    @pytest.mark.asyncio
     async def test_no_prior_match_falls_through_to_add_memory(
         self, journal, event_buffer, mock_memory_service
     ):
