@@ -1410,12 +1410,11 @@ class TaskInterceptor:
         # Path-scope guard: reject before persisting if the candidate references
         # dark-factory module paths but is being filed into a different project.
         # Placed before kwargs.pop('metadata') so _build_candidate can read metadata.
-        if (_candidate := self._build_candidate(kwargs)) and (
-            _pg_verdict := check_candidate_for_dark_factory_paths(
-                _candidate, project_id
-            )
-        ).is_rejection:
-            return _pg_verdict.to_error_dict()
+        candidate = self._build_candidate(kwargs)
+        if candidate is not None:
+            pg_verdict = check_candidate_for_dark_factory_paths(candidate, project_id)
+            if pg_verdict.is_rejection:
+                return pg_verdict.to_error_dict()
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
