@@ -268,6 +268,17 @@ async def test_dedup_flags_no_prior_marker_writes_new_marker():
 async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
     """When memory_service.search raises, dedup_flags does not raise, returns flags unchanged,
     and logs a WARNING.
+
+    Also pins the post-refactor marker-growth behavior: when search fails,
+    find_prior_memory swallows the exception and returns None, so dedup_flags
+    falls into the else-branch and writes one new marker per flag (was: zero in
+    the prior wrap-both pattern where both search and add_memory shared a single
+    try/except).  See flag_dedup.py:106-113 for the caveat about monotonic marker
+    growth during a sustained outage.
+
+    The assertions (d) and (e) below lock down this contract so a future refactor
+    cannot silently flip the count in either direction (zero if the wrap-both
+    pattern is restored, or >1 if a refresh write is added on top).
     """
     import logging
 
@@ -296,6 +307,21 @@ async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
         '55' in record.message and record.levelno >= logging.WARNING
         for record in caplog.records
     )
+    # (d) Exactly one marker write per recurring flag when search fails — pins the
+    #     post-refactor marker-growth behavior.  Catches: zero writes (wrap-both
+    #     try/except restored) or multiple writes (extra refresh write added).
+    memory_service.add_memory.assert_called_once()
+    # (e) Marker is correctly shaped on the failure path — mirrors the success-path
+    #     assertions in test_dedup_flags_no_prior_marker_writes_new_marker so a
+    #     malformed-on-outage marker is also caught.
+    add_call_kwargs = memory_service.add_memory.call_args.kwargs
+    assert add_call_kwargs.get('category') == 'observations_and_summaries'
+    meta = add_call_kwargs.get('metadata', {})
+    assert meta.get('source') == 'stage1_flag_marker'
+    assert meta.get('task_id') == '55'
+    assert meta.get('flag_type') == 'stale_metadata'
+    assert meta.get('run_id') == 'r1'
+    assert meta.get('last_seen_run_id') == 'r1'
 
 
 # ---------------------------------------------------------------------------
