@@ -672,6 +672,55 @@ class GitOps:
         )
         return sha if rc == 0 else None
 
+    async def find_merge_marker(self, branch: str) -> str | None:
+        """Search main's history for a merge commit whose subject matches
+        ``Merge {branch} into {main_branch}``.
+
+        This is the companion check to ``is_ancestor`` for the case where the
+        branch ref has already been deleted (e.g., ``cleanup_worktree`` ran
+        after ``advance_main`` but before ``set_task_status('done')``).
+
+        **Branch-existence gate**: calls ``resolve_branch_sha(branch)`` first.
+        If it returns non-None the branch still exists, so this method returns
+        None immediately — the caller should rely on ``is_ancestor`` instead.
+        This prevents finding a stale merge marker from a *previous* run of a
+        re-opened task that shared the same branch name.
+
+        **Subject pattern**: ``^Merge {branch} into `` (with a trailing space
+        and ``into ``).  The ``^`` anchor + trailing `` into `` guarantee that
+        ``task/1`` does NOT match ``Merge task/10 into main`` (substring-safety).
+        The subject format is written by ``merge_to_main`` at line 755:
+        ``f'Merge {full_branch} into {self.config.main_branch}'``.
+
+        Args:
+            branch: Full prefixed branch name, e.g. ``'task/123'``.
+                    Same convention as ``is_ancestor`` and ``resolve_branch_sha``.
+
+        Returns:
+            The 40-char merge commit SHA on success, or None when the branch
+            still exists, the branch never existed, or no matching marker was
+            found on main.
+        """
+        # Gate: if the branch ref still exists, caller should use is_ancestor.
+        if await self.resolve_branch_sha(branch) is not None:
+            return None
+
+        # Branch is gone — search main for a merge commit with the expected subject.
+        # The trailing space + 'into ' anchors against substring collisions.
+        grep_pattern = f'^Merge {branch} into '
+        rc, out, _ = await _run(
+            [
+                'git', 'log', self.config.main_branch,
+                f'--grep={grep_pattern}',
+                '--max-count=1',
+                '--format=%H',
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not out:
+            return None
+        return out
+
     async def rebase_onto_main(self, worktree: Path) -> bool:
         """Rebase the task branch in *worktree* onto current main.
 
