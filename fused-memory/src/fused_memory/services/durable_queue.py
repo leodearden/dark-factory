@@ -420,7 +420,7 @@ class DurableWriteQueue:
         self,
         group_id: str,
         ids: list[int],
-    ) -> dict[str, list[int]]:
+    ) -> dict[str, Any]:
         """Delete specific dead-lettered items by id.
 
         Only rows with ``status='dead'`` that belong to ``group_id`` are
@@ -431,12 +431,30 @@ class DurableWriteQueue:
         :data:`_DELETE_DEAD_BATCH_SIZE` so callers can pass arbitrarily many
         ids without hitting SQLite's SQLITE_MAX_VARIABLE_NUMBER limit.
 
+        **Success envelope**::
+
+            {'deleted': [<sorted ids removed>], 'not_found': [<sorted ids missed>]}
+
+        **Transient-error envelope** (returned, not raised, on
+        ``aiosqlite.OperationalError`` — e.g. database is locked, disk full)::
+
+            {
+                'error':      '<original exception message>',
+                'error_type': 'TransientSqliteError',
+                'retriable':  True,
+                'deleted':    [<ids successfully deleted before the error>],
+                'remaining':  [<ids not yet attempted or failed>],
+            }
+
+        Programmer-bug exceptions (``ProgrammingError``, ``IntegrityError``)
+        are NOT caught and propagate to the caller.
+
         Args:
             group_id: Project scope — only dead rows in this group are deleted.
             ids: Integer row ids to delete.  Any size list is accepted.
 
         Returns:
-            ``{'deleted': [<sorted ids removed>], 'not_found': [<sorted ids missed>]}``
+            Success or transient-error envelope as described above.
         """
         if not ids:
             return {'deleted': [], 'not_found': []}
@@ -451,13 +469,23 @@ class DurableWriteQueue:
             # The WHERE guards (status='dead', group_id=?) are enforced atomically so
             # a concurrent replay or worker cannot slip a row past the eligibility check
             # between a separate SELECT and DELETE.
-            cursor = await self._db.execute(
-                f"DELETE FROM write_queue "
-                f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
-                f"RETURNING id",
-                (*chunk, group_id),
-            )
-            rows = await cursor.fetchall()
+            try:
+                cursor = await self._db.execute(
+                    f"DELETE FROM write_queue "
+                    f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
+                    f"RETURNING id",
+                    (*chunk, group_id),
+                )
+                rows = await cursor.fetchall()
+            except aiosqlite.OperationalError as exc:
+                await self._db.commit()
+                return {
+                    'error': str(exc),
+                    'error_type': 'TransientSqliteError',
+                    'retriable': True,
+                    'deleted': sorted(deleted),
+                    'remaining': sorted(set(ids) - deleted),
+                }
             deleted |= {
                 (row[0] if isinstance(row, tuple) else row['id']) for row in rows
             }
