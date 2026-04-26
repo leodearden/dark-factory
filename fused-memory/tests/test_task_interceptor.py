@@ -180,7 +180,7 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     """
     import json
 
-    metadata = {'source': 'review-cycle', 'modules': ['fused-memory/src']}
+    metadata = {'source': 'review-cycle', 'modules': ['my-project/src']}
     result = await _submit_and_resolve(interceptor_facade, '/project', prompt='Test', metadata=metadata)
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
@@ -4565,3 +4565,396 @@ class TestAddSubtaskGuardrail:
             f'Field {field!r}: expected fused-memory/ or fused_memory/ in matched_paths: {result}'
         )
         taskmaster.add_subtask.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for TaskInterceptor._extract_meta_files
+# ---------------------------------------------------------------------------
+
+
+class TestExtractMetaFiles:
+    """Unit tests for the TaskInterceptor._extract_meta_files static helper."""
+
+    def test_exists(self):
+        """The helper must be a staticmethod on TaskInterceptor."""
+        assert hasattr(TaskInterceptor, '_extract_meta_files'), (
+            '_extract_meta_files not found on TaskInterceptor'
+        )
+
+    def test_dict_metadata_files_to_modify(self):
+        """dict metadata with files_to_modify → returns the list verbatim."""
+        kwargs = {'metadata': {'files_to_modify': ['orchestrator/harness.py', 'src/foo.py']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['orchestrator/harness.py', 'src/foo.py']
+
+    def test_dict_metadata_modules_only(self):
+        """dict metadata with only modules → returns modules (fallback)."""
+        kwargs = {'metadata': {'modules': ['fused-memory/src', 'orchestrator/']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['fused-memory/src', 'orchestrator/']
+
+    def test_dict_metadata_both_keys_prefers_files_to_modify(self):
+        """dict metadata with BOTH keys → returns files_to_modify (precedence over modules)."""
+        kwargs = {'metadata': {
+            'files_to_modify': ['a.py'],
+            'modules': ['module_a'],
+        }}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['a.py']
+
+    def test_dict_metadata_scalar_string_coerced_to_list(self):
+        """dict metadata with files_to_modify as a string → coerced to single-element list."""
+        kwargs = {'metadata': {'files_to_modify': 'orchestrator/harness.py'}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['orchestrator/harness.py']
+
+    def test_json_string_metadata_parsed(self):
+        """JSON string metadata → parsed and files_to_modify extracted."""
+        import json as _json
+        meta_str = _json.dumps({'files_to_modify': ['orchestrator/harness.py']})
+        kwargs = {'metadata': meta_str}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['orchestrator/harness.py']
+
+    def test_malformed_json_string_returns_empty(self):
+        """Malformed JSON string metadata → returns []."""
+        kwargs = {'metadata': '{not valid json}'}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_none_metadata_returns_empty(self):
+        """metadata=None → returns []."""
+        kwargs = {'metadata': None}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_missing_metadata_key_returns_empty(self):
+        """Missing metadata key → returns []."""
+        kwargs = {}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_non_dict_metadata_list_returns_empty(self):
+        """Non-dict metadata (e.g. list) → returns []."""
+        kwargs = {'metadata': ['some', 'list']}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_falsy_entries_filtered_out(self):
+        """Falsy entries ('', None) inside the list → filtered out."""
+        kwargs = {'metadata': {'files_to_modify': ['', None, 'src/bar.py', '']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['src/bar.py']
+
+    def test_non_string_entries_str_coerced(self):
+        """Non-string truthy entries → str-coerced."""
+        kwargs = {'metadata': {'files_to_modify': [42, 'src/foo.py']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['42', 'src/foo.py']
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — prompt-only fallback must also scan metadata files
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardFallbackMetadataFiles:
+    """Regression tests: prompt-only path-guard also scans metadata files/modules.
+
+    4 parametrised cases (2 meta_key × 2 endpoint) verify that hiding a
+    dark-factory path inside metadata['files_to_modify'] or metadata['modules']
+    cannot bypass the path-scope guard when the free-text fields are clean.
+    """
+
+    @pytest.mark.parametrize('meta_key', ['files_to_modify', 'modules'])
+    @pytest.mark.asyncio
+    async def test_submit_task_fallback_rejects_dark_factory_path_in_metadata(
+        self, meta_key, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """prompt-only submit_task with dark-factory path ONLY in metadata[meta_key]
+        must be rejected even though all free-text fields are clean.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                prompt='Generic refactor',            # no dark-factory path here
+                # Deliberately NO title — forces _build_candidate → None → fallback
+                metadata={meta_key: ['orchestrator/harness.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'meta_key={meta_key!r}: expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'meta_key={meta_key!r}: expected orchestrator/ in matched_paths: {result}'
+        )
+
+        # Ticket store must have zero rows (guard fires before persist)
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, (
+            f'meta_key={meta_key!r}: expected 0 tickets in store, found {row[0]}'
+        )
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_task.assert_not_called()
+
+    @pytest.mark.parametrize('meta_key', ['files_to_modify', 'modules'])
+    @pytest.mark.asyncio
+    async def test_add_subtask_fallback_rejects_dark_factory_path_in_metadata(
+        self, meta_key, interceptor, taskmaster,
+    ):
+        """prompt-only add_subtask with dark-factory path ONLY in metadata[meta_key]
+        must be rejected even though all free-text fields are clean.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            prompt='Generic refactor',            # no dark-factory path here
+            # Deliberately NO title — forces _build_candidate → None → fallback
+            metadata={meta_key: ['orchestrator/harness.py']},
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'meta_key={meta_key!r}: expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'meta_key={meta_key!r}: expected orchestrator/ in matched_paths: {result}'
+        )
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_subtask.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_path_guard_detects_dark_factory_path_in_multi_entry_metadata_list(
+        self, interceptor, taskmaster,
+    ):
+        """Dark-factory path in the SECOND entry of a multi-entry metadata list
+        must still trigger the guard.
+
+        Regression against a future scanner that stops scanning after the first
+        entry (or treats the joined text as a single path): if the join-with-newlines
+        approach ever stops scanning each entry independently, this test catches it.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            prompt='Generic refactor',
+            # The dark-factory path is the SECOND entry; the first is clean.
+            metadata={'files_to_modify': ['non_df_module/file.py', 'orchestrator/harness.py']},
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            'expected DarkFactoryPathScopeViolation when dark-factory path is '
+            f'second entry in metadata list, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'expected orchestrator/ in matched_paths: {result}'
+        )
+        taskmaster.add_subtask.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Negative-control — clean metadata files must NOT be rejected
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardFallbackMetadataFilesNegativeControl:
+    """Negative-control: prompt-only submissions with clean metadata are allowed.
+
+    These tests verify the absence of false positives: if a future refactor
+    accidentally short-circuits on metadata presence rather than content, they
+    will fail loudly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_submit_task_allows_clean_metadata_files_in_other_project(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """prompt-only submit_task with non-dark-factory paths in metadata
+        must NOT be rejected — only dark-factory paths should trigger the guard.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                prompt='Refactor foo/bar.py routing',
+                # No title — prompt-only path
+                metadata={'files_to_modify': ['foo/bar.py', 'src/baz.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected ticket id starting with tkt_, got: {result}'
+        )
+        assert 'error_type' not in result, (
+            f'Should not have error_type for clean metadata files: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_subtask_allows_clean_metadata_files_in_other_project(
+        self, interceptor, taskmaster,
+    ):
+        """prompt-only add_subtask with non-dark-factory paths in metadata
+        must NOT be rejected — only dark-factory paths should trigger the guard.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            prompt='Refactor foo/bar.py routing',
+            # No title — prompt-only path
+            metadata={'files_to_modify': ['foo/bar.py', 'src/baz.py']},
+        )
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, (
+            f'Should not have error_type for clean metadata files: {result}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _path_guard_or_skip helper
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardOrSkip:
+    """Unit tests for TaskInterceptor._path_guard_or_skip.
+
+    Verifies the helper's contract: dark_factory short-circuit, lazy-build
+    of candidate, pass-through of a pre-built candidate, and error propagation.
+    """
+
+    # -- Case 1 -----------------------------------------------------------
+    def test_path_guard_or_skip_returns_none_for_dark_factory_project(
+        self, interceptor, monkeypatch,
+    ):
+        """dark_factory short-circuit: returns None without calling
+        _build_candidate or _path_guard_error.
+        """
+        build_calls: list = []
+        guard_calls: list = []
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: (
+                guard_calls.append((candidate, kwargs, project_id)), None)[1],
+        )
+
+        result = interceptor._path_guard_or_skip(
+            {'title': 'Edit orchestrator/harness.py'}, 'dark_factory',
+        )
+
+        assert result is None
+        assert build_calls == [], '_build_candidate must NOT be called for dark_factory'
+        assert guard_calls == [], '_path_guard_error must NOT be called for dark_factory'
+
+    # -- Case 2 -----------------------------------------------------------
+    def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
+        self, interceptor, monkeypatch,
+    ):
+        """When no candidate is supplied and project is non-dark_factory, the
+        helper builds a candidate via _build_candidate and passes it to
+        _path_guard_error.
+        """
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        built = CandidateTask(
+            title='Generic refactor', description='', details='',
+            files_to_modify=[], priority='medium',
+        )
+        build_calls: list = []
+        guard_calls: list = []
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: (build_calls.append(kwargs), built)[1]),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: (
+                guard_calls.append((candidate, kwargs, project_id)), None)[1],
+        )
+
+        kwargs = {'title': 'Generic refactor'}
+        result = interceptor._path_guard_or_skip(kwargs, 'some_other_project')
+
+        assert result is None
+        assert len(build_calls) == 1, (
+            f'Expected _build_candidate called once, got {len(build_calls)}'
+        )
+        assert build_calls[0] is kwargs
+        assert len(guard_calls) == 1, (
+            f'Expected _path_guard_error called once, got {len(guard_calls)}'
+        )
+        assert guard_calls[0][0] is built
+
+    # -- Case 3 -----------------------------------------------------------
+    def test_path_guard_or_skip_uses_provided_candidate(
+        self, interceptor, monkeypatch,
+    ):
+        """When a pre-built candidate is supplied, _build_candidate is NOT called;
+        _path_guard_error is called with the supplied candidate.
+        """
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        sentinel = CandidateTask(
+            title='Sentinel', description='', details='',
+            files_to_modify=[], priority='medium',
+        )
+        build_calls: list = []
+        guard_calls: list = []
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: (
+                guard_calls.append((candidate, kwargs, project_id)), None)[1],
+        )
+
+        kwargs = {'title': 'Generic refactor'}
+        result = interceptor._path_guard_or_skip(kwargs, 'some_other_project', candidate=sentinel)
+
+        assert result is None
+        assert build_calls == [], '_build_candidate must NOT be called when candidate is supplied'
+        assert len(guard_calls) == 1, (
+            f'Expected _path_guard_error called once, got {len(guard_calls)}'
+        )
+        assert guard_calls[0][0] is sentinel
+
+    # -- Case 4 -----------------------------------------------------------
+    def test_path_guard_or_skip_propagates_rejection(
+        self, interceptor, monkeypatch,
+    ):
+        """When _path_guard_error returns a rejection dict, the helper returns it as-is."""
+        rejection = {
+            'error_type': 'DarkFactoryPathScopeViolation',
+            'matched_paths': ['orchestrator/'],
+        }
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: None),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: rejection,
+        )
+
+        result = interceptor._path_guard_or_skip({'prompt': 'something'}, 'some_other_project')
+        assert result is rejection
