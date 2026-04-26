@@ -453,24 +453,31 @@ class ReconciliationHarness:
 
             # Dedup check: skip completion-summary writes that already exist in Mem0.
             # Only for transition='done' writes — other transitions are left as-is.
+            # Inner try/except: search failures degrade to "no dedup, write proceeds"
+            # rather than propagating to the outer except (which would drop the write).
             if transition == 'done' and tid:
-                results = await self.memory.search(
-                    query=f'task {tid} completion done',
-                    project_id=project_id,
-                    limit=5,
-                )
-                prior = [
-                    r for r in results
-                    if r.metadata.get('task_id') == str(tid)
-                    and r.metadata.get('transition') == 'done'
-                ]
-                if prior:
-                    logger.info(
-                        'Skipping deferred completion-summary for task %s — already written',
-                        tid,
+                try:
+                    results = await self.memory.search(
+                        query=f'task {tid} completion done',
+                        project_id=project_id,
+                        limit=5,
                     )
-                    await self.buffer.delete_deferred_write(write['id'])
-                    continue
+                    prior = [
+                        r for r in results
+                        if r.metadata.get('task_id') == str(tid)
+                        and r.metadata.get('transition') == 'done'
+                    ]
+                    if prior:
+                        logger.info(
+                            'Skipping deferred completion-summary for task %s — already written',
+                            tid,
+                        )
+                        await self.buffer.delete_deferred_write(write['id'])
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        'Deferred-write dedup search failed for task %s: %s', tid, e
+                    )
 
             try:
                 await self.memory.add_memory(
