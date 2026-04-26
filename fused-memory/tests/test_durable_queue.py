@@ -1016,7 +1016,7 @@ class TestDeleteDead:
             # be the synthesised 'database is locked' from the mock-based siblings.
             error_msg = result.get('error', '').lower()
             assert any(
-                token in error_msg for token in ('database is locked', 'busy', 'locked')
+                token in error_msg for token in ('database is locked', 'busy')
             ), (
                 f'Expected real-SQLite BUSY vocabulary in error message, '
                 f'got: {result.get("error")!r}'
