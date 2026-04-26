@@ -3247,3 +3247,70 @@ class TestPruneArchiveThrottle:
         assert spy.call_count == 2, (
             f'Third call within new window must be throttled; expected 2, got {spy.call_count}'
         )
+
+    def test_archive_root_none_no_op_does_not_update_throttle(self, tmp_path: Path):
+        """None call doesn't burn the throttle — subsequent real call still fires."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive') as spy:
+            result_none = _maybe_prune_archive(None)
+            assert spy.call_count == 0, 'None call must not invoke _prune_archive'
+            assert result_none is False
+
+            result_real = _maybe_prune_archive(archive_root)
+            assert spy.call_count == 1, (
+                f'Real call after None must fire _prune_archive; got {spy.call_count}'
+            )
+            assert result_real is True
+
+    @pytest.mark.asyncio
+    async def test_run_scoped_verification_finally_uses_wrapper(self, monkeypatch, tmp_path: Path):
+        """run_scoped_verification goes through the wrapper on every call; the
+        wrapper throttles so _prune_archive fires only once across two calls."""
+        (tmp_path / '.task').mkdir()
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='echo ok',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 1, 'error: --exclude\nfoo\n', False
+
+        wrapper_calls: list[object] = []
+        original_maybe = verify._maybe_prune_archive
+
+        def counting_wrapper(ar):
+            wrapper_calls.append(ar)
+            return original_maybe(ar)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+                patch.object(verify, '_maybe_prune_archive', side_effect=counting_wrapper), \
+                patch.object(verify, '_prune_archive') as prune_spy:
+            # First call — wrapper fires _prune_archive
+            await run_scoped_verification(
+                tmp_path, config, [],
+                attempt_id=1, task_id='42', archive_root=archive_root,
+            )
+            # Second call — wrapper is invoked again but _prune_archive is throttled
+            await run_scoped_verification(
+                tmp_path, config, [],
+                attempt_id=2, task_id='42', archive_root=archive_root,
+            )
+
+        assert len(wrapper_calls) == 2, (
+            f'_maybe_prune_archive should be called twice (once per run); '
+            f'got {len(wrapper_calls)}'
+        )
+        assert prune_spy.call_count == 1, (
+            f'_prune_archive should be called only once (throttled on second); '
+            f'got {prune_spy.call_count}'
+        )
