@@ -99,9 +99,11 @@ was created — count it as a no-op, not a successful addition. Your stats \
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
-`tasks_created` directly. Only fall back to `mcp__fused-memory__get_task` when \
-`task_id` is missing from the `resolve_ticket` response or the status is unrecognised, \
-then skip the counter and flag the discrepancy in your structured report.
+`tasks_created` directly. If `task_id` is missing from the `resolve_ticket` response, \
+skip the `tasks_created` increment and flag the discrepancy in your structured report. \
+If the status is unrecognised but a `task_id` is present, call \
+`mcp__fused-memory__get_task` with that id to verify — only count if it returns a \
+valid record, otherwise flag the discrepancy.
 
 After each `mcp__fused-memory__set_task_status` call, inspect the `tasks[n].newStatus` \
 field in the response — `set_task_status` returns per-task \
@@ -111,13 +113,16 @@ is absent. Only increment the relevant task-success counter (e.g., `tasks_reopen
 if `newStatus` matches the requested status. If the response is missing or ambiguous, \
 call `mcp__fused-memory__get_task` with the same task id to confirm. If the confirmed \
 status differs from the requested one, skip the counter increment and flag the \
-discrepancy in your structured report. If the response contains `no_op: True`, the \
+discrepancy in your structured report. If the response contains `"no_op": true`, the \
 task was already in the requested status — treat as a successful no-op (do not \
 increment a success counter, do not flag as a discrepancy). When `task_id` is a \
 comma-separated list, the response is wrapped as `{{"success": bool, "results": \
 [{{"task_id": ..., "result": {{...}}}}]}}` — apply the per-task `tasks[*].newStatus` \
-and `no_op: True` rules above to each `results[i].result` independently, not to the \
-top-level payload.
+and `"no_op": true` rules above to each `results[i].result` independently, not to the \
+top-level payload. When the wrapper has `success: false`, still process each \
+`results[i].result` independently — some entries may be successes or no-ops while \
+others carry errors. Per-id `result.error` (e.g. terminal-exit gate, \
+bulk-reset-guard rejection) means skip the counter and flag that entry.
 
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
