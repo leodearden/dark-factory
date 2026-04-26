@@ -2073,6 +2073,31 @@ class TestClassifyFailure:
             f"rustc uncoded 'error: invalid …' should fall through to unknown_test_failure, got {result!r}"
         )
 
+    def test_failed_to_find_alone_not_cargo_cli_error(self):
+        """'error: failed to find …' (no 'could not' prefix) must NOT → cargo_cli_error.
+
+        'failed to find' without the 'could not' prefix is not a verified cargo CLI
+        emission — cargo uses 'error: could not find `Cargo.toml` in …' for its typical
+        find-failure case, which is covered by the standalone 'could not find' top-level
+        alternative in the allowlist regex.  'failed to find' alone would over-broaden
+        the sub-alternation without a grounded sample, matching the convention that
+        dropped 'invalid ' and 'package ' from the allowlist.
+
+        Parallels test_rustc_invalid_diagnostic_not_cargo_cli_error: both assert that
+        an un-grounded token is absent from the allowlist regex and falls through to the
+        conservative bucket.
+        """
+        output = 'error: failed to find some-bin\n'
+        result = self._classify(output, rc=1, timed_out=False)
+        assert result != 'cargo_cli_error', (
+            f"'failed to find' without 'could not' prefix must not be mis-bucketed "
+            f"as cargo_cli_error, got {result!r}"
+        )
+        assert result == 'unknown_test_failure', (
+            f"'failed to find' without 'could not' prefix should fall through to "
+            f"unknown_test_failure, got {result!r}"
+        )
+
     # (d) compile_error: rustc diagnostic error codes
     def test_compile_error_rustc_code(self):
         """'error[E0308]: mismatched types' → compile_error."""
