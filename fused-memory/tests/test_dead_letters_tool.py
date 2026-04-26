@@ -520,3 +520,33 @@ class TestDeleteDeadLetters:
         )
 
         assert result == {'deleted': [], 'not_found': []}
+
+
+# ── TestDeleteDeadLettersIdGuard (step-1 / step-3 tests) ──────────────────────
+
+
+class TestDeleteDeadLettersIdGuard:
+    """Guard tests that call tool.fn directly, bypassing pydantic schema validation.
+
+    Using server._tool_manager.get_tool('delete_dead_letters').fn(...) simulates
+    internal callers and transports that bypass pydantic — the exact surface the
+    guard must protect.
+    """
+
+    @pytest.mark.asyncio
+    async def test_uuid_string_in_ids_rejected_with_validation_error_envelope(self):
+        """UUID string in ids is rejected by the guard before reaching delete_dead."""
+        svc = _make_delete_mock_service()
+        server = create_mcp_server(svc)
+        tool_fn = server._tool_manager.get_tool('delete_dead_letters').fn
+
+        result = await tool_fn(
+            project_id='proj1',
+            ids=['550e8400-e29b-41d4-a716-446655440000'],
+        )
+
+        assert isinstance(result, dict), 'expected a dict envelope'
+        assert result.get('error_type') == 'ValidationError', (
+            f"expected 'ValidationError', got: {result}"
+        )
+        svc.durable_queue.delete_dead.assert_not_called()
