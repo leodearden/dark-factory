@@ -96,6 +96,23 @@ def validate_run_id(run_id: str) -> dict[str, str] | None:
     return _validate_identifier(run_id, 'run_id')
 
 
+def validate_int_ids(ids: object, *, name: str = 'ids') -> dict[str, str] | None:
+    """Return an error dict if ids is not a list of plain (non-bool) integers, else None.
+
+    Accepted: list or tuple of int values where none are bool subclass instances.
+    Rejected: anything that is not a list/tuple, or any element that is not a plain int.
+
+    The ``name`` keyword argument customises the field label in error messages so
+    the helper generalises to tools that accept e.g. ``row_ids: list[int]``.
+    """
+    if not isinstance(ids, (list, tuple)):
+        return {
+            'error': f'{name} must be a list of integers, got {type(ids).__name__}',
+            'error_type': 'ValidationError',
+        }
+    return None
+
+
 def require_project_root(project_root: str) -> None:
     """Raise InputValidationError if project_root is not a non-empty absolute path."""
     if err := validate_project_root(project_root):
