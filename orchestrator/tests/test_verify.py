@@ -3199,3 +3199,51 @@ class TestPruneArchiveThrottle:
         assert spy.call_count == 1, (
             f'Second immediate call must be throttled; expected 1, got {spy.call_count}'
         )
+
+    def test_call_after_throttle_elapsed_fires_again(self, monkeypatch, tmp_path: Path):
+        """After the throttle window elapses, the next call fires ``_prune_archive``."""
+        import time as time_mod  # noqa: PLC0415
+
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive, _PRUNE_THROTTLE_SECS  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        base_time = 0.0
+
+        with patch.object(verify, '_prune_archive') as spy:
+            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time)
+            _maybe_prune_archive(archive_root)  # first call — fires
+
+            # Advance time past the throttle window
+            elapsed = _PRUNE_THROTTLE_SECS + 1
+            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time + elapsed)
+            _maybe_prune_archive(archive_root)  # second call — window elapsed, fires again
+
+        assert spy.call_count == 2, (
+            f'Call after throttle elapsed should fire again; expected 2, got {spy.call_count}'
+        )
+
+    def test_third_call_within_new_window_skips(self, monkeypatch, tmp_path: Path):
+        """After second fire, the window slides — an immediate third call is throttled."""
+        import time as time_mod  # noqa: PLC0415
+
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive, _PRUNE_THROTTLE_SECS  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        base_time = 0.0
+        elapsed = _PRUNE_THROTTLE_SECS + 1
+
+        with patch.object(verify, '_prune_archive') as spy:
+            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time)
+            _maybe_prune_archive(archive_root)  # first fire
+
+            monkeypatch.setattr(time_mod, 'monotonic', lambda: base_time + elapsed)
+            _maybe_prune_archive(archive_root)  # second fire (window elapsed)
+
+            # Third call immediately after second — still at the same "elapsed" time
+            _maybe_prune_archive(archive_root)  # should be throttled
+
+        assert spy.call_count == 2, (
+            f'Third call within new window must be throttled; expected 2, got {spy.call_count}'
+        )
