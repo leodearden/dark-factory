@@ -494,7 +494,7 @@ class DurableWriteQueue:
                 # envelope covering all inputs so a full retry is safe.
                 try:
                     await self._db.commit()
-                except aiosqlite.OperationalError as commit_exc:
+                except aiosqlite.OperationalError:
                     logger.exception(
                         'delete_dead: recovery commit failed after OperationalError;'
                         ' reporting full input as remaining',
