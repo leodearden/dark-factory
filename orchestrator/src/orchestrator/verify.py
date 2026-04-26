@@ -410,7 +410,12 @@ def _archive_attempt_log(
     - ``_should_archive_category(category)`` is ``False``
 
     All filesystem errors are caught, logged, and swallowed (best-effort).
-    After copying, calls ``_prune_archive`` to enforce retention limits.
+
+    .. note::
+        ``_prune_archive`` is intentionally NOT called here.  The caller
+        (``run_scoped_verification``) calls it exactly once after all modules
+        have been gathered, preventing concurrent per-module prune walks from
+        racing on the same ``archive_root`` directory tree.
     """
     if archive_root is None:
         return []
@@ -437,9 +442,6 @@ def _archive_attempt_log(
             archived.append(dest)
         except OSError as exc:
             logger.warning('_archive_attempt_log: could not copy %s → %s: %s', src, dest, exc)
-
-    # Rotate-on-write retention (best-effort).
-    _prune_archive(archive_root)
 
     return archived
 
@@ -1457,11 +1459,14 @@ async def run_scoped_verification(
                 logger.info(
                     'Verification mode: global (file-scoped filtered every subproject)',
                 )
-                return await run_verification(
+                _result = await run_verification(
                     worktree, config, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
                     attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 )
+                if archive_root is not None:
+                    _prune_archive(archive_root)
+                return _result
             # Rewrite cargo --workspace → cargo -p <crate> when all task files
             # are .rs and map to known workspace crates.
             scoped = [
@@ -1485,7 +1490,10 @@ async def run_scoped_verification(
                 for mc in scoped
             )
         )
-        return _aggregate_results(list(results))
+        _result = _aggregate_results(list(results))
+        if archive_root is not None:
+            _prune_archive(archive_root)
+        return _result
 
     # No module_configs — try fallback or global
     if task_files:
@@ -1497,11 +1505,14 @@ async def run_scoped_verification(
                 fallback, existing_files, worktree, scope_cargo_enabled,
             )
             logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
-            return await run_verification(
+            _result = await run_verification(
                 worktree, config, fallback, max_retries=max_retries,
                 is_merge_verify=is_merge_verify,
                 attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
             )
+            if archive_root is not None:
+                _prune_archive(archive_root)
+            return _result
 
         # For Rust projects with no module_configs and no Python fallback
         # (Reify's layout), try to scope the global commands.
@@ -1520,15 +1531,21 @@ async def run_scoped_verification(
                     'Verification mode: cargo-scoped (%d .rs files)',
                     len(existing_files),
                 )
-                return await run_verification(
+                _result = await run_verification(
                     worktree, config, rewritten, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
                     attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 )
+                if archive_root is not None:
+                    _prune_archive(archive_root)
+                return _result
 
     logger.info('Verification mode: global (no scope info)')
-    return await run_verification(
+    _result = await run_verification(
         worktree, config, max_retries=max_retries,
         is_merge_verify=is_merge_verify,
         attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
     )
+    if archive_root is not None:
+        _prune_archive(archive_root)
+    return _result
