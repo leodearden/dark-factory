@@ -3029,3 +3029,18 @@ class TestBriefingKnownGapsRefresh:
 
         assert result is None
         mock_subproc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_when_briefing_missing(self, tmp_path):
+        """Script present but review/briefing.yaml absent → returns None without subprocess."""
+        # Create the script file but NOT the briefing
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        # review/briefing.yaml intentionally absent
+
+        with patch('asyncio.create_subprocess_exec') as mock_subproc:
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        mock_subproc.assert_not_called()
