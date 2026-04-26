@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Literal
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
 from orchestrator.verify import run_scoped_verification
 
 if TYPE_CHECKING:
@@ -390,6 +390,14 @@ timeouts rather than a first-time verify failure.  Kept as a module-level
 constant so tests and any future callers share a single source of truth."""
 
 
+WORKTREE_MISSING_REASON_PREFIX = 'Worktree missing'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the task worktree
+has been removed out-of-band (typically by a human marking the task ``done``
+and cleaning up).  ``TaskWorkflow._submit_to_merge_queue`` recognises this
+prefix and re-checks task status: if terminal, it short-circuits to
+``WorkflowOutcome.DONE`` instead of cascading into ``_mark_blocked``."""
+
+
 def _format_unresolved_steps_suffix(unresolved: list[UnresolvedStep]) -> str:
     """Format a human-readable suffix listing unresolved done-step diff-tree failures.
 
@@ -719,6 +727,18 @@ class MergeWorker:
         """Process one merge request.  Returns None if re-enqueued."""
         try:
             return await self._do_merge(req)
+        except WorktreeMissing as exc:
+            # Worktree removed out-of-band (e.g. human cleanup after marking
+            # the task done).  Surface with a recognisable prefix so
+            # ``TaskWorkflow`` can re-check status.
+            logger.info(
+                f'Merge worker for task {req.task_id}: missing worktree '
+                f'{exc.path} — surfacing as blocked'
+            )
+            return MergeOutcome(
+                'blocked',
+                reason=f'{WORKTREE_MISSING_REASON_PREFIX}: {exc.path}',
+            )
         except Exception as exc:
             logger.exception(
                 f'Merge worker error for task {req.task_id}: {exc}'
@@ -1446,6 +1466,40 @@ class SpeculativeMergeWorker:
                         )
                     except asyncio.QueueEmpty:
                         spec_base = None  # no next item, no speculation
+                except WorktreeMissing as exc:
+                    # The task worktree was removed out-of-band (typical
+                    # cause: a human marked the task done and cleaned up
+                    # while we were processing it).  Surface as ``blocked``
+                    # with a recognisable reason; ``TaskWorkflow`` re-checks
+                    # task status and short-circuits to DONE if terminal.
+                    logger.info(
+                        f'Task {req.task_id}: merger detected missing '
+                        f'worktree {exc.path} — surfacing as blocked'
+                    )
+                    if (
+                        merge_result_local is not None
+                        and merge_result_local.merge_worktree
+                    ):
+                        with contextlib.suppress(Exception):
+                            await self._git_ops.cleanup_merge_worktree(
+                                merge_result_local.merge_worktree
+                            )
+                    merge_result_local = None
+                    if (
+                        self._inflight_req is not None
+                        and not self._inflight_req.result.done()
+                    ):
+                        self._inflight_req.result.set_result(
+                            MergeOutcome(
+                                'blocked',
+                                reason=(
+                                    f'{WORKTREE_MISSING_REASON_PREFIX}: '
+                                    f'{exc.path}'
+                                ),
+                            )
+                        )
+                    spec_base = None
+                    self._inflight_req = None
                 except Exception as exc:
                     logger.exception(
                         f'Task {req.task_id}: unexpected merger error: {exc}'

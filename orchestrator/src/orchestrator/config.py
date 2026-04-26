@@ -533,6 +533,15 @@ class OrchestratorConfig(BaseSettings):
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
 
+    # Terminal-status watcher — periodically polls fused-memory for active
+    # workflow tasks whose status has gone terminal out-of-band (typical
+    # cause: a human marked a task ``done`` and removed its worktree while
+    # the orchestrator was still in the merge phase).  When detected the
+    # workflow's ``cancel_event`` is set so it exits cleanly without
+    # cascading into escalations.  See zombie-escalation fix Step 5.
+    terminal_status_watcher_enabled: bool = Field(default=True)
+    terminal_status_poll_interval_secs: float = Field(default=30.0)
+
     # Legacy scalar — ignored if `timeouts` section is present in config.
     # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)

@@ -14,6 +14,7 @@ from orchestrator.git_ops import (
     ScrubOutcome,
     ScrubResult,
     WorktreeInfo,
+    WorktreeMissing,
     _merge_subject,
     _run,
     scrub_task_dir_from_tree,
@@ -2807,3 +2808,35 @@ class TestMergeSubject:
     ) -> None:
         """_merge_subject returns 'Merge {branch} into {main_branch}'."""
         assert _merge_subject(branch, main_branch) == expected
+
+
+@pytest.mark.asyncio
+class TestRunWorktreeMissing:
+    """``_run`` raises typed :class:`WorktreeMissing` for deleted cwd.
+
+    Distinguishes a deleted task worktree (recoverable race) from a
+    PATH-missing binary (real bug).
+    """
+
+    async def test_deleted_cwd_raises_worktree_missing(self, tmp_path: Path) -> None:
+        missing = tmp_path / 'gone'
+        # Path does not exist — pre-flight should classify it.
+        with pytest.raises(WorktreeMissing) as exc:
+            await _run(['git', 'status'], cwd=missing)
+        assert exc.value.path == missing
+        assert isinstance(exc.value, FileNotFoundError)
+
+    async def test_missing_binary_raises_plain_filenotfound(
+        self, tmp_path: Path
+    ) -> None:
+        # cwd exists, but the binary does not — must be plain FileNotFoundError,
+        # not WorktreeMissing.
+        with pytest.raises(FileNotFoundError) as exc:
+            await _run(['definitely-not-a-real-binary-xyz'], cwd=tmp_path)
+        assert not isinstance(exc.value, WorktreeMissing)
+
+    async def test_no_cwd_does_not_classify(self) -> None:
+        # cwd=None — pre-flight is skipped; missing binary surfaces as plain.
+        with pytest.raises(FileNotFoundError) as exc:
+            await _run(['definitely-not-a-real-binary-xyz'])
+        assert not isinstance(exc.value, WorktreeMissing)

@@ -199,15 +199,16 @@ Enter plan mode. The plan covers two parts:
 
 The merge procedure is iterative — don't assume one pass will be enough:
 
-1. Rebase on main. Resolve any conflicts.
-2. Run the project's full verification suite (tests, lint, type-check).
-3. Fix any failures.
-4. On green: rebase on main again — other tasks may have merged while you were fixing.
-5. Repeat steps 2-4 until stable (rebase is clean AND verification passes with no new changes needed).
-6. Use `/merge-queue` to merge. It routes through the orchestrator's merge queue when available (preventing races with concurrent tasks) and falls back to direct merge when the orchestrator isn't running.
-7. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha-of-merge>"})`
+1. **Release the orchestrator's grip** on the task before merging — call `release_workflow(task_id="<TASK_ID>", timeout_secs=30)` on the escalation MCP. This soft-cancels any active workflow so the orchestrator stops processing the task while you finish it manually. If `was_active` is False the orchestrator wasn't running it; you can skip this step in that case.
+2. Rebase on main. Resolve any conflicts.
+3. Run the project's full verification suite (tests, lint, type-check).
+4. Fix any failures.
+5. On green: rebase on main again — other tasks may have merged while you were fixing.
+6. Repeat steps 3-5 until stable (rebase is clean AND verification passes with no new changes needed).
+7. Use `/merge-queue` to merge. It routes through the orchestrator's merge queue when available (preventing races with concurrent tasks) and falls back to direct merge when the orchestrator isn't running.
+8. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha-of-merge>"})`
    - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main (the normal case — merge_request returns the SHA). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
-8. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
+9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 *If this is an escalated task (pending escalation, agent is paused):*
 

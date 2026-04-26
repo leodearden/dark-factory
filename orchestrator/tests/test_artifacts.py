@@ -993,3 +993,51 @@ class TestStringItemResilience:
         completed = artifacts.get_completed_steps()
         assert len(completed) == 1
         assert completed[0]['id'] == 'step-1'
+
+
+class TestWorktreeMissingTolerance:
+    """Best-effort writes survive a deleted worktree without raising."""
+
+    def test_write_review_skips_when_root_gone(self, tmp_path: Path, caplog):
+        worktree = tmp_path / 'gone'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-x', 'gone', 'desc')
+        # Remove the worktree out-of-band
+        import shutil
+        shutil.rmtree(worktree)
+        assert not ta.root.is_dir()
+
+        # Must not raise
+        ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
+        # And nothing was created
+        assert not ta.root.exists()
+
+    def test_write_json_skips_when_root_gone(self, tmp_path: Path):
+        worktree = tmp_path / 'also-gone'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-y', 'gone', 'desc')
+        import shutil
+        shutil.rmtree(worktree)
+
+        # _write_json into a path under .root with the dir gone — should swallow
+        target = ta.root / 'reviews' / 'foo.json'
+        ta._write_json(target, {'a': 1})  # no exception
+
+    def test_write_review_still_raises_for_genuine_io_errors(
+        self, tmp_path: Path, monkeypatch
+    ):
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-z', 'present', 'desc')
+        # Root exists; make write_text raise PermissionError
+        import pathlib
+
+        def _raise_permission(self, *args, **kwargs):
+            raise PermissionError('denied')
+
+        monkeypatch.setattr(pathlib.Path, 'write_text', _raise_permission)
+        with pytest.raises(PermissionError):
+            ta.write_review('rev', {'verdict': 'PASS', 'issues': []})
