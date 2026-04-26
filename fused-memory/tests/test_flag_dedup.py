@@ -148,3 +148,44 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_and_refreshes():
 
     # (c) A refresh marker write was made via add_memory
     memory_service.add_memory.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# dedup_flags — no prior marker (fresh flag) path (step-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_no_prior_marker_writes_new_marker():
+    """When no prior stage1_flag_marker exists, the flag is not annotated and a new marker
+    is written to Mem0.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])  # empty — no prior marker
+    memory_service.add_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'bar'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) Flag has NO persisted_from_run field — it's a fresh finding
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+
+    # (b) add_memory called exactly once with the expected marker metadata
+    memory_service.add_memory.assert_called_once()
+    add_call_kwargs = memory_service.add_memory.call_args.kwargs
+    assert add_call_kwargs.get('category') == 'observations_and_summaries'
+    meta = add_call_kwargs.get('metadata', {})
+    assert meta.get('source') == 'stage1_flag_marker'
+    assert meta.get('task_id') == '99'
+    assert meta.get('flag_type') == 'stale_metadata'
+    assert meta.get('run_id') == 'r1'
+    assert meta.get('last_seen_run_id') == 'r1'
