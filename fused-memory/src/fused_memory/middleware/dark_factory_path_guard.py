@@ -213,3 +213,51 @@ def check_candidate_for_dark_factory_paths(
             matched_paths=tuple(matched),
         )
     return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+
+# ---------------------------------------------------------------------------
+# check_text_for_dark_factory_paths
+# ---------------------------------------------------------------------------
+
+def check_text_for_dark_factory_paths(
+    text: str | None,
+    project_id: str,
+    prefixes: tuple[str, ...] = DARK_FACTORY_PATH_PREFIXES,
+    dark_factory_project_id: str = DARK_FACTORY_PROJECT_ID,
+) -> PathGuardVerdict:
+    """Check whether *text* references dark-factory paths in a wrong project.
+
+    This is the prompt-only counterpart to
+    :func:`check_candidate_for_dark_factory_paths`, used by
+    :class:`~fused_memory.middleware.task_interceptor.TaskInterceptor` when
+    :meth:`~fused_memory.middleware.task_interceptor.TaskInterceptor._build_candidate`
+    returns ``None`` (i.e. the caller passed a free-form ``prompt`` without a
+    ``title``).
+
+    Args:
+        text: Any string — prompt body, title, or their concatenation.
+            ``None`` and the empty string are treated as "no content" and return ok.
+        project_id: The project_id the task is being filed into.
+        prefixes: Path prefixes to check against.  Defaults to
+            :data:`DARK_FACTORY_PATH_PREFIXES`.
+        dark_factory_project_id: The project_id considered "correct" for
+            dark-factory paths.  Defaults to :data:`DARK_FACTORY_PROJECT_ID`.
+
+    Returns:
+        A :class:`PathGuardVerdict` with ``outcome='ok'`` when the text is
+        correctly filed (or has no dark-factory paths), and
+        ``outcome='rejection'`` when dark-factory paths are found in a
+        non-dark-factory project.
+    """
+    # Correctly-filed tasks are always ok — no need to scan.
+    if project_id == dark_factory_project_id:
+        return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+    matched = find_dark_factory_paths(text or '', prefixes)
+    if matched:
+        return PathGuardVerdict(
+            outcome='rejection',
+            project_id=project_id,
+            matched_paths=tuple(matched),
+        )
+    return PathGuardVerdict(outcome='ok', project_id=project_id)
