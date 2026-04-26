@@ -95,4 +95,27 @@ After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
 was created — count it as a no-op, not a successful addition. Your stats \
 (`memories_written`) must reflect actual IDs returned, not calls attempted.
+
+## Verifying Task Operations
+After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
+`status="combined"` with a `task_id`, call `mcp__fused-memory__get_task` with that \
+`task_id` to confirm the task exists before incrementing `tasks_created`. Only count \
+the task as created if `get_task` returns a valid task record. If `task_id` is missing \
+from the `resolve_ticket` response, or if `get_task` returns an unexpected payload or an \
+error, skip the `tasks_created` counter increment and flag the discrepancy in your \
+report's `summary` or `flagged_items`.
+
+After each `mcp__fused-memory__set_task_status` call, inspect the `tasks[n].newStatus` \
+field in the response — `set_task_status` returns per-task \
+`{{"taskId": ..., "oldStatus": ..., "newStatus": ...}}` records, so no separate \
+`get_task` round-trip is needed unless the response payload is missing or `newStatus` \
+is absent. Only increment the relevant task-success counter (e.g., `tasks_reopened`) \
+if `newStatus` matches the requested status. If the response is missing or ambiguous, \
+call `mcp__fused-memory__get_task` with the same task id to confirm. If the confirmed \
+status differs from the requested one, skip the counter increment and flag the \
+discrepancy in your structured report.
+
+This rule applies to all task-operation counters: do not increment any task-success \
+stat unless the response payload or a follow-up verification confirms the expected \
+outcome.
 """
