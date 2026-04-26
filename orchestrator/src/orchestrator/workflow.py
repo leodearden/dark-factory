@@ -1777,7 +1777,12 @@ class TaskWorkflow:
         verify_attempt = 0
 
         while True:
-            result = await run_scoped_verification(self.worktree, self.config, self._module_configs, task_files=self._task_files)
+            result = await run_scoped_verification(
+                self.worktree, self.config, self._module_configs, task_files=self._task_files,
+                attempt_id=verify_attempt + 1,
+                task_id=self.task_id,
+                archive_root=self.config.project_root / 'data' / 'verify-logs',
+            )
             if not result.passed:
                 self._last_verify_result = result
             if result.passed:

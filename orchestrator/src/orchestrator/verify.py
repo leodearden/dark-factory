@@ -809,7 +809,11 @@ class VerifyResult:
         # ## Verify Logs — list on-disk paths so the reader can `cat` the full evidence.
         # Appears between ## Failure Cause and ## Test Failures.
         if self.worktree_log_paths or self.archive_log_paths:
-            log_lines = ['## Verify Logs', '', 'Worktree:']
+            log_lines = ['## Verify Logs', '']
+            if self.category:
+                log_lines.append(f'Category: {self.category}')
+                log_lines.append('')
+            log_lines.append('Worktree:')
             for p in self.worktree_log_paths:
                 log_lines.append(f'- {p}')
             if self.archive_log_paths:
