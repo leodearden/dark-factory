@@ -2020,14 +2020,18 @@ class TestClassifyFailure:
         output = 'error: failed to parse manifest at `/x/Cargo.toml`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
 
-    def test_cargo_cli_error_failed_to_compile_branch(self):
-        """'compile' branch of failed_to_(parse|compile|read|find) → cargo_cli_error.
+    def test_cargo_cli_error_failed_to_compile(self):
+        """'error: failed to compile `…`' (real cargo CLI emission) → cargo_cli_error.
 
-        Exercises the compile sub-case of the alternation so a future refactor
-        cannot silently drop it without a test failure.  The overall token is
-        anchored to a verified real-world cargo log line by
-        test_cargo_cli_error_failed_to_parse_manifest; this test pins just the
-        compile branch structure.
+        cargo's rustc orchestrator emits this exact form when a crate fails to
+        compile (e.g. 'error: failed to compile `proc-macro-foo` (lib),
+        intermediates …' from cargo_rustc / the compiler job-queue in
+        cargo/src/cargo/core/compiler/job_queue/mod.rs).
+        This is a verified real-world cargo CLI log line, not a synthetic fixture.
+
+        Anchors the 'compile' sub-branch of the 'failed to (parse|compile|read)'
+        allowlist token to an observed cargo output sample.  If this sub-branch
+        is ever removed from the allowlist, this test will catch the regression.
         """
         output = 'error: failed to compile `proc-macro-foo`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
@@ -2071,6 +2075,31 @@ class TestClassifyFailure:
         )
         assert result == 'unknown_test_failure', (
             f"rustc uncoded 'error: invalid …' should fall through to unknown_test_failure, got {result!r}"
+        )
+
+    def test_failed_to_find_alone_not_cargo_cli_error(self):
+        """'error: failed to find …' (no 'could not' prefix) must NOT → cargo_cli_error.
+
+        'failed to find' without the 'could not' prefix is not a verified cargo CLI
+        emission — cargo uses 'error: could not find `Cargo.toml` in …' for its typical
+        find-failure case, which is covered by the standalone 'could not find' top-level
+        alternative in the allowlist regex.  'failed to find' alone would over-broaden
+        the sub-alternation without a grounded sample, matching the convention that
+        dropped 'invalid ' and 'package ' from the allowlist.
+
+        Parallels test_rustc_invalid_diagnostic_not_cargo_cli_error: both assert that
+        an un-grounded token is absent from the allowlist regex and falls through to the
+        conservative bucket.
+        """
+        output = 'error: failed to find some-bin\n'
+        result = self._classify(output, rc=1, timed_out=False)
+        assert result != 'cargo_cli_error', (
+            f"'failed to find' without 'could not' prefix must not be mis-bucketed "
+            f"as cargo_cli_error, got {result!r}"
+        )
+        assert result == 'unknown_test_failure', (
+            f"'failed to find' without 'could not' prefix should fall through to "
+            f"unknown_test_failure, got {result!r}"
         )
 
     # (d) compile_error: rustc diagnostic error codes
