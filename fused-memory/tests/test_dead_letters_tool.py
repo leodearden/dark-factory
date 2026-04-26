@@ -538,7 +538,9 @@ class TestDeleteDeadLettersIdGuard:
         """UUID string in ids is rejected by the guard before reaching delete_dead."""
         svc = _make_delete_mock_service()
         server = create_mcp_server(svc)
-        tool_fn = server._tool_manager.get_tool('delete_dead_letters').fn
+        _tool = server._tool_manager.get_tool('delete_dead_letters')
+        assert _tool is not None, 'delete_dead_letters tool not registered'
+        tool_fn = _tool.fn
 
         result = await tool_fn(
             project_id='proj1',
@@ -561,7 +563,9 @@ class TestDeleteDeadLettersIdGuard:
         """
         svc = _make_delete_mock_service()
         server = create_mcp_server(svc)
-        tool_fn = server._tool_manager.get_tool('delete_dead_letters').fn
+        _tool = server._tool_manager.get_tool('delete_dead_letters')
+        assert _tool is not None, 'delete_dead_letters tool not registered'
+        tool_fn = _tool.fn
 
         result = await tool_fn(
             project_id='proj1',
