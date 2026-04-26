@@ -3441,9 +3441,10 @@ class TestMemoryConsolidatorFlagDedup:
     async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
         """Normal (non-remediation) cycle calls dedup_flags with the report's flagged items."""
         from unittest.mock import AsyncMock, patch
+        from datetime import UTC, datetime
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
+        from fused_memory.reconciliation.stages.base import BaseStage
+        from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'p'
@@ -3454,21 +3455,21 @@ class TestMemoryConsolidatorFlagDedup:
             {'task_id': '1', 'flag_type': 'missing_deliverable'},
             {'task_id': '2', 'flag_type': 'stale_metadata'},
         ]
-        stage_result = StageResult(
-            report={'flagged_items': flagged, 'stats': {}, 'summary': 'ok'},
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(flagged),
+            stats={},
             llm_calls=1,
             tokens_used=100,
-            success=True,
         )
 
         deduplicated = [dict(f) for f in flagged]
         dedup_mock = AsyncMock(return_value=deduplicated)
 
         with (
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=stage_result),
-            ),
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
                 'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
                 new=dedup_mock,
@@ -3495,9 +3496,10 @@ class TestMemoryConsolidatorFlagDedup:
     async def test_remediation_run_skips_dedup_flags(self, mock_deps):
         """Remediation runs (remediation_findings set) must NOT call dedup_flags."""
         from unittest.mock import AsyncMock, patch
+        from datetime import UTC, datetime
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-        from fused_memory.models.reconciliation import StageId, Watermark
-        from fused_memory.reconciliation.cli_stage_runner import StageResult
+        from fused_memory.reconciliation.stages.base import BaseStage
+        from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'p'
@@ -3505,20 +3507,20 @@ class TestMemoryConsolidatorFlagDedup:
         stage.memory_limit = 10
         stage.remediation_findings = [{'description': 'x'}]  # remediation mode
 
-        stage_result = StageResult(
-            report={'flagged_items': [{'task_id': '1', 'flag_type': 'foo'}], 'stats': {}, 'summary': 'ok'},
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[{'task_id': '1', 'flag_type': 'foo'}],
+            stats={},
             llm_calls=1,
             tokens_used=100,
-            success=True,
         )
 
         dedup_mock = AsyncMock(return_value=[])
 
         with (
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=stage_result),
-            ),
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
                 'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
                 new=dedup_mock,

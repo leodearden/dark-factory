@@ -14,6 +14,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+from fused_memory.reconciliation.flag_dedup import dedup_flags
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
@@ -43,6 +44,36 @@ class MemoryConsolidator(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+
+    async def run(
+        self,
+        events: list[ReconciliationEvent],
+        watermark: Watermark,
+        prior_reports: list[StageReport],
+        run_id: str,
+        model: str | None = None,
+    ) -> StageReport:
+        """Execute Stage 1 and post-process items_flagged through the flag deduplicator.
+
+        Remediation runs (``remediation_findings`` set) skip dedup — the whole
+        point of a remediation pass is to re-emit a curated list, and running
+        dedup on those flags would defeat the remediation contract.
+        """
+        report = await super().run(events, watermark, prior_reports, run_id, model=model)
+
+        # Skip dedup for remediation passes
+        if self.remediation_findings is not None:
+            return report
+
+        if report.items_flagged:
+            report.items_flagged = await dedup_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                run_id=run_id,
+                flags=report.items_flagged,
+            )
+
+        return report
 
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
