@@ -379,6 +379,14 @@ class FakeScheduler:
         history = self.statuses.get(task_id)
         return history[-1] if history else None
 
+    async def update_task(self, task_id: str, metadata: str | dict) -> bool:
+        return True
+
+    async def _dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = 30.0
+    ) -> dict:
+        return {}
+
     def release(self, task_id: str) -> None:
         pass
 
