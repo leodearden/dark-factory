@@ -27,6 +27,7 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.task_status import TERMINAL_STATUSES
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
 # value) are rate-limited to a geometric schedule so the event store is not
@@ -585,7 +586,13 @@ class Scheduler:
             return False
 
     def _deps_satisfied(self, task: dict, status_map: dict[str, str]) -> bool:
-        """Return True if every dependency of *task* has status 'done'.
+        """Return True if every dependency of *task* is in a terminal status.
+
+        A dep is satisfied when its status is in :data:`TERMINAL_STATUSES`
+        (``done`` or ``cancelled``).  ``cancelled`` represents an obsolete
+        or duplicate task and should not block its dependents — the
+        dependent re-architects against current main and either finds the
+        work already merged or escalates for a different reason.
 
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
@@ -600,9 +607,10 @@ class Scheduler:
         for d in deps:
             dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
             dep_status = status_map.get(dep_id, 'unknown')
-            if dep_status != 'done':
+            if dep_status not in TERMINAL_STATUSES:
                 logger.debug(
-                    'Task %s blocked: dep %s has status %s, need done',
+                    'Task %s blocked: dep %s has status %s, '
+                    'need done or cancelled',
                     task_id,
                     dep_id,
                     dep_status,

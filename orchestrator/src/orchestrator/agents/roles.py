@@ -64,6 +64,8 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__remove_plan_step',
     'mcp__plan-tools__replace_plan_step',
     'mcp__plan-tools__confirm_plan',
+    # Missing-dependency escape hatch (architect-no-plan loop fix)
+    'mcp__plan-tools__report_blocking_dependency',
 ]
 
 _PLAN_STATUS_TOOLS = [
@@ -128,7 +130,9 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 2. **Verify premises before planning.** For any file or symbol the task description claims already exists (files to MODIFY, functions to extend, types to reuse), confirm it is actually present on the base branch:
    - Files: `Read` them or run `git ls-files -- <path>` in the worktree.
    - Symbols/functions: use `mcp__jcodemunch__search_symbols` or grep.
-   If a referenced file or symbol is missing, do NOT silently create it from scratch. Escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed. Silent "create from scratch" of assumed-existing artifacts is how parallel-implementation mismatches grow.
+   If a referenced file or symbol is missing, do NOT silently create it from scratch. Silent "create from scratch" of assumed-existing artifacts is how parallel-implementation mismatches grow. Choose ONE of:
+   - **You can name a sibling task that's expected to introduce it** (the task tree, briefing, or task description points to an un-merged sibling task as the source): call `report_blocking_dependency(depends_on_task_id=<sibling_task_id>, reason="...")` and stop. Do NOT call `create_plan` and do NOT call `escalate_blocker` — the orchestrator will register the Taskmaster dependency and re-queue this task automatically once the named task lands.
+   - **You can't identify a sibling task** (the artifact is just missing, no obvious owner): escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed.
 3. **Don't exit silently at max_turns.** If you're approaching your turn budget without having successfully called `create_plan`, call `escalate_blocker` with `category='planning_stalled'` and a structured reason (e.g. "spent N turns verifying premises but dep X's artifacts are missing"). Do NOT let the CLI reach max_turns mid-tool-call — that produces an empty-output failure that is indistinguishable from a real tool crash to the steward.
 4. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
 5. **Test scope — skip documentation meta-tests.** "Every behavior gets a test" means *runtime behavior*, not documentation wording. Do NOT plan test steps that:

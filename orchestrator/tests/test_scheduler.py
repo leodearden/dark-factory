@@ -607,6 +607,34 @@ class TestDepsSatisfied:
         status_map = {}
         assert scheduler._deps_satisfied(task, status_map) is True
 
+    def test_deps_satisfied_returns_true_when_dep_cancelled(
+        self, scheduler: Scheduler
+    ):
+        """_deps_satisfied treats cancelled deps as satisfied alongside done.
+
+        ``cancelled`` represents an obsolete or duplicate task; the dependent
+        should re-architect rather than wait indefinitely.
+        """
+        task = {'id': '2', 'dependencies': [{'id': 1}]}
+        status_map = {'1': 'cancelled', '2': 'pending'}
+        assert scheduler._deps_satisfied(task, status_map) is True
+
+    def test_deps_satisfied_returns_false_for_blocked_dep(
+        self, scheduler: Scheduler
+    ):
+        """``blocked`` is non-terminal — must still gate dispatch."""
+        task = {'id': '2', 'dependencies': [{'id': 1}]}
+        status_map = {'1': 'blocked', '2': 'pending'}
+        assert scheduler._deps_satisfied(task, status_map) is False
+
+    def test_deps_satisfied_returns_false_for_deferred_dep(
+        self, scheduler: Scheduler
+    ):
+        """``deferred`` is non-terminal — must still gate dispatch."""
+        task = {'id': '2', 'dependencies': [{'id': 1}]}
+        status_map = {'1': 'deferred', '2': 'pending'}
+        assert scheduler._deps_satisfied(task, status_map) is False
+
 
 class TestAcquireNextDependencyGating:
     """acquire_next() must not dispatch tasks whose dependencies are not done."""

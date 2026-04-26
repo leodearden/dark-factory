@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -271,6 +272,59 @@ def _confirm_plan(
 
 
 # ---------------------------------------------------------------------------
+# Missing-dependency reporting (architect escape hatch)
+# ---------------------------------------------------------------------------
+
+
+def _report_blocking_dependency(
+    artifacts: TaskArtifacts,
+    depends_on_task_id: str,
+    reason: str,
+    main_sha: str,
+) -> dict[str, Any]:
+    """Write the blocking-dependency artifact for the workflow to act on.
+
+    The architect calls this when it has determined the task cannot be
+    planned because it depends on work that has not yet landed on main.
+    No Taskmaster mutation happens here — the workflow reads the artifact
+    after the architect returns and registers the dependency
+    deterministically.
+    """
+    artifacts.write_blocking_dependency(
+        depends_on_task_id=depends_on_task_id,
+        reason=reason,
+        main_sha_at_report=main_sha,
+    )
+    return {
+        'status': 'ok',
+        'depends_on_task_id': depends_on_task_id,
+    }
+
+
+def _resolve_main_sha(worktree: Path) -> str:
+    """Return the current ``main`` HEAD SHA visible from *worktree*.
+
+    Falls back to an empty string on git failure — the workflow side
+    treats an empty ``main_sha_at_report`` as "advance check skipped".
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', 'main'],
+            cwd=str(worktree),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.stdout.strip()
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning(
+            'Failed to resolve main SHA for blocking_dependency report: %s', exc
+        )
+        return ''
+
+
+# ---------------------------------------------------------------------------
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
@@ -440,6 +494,37 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         revalidation timestamp on the plan.
         """
         return _confirm_plan(artifacts)
+
+    @mcp.tool()
+    def report_blocking_dependency(
+        depends_on_task_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Report that this task cannot be planned because it depends on
+        another task whose work has not yet landed on main.
+
+        Use this INSTEAD of writing a plan when you discover, during the
+        verify-premises phase, that a referenced file/symbol is missing
+        because the sibling task that would create it has not yet merged.
+
+        After calling this tool, stop. Do NOT call ``create_plan`` or
+        ``escalate_blocker``. The orchestrator will read the report,
+        register the Taskmaster dependency, and re-queue this task to
+        run again after the named task lands.
+
+        Args:
+            depends_on_task_id: The task id this task is blocked on
+                (the one whose work is missing). Use the exact task id
+                from the briefing or the task tree (e.g. "1042").
+            reason: One-line explanation of what's missing — file/symbol
+                names and where this task expected to find them.
+        """
+        # ``artifacts.root`` is ``worktree / '.task'`` so the worktree is its parent.
+        worktree = artifacts.root.parent
+        main_sha = _resolve_main_sha(worktree)
+        return _report_blocking_dependency(
+            artifacts, depends_on_task_id, reason, main_sha,
+        )
 
     return mcp
 
