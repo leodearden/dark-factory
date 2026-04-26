@@ -3348,9 +3348,8 @@ class TestPruneArchiveThrottle:
 
         archive_root = tmp_path / 'data' / 'verify-logs'
 
-        with patch.object(verify, '_prune_archive', side_effect=RuntimeError('bug')):
-            with pytest.raises(RuntimeError, match='bug'):
-                _maybe_prune_archive(archive_root)
+        with patch.object(verify, '_prune_archive', side_effect=RuntimeError('bug')), pytest.raises(RuntimeError, match='bug'):
+            _maybe_prune_archive(archive_root)
 
     def test_throttle_uses_module_level_monotonic_indirection(self, monkeypatch, tmp_path: Path):
         """``_maybe_prune_archive`` reads time via the ``verify._monotonic`` indirection.
