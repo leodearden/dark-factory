@@ -960,12 +960,10 @@ Output JSON matching the schema. Every task must appear in the output.
             # Already-on-main fast-path (is_ancestor == True).
             # Side-effect sequence shared via _mark_in_progress_done.
             if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
-                # Resolve branch SHA BEFORE the helper invokes cleanup_worktree
-                # (which calls 'git branch -D' and would invalidate
-                # post-cleanup rev-parse — see git_ops.py cleanup_worktree).
-                # Build provenance before invoking the helper — the helper
-                # performs cleanup, and any post-cleanup git query (e.g.
-                # rev-parse on a deleted branch) would fail.
+                # Resolve SHA and build provenance BEFORE invoking the helper —
+                # the helper calls cleanup_worktree which runs 'git branch -D'
+                # and would invalidate any post-cleanup rev-parse
+                # (see git_ops.py cleanup_worktree).
                 branch_sha = await self.git_ops.resolve_branch_sha(branch)
 
                 provenance: dict[str, str] = {
