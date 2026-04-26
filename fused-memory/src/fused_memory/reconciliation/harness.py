@@ -465,10 +465,13 @@ class ReconciliationHarness:
                         project_id=project_id,
                         limit=20,
                     )
+                    # Both sides coerced to str so that a prior written with
+                    # int task_id (e.g. 517) matches a deferred write whose
+                    # metadata carries str task_id '517' — mirroring flag_dedup.py.
                     prior = [
                         r for r in results
-                        if r.metadata.get('task_id') == str(tid)
-                        and str(r.metadata.get('transition', '')) == 'done'
+                        if str((r.metadata or {}).get('task_id', '')) == str(tid)
+                        and str((r.metadata or {}).get('transition', '')) == 'done'
                     ]
                     if prior:
                         logger.info(
