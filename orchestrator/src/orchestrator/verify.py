@@ -283,6 +283,8 @@ def _persist_attempt_logs(
     runs: list[dict],
     category: str,
     cause_hint: str,
+    *,
+    module_prefix: 'str | None' = None,
 ) -> list[Path]:
     """Write per-command outputs and a summary JSON to ``<worktree>/.task/verify/``.
 
@@ -298,9 +300,21 @@ def _persist_attempt_logs(
     No-op (returns ``[]``) when ``(worktree / '.task')`` is absent — review-
     checkpoint and merge-queue paths lack ``.task/`` and must not be created.
 
+    When *module_prefix* is provided it is sanitized (``/`` and spaces →
+    ``_``, mirroring :func:`_warm_marker_name`) and inserted as a middle infix:
+    ``attempt-{N}.{safe_prefix}.{label}.log`` and
+    ``attempt-{N}.{safe_prefix}.summary.json``.  This prevents last-writer-wins
+    clobber when ``run_scoped_verification`` gathers multiple concurrent
+    :func:`run_verification` calls for different sub-projects into the same
+    worktree + attempt_id.
+
+    When *module_prefix* is ``None`` the filenames remain
+    ``attempt-{N}.{label}.log`` / ``attempt-{N}.summary.json`` so the single-
+    module path is byte-identical to the pre-prefix behaviour.
+
     Writes:
-    - ``attempt-{N}.{label}.log`` for every run where ``cmd is not None``
-    - ``attempt-{N}.summary.json`` with the summary shape described in the
+    - ``attempt-{N}[.{safe_prefix}].{label}.log`` for every run where ``cmd is not None``
+    - ``attempt-{N}[.{safe_prefix}].summary.json`` with the summary shape described in the
       task description: top-level keys are from the worst-failing run plus a
       ``commands`` list containing all per-run sub-dicts.
 
@@ -318,13 +332,20 @@ def _persist_attempt_logs(
         logger.warning('_persist_attempt_logs: could not create %s: %s', verify_dir, exc)
         return []
 
+    # Sanitize the module prefix for use in filenames (mirrors _warm_marker_name).
+    if module_prefix is not None:
+        safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
+        infix = f'.{safe_prefix}'
+    else:
+        infix = ''
+
     written: list[Path] = []
 
     # Write per-command log files.
     for run in runs:
         if run.get('cmd') is None:
             continue
-        log_path = verify_dir / f'attempt-{attempt_id}.{run["label"]}.log'
+        log_path = verify_dir / f'attempt-{attempt_id}{infix}.{run["label"]}.log'
         try:
             log_path.write_text(run['output'], encoding='utf-8')
             written.append(log_path)
@@ -361,7 +382,7 @@ def _persist_attempt_logs(
         ],
     }
 
-    summary_path = verify_dir / f'attempt-{attempt_id}.summary.json'
+    summary_path = verify_dir / f'attempt-{attempt_id}{infix}.summary.json'
     try:
         summary_path.write_text(
             json.dumps(summary_payload, indent=2, ensure_ascii=False),
@@ -1230,6 +1251,7 @@ async def run_verification(
         try:
             wt_paths = _persist_attempt_logs(
                 worktree, attempt_id, runs, category, cause_hint,
+                module_prefix=module_prefix,
             )
             worktree_log_paths = [str(p) for p in wt_paths]
             arch_paths = _archive_attempt_log(
