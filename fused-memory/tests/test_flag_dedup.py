@@ -189,3 +189,74 @@ async def test_dedup_flags_no_prior_marker_writes_new_marker():
     assert meta.get('flag_type') == 'stale_metadata'
     assert meta.get('run_id') == 'r1'
     assert meta.get('last_seen_run_id') == 'r1'
+
+
+# ---------------------------------------------------------------------------
+# dedup_flags — exception handling (step-9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
+    """When memory_service.search raises, dedup_flags does not raise, returns flags unchanged,
+    and logs a WARNING.
+    """
+    import logging
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+    memory_service.add_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': '55', 'flag_type': 'stale_metadata', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) Does NOT raise
+    # (b) Returns flag unchanged (no persisted_from_run)
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+    # (c) WARNING log mentions the failure and task_id
+    assert any(
+        '55' in record.message and record.levelno >= logging.WARNING
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog):
+    """When memory_service.add_memory raises, dedup_flags does not raise, returns flag unchanged,
+    and logs a WARNING.
+    """
+    import logging
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])  # no prior marker
+    memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write failed'))
+
+    flags = [{'task_id': '66', 'flag_type': 'missing_deliverable', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) Does NOT raise
+    # (b) Returns flag unchanged
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+    # (c) WARNING log mentions failure and task_id
+    assert any(
+        '66' in record.message and record.levelno >= logging.WARNING
+        for record in caplog.records
+    )
