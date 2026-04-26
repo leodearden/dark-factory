@@ -87,6 +87,12 @@ class _SchedulerLike(Protocol):
         self, task_id: str, current: list[str], needed: list[str], /
     ) -> bool: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
+    async def update_task(
+        self, task_id: str, metadata: str | dict,
+    ) -> bool: ...
+    async def _dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = ...,
+    ) -> dict: ...
 
 
 class _McpLike(Protocol):
@@ -856,37 +862,54 @@ class TaskWorkflow:
             )
 
         result: AgentResult | None = None
-        for attempt in range(2):
-            result = await self._invoke(ARCHITECT, prompt, self.worktree)
+        rebase_retry_used = False
+        for _outer_attempt in range(2):  # at most one rebase-retry round-trip
+            for attempt in range(2):
+                result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
-            if not result.success:
-                cls = classify_agent_failure(result)
-                logger.error(
-                    'Task %s: architect failed (%s): %s',
-                    self.task_id, cls.kind.value, cls.summary,
-                )
-                return await self._mark_blocked(
-                    f'Planning failed: {cls.summary}',
-                    detail=cls.diagnostic_detail,
-                )
+                if not result.success:
+                    cls = classify_agent_failure(result)
+                    logger.error(
+                        'Task %s: architect failed (%s): %s',
+                        self.task_id, cls.kind.value, cls.summary,
+                    )
+                    return await self._mark_blocked(
+                        f'Planning failed: {cls.summary}',
+                        detail=cls.diagnostic_detail,
+                    )
 
-            # Detect anomalous premature exit: succeeded but suspiciously
-            # few turns and low cost — likely a transient CLI issue.
-            self.plan = self.artifacts.read_plan()
-            if (
-                attempt == 0
-                and result.turns <= 2
-                and result.cost_usd < 0.20
-                and not self.plan
-            ):
-                logger.warning(
-                    f'Task {self.task_id}: architect completed anomalously '
-                    f'(turns={result.turns}, cost=${result.cost_usd:.2f}, '
-                    f'duration={result.duration_ms}ms, output_len={len(result.output)}) '
-                    f'— retrying once'
+                # Detect anomalous premature exit: succeeded but suspiciously
+                # few turns and low cost — likely a transient CLI issue.
+                self.plan = self.artifacts.read_plan()
+                if (
+                    attempt == 0
+                    and result.turns <= 2
+                    and result.cost_usd < 0.20
+                    and not self.plan
+                ):
+                    logger.warning(
+                        f'Task {self.task_id}: architect completed anomalously '
+                        f'(turns={result.turns}, cost=${result.cost_usd:.2f}, '
+                        f'duration={result.duration_ms}ms, output_len={len(result.output)}) '
+                        f'— retrying once'
+                    )
+                    continue
+
+                break
+
+            # Fix B: the architect may have written a blocking_dependency
+            # report instead of a plan.  Handle deterministically before the
+            # "no plan.json" failure path.
+            if self.artifacts.read_blocking_dependency() is not None:
+                dep_outcome = await self._handle_blocking_dep_report(
+                    rebase_retry_used=rebase_retry_used,
                 )
+                if dep_outcome is not None:
+                    return dep_outcome
+                # Helper rebased + cleared the artifact; loop back to retry
+                # the architect once.
+                rebase_retry_used = True
                 continue
-
             break
 
         assert result is not None  # range(2) always executes at least once
@@ -896,7 +919,7 @@ class TaskWorkflow:
                 'Task %s: architect produced no plan.json (%s): %s',
                 self.task_id, cls.kind.value, cls.summary,
             )
-            return await self._mark_blocked(
+            return await self._handle_no_plan_failure(
                 f'Planning failed: no plan.json produced — {cls.summary}',
                 detail=(
                     'Architect succeeded but did not write .task/plan.json\n'
@@ -922,7 +945,7 @@ class TaskWorkflow:
                 f'Task {self.task_id}: architect wrote plan.json but missing/empty '
                 f'"steps" — full plan content: {plan_dump}'
             )
-            return await self._mark_blocked(
+            return await self._handle_no_plan_failure(
                 'Planning failed: plan missing "steps"',
                 detail=f'Plan content:\n{plan_dump[:4000]}',
             )
@@ -951,7 +974,7 @@ class TaskWorkflow:
 
         plan_files = self.plan.get('files', [])
         if not plan_files:
-            return await self._mark_blocked(
+            return await self._handle_no_plan_failure(
                 'Planning failed: plan missing "files"',
                 detail=(
                     'Architect wrote plan.json without a non-empty "files" array. '
@@ -1083,6 +1106,163 @@ class TaskWorkflow:
             self.task_id,
         )
         return False
+
+    async def _handle_no_plan_failure(
+        self, reason: str, *, detail: str,
+    ) -> WorkflowOutcome:
+        """Block on a no-plan / malformed-plan failure with cycle detection.
+
+        Fix C — increments ``consecutive_no_plan_failures`` keyed by
+        ``last_no_plan_main_sha`` in the task's metadata.  When the
+        counter hits ≥ 2 with the same main SHA, the no-plan loop has
+        been observed and we escalate to a human directly (skip the
+        steward) rather than letting the workflow re-pend.
+        """
+        try:
+            current_main_sha = await self.git_ops.get_main_sha()
+        except Exception as exc:  # noqa: BLE001 — fall through to standard path
+            logger.warning(
+                'Task %s: could not read main SHA for no-plan cycle counter: %s',
+                self.task_id, exc,
+            )
+            current_main_sha = ''
+
+        metadata = self.task.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        last_sha = str(metadata.get('last_no_plan_main_sha') or '')
+        try:
+            counter = int(metadata.get('consecutive_no_plan_failures') or 0)
+        except (TypeError, ValueError):
+            counter = 0
+
+        if not current_main_sha or last_sha != current_main_sha:
+            counter = 1
+        else:
+            counter += 1
+
+        # Persist the new counter (best-effort — never block on this).
+        new_metadata = dict(metadata)
+        new_metadata['last_no_plan_main_sha'] = current_main_sha
+        new_metadata['consecutive_no_plan_failures'] = counter
+        self.task['metadata'] = new_metadata
+        try:
+            await self.scheduler.update_task(self.task_id, metadata=new_metadata)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: failed to persist no-plan cycle counter: %s',
+                self.task_id, exc,
+            )
+
+        if counter >= 2:
+            logger.warning(
+                'Task %s: consecutive_no_plan_failures=%d on main SHA %s — '
+                'no-plan loop confirmed; escalating to human',
+                self.task_id, counter, current_main_sha[:12] or '<unknown>',
+            )
+            full_reason = (
+                f'Repeated no-plan failure (counter={counter}) on same '
+                f'main SHA: {reason}'
+            )
+            return await self._mark_blocked(
+                full_reason, detail=detail, escalate_to_human=True,
+            )
+
+        return await self._mark_blocked(reason, detail=detail)
+
+    async def _handle_blocking_dep_report(
+        self, *, rebase_retry_used: bool,
+    ) -> WorkflowOutcome | None:
+        """Process a ``.task/blocking_dependency.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        - If the named dep is non-terminal: register the Taskmaster
+          dependency, clear the artifact, and return REQUEUED.  Status
+          stays ``pending`` — the scheduler's dep-check keeps the task
+          from dispatching until the dep is ``done``/``cancelled``.
+        - If the dep is already terminal: a race occurred (dep landed
+          between architect-start and report).  Rebase onto current
+          main, clear the artifact, and return ``None`` so the caller
+          retries the architect once.  When ``rebase_retry_used`` is
+          already ``True``, return BLOCKED to prevent unbounded retry.
+        - If the artifact is malformed (missing ``depends_on_task_id``):
+          clear it and return BLOCKED.
+        """
+        assert self.artifacts is not None and self.worktree is not None
+        report = self.artifacts.read_blocking_dependency()
+        assert report is not None  # caller must have verified
+
+        dep_id = str(report.get('depends_on_task_id') or '').strip()
+        reason = report.get('reason', '')
+        if not dep_id:
+            logger.error(
+                'Task %s: blocking_dependency.json missing depends_on_task_id; '
+                'treating as planning failure', self.task_id,
+            )
+            self.artifacts.clear_blocking_dependency()
+            return await self._mark_blocked(
+                'Architect wrote malformed blocking_dependency.json '
+                '(missing depends_on_task_id)',
+                detail=json.dumps(report, indent=2)[:2000],
+            )
+
+        dep_status = await self.scheduler.get_status(dep_id)
+
+        if dep_status in TERMINAL_STATUSES:
+            # Race: dep landed between architect-start and report.
+            self.artifacts.clear_blocking_dependency()
+            if rebase_retry_used:
+                return await self._mark_blocked(
+                    f'Architect repeatedly reported blocking dependency on '
+                    f'task {dep_id} which is already {dep_status} '
+                    f'(rebase-retry already used)',
+                    detail=f'reason: {reason}\nfull_report: '
+                           f'{json.dumps(report, indent=2)[:1500]}',
+                )
+            logger.info(
+                'Task %s: architect reported dep on task %s but it is %s — '
+                'rebasing onto main and retrying architect once',
+                self.task_id, dep_id, dep_status,
+            )
+            rebased = await self.git_ops.rebase_onto_main(self.worktree)
+            new_main_sha = await self.git_ops.get_main_sha()
+            if rebased:
+                self.artifacts.update_base_commit(new_main_sha)
+            else:
+                logger.warning(
+                    'Task %s: rebase onto main failed during blocking-dep '
+                    'recovery — retrying architect on stale base anyway',
+                    self.task_id,
+                )
+            return None
+
+        # Non-terminal dep — register the Taskmaster dependency.
+        logger.info(
+            'Task %s: architect reported blocking dependency on task %s '
+            '(status=%s); registering dep and requeueing — reason: %s',
+            self.task_id, dep_id, dep_status, reason[:200],
+        )
+        try:
+            await self.scheduler._dispatch_tool(
+                'add_dependency',
+                {
+                    'id': self.task_id,
+                    'depends_on': dep_id,
+                    'project_root': str(self.config.project_root),
+                },
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+            logger.warning(
+                'Task %s: add_dependency(%s -> %s) failed: %s — proceeding '
+                'with requeue anyway',
+                self.task_id, self.task_id, dep_id, exc,
+            )
+
+        self.artifacts.clear_blocking_dependency()
+        await self.scheduler.set_task_status(self.task_id, 'pending')
+        return WorkflowOutcome.REQUEUED
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
@@ -2688,6 +2868,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self, reason: str, *, detail: str = '',
         skip_escalation: bool = False,
         merge_phase: bool = False,
+        escalate_to_human: bool = False,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -2699,6 +2880,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         *merge_phase* suppresses task-status transitions (blocked/pending)
         when the caller will retry the merge in-place rather than requeueing
         through the scheduler.
+        *escalate_to_human* (Fix C) skips the steward entirely and submits
+        an L1 escalation immediately.  Use when the caller has determined
+        a confirmed loop / unresolvable failure that the steward cannot
+        meaningfully un-stick (e.g. ≥2 consecutive no-plan failures on
+        the same main SHA).
         """
         if self.state == WorkflowState.DONE:
             logger.warning(
@@ -2738,6 +2924,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         resolved_by='auto-dismissed',
                     )
 
+        created_l0_id: str | None = None
         if self.escalation_queue and not skip_escalation:
             # Don't create a duplicate if level-1 already pending
             if not self.escalation_queue.has_open_l1(self.task_id):
@@ -2756,6 +2943,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     workflow_state=self.state.value,
                 )
                 self.escalation_queue.submit(esc)
+                created_l0_id = esc.id
 
                 if self.event_store:
                     self.event_store.emit(
@@ -2764,6 +2952,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         data={'escalation_id': esc.id, 'category': 'task_failure',
                               'severity': 'blocking', 'summary': reason[:200]},
                     )
+
+            # Fix C short-circuit: the caller already determined this is
+            # a confirmed loop / unresolvable failure that the steward
+            # cannot un-stick.  Skip steward, submit L1, return BLOCKED.
+            if escalate_to_human:
+                await self._ensure_l1_escalation_for_blocked(
+                    reason, detail or reason,
+                )
+                return WorkflowOutcome.BLOCKED
 
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
@@ -2783,6 +2980,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     if current == 'done':
                         self._enter_phase(WorkflowState.DONE)
                         return WorkflowOutcome.DONE
+                    # 'cancelled' is an intentional terminal — no L1 needed.
                     return WorkflowOutcome.BLOCKED
 
                 # If steward resolved all level-0 escalations, set task back
@@ -2818,6 +3016,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
                         return WorkflowOutcome.BLOCKED
 
+                    # Fix A: detect dismiss-with-terminate.  When the
+                    # steward's resolve_issue(terminate=True) marks the L0
+                    # 'dismissed' (rather than 'resolved'), the agent
+                    # signaled "I cannot fix this" — re-pending will loop
+                    # the same failure.  Halt here, submit an L1 so a
+                    # human can intervene, and return BLOCKED.
+                    if created_l0_id is not None:
+                        last_l0 = self.escalation_queue.get(created_l0_id)
+                        if (
+                            last_l0 is not None
+                            and last_l0.status == 'dismissed'
+                        ):
+                            logger.warning(
+                                'Task %s: steward dismissed L0 (terminate) '
+                                '— halting, escalating to L1', self.task_id,
+                            )
+                            await self._ensure_l1_escalation_for_blocked(
+                                reason, detail or reason,
+                            )
+                            return WorkflowOutcome.BLOCKED
+
                     if self.event_store:
                         self.event_store.emit(
                             EventType.escalation_resolved,
@@ -2837,7 +3056,55 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
                     return WorkflowOutcome.REQUEUED
 
+        # Fall-through BLOCKED: either no escalation queue, or the steward
+        # never resolved the L0.  Either way a human should know — submit
+        # an L1 (deduped) so the task isn't silently parked.
+        await self._ensure_l1_escalation_for_blocked(reason, detail or reason)
         return WorkflowOutcome.BLOCKED
+
+    async def _ensure_l1_escalation_for_blocked(
+        self, reason: str, detail: str,
+    ) -> None:
+        """Submit a level-1 escalation if none is open for this task.
+
+        Called from BLOCKED-return paths so a human is signaled when
+        automated handlers cannot make progress.  Idempotent — deduped
+        via ``has_open_l1``.
+        """
+        if not self.escalation_queue:
+            return
+        if self.escalation_queue.has_open_l1(self.task_id):
+            return
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary=f'Workflow blocked, no automated resolution path: {reason[:160]}',
+            detail=detail or reason,
+            suggested_action='manual_intervention',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+            level=1,
+        )
+        self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={
+                    'escalation_id': esc.id, 'category': 'task_failure',
+                    'severity': 'blocking', 'level': 1,
+                    'summary': reason[:200],
+                },
+            )
+        logger.warning(
+            'Task %s: submitted L1 escalation %s for unresolved BLOCKED state',
+            self.task_id, esc.id,
+        )
 
     async def _write_completion_to_memory(self) -> None:
         """Write task completion summary so dependent tasks find it in briefings."""

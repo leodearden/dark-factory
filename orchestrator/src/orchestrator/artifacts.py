@@ -231,6 +231,46 @@ class TaskArtifacts:
         plan['_schema_version'] = PLAN_SCHEMA_VERSION
         self._write_json(self.root / 'plan.json', plan)
 
+    def write_blocking_dependency(
+        self,
+        depends_on_task_id: str,
+        reason: str,
+        main_sha_at_report: str,
+    ) -> None:
+        """Write .task/blocking_dependency.json — architect's report that
+        this task cannot be planned until ``depends_on_task_id`` lands.
+
+        The workflow reads this artifact after the architect returns and
+        deterministically registers the Taskmaster dependency before
+        requeueing.  ``main_sha_at_report`` lets the workflow detect a
+        ``dep_id``-already-terminal race (main advanced after the report).
+        """
+        data = {
+            'depends_on_task_id': depends_on_task_id,
+            'reason': reason,
+            'main_sha_at_report': main_sha_at_report,
+            'reported_at': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'blocking_dependency.json', data)
+
+    def read_blocking_dependency(self) -> dict | None:
+        """Return the parsed ``.task/blocking_dependency.json`` artifact if
+        present, else ``None``.
+        """
+        path = self.root / 'blocking_dependency.json'
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def clear_blocking_dependency(self) -> None:
+        """Remove ``.task/blocking_dependency.json`` if present.
+
+        Called by the workflow after the dependency has been registered (or
+        determined to be a no-op due to an advance-past-report race) so a
+        subsequent architect invocation does not see a stale report.
+        """
+        (self.root / 'blocking_dependency.json').unlink(missing_ok=True)
+
     def read_plan(self) -> dict:
         """Read current plan state, auto-normalizing malformed shapes."""
         plan_path = self.root / 'plan.json'

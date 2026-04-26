@@ -1674,6 +1674,33 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
     return _FakeSteward
 
 
+def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
+    """Return a steward that DISMISSES (terminate=True) all pending L0s.
+
+    Used by Fix A tests to exercise the "steward gives up" code path —
+    the workflow must NOT re-pend; instead it submits an L1 and returns
+    BLOCKED.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        async def start(self) -> None:
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            assert pending, 'expected at least one pending L0 escalation to dismiss'
+            for esc in pending:
+                queue.resolve(
+                    esc.id, 'Cannot fix — terminating',
+                    dismiss=True, resolved_by='fake-steward',
+                )
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
 @pytest.mark.asyncio
 class TestTaskFailureEscalation:
     """Blocked tasks create escalation entries in the queue."""
@@ -1708,15 +1735,18 @@ class TestTaskFailureEscalation:
 
         assert outcome == WorkflowOutcome.BLOCKED
 
-        # Check escalation was created
-        escalations = queue.get_by_task('42')
-        assert len(escalations) == 1
-        esc = escalations[0]
+        # Check L0 escalation was created (the per-failure one).
+        # An L1 is also submitted on the fallthrough BLOCKED path.
+        l0 = queue.get_by_task('42', level=0)
+        assert len(l0) == 1
+        esc = l0[0]
         assert esc.category == 'task_failure'
         assert esc.severity == 'blocking'
         assert esc.agent_role == 'orchestrator'
         assert esc.task_id == '42'
         assert esc.status == 'pending'
+        # L1 fallthrough escalation must also be present (Fix A).
+        assert queue.has_open_l1('42')
 
     async def test_escalation_has_correct_fields(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
@@ -1745,12 +1775,15 @@ class TestTaskFailureEscalation:
 
         assert outcome == WorkflowOutcome.BLOCKED
 
-        escalations = queue.get_by_task('42')
-        assert len(escalations) == 1
-        esc = escalations[0]
+        # Filter to the L0 (the per-failure escalation); Fix A also submits an
+        # L1 on the fallthrough path which is asserted separately.
+        l0 = queue.get_by_task('42', level=0)
+        assert len(l0) == 1
+        esc = l0[0]
         assert esc.workflow_state == 'blocked'
         assert esc.suggested_action == 'investigate_and_retry'
         assert 'Planning failed' in esc.summary
+        assert queue.has_open_l1('42')
 
     async def test_no_escalation_without_queue(
         self, config, git_ops, task_assignment, monkeypatch
@@ -1813,9 +1846,10 @@ class TestTaskFailureEscalation:
 
         assert outcome == WorkflowOutcome.BLOCKED
 
-        escalations = queue.get_by_task('42')
-        assert len(escalations) == 1
-        esc = escalations[0]
+        # L0 carries the cause hint; L1 (Fix A fallthrough) is also present.
+        l0 = queue.get_by_task('42', level=0)
+        assert len(l0) == 1
+        esc = l0[0]
         assert esc.category == 'task_failure'
         assert 'Verification attempts exhausted' in esc.summary
         # detail must carry the cause hint from failure_report()
@@ -1931,9 +1965,12 @@ class TestDoneIsTerminal:
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert 'blocked' in scheduler.statuses.get(task_assignment.task_id, [])
-        escalations = queue.get_by_task(task_assignment.task_id)
-        assert len(escalations) == 1
-        assert escalations[0].category == 'task_failure'
+        # L0 created for the failure; Fix A also submits an L1 on the
+        # fallthrough path (no steward attached in this test).
+        l0 = queue.get_by_task(task_assignment.task_id, level=0)
+        assert len(l0) == 1
+        assert l0[0].category == 'task_failure'
+        assert queue.has_open_l1(task_assignment.task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2349,10 +2386,11 @@ class TestPrerequisitesValidation:
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
 
-        # The escalation must describe the prerequisites problem, not a generic crash
-        escalations = queue.get_by_task('42')
-        assert len(escalations) == 1
-        esc = escalations[0]
+        # The L0 escalation must describe the prerequisites problem, not a
+        # generic crash.  Fix A also submits an L1 on the fallthrough path.
+        l0 = queue.get_by_task('42', level=0)
+        assert len(l0) == 1
+        esc = l0[0]
         # summary or detail must mention 'prerequisites' to confirm the validation ran
         assert 'prerequisites' in esc.summary.lower() or 'prerequisites' in (esc.detail or '').lower()
 
@@ -2425,6 +2463,162 @@ class TestMarkBlockedFalseDoneGuard:
         assert workflow.state != WorkflowState.DONE, (
             f'workflow.state must not be DONE after empty-branch guard: {workflow.state!r}'
         )
+
+    async def test_steward_dismisses_with_terminate_blocks_with_l1(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Fix A: when steward calls resolve_issue(terminate=True), the L0
+        is marked dismissed.  The workflow must NOT re-pend (which would
+        spin the same failure) — it must submit an L1 and return BLOCKED.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        workflow._steward_factory = _make_dismissing_steward(
+            queue, task_assignment.task_id,
+        )
+
+        outcome = await workflow._mark_blocked('architect produced no plan.json')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r} — '
+            'dismiss-with-terminate should not re-pend'
+        )
+        # Status must NOT be re-pended: scheduler should never have seen 'pending'
+        # written after the initial 'blocked' transition.
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'blocked', (
+            f'Final status must be blocked (not requeued), got {statuses}'
+        )
+        # An L1 escalation must have been submitted.
+        assert queue.has_open_l1(task_assignment.task_id), (
+            'Fix A: L1 escalation must be open after steward dismisses-with-terminate'
+        )
+
+    async def test_steward_resolves_still_requeues_no_l1(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Regression: when the steward RESOLVES (not dismisses), the existing
+        re-pend behavior is preserved and no L1 is submitted (unlike Fix A's
+        dismiss case). This test pins that distinction.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        outcome = await workflow._mark_blocked('architect produced no plan.json')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        # Steward resolved (not dismissed) — no L1 should be submitted.
+        assert not queue.has_open_l1(task_assignment.task_id), (
+            'Resolved L0 must NOT trigger an L1 — that path is reserved '
+            'for dismiss-with-terminate and unresolved fallthrough.'
+        )
+
+    async def test_escalate_to_human_skips_steward_and_submits_l1(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Fix C: ``escalate_to_human=True`` must NOT invoke the steward —
+        it goes straight to L0 + L1 + BLOCKED.  Pin this contract so
+        future refactors don't accidentally re-enable steward involvement
+        on confirmed-loop failures.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # Wire a steward factory whose start() would record a call. The Fix-C
+        # short-circuit must NOT instantiate the steward.
+        invocations: list[str] = []
+
+        class _SpyStewardFactory:
+            def __call__(self, wt_path, cfg_dir):  # noqa: ARG002
+                invocations.append('init')
+                return _SpyStewardFactory.Steward()
+
+            class Steward:
+                async def start(self) -> None:
+                    invocations.append('start')
+
+                async def stop(self) -> None:
+                    pass
+
+        workflow._steward_factory = _SpyStewardFactory()
+
+        outcome = await workflow._mark_blocked(
+            'looped failure', escalate_to_human=True,
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert invocations == [], (
+            f'escalate_to_human=True must NOT spawn the steward, '
+            f'but factory was called: {invocations}'
+        )
+        # L0 (visibility) and L1 (human) both submitted.
+        l0 = queue.get_by_task(task_assignment.task_id, level=0)
+        assert len(l0) == 1
+        assert queue.has_open_l1(task_assignment.task_id)
+
+    async def test_l1_dedupe_when_already_open(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """The L1 helper is deduped: if an L1 is already open at the
+        fallthrough, no second L1 is submitted."""
+        from escalation.models import Escalation
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # Pre-seed an L1 escalation so the helper sees has_open_l1 == True.
+        existing_l1 = Escalation(
+            id=queue.make_id(task_assignment.task_id),
+            task_id=task_assignment.task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='task_failure',
+            summary='pre-existing L1',
+            level=1,
+        )
+        queue.submit(existing_l1)
+
+        # No steward — fallthrough path
+        outcome = await workflow._mark_blocked('failure with prior L1 open')
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        l1s = queue.get_by_task(task_assignment.task_id, level=1)
+        # Exactly one L1 — helper saw has_open_l1 and skipped its own submit.
+        assert len(l1s) == 1
+        assert l1s[0].id == existing_l1.id
 
     async def test_empty_branch_with_stale_iteration_log_still_requeues(
         self, config, git_ops, task_assignment, tmp_path
@@ -3909,10 +4103,13 @@ class TestSessionBudgetExhaustionEscalation:
         assert outcome == WorkflowOutcome.BLOCKED
         assert workflow.state == WorkflowState.BLOCKED
 
-        # Check L1 escalation exists with expected fields
-        escalations = queue.get_by_task(task_assignment.task_id)
-        assert len(escalations) == 1, f'Expected 1 escalation, got {len(escalations)}'
-        esc = escalations[0]
+        # Check L0 escalation exists with expected fields.  Fix A also
+        # submits an L1 on the fallthrough path; this test pins the L0's
+        # summary content (which carries the budget-metrics phrasing
+        # callers triage on).
+        l0 = queue.get_by_task(task_assignment.task_id, level=0)
+        assert len(l0) == 1, f'Expected 1 L0 escalation, got {len(l0)}'
+        esc = l0[0]
         summary = esc.summary
 
         # Summary must contain (a) canonical phrase, (b) anchored budget label+value,
@@ -3964,9 +4161,11 @@ class TestSessionBudgetExhaustionEscalation:
 
         assert outcome == WorkflowOutcome.BLOCKED
 
-        escalations = queue.get_by_task(task_assignment.task_id)
-        assert len(escalations) == 1, f'Expected 1 escalation, got {len(escalations)}'
-        detail = escalations[0].detail
+        # The L0 carries the metric-labelled detail; Fix A also submits an L1
+        # on the fallthrough path which is unrelated to this assertion.
+        l0 = queue.get_by_task(task_assignment.task_id, level=0)
+        assert len(l0) == 1, f'Expected 1 L0 escalation, got {len(l0)}'
+        detail = l0[0].detail
 
         # detail must carry labelled metric fields so operators can diagnose runaway cost
         assert '$0.10' in detail, f'Expected budget limit "$0.10" in detail, got: {detail!r}'
@@ -4027,11 +4226,13 @@ class TestFirstInvocationBudgetExhaustion:
             f'Expected BLOCKED outcome, got: {outcome!r}'
         )
 
-        escalations = queue.get_by_task(task_assignment.task_id)
-        assert len(escalations) == 1, (
-            f'Expected exactly 1 escalation, got {len(escalations)}'
+        # The L0 carries the per-failure summary/detail; Fix A also submits an L1
+        # on the fallthrough path (which has its own summary string).
+        l0 = queue.get_by_task(task_assignment.task_id, level=0)
+        assert len(l0) == 1, (
+            f'Expected exactly 1 L0 escalation, got {len(l0)}'
         )
-        esc = escalations[0]
+        esc = l0[0]
         detail = esc.detail
         summary = esc.summary
 

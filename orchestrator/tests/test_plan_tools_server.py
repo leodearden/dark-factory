@@ -15,6 +15,7 @@ from orchestrator.mcp.plan_tools import (
     _mark_step_done,
     _remove_plan_step,
     _replace_plan_step,
+    _report_blocking_dependency,
     _update_plan_metadata,
 )
 
@@ -389,3 +390,48 @@ class TestConfirmPlan:
         result = _confirm_plan(artifacts)
         assert result['status'] == 'error'
         assert 'no steps' in result['message'].lower()
+
+
+class TestReportBlockingDependency:
+    """Architect's escape hatch when a missing-dep means it cannot plan."""
+
+    def test_writes_artifact_with_provided_main_sha(self, artifacts):
+        result = _report_blocking_dependency(
+            artifacts,
+            depends_on_task_id='42',
+            reason='task 50 references foo() introduced by task 42',
+            main_sha='deadbeefcafef00d',
+        )
+        assert result['status'] == 'ok'
+        assert result['depends_on_task_id'] == '42'
+
+        data = artifacts.read_blocking_dependency()
+        assert data is not None
+        assert data['depends_on_task_id'] == '42'
+        assert (
+            data['reason']
+            == 'task 50 references foo() introduced by task 42'
+        )
+        assert data['main_sha_at_report'] == 'deadbeefcafef00d'
+        assert 'reported_at' in data
+
+    def test_overwrites_prior_report(self, artifacts):
+        _report_blocking_dependency(
+            artifacts, '1', 'first', main_sha='aaa'
+        )
+        _report_blocking_dependency(
+            artifacts, '2', 'second', main_sha='bbb'
+        )
+        data = artifacts.read_blocking_dependency()
+        assert data['depends_on_task_id'] == '2'
+        assert data['main_sha_at_report'] == 'bbb'
+
+    def test_does_not_mutate_plan_json(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'], files=['m/x.py'])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
+        _report_blocking_dependency(artifacts, '5', 'r', main_sha='abc')
+
+        plan = artifacts.read_plan()
+        # plan.json must not be touched — the tool only writes the new artifact.
+        assert plan['task_id'] == 'test-1'
+        assert len(plan['steps']) == 1

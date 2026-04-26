@@ -487,6 +487,50 @@ class TestReviews:
         assert 'reviewer2' not in agg.reviews
         assert not agg.all_reviewers_errored
 
+
+class TestBlockingDependency:
+    """Round-trip and edge-case tests for the architect's
+    ``.task/blocking_dependency.json`` artifact."""
+
+    def test_read_returns_none_when_absent(self, artifacts: TaskArtifacts):
+        assert artifacts.read_blocking_dependency() is None
+
+    def test_round_trip(self, artifacts: TaskArtifacts):
+        artifacts.write_blocking_dependency(
+            depends_on_task_id='42',
+            reason='task 50 references helpers.foo introduced by task 42',
+            main_sha_at_report='abc123def456',
+        )
+        data = artifacts.read_blocking_dependency()
+        assert data is not None
+        assert data['depends_on_task_id'] == '42'
+        assert data['reason'] == (
+            'task 50 references helpers.foo introduced by task 42'
+        )
+        assert data['main_sha_at_report'] == 'abc123def456'
+        # reported_at must be present and ISO-8601 parseable
+        from datetime import datetime
+        assert 'reported_at' in data
+        datetime.fromisoformat(data['reported_at'])
+
+    def test_write_atomic_overwrites_prior_artifact(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.write_blocking_dependency('1', 'first reason', 'sha1')
+        artifacts.write_blocking_dependency('2', 'second reason', 'sha2')
+        data = artifacts.read_blocking_dependency()
+        assert data is not None
+        assert data['depends_on_task_id'] == '2'
+        assert data['reason'] == 'second reason'
+        assert data['main_sha_at_report'] == 'sha2'
+
+    def test_artifact_path_is_under_task_dir(self, artifacts: TaskArtifacts):
+        artifacts.write_blocking_dependency('5', 'r', 'sha')
+        path = artifacts.root / 'blocking_dependency.json'
+        assert path.exists()
+        # And contents must be JSON parseable.
+        json.loads(path.read_text())
+
     def test_aggregate_reviews_all_errors(self, artifacts: TaskArtifacts):
         artifacts.write_review('reviewer1', {
             'reviewer': 'reviewer1',
