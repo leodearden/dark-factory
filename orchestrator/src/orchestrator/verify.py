@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from shared.proc_group import terminate_process_group
@@ -221,6 +221,36 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
 # compile_error is handled by the debugger (type annotations, missing imports);
 # the human triage criterion is "a human, not a debugger, has to look".
 _ARCHIVE_DENY_LIST = frozenset({'compile_error', 'test_failure', 'infra_timeout', 'passed', ''})
+
+# Ordered from highest to lowest severity; used by ``_worst_category``.
+# Categories absent from this list (e.g. custom ones) sort lower than all listed.
+_CATEGORY_PRIORITY: list[str] = [
+    'infra_timeout',
+    'cargo_cli_error',
+    'compile_error',
+    'tree_sitter_generate_error',
+    'flock_error',
+    'npm_error',
+    'test_failure',
+    'unknown_test_failure',
+    'passed',
+    '',
+]
+
+
+def _worst_category(categories: list[str]) -> str:
+    """Return the highest-severity category from *categories*.
+
+    Priority is defined by ``_CATEGORY_PRIORITY``; a category not in the list
+    sorts below all listed entries.  Returns ``''`` when *categories* is empty.
+    """
+    def _rank(cat: str) -> int:
+        try:
+            return _CATEGORY_PRIORITY.index(cat)
+        except ValueError:
+            return len(_CATEGORY_PRIORITY)  # unknown → lowest priority
+
+    return min(categories, key=_rank, default='')
 
 
 def _should_archive_category(category: str) -> bool:
@@ -538,6 +568,9 @@ class VerifyResult:
     summary: str
     timed_out: bool = False
     cause_hint: str = ''
+    category: str = ''
+    worktree_log_paths: list[str] = field(default_factory=list)
+    archive_log_paths: list[str] = field(default_factory=list)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -891,16 +924,25 @@ async def run_verification(
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
     # Build cause_hint from each failing check's output; join with ' | '.
+    # Also classify each failing check and pick the worst category.
     if passed:
         cause_hint = ''
+        category = 'passed'
     else:
         hint_parts = []
-        for rc, out in ((test_rc, test_out), (lint_rc, lint_out), (type_rc, type_out)):
+        per_check_categories = []
+        for rc, out, to in (
+            (test_rc, test_out, test_timed_out),
+            (lint_rc, lint_out, lint_timed_out),
+            (type_rc, type_out, type_timed_out),
+        ):
             if rc != 0:
                 h = _extract_cause_hint(out)
                 if h:
                     hint_parts.append(h)
+                per_check_categories.append(_classify_failure(out, rc, to))
         cause_hint = ' | '.join(hint_parts)
+        category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
     result = VerifyResult(
         passed=passed,
@@ -910,6 +952,7 @@ async def run_verification(
         summary=summary,
         timed_out=timed_out,
         cause_hint=cause_hint,
+        category=category,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -964,6 +1007,17 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     # Collect cause_hint from failing child results; join with ' | '.
     cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)
 
+    # Pick the worst child category by priority.
+    child_categories = [r.category for r in results if r.category]
+    category = _worst_category(child_categories) if child_categories else ''
+
+    # Flatten per-child log path lists.
+    worktree_log_paths: list[str] = []
+    archive_log_paths: list[str] = []
+    for r in results:
+        worktree_log_paths.extend(r.worktree_log_paths)
+        archive_log_paths.extend(r.archive_log_paths)
+
     return VerifyResult(
         passed=passed,
         test_output=test_output,
@@ -972,6 +1026,9 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         summary=summary,
         timed_out=timed_out,
         cause_hint=cause_hint,
+        category=category,
+        worktree_log_paths=worktree_log_paths,
+        archive_log_paths=archive_log_paths,
     )
 
 
