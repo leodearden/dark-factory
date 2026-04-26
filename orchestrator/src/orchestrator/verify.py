@@ -217,6 +217,32 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     return 'unknown_test_failure'
 
 
+# Categories that must NOT be auto-archived even though they end with '_error'.
+# compile_error is handled by the debugger (type annotations, missing imports);
+# the human triage criterion is "a human, not a debugger, has to look".
+_ARCHIVE_DENY_LIST = frozenset({'compile_error', 'test_failure', 'infra_timeout', 'passed', ''})
+
+
+def _should_archive_category(category: str) -> bool:
+    """Return True when the failure category warrants durable archival.
+
+    Archival means the log is copied to ``data/verify-logs/<task_id>/`` for
+    human triage — categories where the debugger can self-correct (compile
+    errors, known test failures, timeouts) are excluded.
+
+    Rule:
+    - ``'unknown_test_failure'`` → True  (no pattern matched; human must look)
+    - any category ending with ``'_error'`` AND not in deny-list → True
+      (cargo CLI bugs, npm install failures, flock contention — infra issues)
+    - everything else → False
+    """
+    if category in _ARCHIVE_DENY_LIST:
+        return False
+    if category == 'unknown_test_failure':
+        return True
+    return category.endswith('_error')
+
+
 async def _derive_task_files_from_git(
     worktree: Path, config: OrchestratorConfig,
 ) -> list[str] | None:
