@@ -3794,6 +3794,60 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
         assert len(remaining) == 0
 
     @pytest.mark.asyncio
+    async def test_task_id_only_no_transition_bypasses_dedup(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """transition='done' AND task_id are both required; task_id alone must bypass dedup.
+
+        Validates the `transition == 'done'` clause of the conjunction independently:
+        a future refactor that drops the `transition` guard would be caught here.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Blocked write for task 1',
+            'observations_and_summaries',
+            {'task_id': '1'},  # transition absent
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # search must NOT be called — only task_id present, transition guard fails
+        mock_memory_service.search.assert_not_called()
+        # write must proceed normally
+        mock_memory_service.add_memory.assert_called_once()
+        content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert content == 'Blocked write for task 1'
+
+    @pytest.mark.asyncio
+    async def test_transition_done_no_task_id_bypasses_dedup(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """transition='done' AND task_id are both required; transition alone must bypass dedup.
+
+        Validates the `tid` clause of the conjunction independently:
+        a future refactor that drops the `tid` guard would be caught here.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Done write without task_id',
+            'observations_and_summaries',
+            {'transition': 'done'},  # task_id absent
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # search must NOT be called — only transition present, tid guard fails
+        mock_memory_service.search.assert_not_called()
+        # write must proceed normally
+        mock_memory_service.add_memory.assert_called_once()
+        content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert content == 'Done write without task_id'
+
+    @pytest.mark.asyncio
     async def test_no_prior_match_falls_through_to_add_memory(
         self, journal, event_buffer, mock_memory_service
     ):

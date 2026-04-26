@@ -457,15 +457,18 @@ class ReconciliationHarness:
             # rather than propagating to the outer except (which would drop the write).
             if transition == 'done' and tid:
                 try:
+                    # Limit=20: generous enough to cover typical per-project task
+                    # counts while bounding search cost.  Both sides of the
+                    # transition comparison are coerced to str for safety.
                     results = await self.memory.search(
-                        query=f'task {tid} completion done',
+                        query=f'task {tid} targeted_reconciliation completion done',
                         project_id=project_id,
-                        limit=5,
+                        limit=20,
                     )
                     prior = [
                         r for r in results
                         if r.metadata.get('task_id') == str(tid)
-                        and r.metadata.get('transition') == 'done'
+                        and str(r.metadata.get('transition', '')) == 'done'
                     ]
                     if prior:
                         logger.info(
