@@ -1714,6 +1714,117 @@ class TestFailureReportCauseHint:
         )
 
 
+class TestClassifyFailure:
+    """Tests for ``_classify_failure(output, rc, timed_out) -> str``.
+
+    Each test imports ``_classify_failure`` locally so that existing tests in
+    this file are not disrupted by the missing function during step 1.  Tests
+    will fail with ImportError until step 2 implements the function.
+    """
+
+    def _classify(self, output: str, rc: int, timed_out: bool) -> str:
+        from orchestrator.verify import _classify_failure  # noqa: PLC0415
+        return _classify_failure(output, rc, timed_out)
+
+    # (a) rc == 0 → 'passed' regardless of output content
+    def test_passed_when_rc_zero(self):
+        """rc=0 always yields 'passed'."""
+        assert self._classify('some output FAILED', rc=0, timed_out=False) == 'passed'
+
+    def test_passed_when_rc_zero_and_timed_out_false(self):
+        """rc=0 with timed_out=False is 'passed'."""
+        assert self._classify('', rc=0, timed_out=False) == 'passed'
+
+    # (b) timed_out=True wins over any pattern match
+    def test_infra_timeout_wins_over_rc(self):
+        """timed_out=True yields 'infra_timeout' even when output matches other patterns."""
+        assert self._classify('error: some error', rc=1, timed_out=True) == 'infra_timeout'
+
+    def test_infra_timeout_when_timed_out_true_no_output(self):
+        """timed_out=True with empty output still yields 'infra_timeout'."""
+        assert self._classify('', rc=1, timed_out=True) == 'infra_timeout'
+
+    # (c) cargo_cli_error: --exclude used outside --workspace
+    def test_cargo_cli_error_exclude_pattern(self):
+        """'error: --exclude can only be used together with --workspace' → cargo_cli_error."""
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: --exclude can only be used together with --workspace\n'
+        )
+        assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
+
+    def test_cargo_cli_error_generic_cargo_error(self):
+        """A generic 'error: <cargo cli message>' → cargo_cli_error."""
+        output = 'error: no such subcommand: `tset`\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
+
+    # (d) compile_error: rustc diagnostic error codes
+    def test_compile_error_rustc_code(self):
+        """'error[E0308]: mismatched types' → compile_error."""
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error[E0308]: mismatched types\n'
+            '  --> src/lib.rs:10:5\n'
+        )
+        assert self._classify(output, rc=1, timed_out=False) == 'compile_error'
+
+    def test_compile_error_compile_error_string(self):
+        """'compile error' string → compile_error."""
+        output = 'compile error in foo.py line 5\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'compile_error'
+
+    # (e) test_failure: '… FAILED' rust/pytest pattern
+    def test_test_failure_rust_test_runner(self):
+        """'test my::mod::it FAILED' → test_failure."""
+        output = (
+            'running 3 tests\n'
+            'test my::mod::it FAILED\n'
+            'test my::mod::another ... ok\n'
+        )
+        assert self._classify(output, rc=1, timed_out=False) == 'test_failure'
+
+    def test_test_failure_pytest_failed(self):
+        """'FAILED tests/test_foo.py::test_bar' → test_failure."""
+        output = 'FAILED tests/test_foo.py::test_bar - AssertionError\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'test_failure'
+
+    # (f) unknown_test_failure: rc!=0 with no matching pattern
+    def test_unknown_test_failure_fallback(self):
+        """rc!=0 with output that matches no specific pattern → unknown_test_failure."""
+        output = 'Something went wrong but no recognizable pattern\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'unknown_test_failure'
+
+    def test_unknown_test_failure_empty_output(self):
+        """rc!=0 with empty output → unknown_test_failure."""
+        assert self._classify('', rc=1, timed_out=False) == 'unknown_test_failure'
+
+    # (g) npm_error
+    def test_npm_err_exclamation(self):
+        """'npm ERR! ...' → npm_error."""
+        output = 'npm ERR! code ELIFECYCLE\nnpm ERR! errno 1\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'npm_error'
+
+    def test_npm_error_lowercase(self):
+        """'npm error ...' → npm_error."""
+        output = 'npm error peer dep missing: react@^18\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'npm_error'
+
+    # (h) flock_error
+    def test_flock_error_pattern(self):
+        """'flock: failed to acquire lock' → flock_error."""
+        output = 'flock: failed to acquire lock on /var/lock/mylock\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'flock_error'
+
+    # (i) tree_sitter_generate_error
+    def test_tree_sitter_generate_error(self):
+        """tree-sitter generate failure → tree_sitter_generate_error."""
+        output = (
+            'Running tree-sitter generate\n'
+            'tree-sitter generate failed: unexpected token\n'
+        )
+        assert self._classify(output, rc=1, timed_out=False) == 'tree_sitter_generate_error'
+
+
 class TestBuildFallbackConfigConftest:
     """`_build_fallback_config` handles conftest.py correctly.
 
