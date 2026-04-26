@@ -2627,8 +2627,8 @@ class TestFindMergeMarker:
         """Substring safety: merging task/10 writes 'Merge task/10 into main'.
         find_merge_marker('task/1') must NOT match this commit.
 
-        The '^' anchor + trailing ' into ' in the --grep pattern prevent
-        task/1 from being found inside 'Merge task/10 into main'.
+        The trailing ' into ' literal in the --fixed-strings --grep pattern
+        means 'Merge task/1 into ' is not a substring of 'Merge task/10 into main'.
         """
         # Merge task/10 and delete branch
         tid = '10'
