@@ -908,6 +908,25 @@ Output JSON matching the schema. Every task must appear in the output.
         plan.lock for recovered worktrees) and BEFORE the first
         scheduler.acquire_next() call, so self._dispatched is always empty here.
 
+        **Already-on-main fast-path** (is_ancestor == True):
+        When the task branch is already an ancestor of main, the task is
+        terminal.  We resolve the branch to its 40-char commit SHA via
+        ``git rev-parse --verify`` *before* ``cleanup_worktree`` (which calls
+        ``git branch -D`` and would invalidate a post-cleanup rev-parse — see
+        git_ops.py lines around cleanup_worktree).
+
+        Success path: ``done_provenance={'commit': <sha>, 'note': '…'}`` —
+        matches the workflow.py:656 convention so downstream consumers
+        (fused-memory ``_validate_done_provenance``,
+        ``invalidate_fabricated_shipping_edges.py``, Stage 2 reconciliation)
+        can identify the SHA the task ended on.
+
+        Failure path: if the branch ref vanishes between is_ancestor and the
+        subsequent rev-parse (rare TOCTOU race), ``resolve_branch_sha`` returns
+        None.  We fall back to note-only provenance and emit a WARNING log so
+        operators can spot the race.  Reconciliation is best-effort and must
+        not abort on this edge case; fused-memory accepts note-only provenance.
+
         Limitation: git_ops.is_ancestor returns False when the task branch does
         not exist (e.g., merge_queue successfully merged AND deleted the branch
         before crashing).  In that case the task falls through to the no-lock /
@@ -927,6 +946,11 @@ Output JSON matching the schema. Every task must appear in the output.
             branch = f'{self.git_ops.config.branch_prefix}{tid}'
             if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
                 # Branch is already on main — the task is becoming terminal.
+                # Resolve branch SHA BEFORE cleanup_worktree, which calls
+                # 'git branch -D' (git_ops.py cleanup_worktree) and would
+                # invalidate a post-cleanup rev-parse.
+                branch_sha = await self.git_ops.resolve_branch_sha(branch)
+
                 # Any recovered plan is now stale (no resumption is possible
                 # once the task is 'done'), so drop the entry unconditionally.
                 # Then clean up any orphaned worktree dir so future re-use of
@@ -945,11 +969,22 @@ Output JSON matching the schema. Every task must appear in the output.
                             ' (already-on-main); continuing',
                             tid, exc_info=True,
                         )
+
+                provenance: dict[str, str] = {
+                    'note': 'reconcile: branch already on main when stranded in-progress',
+                }
+                if branch_sha is not None:
+                    provenance['commit'] = branch_sha
+                else:
+                    logger.warning(
+                        'Reconcile: rev-parse failed for %s — '
+                        'recording note-only provenance for task %s',
+                        branch, tid,
+                    )
+
                 await self.scheduler.set_task_status(
                     tid, 'done',
-                    done_provenance={
-                        'note': 'reconcile: branch already on main when stranded in-progress',
-                    },
+                    done_provenance=provenance,
                 )
                 logger.info(
                     'Reconcile: marked task %s done '
