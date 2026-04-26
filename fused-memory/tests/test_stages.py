@@ -2995,3 +2995,41 @@ class TestStage2HandoffShortfallWarning:
             f'Expected no flagged_items_truncated WARNING (run_stage=stage2) for 5 small items; '
             f'got: {[(r.getMessage(), r.__dict__) for r in truncation_records]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Prompt verification-guidance regression tests
+# ---------------------------------------------------------------------------
+
+class TestStage1MemoryVerificationGuidance:
+    """Regression pins for Stage 1's memory_ids write-verification guidance (step 1).
+
+    These tests assert that STAGE1_SYSTEM_PROMPT contains the discrete phrases
+    that instruct the agent to check the `memory_ids` field before counting a
+    write as a successful addition.  They pin commit d6aceede2f's wording so
+    accidental deletion fails CI.
+    """
+
+    def test_stage1_system_prompt_contains_memory_ids_verification_phrase(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'memory_ids' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must instruct the agent to inspect the 'memory_ids' "
+            "field in the add_memory response to verify a write succeeded."
+        )
+
+    def test_stage1_system_prompt_contains_no_op_phrase(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'no-op' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must contain the phrase 'no-op' to instruct the agent "
+            "that a write returning an empty memory_ids list is a no-op, not a success."
+        )
+
+    def test_stage1_system_prompt_contains_memories_added_counter_name(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'memories_added' in STAGE1_SYSTEM_PROMPT or 'memories_written' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must name at least one of the stat counters "
+            "('memories_added' or 'memories_written') in its write-verification guidance."
+        )
