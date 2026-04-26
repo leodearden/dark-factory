@@ -2694,7 +2694,7 @@ class TestFindMergeMarker:
         wt_info = await git_ops.create_worktree(tid)
         assert wt_info is not None
         (wt_info.path / f'iter1_{tid}.py').write_text(f'iter1_{tid} = True\n')
-        await git_ops.commit(wt_info.path, f'Add iter1')
+        await git_ops.commit(wt_info.path, 'Add iter1')
 
         result1 = await git_ops.merge_to_main(wt_info.path, tid)
         assert result1.success
@@ -2712,7 +2712,7 @@ class TestFindMergeMarker:
         wt_info2 = await git_ops.create_worktree(tid)
         assert wt_info2 is not None
         (wt_info2.path / f'iter2_{tid}.py').write_text(f'iter2_{tid} = True\n')
-        await git_ops.commit(wt_info2.path, f'Add iter2')
+        await git_ops.commit(wt_info2.path, 'Add iter2')
 
         result2 = await git_ops.merge_to_main(wt_info2.path, tid)
         assert result2.success
