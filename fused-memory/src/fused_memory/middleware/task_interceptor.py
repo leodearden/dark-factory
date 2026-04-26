@@ -27,6 +27,9 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
+from fused_memory.middleware.dark_factory_path_guard import (
+    check_candidate_for_dark_factory_paths,
+)
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -40,9 +43,6 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-)
-from fused_memory.middleware.dark_factory_path_guard import (
-    check_candidate_for_dark_factory_paths,
 )
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -1410,13 +1410,12 @@ class TaskInterceptor:
         # Path-scope guard: reject before persisting if the candidate references
         # dark-factory module paths but is being filed into a different project.
         # Placed before kwargs.pop('metadata') so _build_candidate can read metadata.
-        if _candidate := self._build_candidate(kwargs):
-            if (
-                _pg_verdict := check_candidate_for_dark_factory_paths(
-                    _candidate, project_id
-                )
-            ).is_rejection:
-                return _pg_verdict.to_error_dict()
+        if (_candidate := self._build_candidate(kwargs)) and (
+            _pg_verdict := check_candidate_for_dark_factory_paths(
+                _candidate, project_id
+            )
+        ).is_rejection:
+            return _pg_verdict.to_error_dict()
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
