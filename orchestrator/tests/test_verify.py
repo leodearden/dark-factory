@@ -1825,6 +1825,113 @@ class TestClassifyFailure:
         assert self._classify(output, rc=1, timed_out=False) == 'tree_sitter_generate_error'
 
 
+class TestVerifyResultCategoryAndPaths:
+    """Tests for the new ``category``, ``worktree_log_paths``, and
+    ``archive_log_paths`` fields on ``VerifyResult``, and their population
+    through ``run_verification`` / ``_aggregate_results``.
+
+    Tests fail until step 6 adds the fields to the dataclass and wires
+    category classification into ``run_verification`` / ``_aggregate_results``.
+    """
+
+    # (a) VerifyResult defaults: category='', worktree_log_paths=[], archive_log_paths=[]
+    def test_verify_result_category_defaults(self):
+        """VerifyResult defaults: category='', log path lists are empty."""
+        vr = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='All checks passed',
+        )
+        assert vr.category == '', f'Expected empty category default, got {vr.category!r}'
+        assert vr.worktree_log_paths == [], f'Expected empty list, got {vr.worktree_log_paths!r}'
+        assert vr.archive_log_paths == [], f'Expected empty list, got {vr.archive_log_paths!r}'
+
+    # (b) explicit values round-trip
+    def test_verify_result_explicit_category_and_paths(self):
+        """Explicit category/paths round-trip via dataclass field access."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='error: bad',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            category='cargo_cli_error',
+            worktree_log_paths=['/wt/.task/verify/attempt-1.test.log'],
+            archive_log_paths=['/data/verify-logs/42/attempt-1-20260426T120000Z.log'],
+        )
+        assert vr.category == 'cargo_cli_error'
+        assert vr.worktree_log_paths == ['/wt/.task/verify/attempt-1.test.log']
+        assert vr.archive_log_paths == ['/data/verify-logs/42/attempt-1-20260426T120000Z.log']
+
+    # (c) run_verification populates result.category from _classify_failure
+    @pytest.mark.asyncio
+    async def test_run_verification_populates_category_from_test_failure(
+        self, tmp_path: Path,
+    ):
+        """run_verification sets result.category from _classify_failure on the failing check."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert result.category == 'cargo_cli_error', (
+            f'Expected cargo_cli_error, got {result.category!r}'
+        )
+
+    # (d) _aggregate_results concatenates worktree_log_paths and archive_log_paths
+    def test_aggregate_results_concatenates_log_paths(self):
+        """_aggregate_results flattens child worktree_log_paths and archive_log_paths."""
+        r1 = VerifyResult(
+            passed=False, test_output='', lint_output='lint error', type_output='',
+            summary='Failures: lint issues',
+            worktree_log_paths=['/wt/.task/verify/attempt-1.lint.log'],
+            archive_log_paths=['/data/verify-logs/42/attempt-1-lint.log'],
+        )
+        r2 = VerifyResult(
+            passed=False, test_output='error: bad', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            worktree_log_paths=['/wt/.task/verify/attempt-1.test.log'],
+            archive_log_paths=[],
+        )
+        agg = _aggregate_results([r1, r2])
+        assert '/wt/.task/verify/attempt-1.lint.log' in agg.worktree_log_paths
+        assert '/wt/.task/verify/attempt-1.test.log' in agg.worktree_log_paths
+        assert '/data/verify-logs/42/attempt-1-lint.log' in agg.archive_log_paths
+
+    # (e) _aggregate_results picks worst child category by priority
+    def test_aggregate_results_picks_worst_category(self):
+        """_aggregate_results selects the highest-priority non-passed category."""
+        r_test = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            category='test_failure',
+        )
+        r_cargo = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            category='cargo_cli_error',
+        )
+        agg = _aggregate_results([r_test, r_cargo])
+        # cargo_cli_error has higher priority than test_failure
+        assert agg.category == 'cargo_cli_error', (
+            f'Expected cargo_cli_error (higher priority), got {agg.category!r}'
+        )
+
+
 class TestShouldArchiveCategory:
     """Tests for ``_should_archive_category(category: str) -> bool``.
 
