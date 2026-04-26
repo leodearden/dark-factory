@@ -479,3 +479,23 @@ class TestCheckText:
         # Default prefix must NOT match when the custom set is active.
         result2 = self.check('edit orchestrator/harness.py', 'reify', prefixes=('foo/',))
         assert result2.outcome == 'ok'
+
+    def test_custom_dark_factory_project_id_short_circuits(self):
+        """dark_factory_project_id kwarg is honoured: matching project_id short-circuits to ok."""
+        result = self.check(
+            'Edit orchestrator/harness.py for the deadlock',
+            'custom_id',
+            dark_factory_project_id='custom_id',
+        )
+        assert result.outcome == 'ok'
+        assert not result.is_rejection
+
+    def test_multiple_prefixes_in_text_are_ordered_and_deduped(self):
+        """check_text wraps matched_paths as a deduplicated tuple (strict ordering tested in TestFindDarkFactoryPaths)."""
+        result = self.check(
+            'orchestrator/x and fused-memory/y and orchestrator/z again',
+            'reify',
+        )
+        assert result.is_rejection
+        assert isinstance(result.matched_paths, tuple)
+        assert set(result.matched_paths) == {'orchestrator/', 'fused-memory/'}
