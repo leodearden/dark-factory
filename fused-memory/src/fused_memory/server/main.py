@@ -652,11 +652,13 @@ async def _graceful_shutdown(
 
     Each step runs under asyncio.shield with a bounded timeout so cleanup
     makes progress even when this coroutine itself is being cancelled, and
-    one stuck step can't starve the rest. A force-exit watchdog armed at
-    entry guarantees the process dies if cleanup hangs past the total
-    budget — systemd then restarts the unit.
+    one stuck step can't starve the rest.
+
+    Note: the force-exit watchdog is NOT armed here.  It is armed by
+    _shutdown_with_watchdog (the lifespan-only entry point) so that unit
+    tests can call _graceful_shutdown directly without leaking a 45s
+    os._exit(1) daemon timer.
     """
-    _arm_force_exit()
     _sd_notify('STOPPING=1')
 
     if task_interceptor is not None:
