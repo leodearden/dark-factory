@@ -4654,3 +4654,93 @@ class TestExtractMetaFiles:
         kwargs = {'metadata': {'files_to_modify': [42, 'src/foo.py']}}
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['42', 'src/foo.py']
+
+
+# ---------------------------------------------------------------------------
+# Step-3: regression tests — prompt-only fallback must also scan metadata files
+# ---------------------------------------------------------------------------
+# These tests MUST FAIL before step-4 because _path_guard_error's fallback
+# branch currently only scans the joined text of prompt/title/description/details
+# and ignores metadata['files_to_modify'] / metadata['modules'].
+# A caller can therefore bypass the guard by hiding dark-factory paths in
+# metadata while keeping all text fields clean.
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardFallbackMetadataFiles:
+    """Regression tests: prompt-only path-guard also scans metadata files/modules.
+
+    4 parametrised cases (2 meta_key × 2 endpoint).  All four must be RED
+    before step-4 and GREEN after step-4.
+    """
+
+    @pytest.mark.parametrize('meta_key', ['files_to_modify', 'modules'])
+    @pytest.mark.asyncio
+    async def test_submit_task_fallback_rejects_dark_factory_path_in_metadata(
+        self, meta_key, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """prompt-only submit_task with dark-factory path ONLY in metadata[meta_key]
+        must be rejected even though all free-text fields are clean.
+
+        This is the residual-leak: the current fallback does NOT scan metadata,
+        so this case is RED before step-4.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                prompt='Generic refactor',            # no dark-factory path here
+                # Deliberately NO title — forces _build_candidate → None → fallback
+                metadata={meta_key: ['orchestrator/harness.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'meta_key={meta_key!r}: expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'meta_key={meta_key!r}: expected orchestrator/ in matched_paths: {result}'
+        )
+
+        # Ticket store must have zero rows (guard fires before persist)
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, (
+            f'meta_key={meta_key!r}: expected 0 tickets in store, found {row[0]}'
+        )
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_task.assert_not_called()
+
+    @pytest.mark.parametrize('meta_key', ['files_to_modify', 'modules'])
+    @pytest.mark.asyncio
+    async def test_add_subtask_fallback_rejects_dark_factory_path_in_metadata(
+        self, meta_key, interceptor, taskmaster,
+    ):
+        """prompt-only add_subtask with dark-factory path ONLY in metadata[meta_key]
+        must be rejected even though all free-text fields are clean.
+
+        This is the residual-leak: the current fallback does NOT scan metadata,
+        so this case is RED before step-4.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            prompt='Generic refactor',            # no dark-factory path here
+            # Deliberately NO title — forces _build_candidate → None → fallback
+            metadata={meta_key: ['orchestrator/harness.py']},
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'meta_key={meta_key!r}: expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'meta_key={meta_key!r}: expected orchestrator/ in matched_paths: {result}'
+        )
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_subtask.assert_not_called()
