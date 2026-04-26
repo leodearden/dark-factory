@@ -509,9 +509,9 @@ class TestDeleteDeadLetters:
         svc.durable_queue.delete_dead.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_empty_ids_short_circuits(self):
-        """empty ids=[] returns {'deleted': [], 'not_found': []} without calling delete_dead."""
-        svc = _make_delete_mock_service()
+    async def test_empty_ids_returns_empty_envelope(self):
+        """empty ids=[] returns {'deleted': [], 'not_found': []}."""
+        svc = _make_delete_mock_service(delete_dead_return={'deleted': [], 'not_found': []})
         server = create_mcp_server(svc)
 
         result = await server._tool_manager.call_tool(
@@ -520,4 +520,3 @@ class TestDeleteDeadLetters:
         )
 
         assert result == {'deleted': [], 'not_found': []}
-        svc.durable_queue.delete_dead.assert_not_called()

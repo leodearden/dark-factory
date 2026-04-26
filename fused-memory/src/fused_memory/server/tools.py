@@ -1170,6 +1170,13 @@ def create_mcp_server(
         eligible.  Cross-project ids, non-existent ids, and non-dead-status
         ids land in ``not_found`` without leaking information.
 
+        .. note::
+            This tool only covers entries in the *durable write queue* (SQLite).
+            Dead letters in the event_queue (JSONL) use string UUIDs and are
+            managed by a separate mechanism; passing event_queue ids here will
+            always return them in ``not_found``.  Use ``get_dead_letters`` to
+            inspect which source each dead letter belongs to before deleting.
+
         Args:
             project_id: Project scope (required — prevents accidental cross-project deletes).
             ids: Integer row ids to delete (e.g. [1820, 2017] for the dark_factory entries).
@@ -1182,8 +1189,6 @@ def create_mcp_server(
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
-            if not ids:
-                return {'deleted': [], 'not_found': []}
             result = await memory_service.durable_queue.delete_dead(
                 group_id=project_id, ids=ids,
             )
