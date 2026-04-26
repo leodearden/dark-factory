@@ -4329,6 +4329,58 @@ class TestSubmitTaskGuardrail:
         # Taskmaster backend must never have been called
         taskmaster.add_task.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_submit_task_allows_prompt_only_dark_factory_paths_in_dark_factory_project(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """Prompt-only submit_task filed under /dark-factory is always allowed.
+
+        The dark_factory short-circuit in check_text_for_dark_factory_paths must fire
+        and the result must be a 'tkt_'-prefixed ticket with no error_type.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/dark-factory',
+                prompt='Edit orchestrator/harness.py for the deadlock',
+                # No title — prompt-only path
+            )
+        finally:
+            await interceptor_with_store.close()
+
+        assert isinstance(result, dict)
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected ticket id starting with tkt_, got: {result}'
+        )
+        assert 'error_type' not in result, (
+            f'Should not have error_type for dark_factory project: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_task_allows_clean_prompt_only_in_other_project(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """Prompt-only submit_task with no dark-factory paths in a non-dark-factory
+        project must not be rejected (returns a 'tkt_'-prefixed ticket).
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                prompt='Refactor foo/bar.py routing',
+                # No title — prompt-only path, but no dark-factory paths
+            )
+        finally:
+            await interceptor_with_store.close()
+
+        assert isinstance(result, dict)
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected ticket id starting with tkt_, got: {result}'
+        )
+        assert 'error_type' not in result, (
+            f'Should not have error_type for clean prompt: {result}'
+        )
+
 
 class TestAddSubtaskGuardrail:
     """Integration tests: path-scope guard wired into add_subtask."""
