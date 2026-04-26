@@ -501,6 +501,10 @@ class TestShutdownWithWatchdog:
         Especially important for the optional event_queue and sqlite_watchdog args — if
         either is dropped the production shutdown skips flushing the bounded write queue
         or cancelling the SQLite watchdog.
+
+        The test guards against silent kwarg drops by first asserting that the full set of
+        forwarded keys exactly matches the six expected names, then asserting per-key
+        identity against unique non-None MagicMock sentinels.
         """
         import fused_memory.server.main as main_mod
 
@@ -508,6 +512,7 @@ class TestShutdownWithWatchdog:
 
         memory_service = MagicMock(close=AsyncMock())
         task_interceptor = MagicMock(drain=AsyncMock(), close=AsyncMock())
+        harness_loop_task = MagicMock()
         recon_journal = MagicMock(close=AsyncMock())
         event_queue = MagicMock(close=AsyncMock())
         sqlite_watchdog = MagicMock(close=AsyncMock())
@@ -522,17 +527,25 @@ class TestShutdownWithWatchdog:
                 await main_mod._shutdown_with_watchdog(
                     memory_service=memory_service,
                     task_interceptor=task_interceptor,
-                    harness_loop_task=None,
+                    harness_loop_task=harness_loop_task,
                     recon_journal=recon_journal,
                     event_queue=event_queue,
                     sqlite_watchdog=sqlite_watchdog,
                 )
 
-            assert captured.get('memory_service') is memory_service
-            assert captured.get('task_interceptor') is task_interceptor
-            assert captured.get('harness_loop_task') is None
-            assert captured.get('recon_journal') is recon_journal
-            assert captured.get('event_queue') is event_queue
-            assert captured.get('sqlite_watchdog') is sqlite_watchdog
+            expected_keys = {
+                'memory_service', 'task_interceptor', 'harness_loop_task',
+                'recon_journal', 'event_queue', 'sqlite_watchdog',
+            }
+            assert captured.keys() == expected_keys, (
+                f'_shutdown_with_watchdog dropped or added a forwarded kwarg: '
+                f'expected {expected_keys}, got {set(captured.keys())}'
+            )
+            assert captured['memory_service'] is memory_service
+            assert captured['task_interceptor'] is task_interceptor
+            assert captured['harness_loop_task'] is harness_loop_task
+            assert captured['recon_journal'] is recon_journal
+            assert captured['event_queue'] is event_queue
+            assert captured['sqlite_watchdog'] is sqlite_watchdog
         finally:
             main_mod._cancel_force_exit()
