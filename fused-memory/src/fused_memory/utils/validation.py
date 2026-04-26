@@ -43,6 +43,17 @@ def _safe_repr(value: str, max_len: int = 200) -> str:
     return r
 
 
+def _is_plain_int(x: object) -> bool:
+    """Return True iff x is a plain int (not a bool subclass).
+
+    Python's bool is a subclass of int, so ``isinstance(True, int)`` is True.
+    This predicate makes the intent explicit: only bare int values are accepted;
+    bool True/False are rejected so callers can't silently pass boolean flags
+    as list[int] element IDs.
+    """
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
 def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
     """Shared private helper: validate a single identifier against the safe allowlist.
 
@@ -108,6 +119,19 @@ def validate_int_ids(ids: object, *, name: str = 'ids') -> dict[str, str] | None
     if not isinstance(ids, (list, tuple)):
         return {
             'error': f'{name} must be a list of integers, got {type(ids).__name__}',
+            'error_type': 'ValidationError',
+        }
+    bad_idx = next(
+        (i for i, x in enumerate(ids) if not _is_plain_int(x)),
+        None,
+    )
+    if bad_idx is not None:
+        bad_val = ids[bad_idx]
+        return {
+            'error': (
+                f'{name}[{bad_idx}] must be int, '
+                f'got {type(bad_val).__name__}: {_safe_repr(bad_val)}'
+            ),
             'error_type': 'ValidationError',
         }
     return None
