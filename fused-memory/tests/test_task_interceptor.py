@@ -4744,3 +4744,67 @@ class TestPathGuardFallbackMetadataFiles:
 
         # Taskmaster backend must never have been called
         taskmaster.add_subtask.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step-5: negative-control — clean metadata files must NOT be rejected
+# ---------------------------------------------------------------------------
+# This test is GREEN after step-4: _extract_meta_files returns clean paths,
+# find_dark_factory_paths returns [], and the verdict is 'ok'.
+# Its purpose is to lock in the absence of false positives: if a future
+# refactor accidentally short-circuits on metadata presence rather than
+# content, this test will fail loudly.
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardFallbackMetadataFilesNegativeControl:
+    """Negative-control: prompt-only submissions with clean metadata are allowed.
+
+    Must be GREEN immediately after step-4.
+    """
+
+    @pytest.mark.asyncio
+    async def test_submit_task_allows_clean_metadata_files_in_other_project(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """prompt-only submit_task with non-dark-factory paths in metadata
+        must NOT be rejected — only dark-factory paths should trigger the guard.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                prompt='Refactor foo/bar.py routing',
+                # No title — prompt-only path
+                metadata={'files_to_modify': ['foo/bar.py', 'src/baz.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected ticket id starting with tkt_, got: {result}'
+        )
+        assert 'error_type' not in result, (
+            f'Should not have error_type for clean metadata files: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_subtask_allows_clean_metadata_files_in_other_project(
+        self, interceptor, taskmaster,
+    ):
+        """prompt-only add_subtask with non-dark-factory paths in metadata
+        must NOT be rejected — only dark-factory paths should trigger the guard.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            prompt='Refactor foo/bar.py routing',
+            # No title — prompt-only path
+            metadata={'files_to_modify': ['foo/bar.py', 'src/baz.py']},
+        )
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, (
+            f'Should not have error_type for clean metadata files: {result}'
+        )
