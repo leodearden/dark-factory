@@ -463,6 +463,11 @@ class ReconciliationHarness:
                     task_id=tid,
                     kind={'transition': 'done'},
                     query=f'task {tid} targeted_reconciliation completion done',
+                    # categories pinned to match the writer in targeted.py:_on_task_done
+                    # (TargetedReconciliation writes completion summaries with
+                    # transition='done' under 'observations_and_summaries'). Keep these
+                    # in sync — a future writer using a different category would silently
+                    # bypass this dedup.
                     categories=['observations_and_summaries'],
                     limit=20,
                     log=logger,
