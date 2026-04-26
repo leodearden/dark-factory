@@ -3149,3 +3149,28 @@ class TestPruneArchiveDedupedAtAggregateSite:
             f'Global path should call _prune_archive exactly once; '
             f'got {spy.call_count} call(s)'
         )
+
+
+class TestPruneArchiveThrottle:
+    """Tests for the ``_maybe_prune_archive`` throttle wrapper.
+
+    Each test resets ``_LAST_PRUNE_AT`` to ``None`` via an autouse fixture so
+    module-level state doesn't leak between cases.
+    """
+
+    def test_first_call_invokes_prune(self, tmp_path: Path):
+        """First call to ``_maybe_prune_archive`` always fires ``_prune_archive``."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive') as spy:
+            _maybe_prune_archive(archive_root)
+
+        assert spy.call_count == 1, (
+            f'First call should invoke _prune_archive once; got {spy.call_count}'
+        )
+        assert spy.call_args[0][0] == archive_root, (
+            f'First positional arg should be archive_root; got {spy.call_args[0][0]!r}'
+        )
