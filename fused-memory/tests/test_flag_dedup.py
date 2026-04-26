@@ -145,16 +145,11 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
 
     # (b) search was called once with project_id='p' and a query mentioning task_id and flag_type
     memory_service.search.assert_called_once()
-    search_call_kwargs = memory_service.search.call_args
-    # Accept both positional and keyword call styles
-    call_kwargs = search_call_kwargs.kwargs if search_call_kwargs.kwargs else {}
-    call_args = search_call_kwargs.args if search_call_kwargs.args else ()
-    # project_id should be 'p'
-    assert call_kwargs.get('project_id') == 'p' or (len(call_args) >= 2 and 'p' in call_args)
-    # query should mention 'task' and '42' and 'missing_deliverable'
-    query = call_kwargs.get('query') or (call_args[0] if call_args else '')
-    assert 'task' in query.lower() or '42' in query
-    assert '42' in query or 'missing_deliverable' in query
+    # project_id must be passed as a kwarg (production code uses kwargs throughout)
+    assert memory_service.search.call_args.kwargs['project_id'] == 'p'
+    # query must strictly mention both the task_id and the flag_type (no permissive 'or')
+    query = memory_service.search.call_args.kwargs.get('query', '')
+    assert '42' in query and 'missing_deliverable' in query
 
     # (c) No refresh write — the prior marker is sufficient; skipping avoids N*M accumulation
     memory_service.add_memory.assert_not_called()
