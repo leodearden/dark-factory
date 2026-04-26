@@ -1211,6 +1211,25 @@ def create_mcp_server(
         """
         if err := validate_project_id(project_id):
             return err
+        if not isinstance(ids, (list, tuple)):
+            return {
+                'error': f'ids must be a list of integers, got {type(ids).__name__}',
+                'error_type': 'ValidationError',
+            }
+        _bad_idx = next(
+            (idx for idx, i in enumerate(ids)
+             if not (isinstance(i, int) and not isinstance(i, bool))),
+            None,
+        )
+        if _bad_idx is not None:
+            _bad_val = ids[_bad_idx]
+            return {
+                'error': (
+                    f'ids[{_bad_idx}] must be int, '
+                    f'got {type(_bad_val).__name__}: {_bad_val!r}'
+                ),
+                'error_type': 'ValidationError',
+            }
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
