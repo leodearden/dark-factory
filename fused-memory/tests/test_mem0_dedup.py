@@ -49,3 +49,50 @@ async def test_returns_match_with_symmetric_str_coercion():
         f'Expected find_prior_memory to return the matching result '
         f'but got {result!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — no-match paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_returns_none_when_no_match():
+    """Returns None when search returns rows that do not satisfy the kind discriminator."""
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    wrong_type = _make_memory_result({'task_id': '42', 'flag_type': 'wrong_type'})
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[wrong_type])
+
+    result = await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': 'correct_type'},
+        query='q',
+    )
+
+    assert result is None, (
+        f'Expected None when kind discriminator does not match but got {result!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_returns_none_on_empty_search_result():
+    """Returns None when search returns an empty list."""
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[])
+
+    result = await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='99',
+        kind={'flag_type': 'some_type'},
+        query='q',
+    )
+
+    assert result is None
