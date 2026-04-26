@@ -6,9 +6,11 @@ import asyncio
 import time
 from unittest.mock import AsyncMock
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
+import fused_memory.services.durable_queue as dq_module
 from fused_memory.services.durable_queue import DurableWriteQueue
 
 
@@ -618,6 +620,200 @@ class TestDeleteDead:
 
         assert result['deleted'] == [id_dead_proj1]
         assert sorted(result['not_found']) == sorted([id_dead_proj2, id_pending, id_nonexistent])
+
+    @pytest.mark.asyncio
+    async def test_chunks_large_id_lists_without_param_limit_error(
+        self, queue, monkeypatch
+    ):
+        """Large id lists are processed in chunks without hitting SQLite variable limits.
+
+        Monkeypatches _DELETE_DEAD_BATCH_SIZE to 3 so chunking is exercised with
+        a small fixture set (7 dead rows) instead of thousands of rows.
+        """
+        # Patch batch size to 3 so our 7-row set forces multiple chunks.
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
+
+        # Insert 7 dead rows for proj1.
+        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+
+        # Insert 1 pending row for proj1 and 1 dead row for proj2 (both ineligible).
+        pending_id = await self._insert_pending_row(queue, 'proj1')
+        cross_id = await self._insert_dead_row(queue, 'proj2')
+        nonexistent_id = 999999
+
+        all_input_ids = dead_ids + [pending_id, cross_id, nonexistent_id]
+        result = await queue.delete_dead(group_id='proj1', ids=all_input_ids)
+
+        # All 7 dead proj1 rows must be deleted.
+        assert sorted(result['deleted']) == sorted(dead_ids)
+        # Ineligible ids land in not_found.
+        assert sorted(result['not_found']) == sorted([pending_id, cross_id, nonexistent_id])
+
+        # Physically verify rows are gone.
+        remaining = await queue.get_dead_items(group_id='proj1')
+        remaining_ids = {item['id'] for item in remaining}
+        assert not remaining_ids.intersection(dead_ids)
+
+        # Rows in proj2 are untouched.
+        proj2_items = await queue.get_dead_items(group_id='proj2')
+        assert any(item['id'] == cross_id for item in proj2_items)
+
+    @pytest.mark.asyncio
+    async def test_exact_batch_size_boundary(self, queue, monkeypatch):
+        """ids count == batch_size exercises the loop with zero remainder.
+
+        An off-by-one in ``range(0, len(ids), step)`` would silently drop the
+        last chunk when ``len(ids)`` is an exact multiple of ``step``.  With
+        batch_size=3 and exactly 6 dead rows all 6 must be deleted.
+        """
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
+
+        # Boundary cases: batch_size-1, batch_size, batch_size+1, 2*batch_size.
+        for count in (2, 3, 4, 6):
+            dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(count)]
+            result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
+            assert sorted(result['deleted']) == sorted(dead_ids), (
+                f'All {count} dead rows must be deleted (batch_size boundary)'
+            )
+            assert result['not_found'] == []
+
+    @pytest.mark.asyncio
+    async def test_all_ineligible_chunk_followed_by_eligible_chunk(self, queue, monkeypatch):
+        """An all-ineligible first chunk does not clobber the deleted accumulator.
+
+        If ``deleted`` were ever overwritten instead of unioned, the second
+        chunk's results would be discarded when the first chunk returns nothing.
+        With batch_size=3: first chunk = 3 pending (ineligible), second = 3 dead.
+        """
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
+
+        pending_ids = [await self._insert_pending_row(queue, 'proj1') for _ in range(3)]
+        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(3)]
+
+        # Interleave so the first chunk is all-ineligible.
+        all_ids = pending_ids + dead_ids
+        result = await queue.delete_dead(group_id='proj1', ids=all_ids)
+
+        assert sorted(result['deleted']) == sorted(dead_ids)
+        assert sorted(result['not_found']) == sorted(pending_ids)
+
+        # Pending rows must still be present.
+        assert queue._db is not None
+        cursor = await queue._db.execute(
+            f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(pending_ids))})",
+            tuple(pending_ids),
+        )
+        rows = await cursor.fetchall()
+        found = {(row[0] if isinstance(row, tuple) else row['id']) for row in rows}
+        assert found == set(pending_ids), 'Pending rows must not be deleted'
+
+    @pytest.mark.asyncio
+    async def test_operational_error_returns_typed_envelope(self, queue, monkeypatch):
+        """An aiosqlite.OperationalError during DELETE returns a typed retriable envelope.
+
+        The function must NOT raise; instead it returns a dict with
+        error_type='TransientSqliteError' and retriable=True.
+        """
+        id1 = await self._insert_dead_row(queue, 'proj1')
+
+        # Replace db.execute with one that raises OperationalError on any DELETE call.
+        original_execute = queue._db.execute
+
+        async def mock_execute(sql, *args, **kwargs):
+            if 'DELETE' in sql.upper():
+                raise aiosqlite.OperationalError('database is locked')
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+
+        result = await queue.delete_dead(group_id='proj1', ids=[id1])
+
+        # Must return a typed error envelope — not raise.
+        assert result.get('error_type') == 'TransientSqliteError'
+        assert result.get('retriable') is True
+        assert 'database is locked' in result.get('error', '')
+        # Degenerate first-chunk failure: nothing was deleted yet.
+        assert result.get('deleted') == []
+        # No ineligible ids were discovered (the chunk never ran).
+        assert result.get('not_found') == []
+        # The single input id lands in remaining so caller can retry.
+        assert result.get('remaining') == [id1]
+
+    @pytest.mark.asyncio
+    async def test_operational_error_mid_batch_preserves_deleted_progress(
+        self, queue, monkeypatch
+    ):
+        """Mid-batch OperationalError: prior-chunk deletions are committed and reported.
+
+        Uses batch_size=3 so 7 rows produce chunks [0:3], [3:6], [6:7].
+        The second DELETE raises OperationalError.  Assertions:
+          (a) envelope has error_type='TransientSqliteError', retriable=True
+          (b) envelope['deleted'] matches the first chunk's ids AND those rows
+              are physically gone (visible via a fresh DB read after re-open)
+          (c) envelope['remaining'] covers the un-attempted rows
+          (d) deleted ∪ remaining == all input ids (no overlap, no gap)
+        """
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
+
+        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+
+        # Track which DELETE invocation we're on.
+        delete_call_count = 0
+        original_execute = queue._db.execute
+
+        async def mock_execute(sql, *args, **kwargs):
+            nonlocal delete_call_count
+            if 'DELETE' in sql.upper():
+                delete_call_count += 1
+                if delete_call_count == 2:
+                    raise aiosqlite.OperationalError('database is locked')
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+
+        result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
+
+        # (a) Typed envelope.
+        assert result.get('error_type') == 'TransientSqliteError'
+        assert result.get('retriable') is True
+
+        envelope_deleted = set(result['deleted'])
+        envelope_remaining = set(result['remaining'])
+
+        # (b) First chunk (batch_size=3) must be reported deleted.
+        assert len(envelope_deleted) == 3
+        # No ineligible ids in completed chunks (all were dead rows).
+        assert result.get('not_found') == []
+
+        # Verify durability: close the queue and reopen the raw SQLite file to
+        # confirm the commit landed.  We avoid re-instantiating DurableWriteQueue
+        # with hard-coded constructor args (which could silently diverge from the
+        # fixture) — raw aiosqlite is sufficient for a table-contents check.
+        db_path = queue._data_dir / 'write_queue.db'
+        await queue.close()
+
+        async with aiosqlite.connect(str(db_path)) as raw_db:
+            raw_db.row_factory = aiosqlite.Row
+            cursor = await raw_db.execute(
+                "SELECT id FROM write_queue WHERE status='dead' AND group_id='proj1'"
+            )
+            rows = await cursor.fetchall()
+            surviving = {row['id'] for row in rows}
+
+        # The first chunk's rows must be gone; remaining rows still exist.
+        assert not envelope_deleted.intersection(surviving), (
+            'First-chunk rows must be durably deleted'
+        )
+        assert envelope_remaining.issubset(surviving), (
+            'Remaining rows must still exist after partial commit'
+        )
+
+        # (c) Remaining = un-attempted rows (batches 2+3 = 4 ids).
+        assert len(envelope_remaining) == 4
+
+        # (d) No overlap, full coverage.
+        assert envelope_deleted.isdisjoint(envelope_remaining)
+        assert envelope_deleted | envelope_remaining == set(dead_ids)
 
 
 class TestStats:

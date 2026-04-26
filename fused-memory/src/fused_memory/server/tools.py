@@ -1172,17 +1172,42 @@ def create_mcp_server(
 
         .. note::
             This tool only covers entries in the *durable write queue* (SQLite).
-            Dead letters in the event_queue (JSONL) use string UUIDs and are
-            managed by a separate mechanism; passing event_queue ids here will
-            always return them in ``not_found``.  Use ``get_dead_letters`` to
-            inspect which source each dead letter belongs to before deleting.
+            Dead letters in the **event_queue** (JSONL) use string UUIDs, not
+            integers.  event_queue UUIDs are not valid integer ids and will be
+            rejected at input validation before the request reaches the tool;
+            those entries therefore never appear in ``not_found``.
+            Filter ``get_dead_letters`` output on ``source == 'durable_queue'``
+            before constructing the ``ids`` list for this tool.
+
+            **Large id lists** are safe: the tool internally chunks requests into
+            batches of 500 so SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` limit is
+            never exceeded.
+
+            **Transient SQLite errors** (database locked, disk full) are returned
+            as a retriable envelope rather than raised::
+
+                {
+                    'error':      '<exception message>',
+                    'error_type': 'TransientSqliteError',
+                    'retriable':  True,
+                    'deleted':    [...ids durably deleted in prior chunks...],
+                    'not_found':  [...ineligible ids from prior chunks...],
+                    'remaining':  [...ids in the failing chunk and later — never attempted...],
+                }
+
+            ``remaining`` excludes ineligible ids already classified in prior
+            chunks, so re-calling with ``ids=remaining`` is safe and
+            non-redundant.  Re-call after the underlying issue is resolved.
 
         Args:
             project_id: Project scope (required — prevents accidental cross-project deletes).
             ids: Integer row ids to delete (e.g. [1820, 2017] for the dark_factory entries).
+                 Any number of ids is accepted; large lists are chunked automatically.
 
         Returns:
-            ``{'deleted': [...sorted ids removed...], 'not_found': [...sorted ids missed...]}``
+            On success: ``{'deleted': [...sorted ids removed...], 'not_found': [...sorted ids missed...]}``
+
+            On transient SQLite error: ``{'error': ..., 'error_type': 'TransientSqliteError', 'retriable': True, 'deleted': [...], 'not_found': [...], 'remaining': [...]}``
         """
         if err := validate_project_id(project_id):
             return err

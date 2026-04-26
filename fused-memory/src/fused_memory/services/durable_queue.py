@@ -20,6 +20,12 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of ids per DELETE…RETURNING batch.  SQLite's legacy
+# SQLITE_MAX_VARIABLE_NUMBER default is 999 (modern builds allow 32766);
+# keeping this well below 999 leaves headroom for the trailing group_id
+# placeholder and ensures correctness across all SQLite versions.
+_DELETE_DEAD_BATCH_SIZE = 500
+
 # -- Schema ------------------------------------------------------------------
 
 _CREATE_TABLE = """\
@@ -414,44 +420,112 @@ class DurableWriteQueue:
         self,
         group_id: str,
         ids: list[int],
-    ) -> dict[str, list[int]]:
+    ) -> dict[str, Any]:
         """Delete specific dead-lettered items by id.
 
         Only rows with ``status='dead'`` that belong to ``group_id`` are
         eligible.  Cross-project ids, non-existent ids, and non-dead-status
         ids all land in ``not_found`` without leaking information.
 
+        Large id lists are processed internally in chunks of
+        :data:`_DELETE_DEAD_BATCH_SIZE` so callers can pass arbitrarily many
+        ids without hitting SQLite's SQLITE_MAX_VARIABLE_NUMBER limit.
+
+        **Success envelope**::
+
+            {'deleted': [<sorted ids removed>], 'not_found': [<sorted ids missed>]}
+
+        **Transient-error envelope** (returned, not raised, on
+        ``aiosqlite.OperationalError`` — e.g. database is locked, disk full)::
+
+            {
+                'error':      '<original exception message>',
+                'error_type': 'TransientSqliteError',
+                'retriable':  True,
+                'deleted':    [<ids durably deleted in prior chunks>],
+                'not_found':  [<ineligible ids discovered in prior chunks>],
+                'remaining':  [<ids in the failing chunk and all later chunks>],
+            }
+
+        ``remaining`` contains only ids that were *never attempted* — it
+        excludes ineligible ids already classified in prior chunks.  Retrying
+        with ``ids=remaining`` is therefore safe and non-redundant.
+
+        If the recovery ``COMMIT`` after the error also fails (e.g. disk still
+        full), ``deleted`` and ``not_found`` are set to ``[]`` and ``remaining``
+        covers all input ids, so a full retry is safe.
+
+        Programmer-bug exceptions (``ProgrammingError``, ``IntegrityError``)
+        are NOT caught and propagate to the caller.
+
         Args:
             group_id: Project scope — only dead rows in this group are deleted.
-            ids: Integer row ids to delete.
+            ids: Integer row ids to delete.  Any size list is accepted.
 
         Returns:
-            ``{'deleted': [<sorted ids removed>], 'not_found': [<sorted ids missed>]}``
+            Success or transient-error envelope as described above.
         """
         if not ids:
             return {'deleted': [], 'not_found': []}
 
         assert self._db is not None
-        placeholders = ','.join('?' * len(ids))
-        # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
-        # The WHERE guards (status='dead', group_id=?) are enforced atomically so
-        # a concurrent replay or worker cannot slip a row past the eligibility check
-        # between a separate SELECT and DELETE.
-        cursor = await self._db.execute(
-            f"DELETE FROM write_queue "
-            f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
-            f"RETURNING id",
-            (*ids, group_id),
-        )
-        rows = await cursor.fetchall()
-        deleted: set[int] = {
-            (row[0] if isinstance(row, tuple) else row['id']) for row in rows
-        }
+        deleted: set[int] = set()
+        not_found_completed: set[int] = set()
+
+        for i in range(0, len(ids), _DELETE_DEAD_BATCH_SIZE):
+            chunk = ids[i : i + _DELETE_DEAD_BATCH_SIZE]
+            placeholders = ','.join('?' * len(chunk))
+            # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
+            # The WHERE guards (status='dead', group_id=?) are enforced atomically so
+            # a concurrent replay or worker cannot slip a row past the eligibility check
+            # between a separate SELECT and DELETE.
+            try:
+                cursor = await self._db.execute(
+                    f"DELETE FROM write_queue "
+                    f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
+                    f"RETURNING id",
+                    (*chunk, group_id),
+                )
+                rows = await cursor.fetchall()
+            except aiosqlite.OperationalError as exc:
+                # Commit prior-chunk deletions durably before returning.
+                # The commit itself can fail (e.g. disk still full), in which case
+                # we cannot guarantee prior deletions landed — return a conservative
+                # envelope covering all inputs so a full retry is safe.
+                try:
+                    await self._db.commit()
+                except aiosqlite.OperationalError as commit_exc:
+                    logger.warning(
+                        'delete_dead: recovery commit failed after OperationalError: %s',
+                        commit_exc,
+                    )
+                    return {
+                        'error': str(exc),
+                        'error_type': 'TransientSqliteError',
+                        'retriable': True,
+                        'deleted': [],
+                        'not_found': [],
+                        'remaining': sorted(ids),
+                    }
+                return {
+                    'error': str(exc),
+                    'error_type': 'TransientSqliteError',
+                    'retriable': True,
+                    'deleted': sorted(deleted),
+                    'not_found': sorted(not_found_completed),
+                    'remaining': sorted(ids[i:]),
+                }
+            chunk_deleted = {
+                (row[0] if isinstance(row, tuple) else row['id']) for row in rows
+            }
+            deleted |= chunk_deleted
+            not_found_completed |= set(chunk) - chunk_deleted
+
         await self._db.commit()
 
         return {
             'deleted': sorted(deleted),
-            'not_found': sorted(set(ids) - deleted),
+            'not_found': sorted(not_found_completed),
         }
 
     async def get_dead_items(
