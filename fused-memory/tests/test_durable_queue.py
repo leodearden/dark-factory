@@ -1001,6 +1001,7 @@ class TestDeleteDead:
 
                 # (6) Run delete_dead — chunk-2 DELETE hits real SQLITE_BUSY.
                 result = await q.delete_dead(group_id='proj1', ids=dead_ids)
+                assert delete_call_count >= 2, 'chunk-2 DELETE must have been attempted (otherwise the SQLITE_BUSY engineered for chunk-2 was never exercised)'
 
                 # (7) Release conn2's write lock before the context manager closes it.
                 await conn2.rollback()
@@ -1014,8 +1015,8 @@ class TestDeleteDead:
             # The error message must contain real-SQLite vocabulary — it must NOT
             # be the synthesised 'database is locked' from the mock-based siblings.
             error_msg = result.get('error', '').lower()
-            assert any(
-                token in error_msg for token in ('database is locked', 'busy', 'locked')
+            assert (
+                'database is locked' in error_msg or 'busy' in error_msg
             ), (
                 f'Expected real-SQLite BUSY vocabulary in error message, '
                 f'got: {result.get("error")!r}'
