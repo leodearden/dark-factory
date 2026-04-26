@@ -265,6 +265,18 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
 
 
+def _merge_subject(branch: str, main_branch: str) -> str:
+    """Return the canonical subject line for a no-ff merge of *branch* into *main_branch*.
+
+    Single source of truth for the merge commit subject format consumed by
+    ``find_merge_marker``, ``merge_to_main``, and the retry path in
+    ``advance_main``.  Changing this function is the one place where the
+    format needs to be updated — all three consumers will automatically
+    use the new format.
+    """
+    return f'Merge {branch} into {main_branch}'
+
+
 class GitOps:
     """Git worktree and merge operations."""
 
