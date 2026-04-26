@@ -3440,12 +3440,6 @@ class TestMemoryConsolidatorFlagDedup:
     @pytest.mark.asyncio
     async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
         """Normal (non-remediation) cycle calls dedup_flags with the report's flagged items."""
-        from unittest.mock import AsyncMock, patch
-        from datetime import UTC, datetime
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-        from fused_memory.reconciliation.stages.base import BaseStage
-        from fused_memory.models.reconciliation import StageId, StageReport, Watermark
-
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'p'
         stage.episode_limit = 10
@@ -3485,6 +3479,7 @@ class TestMemoryConsolidatorFlagDedup:
         # dedup_flags must be awaited exactly once with the correct arguments
         dedup_mock.assert_awaited_once()
         call_args = dedup_mock.await_args
+        assert call_args is not None
         assert call_args.kwargs.get('project_id') == 'p' or call_args.args[1] == 'p'
         assert call_args.kwargs.get('run_id') == 'r-uuid' or call_args.args[2] == 'r-uuid'
         flags_arg = call_args.kwargs.get('flags') or call_args.args[3]
@@ -3495,12 +3490,6 @@ class TestMemoryConsolidatorFlagDedup:
     @pytest.mark.asyncio
     async def test_remediation_run_skips_dedup_flags(self, mock_deps):
         """Remediation runs (remediation_findings set) must NOT call dedup_flags."""
-        from unittest.mock import AsyncMock, patch
-        from datetime import UTC, datetime
-        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-        from fused_memory.reconciliation.stages.base import BaseStage
-        from fused_memory.models.reconciliation import StageId, StageReport, Watermark
-
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'p'
         stage.episode_limit = 10
