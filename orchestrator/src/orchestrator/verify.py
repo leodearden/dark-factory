@@ -529,15 +529,36 @@ def _prune_archive(
                 logger.warning('_prune_archive: could not delete %s: %s', path, exc)
 
 
+# Process-local throttle: at most one rglob walk per process per 30 min.
+# Cross-process redundancy is accepted as a cost-only trade-off; see task 1102.
+_PRUNE_THROTTLE_SECS: float = 1800  # 30 minutes
+_LAST_PRUNE_AT: float | None = None
+
+
 def _maybe_prune_archive(archive_root: Path | None) -> bool:
-    """Thin wrapper around ``_prune_archive`` with None-guard.
+    """Thin wrapper around ``_prune_archive`` with None-guard and time throttle.
 
     Returns True if ``_prune_archive`` was invoked, False otherwise.
-    ``archive_root=None`` short-circuits without calling ``_prune_archive``.
+
+    - ``archive_root=None`` short-circuits immediately without updating the
+      throttle timestamp (preserves semantics: None means no archival/pruning).
+    - First call in a process always fires (``_LAST_PRUNE_AT is None``).
+    - Subsequent calls within ``_PRUNE_THROTTLE_SECS`` are skipped.
+    - After the window elapses, the next call fires and slides the window forward.
     """
+    global _LAST_PRUNE_AT
     if archive_root is None:
         return False
+    now = time.monotonic()
+    if _LAST_PRUNE_AT is not None and now - _LAST_PRUNE_AT < _PRUNE_THROTTLE_SECS:
+        logger.debug(
+            'skipping prune: %.0fs since last (throttle %ds)',
+            now - _LAST_PRUNE_AT,
+            _PRUNE_THROTTLE_SECS,
+        )
+        return False
     _prune_archive(archive_root)
+    _LAST_PRUNE_AT = now
     return True
 
 

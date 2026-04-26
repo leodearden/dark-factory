@@ -3008,6 +3008,11 @@ class TestPruneArchiveDedupedAtAggregateSite:
     site in ``run_scoped_verification``.
     """
 
+    @pytest.fixture(autouse=True)
+    def _reset_prune_throttle(self, monkeypatch):
+        from orchestrator import verify  # noqa: PLC0415
+        monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
+
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
         return OrchestratorConfig(
             project_root=tmp_path,
@@ -3157,6 +3162,11 @@ class TestPruneArchiveThrottle:
     Each test resets ``_LAST_PRUNE_AT`` to ``None`` via an autouse fixture so
     module-level state doesn't leak between cases.
     """
+
+    @pytest.fixture(autouse=True)
+    def _reset_prune_throttle(self, monkeypatch):
+        from orchestrator import verify  # noqa: PLC0415
+        monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
 
     def test_first_call_invokes_prune(self, tmp_path: Path):
         """First call to ``_maybe_prune_archive`` always fires ``_prune_archive``."""
