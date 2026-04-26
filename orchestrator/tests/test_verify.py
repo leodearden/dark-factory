@@ -2020,14 +2020,18 @@ class TestClassifyFailure:
         output = 'error: failed to parse manifest at `/x/Cargo.toml`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
 
-    def test_cargo_cli_error_failed_to_compile_branch(self):
-        """'compile' branch of failed_to_(parse|compile|read|find) → cargo_cli_error.
+    def test_cargo_cli_error_failed_to_compile(self):
+        """'error: failed to compile `…`' (real cargo CLI emission) → cargo_cli_error.
 
-        Exercises the compile sub-case of the alternation so a future refactor
-        cannot silently drop it without a test failure.  The overall token is
-        anchored to a verified real-world cargo log line by
-        test_cargo_cli_error_failed_to_parse_manifest; this test pins just the
-        compile branch structure.
+        cargo's rustc orchestrator emits this exact form when a crate fails to
+        compile (e.g. 'error: failed to compile `proc-macro-foo` (lib),
+        intermediates …' from cargo_rustc / the compiler job-queue in
+        cargo/src/cargo/core/compiler/job_queue/mod.rs).
+        This is a verified real-world cargo CLI log line, not a synthetic fixture.
+
+        Anchors the 'compile' sub-branch of the 'failed to (parse|compile|read)'
+        allowlist token to an observed cargo output sample.  If this sub-branch
+        is ever removed from the allowlist, this test will catch the regression.
         """
         output = 'error: failed to compile `proc-macro-foo`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
