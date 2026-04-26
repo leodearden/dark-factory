@@ -172,7 +172,7 @@ class PathGuardVerdict:
 # ---------------------------------------------------------------------------
 
 def check_candidate_for_dark_factory_paths(
-    candidate: 'CandidateTask',
+    candidate: CandidateTask,
     project_id: str,
     prefixes: tuple[str, ...] = DARK_FACTORY_PATH_PREFIXES,
     dark_factory_project_id: str = DARK_FACTORY_PROJECT_ID,
