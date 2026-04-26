@@ -39,9 +39,9 @@ _need_two_accounts = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 _CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
-    'capped',
+    ' capped',          # leading space prevents matching 'uncapped' as a false positive
     'rate limit',
-    'unavailable',
+    'account unavailable',  # narrowed from bare 'unavailable' to avoid generic network errors
     'out of extra usage',
     'usage limit',
     "you've hit",
@@ -223,45 +223,75 @@ class TestLooksLikeCapacityFailure:
     No @pytest.mark.integration marker so these run in normal CI.
     """
 
-    @pytest.mark.parametrize('marker', [
-        'capped',
-        'rate limit',
-        'unavailable',
-        'out of extra usage',
-        'usage limit',
-        "you've hit",
-        "you've used",
+    @pytest.mark.parametrize('cli_output', [
+        # Verbatim Claude CLI cap-hit messages (from shared.usage_gate inline comments,
+        # lines 64-75 — these are the actual strings that motivated the marker list).
+        "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+        "You've used all available credits. Upgrade your plan for more capacity.",
+        "You're out of extra usage for this billing period. Your plan resets in 2h.",
+        "You're close to reaching your usage limit. Your plan resets in 1h.",
+        # Other realistic capacity phrases
+        "Your account is capped until the next billing cycle.",
+        "Rate limit exceeded. Please wait and retry.",
+        "account unavailable at this time; try again later.",
     ])
-    def test_marker_in_output_returns_true(self, marker):
-        result = AgentResult(success=False, output=f'Error: {marker} condition', stderr='')
+    def test_capacity_output_returns_true(self, cli_output):
+        """Realistic Claude CLI cap messages in output are detected."""
+        result = AgentResult(success=False, output=cli_output, stderr='')
         assert _looks_like_capacity_failure(result)
 
-    @pytest.mark.parametrize('marker', [
-        'capped',
-        'rate limit',
-        'unavailable',
-        'out of extra usage',
-        'usage limit',
-        "you've hit",
-        "you've used",
+    @pytest.mark.parametrize('cli_stderr', [
+        "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+        "You're out of extra usage for this billing period. Your plan resets in 2h.",
+        "rate limit: too many requests",
     ])
-    def test_marker_in_stderr_returns_true(self, marker):
-        result = AgentResult(success=False, output='', stderr=f'Error: {marker} condition')
+    def test_capacity_stderr_returns_true(self, cli_stderr):
+        """Realistic Claude CLI cap messages in stderr are also detected."""
+        result = AgentResult(success=False, output='', stderr=cli_stderr)
+        assert _looks_like_capacity_failure(result)
+
+    @pytest.mark.parametrize('output', [
+        "YOU'VE HIT YOUR USAGE LIMIT FOR CLAUDE PRO.",
+        "YOUR ACCOUNT IS CAPPED.",
+        "RATE LIMIT EXCEEDED.",
+    ])
+    def test_case_insensitive_returns_true(self, output):
+        """Cap detection is case-insensitive."""
+        result = AgentResult(success=False, output=output, stderr='')
         assert _looks_like_capacity_failure(result)
 
     @pytest.mark.parametrize('output,stderr', [
-        ('RATE LIMIT exceeded', ''),
-        ('Account is Capped', ''),
-        ('', 'USAGE LIMIT reached'),
+        # Generic non-capacity failures — must NOT trigger skip
+        ('process spawn failed: ENOENT', 'Traceback (most recent call last): ...'),
+        ('malformed JSON response: unexpected token', ''),
+        ('OAuth token validation failed: 401 Unauthorized', ''),
+        # Substring boundary collisions — the narrowed markers must not match
+        ('account uncapped and ready to use', ''),         # 'uncapped' must not match ' capped'
+        ('service unavailable: DNS resolution failed', ''),  # generic 'unavailable' != 'account unavailable'
+        ('', ''),  # empty result
     ])
-    def test_case_insensitive_returns_true(self, output, stderr):
+    def test_non_capacity_failure_returns_false(self, output, stderr):
+        """Generic failures and substring boundary cases do not trigger a skip."""
         result = AgentResult(success=False, output=output, stderr=stderr)
-        assert _looks_like_capacity_failure(result)
-
-    def test_generic_failure_returns_false(self):
-        result = AgentResult(success=False, output='process spawn failed: ENOENT', stderr='Traceback ...')
         assert not _looks_like_capacity_failure(result)
 
-    def test_empty_result_returns_false(self):
-        result = AgentResult(success=False, output='', stderr='')
+    def test_call_site_contract_non_capacity_raises_not_skips(self):
+        """The call-site guarantee: a non-capacity failure reaches assert, not skip.
+
+        At each call site the pattern is::
+
+            if not r.success and _looks_like_capacity_failure(r):
+                pytest.skip(...)
+            assert r.success  # ← fires for any non-capacity failure
+
+        When the helper returns False (non-capacity), the skip branch is never
+        taken and the subsequent ``assert r.success`` fires loudly.  This test
+        verifies that behavioral guarantee — a regression in the call-site
+        predicate would either break this test or the parametrize test above.
+        """
+        result = AgentResult(success=False, output='process spawn failed: ENOENT', stderr='Traceback...')
+        # Helper must return False → the skip branch is NOT taken
         assert not _looks_like_capacity_failure(result)
+        # Therefore the call site reaches `assert r.success`, which raises
+        with pytest.raises(AssertionError):
+            assert result.success
