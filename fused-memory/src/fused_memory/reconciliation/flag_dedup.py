@@ -13,6 +13,13 @@ Note: this module does **not** suppress persistent flags before Stage 2 sees
 them; suppression logic lives in Stage 2's prompt instructions which direct
 the LLM to soft-handle annotated flags.
 
+Marker growth
+-------------
+Markers accumulate monotonically — one row per unique (task_id, flag_type)
+pair.  No refresh write is made on subsequent hits (see :func:`dedup_flags`
+for rationale).  Stale markers must be purged manually; there is no automated
+GC sweep.
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
@@ -46,6 +53,12 @@ async def dedup_flags(
       On a miss a new marker is written so future cycles detect the repeat.
     - All search/write exceptions are caught and logged at WARNING so that a
       transient Mem0 outage does not abort the stage run.
+
+    ``persisted_from_run`` is set to the ``run_id`` stored in the prior
+    marker's metadata.  If that metadata field is absent, ``None``, or an
+    empty string (i.e. any falsy value), the literal sentinel ``'unknown'``
+    is used instead.  Downstream consumers (Stage 2 prompt, observability
+    dashboards) can grep for ``'unknown'`` to detect malformed markers.
 
     Returns the (possibly annotated) flag list.
     """
@@ -83,9 +96,13 @@ async def dedup_flags(
                 flag['last_seen_run_id'] = run_id
                 # No refresh write — the prior marker is sufficient for dedup.
                 # Appending a new marker every cycle would grow the marker table
-                # monotonically (N*M rows for M flags over N cycles).  A future
-                # GC sweep can use last_seen_run_id written on the initial marker
-                # to expire stale rows.
+                # monotonically (N*M rows for M flags over N cycles).
+                #
+                # Note: last_seen_run_id is set once at marker *creation* and is
+                # NOT refreshed on subsequent hits.  A GC sweep keyed on that
+                # field would therefore expire markers that are still actively
+                # being matched — defeating the dedup purpose.  Stale markers
+                # must be purged manually (see module docstring).
             else:
                 # Novel flag — write a new marker for future dedup cycles.
                 # _source='stage1_flag_dedup' distinguishes these from
