@@ -118,8 +118,28 @@ class Mem0Backend:
         limit: int = 10,
         categories: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Search memories in Mem0."""
+        """Search memories in Mem0.
+
+        Args:
+            query: The search query string.
+            scope: The project/agent/session scope for this search.
+            limit: Maximum number of results to return (default 10).
+            categories: Optional list of category names to restrict the search.
+                When provided, the filter is pushed down to the Qdrant vector
+                store via Mem0's ``filters`` kwarg so that the top-N ranking
+                occurs *within* the category-scoped subset.  This prevents the
+                false-negative pattern (task 1083) where a matching memory of
+                the requested category can be rank-pushed out of the top-N by
+                higher-similarity memories belonging to other categories.
+                Single-category → ``{'category': 'name'}`` (equality).
+                Multi-category → ``{'category': {'in': [...]}}`` (OR match).
+        """
         instance = await self._get_instance(scope)
+        # Build Qdrant payload filter for category scoping.
+        # Pushing the filter down here ensures top-N is computed within the
+        # requested category subset, eliminating the false-negative described
+        # in task 1083 where post-filtering on an already-truncated top-N
+        # silently drops matching memories that ranked below the limit.
         filters: dict | None = None
         if categories and len(categories) == 1:
             filters = {'category': categories[0]}

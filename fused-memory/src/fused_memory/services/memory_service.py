@@ -954,6 +954,9 @@ class MemoryService:
         When include_planned=False (default), results tagged with planned=True
         in their metadata are excluded.  When include_planned=True they are returned.
         """
+        # Forward categories so Mem0Backend pushes the filter down to Qdrant
+        # (task 1083: prevents false-negatives caused by post-filtering on
+        # an already-truncated top-N that excludes low-ranked matching memories).
         response = await self.mem0.search(query=query, scope=scope, limit=limit, categories=categories)
         mem0_results = response.get('results', [])
         results = []
