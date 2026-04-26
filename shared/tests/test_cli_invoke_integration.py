@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from shared.cli_invoke import invoke_claude_agent
+from shared.cli_invoke import AgentResult, invoke_claude_agent
 from shared.config_dir import TaskConfigDir
 
 # Discover available OAuth tokens from env
@@ -167,3 +167,53 @@ class TestConfigDirCredentials:
             )
         finally:
             config_dir.cleanup()
+
+
+class TestLooksLikeCapacityFailure:
+    """Unit tests for _looks_like_capacity_failure helper.
+
+    No @pytest.mark.integration marker so these run in normal CI.
+    """
+
+    @pytest.mark.parametrize('marker', [
+        'capped',
+        'rate limit',
+        'unavailable',
+        'out of extra usage',
+        'usage limit',
+        "you've hit",
+        "you've used",
+    ])
+    def test_marker_in_output_returns_true(self, marker):
+        result = AgentResult(success=False, output=f'Error: {marker} condition', stderr='')
+        assert _looks_like_capacity_failure(result)
+
+    @pytest.mark.parametrize('marker', [
+        'capped',
+        'rate limit',
+        'unavailable',
+        'out of extra usage',
+        'usage limit',
+        "you've hit",
+        "you've used",
+    ])
+    def test_marker_in_stderr_returns_true(self, marker):
+        result = AgentResult(success=False, output='', stderr=f'Error: {marker} condition')
+        assert _looks_like_capacity_failure(result)
+
+    @pytest.mark.parametrize('output,stderr', [
+        ('RATE LIMIT exceeded', ''),
+        ('Account is Capped', ''),
+        ('', 'USAGE LIMIT reached'),
+    ])
+    def test_case_insensitive_returns_true(self, output, stderr):
+        result = AgentResult(success=False, output=output, stderr=stderr)
+        assert _looks_like_capacity_failure(result)
+
+    def test_generic_failure_returns_false(self):
+        result = AgentResult(success=False, output='process spawn failed: ENOENT', stderr='Traceback ...')
+        assert not _looks_like_capacity_failure(result)
+
+    def test_empty_result_returns_false(self):
+        result = AgentResult(success=False, output='', stderr='')
+        assert not _looks_like_capacity_failure(result)
