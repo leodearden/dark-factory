@@ -96,11 +96,44 @@ class TestFindDarkFactoryPaths:
 
     def test_order_follows_first_occurrence(self):
         """Prefixes are returned in the order of their first match in the text."""
-        text = 'see escalation/foo.py and also mem0/bar.py and escalation/baz.py'
+        text = 'see graphiti/foo.py and also mem0/bar.py and graphiti/baz.py'
         result = self.find(text)
-        assert result[0] == 'escalation/'
+        assert result[0] == 'graphiti/'
         assert result[1] == 'mem0/'
         assert len(result) == 2  # no duplicates
+
+    def test_generic_directory_names_do_not_match(self):
+        """Common directory names removed from the prefix list must NOT be detected.
+
+        ``shared/``, ``skills/``, ``review/``, ``hooks/``, and ``escalation/``
+        are too generic — they appear legitimately in non-dark-factory projects.
+        A task referencing ``hooks/pre-commit.sh`` should never be rejected.
+        """
+        for generic in ('hooks/', 'shared/', 'skills/', 'review/', 'escalation/'):
+            result = self.find(f'update {generic}some_file.py for this project')
+            assert result == [], (
+                f'{generic!r} is a generic name and must not match; got {result!r}'
+            )
+
+    def test_custom_prefixes_kwarg_overrides_defaults(self):
+        """Passing a custom ``prefixes`` tuple replaces the built-in default set."""
+        # A word that matches a custom prefix but NOT the defaults.
+        result = self.find('edit foo/some_file.py', prefixes=('foo/',))
+        assert result == ['foo/']
+
+        # Conversely, a default prefix must NOT match when the custom set is active.
+        result2 = self.find('edit orchestrator/harness.py', prefixes=('foo/',))
+        assert result2 == []
+
+    def test_url_style_path_matches_by_design(self):
+        """A URL like ``https://github.com/owner/orchestrator/`` matches because
+        the slash before ``orchestrator/`` satisfies the lookbehind.
+
+        This is intentional: better to over-reject a URL that mentions a
+        dark-factory path than to miss a genuine mis-filing.
+        """
+        result = self.find('see https://github.com/owner/orchestrator/repo')
+        assert 'orchestrator/' in result
 
 
 # ---------------------------------------------------------------------------
@@ -331,3 +364,34 @@ class TestCheckCandidate:
         result = self.check(candidate, 'some_other_project')
         assert result.is_rejection
         assert result.project_id == 'some_other_project'
+
+    def test_generic_directory_names_do_not_trigger_rejection(self):
+        """Generic names removed from the prefix list must not cause false rejections.
+
+        A non-dark-factory task that mentions ``hooks/``, ``shared/``, etc. in
+        its title or description must pass through cleanly.
+        """
+        for generic in ('hooks/', 'shared/', 'skills/', 'review/', 'escalation/'):
+            candidate = self._make_candidate(
+                title=f'Update {generic}some_file.py',
+                description=f'Improve {generic}utils.py for this project',
+            )
+            result = self.check(candidate, 'reify')
+            assert result.outcome == 'ok', (
+                f'{generic!r} incorrectly triggered a rejection: {result}'
+            )
+
+    def test_custom_prefixes_kwarg_in_check_candidate(self):
+        """The ``prefixes`` kwarg overrides the default prefix set end-to-end.
+
+        Only the supplied prefixes are scanned; defaults are ignored.
+        """
+        candidate = self._make_candidate(
+            title='Fix foo/module.py',
+            description='orchestrator/harness.py is also mentioned',  # default match
+        )
+        # With custom prefix ('foo/',), only 'foo/' triggers; 'orchestrator/' is ignored.
+        result = self.check(candidate, 'reify', prefixes=('foo/',))
+        assert result.is_rejection
+        assert 'foo/' in result.matched_paths
+        assert 'orchestrator/' not in result.matched_paths

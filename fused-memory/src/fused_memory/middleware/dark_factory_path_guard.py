@@ -48,17 +48,17 @@ DARK_FACTORY_PATH_PREFIXES: tuple[str, ...] = (
     'graphiti/',
     'taskmaster-ai/',
     'taskmaster_ai/',
-    'escalation/',
     'dashboard/',
-    'shared/',
-    'skills/',
-    'review/',
-    'hooks/',
 )
 """Directory prefixes that uniquely identify dark-factory subprojects.
 
 The leading word-boundary check in :func:`find_dark_factory_paths` prevents
 siblings like ``foo-orchestrator/`` from matching ``orchestrator/``.
+
+Intentionally **excludes** generic directory names that commonly appear in
+non-dark-factory projects: ``shared/``, ``skills/``, ``review/``,
+``hooks/``, ``escalation/``.  A task referencing ``hooks/pre-commit.sh``
+or ``shared/utils.py`` should not be rejected as a scope violation.
 """
 
 # ---------------------------------------------------------------------------
@@ -79,9 +79,7 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
         # start of a string or after whitespace/punctuation.
         alts = '|'.join(re.escape(p) for p in prefixes)
         pattern = re.compile(
-            rf'(?:(?:^|(?<=[^A-Za-z0-9_\-])))'
-            rf'({alts})',
-            re.MULTILINE,
+            rf'(?:^|(?<=[^A-Za-z0-9_\-]))({alts})',
         )
         _PATTERN_CACHE[prefixes] = pattern
     return _PATTERN_CACHE[prefixes]
