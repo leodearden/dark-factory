@@ -3763,3 +3763,68 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             f'Expected an INFO log mentioning task 517 but got: '
             f'{[r.message for r in caplog.records]}'
         )
+
+    @pytest.mark.asyncio
+    async def test_no_transition_bypasses_dedup(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Deferred writes with no transition field bypass the dedup check entirely."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Some non-done write',
+            'observations_and_summaries',
+            {},  # no task_id, no transition
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # (a) search was NOT called — bypass condition triggered before any search
+        mock_memory_service.search.assert_not_called()
+
+        # (b) add_memory WAS called once with the deferred-write content
+        mock_memory_service.add_memory.assert_called_once()
+        call_content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert call_content == 'Some non-done write'
+
+        # (c) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    async def test_no_prior_match_falls_through_to_add_memory(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """When Mem0 search returns no prior done-summary, the write proceeds normally."""
+        mock_memory_service.search = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Task 999 completed.',
+            'observations_and_summaries',
+            {'task_id': '999', 'transition': 'done'},
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # (a) search WAS called with project_id and '999' and 'completion'
+        mock_memory_service.search.assert_called_once()
+        search_kwargs = mock_memory_service.search.call_args.kwargs
+        assert search_kwargs.get('project_id') == 'test-project'
+        query = search_kwargs.get('query', '')
+        assert '999' in query and 'completion' in query, (
+            f"Expected query to mention '999' and 'completion', got: {query!r}"
+        )
+
+        # (b) add_memory WAS called once (no prior match — write proceeds)
+        mock_memory_service.add_memory.assert_called_once()
+        call_content = mock_memory_service.add_memory.call_args.kwargs.get('content')
+        assert call_content == 'Task 999 completed.'
+
+        # (c) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0
