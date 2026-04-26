@@ -8,7 +8,7 @@ import re
 import shutil
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from shared.proc_group import terminate_process_group
@@ -403,7 +403,7 @@ def _archive_attempt_log(
         logger.warning('_archive_attempt_log: could not create %s: %s', target_dir, exc)
         return []
 
-    utc_ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
     archived: list[Path] = []
     for src in worktree_log_paths:
         src = Path(src)
@@ -1095,7 +1095,7 @@ async def run_verification(
         """
         if cmd is None:
             return 0, '', False, None, 0.0
-        started_at = datetime.now(timezone.utc).isoformat()
+        started_at = datetime.now(UTC).isoformat()
         t0 = time.monotonic()
         rc, out, timed_out_flag = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
         return rc, out, timed_out_flag, started_at, time.monotonic() - t0
