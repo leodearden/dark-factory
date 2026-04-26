@@ -932,6 +932,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 # Then clean up any orphaned worktree dir so future re-use of
                 # the same task id doesn't collide.
                 worktree_path = self.git_ops.worktree_base / tid
+                # pop(tid, None) is idempotent: if set_task_status fails below
+                # and the next reconcile pass re-enters this branch, the pop
+                # is a cheap no-op and cleanup retries cleanly.
                 self._recovered_plans.pop(tid, None)
                 if worktree_path.exists():
                     try:

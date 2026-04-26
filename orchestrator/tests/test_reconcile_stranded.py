@@ -579,14 +579,9 @@ class TestReconcileStrandedInProgress:
         self, harness: Harness
     ):
         """Regression: when is_ancestor=True and the task has a recovered plan,
-        the stale _recovered_plans entry must be dropped and the worktree must
-        be cleaned up unconditionally — not skipped by the old guard.
-
-        RED state: against current main the guard at harness.py:935 is
-        `worktree_path.exists() and tid not in self._recovered_plans`, so
-        cleanup is skipped and the _recovered_plans entry lingers.  The
-        assertions `tid not in harness._recovered_plans` and
-        `cleanup_worktree.assert_awaited_once_with(...)` will both fail.
+        the stale _recovered_plans entry must be dropped and the orphaned
+        worktree must be cleaned up — no entry should linger after the task
+        transitions to a terminal 'done' state where resumption is impossible.
         """
         tid = '52'
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
