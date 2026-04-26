@@ -3067,3 +3067,31 @@ class TestStage2MemoryVerificationGuidance:
             "STAGE2_SYSTEM_PROMPT must name the 'memories_written' stat counter "
             "in its write-verification guidance so agents know which field to correct."
         )
+
+
+class TestStage2TaskVerificationGuidance:
+    """TDD tests for Stage 2's task-operation verification guidance (steps 5–10).
+
+    These tests drive the addition of a new '## Verifying Task Operations' section
+    to STAGE2_SYSTEM_PROMPT that instructs the agent to call get_task to confirm
+    task writes before incrementing stat counters (tasks_created, tasks_reopened).
+    """
+
+    def test_stage2_system_prompt_instructs_get_task_verification_after_creation(self):
+        """RED (step 5): STAGE2_SYSTEM_PROMPT must instruct agents to call get_task
+        after resolve_ticket returns status=created|combined, and to increment
+        tasks_created only after that confirmation.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'resolve_ticket' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must reference 'resolve_ticket' in its task-creation guidance."
+        )
+        assert 'get_task' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must instruct agents to call 'get_task' to verify a "
+            "task was actually created before incrementing the tasks_created counter."
+        )
+        assert 'tasks_created' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must name the 'tasks_created' stat counter in its "
+            "task-verification guidance so agents know which counter to conditionally increment."
+        )
