@@ -3008,6 +3008,11 @@ class TestPruneArchiveDedupedAtAggregateSite:
     site in ``run_scoped_verification``.
     """
 
+    @pytest.fixture(autouse=True)
+    def _reset_prune_throttle(self, monkeypatch):
+        from orchestrator import verify  # noqa: PLC0415
+        monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
+
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
         return OrchestratorConfig(
             project_root=tmp_path,
@@ -3148,4 +3153,163 @@ class TestPruneArchiveDedupedAtAggregateSite:
         assert spy.call_count == 1, (
             f'Global path should call _prune_archive exactly once; '
             f'got {spy.call_count} call(s)'
+        )
+
+
+class TestPruneArchiveThrottle:
+    """Tests for the ``_maybe_prune_archive`` throttle wrapper.
+
+    Each test resets ``_LAST_PRUNE_AT`` to ``None`` via an autouse fixture so
+    module-level state doesn't leak between cases.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_prune_throttle(self, monkeypatch):
+        from orchestrator import verify  # noqa: PLC0415
+        monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
+
+    def test_first_call_invokes_prune(self, tmp_path: Path):
+        """First call to ``_maybe_prune_archive`` always fires ``_prune_archive``."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive') as spy:
+            _maybe_prune_archive(archive_root)
+
+        assert spy.call_count == 1, (
+            f'First call should invoke _prune_archive once; got {spy.call_count}'
+        )
+        assert spy.call_args[0][0] == archive_root, (
+            f'First positional arg should be archive_root; got {spy.call_args[0][0]!r}'
+        )
+
+    def test_second_call_within_window_skips_prune(self, tmp_path: Path):
+        """Second immediate call is throttled — ``_prune_archive`` called only once."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive') as spy:
+            _maybe_prune_archive(archive_root)
+            _maybe_prune_archive(archive_root)
+
+        assert spy.call_count == 1, (
+            f'Second immediate call must be throttled; expected 1, got {spy.call_count}'
+        )
+
+    def test_call_after_throttle_elapsed_fires_again(self, monkeypatch, tmp_path: Path):
+        """After the throttle window elapses, the next call fires ``_prune_archive``."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        base_time = 0.0
+
+        with patch.object(verify, '_prune_archive') as spy:
+            # Patch via verify.time so the test breaks visibly if verify.py ever
+            # switches to "from time import monotonic" (instead of silently using
+            # real wall-clock time).
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
+            _maybe_prune_archive(archive_root)  # first call — fires
+
+            # Advance time past the throttle window
+            elapsed = _PRUNE_THROTTLE_SECS + 1
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
+            _maybe_prune_archive(archive_root)  # second call — window elapsed, fires again
+
+        assert spy.call_count == 2, (
+            f'Call after throttle elapsed should fire again; expected 2, got {spy.call_count}'
+        )
+
+    def test_third_call_within_new_window_skips(self, monkeypatch, tmp_path: Path):
+        """After second fire, the window slides — an immediate third call is throttled."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        base_time = 0.0
+        elapsed = _PRUNE_THROTTLE_SECS + 1
+
+        with patch.object(verify, '_prune_archive') as spy:
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time)
+            _maybe_prune_archive(archive_root)  # first fire
+
+            monkeypatch.setattr(verify.time, 'monotonic', lambda: base_time + elapsed)
+            _maybe_prune_archive(archive_root)  # second fire (window elapsed)
+
+            # Third call immediately after second — still at the same "elapsed" time
+            _maybe_prune_archive(archive_root)  # should be throttled
+
+        assert spy.call_count == 2, (
+            f'Third call within new window must be throttled; expected 2, got {spy.call_count}'
+        )
+
+    def test_archive_root_none_no_op_does_not_update_throttle(self, tmp_path: Path):
+        """None call doesn't burn the throttle — subsequent real call still fires."""
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
+
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive') as spy:
+            result_none = _maybe_prune_archive(None)
+            assert spy.call_count == 0, 'None call must not invoke _prune_archive'
+            assert result_none is False
+
+            result_real = _maybe_prune_archive(archive_root)
+            assert spy.call_count == 1, (
+                f'Real call after None must fire _prune_archive; got {spy.call_count}'
+            )
+            assert result_real is True
+
+    @pytest.mark.asyncio
+    async def test_run_scoped_verification_finally_uses_wrapper(self, monkeypatch, tmp_path: Path):
+        """run_scoped_verification goes through the wrapper on every call; the
+        wrapper throttles so _prune_archive fires only once across two calls."""
+        (tmp_path / '.task').mkdir()
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='echo ok',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 1, 'error: --exclude\nfoo\n', False
+
+        wrapper_calls: list[object] = []
+        original_maybe = verify._maybe_prune_archive
+
+        def counting_wrapper(ar):
+            wrapper_calls.append(ar)
+            return original_maybe(ar)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+                patch.object(verify, '_maybe_prune_archive', side_effect=counting_wrapper), \
+                patch.object(verify, '_prune_archive') as prune_spy:
+            # First call — wrapper fires _prune_archive
+            await run_scoped_verification(
+                tmp_path, config, [],
+                attempt_id=1, task_id='42', archive_root=archive_root,
+            )
+            # Second call — wrapper is invoked again but _prune_archive is throttled
+            await run_scoped_verification(
+                tmp_path, config, [],
+                attempt_id=2, task_id='42', archive_root=archive_root,
+            )
+
+        assert len(wrapper_calls) == 2, (
+            f'_maybe_prune_archive should be called twice (once per run); '
+            f'got {len(wrapper_calls)}'
+        )
+        assert prune_spy.call_count == 1, (
+            f'_prune_archive should be called only once (throttled on second); '
+            f'got {prune_spy.call_count}'
         )

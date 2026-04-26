@@ -468,6 +468,13 @@ def _archive_attempt_log(
 
 _DEFAULT_ARCHIVE_MAX_AGE_DAYS = 30
 _DEFAULT_ARCHIVE_MAX_BYTES = 500 * 1024 * 1024
+# Process-local throttle: at most one rglob walk per process per 30 min.
+# Cross-process redundancy is accepted as a cost-only trade-off; see task 1102.
+# Thread-safety: _maybe_prune_archive has no awaits, so concurrent async coroutines
+# cannot interleave the check + update. This is NOT safe for multi-threaded callers
+# (e.g. asyncio.to_thread) without a threading.Lock — add one if that ever changes.
+_PRUNE_THROTTLE_SECS: float = 1800  # 30 minutes
+_LAST_PRUNE_AT: float | None = None
 
 
 def _prune_archive(
@@ -527,6 +534,33 @@ def _prune_archive(
                 total -= size
             except OSError as exc:
                 logger.warning('_prune_archive: could not delete %s: %s', path, exc)
+
+
+def _maybe_prune_archive(archive_root: Path | None) -> bool:
+    """Thin wrapper around ``_prune_archive`` with None-guard and time throttle.
+
+    Returns True if ``_prune_archive`` was invoked, False otherwise.
+
+    - ``archive_root=None`` short-circuits immediately without updating the
+      throttle timestamp (preserves semantics: None means no archival/pruning).
+    - First call in a process always fires (``_LAST_PRUNE_AT is None``).
+    - Subsequent calls within ``_PRUNE_THROTTLE_SECS`` are skipped.
+    - After the window elapses, the next call fires and slides the window forward.
+    """
+    global _LAST_PRUNE_AT
+    if archive_root is None:
+        return False
+    now = time.monotonic()
+    if _LAST_PRUNE_AT is not None and now - _LAST_PRUNE_AT < _PRUNE_THROTTLE_SECS:
+        logger.debug(
+            'skipping prune: %.0fs since last (throttle %ds)',
+            now - _LAST_PRUNE_AT,
+            _PRUNE_THROTTLE_SECS,
+        )
+        return False
+    _prune_archive(archive_root)
+    _LAST_PRUNE_AT = now
+    return True
 
 
 async def _derive_task_files_from_git(
@@ -1569,5 +1603,4 @@ async def run_scoped_verification(
             attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
         )
     finally:
-        if archive_root is not None:
-            _prune_archive(archive_root)
+        _maybe_prune_archive(archive_root)
