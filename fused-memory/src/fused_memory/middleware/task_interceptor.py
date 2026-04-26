@@ -953,6 +953,34 @@ class TaskInterceptor:
             v = check_text_for_dark_factory_paths(text, project_id)
         return v.to_error_dict() if v.is_rejection else None
 
+    def _path_guard_or_skip(
+        self,
+        kwargs: dict,
+        project_id: str,
+        candidate: 'CandidateTask | None' = None,
+    ) -> 'dict | None':
+        """Run the path-scope guard with the dark_factory short-circuit applied.
+
+        Returns the structured error dict on rejection, or ``None`` when the
+        submission is allowed (or the project is dark_factory, in which case
+        the guard is a no-op and the build is skipped on the hot path).
+
+        The optional *candidate* parameter lets callers pass an already-built
+        :class:`CandidateTask` (as ``add_subtask`` does, since the candidate is
+        consumed downstream by ``_add_subtask_locked``). When ``candidate`` is
+        None and the project is non-dark_factory, the helper lazy-builds via
+        ``_build_candidate`` — preserving ``submit_task``'s hot-path optimisation
+        that skips the build entirely for dark_factory.
+
+        Call-site pattern:
+            ``if err := self._path_guard_or_skip(kwargs, project_id): return err``
+        """
+        if project_id == DARK_FACTORY_PROJECT_ID:
+            return None
+        if candidate is None:
+            candidate = self._build_candidate(kwargs)
+        return self._path_guard_error(candidate, kwargs, project_id)
+
     async def _execute_combine(
         self,
         project_root: str,
@@ -1476,15 +1504,11 @@ class TaskInterceptor:
 
         # Path-scope guard: reject before persisting if the candidate references
         # dark-factory module paths but is being filed into a different project.
-        # Skip _build_candidate entirely for the dark_factory hot path — the
-        # guard short-circuits to 'ok' there anyway, and the worker will rebuild
-        # the candidate from the persisted blob.
-        # The inner _build_candidate call must run before kwargs.pop('metadata')
-        # below so it can still read metadata.
-        if project_id != DARK_FACTORY_PROJECT_ID:
-            candidate = self._build_candidate(kwargs)
-            if err := self._path_guard_error(candidate, kwargs, project_id):
-                return err
+        # _path_guard_or_skip handles the dark_factory short-circuit (which skips
+        # _build_candidate entirely for the hot path) and runs the guard otherwise.
+        # Must run before kwargs.pop('metadata') below so the helper can read metadata.
+        if err := self._path_guard_or_skip(kwargs, project_id):
+            return err
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
@@ -2533,16 +2557,16 @@ class TaskInterceptor:
     ) -> dict:
         if err := await self._backlog_gate(project_root):
             return err
-        # Unlike submit_task, we cannot hoist _build_candidate behind a
-        # project_id != DARK_FACTORY_PROJECT_ID check here: the candidate is
-        # passed directly into _add_subtask_locked and reused by the curator
-        # and write paths, so skipping the build on the dark_factory hot path
-        # would just force a duplicate build later.
+        # The candidate is built unconditionally because it is consumed downstream
+        # by _add_subtask_locked (curator + write path). The dark_factory
+        # short-circuit lives inside _path_guard_or_skip, which simply returns
+        # None for dark_factory without re-running the guard scan.
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
         # Path-scope guard: reject before acquiring the curator lock so a
         # mis-filed task never touches the lock, ticket store, or curator.
-        if err := self._path_guard_error(candidate, kwargs, project_id):
+        # Pass the pre-built candidate so _path_guard_or_skip doesn't double-build.
+        if err := self._path_guard_or_skip(kwargs, project_id, candidate):
             return err
         # curator_lock across curator.curate + note_created/record_task;
         # write_lock acquired internally for the brief tm.add_subtask call.
