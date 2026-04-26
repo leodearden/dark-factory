@@ -118,4 +118,12 @@ discrepancy in your structured report.
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.
+
+## Briefing-Refresh Tasks
+Tasks titled "Refresh briefing: remove task <N> from known_gaps" may appear in the \
+task tree. These are queued automatically by the reconciliation harness (not by an \
+agent) when the project's briefing.yaml lists a task in its known_gaps section that \
+no longer needs to be there. Leave these tasks in place — do not curate them away, \
+merge them, or mark them done. They are completed by the briefing-refresh workflow \
+outside of reconciliation.
 """

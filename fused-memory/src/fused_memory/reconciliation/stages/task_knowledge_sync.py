@@ -8,7 +8,13 @@ import heapq
 import itertools
 import json
 import logging
+import sys
 from collections.abc import Iterable
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fused_memory.backends.taskmaster_client import TaskmasterBackend
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -35,6 +41,11 @@ from fused_memory.reconciliation.task_filter import (
 
 logger = logging.getLogger(__name__)
 
+# Projects allowed to use the briefing-refresh hook.  This is a reify-specific
+# feature; gating on project_id prevents accidental triggering by other projects
+# that happen to have the same file layout.  Extend when needed.
+_BRIEFING_REFRESH_PROJECT_ALLOWLIST: frozenset[str] = frozenset({'reify'})
+
 
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
@@ -53,6 +64,77 @@ class TaskKnowledgeSync(BaseStage):
 
     def get_disallowed_tools(self) -> list[str]:
         return STAGE2_DISALLOWED
+
+    async def run(
+        self,
+        events: list[ReconciliationEvent],
+        watermark: Watermark,
+        prior_reports: list[StageReport],
+        run_id: str,
+        model: str | None = None,
+    ) -> StageReport:
+        """Run the briefing-refresh hook then delegate to BaseStage.run()."""
+        await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
+        return await super().run(events, watermark, prior_reports, run_id, model=model)
+
+    async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
+        """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
+
+        Silently skips if project_root or taskmaster is absent, or if project_id
+        is not in ``_BRIEFING_REFRESH_PROJECT_ALLOWLIST`` (reify-specific feature).
+        Any exception is caught and logged as a WARNING so a broken script can
+        never abort Stage 2.
+        """
+        if not self.project_root or not self.taskmaster:
+            return
+        if self.project_id not in _BRIEFING_REFRESH_PROJECT_ALLOWLIST:
+            return
+        try:
+            mismatches = await _run_briefing_known_gaps_script(self.project_root)
+            if not mismatches:
+                return
+            # Avoid a redundant get_tasks round-trip when the harness has
+            # already injected the full task tree into self.filtered_task_tree.
+            existing_tasks: list[dict] | None = None
+            if self.filtered_task_tree is not None:
+                existing_tasks = list(itertools.chain(
+                    self.filtered_task_tree.active_tasks,
+                    self.filtered_task_tree.done_tasks,
+                    self.filtered_task_tree.cancelled_tasks,
+                ))
+            summary = await _queue_briefing_refresh_tasks(
+                self.taskmaster, self.project_root, mismatches,
+                existing_tasks=existing_tasks,
+                run_id=run_id,
+            )
+            # Extract values inside the try/except so a contract violation
+            # (e.g. summary being None due to a future refactor) is caught
+            # here rather than propagating out of this method.
+            created_ids = summary.get('created', [])
+            skipped_ids = summary.get('skipped', [])
+            failed_ids = summary.get('failed', [])
+        except Exception:
+            logger.warning(
+                'briefing_refresh_hook_failed',
+                exc_info=True,
+                extra={'project_root': self.project_root},
+            )
+            return
+        # Logging is intentionally outside the try/except above so a logging
+        # bug (e.g. a reserved-name collision in `extra`) surfaces as a real
+        # error rather than being swallowed as a misleading
+        # 'briefing_refresh_hook_failed' WARNING. Note: 'created' is a
+        # reserved LogRecord attribute (the timestamp), so we use
+        # 'created_ids'/'skipped_ids'/'failed_ids' here.
+        logger.info(
+            'briefing_refresh_tasks_queued',
+            extra={
+                'project_root': self.project_root,
+                'created_ids': created_ids,
+                'skipped_ids': skipped_ids,
+                'failed_ids': failed_ids,
+            },
+        )
 
     async def assemble_payload(
         self,
@@ -494,3 +576,155 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
         return (priority, -_id_key(t))
 
     return heapq.nsmallest(n, tasks, key=sort_key)
+
+
+async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | None:
+    """Run reify's refresh_briefing_known_gaps.py in --json mode.
+
+    Returns a list of mismatch dicts when mismatches are present, an empty list
+    when none are found, or None when the script is absent (non-reify project),
+    the briefing file is missing, or the subprocess fails.
+
+    Exit codes:
+    - 0: no mismatches → return []
+    - 1: mismatches present → return parsed JSON list
+    - 2+: script error → log WARNING, return None
+    """
+    script_path = Path(project_root) / 'scripts' / 'refresh_briefing_known_gaps.py'
+    if not script_path.exists():
+        return None
+
+    briefing_path = Path(project_root) / 'review' / 'briefing.yaml'
+    if not briefing_path.exists():
+        return None
+
+    tasks_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.json'
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(script_path),
+            '--briefing', str(briefing_path),
+            '--tasks', str(tasks_path),
+            '--json',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            logger.warning(
+                'briefing_known_gaps_script_timeout',
+                extra={'project_root': project_root},
+            )
+            return None
+    except FileNotFoundError:
+        logger.warning(
+            'briefing_known_gaps_script_not_found',
+            extra={'project_root': project_root},
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            'briefing_known_gaps_script_error',
+            extra={'project_root': project_root, 'error': str(exc)},
+        )
+        return None
+
+    if proc.returncode not in (0, 1):
+        logger.warning(
+            'briefing_known_gaps_script_failed',
+            extra={
+                'project_root': project_root,
+                'returncode': proc.returncode,
+                'stderr': stderr.decode('utf-8', errors='replace')[:500],
+            },
+        )
+        return None
+
+    try:
+        return json.loads(stdout.decode('utf-8', errors='replace'))
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            'briefing_known_gaps_script_bad_json',
+            extra={'project_root': project_root, 'error': str(exc)},
+        )
+        return None
+
+
+async def _queue_briefing_refresh_tasks(
+    taskmaster: TaskmasterBackend,
+    project_root: str,
+    mismatches: list[dict],
+    existing_tasks: list[dict] | None = None,
+    run_id: str = '',
+) -> dict:
+    """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
+
+    Skips creation when a task with status 'pending' and the same canonical title
+    already exists (exact-title de-dup, case-sensitive string equality).
+
+    ``existing_tasks`` may be pre-supplied by the caller (e.g. derived from
+    the harness-injected ``filtered_task_tree``) to avoid a redundant
+    ``get_tasks`` round-trip.  When ``None``, the function fetches the tree
+    itself.
+
+    ``run_id`` is written into task metadata as ``_causation_id`` so the
+    created tasks are traceable back to the reconciliation run that filed them.
+
+    Returns ``{"created": [task_ids], "skipped": [task_ids], "failed": [task_ids]}``.
+    """
+    if existing_tasks is None:
+        existing_raw = await taskmaster.get_tasks(project_root=project_root)
+        existing_tasks = existing_raw.get('tasks', []) if isinstance(existing_raw, dict) else []
+    pending_titles = {
+        t.get('title', '')
+        for t in existing_tasks
+        if t.get('status') == 'pending'
+    }
+
+    created: list[str] = []
+    skipped: list[str] = []
+    failed: list[str] = []
+
+    task_metadata: str | None = (
+        json.dumps({'_causation_id': run_id, 'agent_id': 'recon-stage-task_knowledge_sync'})
+        if run_id else None
+    )
+
+    for mismatch in mismatches:
+        task_id = str(mismatch.get('task_id', ''))
+        title = f'Refresh briefing: remove task {task_id} from known_gaps'
+
+        if title in pending_titles:
+            skipped.append(task_id)
+            continue
+
+        subproject = mismatch.get('subproject', '')
+        task_title = mismatch.get('title', '')
+        what = mismatch.get('what', '')
+        description = (
+            f'Subproject: {subproject}\n'
+            f'Task title: {task_title}\n'
+            f'Gap: {what}'
+        )
+        try:
+            result = await taskmaster.add_task(
+                project_root=project_root,
+                title=title,
+                description=description,
+                metadata=task_metadata,
+            )
+            if isinstance(result, dict) and 'id' in result:
+                created.append(str(result['id']))
+            else:
+                created.append(task_id)
+        except Exception:
+            logger.warning(
+                'briefing_refresh_add_task_failed',
+                exc_info=True,
+                extra={'project_root': project_root, 'task_id': task_id},
+            )
+            failed.append(task_id)
+
+    return {'created': created, 'skipped': skipped, 'failed': failed}

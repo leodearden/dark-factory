@@ -34,6 +34,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
+    _queue_briefing_refresh_tasks,
+    _run_briefing_known_gaps_script,
     _select_proactive_sample,
 )
 from fused_memory.reconciliation.task_filter import (
@@ -2995,3 +2997,424 @@ class TestStage2HandoffShortfallWarning:
             f'Expected no flagged_items_truncated WARNING (run_stage=stage2) for 5 small items; '
             f'got: {[(r.getMessage(), r.__dict__) for r in truncation_records]}'
         )
+
+
+class TestBriefingKnownGapsRefresh:
+    """Tests for _run_briefing_known_gaps_script and _queue_briefing_refresh_tasks helpers."""
+
+    @pytest.fixture
+    def mock_deps(self, tmp_path):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root=str(tmp_path))
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='reify')
+
+    # ------------------------------------------------------------------ #
+    # _run_briefing_known_gaps_script                                       #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_when_script_missing(self, tmp_path):
+        """No scripts/refresh_briefing_known_gaps.py → returns None without subprocess."""
+        # tmp_path has neither the script nor the briefing file
+        with patch('asyncio.create_subprocess_exec') as mock_subproc:
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        mock_subproc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_when_briefing_missing(self, tmp_path):
+        """Script present but review/briefing.yaml absent → returns None without subprocess."""
+        # Create the script file but NOT the briefing
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        # review/briefing.yaml intentionally absent
+
+        with patch('asyncio.create_subprocess_exec') as mock_subproc:
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        mock_subproc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_script_parses_json_mismatches_on_success(self, tmp_path):
+        """Both artifacts present; subprocess returns exit 1 with JSON mismatches."""
+        # Create both required artifacts
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        review_dir = tmp_path / 'review'
+        review_dir.mkdir()
+        (review_dir / 'briefing.yaml').touch()
+
+        mismatch_data = [
+            {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        ]
+        stdout_bytes = json.dumps(mismatch_data).encode()
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(stdout_bytes, b''))
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result == mismatch_data
+
+        # Verify the subprocess was called with the expected flags
+        call_args = mock_exec.call_args
+        pos_args = call_args[0]
+        assert '--briefing' in pos_args
+        assert '--tasks' in pos_args
+        assert '--json' in pos_args
+        # The briefing path must point to <project_root>/review/briefing.yaml
+        briefing_idx = pos_args.index('--briefing')
+        assert pos_args[briefing_idx + 1] == str(tmp_path / 'review' / 'briefing.yaml')
+        # The tasks path must point to <project_root>/.taskmaster/tasks/tasks.json
+        tasks_idx = pos_args.index('--tasks')
+        assert pos_args[tasks_idx + 1] == str(tmp_path / '.taskmaster' / 'tasks' / 'tasks.json')
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_on_subprocess_error(self, tmp_path, caplog):
+        """Exit code 2 → returns None and emits a WARNING naming the exit code."""
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        review_dir = tmp_path / 'review'
+        review_dir.mkdir()
+        (review_dir / 'briefing.yaml').touch()
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 2
+        mock_proc.communicate = AsyncMock(
+            return_value=(b'', b'ERROR: cannot parse briefing.yaml: bad syntax')
+        )
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        # The warning must use the canonical message key and carry the exit code in extra.
+        assert 'briefing_known_gaps_script_failed' in warning_records[0].getMessage()
+        assert getattr(warning_records[0], 'returncode', None) == 2
+
+    # ------------------------------------------------------------------ #
+    # _queue_briefing_refresh_tasks                                         #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_calls_add_task_for_each_mismatch(self):
+        """No existing tasks → add_task called once per mismatch with canonical title."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        mismatches = [
+            {'task_id': '1751', 'title': 'Old gap title', 'subproject': 'fused-memory', 'what': 'Description of the gap'},
+            {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
+        ]
+
+        await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        assert taskmaster.add_task.call_count == 2
+
+        first_call_kwargs = taskmaster.add_task.call_args_list[0][1]
+        assert first_call_kwargs['title'] == 'Refresh briefing: remove task 1751 from known_gaps'
+        assert 'fused-memory' in first_call_kwargs['description']
+        assert 'Old gap title' in first_call_kwargs['description']
+
+        second_call_kwargs = taskmaster.add_task.call_args_list[1][1]
+        assert second_call_kwargs['title'] == 'Refresh briefing: remove task 1820 from known_gaps'
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_skips_existing_pending_with_same_title(self):
+        """Existing pending task with canonical title → add_task not called; skipped list populated."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [{
+                'id': 999,
+                'status': 'pending',
+                'title': 'Refresh briefing: remove task 1751 from known_gaps',
+            }]
+        }
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        taskmaster.add_task.assert_not_called()
+        assert '1751' in result['skipped']
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_creates_when_existing_with_same_title_is_done(self):
+        """Done task with same canonical title → add_task IS called (regression can re-file)."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [{
+                'id': 999,
+                'status': 'done',
+                'title': 'Refresh briefing: remove task 1751 from known_gaps',
+            }]
+        }
+        taskmaster.add_task.return_value = {'id': '1000', 'message': 'created'}
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        taskmaster.add_task.assert_called_once()
+        assert '1751' not in result['skipped']
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_dedup_is_exact_title_match(self):
+        """Dedup uses case-sensitive exact string equality — near-misses do NOT dedup.
+
+        A pending task whose title differs from the canonical title by trailing
+        whitespace or casing is NOT treated as a duplicate.  This documents the
+        intended behavior: if we ever want tolerance, we should normalise before
+        comparing and add a test for that normalisation.
+        """
+        taskmaster = AsyncMock()
+        canonical = 'Refresh briefing: remove task 1751 from known_gaps'
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                # trailing space — should NOT dedup
+                {'id': 900, 'status': 'pending', 'title': canonical + ' '},
+                # uppercase — should NOT dedup
+                {'id': 901, 'status': 'pending', 'title': canonical.upper()},
+            ]
+        }
+        taskmaster.add_task.return_value = {'id': '9999', 'message': 'created'}
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        # Neither near-miss deduped → add_task must be called exactly once
+        taskmaster.add_task.assert_called_once()
+        assert '1751' not in result['skipped']
+
+    # ------------------------------------------------------------------ #
+    # TaskKnowledgeSync.run() integration                                   #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_run_invokes_briefing_refresh_hook_before_super_run(self, mock_deps, tmp_path):
+        """run() calls _maybe_queue_briefing_refresh_tasks then super().run()."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['taskmaster'].add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(return_value=[mismatch]),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=MagicMock(
+                    success=True, report={'summary': 'ok'},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-1086',
+            )
+
+        # The hook should have called add_task once
+        mock_deps['taskmaster'].add_task.assert_called_once()
+        call_kwargs = mock_deps['taskmaster'].add_task.call_args[1]
+        assert call_kwargs['title'] == 'Refresh briefing: remove task 1751 from known_gaps'
+
+        # And the run should have completed with a StageReport
+        assert report is not None
+
+    @pytest.mark.asyncio
+    async def test_run_success_log_uses_non_reserved_logrecord_keys(
+        self, mock_deps, tmp_path, caplog,
+    ):
+        """Success-path INFO log must not collide with reserved LogRecord attrs.
+
+        Regression: 'created' is a reserved LogRecord attribute (timestamp);
+        passing it via extra= raises KeyError inside logging.makeRecord. Prior
+        to the fix, the success path was wrapped in a broad try/except that
+        masked the KeyError and emitted a misleading 'briefing_refresh_hook_failed'
+        WARNING even when tasks had been queued successfully. We assert here
+        that the success path emits the INFO record cleanly and that no
+        'briefing_refresh_hook_failed' WARNING is produced.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['taskmaster'].add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(return_value=[mismatch]),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=MagicMock(
+                    success=True, report={'summary': 'ok'},
+                )),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-1086-log',
+            )
+
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        info_records = [
+            r for r in caplog.records
+            if r.name == target_logger
+            and r.levelno == logging.INFO
+            and 'briefing_refresh_tasks_queued' in r.getMessage()
+        ]
+        assert len(info_records) == 1, (
+            'expected exactly one briefing_refresh_tasks_queued INFO record'
+        )
+        rec = info_records[0]
+        # The renamed extras must be present on the LogRecord.
+        assert getattr(rec, 'created_ids', None) == ['9001']
+        assert getattr(rec, 'skipped_ids', None) == []
+
+        # And no false-positive failure WARNING should have fired.
+        failure_warnings = [
+            r for r in caplog.records
+            if r.name == target_logger
+            and r.levelno == logging.WARNING
+            and 'briefing_refresh_hook_failed' in r.getMessage()
+        ]
+        assert failure_warnings == [], (
+            'success path must not emit briefing_refresh_hook_failed'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_dedupes_when_invoked_twice_with_same_mismatch(self, mock_deps, tmp_path):
+        """Calling run() twice: second call skips add_task because first created pending task."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        canonical_title = 'Refresh briefing: remove task 1751 from known_gaps'
+
+        # First call: no existing tasks
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['taskmaster'].add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        fake_cli_result = MagicMock(success=True, report={'summary': 'ok'})
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(return_value=[mismatch]),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=fake_cli_result),
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-1',
+            )
+
+            # Now update get_tasks to include the just-created task as pending
+            mock_deps['taskmaster'].get_tasks.return_value = {
+                'tasks': [{'id': '9001', 'status': 'pending', 'title': canonical_title}]
+            }
+            mock_deps['taskmaster'].add_task.reset_mock()
+
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-2',
+            )
+
+        # Second invocation must not call add_task again
+        mock_deps['taskmaster'].add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_swallows_helper_failure(self, mock_deps, tmp_path, caplog):
+        """If _run_briefing_known_gaps_script raises, run() still completes and logs WARNING."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        fake_cli_result = MagicMock(success=True, report={'summary': 'ok'})
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(side_effect=RuntimeError('boom')),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=fake_cli_result),
+            ),
+            caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-swallow',
+            )
+
+        assert report is not None
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'briefing_refresh_hook_failed' in r.getMessage()
+        ]
+        assert len(warning_records) == 1
+
