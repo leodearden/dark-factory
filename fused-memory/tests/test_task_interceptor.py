@@ -4172,3 +4172,165 @@ async def test_dedupe_bulk_intra_batch_partial_failure_curator_drop_routes_to_re
         f'curator.curate received unexpected candidate titles {curate_call_titles!r}; '
         f'routing-key mismatch: task 12 must reach curator with title "fix Foo"'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7/9: path-scope guard integration tests
+# ---------------------------------------------------------------------------
+# These tests verify that the DarkFactoryPathScopeViolation guard is wired
+# into submit_task (step-7) and add_subtask (step-9).
+# They FAIL until steps 8 and 10 wire the guard into task_interceptor.py.
+# ---------------------------------------------------------------------------
+
+
+async def _cancel_interceptor_workers(ti) -> None:
+    """Cancel any background ticket-worker tasks on *ti* and await them silently.
+
+    Used in test teardown so fixture cleanup (DB close) never races a live worker.
+    """
+    for t in list(ti._worker_tasks.values()):
+        if not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+
+
+class TestSubmitTaskGuardrail:
+    """Integration tests: path-scope guard wired into submit_task."""
+
+    @pytest.mark.asyncio
+    async def test_submit_task_rejects_dark_factory_paths_in_wrong_project(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """Filing a task referencing orchestrator/ under a non-dark-factory project
+        returns a DarkFactoryPathScopeViolation error and does NOT persist a ticket.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+            )
+        finally:
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        # Guard must return a structured error
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'Expected orchestrator/ in matched_paths: {result}'
+        )
+
+        # Ticket store must have zero rows (guard fires before persist)
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets in store, found {row[0]}'
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_task_allows_dark_factory_paths_in_dark_factory_project(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """Filing the same task content under /dark-factory is allowed (project_id
+        resolves to dark_factory and the guard no-ops).
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/dark-factory',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock referencing orchestrator/harness.py',
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected ticket id starting with tkt_, got: {result}'
+        )
+        assert 'error_type' not in result, (
+            f'Should not have error_type for correctly-filed task: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_task_allows_clean_task_in_other_project(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """A task with no dark-factory paths in a non-dark-factory project proceeds
+        normally (returns a ticket id).
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Clean task',
+                description='Generic refactor of foo/bar.py',
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected ticket id starting with tkt_, got: {result}'
+        )
+        assert 'error_type' not in result
+
+
+class TestAddSubtaskGuardrail:
+    """Integration tests: path-scope guard wired into add_subtask."""
+
+    @pytest.mark.asyncio
+    async def test_add_subtask_rejects_dark_factory_paths_in_wrong_project(
+        self, interceptor, taskmaster,
+    ):
+        """add_subtask referencing fused-memory/ under a non-dark-factory project
+        returns a DarkFactoryPathScopeViolation error and does NOT call taskmaster.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            title='Edit fused-memory/src/fused_memory/middleware/task_curator.py',
+            description='Fix drop logic',
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
+        )
+        assert 'fused-memory/' in result.get('matched_paths', []) or \
+               'fused_memory/' in result.get('matched_paths', []), (
+            f'Expected fused-memory/ or fused_memory/ in matched_paths: {result}'
+        )
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_subtask.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_subtask_allows_dark_factory_paths_in_dark_factory_project(
+        self, interceptor, taskmaster,
+    ):
+        """add_subtask with dark-factory paths filed under /dark-factory proceeds
+        normally (project_id resolves to dark_factory and the guard no-ops).
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/dark-factory',
+            title='Edit fused-memory/src/fused_memory/middleware/task_curator.py',
+            description='Fix drop logic',
+        )
+
+        # Should return the taskmaster mock's add_subtask result
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, (
+            f'Should not have error_type for correctly-filed task: {result}'
+        )
+        # taskmaster.add_subtask should eventually be called (after curator)
+        # We don't assert exact call count here since the curator may drop/combine.
