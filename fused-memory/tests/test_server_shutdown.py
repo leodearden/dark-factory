@@ -490,3 +490,46 @@ class TestShutdownWithWatchdog:
             )
         finally:
             main_mod._cancel_force_exit()
+
+    @pytest.mark.asyncio
+    async def test_forwards_all_kwargs_to_graceful_shutdown(self):
+        """_shutdown_with_watchdog must forward all six kwargs to _graceful_shutdown unchanged.
+
+        Especially important for the optional event_queue and sqlite_watchdog args — if
+        either is dropped the production shutdown skips flushing the bounded write queue
+        or cancelling the SQLite watchdog.
+        """
+        import fused_memory.server.main as main_mod
+
+        main_mod._cancel_force_exit()
+
+        memory_service = MagicMock(close=AsyncMock())
+        task_interceptor = MagicMock(drain=AsyncMock(), close=AsyncMock())
+        recon_journal = MagicMock(close=AsyncMock())
+        event_queue = MagicMock(close=AsyncMock())
+        sqlite_watchdog = MagicMock(close=AsyncMock())
+
+        captured: dict = {}
+
+        async def _spy(**kwargs):  # type: ignore[override]
+            captured.update(kwargs)
+
+        try:
+            with patch.object(main_mod, '_graceful_shutdown', _spy):
+                await main_mod._shutdown_with_watchdog(
+                    memory_service=memory_service,
+                    task_interceptor=task_interceptor,
+                    harness_loop_task=None,
+                    recon_journal=recon_journal,
+                    event_queue=event_queue,
+                    sqlite_watchdog=sqlite_watchdog,
+                )
+
+            assert captured.get('memory_service') is memory_service
+            assert captured.get('task_interceptor') is task_interceptor
+            assert captured.get('harness_loop_task') is None
+            assert captured.get('recon_journal') is recon_journal
+            assert captured.get('event_queue') is event_queue
+            assert captured.get('sqlite_watchdog') is sqlite_watchdog
+        finally:
+            main_mod._cancel_force_exit()
