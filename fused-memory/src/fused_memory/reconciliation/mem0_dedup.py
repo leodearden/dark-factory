@@ -24,7 +24,7 @@ async def find_prior_memory(
     *,
     project_id: str,
     task_id: str | int,
-    kind: dict[str, str],
+    kind: dict[str, Any],
     query: str,
     categories: list[str] | None = None,
     limit: int = 50,
@@ -42,7 +42,8 @@ async def find_prior_memory(
         project_id: Project scope passed to ``memory_service.search``.
         task_id: Task identifier; compared symmetrically as ``str`` on both sides.
         kind: Extra metadata-equality filters (e.g. ``{'transition': 'done'}``).
-              All values are str-coerced; ALL keys must match (AND semantics).
+              Values may be any type — they are str-coerced on both sides of
+              comparison.  ALL keys must match (AND semantics).
         query: Embedding query string forwarded to ``memory_service.search``.
         categories: Optional category list forwarded to ``memory_service.search``
                     to constrain the corpus before similarity ranking.

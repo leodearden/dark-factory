@@ -3718,7 +3718,12 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
     async def test_skip_on_prior_match(
         self, journal, event_buffer, mock_memory_service, caplog
     ):
-        """When a prior done-summary exists in Mem0, the deferred write is skipped."""
+        """When a prior done-summary exists in Mem0, the deferred write is skipped.
+
+        Integration test: asserts the harness wires through find_prior_memory correctly
+        — a matching prior causes the write to be skipped and the row deleted.
+        Coercion and kwargs-forwarding contracts are covered in test_mem0_dedup.py.
+        """
         from unittest.mock import MagicMock
 
         prior_result = MagicMock()
@@ -3920,85 +3925,4 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
         assert warn_records, (
             f'Expected a WARNING log mentioning task 777 but got: '
             f'{[r.message for r in caplog.records]}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_dedup_matches_int_task_id_in_prior_metadata(
-        self, journal, event_buffer, mock_memory_service
-    ):
-        """Prior memory with int task_id=517 must match a deferred write with str task_id='517'.
-
-        Regression test for Fix 1: asymmetric coercion bug where
-        `r.metadata.get('task_id') == str(tid)` compared int 517 to str '517'
-        and returned False, causing the dedup check to miss an existing prior.
-        After the fix, both sides are coerced: `str(r.metadata.get('task_id', '')) == str(tid)`.
-        """
-        from unittest.mock import MagicMock
-
-        prior_result = MagicMock()
-        prior_result.metadata = {
-            'task_id': 517,            # int — as stored when task_id was written as int
-            'transition': 'done',
-            'source': 'targeted_reconciliation',
-        }
-        mock_memory_service.search = AsyncMock(return_value=[prior_result])
-
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-        await event_buffer.defer_write(
-            'test-project',
-            "Task 'Y' completed.",
-            'observations_and_summaries',
-            {
-                'task_id': '517',      # str — as stored when task_id arrives as str
-                'transition': 'done',
-                'source': 'targeted_reconciliation',
-                '_deferred': True,
-            },
-        )
-
-        await harness._replay_deferred_writes('test-project')
-
-        # (a) add_memory must NOT be called — int/str mismatch should not cause a miss
-        mock_memory_service.add_memory.assert_not_called()
-
-        # (b) the row was deleted from event_buffer
-        await event_buffer.release_stale_claims(0.0)
-        remaining = await event_buffer.claim_deferred_writes('test-project')
-        assert len(remaining) == 0, (
-            f'Expected no remaining rows but got {len(remaining)} — '
-            f'likely the int task_id was not matched by str coercion'
-        )
-
-    @pytest.mark.asyncio
-    async def test_dedup_search_passes_categories_filter(
-        self, journal, event_buffer, mock_memory_service
-    ):
-        """The dedup search must pass categories=['observations_and_summaries'] to Mem0.
-
-        Regression test for Fix 2: harness was missing the categories kwarg on
-        memory.search, which causes false-negatives via embedding-rank bias when
-        the corpus is large (markers ranked outside the limit bypass the filter).
-        After the fix, categories constrains the corpus before similarity ranking.
-        """
-        # Return empty list so the write falls through (this test is about the search call)
-        mock_memory_service.search = AsyncMock(return_value=[])
-
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-        await event_buffer.defer_write(
-            'test-project',
-            'Task 888 completed.',
-            'observations_and_summaries',
-            {'task_id': '888', 'transition': 'done'},
-        )
-
-        await harness._replay_deferred_writes('test-project')
-
-        # The search must have been called with categories=['observations_and_summaries']
-        mock_memory_service.search.assert_called_once()
-        call_kwargs = mock_memory_service.search.call_args.kwargs
-        assert call_kwargs.get('categories') == ['observations_and_summaries'], (
-            f"Expected search to be called with categories=['observations_and_summaries'] "
-            f"but got categories={call_kwargs.get('categories')!r}"
         )

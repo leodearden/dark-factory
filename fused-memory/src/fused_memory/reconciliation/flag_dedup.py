@@ -102,6 +102,15 @@ async def dedup_flags(
             # Novel flag (or search failed) — write a new marker for future
             # dedup cycles.  _source='stage1_flag_dedup' distinguishes these
             # from 'targeted_recon' writes in the audit journal.
+            #
+            # Marker-growth caveat: when find_prior_memory returns None due to
+            # a search failure (transient Mem0 outage) rather than a genuine
+            # miss, this branch still writes a new marker.  During a sustained
+            # outage every cycle will write a marker for recurring flags,
+            # causing monotonic marker-table growth beyond the normal one-row-
+            # per-(task_id, flag_type) bound.  Bounded growth therefore depends
+            # on Mem0 search availability; long outages may require manual
+            # deduplication of the marker table after recovery.
             try:
                 await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
