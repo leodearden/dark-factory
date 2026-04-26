@@ -722,12 +722,7 @@ class GitOps:
             return None
 
         # Branch is gone — search main for a merge commit with the expected subject.
-        # _merge_subject is the single source of truth shared with merge_to_main and
-        # advance_main, so writer and reader always use the same format.
-        # --fixed-strings avoids BRE metacharacter interpretation (e.g. dots in
-        # branch names would otherwise be wildcards).  The full subject pattern
-        # 'Merge task/1 into main' cannot appear inside 'Merge task/10 into main'
-        # because the '0' after 'task/1' falls where the pattern has a space.
+        # Pattern derivation shared with merge_to_main — see docstring for substring-safety argument.
         grep_pattern = _merge_subject(branch, self.config.main_branch)
         rc, out, _ = await _run(
             [

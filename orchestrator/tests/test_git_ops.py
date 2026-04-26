@@ -2741,35 +2741,20 @@ class TestFindMergeMarker:
 
 @pytest.mark.asyncio
 class TestMergeSubjectContract:
-    """Contract test: both merge_to_main and find_merge_marker route through
-    _merge_subject.
+    """End-to-end contract: the merge subject written to main by merge_to_main
+    equals _merge_subject output, and find_merge_marker locates that commit.
 
-    Uses a monkeypatch spy on the module global so any future drive-by
-    refactor that reverts either call site to an inline f-string is caught
-    immediately (the spy call count assertion fails).
-
-    RED before step-4: neither call site invokes _merge_subject yet
-    (both use inline f-strings), so the '>= 2 calls' assertion fails.
-    GREEN after step-4: both call sites route through the helper.
+    If either the writer or reader drifts from _merge_subject (e.g. an inline
+    f-string replaces the helper call with a different format), at least one of
+    the two roundtrip assertions will fail.
     """
 
-    async def test_both_callsites_use_merge_subject_helper(
-        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch
+    async def test_merge_subject_roundtrip(
+        self, git_ops: GitOps
     ) -> None:
-        """Spy on _merge_subject; assert merge_to_main and find_merge_marker
-        both call it with (full_branch, main_branch).
+        """Assert the on-main subject equals _merge_subject output and that
+        find_merge_marker returns the same SHA.
         """
-        import orchestrator.git_ops as _module  # module ref for setattr
-
-        calls: list[tuple[str, str]] = []
-        original = _merge_subject
-
-        def _spy(branch: str, main_branch: str) -> str:
-            calls.append((branch, main_branch))
-            return original(branch, main_branch)
-
-        monkeypatch.setattr(_module, '_merge_subject', _spy)
-
         tid = 'contract-1'
         full_branch = f'task/{tid}'
 
@@ -2794,24 +2779,11 @@ class TestMergeSubjectContract:
             ['git', 'log', '--format=%s', '-n', '1', result.merge_commit],
             cwd=git_ops.project_root,
         )
-        assert subject == original(full_branch, git_ops.config.main_branch)
+        assert subject == _merge_subject(full_branch, git_ops.config.main_branch)
 
-        # find_merge_marker must find the merge commit
+        # find_merge_marker must locate the same commit
         marker_sha = await git_ops.find_merge_marker(full_branch)
         assert marker_sha == result.merge_commit
-
-        # Contract: _merge_subject must be called at least twice total —
-        # once by merge_to_main (writes the subject) and once by find_merge_marker
-        # (builds the grep pattern).
-        target_calls = [
-            c for c in calls
-            if c == (full_branch, git_ops.config.main_branch)
-        ]
-        assert len(target_calls) >= 2, (
-            f'Expected _merge_subject called ≥2 times with '
-            f'({full_branch!r}, {git_ops.config.main_branch!r}), '
-            f'got calls: {calls!r}'
-        )
 
 
 class TestMergeSubject:
