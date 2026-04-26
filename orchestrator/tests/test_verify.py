@@ -1932,6 +1932,143 @@ class TestVerifyResultCategoryAndPaths:
         )
 
 
+class TestPersistAttemptLogs:
+    """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)``.
+
+    Tests fail until step 8 implements the helper.
+    """
+
+    def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
+        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(
+            _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)
+        ) if asyncio.iscoroutinefunction(_persist_attempt_logs) else _persist_attempt_logs(
+            worktree, attempt_id, runs, category, cause_hint
+        )
+
+    def _make_runs(self):
+        """Return a list of fake per-command run dicts for test+lint+type."""
+        return [
+            {
+                'label': 'test',
+                'cmd': 'cargo test --workspace',
+                'rc': 1,
+                'output': 'error: --exclude can only be used together with --workspace\nLine2\n',
+                'timed_out': False,
+                'started_at': '2026-04-26T12:00:00+00:00',
+                'duration_secs': 5.1,
+            },
+            {
+                'label': 'lint',
+                'cmd': 'ruff check src/',
+                'rc': 0,
+                'output': '',
+                'timed_out': False,
+                'started_at': '2026-04-26T12:00:05+00:00',
+                'duration_secs': 1.2,
+            },
+            {
+                'label': 'type',
+                'cmd': 'mypy src/',
+                'rc': 0,
+                'output': '',
+                'timed_out': False,
+                'started_at': '2026-04-26T12:00:06+00:00',
+                'duration_secs': 0.8,
+            },
+        ]
+
+    # (a-c) basic write: three log files + summary.json created
+    def test_writes_log_files_and_summary(self, tmp_path: Path):
+        """Log files and summary.json are created under .task/verify/."""
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        paths = self._persist(tmp_path, attempt_id=1, runs=runs)
+
+        verify_dir = tmp_path / '.task' / 'verify'
+        test_log = verify_dir / 'attempt-1.test.log'
+        lint_log = verify_dir / 'attempt-1.lint.log'
+        type_log = verify_dir / 'attempt-1.type.log'
+        summary = verify_dir / 'attempt-1.summary.json'
+
+        assert test_log.exists(), f'test log missing: {test_log}'
+        assert test_log.read_text() == runs[0]['output']
+        # lint and type have empty output but cmd is set → files created
+        assert lint_log.exists(), 'lint log missing'
+        assert type_log.exists(), 'type log missing'
+        assert summary.exists(), 'summary.json missing'
+
+    # (d) summary.json contains required keys
+    def test_summary_json_has_required_keys(self, tmp_path: Path):
+        """summary.json has category, cause_hint, rc, timed_out, cmd, started_at, duration_secs, commands."""
+        import json
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        self._persist(tmp_path, attempt_id=1, runs=runs, category='cargo_cli_error', cause_hint='error: bad')
+        summary_path = tmp_path / '.task' / 'verify' / 'attempt-1.summary.json'
+        data = json.loads(summary_path.read_text())
+        for key in ('category', 'cause_hint', 'rc', 'timed_out', 'cmd', 'started_at', 'duration_secs', 'commands'):
+            assert key in data, f'Missing key {key!r} in summary: {data}'
+        assert data['category'] == 'cargo_cli_error'
+        assert data['cause_hint'] == 'error: bad'
+        assert isinstance(data['commands'], list)
+        assert len(data['commands']) >= 1
+
+    # (e) returned list contains the written log paths
+    def test_returns_written_log_paths(self, tmp_path: Path):
+        """Return value lists exactly the written log paths in test/lint/type order."""
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        paths = self._persist(tmp_path, attempt_id=1, runs=runs)
+        verify_dir = tmp_path / '.task' / 'verify'
+        # All three cmd-based logs should be in the returned list
+        path_strs = [str(p) for p in paths]
+        assert str(verify_dir / 'attempt-1.test.log') in path_strs
+        assert str(verify_dir / 'attempt-1.lint.log') in path_strs
+        assert str(verify_dir / 'attempt-1.type.log') in path_strs
+
+    # non-clobber: attempt-1 and attempt-2 files coexist
+    def test_non_clobbering_multiple_attempts(self, tmp_path: Path):
+        """Different attempt_ids produce separate files that coexist."""
+        (tmp_path / '.task').mkdir()
+        runs = self._make_runs()
+        self._persist(tmp_path, attempt_id=1, runs=runs)
+        self._persist(tmp_path, attempt_id=2, runs=runs)
+        verify_dir = tmp_path / '.task' / 'verify'
+        assert (verify_dir / 'attempt-1.test.log').exists()
+        assert (verify_dir / 'attempt-2.test.log').exists()
+
+    # no-op: when .task/ is absent, returns empty list and no files created
+    def test_noop_when_task_dir_absent(self, tmp_path: Path):
+        """When .task/ does not exist, returns [] and creates no files."""
+        runs = self._make_runs()
+        paths = self._persist(tmp_path, attempt_id=1, runs=runs)
+        assert paths == [] or paths == [], f'Expected empty list, got {paths!r}'
+        assert not (tmp_path / '.task').exists(), '.task/ should not have been created'
+
+    # skipped cmd (None) does not produce a log file
+    def test_none_cmd_run_skipped(self, tmp_path: Path):
+        """A run with cmd=None produces no log file."""
+        (tmp_path / '.task').mkdir()
+        runs = [
+            {
+                'label': 'test',
+                'cmd': None,
+                'rc': 0,
+                'output': '',
+                'timed_out': False,
+                'started_at': '2026-04-26T12:00:00+00:00',
+                'duration_secs': 0.0,
+            }
+        ]
+        self._persist(tmp_path, attempt_id=1, runs=runs)
+        verify_dir = tmp_path / '.task' / 'verify'
+        # No .log files (only summary.json may exist)
+        log_files = list(verify_dir.glob('*.log'))
+        assert log_files == [], f'Expected no log files, got {log_files}'
+
+
 class TestShouldArchiveCategory:
     """Tests for ``_should_archive_category(category: str) -> bool``.
 
