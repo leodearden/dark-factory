@@ -1017,6 +1017,79 @@ class TestReconcileStrandedInProgress:
 
         spy.assert_awaited_once_with('90', expected_provenance, expected_reason)
 
+    # -----------------------------------------------------------------------
+    # Side-effect symmetry regression test
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        'scenario,is_ancestor_val,marker_sha_val,expected_provenance',
+        [
+            pytest.param(
+                'is_ancestor',
+                True,
+                None,
+                {
+                    'note': 'reconcile: branch already on main when stranded in-progress',
+                    'commit': 'deadbeef' + 'a' * 32,
+                },
+                id='is_ancestor-branch',
+            ),
+            pytest.param(
+                'marker',
+                False,
+                'cafebabe' + 'd' * 32,
+                {
+                    'note': 'reconcile: branch deleted but merge marker found on main',
+                    'commit': 'cafebabe' + 'd' * 32,
+                },
+                id='marker-branch',
+            ),
+        ],
+    )
+    async def test_done_branches_share_identical_side_effects(
+        self,
+        harness: Harness,
+        tmp_path: Path,
+        scenario: str,
+        is_ancestor_val: bool,
+        marker_sha_val: str | None,
+        expected_provenance: dict,
+    ):
+        """Symmetry regression lock: both done-branches produce identical
+        observable side effects — pop, cleanup, set_task_status('done',
+        provenance).  Any future asymmetric drift between the two branches
+        will fail loudly here.
+        """
+        tid = '95'
+        harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        # Seed a recovered plan entry — helper must pop it.
+        harness._recovered_plans[tid] = {'task_id': tid, 'steps': []}  # type: ignore[attr-defined]
+
+        # Create worktree dir — helper must attempt cleanup.
+        worktree_path = harness.git_ops.worktree_base / tid
+        worktree_path.mkdir(parents=True)
+
+        await harness._reconcile_stranded_in_progress()
+
+        # 1. Recovered plan must be gone.
+        assert tid not in harness._recovered_plans  # type: ignore[attr-defined]
+
+        # 2. cleanup_worktree must have been called exactly once.
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            worktree_path, tid
+        )
+
+        # 3. set_task_status must be called with 'done' and the expected provenance.
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done', done_provenance=expected_provenance
+        )
+
+        # 4. Worktree dir must have been removed by the cleanup side-effect.
+        assert not worktree_path.exists()
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
