@@ -3418,6 +3418,147 @@ class TestBriefingKnownGapsRefresh:
         ]
         assert len(warning_records) == 1
 
+    # ------------------------------------------------------------------ #
+    # _run_briefing_known_gaps_script — timeout path                        #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_on_timeout(self, tmp_path, caplog):
+        """asyncio.wait_for raises TimeoutError → proc.kill() called, returns None, WARN emitted."""
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        review_dir = tmp_path / 'review'
+        review_dir.mkdir()
+        (review_dir / 'briefing.yaml').touch()
+
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        mock_proc.kill.assert_called_once()
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        assert 'briefing_known_gaps_script_timeout' in warning_records[0].getMessage()
+
+    # ------------------------------------------------------------------ #
+    # _run_briefing_known_gaps_script — bad JSON path                       #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_run_script_returns_none_on_bad_json(self, tmp_path, caplog):
+        """Subprocess returns non-JSON stdout → returns None, WARN carries error key."""
+        script_dir = tmp_path / 'scripts'
+        script_dir.mkdir()
+        (script_dir / 'refresh_briefing_known_gaps.py').touch()
+        review_dir = tmp_path / 'review'
+        review_dir.mkdir()
+        (review_dir / 'briefing.yaml').touch()
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1  # "mismatches found" exit code
+        mock_proc.communicate = AsyncMock(return_value=(b'not valid json {', b''))
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _run_briefing_known_gaps_script(str(tmp_path))
+
+        assert result is None
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        assert 'briefing_known_gaps_script_bad_json' in warning_records[0].getMessage()
+        # The WARN's extra must carry an 'error' key with a string from JSONDecodeError
+        assert isinstance(getattr(warning_records[0], 'error', None), str)
+
+    # ------------------------------------------------------------------ #
+    # _queue_briefing_refresh_tasks — exception path                        #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_appends_failed_when_add_task_raises(self, caplog):
+        """add_task raises → task_id in failed (not created), WARN emitted."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.add_task.side_effect = RuntimeError('mcp transport dead')
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        assert result['failed'] == ['1751']
+        assert result['created'] == []
+        assert result['skipped'] == []
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        assert 'briefing_refresh_add_task_failed' in warning_records[0].getMessage()
+        assert getattr(warning_records[0], 'task_id', None) == '1751'
+
+    # ------------------------------------------------------------------ #
+    # _queue_briefing_refresh_tasks — unexpected-shape (contract-drift)     #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'bogus_result',
+        [None, {'message': 'no id field'}, 'string-not-dict'],
+        ids=['none', 'dict_without_id', 'non_dict'],
+    )
+    async def test_queue_refresh_tasks_treats_unexpected_shape_as_failure(
+        self, bogus_result, caplog,
+    ):
+        """add_task returns wrong shape → task_id in failed (NOT created), WARN with new key."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.add_task.return_value = bogus_result
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        assert result['created'] == [], (
+            f'created should be [] when add_task returns {bogus_result!r}, got {result["created"]!r}'
+        )
+        assert result['failed'] == ['1751'], (
+            f'failed should be [\"1751\"] when add_task returns {bogus_result!r}'
+        )
+        assert result['skipped'] == []
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        assert 'briefing_refresh_add_task_unexpected_shape' in warning_records[0].getMessage()
+        assert getattr(warning_records[0], 'task_id', None) == '1751'
+
 
 # ---------------------------------------------------------------------------
 # MemoryConsolidator.run() dedup hook tests (step-11)
