@@ -8,3 +8,11 @@ def test_stage2_prompt_documents_no_op_response_shape():
         "STAGE2_SYSTEM_PROMPT must instruct agents to treat `no_op: True` "
         "set_task_status responses as successful no-ops, not discrepancies."
     )
+
+
+def test_stage2_prompt_documents_multi_id_response_shape():
+    assert 'results[i].result' in STAGE2_SYSTEM_PROMPT, (
+        "STAGE2_SYSTEM_PROMPT must document the multi-id `set_task_status` response shape — "
+        "when `task_id` is comma-separated, per-task `tasks[*].newStatus` lives under "
+        "`results[i].result` (see middleware/task_interceptor.py:400-417)."
+    )
