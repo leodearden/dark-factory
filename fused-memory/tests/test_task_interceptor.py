@@ -4293,6 +4293,42 @@ class TestSubmitTaskGuardrail:
         )
         assert 'error_type' not in result
 
+    @pytest.mark.asyncio
+    async def test_submit_task_rejects_prompt_only_dark_factory_paths_in_wrong_project(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """A prompt-only submit_task (no title) referencing orchestrator/ under a
+        non-dark-factory project returns a DarkFactoryPathScopeViolation error,
+        persists no ticket, and never calls taskmaster.add_task.
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                prompt='Edit orchestrator/harness.py for the deadlock',
+                # Deliberately NO title kwarg — this is the prompt-only path
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        # Guard must return a structured error
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'Expected orchestrator/ in matched_paths: {result}'
+        )
+
+        # Ticket store must have zero rows (guard fires before persist)
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets in store, found {row[0]}'
+
+        # Taskmaster backend must never have been called
+        taskmaster.add_task.assert_not_called()
+
 
 class TestAddSubtaskGuardrail:
     """Integration tests: path-scope guard wired into add_subtask."""
