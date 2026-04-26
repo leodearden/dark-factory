@@ -815,6 +815,32 @@ class TestDeleteDead:
         assert envelope_deleted.isdisjoint(envelope_remaining)
         assert envelope_deleted | envelope_remaining == set(dead_ids)
 
+    @pytest.mark.asyncio
+    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, monkeypatch):
+        """Duplicate ids in the input must never appear in both deleted and not_found.
+
+        When batch_size=1 a list like [id1, id1] forces two separate chunks.
+        Chunk 1 physically deletes the row and adds id1 to deleted.
+        Chunk 2 finds nothing (row is gone) so without the fix id1 falls into
+        not_found_completed — violating the disjointness guarantee.
+
+        Regression test for the overlap bug fixed by subtracting `deleted` from
+        `not_found_completed` immediately before returning.
+        """
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 1)
+
+        id1 = await self._insert_dead_row(queue, 'proj1')
+
+        result = await queue.delete_dead(group_id='proj1', ids=[id1, id1])
+
+        # Disjointness invariant: id1 must appear in exactly one bucket.
+        assert set(result['deleted']).isdisjoint(set(result['not_found'])), (
+            'deleted and not_found buckets must be disjoint — same id cannot appear in both'
+        )
+        # id1 was a real dead row, so it must land in deleted.
+        assert result['deleted'] == [id1]
+        assert result['not_found'] == []
+
 
 class TestStats:
     @pytest.mark.asyncio
