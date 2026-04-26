@@ -3969,3 +3969,36 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             f'Expected no remaining rows but got {len(remaining)} — '
             f'likely the int task_id was not matched by str coercion'
         )
+
+    @pytest.mark.asyncio
+    async def test_dedup_search_passes_categories_filter(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """The dedup search must pass categories=['observations_and_summaries'] to Mem0.
+
+        Regression test for Fix 2: harness was missing the categories kwarg on
+        memory.search, which causes false-negatives via embedding-rank bias when
+        the corpus is large (markers ranked outside the limit bypass the filter).
+        After the fix, categories constrains the corpus before similarity ranking.
+        """
+        # Return empty list so the write falls through (this test is about the search call)
+        mock_memory_service.search = AsyncMock(return_value=[])
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            'Task 888 completed.',
+            'observations_and_summaries',
+            {'task_id': '888', 'transition': 'done'},
+        )
+
+        await harness._replay_deferred_writes('test-project')
+
+        # The search must have been called with categories=['observations_and_summaries']
+        mock_memory_service.search.assert_called_once()
+        call_kwargs = mock_memory_service.search.call_args.kwargs
+        assert call_kwargs.get('categories') == ['observations_and_summaries'], (
+            f"Expected search to be called with categories=['observations_and_summaries'] "
+            f"but got categories={call_kwargs.get('categories')!r}"
+        )
