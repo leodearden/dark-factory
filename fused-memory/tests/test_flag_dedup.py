@@ -110,6 +110,27 @@ def _make_memory_result(metadata: dict) -> MagicMock:
     return r
 
 
+def _assert_valid_stage1_marker(
+    call_kwargs: dict,
+    *,
+    task_id: str,
+    flag_type: str,
+    run_id: str,
+) -> None:
+    """Assert that an add_memory call_kwargs encodes a well-formed stage1_flag_marker.
+
+    Centralises the marker-shape contract so that a schema change only needs to
+    be updated here rather than in every test that writes or inspects a marker.
+    """
+    assert call_kwargs.get('category') == 'observations_and_summaries'
+    meta = call_kwargs.get('metadata', {})
+    assert meta.get('source') == 'stage1_flag_marker'
+    assert meta.get('task_id') == task_id
+    assert meta.get('flag_type') == flag_type
+    assert meta.get('run_id') == run_id
+    assert meta.get('last_seen_run_id') == run_id
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id
@@ -206,13 +227,10 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
 
     # No-prior-marker write path exercised: a new marker is written
     memory_service.add_memory.assert_called_once()
-    add_kwargs = memory_service.add_memory.call_args.kwargs
-    meta = add_kwargs.get('metadata', {})
-    assert meta.get('source') == 'stage1_flag_marker'
-    assert meta.get('task_id') == '42'
-    assert meta.get('flag_type') == 'missing_deliverable'
-    assert meta.get('run_id') == 'r1'
-    assert meta.get('last_seen_run_id') == 'r1'
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args.kwargs,
+        task_id='42', flag_type='missing_deliverable', run_id='r1',
+    )
 
     # Exactly one search per flag
     memory_service.search.assert_called_once()
@@ -249,14 +267,10 @@ async def test_dedup_flags_no_prior_marker_writes_new_marker():
 
     # (b) add_memory called exactly once with the expected marker metadata
     memory_service.add_memory.assert_called_once()
-    add_call_kwargs = memory_service.add_memory.call_args.kwargs
-    assert add_call_kwargs.get('category') == 'observations_and_summaries'
-    meta = add_call_kwargs.get('metadata', {})
-    assert meta.get('source') == 'stage1_flag_marker'
-    assert meta.get('task_id') == '99'
-    assert meta.get('flag_type') == 'stale_metadata'
-    assert meta.get('run_id') == 'r1'
-    assert meta.get('last_seen_run_id') == 'r1'
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args.kwargs,
+        task_id='99', flag_type='stale_metadata', run_id='r1',
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +282,19 @@ async def test_dedup_flags_no_prior_marker_writes_new_marker():
 async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
     """When memory_service.search raises, dedup_flags does not raise, returns flags unchanged,
     and logs a WARNING.
+
+    Also pins the post-refactor marker-growth behavior: when search fails,
+    find_prior_memory swallows the exception and returns None, so dedup_flags
+    falls into the else-branch and writes one new marker per flag (was: zero in
+    the prior wrap-both pattern where both search and add_memory shared a single
+    try/except).  See the marker-growth caveat comment in the else-branch of
+    dedup_flags for details on monotonic marker growth during a sustained outage.
+
+    Two flags are passed so the 'one write per flag' contract is verified, not
+    merely 'exactly one write ever'.  The assertions (d) and (e) below lock down
+    this contract so a future refactor cannot silently flip the count in either
+    direction (zero if the wrap-both pattern is restored, or >N if an extra
+    refresh write is added per flag).
     """
     import logging
 
@@ -277,7 +304,10 @@ async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
     memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
     memory_service.add_memory = AsyncMock(return_value=None)
 
-    flags = [{'task_id': '55', 'flag_type': 'stale_metadata', 'description': 'test'}]
+    flags = [
+        {'task_id': '55', 'flag_type': 'stale_metadata', 'description': 'test'},
+        {'task_id': '66', 'flag_type': 'missing_deliverable', 'description': 'test2'},
+    ]
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
         result = await dedup_flags(
@@ -288,13 +318,26 @@ async def test_dedup_flags_search_exception_does_not_raise_and_warns(caplog):
         )
 
     # (a) Does NOT raise
-    # (b) Returns flag unchanged (no persisted_from_run)
-    assert len(result) == 1
+    # (b) Returns both flags unchanged (no persisted_from_run)
+    assert len(result) == 2
     assert 'persisted_from_run' not in result[0]
-    # (c) WARNING log mentions the failure and task_id
-    assert any(
-        '55' in record.message and record.levelno >= logging.WARNING
-        for record in caplog.records
+    assert 'persisted_from_run' not in result[1]
+    # (c) WARNING log mentions the failure for both task_ids
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('55' in m for m in warning_messages)
+    assert any('66' in m for m in warning_messages)
+    # (d) Exactly one marker write per flag when search fails — verifies the 'per flag'
+    #     contract (two flags → two writes).  Catches: zero writes (wrap-both try/except
+    #     restored) or multiple writes per flag (extra refresh write added).
+    assert memory_service.add_memory.call_count == 2
+    # (e) Each marker is correctly shaped on the failure path.
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args_list[0].kwargs,
+        task_id='55', flag_type='stale_metadata', run_id='r1',
+    )
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args_list[1].kwargs,
+        task_id='66', flag_type='missing_deliverable', run_id='r1',
     )
 
 
