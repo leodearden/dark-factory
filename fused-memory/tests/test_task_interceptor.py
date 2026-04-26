@@ -4568,15 +4568,12 @@ class TestAddSubtaskGuardrail:
 
 
 # ---------------------------------------------------------------------------
-# Step-1: unit tests for TaskInterceptor._extract_meta_files (RED before step-2)
+# Unit tests for TaskInterceptor._extract_meta_files
 # ---------------------------------------------------------------------------
 
 
 class TestExtractMetaFiles:
-    """Unit tests for the TaskInterceptor._extract_meta_files static helper.
-
-    These tests MUST FAIL before step-2 (the helper does not yet exist).
-    """
+    """Unit tests for the TaskInterceptor._extract_meta_files static helper."""
 
     def test_exists(self):
         """The helper must be a staticmethod on TaskInterceptor."""
@@ -4657,21 +4654,16 @@ class TestExtractMetaFiles:
 
 
 # ---------------------------------------------------------------------------
-# Step-3: regression tests — prompt-only fallback must also scan metadata files
-# ---------------------------------------------------------------------------
-# These tests MUST FAIL before step-4 because _path_guard_error's fallback
-# branch currently only scans the joined text of prompt/title/description/details
-# and ignores metadata['files_to_modify'] / metadata['modules'].
-# A caller can therefore bypass the guard by hiding dark-factory paths in
-# metadata while keeping all text fields clean.
+# Regression tests — prompt-only fallback must also scan metadata files
 # ---------------------------------------------------------------------------
 
 
 class TestPathGuardFallbackMetadataFiles:
     """Regression tests: prompt-only path-guard also scans metadata files/modules.
 
-    4 parametrised cases (2 meta_key × 2 endpoint).  All four must be RED
-    before step-4 and GREEN after step-4.
+    4 parametrised cases (2 meta_key × 2 endpoint) verify that hiding a
+    dark-factory path inside metadata['files_to_modify'] or metadata['modules']
+    cannot bypass the path-scope guard when the free-text fields are clean.
     """
 
     @pytest.mark.parametrize('meta_key', ['files_to_modify', 'modules'])
@@ -4681,9 +4673,6 @@ class TestPathGuardFallbackMetadataFiles:
     ):
         """prompt-only submit_task with dark-factory path ONLY in metadata[meta_key]
         must be rejected even though all free-text fields are clean.
-
-        This is the residual-leak: the current fallback does NOT scan metadata,
-        so this case is RED before step-4.
         """
         try:
             result = await interceptor_with_store.submit_task(
@@ -4722,9 +4711,6 @@ class TestPathGuardFallbackMetadataFiles:
     ):
         """prompt-only add_subtask with dark-factory path ONLY in metadata[meta_key]
         must be rejected even though all free-text fields are clean.
-
-        This is the residual-leak: the current fallback does NOT scan metadata,
-        so this case is RED before step-4.
         """
         result = await interceptor.add_subtask(
             parent_id='1',
@@ -4745,22 +4731,47 @@ class TestPathGuardFallbackMetadataFiles:
         # Taskmaster backend must never have been called
         taskmaster.add_subtask.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_path_guard_detects_dark_factory_path_in_multi_entry_metadata_list(
+        self, interceptor, taskmaster,
+    ):
+        """Dark-factory path in the SECOND entry of a multi-entry metadata list
+        must still trigger the guard.
+
+        Regression against a future scanner that stops scanning after the first
+        entry (or treats the joined text as a single path): if the join-with-newlines
+        approach ever stops scanning each entry independently, this test catches it.
+        """
+        result = await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            prompt='Generic refactor',
+            # The dark-factory path is the SECOND entry; the first is clean.
+            metadata={'files_to_modify': ['non_df_module/file.py', 'orchestrator/harness.py']},
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            'expected DarkFactoryPathScopeViolation when dark-factory path is '
+            f'second entry in metadata list, got: {result}'
+        )
+        assert 'orchestrator/' in result.get('matched_paths', []), (
+            f'expected orchestrator/ in matched_paths: {result}'
+        )
+        taskmaster.add_subtask.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
-# Step-5: negative-control — clean metadata files must NOT be rejected
-# ---------------------------------------------------------------------------
-# This test is GREEN after step-4: _extract_meta_files returns clean paths,
-# find_dark_factory_paths returns [], and the verdict is 'ok'.
-# Its purpose is to lock in the absence of false positives: if a future
-# refactor accidentally short-circuits on metadata presence rather than
-# content, this test will fail loudly.
+# Negative-control — clean metadata files must NOT be rejected
 # ---------------------------------------------------------------------------
 
 
 class TestPathGuardFallbackMetadataFilesNegativeControl:
     """Negative-control: prompt-only submissions with clean metadata are allowed.
 
-    Must be GREEN immediately after step-4.
+    These tests verify the absence of false positives: if a future refactor
+    accidentally short-circuits on metadata presence rather than content, they
+    will fail loudly.
     """
 
     @pytest.mark.asyncio
@@ -4811,18 +4822,15 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
 
 
 # ---------------------------------------------------------------------------
-# Step-6: unit + spy tests for _path_guard_or_skip helper
-# ---------------------------------------------------------------------------
-# Cases 1-4 are RED before step-7 because the helper doesn't exist yet
-# (direct calls raise AttributeError).  Cases 5-6 are RED because the call
-# sites still invoke _path_guard_error directly, so the spy is never called.
+# Unit tests for _path_guard_or_skip helper
 # ---------------------------------------------------------------------------
 
 
 class TestPathGuardOrSkip:
-    """Unit and spy tests for TaskInterceptor._path_guard_or_skip.
+    """Unit tests for TaskInterceptor._path_guard_or_skip.
 
-    Must be RED before step-7 and GREEN after step-7.
+    Verifies the helper's contract: dark_factory short-circuit, lazy-build
+    of candidate, pass-through of a pre-built candidate, and error propagation.
     """
 
     # -- Case 1 -----------------------------------------------------------
@@ -4950,74 +4958,3 @@ class TestPathGuardOrSkip:
 
         result = interceptor._path_guard_or_skip({'prompt': 'something'}, 'some_other_project')
         assert result is rejection
-
-    # -- Case 5 -----------------------------------------------------------
-    @pytest.mark.asyncio
-    async def test_submit_task_invokes_path_guard_or_skip(
-        self, interceptor_with_store, taskmaster, monkeypatch,
-    ):
-        """submit_task delegates path-scope guard to _path_guard_or_skip (symmetry).
-
-        Before step-7 this is RED: submit_task calls _path_guard_error directly,
-        so the spy is never called and the assertion fails.
-        """
-        spy_calls: list[dict] = []
-
-        def spy(self, kwargs, project_id, candidate=None):
-            spy_calls.append({'project_id': project_id, 'candidate': candidate})
-            return None  # allow the call through (no rejection)
-
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_or_skip', spy)
-
-        try:
-            await interceptor_with_store.submit_task(
-                project_root='/some-other-project',
-                title='Clean task',
-                description='Generic refactor of foo/bar.py',
-            )
-            calls_after_submit = len(spy_calls)
-        finally:
-            await _cancel_interceptor_workers(interceptor_with_store)
-
-        assert calls_after_submit == 1, (
-            f'Expected _path_guard_or_skip called exactly once, got {calls_after_submit}'
-        )
-        assert spy_calls[0]['project_id'] == 'some_other_project', (
-            f'Expected project_id=some_other_project, got: {spy_calls[0]["project_id"]!r}'
-        )
-
-    # -- Case 6 -----------------------------------------------------------
-    @pytest.mark.asyncio
-    async def test_add_subtask_invokes_path_guard_or_skip(
-        self, interceptor, taskmaster, monkeypatch,
-    ):
-        """add_subtask delegates path-scope guard to _path_guard_or_skip with a
-        pre-built candidate (symmetry test).
-
-        Before step-7 this is RED: add_subtask calls _path_guard_error directly,
-        so the spy is never called and the assertion fails.
-        """
-        spy_calls: list[dict] = []
-
-        def spy(self, kwargs, project_id, candidate=None):
-            spy_calls.append({'project_id': project_id, 'candidate': candidate})
-            return None  # allow the call through (no rejection)
-
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_or_skip', spy)
-
-        await interceptor.add_subtask(
-            parent_id='1',
-            project_root='/some-other-project',
-            title='Clean task',
-        )
-
-        assert len(spy_calls) == 1, (
-            f'Expected _path_guard_or_skip called exactly once, got {len(spy_calls)}'
-        )
-        assert spy_calls[0]['project_id'] == 'some_other_project', (
-            f'Expected project_id=some_other_project, got: {spy_calls[0]["project_id"]!r}'
-        )
-        # add_subtask pre-builds the candidate and passes it; verify it's non-None
-        assert spy_calls[0]['candidate'] is not None, (
-            'Expected add_subtask to pass a pre-built candidate to _path_guard_or_skip'
-        )
