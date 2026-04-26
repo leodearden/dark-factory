@@ -105,6 +105,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # Individual tests may override with AsyncMock(return_value=True).
     h.git_ops.is_ancestor = AsyncMock(return_value=False)
 
+    # Default: resolve_branch_sha returns a fixed SHA so tests that trigger the
+    # is_ancestor guard get a consistent commit in done_provenance.
+    # Individual tests may override with AsyncMock(return_value=None).
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' + 'a' * 32)
+
     return h
 
 
@@ -564,13 +569,15 @@ class TestReconcileStrandedInProgress:
         # is_ancestor must have been invoked with the configured branch + main_branch
         harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
 
-        # set_task_status must be called exactly once: ('50', 'done') with note kwarg
+        # set_task_status must be called exactly once: ('50', 'done') with commit + note
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             '50', 'done',
             done_provenance={
+                'commit': 'deadbeef' + 'a' * 32,
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
         )
+        harness.git_ops.resolve_branch_sha.assert_awaited_once_with('task/50')  # type: ignore[attr-defined]
 
         # cleanup_worktree must NOT have been called
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
@@ -607,10 +614,11 @@ class TestReconcileStrandedInProgress:
             worktree_path, tid
         )
 
-        # (3) Task must be marked done with the expected provenance
+        # (3) Task must be marked done with the expected provenance (commit + note)
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'done',
             done_provenance={
+                'commit': 'deadbeef' + 'a' * 32,
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
         )
@@ -656,6 +664,7 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             '51', 'done',
             done_provenance={
+                'commit': 'deadbeef' + 'a' * 32,
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
         )
@@ -672,6 +681,39 @@ class TestReconcileStrandedInProgress:
         assert not lock_path.exists(), (
             'plan.lock should be removed by cleanup_worktree in the is_ancestor guard'
         )
+
+    async def test_already_merged_provenance_omits_commit_when_branch_unresolved(
+        self, harness: Harness, caplog
+    ):
+        """Fallback: when resolve_branch_sha returns None (branch ref vanished after
+        is_ancestor check), done_provenance has only 'note' — no 'commit' key —
+        and a WARNING log is emitted containing the branch name and 'rev-parse'.
+        """
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'53': 'in-progress'}, None
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # Note-only provenance — NO 'commit' key
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '53', 'done',
+            done_provenance={
+                'note': 'reconcile: branch already on main when stranded in-progress',
+            },
+        )
+
+        # WARNING log must mention the branch name and 'rev-parse'
+        warning_messages = [
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'task/53' in msg and 'rev-parse' in msg
+            for msg in warning_messages
+        ), f'Expected WARNING with task/53 and rev-parse, got: {warning_messages}'
 
     async def test_is_ancestor_not_invoked_for_non_in_progress_tasks(
         self, harness: Harness
