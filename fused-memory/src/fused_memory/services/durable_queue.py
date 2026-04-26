@@ -494,10 +494,10 @@ class DurableWriteQueue:
                 # envelope covering all inputs so a full retry is safe.
                 try:
                     await self._db.commit()
-                except aiosqlite.OperationalError as commit_exc:
-                    logger.warning(
-                        'delete_dead: recovery commit failed after OperationalError: %s',
-                        commit_exc,
+                except aiosqlite.OperationalError:
+                    logger.exception(
+                        'delete_dead: recovery commit failed after OperationalError;'
+                        ' reporting full input as remaining',
                     )
                     return {
                         'error': str(exc),
@@ -519,7 +519,9 @@ class DurableWriteQueue:
                 (row[0] if isinstance(row, tuple) else row['id']) for row in rows
             }
             deleted |= chunk_deleted
-            not_found_completed |= set(chunk) - chunk_deleted
+            # Subtract `deleted` at point-of-update so the invariant holds
+            # throughout the loop — any future early-return path is safe.
+            not_found_completed |= (set(chunk) - chunk_deleted) - deleted
 
         await self._db.commit()
 

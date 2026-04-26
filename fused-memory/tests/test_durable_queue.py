@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from unittest.mock import AsyncMock
 
@@ -814,6 +815,86 @@ class TestDeleteDead:
         # (d) No overlap, full coverage.
         assert envelope_deleted.isdisjoint(envelope_remaining)
         assert envelope_deleted | envelope_remaining == set(dead_ids)
+
+    @pytest.mark.asyncio
+    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, monkeypatch):
+        """Duplicate ids in the input must never appear in both deleted and not_found.
+
+        When batch_size=1 a list like [id1, id1] forces two separate chunks.
+        Chunk 1 physically deletes the row and adds id1 to deleted.
+        Chunk 2 finds nothing (row is gone) so without the fix id1 falls into
+        not_found_completed — violating the disjointness guarantee.
+
+        Regression test for the overlap bug fixed by subtracting `deleted` from
+        `not_found_completed` immediately before returning.
+        """
+        monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 1)
+
+        id1 = await self._insert_dead_row(queue, 'proj1')
+
+        result = await queue.delete_dead(group_id='proj1', ids=[id1, id1])
+
+        # Disjointness invariant: id1 must appear in exactly one bucket.
+        assert set(result['deleted']).isdisjoint(set(result['not_found'])), (
+            'deleted and not_found buckets must be disjoint — same id cannot appear in both'
+        )
+        # id1 was a real dead row, so it must land in deleted.
+        assert result['deleted'] == [id1]
+        assert result['not_found'] == []
+
+    @pytest.mark.asyncio
+    async def test_recovery_commit_failure_logs_at_error_level_with_traceback(
+        self, queue, monkeypatch, caplog
+    ):
+        """Recovery-commit failure must be logged at ERROR level with a traceback.
+
+        When the recovery commit() after an OperationalError also fails, the
+        function returns a conservative full-retry envelope.  The log record
+        must surface at ERROR level (not WARNING) and must include exc_info so
+        operators see the traceback — distinguishing logger.exception() from
+        logger.error() or logger.warning().
+        """
+        id1 = await self._insert_dead_row(queue, 'proj1')
+
+        # Raise OperationalError on any DELETE to trigger the error path.
+        original_execute = queue._db.execute
+
+        async def mock_execute(sql, *args, **kwargs):
+            if 'DELETE' in sql.upper():
+                raise aiosqlite.OperationalError('database is locked')
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+
+        # Also fail the recovery commit so we enter the double-failure branch.
+        async def mock_commit():
+            raise aiosqlite.OperationalError('disk I/O error')
+
+        monkeypatch.setattr(queue._db, 'commit', mock_commit)
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.durable_queue'):
+            result = await queue.delete_dead(group_id='proj1', ids=[id1])
+
+        # Envelope must be the conservative full-retry form.
+        assert result.get('error_type') == 'TransientSqliteError'
+        assert result.get('retriable') is True
+        assert result.get('deleted') == []
+        assert result.get('not_found') == []
+        assert result.get('remaining') == [id1]
+
+        # At least one ERROR-level record with exc_info from logger.exception().
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+        ]
+        assert error_records, (
+            'Expected at least one ERROR-level log record from the recovery-commit failure; '
+            f'got records: {[(r.levelno, r.getMessage()) for r in caplog.records]}'
+        )
+        # logger.exception() must capture exc_info (traceback) — not just logger.error().
+        assert any(r.exc_info is not None for r in error_records), (
+            'Expected exc_info to be captured by logger.exception(), got None for all ERROR records'
+        )
 
 
 class TestStats:
