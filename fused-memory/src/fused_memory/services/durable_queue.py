@@ -495,9 +495,9 @@ class DurableWriteQueue:
                 try:
                     await self._db.commit()
                 except aiosqlite.OperationalError as commit_exc:
-                    logger.warning(
-                        'delete_dead: recovery commit failed after OperationalError: %s',
-                        commit_exc,
+                    logger.exception(
+                        'delete_dead: recovery commit failed after OperationalError;'
+                        ' reporting full input as remaining',
                     )
                     return {
                         'error': str(exc),
