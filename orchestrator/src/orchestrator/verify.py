@@ -1250,11 +1250,24 @@ async def run_verification(
     if passed:
         logger.info('Verification passed: %s', summary)
     else:
-        detail_tail = f' — {cause_hint}' if cause_hint else ''
-        if timed_out:
-            logger.warning('Verification failed: %s%s', summary, detail_tail)
+        # Use the richer format when we have a category and a persisted log path —
+        # this avoids dumping the raw blob into the orchestrator log.
+        if result.category and result.worktree_log_paths:
+            hint_part = result.cause_hint or '<no hint>'
+            log_ref = result.worktree_log_paths[0]
+            log_msg = 'Verification failed: %s — %s (full log: %s)'
+            if timed_out:
+                logger.warning(log_msg, result.category, hint_part, log_ref)
+            else:
+                logger.info(log_msg, result.category, hint_part, log_ref)
         else:
-            logger.info('Verification failed: %s%s', summary, detail_tail)
+            # Legacy format — no log path available (merge-queue, review-checkpoint,
+            # or path outside .task/).
+            detail_tail = f' — {cause_hint}' if cause_hint else ''
+            if timed_out:
+                logger.warning('Verification failed: %s%s', summary, detail_tail)
+            else:
+                logger.info('Verification failed: %s%s', summary, detail_tail)
     return result
 
 
