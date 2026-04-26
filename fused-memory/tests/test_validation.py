@@ -921,3 +921,82 @@ class TestValidateIntIds:
             assert result is not None
         except Exception as exc:
             pytest.fail(f'validate_int_ids raised unexpectedly: {exc}')
+
+    # ── Element-level rejection ───────────────────────────────────────────────
+
+    def test_list_with_str_element_returns_error(self):
+        result = validate_int_ids([1, 2, 'bad'])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'str' in result['error']
+
+    def test_list_with_float_element_returns_error(self):
+        result = validate_int_ids([1, 2.5])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'float' in result['error']
+
+    def test_list_with_none_element_returns_error(self):
+        result = validate_int_ids([1, None])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'NoneType' in result['error']
+
+    def test_list_with_dict_element_returns_error(self):
+        result = validate_int_ids([{}])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'dict' in result['error']
+
+    def test_bool_true_rejected(self):
+        """True is a bool, which is an int subclass — must be rejected."""
+        result = validate_int_ids([True])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_bool_false_rejected(self):
+        """False is a bool subclass — must be rejected."""
+        result = validate_int_ids([False])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_bool_in_mixed_list_rejected(self):
+        result = validate_int_ids([1, 2, True, 4])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_error_pinpoints_first_bad_element_index(self):
+        """Mixed list [1, 2, 'uuid'] — error mentions ids[2]."""
+        bad_uuid = '550e8400-e29b-41d4-a716-446655440000'
+        result = validate_int_ids([1, 2, bad_uuid])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'ids[2]' in result['error'], (
+            f"expected 'ids[2]' in error, got: {result['error']!r}"
+        )
+        assert 'str' in result['error']
+        assert bad_uuid in result['error']
+
+    def test_element_error_has_exactly_two_keys(self):
+        result = validate_int_ids([1, 'bad'])
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_element_error_message_format(self):
+        """Element error follows '<name>[<idx>] must be int, got <type>: <repr>' format."""
+        result = validate_int_ids([1, 'oops'])
+        assert result is not None
+        assert 'ids[1]' in result['error']
+        assert 'must be int' in result['error']
+        assert 'str' in result['error']
+
+    def test_1mb_bad_element_produces_short_message(self):
+        """A 1 MB bad element produces an error message shorter than 400 chars."""
+        big_str = 'x' * (1024 * 1024)
+        result = validate_int_ids([big_str])
+        assert result is not None
+        assert len(result['error']) < 400, (
+            f"Error message length {len(result['error'])} exceeds 400 — "
+            'validate_int_ids must use _safe_repr to cap the bad element repr'
+        )
+        assert '...(truncated)' in result['error']
