@@ -942,7 +942,7 @@ Output JSON matching the schema. Every task must appear in the output.
         so it can only hit the git-log path when the ref is truly gone), then
         searches recent main commits for a subject matching
         ``Merge {branch} into {main_branch}`` — the format ``merge_to_main``
-        writes at git_ops.py:755.  A hit is treated identically to the
+        writes.  A hit is treated identically to the
         is_ancestor path: pop ``_recovered_plans``, attempt
         ``cleanup_worktree`` (swallow errors), call
         ``set_task_status('done', done_provenance={'commit': marker_sha, ...})``.

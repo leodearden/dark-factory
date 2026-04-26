@@ -686,10 +686,12 @@ class GitOps:
         This prevents finding a stale merge marker from a *previous* run of a
         re-opened task that shared the same branch name.
 
-        **Subject pattern**: ``^Merge {branch} into `` (with a trailing space
-        and ``into ``).  The ``^`` anchor + trailing `` into `` guarantee that
-        ``task/1`` does NOT match ``Merge task/10 into main`` (substring-safety).
-        The subject format is written by ``merge_to_main`` at line 755:
+        **Subject pattern**: ``Merge {branch} into `` matched with
+        ``--fixed-strings`` (literal match — no BRE metacharacter
+        interpretation, so branch names like ``task/v1.0`` are safe).
+        The trailing `` into `` guarantees that ``task/1`` does NOT match
+        ``Merge task/10 into main`` (substring-safety).  The subject format
+        is written by ``merge_to_main``:
         ``f'Merge {full_branch} into {self.config.main_branch}'``.
 
         Args:
@@ -706,13 +708,18 @@ class GitOps:
             return None
 
         # Branch is gone — search main for a merge commit with the expected subject.
-        # The trailing space + 'into ' anchors against substring collisions.
-        grep_pattern = f'^Merge {branch} into '
+        # --fixed-strings avoids BRE metacharacter interpretation (e.g. dots in
+        # branch names would otherwise be wildcards).  The trailing ' into '
+        # prevents task/1 from matching 'Merge task/10 into main'.
+        # -n 5000 bounds the scan on large histories; the marker is always recent.
+        grep_pattern = f'Merge {branch} into '
         rc, out, _ = await _run(
             [
                 'git', 'log', self.config.main_branch,
+                '--fixed-strings',
                 f'--grep={grep_pattern}',
                 '--max-count=1',
+                '-n', '5000',
                 '--format=%H',
             ],
             cwd=self.project_root,

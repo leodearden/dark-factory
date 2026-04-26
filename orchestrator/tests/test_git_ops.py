@@ -2652,3 +2652,26 @@ class TestFindMergeMarker:
         # find_merge_marker('task/1') must NOT find it
         marker_sha = await git_ops.find_merge_marker('task/1')
         assert marker_sha is None
+
+    async def test_returns_none_when_branch_deleted_without_merging(
+        self, git_ops: GitOps
+    ):
+        """Branch was created and abandoned: deleted without ever being merged.
+
+        This is subtly different from 'branch never existed' (case c): the
+        branch ref existed at some point but was cleaned up without writing a
+        merge commit on main.  find_merge_marker must return None because there
+        is no matching marker subject to find.
+        """
+        tid = 'abandoned-1'
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        # Delete the worktree and branch WITHOUT merging to main
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+
+        # Branch is gone but no merge marker was ever written on main
+        result = await git_ops.find_merge_marker(f'task/{tid}')
+        assert result is None
