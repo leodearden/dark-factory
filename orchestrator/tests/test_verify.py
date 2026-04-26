@@ -1830,6 +1830,138 @@ class TestFailureReportCauseHint:
         )
 
 
+class TestFailureReportLogPaths:
+    """Tests for ``## Verify Logs`` section in ``VerifyResult.failure_report()``.
+
+    Tests will fail until step 18 inserts the ``## Verify Logs`` section into
+    ``failure_report()`` between ``## Failure Cause`` and ``## Test Failures``.
+    """
+
+    # (a) non-empty worktree_log_paths → ## Verify Logs section appears
+    def test_verify_logs_section_appears_when_paths_set(self):
+        """## Verify Logs section is present when worktree_log_paths is non-empty."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='test my::mod::it FAILED',
+            worktree_log_paths=['/wt/.task/verify/attempt-1.test.log'],
+            archive_log_paths=['/data/verify-logs/42/attempt-1-20260426T120000Z.log'],
+        )
+        report = vr.failure_report()
+        assert '## Verify Logs' in report, (
+            f'"## Verify Logs" missing from failure_report():\n{report!r}'
+        )
+
+    # (b) ## Verify Logs appears after ## Failure Cause and before ## Test Failures
+    def test_verify_logs_section_ordering(self):
+        """## Verify Logs appears after ## Failure Cause and before ## Test Failures."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\nline2',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='test my::mod::it FAILED',
+            worktree_log_paths=['/wt/.task/verify/attempt-1.test.log'],
+            archive_log_paths=[],
+        )
+        report = vr.failure_report()
+        cause_pos = report.find('## Failure Cause')
+        logs_pos = report.find('## Verify Logs')
+        test_pos = report.find('## Test Failures')
+        assert cause_pos >= 0, '## Failure Cause missing'
+        assert logs_pos >= 0, '## Verify Logs missing'
+        assert test_pos >= 0, '## Test Failures missing'
+        assert cause_pos < logs_pos, (
+            f'Expected ## Failure Cause before ## Verify Logs: '
+            f'cause={cause_pos}, logs={logs_pos}'
+        )
+        assert logs_pos < test_pos, (
+            f'Expected ## Verify Logs before ## Test Failures: '
+            f'logs={logs_pos}, test={test_pos}'
+        )
+
+    # (c) when both lists are empty, ## Verify Logs must NOT appear
+    def test_no_verify_logs_section_when_paths_empty(self):
+        """## Verify Logs is absent when both log path lists are empty."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='test my::mod::it FAILED',
+        )
+        report = vr.failure_report()
+        assert '## Verify Logs' not in report, (
+            f'"## Verify Logs" present despite empty paths:\n{report!r}'
+        )
+
+    # (d) section contains Worktree: with paths, Archive: with archive paths
+    def test_verify_logs_section_contains_paths(self):
+        """## Verify Logs section contains Worktree: and Archive: subsections."""
+        wt_path = '/wt/.task/verify/attempt-1.test.log'
+        arch_path = '/data/verify-logs/42/attempt-1-20260426T120000Z.log'
+        vr = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='lint error here',
+            type_output='',
+            summary='Failures: lint issues',
+            cause_hint='lint error here',
+            worktree_log_paths=[wt_path],
+            archive_log_paths=[arch_path],
+        )
+        report = vr.failure_report()
+        assert 'Worktree:' in report, f'"Worktree:" missing from ## Verify Logs:\n{report!r}'
+        assert wt_path in report, f'Worktree path {wt_path!r} missing from report:\n{report!r}'
+        assert 'Archive' in report, f'"Archive" missing from ## Verify Logs:\n{report!r}'
+        assert arch_path in report, f'Archive path {arch_path!r} missing from report:\n{report!r}'
+
+    # (d-extra) when archive_log_paths is empty, Archive section is omitted
+    def test_no_archive_subsection_when_archive_empty(self):
+        """When archive_log_paths is empty, no Archive subsection appears."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='lint error here',
+            type_output='',
+            summary='Failures: lint issues',
+            cause_hint='lint error here',
+            worktree_log_paths=['/wt/.task/verify/attempt-1.lint.log'],
+            archive_log_paths=[],
+        )
+        report = vr.failure_report()
+        assert '## Verify Logs' in report, '## Verify Logs should appear (worktree paths set)'
+        # No archive paths → no "Archive" subsection
+        assert 'Archive' not in report, (
+            f'"Archive" present despite empty archive_log_paths:\n{report!r}'
+        )
+
+    # (e) Existing tests: existing sections still appear, regression guard
+    def test_existing_sections_still_present_with_paths(self):
+        """All existing sections still appear when ## Verify Logs is added."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\nline2',
+            lint_output='lint error',
+            type_output='error: type mismatch',
+            summary='Failures: tests failed, lint issues, type errors',
+            cause_hint='test my::mod::it FAILED',
+            worktree_log_paths=['/wt/.task/verify/attempt-1.test.log'],
+            archive_log_paths=[],
+        )
+        report = vr.failure_report()
+        assert '## Failure Cause' in report
+        assert '## Verify Logs' in report
+        assert '## Test Failures' in report
+        assert '## Lint Issues' in report
+        assert '## Type Errors' in report
+
+
 class TestClassifyFailure:
     """Tests for ``_classify_failure(output, rc, timed_out) -> str``.
 
