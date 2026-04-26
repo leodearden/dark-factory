@@ -4725,13 +4725,17 @@ class TestExtractMetaFiles:
         assert result == ['42', 'src/foo.py']
 
     def test_build_candidate_parses_metadata_once(self, monkeypatch):
-        """_build_candidate must call _parse_metadata exactly once per invocation.
+        """_build_candidate must call _parse_metadata at most once per invocation.
 
         Regression guard for the hot-path dedupe: before the fix, _build_candidate
         called _parse_metadata directly (line 909) AND indirectly via
         _extract_meta_files (line 910) — two parses per title-bearing submission.
         After the fix (_build_candidate delegates to _extract_meta_files_from_meta
-        using the meta already in scope), the count drops to 1.
+        using the meta already in scope), the count drops to ≤1.
+
+        The guard uses <=1 rather than ==1 so a future short-circuit that skips
+        _parse_metadata entirely (count==0) is not penalised; only the regression
+        of calling it more than once (count>=2) fails.
         """
         original_parse = TaskInterceptor._parse_metadata
         call_count: list[int] = [0]
@@ -4747,8 +4751,8 @@ class TestExtractMetaFiles:
 
         assert candidate is not None
         assert candidate.files_to_modify == ['a.py']
-        assert call_count[0] == 1, (
-            f'_parse_metadata should be called exactly once by _build_candidate, '
+        assert call_count[0] <= 1, (
+            f'_parse_metadata should be called at most once by _build_candidate, '
             f'but was called {call_count[0]} time(s)'
         )
 
