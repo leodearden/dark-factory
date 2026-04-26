@@ -2006,6 +2006,37 @@ class TestClassifyFailure:
         output = 'error: no such subcommand: `tset`\n'
         assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
 
+    def test_cargo_cli_error_failed_to_compile(self):
+        """'error: failed to compile …' (cargo CLI wrapper) → cargo_cli_error.
+
+        Documents that the 'failed to (parse|compile|read|find)' allowlist token
+        is intentional: cargo emits this form as a CLI-level wrapper (distinct from
+        rustc's 'error: could not compile `…`').  If this token is ever removed
+        from the allowlist, this test will catch the regression.
+        """
+        output = 'error: failed to compile `my-crate` (lib)\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'cargo_cli_error'
+
+    def test_rustc_top_level_diagnostics_not_cargo_cli_error(self):
+        """rustc top-level diagnostics without error[Exxxx] code must NOT → cargo_cli_error.
+
+        When a rustc compile failure escapes without a coded error[E\\d+]: line (e.g. parse
+        errors that promote to a top-level diagnostic), the run must fall through to
+        'unknown_test_failure', not be mis-bucketed as 'cargo_cli_error'.
+        """
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: aborting due to previous errors\n'
+            'error: could not compile `my-crate` (lib) due to previous error\n'
+        )
+        result = self._classify(output, rc=1, timed_out=False)
+        assert result != 'cargo_cli_error', (
+            f"rustc top-level diagnostics must not be mis-bucketed as cargo_cli_error, got {result!r}"
+        )
+        assert result == 'unknown_test_failure', (
+            f"rustc top-level diagnostics should fall through to unknown_test_failure, got {result!r}"
+        )
+
     # (d) compile_error: rustc diagnostic error codes
     def test_compile_error_rustc_code(self):
         """'error[E0308]: mismatched types' → compile_error."""

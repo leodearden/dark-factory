@@ -180,8 +180,18 @@ def _extract_cause_hint(output: str) -> str:
 _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'error\[E\d+\]:', re.MULTILINE), 'compile_error'),
     (re.compile(r'compile error', re.MULTILINE | re.IGNORECASE), 'compile_error'),
-    # cargo CLI errors (no diagnostic code) — 'error: --exclude …' etc.
-    (re.compile(r'^error: ', re.MULTILINE), 'cargo_cli_error'),
+    # cargo CLI errors — narrow allowlist of cargo-only prefixes so rustc
+    # top-level diagnostics ('error: aborting due to previous errors',
+    # 'error: could not compile `…`') fall through to unknown_test_failure.
+    # Intentionally conservative: novel cargo CLI messages not listed here
+    # (e.g. 'error: unexpected argument', 'error: the manifest-path must be …',
+    # 'error: manifest path … does not exist') will fall through to
+    # unknown_test_failure until added to the allowlist.  Extend when a new
+    # cargo CLI failure mode appears in production and needs its own bucket.
+    (re.compile(
+        r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|package |could not find|invalid )',
+        re.MULTILINE,
+    ), 'cargo_cli_error'),
     # Rust test runner / pytest FAILED lines
     (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), 'test_failure'),
     (re.compile(r'^FAILED\s', re.MULTILINE), 'test_failure'),
@@ -198,16 +208,16 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     """Classify a command failure into a named category bucket.
 
     Uses a pattern ladder (first match wins):
-    1. ``rc == 0``                      → ``'passed'``
-    2. ``timed_out``                    → ``'infra_timeout'``
-    3. ``error: …`` (no [E\\d+] code)  → ``'cargo_cli_error'``
-    4. ``error[E\\d+]:``               → ``'compile_error'``
-    5. ``compile error``                → ``'compile_error'``
-    6. ``… FAILED``                     → ``'test_failure'``
-    7. ``npm (ERR!|error)``             → ``'npm_error'``
-    8. ``flock:``                       → ``'flock_error'``
-    9. ``tree-sitter generate``         → ``'tree_sitter_generate_error'``
-    10. fallback (rc != 0)              → ``'unknown_test_failure'``
+    1. ``rc == 0``                              → ``'passed'``
+    2. ``timed_out``                            → ``'infra_timeout'``
+    3. ``error[E\\d+]:``                        → ``'compile_error'``
+    4. ``compile error``                         → ``'compile_error'``
+    5. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
+    6. ``… FAILED``                              → ``'test_failure'``
+    7. ``npm (ERR!|error)``                      → ``'npm_error'``
+    8. ``flock:``                                → ``'flock_error'``
+    9. ``tree-sitter generate``                  → ``'tree_sitter_generate_error'``
+    10. fallback (rc != 0)                       → ``'unknown_test_failure'``
 
     The ``timed_out`` flag wins over any output pattern because the root
     cause is the wall-clock limit, not the command output.
