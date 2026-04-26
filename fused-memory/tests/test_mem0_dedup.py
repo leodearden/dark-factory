@@ -96,3 +96,42 @@ async def test_returns_none_on_empty_search_result():
     )
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Step 9 — search exception returns None and logs WARNING
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_exception_returns_none_and_logs_warning(caplog):
+    """When memory_service.search raises, find_prior_memory returns None and logs a WARNING.
+
+    The caller must never see the exception — search failures degrade gracefully.
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.mem0_dedup'):
+        result = await find_prior_memory(
+            memory_service,
+            project_id='p',
+            task_id='55',
+            kind={'flag_type': 'foo'},
+            query='q',
+        )
+
+    # (a) Does NOT raise
+    # (b) Returns None
+    assert result is None
+
+    # (c) At least one WARNING record mentions the task_id
+    assert any(
+        '55' in record.message and record.levelno >= logging.WARNING
+        for record in caplog.records
+    ), (
+        f'Expected a WARNING mentioning task 55 but got: '
+        f'{[r.message for r in caplog.records]}'
+    )
