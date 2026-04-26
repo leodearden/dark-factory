@@ -443,17 +443,20 @@ class TestGracefulShutdownDoesNotArmForceExitWatchdog:
         memory_service = MagicMock()
         memory_service.close = AsyncMock()
 
-        await _graceful_shutdown(
-            memory_service=memory_service,
-            task_interceptor=None,
-            harness_loop_task=None,
-            recon_journal=None,
-        )
+        try:
+            await _graceful_shutdown(
+                memory_service=memory_service,
+                task_interceptor=None,
+                harness_loop_task=None,
+                recon_journal=None,
+            )
 
-        assert main_mod._shutdown_watchdog is None, (
-            'Task 1080 regression: _graceful_shutdown armed a 45s os._exit(1) watchdog. '
-            'The watchdog must only be armed by _shutdown_with_watchdog (the lifespan-only wrapper).'
-        )
+            assert main_mod._shutdown_watchdog is None, (
+                'Task 1080 regression: _graceful_shutdown armed a 45s os._exit(1) watchdog. '
+                'The watchdog must only be armed by _shutdown_with_watchdog (the lifespan-only wrapper).'
+            )
+        finally:
+            main_mod._cancel_force_exit()
 
 
 class TestShutdownWithWatchdog:

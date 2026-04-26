@@ -690,14 +690,7 @@ async def _graceful_shutdown(
         await _run_shielded('recon_journal.close', recon_journal.close)
 
 
-async def _shutdown_with_watchdog(
-    memory_service: MemoryService,
-    task_interceptor: 'TaskInterceptor | None',
-    harness_loop_task: 'asyncio.Task[None] | None',
-    recon_journal: 'ReconciliationJournal | None',
-    event_queue: 'EventQueue | None' = None,
-    sqlite_watchdog: 'SqliteWatchdog | None' = None,
-) -> None:
+async def _shutdown_with_watchdog(**kwargs: Any) -> None:
     """Lifespan-only entry point: arm the force-exit watchdog, then run graceful shutdown.
 
     The watchdog is interpreter-shutdown safety — it guarantees the process dies
@@ -706,16 +699,13 @@ async def _shutdown_with_watchdog(
     _graceful_shutdown) so unit tests of pure cleanup orchestration don't leak a
     45s os._exit(1) timer.  The watchdog is cancelled in main() after
     asyncio.run() returns cleanly.
+
+    All kwargs are forwarded to _graceful_shutdown unchanged.  Using **kwargs
+    rather than repeating the explicit signature avoids the two functions
+    diverging silently if _graceful_shutdown grows a new parameter.
     """
     _arm_force_exit()
-    await _graceful_shutdown(
-        memory_service=memory_service,
-        task_interceptor=task_interceptor,
-        harness_loop_task=harness_loop_task,
-        recon_journal=recon_journal,
-        event_queue=event_queue,
-        sqlite_watchdog=sqlite_watchdog,
-    )
+    await _graceful_shutdown(**kwargs)
 
 
 _singleton_socket = None  # Module-level ref to prevent GC
