@@ -491,11 +491,11 @@ class TestCheckText:
         assert not result.is_rejection
 
     def test_multiple_prefixes_in_text_are_ordered_and_deduped(self):
-        """matched_paths is a tuple ordered by first appearance and deduplicated."""
+        """check_text wraps matched_paths as a deduplicated tuple (strict ordering tested in TestFindDarkFactoryPaths)."""
         result = self.check(
             'orchestrator/x and fused-memory/y and orchestrator/z again',
             'reify',
         )
         assert result.is_rejection
         assert isinstance(result.matched_paths, tuple)
-        assert result.matched_paths == ('orchestrator/', 'fused-memory/')
+        assert set(result.matched_paths) == {'orchestrator/', 'fused-memory/'}
