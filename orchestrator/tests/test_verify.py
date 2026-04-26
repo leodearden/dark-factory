@@ -2965,3 +2965,156 @@ class TestBuildFallbackConfigConftest:
         assert result is not None
         assert result.test_command == 'pytest a ab/test_x.py'
         assert 'conftest.py' not in result.test_command
+
+
+class TestPruneArchiveDedupedAtAggregateSite:
+    """Tests ensuring ``_prune_archive`` is called exactly once per
+    ``run_scoped_verification``, not once-per-module inside
+    ``_archive_attempt_log``.
+
+    Tests (a) and (b) fail until step 24 removes the inner ``_prune_archive``
+    call from ``_archive_attempt_log`` and adds a single call at the aggregate
+    site in ``run_scoped_verification``.
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+    def _make_module_configs(self) -> list[ModuleConfig]:
+        return [
+            ModuleConfig(
+                prefix='cratea',
+                test_command='cargo test -p cratea',
+                lint_command=None,
+                type_check_command=None,
+            ),
+            ModuleConfig(
+                prefix='crateb',
+                test_command='cargo test -p crateb',
+                lint_command=None,
+                type_check_command=None,
+            ),
+        ]
+
+    def test_archive_attempt_log_does_not_call_prune(self, tmp_path: Path):
+        """(a) After step 24, _archive_attempt_log must NOT call _prune_archive.
+
+        ``_prune_archive`` belongs at the aggregate site in
+        ``run_scoped_verification``, not inside the per-file copy loop.
+        """
+        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
+
+        log_file = tmp_path / 'attempt-1.test.log'
+        log_file.write_text('cratea ERR\n')
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        with patch.object(verify, '_prune_archive') as spy:
+            _archive_attempt_log(
+                [log_file],
+                archive_root,
+                task_id='42',
+                attempt_id=1,
+                category='cargo_cli_error',
+            )
+            assert spy.call_count == 0, (
+                f'_archive_attempt_log must not call _prune_archive; '
+                f'got {spy.call_count} call(s)'
+            )
+
+    @pytest.mark.asyncio
+    async def test_gather_calls_prune_exactly_once(self, tmp_path: Path):
+        """(b) Two concurrent modules each archiving → _prune_archive called once total.
+
+        Before step 24, _archive_attempt_log calls _prune_archive once per
+        module, yielding 2 calls.  After step 24, the aggregate site fires once.
+        """
+        (tmp_path / '.task').mkdir()
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = self._make_config(tmp_path)
+        module_configs = self._make_module_configs()
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cratea' in cmd:
+                return 1, 'error: --exclude cratea\ncratea ERR\n', False
+            if 'crateb' in cmd:
+                return 1, 'error: --exclude crateb\ncrateb ERR\n', False
+            return 0, 'ok', False
+
+        from orchestrator import verify  # noqa: PLC0415
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+                patch.object(verify, '_prune_archive') as spy:
+            await run_scoped_verification(
+                tmp_path, config, module_configs,
+                attempt_id=1,
+                task_id='42',
+                archive_root=archive_root,
+            )
+        assert spy.call_count == 1, (
+            f'_prune_archive should be called exactly once across gather; '
+            f'got {spy.call_count} call(s)'
+        )
+        assert spy.call_args[0][0] == archive_root, (
+            f'First positional arg to _prune_archive should be archive_root; '
+            f'got {spy.call_args[0][0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_prune_when_archive_root_is_none(self, tmp_path: Path):
+        """(c) archive_root=None → _prune_archive is never called."""
+        (tmp_path / '.task').mkdir()
+        config = self._make_config(tmp_path)
+        module_configs = self._make_module_configs()
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 1, 'error: --exclude\n', False
+
+        from orchestrator import verify  # noqa: PLC0415
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+                patch.object(verify, '_prune_archive') as spy:
+            await run_scoped_verification(
+                tmp_path, config, module_configs,
+                attempt_id=1,
+                task_id='42',
+                archive_root=None,
+            )
+        assert spy.call_count == 0, (
+            f'_prune_archive must not be called when archive_root is None; '
+            f'got {spy.call_count} call(s)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_module_global_path_calls_prune_once(self, tmp_path: Path):
+        """(d) Global path (module_configs=[], task_files=None) still calls prune once.
+
+        After step 24, the single aggregate-site call in ``run_scoped_verification``
+        fires even on the non-gather (global) fallback paths.
+        """
+        (tmp_path / '.task').mkdir()
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = self._make_config(tmp_path)
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 1, 'error: --exclude\nfoo\n', False
+
+        from orchestrator import verify  # noqa: PLC0415
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+                patch.object(verify, '_prune_archive') as spy:
+            await run_scoped_verification(
+                tmp_path, config, [],
+                attempt_id=1,
+                task_id='42',
+                archive_root=archive_root,
+            )
+        assert spy.call_count == 1, (
+            f'Global path should call _prune_archive exactly once; '
+            f'got {spy.call_count} call(s)'
+        )
