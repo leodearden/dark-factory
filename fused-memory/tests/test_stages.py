@@ -3112,8 +3112,9 @@ class TestBriefingKnownGapsRefresh:
             and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
         ]
         assert len(warning_records) == 1
-        # The warning must reference the exit code (2)
-        assert '2' in warning_records[0].getMessage() or getattr(warning_records[0], 'returncode', None) == 2
+        # The warning must use the canonical message key and carry the exit code in extra.
+        assert 'briefing_known_gaps_script_failed' in warning_records[0].getMessage()
+        assert getattr(warning_records[0], 'returncode', None) == 2
 
     # ------------------------------------------------------------------ #
     # _queue_briefing_refresh_tasks                                         #
@@ -3179,6 +3180,35 @@ class TestBriefingKnownGapsRefresh:
 
         result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
 
+        taskmaster.add_task.assert_called_once()
+        assert '1751' not in result['skipped']
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_dedup_is_exact_title_match(self):
+        """Dedup uses case-sensitive exact string equality — near-misses do NOT dedup.
+
+        A pending task whose title differs from the canonical title by trailing
+        whitespace or casing is NOT treated as a duplicate.  This documents the
+        intended behavior: if we ever want tolerance, we should normalise before
+        comparing and add a test for that normalisation.
+        """
+        taskmaster = AsyncMock()
+        canonical = 'Refresh briefing: remove task 1751 from known_gaps'
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                # trailing space — should NOT dedup
+                {'id': 900, 'status': 'pending', 'title': canonical + ' '},
+                # uppercase — should NOT dedup
+                {'id': 901, 'status': 'pending', 'title': canonical.upper()},
+            ]
+        }
+        taskmaster.add_task.return_value = {'id': '9999', 'message': 'created'}
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        # Neither near-miss deduped → add_task must be called exactly once
         taskmaster.add_task.assert_called_once()
         assert '1751' not in result['skipped']
 
