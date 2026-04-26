@@ -30,6 +30,7 @@ from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
@@ -453,34 +454,26 @@ class ReconciliationHarness:
 
             # Dedup check: skip completion-summary writes that already exist in Mem0.
             # Only for transition='done' writes — other transitions are left as-is.
-            # Inner try/except: search failures degrade to "no dedup, write proceeds"
-            # rather than propagating to the outer except (which would drop the write).
+            # find_prior_memory degrades gracefully: search failures log a WARNING
+            # under logger and return None so the write proceeds normally.
             if transition == 'done' and tid:
-                try:
-                    # Limit=20: generous enough to cover typical per-project task
-                    # counts while bounding search cost.  Both sides of the
-                    # transition comparison are coerced to str for safety.
-                    results = await self.memory.search(
-                        query=f'task {tid} targeted_reconciliation completion done',
-                        project_id=project_id,
-                        limit=20,
+                prior = await find_prior_memory(
+                    self.memory,
+                    project_id=project_id,
+                    task_id=tid,
+                    kind={'transition': 'done'},
+                    query=f'task {tid} targeted_reconciliation completion done',
+                    categories=['observations_and_summaries'],
+                    limit=20,
+                    log=logger,
+                )
+                if prior is not None:
+                    logger.info(
+                        'Skipping deferred completion-summary for task %s — already written',
+                        tid,
                     )
-                    prior = [
-                        r for r in results
-                        if r.metadata.get('task_id') == str(tid)
-                        and str(r.metadata.get('transition', '')) == 'done'
-                    ]
-                    if prior:
-                        logger.info(
-                            'Skipping deferred completion-summary for task %s — already written',
-                            tid,
-                        )
-                        await self.buffer.delete_deferred_write(write['id'])
-                        continue
-                except Exception as e:
-                    logger.warning(
-                        'Deferred-write dedup search failed for task %s: %s', tid, e
-                    )
+                    await self.buffer.delete_deferred_write(write['id'])
+                    continue
 
             try:
                 await self.memory.add_memory(

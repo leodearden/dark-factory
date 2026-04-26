@@ -3718,7 +3718,12 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
     async def test_skip_on_prior_match(
         self, journal, event_buffer, mock_memory_service, caplog
     ):
-        """When a prior done-summary exists in Mem0, the deferred write is skipped."""
+        """When a prior done-summary exists in Mem0, the deferred write is skipped.
+
+        Integration test: asserts the harness wires through find_prior_memory correctly
+        — a matching prior causes the write to be skipped and the row deleted.
+        Coercion and kwargs-forwarding contracts are covered in test_mem0_dedup.py.
+        """
         from unittest.mock import MagicMock
 
         prior_result = MagicMock()
