@@ -512,7 +512,7 @@ class DurableWriteQueue:
                     'error_type': 'TransientSqliteError',
                     'retriable': True,
                     'deleted': sorted(deleted),
-                    'not_found': sorted(not_found_completed),
+                    'not_found': sorted(not_found_completed - deleted),
                     'remaining': sorted(ids[i:]),
                 }
             chunk_deleted = {
@@ -525,7 +525,7 @@ class DurableWriteQueue:
 
         return {
             'deleted': sorted(deleted),
-            'not_found': sorted(not_found_completed),
+            'not_found': sorted(not_found_completed - deleted),
         }
 
     async def get_dead_items(
