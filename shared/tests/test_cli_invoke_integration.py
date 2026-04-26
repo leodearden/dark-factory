@@ -44,8 +44,8 @@ _CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
     'account unavailable',  # narrowed from bare 'unavailable' to avoid generic network errors
     'out of extra usage',
     'usage limit',
-    "you've hit",
-    "you've used",
+    "you've hit your usage",   # narrowed prefix to avoid matching innocuous "you've hit a snag" phrasing
+    "you've used all",         # narrowed prefix to avoid matching innocuous "you've used the wrong format" phrasing
 )
 
 
