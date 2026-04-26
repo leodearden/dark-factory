@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from shared.proc_group import terminate_process_group
@@ -368,6 +370,118 @@ def _persist_attempt_logs(
         logger.warning('_persist_attempt_logs: could not write %s: %s', summary_path, exc)
 
     return written
+
+
+def _archive_attempt_log(
+    worktree_log_paths: list[Path],
+    archive_root: 'Path | None',
+    task_id: str,
+    attempt_id: int,
+    category: str,
+) -> list[Path]:
+    """Copy worktree logs to the durable archive when ``category`` warrants it.
+
+    Archive target: ``<archive_root>/<task_id>/attempt-{N}-<utc_ts>.log``.
+
+    Early-returns ``[]`` when:
+    - ``archive_root`` is ``None``
+    - ``_should_archive_category(category)`` is ``False``
+
+    All filesystem errors are caught, logged, and swallowed (best-effort).
+    After copying, calls ``_prune_archive`` to enforce retention limits.
+    """
+    if archive_root is None:
+        return []
+    if not _should_archive_category(category):
+        return []
+
+    target_dir = archive_root / task_id
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning('_archive_attempt_log: could not create %s: %s', target_dir, exc)
+        return []
+
+    utc_ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    archived: list[Path] = []
+    for src in worktree_log_paths:
+        src = Path(src)
+        # Preserve the source stem to avoid collisions when multiple log files
+        # share the same suffix (e.g. attempt-1.test.log and attempt-1.lint.log
+        # would both resolve to attempt-1-TS.log without the stem).
+        dest = target_dir / f'{src.stem}-{utc_ts}{src.suffix}'
+        try:
+            shutil.copy2(src, dest)
+            archived.append(dest)
+        except OSError as exc:
+            logger.warning('_archive_attempt_log: could not copy %s → %s: %s', src, dest, exc)
+
+    # Rotate-on-write retention (best-effort).
+    _prune_archive(archive_root)
+
+    return archived
+
+
+_DEFAULT_ARCHIVE_MAX_AGE_DAYS = 30
+_DEFAULT_ARCHIVE_MAX_BYTES = 500 * 1024 * 1024
+
+
+def _prune_archive(
+    archive_root: Path,
+    max_age_days: int = _DEFAULT_ARCHIVE_MAX_AGE_DAYS,
+    max_total_bytes: int = _DEFAULT_ARCHIVE_MAX_BYTES,
+) -> None:
+    """Enforce age + size retention on ``archive_root``.
+
+    Two-pass strategy:
+    1. Delete files older than ``max_age_days`` (by mtime).
+    2. If aggregate size still exceeds ``max_total_bytes``, delete oldest-first
+       until under cap.
+
+    All errors are logged and swallowed; never raises.
+    """
+    if not archive_root.exists():
+        return
+
+    import time
+    now = time.time()
+    cutoff = now - max_age_days * 86_400
+
+    def _iter_logs() -> list[tuple[Path, float, int]]:
+        entries = []
+        for path in archive_root.rglob('*.log'):
+            try:
+                st = path.stat()
+                if not path.is_file():
+                    continue
+                entries.append((path, st.st_mtime, st.st_size))
+            except OSError:
+                continue
+        return entries
+
+    # Pass 1: age-based deletion.
+    entries = _iter_logs()
+    for path, mtime, _size in entries:
+        if mtime < cutoff:
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.warning('_prune_archive: could not delete %s: %s', path, exc)
+
+    # Pass 2: size cap.
+    entries = _iter_logs()
+    total = sum(sz for _, _, sz in entries)
+    if total > max_total_bytes:
+        # Sort oldest-first.
+        entries.sort(key=lambda t: t[1])
+        for path, _mtime, size in entries:
+            if total <= max_total_bytes:
+                break
+            try:
+                path.unlink()
+                total -= size
+            except OSError as exc:
+                logger.warning('_prune_archive: could not delete %s: %s', path, exc)
 
 
 async def _derive_task_files_from_git(
