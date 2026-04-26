@@ -28,6 +28,7 @@ except ImportError:
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.middleware.dark_factory_path_guard import (
+    DARK_FACTORY_PROJECT_ID,
     check_candidate_for_dark_factory_paths,
     check_text_for_dark_factory_paths,
 )
@@ -1442,10 +1443,15 @@ class TaskInterceptor:
 
         # Path-scope guard: reject before persisting if the candidate references
         # dark-factory module paths but is being filed into a different project.
-        # Placed before kwargs.pop('metadata') so _build_candidate can read metadata.
-        candidate = self._build_candidate(kwargs)
-        if err := self._path_guard_error(candidate, kwargs, project_id):
-            return err
+        # Skip _build_candidate entirely for the dark_factory hot path — the
+        # guard short-circuits to 'ok' there anyway, and the worker will rebuild
+        # the candidate from the persisted blob.
+        # The inner _build_candidate call must run before kwargs.pop('metadata')
+        # below so it can still read metadata.
+        if project_id != DARK_FACTORY_PROJECT_ID:
+            candidate = self._build_candidate(kwargs)
+            if err := self._path_guard_error(candidate, kwargs, project_id):
+                return err
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
@@ -2494,6 +2500,11 @@ class TaskInterceptor:
     ) -> dict:
         if err := await self._backlog_gate(project_root):
             return err
+        # Unlike submit_task, we cannot hoist _build_candidate behind a
+        # project_id != DARK_FACTORY_PROJECT_ID check here: the candidate is
+        # passed directly into _add_subtask_locked and reused by the curator
+        # and write paths, so skipping the build on the dark_factory hot path
+        # would just force a duplicate build later.
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
         # Path-scope guard: reject before acquiring the curator lock so a

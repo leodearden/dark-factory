@@ -4253,10 +4253,9 @@ class TestSubmitTaskGuardrail:
                 description='harness deadlock referencing orchestrator/harness.py',
             )
         finally:
-            # close() cancels workers and awaits them before the TicketStore
-            # fixture closes the SQLite DB — prevents "closed database" warnings
-            # from a worker that is still mid-write at teardown.
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
@@ -4265,6 +4264,42 @@ class TestSubmitTaskGuardrail:
         )
         assert 'error_type' not in result, (
             f'Should not have error_type for correctly-filed task: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_task_skips_build_candidate_for_dark_factory_project(
+        self, interceptor_with_store, taskmaster, monkeypatch,
+    ):
+        """Hoist optimisation: _build_candidate is not invoked for the dark_factory
+        project_id, since the path guard short-circuits to 'ok' anyway.
+        """
+        calls: list[dict] = []
+        original = TaskInterceptor._build_candidate
+
+        def spy(kwargs):
+            calls.append(kwargs)
+            return original(kwargs)
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(spy))
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/dark-factory',
+                title='Investigate orchestrator/harness.py deadlock',
+                description='harness deadlock',
+            )
+            # Snapshot call count immediately after submit_task returns, before
+            # any cancellation/await — this ensures the assertion is unaffected
+            # by a background worker that may also call _build_candidate.
+            calls_after_submit = len(calls)
+        finally:
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('ticket', '').startswith('tkt_')
+        assert calls_after_submit == 0, (
+            f'Expected _build_candidate to be skipped for dark_factory; got {calls_after_submit} calls'
         )
 
     @pytest.mark.asyncio
@@ -4281,10 +4316,9 @@ class TestSubmitTaskGuardrail:
                 description='Generic refactor of foo/bar.py',
             )
         finally:
-            # close() cancels workers and awaits them before the TicketStore
-            # fixture closes the SQLite DB — prevents "closed database" warnings
-            # from a worker that is still mid-write at teardown.
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
@@ -4345,7 +4379,9 @@ class TestSubmitTaskGuardrail:
                 # No title — prompt-only path
             )
         finally:
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
@@ -4370,7 +4406,9 @@ class TestSubmitTaskGuardrail:
                 # No title — prompt-only path, but no dark-factory paths
             )
         finally:
-            await interceptor_with_store.close()
+            # Ensure any background worker is cancelled before the ticket_store
+            # fixture closes the DB, preventing "closed database" background errors.
+            await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
