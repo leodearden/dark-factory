@@ -4808,3 +4808,216 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
         assert 'error_type' not in result, (
             f'Should not have error_type for clean metadata files: {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-6: unit + spy tests for _path_guard_or_skip helper
+# ---------------------------------------------------------------------------
+# Cases 1-4 are RED before step-7 because the helper doesn't exist yet
+# (direct calls raise AttributeError).  Cases 5-6 are RED because the call
+# sites still invoke _path_guard_error directly, so the spy is never called.
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardOrSkip:
+    """Unit and spy tests for TaskInterceptor._path_guard_or_skip.
+
+    Must be RED before step-7 and GREEN after step-7.
+    """
+
+    # -- Case 1 -----------------------------------------------------------
+    def test_path_guard_or_skip_returns_none_for_dark_factory_project(
+        self, interceptor, monkeypatch,
+    ):
+        """dark_factory short-circuit: returns None without calling
+        _build_candidate or _path_guard_error.
+        """
+        build_calls: list = []
+        guard_calls: list = []
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: (
+                guard_calls.append((candidate, kwargs, project_id)), None)[1],
+        )
+
+        result = interceptor._path_guard_or_skip(
+            {'title': 'Edit orchestrator/harness.py'}, 'dark_factory',
+        )
+
+        assert result is None
+        assert build_calls == [], '_build_candidate must NOT be called for dark_factory'
+        assert guard_calls == [], '_path_guard_error must NOT be called for dark_factory'
+
+    # -- Case 2 -----------------------------------------------------------
+    def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
+        self, interceptor, monkeypatch,
+    ):
+        """When no candidate is supplied and project is non-dark_factory, the
+        helper builds a candidate via _build_candidate and passes it to
+        _path_guard_error.
+        """
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        built = CandidateTask(
+            title='Generic refactor', description='', details='',
+            files_to_modify=[], priority='medium',
+        )
+        build_calls: list = []
+        guard_calls: list = []
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: (build_calls.append(kwargs), built)[1]),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: (
+                guard_calls.append((candidate, kwargs, project_id)), None)[1],
+        )
+
+        kwargs = {'title': 'Generic refactor'}
+        result = interceptor._path_guard_or_skip(kwargs, 'some_other_project')
+
+        assert result is None
+        assert len(build_calls) == 1, (
+            f'Expected _build_candidate called once, got {len(build_calls)}'
+        )
+        assert build_calls[0] is kwargs
+        assert len(guard_calls) == 1, (
+            f'Expected _path_guard_error called once, got {len(guard_calls)}'
+        )
+        assert guard_calls[0][0] is built
+
+    # -- Case 3 -----------------------------------------------------------
+    def test_path_guard_or_skip_uses_provided_candidate(
+        self, interceptor, monkeypatch,
+    ):
+        """When a pre-built candidate is supplied, _build_candidate is NOT called;
+        _path_guard_error is called with the supplied candidate.
+        """
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        sentinel = CandidateTask(
+            title='Sentinel', description='', details='',
+            files_to_modify=[], priority='medium',
+        )
+        build_calls: list = []
+        guard_calls: list = []
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: (
+                guard_calls.append((candidate, kwargs, project_id)), None)[1],
+        )
+
+        kwargs = {'title': 'Generic refactor'}
+        result = interceptor._path_guard_or_skip(kwargs, 'some_other_project', candidate=sentinel)
+
+        assert result is None
+        assert build_calls == [], '_build_candidate must NOT be called when candidate is supplied'
+        assert len(guard_calls) == 1, (
+            f'Expected _path_guard_error called once, got {len(guard_calls)}'
+        )
+        assert guard_calls[0][0] is sentinel
+
+    # -- Case 4 -----------------------------------------------------------
+    def test_path_guard_or_skip_propagates_rejection(
+        self, interceptor, monkeypatch,
+    ):
+        """When _path_guard_error returns a rejection dict, the helper returns it as-is."""
+        rejection = {
+            'error_type': 'DarkFactoryPathScopeViolation',
+            'matched_paths': ['orchestrator/'],
+        }
+
+        monkeypatch.setattr(
+            TaskInterceptor, '_build_candidate',
+            staticmethod(lambda kwargs: None),
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_error',
+            lambda self, candidate, kwargs, project_id: rejection,
+        )
+
+        result = interceptor._path_guard_or_skip({'prompt': 'something'}, 'some_other_project')
+        assert result is rejection
+
+    # -- Case 5 -----------------------------------------------------------
+    @pytest.mark.asyncio
+    async def test_submit_task_invokes_path_guard_or_skip(
+        self, interceptor_with_store, taskmaster, monkeypatch,
+    ):
+        """submit_task delegates path-scope guard to _path_guard_or_skip (symmetry).
+
+        Before step-7 this is RED: submit_task calls _path_guard_error directly,
+        so the spy is never called and the assertion fails.
+        """
+        spy_calls: list[dict] = []
+
+        def spy(self, kwargs, project_id, candidate=None):
+            spy_calls.append({'project_id': project_id, 'candidate': candidate})
+            return None  # allow the call through (no rejection)
+
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_or_skip', spy)
+
+        try:
+            await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Clean task',
+                description='Generic refactor of foo/bar.py',
+            )
+            calls_after_submit = len(spy_calls)
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert calls_after_submit == 1, (
+            f'Expected _path_guard_or_skip called exactly once, got {calls_after_submit}'
+        )
+        assert spy_calls[0]['project_id'] == 'some_other_project', (
+            f'Expected project_id=some_other_project, got: {spy_calls[0]["project_id"]!r}'
+        )
+
+    # -- Case 6 -----------------------------------------------------------
+    @pytest.mark.asyncio
+    async def test_add_subtask_invokes_path_guard_or_skip(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """add_subtask delegates path-scope guard to _path_guard_or_skip with a
+        pre-built candidate (symmetry test).
+
+        Before step-7 this is RED: add_subtask calls _path_guard_error directly,
+        so the spy is never called and the assertion fails.
+        """
+        spy_calls: list[dict] = []
+
+        def spy(self, kwargs, project_id, candidate=None):
+            spy_calls.append({'project_id': project_id, 'candidate': candidate})
+            return None  # allow the call through (no rejection)
+
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_or_skip', spy)
+
+        await interceptor.add_subtask(
+            parent_id='1',
+            project_root='/some-other-project',
+            title='Clean task',
+        )
+
+        assert len(spy_calls) == 1, (
+            f'Expected _path_guard_or_skip called exactly once, got {len(spy_calls)}'
+        )
+        assert spy_calls[0]['project_id'] == 'some_other_project', (
+            f'Expected project_id=some_other_project, got: {spy_calls[0]["project_id"]!r}'
+        )
+        # add_subtask pre-builds the candidate and passes it; verify it's non-None
+        assert spy_calls[0]['candidate'] is not None, (
+            'Expected add_subtask to pass a pre-built candidate to _path_guard_or_skip'
+        )
