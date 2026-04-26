@@ -3706,3 +3706,60 @@ class TestHarnessDrainIdleShortCircuit:
             f"Expected exactly 1 'Harness fully drained' record but got "
             f"{len(drained_records)}: {[r.message for r in drained_records]}"
         )
+
+
+# ── Deferred-write replay deduplication (Fix 2) ───────────────────────────────
+
+
+class TestReplayDeferredWritesCompletionSummaryDedup:
+    """Tests for the completion-summary dedup check in _replay_deferred_writes."""
+
+    @pytest.mark.asyncio
+    async def test_skip_on_prior_match(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """When a prior done-summary exists in Mem0, the deferred write is skipped."""
+        from unittest.mock import MagicMock
+
+        prior_result = MagicMock()
+        prior_result.metadata = {
+            'task_id': '517',
+            'transition': 'done',
+            'source': 'targeted_reconciliation',
+        }
+        mock_memory_service.search = AsyncMock(return_value=[prior_result])
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        await event_buffer.defer_write(
+            'test-project',
+            "Task 'X' completed. Summary here.",
+            'observations_and_summaries',
+            {
+                'task_id': '517',
+                'transition': 'done',
+                'source': 'targeted_reconciliation',
+                '_deferred': True,
+            },
+        )
+
+        with caplog.at_level(logging.INFO):
+            await harness._replay_deferred_writes('test-project')
+
+        # (a) add_memory was NOT called — dedup should have skipped the write
+        mock_memory_service.add_memory.assert_not_called()
+
+        # (b) the row was deleted from event_buffer
+        await event_buffer.release_stale_claims(0.0)
+        remaining = await event_buffer.claim_deferred_writes('test-project')
+        assert len(remaining) == 0, f'Expected no remaining rows but got {len(remaining)}'
+
+        # (c) INFO log mentions skipping task 517
+        skip_records = [
+            r for r in caplog.records
+            if '517' in r.message and r.levelno == logging.INFO
+        ]
+        assert skip_records, (
+            f'Expected an INFO log mentioning task 517 but got: '
+            f'{[r.message for r in caplog.records]}'
+        )
