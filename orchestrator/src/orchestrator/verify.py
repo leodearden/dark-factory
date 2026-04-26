@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -987,6 +988,9 @@ async def run_verification(
     allow_cold_cache: bool = True,
     max_retries: int | None = None,
     is_merge_verify: bool = False,
+    attempt_id: int | None = None,
+    task_id: str | None = None,
+    archive_root: Path | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
 
@@ -1066,27 +1070,45 @@ async def run_verification(
             'concurrent' if concurrent else 'sequential',
         )
 
-    async def _run_or_skip(cmd: str | None) -> tuple[int, str, bool]:
+    async def _run_or_skip_timed(
+        cmd: str | None,
+    ) -> tuple[int, str, bool, str | None, float]:
+        """Like _run_cmd but returns (rc, out, timed_out, started_at_iso, duration_secs).
+
+        When *cmd* is None (skipped check), returns (0, '', False, None, 0.0).
+        """
         if cmd is None:
-            return 0, '', False
-        return await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+            return 0, '', False, None, 0.0
+        started_at = datetime.now(timezone.utc).isoformat()
+        t0 = time.monotonic()
+        rc, out, timed_out_flag = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+        return rc, out, timed_out_flag, started_at, time.monotonic() - t0
+
+    # Per-check timing for the final attempt (reset each retry; only the last values
+    # are used for persistence — internal retries collapse into the final result).
+    test_started_at: str | None = None
+    test_duration: float = 0.0
+    lint_started_at: str | None = None
+    lint_duration: float = 0.0
+    type_started_at: str | None = None
+    type_duration: float = 0.0
 
     attempt = 0
     while True:
         if concurrent:
             (
-                (test_rc, test_out, test_timed_out),
-                (lint_rc, lint_out, lint_timed_out),
-                (type_rc, type_out, type_timed_out),
+                (test_rc, test_out, test_timed_out, test_started_at, test_duration),
+                (lint_rc, lint_out, lint_timed_out, lint_started_at, lint_duration),
+                (type_rc, type_out, type_timed_out, type_started_at, type_duration),
             ) = await asyncio.gather(
-                _run_or_skip(test_cmd),
-                _run_or_skip(lint_cmd),
-                _run_or_skip(type_cmd),
+                _run_or_skip_timed(test_cmd),
+                _run_or_skip_timed(lint_cmd),
+                _run_or_skip_timed(type_cmd),
             )
         else:
-            test_rc, test_out, test_timed_out = await _run_or_skip(test_cmd)
-            lint_rc, lint_out, lint_timed_out = await _run_or_skip(lint_cmd)
-            type_rc, type_out, type_timed_out = await _run_or_skip(type_cmd)
+            test_rc, test_out, test_timed_out, test_started_at, test_duration = await _run_or_skip_timed(test_cmd)
+            lint_rc, lint_out, lint_timed_out, lint_started_at, lint_duration = await _run_or_skip_timed(lint_cmd)
+            type_rc, type_out, type_timed_out, type_started_at, type_duration = await _run_or_skip_timed(type_cmd)
 
         passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
         any_timed_out = test_timed_out or lint_timed_out or type_timed_out
@@ -1155,6 +1177,52 @@ async def run_verification(
         cause_hint = ' | '.join(hint_parts)
         category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
+    # Persist attempt logs when requested (opt-in via attempt_id kwarg).
+    # No-op when attempt_id is None (existing callers: merge_queue, review_checkpoint).
+    worktree_log_paths: list[str] = []
+    archive_log_paths: list[str] = []
+    if attempt_id is not None and task_id is not None:
+        runs = [
+            {
+                'label': 'test',
+                'cmd': test_cmd,
+                'rc': test_rc,
+                'output': test_out,
+                'timed_out': test_timed_out,
+                'started_at': test_started_at or '',
+                'duration_secs': test_duration,
+            },
+            {
+                'label': 'lint',
+                'cmd': lint_cmd,
+                'rc': lint_rc,
+                'output': lint_out,
+                'timed_out': lint_timed_out,
+                'started_at': lint_started_at or '',
+                'duration_secs': lint_duration,
+            },
+            {
+                'label': 'type',
+                'cmd': type_cmd,
+                'rc': type_rc,
+                'output': type_out,
+                'timed_out': type_timed_out,
+                'started_at': type_started_at or '',
+                'duration_secs': type_duration,
+            },
+        ]
+        try:
+            wt_paths = _persist_attempt_logs(
+                worktree, attempt_id, runs, category, cause_hint,
+            )
+            worktree_log_paths = [str(p) for p in wt_paths]
+            arch_paths = _archive_attempt_log(
+                wt_paths, archive_root, task_id, attempt_id, category,
+            )
+            archive_log_paths = [str(p) for p in arch_paths]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('run_verification: persistence error (non-fatal): %s', exc)
+
     result = VerifyResult(
         passed=passed,
         test_output=test_out,
@@ -1164,6 +1232,8 @@ async def run_verification(
         timed_out=timed_out,
         cause_hint=cause_hint,
         category=category,
+        worktree_log_paths=worktree_log_paths,
+        archive_log_paths=archive_log_paths,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -1278,6 +1348,9 @@ async def run_scoped_verification(
     *,
     max_retries: int | None = None,
     is_merge_verify: bool = False,
+    attempt_id: int | None = None,
+    task_id: str | None = None,
+    archive_root: Path | None = None,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
@@ -1336,6 +1409,7 @@ async def run_scoped_verification(
                 return await run_verification(
                     worktree, config, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
+                    attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 )
             # Rewrite cargo --workspace → cargo -p <crate> when all task files
             # are .rs and map to known workspace crates.
@@ -1355,6 +1429,7 @@ async def run_scoped_verification(
                     worktree, config, mc,
                     max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
+                    attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 )
                 for mc in scoped
             )
@@ -1374,6 +1449,7 @@ async def run_scoped_verification(
             return await run_verification(
                 worktree, config, fallback, max_retries=max_retries,
                 is_merge_verify=is_merge_verify,
+                attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
             )
 
         # For Rust projects with no module_configs and no Python fallback
@@ -1396,10 +1472,12 @@ async def run_scoped_verification(
                 return await run_verification(
                     worktree, config, rewritten, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
+                    attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 )
 
     logger.info('Verification mode: global (no scope info)')
     return await run_verification(
         worktree, config, max_retries=max_retries,
         is_merge_verify=is_merge_verify,
+        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
     )
