@@ -433,28 +433,25 @@ class DurableWriteQueue:
 
         assert self._db is not None
         placeholders = ','.join('?' * len(ids))
-        # Find which of the requested ids are actually dead in this group.
+        # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
+        # The WHERE guards (status='dead', group_id=?) are enforced atomically so
+        # a concurrent replay or worker cannot slip a row past the eligibility check
+        # between a separate SELECT and DELETE.
         cursor = await self._db.execute(
-            f'SELECT id FROM write_queue '
-            f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=?",
+            f"DELETE FROM write_queue "
+            f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
+            f"RETURNING id",
             (*ids, group_id),
         )
         rows = await cursor.fetchall()
-        deletable: set[int] = {
+        deleted: set[int] = {
             (row[0] if isinstance(row, tuple) else row['id']) for row in rows
         }
-
-        if deletable:
-            del_placeholders = ','.join('?' * len(deletable))
-            await self._db.execute(
-                f'DELETE FROM write_queue WHERE id IN ({del_placeholders})',
-                tuple(deletable),
-            )
-            await self._db.commit()
+        await self._db.commit()
 
         return {
-            'deleted': sorted(deletable),
-            'not_found': sorted(set(ids) - deletable),
+            'deleted': sorted(deleted),
+            'not_found': sorted(set(ids) - deleted),
         }
 
     async def get_dead_items(
