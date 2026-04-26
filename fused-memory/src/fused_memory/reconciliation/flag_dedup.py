@@ -1,12 +1,17 @@
 """Flag deduplication helpers for Stage 1 (MemoryConsolidator).
 
-This module provides deterministic, code-level deduplication of Stage 1's
-``items_flagged`` output.  The LLM has no memory of prior cycles, so the same
-(task_id, flag_type) pair can be emitted cycle after cycle.  Rather than
-relying on prompt instructions (fragile across model versions), the harness
-post-processes each report: for flags with a computable *signature* we check
-Mem0 for a prior ``stage1_flag_marker`` memory and, on a hit, annotate the
-flag with ``persisted_from_run`` so Stage 2 can decide whether to re-act.
+This module provides code-level annotation of Stage 1's ``items_flagged``
+output.  The LLM has no memory of prior cycles, so the same (task_id,
+flag_type) pair can be emitted cycle after cycle.  For flags with a
+computable *signature* we check Mem0 for a prior ``stage1_flag_marker``
+memory.  On a hit, the flag is annotated with ``persisted_from_run`` — this
+is advisory: Stage 2's prompt uses the annotation to decide whether to
+re-act, search for prior actions, or skip the flag.  On a miss, a new
+marker memory is written so future cycles can detect the repeat.
+
+Note: this module does **not** suppress persistent flags before Stage 2 sees
+them; suppression logic lives in Stage 2's prompt instructions which direct
+the LLM to soft-handle annotated flags.
 
 Public API
 ----------
@@ -28,7 +33,7 @@ async def dedup_flags(
     run_id: str,
     flags: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Deduplicate Stage 1 flagged items against prior ``stage1_flag_marker`` memories.
+    """Annotate Stage 1 flagged items against prior ``stage1_flag_marker`` memories.
 
     For each flag in *flags*:
 
@@ -36,8 +41,9 @@ async def dedup_flags(
       ``flag_type``), it is returned unchanged — no I/O performed.
     - If a signature is computable, Mem0 is searched for a prior marker memory
       with matching ``task_id`` and ``flag_type``.  On a hit the flag is
-      annotated with ``persisted_from_run`` and ``last_seen_run_id``, and a
-      refresh marker is written.  On a miss a new marker is written.
+      annotated with ``persisted_from_run`` and ``last_seen_run_id``; no
+      additional marker write is made (avoids monotonic marker accumulation).
+      On a miss a new marker is written so future cycles detect the repeat.
     - All search/write exceptions are caught and logged at WARNING so that a
       transient Mem0 outage does not abort the stage run.
 
@@ -51,11 +57,13 @@ async def dedup_flags(
             continue
         tid, ftype = sig
         try:
+            # Limit=50 and constrain by category to reduce false-negatives from
+            # embedding-similarity ranking when the marker table is large.
             matches = await memory_service.search(
                 query=f'stage1 flag marker task {tid} type {ftype}',
                 project_id=project_id,
                 categories=['observations_and_summaries'],
-                limit=10,
+                limit=50,
             )
             prior = next(
                 (
@@ -73,23 +81,15 @@ async def dedup_flags(
                 flag = dict(flag)
                 flag['persisted_from_run'] = prior_run_id
                 flag['last_seen_run_id'] = run_id
-                # Write a refresh marker so last_seen_run_id is up to date
-                await memory_service.add_memory(
-                    content=f'Stage 1 flag marker: task={tid} type={ftype} from run={prior_run_id}',
-                    category='observations_and_summaries',
-                    project_id=project_id,
-                    metadata={
-                        'source': 'stage1_flag_marker',
-                        'task_id': tid,
-                        'flag_type': ftype,
-                        'run_id': prior_run_id,
-                        'last_seen_run_id': run_id,
-                    },
-                    causation_id=run_id,
-                    _source='reconciliation',
-                )
+                # No refresh write — the prior marker is sufficient for dedup.
+                # Appending a new marker every cycle would grow the marker table
+                # monotonically (N*M rows for M flags over N cycles).  A future
+                # GC sweep can use last_seen_run_id written on the initial marker
+                # to expire stale rows.
             else:
-                # Novel flag — write a new marker for future dedup cycles
+                # Novel flag — write a new marker for future dedup cycles.
+                # _source='stage1_flag_dedup' distinguishes these from
+                # 'targeted_recon' writes in the audit journal.
                 await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
@@ -102,7 +102,7 @@ async def dedup_flags(
                         'last_seen_run_id': run_id,
                     },
                     causation_id=run_id,
-                    _source='reconciliation',
+                    _source='stage1_flag_dedup',
                 )
         except Exception as e:
             logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
@@ -113,15 +113,17 @@ async def dedup_flags(
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     """Return a (task_id_str, flag_type_str) signature for *flag*, or ``None``.
 
-    Both ``task_id`` and ``flag_type`` must be present and truthy for a
-    signature to be computed.  Values are coerced to ``str`` so that an integer
-    task_id (common in LLM output) and a string task_id compare equal.
+    Both ``task_id`` and ``flag_type`` must be present (i.e. not ``None``) for
+    a signature to be computed.  Values are coerced to ``str`` so that an
+    integer task_id (common in LLM output) and a string task_id compare equal.
+    Falsy-but-valid values like ``task_id=0`` or ``flag_type=''`` are accepted
+    — only ``None`` (absent key) triggers a ``None`` return.
 
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
     """
     task_id = flag.get('task_id')
     flag_type = flag.get('flag_type')
-    if not task_id or not flag_type:
+    if task_id is None or flag_type is None:
         return None
     return (str(task_id), str(flag_type))

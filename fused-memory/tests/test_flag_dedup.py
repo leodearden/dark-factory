@@ -53,6 +53,16 @@ class TestComputeFlagSignature:
         flag = {'description': 'some flag'}
         assert compute_flag_signature(flag) is None
 
+    def test_returns_tuple_when_task_id_is_zero(self):
+        """task_id=0 is a falsy-but-valid value; should produce a signature, not None."""
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        flag = {'task_id': 0, 'flag_type': 'missing_deliverable'}
+        result = compute_flag_signature(flag)
+        assert result == ('0', 'missing_deliverable'), (
+            'task_id=0 must not be silently discarded by a falsy check'
+        )
+
 
 # ---------------------------------------------------------------------------
 # dedup_flags tests — no-signature path (step-3)
@@ -101,9 +111,9 @@ def _make_memory_result(metadata: dict) -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_dedup_flags_prior_marker_found_annotates_flag_and_refreshes():
+async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id
-    and a refresh marker is written.
+    and NO additional marker write is made (avoids monotonic marker accumulation).
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
@@ -146,8 +156,8 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_and_refreshes():
     assert 'task' in query.lower() or '42' in query
     assert '42' in query or 'missing_deliverable' in query
 
-    # (c) A refresh marker write was made via add_memory
-    memory_service.add_memory.assert_called_once()
+    # (c) No refresh write — the prior marker is sufficient; skipping avoids N*M accumulation
+    memory_service.add_memory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
