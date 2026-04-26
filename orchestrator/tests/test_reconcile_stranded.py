@@ -575,6 +575,56 @@ class TestReconcileStrandedInProgress:
         # cleanup_worktree must NOT have been called
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_already_merged_drops_recovered_plan_and_cleans_worktree(
+        self, harness: Harness
+    ):
+        """Regression: when is_ancestor=True and the task has a recovered plan,
+        the stale _recovered_plans entry must be dropped and the worktree must
+        be cleaned up unconditionally — not skipped by the old guard.
+
+        RED state: against current main the guard at harness.py:935 is
+        `worktree_path.exists() and tid not in self._recovered_plans`, so
+        cleanup is skipped and the _recovered_plans entry lingers.  The
+        assertions `tid not in harness._recovered_plans` and
+        `cleanup_worktree.assert_awaited_once_with(...)` will both fail.
+        """
+        tid = '52'
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {tid: 'in-progress'}, None
+        )
+        # Seed a recovered plan — simulates _recover_crashed_tasks having run
+        harness._recovered_plans[tid] = {'task_id': tid, 'steps': []}
+
+        # Create the worktree dir on disk so the cleanup branch is reachable
+        worktree_path = harness.git_ops.worktree_base / tid
+        worktree_path.mkdir(parents=True)
+
+        await harness._reconcile_stranded_in_progress()
+
+        # (1) Stale recovered-plan entry must be dropped
+        assert tid not in harness._recovered_plans, (
+            '_recovered_plans entry must be popped when branch is already on main'
+        )
+
+        # (2) cleanup_worktree must be called exactly once (unconditional cleanup)
+        harness.git_ops.cleanup_worktree.assert_awaited_once_with(  # type: ignore[attr-defined]
+            worktree_path, tid
+        )
+
+        # (3) Task must be marked done with the expected provenance
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'note': 'reconcile: branch already on main when stranded in-progress',
+            },
+        )
+
+        # (4) Worktree dir is gone — proves cleanup_worktree's rmtree side_effect ran
+        assert not worktree_path.exists(), (
+            'worktree dir must be removed by cleanup_worktree'
+        )
+
     async def test_already_merged_takes_precedence_over_stale_lock(
         self, harness: Harness, monkeypatch
     ):
