@@ -15,7 +15,11 @@ from fused_memory.middleware.task_interceptor import _is_ticket_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.utils.validation import validate_int_ids, validate_project_id, validate_project_root
+from fused_memory.utils.validation import (
+    validate_int_ids,
+    validate_project_id,
+    validate_project_root,
+)
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor

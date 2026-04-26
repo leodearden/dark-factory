@@ -1010,7 +1010,7 @@ class TestValidateIntIdsName:
         """Non-list branch uses the custom name in the error string."""
         result = validate_int_ids(None, name='row_ids')
         assert result is not None
-        assert 'row_ids must be a list of integers, got NoneType' == result['error']
+        assert result['error'] == 'row_ids must be a list of integers, got NoneType'
 
     def test_name_kwarg_in_element_error(self):
         """Element error uses the custom name."""
