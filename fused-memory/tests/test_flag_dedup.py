@@ -416,6 +416,56 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(prio
 
 
 @pytest.mark.asyncio
+async def test_dedup_flags_unknown_sentinel_emits_info_log(caplog):
+    """When a prior marker exists but its run_id is falsy (collapses to 'unknown'),
+    dedup_flags must emit an INFO log mentioning the task_id and flag_type so that
+    observability dashboards can detect malformed markers in normal operation.
+
+    Uses a run_id=None prior (survives the candidate filter because source/task_id/
+    flag_type are valid) to trigger the sentinel-collapse path at flag_dedup.py:88.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    # Marker that survives the candidate filter but has a falsy run_id → sentinel
+    prior_marker = _make_memory_result({**_VALID_FILTER_META, 'run_id': None})
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.add_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # Sentinel value is preserved in the result
+    assert result[0]['persisted_from_run'] == 'unknown', (
+        f"Expected sentinel 'unknown' but got {result[0].get('persisted_from_run')!r}"
+    )
+
+    # At least one INFO (or higher) log record must mention task_id AND flag_type
+    # AND one of 'unknown'/'malformed' — loose enough to tolerate minor wording
+    # changes, strict enough to lock in the observability intent.
+    assert any(
+        '42' in record.message
+        and 'missing_deliverable' in record.message
+        and ('unknown' in record.message or 'malformed' in record.message)
+        and record.levelno >= logging.INFO
+        for record in caplog.records
+    ), (
+        f"Expected an INFO log mentioning task_id='42', flag_type='missing_deliverable', "
+        f"and 'unknown'/'malformed', but got records: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog):
     """When memory_service.add_memory raises, dedup_flags does not raise, returns flag unchanged,
     and logs a WARNING.
