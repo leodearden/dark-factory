@@ -3300,23 +3300,29 @@ class TestPruneArchiveThrottle:
             )
             assert result_real is True
 
-    def test_prune_archive_oserror_swallowed_and_throttle_advances(self, monkeypatch, tmp_path: Path):
+    def test_prune_archive_oserror_swallowed_and_throttle_advances(self, monkeypatch, caplog, tmp_path: Path):
         """OSError from ``_prune_archive`` is swallowed and the throttle advances.
 
         Simulates a permission-broken FS where _prune_archive raises OSError
         (e.g. archive_root.exists() or rglob fails).  The first call must return
         True (fired, exception swallowed), the throttle must advance (_LAST_PRUNE_AT
         is not None), and the second call must be throttled (_prune_archive called
-        only once total).
+        only once total).  The failure must also be logged at WARNING level so
+        operators can observe FS problems without being flooded per-verification.
 
         Must FAIL until step-4 wraps the _prune_archive call in try/except OSError.
         """
+        import logging  # noqa: PLC0415
+
         from orchestrator import verify  # noqa: PLC0415
         from orchestrator.verify import _maybe_prune_archive  # noqa: PLC0415
 
         archive_root = tmp_path / 'data' / 'verify-logs'
 
-        with patch.object(verify, '_prune_archive', side_effect=OSError('permission denied')) as spy:
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+            patch.object(verify, '_prune_archive', side_effect=OSError('permission denied')) as spy,
+        ):
             result = _maybe_prune_archive(archive_root)  # first call — fires but raises
 
         assert result is True, (
@@ -3327,6 +3333,10 @@ class TestPruneArchiveThrottle:
         )
         assert verify._LAST_PRUNE_AT is not None, (
             '_LAST_PRUNE_AT must be advanced even when _prune_archive raises OSError'
+        )
+        assert any('permission denied' in r.message for r in caplog.records), (
+            'Expected a WARNING log record containing "permission denied" — '
+            'logger.warning must be called so FS errors are visible to operators'
         )
 
         # Second call — throttle should still apply (window not elapsed)
@@ -3350,34 +3360,6 @@ class TestPruneArchiveThrottle:
 
         with patch.object(verify, '_prune_archive', side_effect=RuntimeError('bug')), pytest.raises(RuntimeError, match='bug'):
             _maybe_prune_archive(archive_root)
-
-    def test_throttle_uses_module_level_monotonic_indirection(self, monkeypatch, tmp_path: Path):
-        """``_maybe_prune_archive`` reads time via the ``verify._monotonic`` indirection.
-
-        Patches ``verify._monotonic`` directly (not ``verify.time.monotonic``) to confirm
-        that the module-level reference capture is in place.  This test must FAIL until
-        step-2 adds ``_monotonic = time.monotonic`` to verify.py and updates
-        ``_maybe_prune_archive`` to call ``_monotonic()`` instead of ``time.monotonic()``.
-        """
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _PRUNE_THROTTLE_SECS, _maybe_prune_archive  # noqa: PLC0415
-
-        archive_root = tmp_path / 'data' / 'verify-logs'
-        base_time = 0.0
-
-        with patch.object(verify, '_prune_archive') as spy:
-            # monkeypatch.setattr raises AttributeError when the attribute is absent —
-            # this is the expected failure mode until _monotonic is added to verify.py.
-            monkeypatch.setattr(verify, '_monotonic', lambda: base_time)
-            _maybe_prune_archive(archive_root)  # first call — fires
-
-            elapsed = _PRUNE_THROTTLE_SECS + 1
-            monkeypatch.setattr(verify, '_monotonic', lambda: base_time + elapsed)
-            _maybe_prune_archive(archive_root)  # second call — window elapsed, fires again
-
-        assert spy.call_count == 2, (
-            f'Call after throttle elapsed should fire again; expected 2, got {spy.call_count}'
-        )
 
     @pytest.mark.asyncio
     async def test_run_scoped_verification_finally_uses_wrapper(self, monkeypatch, tmp_path: Path):

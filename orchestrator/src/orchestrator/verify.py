@@ -583,6 +583,10 @@ def _maybe_prune_archive(archive_root: Path | None) -> bool:
     try:
         _prune_archive(archive_root)
     except OSError as exc:
+        # Deliberate OSError-only scope: _prune_archive uses path.unlink() (not
+        # shutil.rmtree), so shutil.Error cannot arise.  PermissionError /
+        # FileNotFoundError are OSError subclasses on Python ≥ 3.3.  Programming
+        # bugs (RuntimeError, AttributeError, etc.) still propagate uncaught.
         logger.warning(
             '_maybe_prune_archive: prune raised %s; advancing throttle to suppress retry storm',
             exc,
