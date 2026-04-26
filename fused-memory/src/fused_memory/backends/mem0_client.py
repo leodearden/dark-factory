@@ -123,6 +123,8 @@ class Mem0Backend:
         filters: dict | None = None
         if categories and len(categories) == 1:
             filters = {'category': categories[0]}
+        elif categories and len(categories) > 1:
+            filters = {'category': {'in': list(categories)}}
         try:
             return await asyncio.wait_for(
                 instance.search(
