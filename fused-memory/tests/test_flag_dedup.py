@@ -373,7 +373,9 @@ _VALID_FILTER_META = {
     ],
 )
 @pytest.mark.asyncio
-async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(prior_metadata):
+async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
+    prior_metadata, caplog
+):
     """When a prior stage1_flag_marker exists but has a missing/falsy run_id, dedup_flags
     must annotate the flag with persisted_from_run='unknown' — not the current run_id.
 
@@ -383,11 +385,17 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(prio
     (d) run_id=''                  → .get returns '' ≠ 'unknown'
     All three must produce persisted_from_run='unknown' with the sentinel fix applied.
 
+    Also asserts that the sentinel-collapse path emits a DEBUG log for each malformed
+    shape — this folds in what was previously a standalone test, giving observability
+    coverage across all three shapes in a single parametrized suite.
+
     Note: the case where prior.metadata is None is intentionally omitted.  When
     metadata is None, the candidate filter ((r.metadata or {}).get('source') etc.)
     returns falsy values for all three checks, so the candidate is never selected
     as ``prior`` — the code under test (run_id extraction) is never reached.
     """
+    import logging
+
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     prior_marker = _make_memory_result(prior_metadata)
@@ -398,12 +406,13 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(prio
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
 
-    result = await dedup_flags(
-        memory_service=memory_service,
-        project_id='p',
-        run_id='r1',
-        flags=flags,
-    )
+    with caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
 
     assert len(result) == 1
     assert result[0]['persisted_from_run'] == 'unknown', (
@@ -414,53 +423,17 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(prio
     # No new marker write — prior was found, no accumulation
     memory_service.add_memory.assert_not_called()
 
-
-@pytest.mark.asyncio
-async def test_dedup_flags_unknown_sentinel_emits_info_log(caplog):
-    """When a prior marker exists but its run_id is falsy (collapses to 'unknown'),
-    dedup_flags must emit an INFO log mentioning the task_id and flag_type so that
-    observability dashboards can detect malformed markers in normal operation.
-
-    Uses a run_id=None prior (survives the candidate filter because source/task_id/
-    flag_type are valid) to trigger the sentinel-collapse path at flag_dedup.py:88.
-    """
-    import logging
-
-    from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-    # Marker that survives the candidate filter but has a falsy run_id → sentinel
-    prior_marker = _make_memory_result({**_VALID_FILTER_META, 'run_id': None})
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
-    memory_service.add_memory = AsyncMock(return_value=None)
-
-    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
-
-    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
-        result = await dedup_flags(
-            memory_service=memory_service,
-            project_id='p',
-            run_id='r1',
-            flags=flags,
-        )
-
-    # Sentinel value is preserved in the result
-    assert result[0]['persisted_from_run'] == 'unknown', (
-        f"Expected sentinel 'unknown' but got {result[0].get('persisted_from_run')!r}"
-    )
-
-    # At least one INFO (or higher) log record must mention task_id AND flag_type
-    # AND one of 'unknown'/'malformed' — loose enough to tolerate minor wording
-    # changes, strict enough to lock in the observability intent.
+    # Sentinel-collapse path emits a DEBUG log — covers all three malformed shapes.
+    # Loose enough to tolerate minor wording changes; strict enough to lock in the
+    # observability intent (dashboards can grep for 'unknown'/'malformed').
     assert any(
         '42' in record.message
         and 'missing_deliverable' in record.message
         and ('unknown' in record.message or 'malformed' in record.message)
-        and record.levelno >= logging.INFO
+        and record.levelno >= logging.DEBUG
         for record in caplog.records
     ), (
-        f"Expected an INFO log mentioning task_id='42', flag_type='missing_deliverable', "
+        f"Expected a DEBUG log mentioning task_id='42', flag_type='missing_deliverable', "
         f"and 'unknown'/'malformed', but got records: {[r.message for r in caplog.records]}"
     )
 
@@ -477,8 +450,9 @@ async def test_dedup_flags_prior_marker_None_metadata_writes_new_marker():
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     # Prior result with metadata=None — survives the search but is rejected by the
-    # candidate filter because (r.metadata or {}).get('source') returns None, which
-    # doesn't equal 'stage1_flag_marker'.
+    # candidate filter because (r.metadata or {}).get('task_id', '') is empty and
+    # does not match '42'; the task_id check runs first so the source/flag_type
+    # checks are never evaluated.
     prior_result = _make_memory_result(None)
 
     memory_service = AsyncMock()

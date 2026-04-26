@@ -87,7 +87,7 @@ async def dedup_flags(
         if prior is not None:
             prior_run_id = (prior.metadata or {}).get('run_id') or 'unknown'
             if prior_run_id == 'unknown':
-                logger.info(
+                logger.debug(
                     'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
                     tid,
                     ftype,
