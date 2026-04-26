@@ -101,6 +101,10 @@ def harness(tmp_path: Path, mock_orch_config):
 
     h.git_ops.cleanup_worktree = AsyncMock(side_effect=_fake_cleanup)
 
+    # Default: is_ancestor returns False so no guard fires for existing tests.
+    # Individual tests may override with AsyncMock(return_value=True).
+    h.git_ops.is_ancestor = AsyncMock(return_value=False)
+
     return h
 
 

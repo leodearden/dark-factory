@@ -915,6 +915,20 @@ Output JSON matching the schema. Every task must appear in the output.
             if status != 'in-progress':
                 continue
 
+            branch = f'{self.git_ops.config.branch_prefix}{tid}'
+            if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
+                await self.scheduler.set_task_status(
+                    tid, 'done',
+                    done_provenance={
+                        'note': 'reconcile: branch already on main when stranded in-progress',
+                    },
+                )
+                logger.info(
+                    'Reconcile: marked task %s done '
+                    '(reason=branch-already-on-main)', tid,
+                )
+                continue
+
             worktree_path = self.git_ops.worktree_base / tid
             lock_path = worktree_path / '.task' / 'plan.lock'
 
