@@ -120,8 +120,9 @@ class TestCrossAccountResume:
             oauth_token=token,
             **_INVOKE_DEFAULTS,
         )
-        if not r1.success or not r1.session_id:
-            pytest.skip(f'Initial invocation failed (account capped or unavailable): {r1.output!r}')
+        if not r1.success and _looks_like_capacity_failure(r1):
+            pytest.skip(f'Capacity failure: {r1.output!r}')
+        assert r1.success and r1.session_id
 
         # Resume and ask for the codeword
         r2 = await invoke_claude_agent(
@@ -130,8 +131,9 @@ class TestCrossAccountResume:
             resume_session_id=r1.session_id,
             **_INVOKE_DEFAULTS,
         )
-        if not r2.success:
-            pytest.skip(f'Resume invocation failed (account capped or unavailable): {r2.output!r}')
+        if not r2.success and _looks_like_capacity_failure(r2):
+            pytest.skip(f'Capacity failure: {r2.output!r}')
+        assert r2.success
         assert 'FLAMINGO' in r2.output.upper(), (
             f'Expected FLAMINGO in resumed output, got: {r2.output!r}'
         )
@@ -148,8 +150,9 @@ class TestCrossAccountResume:
             oauth_token=token_a,
             **_INVOKE_DEFAULTS,
         )
-        if not r1.success or not r1.session_id:
-            pytest.skip(f'Initial invocation on account A failed (capped or unavailable): {r1.output!r}')
+        if not r1.success and _looks_like_capacity_failure(r1):
+            pytest.skip(f'Capacity failure: {r1.output!r}')
+        assert r1.success and r1.session_id
 
         # Resume on account B and ask for the codeword
         r2 = await invoke_claude_agent(
@@ -158,8 +161,9 @@ class TestCrossAccountResume:
             resume_session_id=r1.session_id,
             **_INVOKE_DEFAULTS,
         )
-        if not r2.success:
-            pytest.skip(f'Resume invocation on account B failed (capped or unavailable): {r2.output!r}')
+        if not r2.success and _looks_like_capacity_failure(r2):
+            pytest.skip(f'Capacity failure: {r2.output!r}')
+        assert r2.success
         assert 'ZEPPELIN' in r2.output.upper(), (
             f'Expected ZEPPELIN in cross-account resumed output, got: {r2.output!r}'
         )
