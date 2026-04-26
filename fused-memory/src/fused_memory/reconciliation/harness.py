@@ -447,6 +447,31 @@ class ReconciliationHarness:
             return
         logger.info(f'Replaying {len(deferred)} deferred writes for {project_id}')
         for write in deferred:
+            meta = write['metadata'] or {}
+            tid = meta.get('task_id')
+            transition = meta.get('transition')
+
+            # Dedup check: skip completion-summary writes that already exist in Mem0.
+            # Only for transition='done' writes — other transitions are left as-is.
+            if transition == 'done' and tid:
+                results = await self.memory.search(
+                    query=f'task {tid} completion done',
+                    project_id=project_id,
+                    limit=5,
+                )
+                prior = [
+                    r for r in results
+                    if r.metadata.get('task_id') == str(tid)
+                    and r.metadata.get('transition') == 'done'
+                ]
+                if prior:
+                    logger.info(
+                        'Skipping deferred completion-summary for task %s — already written',
+                        tid,
+                    )
+                    await self.buffer.delete_deferred_write(write['id'])
+                    continue
+
             try:
                 await self.memory.add_memory(
                     content=write['content'],
