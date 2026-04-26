@@ -1071,6 +1071,10 @@ class TestReconcileStrandedInProgress:
         )
 
         if cleanup_raises:
+            # cleanup_worktree must have been called (before the OSError was swallowed).
+            harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+                worktree_path, tid
+            )
             # Exception swallowed; WARNING log must contain tid and reason.
             warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert any(
@@ -1098,10 +1102,28 @@ class TestReconcileStrandedInProgress:
             )
 
     @pytest.mark.parametrize(
-        'scenario,is_ancestor_val,marker_sha_val',
+        'scenario,is_ancestor_val,marker_sha_val,expected_provenance',
         [
-            pytest.param('is_ancestor', True, None, id='is_ancestor-branch'),
-            pytest.param('marker', False, 'cafebabe' + 'd' * 32, id='marker-branch'),
+            pytest.param(
+                'is_ancestor',
+                True,
+                None,
+                {
+                    'note': 'reconcile: branch already on main when stranded in-progress',
+                    'commit': 'deadbeef' + 'a' * 32,
+                },
+                id='is_ancestor-branch',
+            ),
+            pytest.param(
+                'marker',
+                False,
+                'cafebabe' + 'd' * 32,
+                {
+                    'note': 'reconcile: branch deleted but merge marker found on main',
+                    'commit': 'cafebabe' + 'd' * 32,
+                },
+                id='marker-branch',
+            ),
         ],
     )
     async def test_absent_worktree_dir_skips_cleanup(
@@ -1110,24 +1132,34 @@ class TestReconcileStrandedInProgress:
         scenario: str,
         is_ancestor_val: bool,
         marker_sha_val: str | None,
+        expected_provenance: dict,
     ):
         """When the worktree directory does not exist, cleanup_worktree must
         NOT be called — the existence guard must hold for both done-branches.
-        set_task_status still fires normally.
+        set_task_status still fires with 'done' and the expected provenance,
+        and _recovered_plans is popped regardless of worktree absence.
         """
         tid = '97'
         harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)  # type: ignore[attr-defined]
         harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)  # type: ignore[attr-defined]
         harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
 
+        # Seed a recovered plan entry — helper must pop it even without a worktree dir.
+        harness._recovered_plans[tid] = {'task_id': tid, 'steps': []}  # type: ignore[attr-defined]
+
         # Deliberately do NOT mkdir — the worktree dir is absent.
 
         await harness._reconcile_stranded_in_progress()
 
+        # Recovered plan must be gone regardless of worktree absence.
+        assert tid not in harness._recovered_plans  # type: ignore[attr-defined]
+
         # cleanup_worktree must NOT have been called.
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
-        # Task must still be marked done.
-        harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
+        # Task must still be marked done with pinned provenance.
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done', done_provenance=expected_provenance
+        )
 
 
 # ---------------------------------------------------------------------------
