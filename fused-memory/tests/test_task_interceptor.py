@@ -4730,6 +4730,34 @@ class TestExtractMetaFiles:
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['42', 'src/foo.py']
 
+    def test_build_candidate_parses_metadata_once(self, monkeypatch):
+        """_build_candidate must call _parse_metadata exactly once per invocation.
+
+        Regression guard for the hot-path dedupe: before the fix, _build_candidate
+        called _parse_metadata directly (line 909) AND indirectly via
+        _extract_meta_files (line 910) — two parses per title-bearing submission.
+        After the fix (_build_candidate delegates to _extract_meta_files_from_meta
+        using the meta already in scope), the count drops to 1.
+        """
+        original_parse = TaskInterceptor._parse_metadata
+        call_count: list[int] = [0]
+
+        def counting_parse(kwargs):
+            call_count[0] += 1
+            return original_parse(kwargs)
+
+        monkeypatch.setattr(TaskInterceptor, '_parse_metadata', staticmethod(counting_parse))
+
+        kwargs = {'title': 'Foo', 'metadata': {'files_to_modify': ['a.py']}}
+        candidate = TaskInterceptor._build_candidate(kwargs)
+
+        assert candidate is not None
+        assert candidate.files_to_modify == ['a.py']
+        assert call_count[0] == 1, (
+            f'_parse_metadata should be called exactly once by _build_candidate, '
+            f'but was called {call_count[0]} time(s)'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Regression tests — prompt-only fallback must also scan metadata files
