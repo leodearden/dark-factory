@@ -865,6 +865,148 @@ class TestRunScopedVerificationSkipsUntouched:
             f'fused-memory command should have run; calls: {calls}'
         )
 
+    # --- Fix 1: docs-only short-circuit + per-subproject fan-out ---
+
+    @pytest.mark.asyncio
+    async def test_doc_only_diff_with_module_configs_trivially_passes(
+        self, tmp_path: Path,
+    ):
+        """A docs-only diff with module_configs should trivially pass — no commands run.
+
+        Reproduces task 1025's path: 5 markdown files + non-empty
+        module_configs from the architect. Pre-fix this fell through to the
+        unsafe global ``pytest`` command at worktree root.
+        """
+        (tmp_path / 'skills').mkdir()
+        (tmp_path / 'skills' / 'foo.md').write_text('# foo\n')
+        (tmp_path / 'README.md').write_text('# readme\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='shared', test_command='uv run --directory shared pytest tests/'),
+            ModuleConfig(prefix='fused-memory', test_command='uv run --directory fused-memory pytest tests/'),
+        ]
+
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['skills/foo.md', 'README.md'],
+            )
+
+        assert result.passed
+        assert 'No source files' in result.summary, (
+            f'Expected docs-only summary, got: {result.summary!r}'
+        )
+        assert calls == [], (
+            f'No subproject commands should run for docs-only diff; got: {calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_doc_only_diff_no_module_configs_trivially_passes(
+        self, tmp_path: Path,
+    ):
+        """A docs-only diff with empty module_configs trivially passes."""
+        (tmp_path / 'skills').mkdir()
+        (tmp_path / 'skills' / 'foo.md').write_text('# foo\n')
+        (tmp_path / 'README.md').write_text('# readme\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, [],
+                task_files=['skills/foo.md', 'README.md'],
+            )
+
+        assert result.passed
+        assert 'No source files' in result.summary, (
+            f'Expected docs-only summary, got: {result.summary!r}'
+        )
+        assert calls == [], (
+            f'No commands should run for docs-only diff; got: {calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_root_conftest_plus_doc_fans_out(self, tmp_path: Path):
+        """Source files that don't fit any prefix → per-subproject fan-out (not global)."""
+        # Root conftest.py is .py source but does not start with any
+        # subproject prefix, so scope_module_config returns None for every
+        # subproject. Pre-fix this fell through to the unsafe global
+        # pytest. Post-fix it fans out per-subproject.
+        (tmp_path / 'conftest.py').write_text('# root\n')
+        (tmp_path / 'skills').mkdir()
+        (tmp_path / 'skills' / 'foo.md').write_text('# foo\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='shared', test_command='__shared_cmd__'),
+            ModuleConfig(prefix='fused-memory', test_command='__fm_cmd__'),
+        ]
+
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['conftest.py', 'skills/foo.md'],
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__shared_cmd__' in joined, (
+            f'shared subproject command should have run; calls: {calls}'
+        )
+        assert '__fm_cmd__' in joined, (
+            f'fused-memory subproject command should have run; calls: {calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_yaml_only_diff_trivially_passes(self, tmp_path: Path):
+        """``.yaml`` files do NOT count as source — verify trivially passes."""
+        (tmp_path / 'orchestrator').mkdir()
+        (tmp_path / 'orchestrator' / 'config.yaml').write_text('foo: bar\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='orchestrator', test_command='__orch_cmd__'),
+        ]
+
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['orchestrator/config.yaml'],
+            )
+
+        assert result.passed
+        assert 'No source files' in result.summary, (
+            f'Expected docs-only summary, got: {result.summary!r}'
+        )
+        assert calls == [], (
+            f'No commands should run for yaml-only diff; got: {calls}'
+        )
+
     @pytest.mark.asyncio
     async def test_max_retries_zero_disables_timeout_retry(self, tmp_path: Path):
         """max_retries=0 (merge-queue path) short-circuits the retry loop.
@@ -1379,6 +1521,92 @@ class TestExtractCauseHint:
         )
         hint = _extract_cause_hint(output)
         assert hint == 'error: first error here', f'Unexpected hint: {hint!r}'
+
+    # --- pytest-aware patterns (added by Fix 3) ---
+
+    def test_pytest_FAILED_line_returned(self):
+        """A pytest ``FAILED test::name - reason`` line is detected and returned."""
+        output = (
+            'collecting ...\n'
+            'tests/test_x.py F   [100%]\n'
+            'FAILED tests/test_x.py::test_foo - AssertionError\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'FAILED tests/test_x.py::test_foo - AssertionError', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_pytest_INTERNALERROR_returned(self):
+        """A pytest ``INTERNALERROR>`` line is detected and returned."""
+        output = (
+            'collecting ...\n'
+            'INTERNALERROR> ImportError: cannot import name foo from bar\n'
+            'INTERNALERROR>   File "x.py", line 1\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'INTERNALERROR> ImportError: cannot import name foo from bar', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_pytest_failure_summary_returned(self):
+        """A pytest ``===== N failed in Xs =====`` summary line is detected."""
+        output = (
+            'tests/test_x.py F   [100%]\n'
+            '\n'
+            '======= 3 failed, 12 passed in 4.21s =======\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == '======= 3 failed, 12 passed in 4.21s =======', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_pytest_traceback_E_line_returns_last(self):
+        """When only traceback E-lines exist (no FAILED/INTERNALERROR), the LAST E-line wins."""
+        # No FAILED lines, no INTERNALERROR, no failure summary, no
+        # ``error:``/``ERROR:``/cargo-FAILED, and no npm errors — should fall
+        # through to the E-line ladder rung.
+        output = (
+            '=================================== FAILURES =====================================\n'
+            '___________________________________ test_one _____________________________________\n'
+            '    def test_one():\n'
+            '>       assert 1 == 2\n'
+            'E       AssertionError: assert 1 == 2\n'
+            '\n'
+            '___________________________________ test_two _____________________________________\n'
+            '    def test_two():\n'
+            '>       raise ValueError("specific bad")\n'
+            'E       ValueError: specific bad\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'E       ValueError: specific bad', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_pytest_progress_dots_filtered_returns_opaque(self):
+        """If pytest is killed mid-run with only progress dots, fallback returns the opaque message."""
+        # Both lines are progress lines; nothing meaningful remains after filter.
+        output = '.....F.....   [ 77%]\ntest_x.py ...   [ 80%]'
+        hint = _extract_cause_hint(output)
+        assert hint == 'opaque test exit (no failure markers in output)', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_concatenated_aggregate_finds_first_failure(self):
+        """Joined per-subproject outputs: the FIRST FAILED line wins."""
+        output1 = (
+            'tests/test_x.py F   [100%]\n'
+            '\n'
+            'FAILED tests/test_x.py::test_first_subproject - AssertionError\n'
+        )
+        output2 = (
+            'tests/test_y.py F   [100%]\n'
+            '\n'
+            'FAILED tests/test_y.py::test_second_subproject - ValueError\n'
+        )
+        hint = _extract_cause_hint(output1 + output2)
+        assert hint == 'FAILED tests/test_x.py::test_first_subproject - AssertionError', (
+            f'Unexpected hint: {hint!r}'
+        )
 
 
 class TestVerifyResultCauseHint:

@@ -80,3 +80,29 @@ class TestSetBackendRejectsInvalidInput:
     def test_rejects_none_value(self):
         with pytest.raises(TypeError):
             sandbox_dispatch.set_backend(None)  # type: ignore[arg-type]
+
+
+class TestResolveActiveBackendCorruptionGuard:
+    """resolve_active_backend / wrap_command must fail loudly on corrupted _preferred.
+
+    set_backend's input validator blocks corrupt values from entering via the
+    public API, so reaching the unknown-backend branch in either function
+    means _preferred was mutated directly past the validator. Pre-fix this
+    silently fell through to ``return 'none'`` / ``return inner_cmd``,
+    disabling sandboxing on the actual agent run. Post-fix it raises.
+    """
+
+    def test_resolve_active_backend_raises_on_corrupted_preferred(self):
+        sandbox_dispatch._preferred = 'docker'  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match='_preferred is corrupted'):
+            sandbox_dispatch.resolve_active_backend()
+
+    def test_wrap_command_raises_on_corrupted_preferred(self, tmp_path):
+        from pathlib import Path
+        sandbox_dispatch._preferred = 'docker'  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match='_preferred is corrupted'):
+            sandbox_dispatch.wrap_command(
+                inner_cmd=['claude'],
+                cwd=Path(tmp_path),
+                writable_modules=['mod_a'],
+            )

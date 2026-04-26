@@ -135,16 +135,33 @@ _CARGO_EXCLUDE_RE = re.compile(
 )
 
 
+# Pytest-aware cause-hint patterns. Anchored to whole lines so they don't
+# false-match prose. ``_PYTEST_PROGRESS_*`` patterns are used to filter the
+# fallback (last-non-blank-line) path so a pytest run killed mid-progress
+# doesn't surface "...." dots as the cause hint.
+_PYTEST_FAILED_LINE_RE = re.compile(r'^FAILED .+$', re.MULTILINE)
+_PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
+_PYTEST_FAILURE_SUMMARY_RE = re.compile(r'^=+ \d+ failed.*=+$', re.MULTILINE)
+_PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
+_PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
+_PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
+
+
 def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
     Uses a pattern ladder (first match wins):
-    1. ``error: …``         — cargo/clippy surface errors
-    2. ``… FAILED``         — Rust test runner failure lines
-    3. ``Command timed out after Ns: …`` — our own timeout wrapper
-    4. ``ERROR: …``         — flock/script wrapper errors
-    5. ``… npm (ERR!|error) …`` — npm errors
-    6. fallback: last non-blank line of output
+    1. ``FAILED test::name`` — pytest failure lines (start of line)
+    2. ``INTERNALERROR>`` — pytest collection / plugin errors
+    3. ``===== N failed in Xs =====`` — pytest summary line
+    4. ``error: …``         — cargo/clippy surface errors
+    5. ``… FAILED``         — Rust test runner failure lines
+    6. ``Command timed out after Ns: …`` — our own timeout wrapper
+    7. ``ERROR: …``         — flock/script wrapper errors
+    8. ``… npm (ERR!|error) …`` — npm errors
+    9. last ``E   …`` line  — pytest traceback (last match wins; most specific)
+    10. fallback: last non-blank line of output, with pytest progress lines
+        filtered. If only progress lines remain, returns an opaque-exit message.
 
     Returns ``''`` for None, empty, or whitespace-only input.
     Result is stripped to a single line and capped at 200 chars.
@@ -153,6 +170,9 @@ def _extract_cause_hint(output: str) -> str:
         return ''
 
     _HINT_PATTERNS = [
+        _PYTEST_FAILED_LINE_RE,
+        _PYTEST_INTERNALERROR_RE,
+        _PYTEST_FAILURE_SUMMARY_RE,
         re.compile(r'^error: .+$', re.MULTILINE),
         re.compile(r'^.+\s+FAILED$', re.MULTILINE),
         re.compile(r'^Command timed out after \d+s:.+$', re.MULTILINE),
@@ -165,12 +185,23 @@ def _extract_cause_hint(output: str) -> str:
         if m:
             return m.group(0).strip()[:200]
 
-    # Fallback: last non-blank line
-    last = next(
-        (line for line in reversed(output.splitlines()) if line.strip()),
-        '',
-    )
-    return last.strip()[:200]
+    # Pytest traceback E-line — capture LAST one (most specific).
+    e_matches = _PYTEST_TRACEBACK_E_RE.findall(output)
+    if e_matches:
+        return e_matches[-1].strip()[:200]
+
+    # Filtered fallback: drop pytest progress lines before the last-non-blank.
+    # Without this, a killed-mid-run pytest surfaces lines like
+    # "orchestrator/tests/test_scheduler.py .." as the cause hint.
+    meaningful = [
+        line for line in reversed(output.splitlines())
+        if line.strip()
+        and not _PYTEST_PROGRESS_BARE_RE.match(line)
+        and not _PYTEST_PROGRESS_FILE_RE.match(line)
+    ]
+    if not meaningful:
+        return 'opaque test exit (no failure markers in output)'
+    return meaningful[0].strip()[:200]
 
 
 # Compiled regex patterns for _classify_failure — hoisted to module scope so
@@ -762,6 +793,38 @@ def _apply_cargo_scope(
         concurrent_verify=mc.concurrent_verify,
         verify_env=mc.verify_env,
         scope_cargo=mc.scope_cargo,
+    )
+
+
+# Source-file extensions that warrant running verify at all. Markdown / YAML /
+# TOML / JSON diffs are inert: every existing scoping branch
+# (scope_module_config filters .py, _build_fallback_config filters .py,
+# _apply_cargo_scope filters .rs) would no-op on them anyway, so the
+# previous global-pytest fall-through was the only path that actually fired
+# — and it was unsafe (see plans/fix-all-root-causes-humble-dream.md R1/R2).
+_SOURCE_EXTENSIONS: frozenset[str] = frozenset({'.py', '.rs'})
+
+
+def _has_source_files(task_files: list[str]) -> bool:
+    """Return True when *task_files* contains at least one .py or .rs path."""
+    exts = tuple(_SOURCE_EXTENSIONS)
+    return any(f.endswith(exts) for f in task_files)
+
+
+def _trivial_pass(reason: str) -> 'VerifyResult':
+    """Build a VerifyResult that represents 'verify trivially passed'.
+
+    Forward-reference string annotation: ``VerifyResult`` is defined further
+    down in this module (no ``from __future__ import annotations`` here).
+    """
+    return VerifyResult(
+        passed=True,
+        summary=reason,
+        test_output='',
+        lint_output='',
+        type_output='',
+        timed_out=False,
+        cause_hint='',
     )
 
 
@@ -1562,16 +1625,36 @@ async def run_scoped_verification(
                         len(skipped), ', '.join(skipped),
                     )
                 if not scoped:
-                    # No subproject has matching files — fall through to global.
-                    # Otherwise we'd gather() zero coroutines and silently pass.
+                    # No subproject has matching files. Two sub-cases:
+                    #   (a) Diff has no .py/.rs at all (docs, YAML, JSON …) —
+                    #       every existing scope branch would no-op anyway; the
+                    #       previous global-pytest fall-through was unsafe in
+                    #       this layout. Trivially pass.
+                    #   (b) Source files exist but don't fit any prefix
+                    #       (e.g. root-level conftest.py + skills/*.md). Fan
+                    #       out per-subproject so each runs in its own venv
+                    #       with its own pyproject options.
+                    if not _has_source_files(existing_files):
+                        logger.info(
+                            'Verification mode: trivial pass (no source files in diff)',
+                        )
+                        return _trivial_pass(
+                            'No source files changed — verify trivially passes',
+                        )
                     logger.info(
-                        'Verification mode: global (file-scoped filtered every subproject)',
+                        'Verification mode: per-subproject fan-out (%d subprojects)',
+                        len(module_configs),
                     )
-                    return await run_verification(
-                        worktree, config, max_retries=max_retries,
-                        is_merge_verify=is_merge_verify,
-                        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-                    )
+                    results = await asyncio.gather(*(
+                        run_verification(
+                            worktree, config, mc,
+                            max_retries=max_retries,
+                            is_merge_verify=is_merge_verify,
+                            attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                        )
+                        for mc in module_configs
+                    ))
+                    return _aggregate_results(list(results))
                 # Rewrite cargo --workspace → cargo -p <crate> when all task files
                 # are .rs and map to known workspace crates.
                 scoped = [
@@ -1601,6 +1684,16 @@ async def run_scoped_verification(
         if task_files:
             # Filter to files that still exist — tasks may delete files as part of their work
             existing_files = [f for f in task_files if (worktree / f).exists()]
+            # Mirror the same docs-only short-circuit as the module_configs
+            # branch: with no .py/.rs files _build_fallback_config would
+            # return None and we'd fall through to the unsafe global pytest.
+            if not _has_source_files(existing_files):
+                logger.info(
+                    'Verification mode: trivial pass (no source files, no module configs)',
+                )
+                return _trivial_pass(
+                    'No source files changed — verify trivially passes',
+                )
             fallback = _build_fallback_config(existing_files)
             if fallback is not None:
                 fallback = _apply_cargo_scope(

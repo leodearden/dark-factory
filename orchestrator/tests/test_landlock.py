@@ -164,37 +164,35 @@ class TestInvokeBackendDispatch:
     ):
         from orchestrator.agents import sandbox_dispatch
 
-        # Set the backend preference (test fixture would normally reset this)
+        # Root conftest's _restore_sandbox_backend autouse fixture restores
+        # the prior backend after this test, so no try/finally needed here.
         sandbox_dispatch.set_backend(cast(Backend, backend))
-        try:
-            with patch(
-                'orchestrator.agents.sandbox.is_bwrap_available', return_value=True,
-            ), patch(
-                'orchestrator.agents.sandbox.build_bwrap_command',
-                return_value=['bwrap-wrapped', 'claude'],
-            ) as mock_bwrap, patch(
-                'orchestrator.agents.landlock.is_landlock_available', return_value=True,
-            ), patch(
-                'orchestrator.agents.landlock.build_landlock_command',
-                return_value=['landlock-wrapped', 'claude'],
-            ) as mock_landlock, patch(
-                'asyncio.create_subprocess_exec', new_callable=AsyncMock,
-            ) as mock_exec:
-                mock_proc = AsyncMock()
-                mock_proc.communicate.return_value = (b'{"result": "ok"}', b'')
-                mock_proc.returncode = 0
-                mock_exec.return_value = mock_proc
+        with patch(
+            'orchestrator.agents.sandbox.is_bwrap_available', return_value=True,
+        ), patch(
+            'orchestrator.agents.sandbox.build_bwrap_command',
+            return_value=['bwrap-wrapped', 'claude'],
+        ) as mock_bwrap, patch(
+            'orchestrator.agents.landlock.is_landlock_available', return_value=True,
+        ), patch(
+            'orchestrator.agents.landlock.build_landlock_command',
+            return_value=['landlock-wrapped', 'claude'],
+        ) as mock_landlock, patch(
+            'asyncio.create_subprocess_exec', new_callable=AsyncMock,
+        ) as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.communicate.return_value = (b'{"result": "ok"}', b'')
+            mock_proc.returncode = 0
+            mock_exec.return_value = mock_proc
 
-                from orchestrator.agents.invoke import invoke_agent
-                await invoke_agent(
-                    prompt='test', system_prompt='sys', cwd=tmp_path,
-                    sandbox_modules=['mod_a'],
-                )
+            from orchestrator.agents.invoke import invoke_agent
+            await invoke_agent(
+                prompt='test', system_prompt='sys', cwd=tmp_path,
+                sandbox_modules=['mod_a'],
+            )
 
-                assert mock_bwrap.called == expect_bwrap
-                assert mock_landlock.called == expect_landlock
-        finally:
-            sandbox_dispatch.set_backend('auto')
+            assert mock_bwrap.called == expect_bwrap
+            assert mock_landlock.called == expect_landlock
 
 
 # ---------------------------------------------------------------------------
