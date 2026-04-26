@@ -529,6 +529,18 @@ def _prune_archive(
                 logger.warning('_prune_archive: could not delete %s: %s', path, exc)
 
 
+def _maybe_prune_archive(archive_root: Path | None) -> bool:
+    """Thin wrapper around ``_prune_archive`` with None-guard.
+
+    Returns True if ``_prune_archive`` was invoked, False otherwise.
+    ``archive_root=None`` short-circuits without calling ``_prune_archive``.
+    """
+    if archive_root is None:
+        return False
+    _prune_archive(archive_root)
+    return True
+
+
 async def _derive_task_files_from_git(
     worktree: Path, config: OrchestratorConfig,
 ) -> list[str] | None:
@@ -1569,5 +1581,4 @@ async def run_scoped_verification(
             attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
         )
     finally:
-        if archive_root is not None:
-            _prune_archive(archive_root)
+        _maybe_prune_archive(archive_root)
