@@ -8,6 +8,7 @@ to the worktree, simulating what real agents would do.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,9 +21,9 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState, _SchedulerLike
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2409,6 +2410,39 @@ class TestFakeSchedulerGetStatus:
             'x', 'pending', reopen_reason='un-defer script',
         )
         assert fake.reopen_reasons['x'] == 'un-defer script'  # type: ignore[attr-defined]
+
+
+class TestDispatchToolPromotedToPublic:
+    """Pins the rename of _dispatch_tool → dispatch_tool across Protocol, Scheduler, and FakeScheduler."""
+
+    def test_scheduler_exposes_public_dispatch_tool(self):
+        """Scheduler must expose `dispatch_tool` (no underscore) as a public method."""
+        assert hasattr(Scheduler, 'dispatch_tool'), (
+            'Scheduler._dispatch_tool has not been promoted to dispatch_tool'
+        )
+
+    def test_fake_scheduler_exposes_public_dispatch_tool(self):
+        """FakeScheduler must expose `dispatch_tool` (no underscore) to match the Protocol."""
+        assert hasattr(FakeScheduler, 'dispatch_tool'), (
+            'FakeScheduler._dispatch_tool has not been promoted to dispatch_tool'
+        )
+
+    def test_protocol_declares_dispatch_tool_member(self):
+        """_SchedulerLike Protocol must declare `dispatch_tool` (not `_dispatch_tool`)."""
+        attrs = _SchedulerLike.__protocol_attrs__
+        assert 'dispatch_tool' in attrs, (
+            f'dispatch_tool not found in _SchedulerLike.__protocol_attrs__; got: {attrs}'
+        )
+
+    def test_fake_scheduler_dispatch_tool_signature_matches_real_scheduler(self):
+        """FakeScheduler.dispatch_tool timeout default must match Scheduler.dispatch_tool."""
+        real_sig = inspect.signature(Scheduler.dispatch_tool)
+        fake_sig = inspect.signature(FakeScheduler.dispatch_tool)
+        real_default = real_sig.parameters['timeout'].default
+        fake_default = fake_sig.parameters['timeout'].default
+        assert fake_default == real_default == 15, (
+            f'timeout default mismatch: Scheduler={real_default!r}, FakeScheduler={fake_default!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
