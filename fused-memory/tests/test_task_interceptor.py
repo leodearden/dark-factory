@@ -4288,14 +4288,18 @@ class TestSubmitTaskGuardrail:
                 title='Investigate orchestrator/harness.py deadlock',
                 description='harness deadlock',
             )
+            # Snapshot call count immediately after submit_task returns, before
+            # any cancellation/await — this ensures the assertion is unaffected
+            # by a background worker that may also call _build_candidate.
+            calls_after_submit = len(calls)
         finally:
             # Ensure any background worker is cancelled before the ticket_store
             # fixture closes the DB, preventing "closed database" background errors.
             await _cancel_interceptor_workers(interceptor_with_store)
 
         assert result.get('ticket', '').startswith('tkt_')
-        assert calls == [], (
-            f'Expected _build_candidate to be skipped for dark_factory; got {len(calls)} calls'
+        assert calls_after_submit == 0, (
+            f'Expected _build_candidate to be skipped for dark_factory; got {calls_after_submit} calls'
         )
 
     @pytest.mark.asyncio

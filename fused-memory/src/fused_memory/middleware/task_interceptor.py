@@ -2500,6 +2500,11 @@ class TaskInterceptor:
     ) -> dict:
         if err := await self._backlog_gate(project_root):
             return err
+        # Unlike submit_task, we cannot hoist _build_candidate behind a
+        # project_id != DARK_FACTORY_PROJECT_ID check here: the candidate is
+        # passed directly into _add_subtask_locked and reused by the curator
+        # and write paths, so skipping the build on the dark_factory hot path
+        # would just force a duplicate build later.
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
         # Path-scope guard: reject before acquiring the curator lock so a

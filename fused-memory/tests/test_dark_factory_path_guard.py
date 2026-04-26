@@ -256,6 +256,22 @@ class TestPathGuardVerdict:
         error_msg = v.to_error_dict()['error']
         assert 'dark_factory' in error_msg
 
+    def test_verdict_is_frozen(self):
+        """Attempting to set an attribute on a frozen dataclass raises."""
+        v = self.Verdict(outcome='ok')
+        with pytest.raises((AttributeError, TypeError)):
+            v.outcome = 'rejection'  # type: ignore[misc]
+
+    def test_verdict_is_hashable(self):
+        """A frozen dataclass with hashable fields must be hashable."""
+        v = self.Verdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('orchestrator/',),
+        )
+        # Should not raise
+        _ = hash(v)
+
 
 # ---------------------------------------------------------------------------
 # TestCheckCandidate  (step-5)
