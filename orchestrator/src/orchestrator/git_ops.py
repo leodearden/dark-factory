@@ -659,14 +659,18 @@ class GitOps:
     async def resolve_branch_sha(self, branch_name: str) -> str | None:
         """Resolve a branch name to its 40-char commit SHA via ``git rev-parse --verify``.
 
-        Returns the SHA on success, or None when the ref does not exist
-        (e.g. branch deleted post-merge).
+        Uses ``refs/heads/{branch_name}`` to constrain resolution to local
+        branches, preventing ambiguous resolution against tags or remote refs
+        that happen to share the same name.
+
+        Returns the SHA on success, or None when the ref does not exist or
+        cannot be resolved (e.g. branch deleted post-merge, malformed name).
         """
         rc, sha, _ = await _run(
-            ['git', 'rev-parse', '--verify', branch_name],
+            ['git', 'rev-parse', '--verify', f'refs/heads/{branch_name}'],
             cwd=self.project_root,
         )
-        return sha.strip() if rc == 0 else None
+        return sha if rc == 0 else None
 
     async def rebase_onto_main(self, worktree: Path) -> bool:
         """Rebase the task branch in *worktree* onto current main.

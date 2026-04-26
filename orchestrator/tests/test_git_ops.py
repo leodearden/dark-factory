@@ -2531,3 +2531,21 @@ class TestResolveBranchSha:
         """
         result = await git_ops.resolve_branch_sha('task/does-not-exist')
         assert result is None
+
+    @pytest.mark.parametrize(
+        'bad_ref',
+        [
+            'task/does-not-exist',   # simply absent branch
+            'not a valid ref',       # contains spaces — syntactically malformed
+            '..bad..',               # double-dot traversal form — rejected by git
+        ],
+    )
+    async def test_returns_none_for_bad_refs(self, git_ops: GitOps, bad_ref: str):
+        """resolve_branch_sha returns None for any ref git cannot resolve.
+
+        Covers both 'missing' (rc=128 from rev-parse not finding the ref) and
+        'malformed' (rc=128 from git rejecting the name) error modes, locking
+        in the rc-based fallback contract for the harness fallback path.
+        """
+        result = await git_ops.resolve_branch_sha(bad_ref)
+        assert result is None
