@@ -550,3 +550,26 @@ class TestDeleteDeadLettersIdGuard:
             f"expected 'ValidationError', got: {result}"
         )
         svc.durable_queue.delete_dead.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bool_in_ids_rejected_because_bool_is_int_subclass(self):
+        """Bool values in ids are rejected even though isinstance(True, int) is True.
+
+        Python's bool is a subclass of int, so a guard using only isinstance(i, int)
+        would silently accept True/False as 1/0 and pass them to delete_dead.
+        The guard must also check not isinstance(i, bool) to close this gap.
+        """
+        svc = _make_delete_mock_service()
+        server = create_mcp_server(svc)
+        tool_fn = server._tool_manager.get_tool('delete_dead_letters').fn
+
+        result = await tool_fn(
+            project_id='proj1',
+            ids=[True, False],
+        )
+
+        assert isinstance(result, dict), 'expected a dict envelope'
+        assert result.get('error_type') == 'ValidationError', (
+            f"expected 'ValidationError', got: {result}"
+        )
+        svc.durable_queue.delete_dead.assert_not_called()
