@@ -3226,6 +3226,78 @@ class TestBriefingKnownGapsRefresh:
         assert report is not None
 
     @pytest.mark.asyncio
+    async def test_run_success_log_uses_non_reserved_logrecord_keys(
+        self, mock_deps, tmp_path, caplog,
+    ):
+        """Success-path INFO log must not collide with reserved LogRecord attrs.
+
+        Regression: 'created' is a reserved LogRecord attribute (timestamp);
+        passing it via extra= raises KeyError inside logging.makeRecord. Prior
+        to the fix, the success path was wrapped in a broad try/except that
+        masked the KeyError and emitted a misleading 'briefing_refresh_hook_failed'
+        WARNING even when tasks had been queued successfully. We assert here
+        that the success path emits the INFO record cleanly and that no
+        'briefing_refresh_hook_failed' WARNING is produced.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = str(tmp_path)
+
+        mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['taskmaster'].add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._run_briefing_known_gaps_script',
+                new=AsyncMock(return_value=[mismatch]),
+            ),
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=MagicMock(
+                    success=True, report={'summary': 'ok'},
+                )),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-1086-log',
+            )
+
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        info_records = [
+            r for r in caplog.records
+            if r.name == target_logger
+            and r.levelno == logging.INFO
+            and 'briefing_refresh_tasks_queued' in r.getMessage()
+        ]
+        assert len(info_records) == 1, (
+            'expected exactly one briefing_refresh_tasks_queued INFO record'
+        )
+        rec = info_records[0]
+        # The renamed extras must be present on the LogRecord.
+        assert getattr(rec, 'created_ids', None) == ['9001']
+        assert getattr(rec, 'skipped_ids', None) == []
+
+        # And no false-positive failure WARNING should have fired.
+        failure_warnings = [
+            r for r in caplog.records
+            if r.name == target_logger
+            and r.levelno == logging.WARNING
+            and 'briefing_refresh_hook_failed' in r.getMessage()
+        ]
+        assert failure_warnings == [], (
+            'success path must not emit briefing_refresh_hook_failed'
+        )
+
+    @pytest.mark.asyncio
     async def test_run_dedupes_when_invoked_twice_with_same_mismatch(self, mock_deps, tmp_path):
         """Calling run() twice: second call skips add_task because first created pending task."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)

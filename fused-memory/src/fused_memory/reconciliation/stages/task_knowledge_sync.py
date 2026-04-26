@@ -85,20 +85,27 @@ class TaskKnowledgeSync(BaseStage):
             summary = await _queue_briefing_refresh_tasks(
                 self.taskmaster, self.project_root, mismatches,
             )
-            logger.info(
-                'briefing_refresh_tasks_queued',
-                extra={
-                    'project_root': self.project_root,
-                    'created': summary.get('created', []),
-                    'skipped': summary.get('skipped', []),
-                },
-            )
         except Exception:
             logger.warning(
                 'briefing_refresh_hook_failed',
                 exc_info=True,
                 extra={'project_root': self.project_root},
             )
+            return
+        # Logging is intentionally outside the try/except above so a logging
+        # bug (e.g. a reserved-name collision in `extra`) surfaces as a real
+        # error rather than being swallowed as a misleading
+        # 'briefing_refresh_hook_failed' WARNING. Note: 'created' is a
+        # reserved LogRecord attribute (the timestamp), so we use
+        # 'created_ids'/'skipped_ids' here.
+        logger.info(
+            'briefing_refresh_tasks_queued',
+            extra={
+                'project_root': self.project_root,
+                'created_ids': summary.get('created', []),
+                'skipped_ids': summary.get('skipped', []),
+            },
+        )
 
     async def assemble_payload(
         self,
