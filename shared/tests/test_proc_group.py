@@ -96,9 +96,25 @@ class TestTerminateProcessGroup:
 
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
-        # All members of the group must be gone.
-        with pytest.raises(ProcessLookupError):
-            os.killpg(pgid, 0)
+        # Poll: subreaper-driven reparented grandchildren may need a beat to be
+        # fully reaped after SIGTERM/SIGKILL.  When bash exits, the OS
+        # reparents its background sleeps to the user's systemd --user
+        # subreaper (or pid 1), which reaps them on its own schedule — a
+        # non-deterministic 0–500 ms window.  5 s is comfortably longer than
+        # any observed subreaper latency on Linux; if the group genuinely
+        # leaks (regression), the loop falls through and the assert fires.
+        group_gone = False
+        for _ in range(50):  # 50 × 0.1 s = 5 s budget
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                group_gone = True
+                break
+            await asyncio.sleep(0.1)
+        assert group_gone, (
+            f'Process group {pgid} was not fully reaped within 5 s — '
+            f'grandchildren leaked.'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
