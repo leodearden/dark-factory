@@ -897,9 +897,18 @@ class TaskWorkflow:
 
                 break
 
+            # Architect task-rejection artifacts.  Both are terminal — handle
+            # deterministically before the "no plan.json" failure path so
+            # neither interacts with the consecutive_no_plan_failures cycle
+            # counter.  Order matters: unactionable_task is the most decisive
+            # (jumps straight to L1, bypasses steward); already_done is a
+            # clean DONE; blocking_dependency may re-loop the architect.
+            if self.artifacts.read_unactionable_task() is not None:
+                return await self._handle_unactionable_task_report()
+            if self.artifacts.read_already_done() is not None:
+                return await self._handle_already_done_report()
             # Fix B: the architect may have written a blocking_dependency
-            # report instead of a plan.  Handle deterministically before the
-            # "no plan.json" failure path.
+            # report instead of a plan.
             if self.artifacts.read_blocking_dependency() is not None:
                 dep_outcome = await self._handle_blocking_dep_report(
                     rebase_retry_used=rebase_retry_used,
@@ -1263,6 +1272,106 @@ class TaskWorkflow:
         self.artifacts.clear_blocking_dependency()
         await self.scheduler.set_task_status(self.task_id, 'pending')
         return WorkflowOutcome.REQUEUED
+
+    async def _handle_already_done_report(self) -> WorkflowOutcome:
+        """Process a ``.task/already_done.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        Validation: ``commit`` must be non-empty and reachable from main.
+        ``git merge-base --is-ancestor`` returns false for both unknown SHAs
+        and SHAs not on main, so this single check covers both.
+
+        On success: set task status to ``done`` with provenance pointing
+        at the architect-named commit, return ``DONE``.
+        On validation failure: clear the artifact, route to ``_mark_blocked``
+        without escalating to a human — this is an architect mistake
+        (wrong/missing commit), not an unworkable task.
+        """
+        assert self.artifacts is not None
+        report = self.artifacts.read_already_done()
+        assert report is not None  # caller must have verified
+
+        commit = str(report.get('commit') or '').strip()
+        evidence = str(report.get('evidence') or '')
+
+        self.artifacts.clear_already_done()
+
+        if not commit:
+            return await self._mark_blocked(
+                'Architect wrote malformed already_done.json '
+                '(missing commit)',
+                detail=json.dumps(report, indent=2)[:2000],
+            )
+
+        main_sha = await self.git_ops.get_main_sha()
+        on_main = await self.git_ops.is_ancestor(commit, main_sha)
+        if not on_main:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} '
+                f'but commit is not reachable from main',
+                detail=(
+                    f'commit: {commit}\nmain_sha: {main_sha}\n'
+                    f'evidence: {evidence}'
+                )[:2000],
+            )
+
+        logger.info(
+            'Task %s: architect reported task already done at %s — '
+            'setting status done with provenance',
+            self.task_id, commit[:12],
+        )
+        self._enter_phase(WorkflowState.DONE)
+        await self.scheduler.set_task_status(
+            self.task_id, 'done',
+            done_provenance={
+                'commit': commit,
+                'verified_by': 'architect',
+                'evidence': evidence[:500],
+            },
+        )
+        return WorkflowOutcome.DONE
+
+    async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
+        """Process a ``.task/unactionable_task.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        Stops the steward early to close the small async window where a
+        stale L0 from a prior PLAN attempt could be processed concurrently
+        with our L1 submission.  The ``finally`` block in ``run()`` also
+        stops the steward, so this is defense-in-depth.
+
+        Then short-circuits to ``_mark_blocked(escalate_to_human=True)``,
+        which submits an L1 directly without invoking the steward — the
+        steward consumes only L0 escalations and cannot fix a broken spec.
+        """
+        assert self.artifacts is not None
+        report = self.artifacts.read_unactionable_task()
+        assert report is not None  # caller must have verified
+
+        reason = str(report.get('reason') or '').strip()
+        evidence = str(report.get('evidence') or '')
+
+        if self._steward:
+            await self._steward.stop()
+            self._steward = None
+
+        self.artifacts.clear_unactionable_task()
+
+        if not reason:
+            return await self._mark_blocked(
+                'Architect wrote malformed unactionable_task.json '
+                '(missing reason)',
+                detail=json.dumps(report, indent=2)[:2000],
+                escalate_to_human=True,
+            )
+
+        return await self._mark_blocked(
+            f'Architect reported task unactionable: {reason}',
+            detail=f'reason: {reason}\nevidence: {evidence}'[:2000],
+            escalate_to_human=True,
+        )
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""

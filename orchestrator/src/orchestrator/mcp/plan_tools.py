@@ -301,6 +301,37 @@ def _report_blocking_dependency(
     }
 
 
+def _report_task_already_done(
+    artifacts: TaskArtifacts,
+    commit: str,
+    evidence: str,
+) -> dict[str, Any]:
+    """Write the already-done artifact for the workflow to act on.
+
+    The architect calls this when it has determined that the task's work
+    is already on main at *commit*.  The workflow validates the claim
+    (commit reachable from main) and sets task status to ``done``.
+    """
+    artifacts.write_already_done(commit=commit, evidence=evidence)
+    return {'status': 'ok', 'commit': commit}
+
+
+def _report_unactionable_task(
+    artifacts: TaskArtifacts,
+    reason: str,
+    evidence: str,
+) -> dict[str, Any]:
+    """Write the unactionable-task artifact for the workflow to act on.
+
+    The architect calls this when it has determined the task spec itself
+    is unworkable — premises are contradictory, the goal is incompatible
+    with current main, or no valid plan is possible as written.  The
+    workflow short-circuits to a level-1 escalation, bypassing the steward.
+    """
+    artifacts.write_unactionable_task(reason=reason, evidence=evidence)
+    return {'status': 'ok', 'reason': reason}
+
+
 def _resolve_main_sha(worktree: Path) -> str:
     """Return the current ``main`` HEAD SHA visible from *worktree*.
 
@@ -525,6 +556,59 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_blocking_dependency(
             artifacts, depends_on_task_id, reason, main_sha,
         )
+
+    @mcp.tool()
+    def report_task_already_done(
+        commit: str,
+        evidence: str,
+    ) -> dict[str, Any]:
+        """Report that this task's work is already on main at ``commit``.
+
+        Use this INSTEAD of writing a plan when you discover, during the
+        verify-premises phase, that the work this task asks for is already
+        present on main — typically because a sibling task direct-merged
+        the change, or a prior orchestrator run landed it under a different
+        task id.
+
+        After calling this tool, stop. Do NOT call ``create_plan`` or
+        ``escalate_blocker``. The orchestrator will validate that ``commit``
+        is reachable from main, then set this task to ``done`` with
+        provenance pointing at ``commit``.
+
+        Args:
+            commit: The git SHA on main that contains this task's work.
+                Must be reachable from main; the orchestrator verifies this.
+            evidence: Brief description of what you found — file/symbol
+                names that match this task's expected output, or why the
+                commit appears to subsume this task's scope.
+        """
+        return _report_task_already_done(artifacts, commit, evidence)
+
+    @mcp.tool()
+    def report_unactionable_task(
+        reason: str,
+        evidence: str,
+    ) -> dict[str, Any]:
+        """Report that this task spec is unworkable as written.
+
+        Use this INSTEAD of writing a plan when you have determined the
+        task itself cannot proceed — premises are contradictory, the goal
+        is incompatible with current main, or no valid plan exists as
+        written. Use this only when a human needs to rewrite or cancel
+        the task; for risks/concerns where a plan is still possible, use
+        ``escalate_blocker`` instead.
+
+        After calling this tool, stop. Do NOT call ``create_plan`` or
+        ``escalate_blocker``. The orchestrator will mark this task BLOCKED
+        and submit a level-1 escalation directly — the steward is bypassed
+        because no automated handler can fix a broken spec.
+
+        Args:
+            reason: One-line summary of why the task is unworkable.
+            evidence: Detail — the specific contradiction, false premise,
+                or impossibility, with file:line references where possible.
+        """
+        return _report_unactionable_task(artifacts, reason, evidence)
 
     return mcp
 

@@ -16,6 +16,8 @@ from orchestrator.mcp.plan_tools import (
     _remove_plan_step,
     _replace_plan_step,
     _report_blocking_dependency,
+    _report_task_already_done,
+    _report_unactionable_task,
     _update_plan_metadata,
 )
 
@@ -433,5 +435,77 @@ class TestReportBlockingDependency:
 
         plan = artifacts.read_plan()
         # plan.json must not be touched — the tool only writes the new artifact.
+        assert plan['task_id'] == 'test-1'
+        assert len(plan['steps']) == 1
+
+
+class TestReportTaskAlreadyDone:
+    """Architect's escape hatch when the task's work is already on main."""
+
+    def test_writes_artifact(self, artifacts):
+        result = _report_task_already_done(
+            artifacts,
+            commit='abc123def456',
+            evidence='helpers.foo introduced by task 42',
+        )
+        assert result['status'] == 'ok'
+        assert result['commit'] == 'abc123def456'
+
+        data = artifacts.read_already_done()
+        assert data is not None
+        assert data['commit'] == 'abc123def456'
+        assert data['evidence'] == 'helpers.foo introduced by task 42'
+        assert 'reported_at' in data
+
+    def test_overwrites_prior_report(self, artifacts):
+        _report_task_already_done(artifacts, 'sha1', 'first')
+        _report_task_already_done(artifacts, 'sha2', 'second')
+        data = artifacts.read_already_done()
+        assert data is not None
+        assert data['commit'] == 'sha2'
+        assert data['evidence'] == 'second'
+
+    def test_does_not_mutate_plan_json(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'], files=['m/x.py'])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
+        _report_task_already_done(artifacts, 'sha', 'e')
+
+        plan = artifacts.read_plan()
+        assert plan['task_id'] == 'test-1'
+        assert len(plan['steps']) == 1
+
+
+class TestReportUnactionableTask:
+    """Architect's escape hatch when the task spec is unworkable."""
+
+    def test_writes_artifact(self, artifacts):
+        result = _report_unactionable_task(
+            artifacts,
+            reason='spec contradicts already-merged refactor',
+            evidence='task asks to add foo() but task 31 deleted it',
+        )
+        assert result['status'] == 'ok'
+        assert result['reason'] == 'spec contradicts already-merged refactor'
+
+        data = artifacts.read_unactionable_task()
+        assert data is not None
+        assert data['reason'] == 'spec contradicts already-merged refactor'
+        assert 'task 31 deleted it' in data['evidence']
+        assert 'reported_at' in data
+
+    def test_overwrites_prior_report(self, artifacts):
+        _report_unactionable_task(artifacts, 'first', 'e1')
+        _report_unactionable_task(artifacts, 'second', 'e2')
+        data = artifacts.read_unactionable_task()
+        assert data is not None
+        assert data['reason'] == 'second'
+        assert data['evidence'] == 'e2'
+
+    def test_does_not_mutate_plan_json(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'], files=['m/x.py'])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
+        _report_unactionable_task(artifacts, 'r', 'e')
+
+        plan = artifacts.read_plan()
         assert plan['task_id'] == 'test-1'
         assert len(plan['steps']) == 1

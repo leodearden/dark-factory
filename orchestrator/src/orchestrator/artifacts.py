@@ -271,6 +271,66 @@ class TaskArtifacts:
         """
         (self.root / 'blocking_dependency.json').unlink(missing_ok=True)
 
+    # ──────────────────────────────────────────────────────────────────
+    # Architect task-rejection artifacts (paired with plan-tools MCP)
+    #
+    # These are structured exits the architect takes *instead of* writing a
+    # plan, when it can determine the task should not proceed as written.
+    # The workflow reads the artifact after the architect returns and takes
+    # a deterministic action — see workflow._plan().
+    # ──────────────────────────────────────────────────────────────────
+
+    def write_already_done(self, commit: str, evidence: str) -> None:
+        """Write ``.task/already_done.json`` — architect's claim that this
+        task's work is already on main at ``commit``.
+
+        The workflow validates the claim (commit reachable from main) and
+        sets task status to ``done`` with provenance pointing at ``commit``.
+        """
+        data = {
+            'commit': commit,
+            'evidence': evidence,
+            'reported_at': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'already_done.json', data)
+
+    def read_already_done(self) -> dict | None:
+        """Return the parsed ``.task/already_done.json`` artifact if present."""
+        path = self.root / 'already_done.json'
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def clear_already_done(self) -> None:
+        """Remove ``.task/already_done.json`` if present."""
+        (self.root / 'already_done.json').unlink(missing_ok=True)
+
+    def write_unactionable_task(self, reason: str, evidence: str) -> None:
+        """Write ``.task/unactionable_task.json`` — architect's claim that
+        the task spec itself is unworkable (false premise, contradiction,
+        incompatible with main).
+
+        The workflow short-circuits to a level-1 escalation, bypassing the
+        steward — only a human can rewrite or cancel the task.
+        """
+        data = {
+            'reason': reason,
+            'evidence': evidence,
+            'reported_at': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'unactionable_task.json', data)
+
+    def read_unactionable_task(self) -> dict | None:
+        """Return the parsed ``.task/unactionable_task.json`` artifact if present."""
+        path = self.root / 'unactionable_task.json'
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def clear_unactionable_task(self) -> None:
+        """Remove ``.task/unactionable_task.json`` if present."""
+        (self.root / 'unactionable_task.json').unlink(missing_ok=True)
+
     def read_plan(self) -> dict:
         """Read current plan state, auto-normalizing malformed shapes."""
         plan_path = self.root / 'plan.json'
