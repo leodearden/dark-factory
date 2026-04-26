@@ -418,3 +418,105 @@ class TestTruncatePayloadHardening:
         # With ensure_ascii=False (the fix), the UTF-8 form fits and passes through.
         assert truncated is False
         assert result == payload
+
+
+# ── step-3 tests (delete_dead_letters MCP tool) ────────────────────────────
+
+
+def _make_delete_mock_service(delete_dead_return=None):
+    """Build a minimal mock MemoryService with delete_dead wired on durable_queue."""
+    svc = AsyncMock()
+    svc.durable_queue = MagicMock()
+    svc.durable_queue.delete_dead = AsyncMock(
+        return_value=delete_dead_return or {'deleted': [], 'not_found': []}
+    )
+    return svc
+
+
+class TestDeleteDeadLetters:
+    """MCP-level tests for the delete_dead_letters tool."""
+
+    @pytest.mark.asyncio
+    async def test_routes_to_durable_queue_delete_dead(self):
+        """Tool calls durable_queue.delete_dead with correct group_id and ids."""
+        svc = _make_delete_mock_service(delete_dead_return={'deleted': [1, 2, 3], 'not_found': []})
+        server = create_mcp_server(svc)
+
+        await server._tool_manager.call_tool(
+            'delete_dead_letters',
+            {'project_id': 'proj1', 'ids': [1, 2, 3]},
+        )
+
+        svc.durable_queue.delete_dead.assert_called_once_with(
+            group_id='proj1', ids=[1, 2, 3],
+        )
+
+    @pytest.mark.asyncio
+    async def test_envelope_passthrough(self):
+        """Tool returns the exact envelope from durable_queue.delete_dead."""
+        envelope = {'deleted': [1, 2], 'not_found': [3]}
+        svc = _make_delete_mock_service(delete_dead_return=envelope)
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool(
+            'delete_dead_letters',
+            {'project_id': 'proj1', 'ids': [1, 2, 3]},
+        )
+
+        assert result == envelope
+
+    @pytest.mark.asyncio
+    async def test_no_durable_queue_returns_configuration_error(self):
+        """When durable_queue is None, tool returns ConfigurationError dict without raising."""
+        svc = AsyncMock()
+        svc.durable_queue = None
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool(
+            'delete_dead_letters',
+            {'project_id': 'proj1', 'ids': [1, 2]},
+        )
+
+        assert result == {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+
+    @pytest.mark.asyncio
+    async def test_invalid_project_id_returns_validation_error(self):
+        """Invalid project_id (empty, injection chars) returns validation error dict."""
+        svc = _make_delete_mock_service()
+        server = create_mcp_server(svc)
+
+        # Empty project_id
+        result = await server._tool_manager.call_tool(
+            'delete_dead_letters',
+            {'project_id': '', 'ids': [1]},
+        )
+
+        assert result.get('error_type') == 'ValidationError'
+        svc.durable_queue.delete_dead.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_project_id_with_injection_chars_rejected(self):
+        """project_id containing prompt-injection characters is rejected."""
+        svc = _make_delete_mock_service()
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool(
+            'delete_dead_letters',
+            {'project_id': 'proj1; DROP TABLE write_queue', 'ids': [1]},
+        )
+
+        assert result.get('error_type') == 'ValidationError'
+        svc.durable_queue.delete_dead.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_ids_returns_empty_envelope(self):
+        """empty ids=[] returns {'deleted': [], 'not_found': []}."""
+        svc = _make_delete_mock_service(delete_dead_return={'deleted': [], 'not_found': []})
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool(
+            'delete_dead_letters',
+            {'project_id': 'proj1', 'ids': []},
+        )
+
+        assert result == {'deleted': [], 'not_found': []}

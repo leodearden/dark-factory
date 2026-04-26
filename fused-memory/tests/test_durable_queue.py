@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -338,7 +339,6 @@ class TestRecovery:
         await q.initialize()
 
         # Manually insert an in_flight item (simulating crash)
-        import time
         assert q._db is not None
         await q._db.execute(
             'INSERT INTO write_queue '
@@ -508,6 +508,116 @@ class TestShutdown:
         # Workers should be cleaned up
         assert len(q._worker_tasks) == 0
         assert q._db is None
+
+
+class TestDeleteDead:
+    """Tests for DurableWriteQueue.delete_dead(group_id, ids)."""
+
+    async def _insert_dead_row(self, q, group_id: str = 'proj1') -> int:
+        """Insert a dead row directly via SQL and return its id."""
+        assert q._db is not None
+        cursor = await q._db.execute(
+            'INSERT INTO write_queue '
+            '(group_id, operation, payload, status, attempts, max_attempts, '
+            ' next_retry_at, created_at) '
+            "VALUES (?, 'add_episode', '{\"content\":\"dead\"}', 'dead', 3, 3, 0, ?)",
+            (group_id, time.time()),
+        )
+        await q._db.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    async def _insert_pending_row(self, q, group_id: str = 'proj1') -> int:
+        """Insert a pending row directly via SQL and return its id."""
+        assert q._db is not None
+        cursor = await q._db.execute(
+            'INSERT INTO write_queue '
+            '(group_id, operation, payload, status, attempts, max_attempts, '
+            ' next_retry_at, created_at) '
+            "VALUES (?, 'add_episode', '{\"content\":\"pending\"}', 'pending', 0, 3, 0, ?)",
+            (group_id, time.time()),
+        )
+        await q._db.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_dead_rows(self, queue):
+        """Bulk-deleting dead rows returns them in 'deleted' and removes them."""
+        id1 = await self._insert_dead_row(queue, 'proj1')
+        id2 = await self._insert_dead_row(queue, 'proj1')
+
+        result = await queue.delete_dead(group_id='proj1', ids=[id1, id2])
+
+        assert sorted(result['deleted']) == sorted([id1, id2])
+        assert result['not_found'] == []
+
+        # Rows must no longer appear via get_dead_items
+        remaining = await queue.get_dead_items(group_id='proj1')
+        remaining_ids = [item['id'] for item in remaining]
+        assert id1 not in remaining_ids
+        assert id2 not in remaining_ids
+
+    @pytest.mark.asyncio
+    async def test_missing_ids_in_not_found(self, queue):
+        """Non-existent IDs appear in 'not_found'."""
+        result = await queue.delete_dead(group_id='proj1', ids=[99999, 88888])
+
+        assert result['deleted'] == []
+        assert sorted(result['not_found']) == [88888, 99999]
+
+    @pytest.mark.asyncio
+    async def test_cross_project_ids_not_deleted(self, queue):
+        """Dead rows from proj-b are not deleted when calling with proj-a."""
+        id_b = await self._insert_dead_row(queue, 'proj-b')
+
+        result = await queue.delete_dead(group_id='proj-a', ids=[id_b])
+
+        assert result['deleted'] == []
+        assert result['not_found'] == [id_b]
+
+        # Row in proj-b must still be there
+        dead_b = await queue.get_dead_items(group_id='proj-b')
+        assert any(item['id'] == id_b for item in dead_b)
+
+    @pytest.mark.asyncio
+    async def test_non_dead_status_ids_not_deleted(self, queue):
+        """Pending rows are silently skipped (land in 'not_found') and stay in table."""
+        id_pending = await self._insert_pending_row(queue, 'proj1')
+
+        result = await queue.delete_dead(group_id='proj1', ids=[id_pending])
+
+        assert result['deleted'] == []
+        assert result['not_found'] == [id_pending]
+
+        # Row must still be present
+        assert queue._db is not None
+        cursor = await queue._db.execute(
+            'SELECT id FROM write_queue WHERE id = ?', (id_pending,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None, 'Pending row must not be deleted'
+
+    @pytest.mark.asyncio
+    async def test_empty_ids_no_op(self, queue):
+        """Empty ids list returns empty buckets without touching the DB."""
+        result = await queue.delete_dead(group_id='proj1', ids=[])
+
+        assert result == {'deleted': [], 'not_found': []}
+
+    @pytest.mark.asyncio
+    async def test_mixed_call_partitions_correctly(self, queue):
+        """Mixed input: valid dead, cross-project dead, non-existent, non-dead partitions."""
+        id_dead_proj1 = await self._insert_dead_row(queue, 'proj1')
+        id_dead_proj2 = await self._insert_dead_row(queue, 'proj2')
+        id_pending = await self._insert_pending_row(queue, 'proj1')
+        id_nonexistent = 999999
+
+        result = await queue.delete_dead(
+            group_id='proj1',
+            ids=[id_dead_proj1, id_dead_proj2, id_pending, id_nonexistent],
+        )
+
+        assert result['deleted'] == [id_dead_proj1]
+        assert sorted(result['not_found']) == sorted([id_dead_proj2, id_pending, id_nonexistent])
 
 
 class TestStats:

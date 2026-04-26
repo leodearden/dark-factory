@@ -63,6 +63,9 @@ Management:
 - refresh_entity_summary: Rebuild an entity node's summary from its valid edges (accepts entity_uuid or entity_name)
 - merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
 - get_status: Health check for all backends
+- get_dead_letters: Inspect dead-lettered items from the durable write queue and event queue
+- replay_dead_letters: Reset dead-lettered queue items to pending for retry (use for retriable transient failures)
+- delete_dead_letters: Permanently delete dead-lettered items by id (use for non-retriable errors such as NodeNotFoundError after a graph wipe)
 
 Reconciliation:
 - Task status transitions (done/blocked/cancelled/deferred) trigger targeted reconciliation
@@ -1150,6 +1153,50 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'get_dead_letters error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def delete_dead_letters(
+        project_id: str,
+        ids: list[int],
+    ) -> dict[str, Any]:
+        """Permanently delete dead-lettered durable-queue items by id.
+
+        Use this tool for non-retriable errors (e.g. NodeNotFoundError after a
+        graph wipe) where replaying would always fail.  For retriable transient
+        failures use ``replay_dead_letters`` instead.
+
+        Only rows with ``status='dead'`` that belong to ``project_id`` are
+        eligible.  Cross-project ids, non-existent ids, and non-dead-status
+        ids land in ``not_found`` without leaking information.
+
+        .. note::
+            This tool only covers entries in the *durable write queue* (SQLite).
+            Dead letters in the event_queue (JSONL) use string UUIDs and are
+            managed by a separate mechanism; passing event_queue ids here will
+            always return them in ``not_found``.  Use ``get_dead_letters`` to
+            inspect which source each dead letter belongs to before deleting.
+
+        Args:
+            project_id: Project scope (required — prevents accidental cross-project deletes).
+            ids: Integer row ids to delete (e.g. [1820, 2017] for the dark_factory entries).
+
+        Returns:
+            ``{'deleted': [...sorted ids removed...], 'not_found': [...sorted ids missed...]}``
+        """
+        if err := validate_project_id(project_id):
+            return err
+        try:
+            if memory_service.durable_queue is None:
+                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+            result = await memory_service.durable_queue.delete_dead(
+                group_id=project_id, ids=ids,
+            )
+            return result
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'delete_dead_letters error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------

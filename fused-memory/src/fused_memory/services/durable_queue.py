@@ -410,6 +410,50 @@ class DurableWriteQueue:
             'oldest_pending_age_seconds': oldest_pending_age,
         }
 
+    async def delete_dead(
+        self,
+        group_id: str,
+        ids: list[int],
+    ) -> dict[str, list[int]]:
+        """Delete specific dead-lettered items by id.
+
+        Only rows with ``status='dead'`` that belong to ``group_id`` are
+        eligible.  Cross-project ids, non-existent ids, and non-dead-status
+        ids all land in ``not_found`` without leaking information.
+
+        Args:
+            group_id: Project scope — only dead rows in this group are deleted.
+            ids: Integer row ids to delete.
+
+        Returns:
+            ``{'deleted': [<sorted ids removed>], 'not_found': [<sorted ids missed>]}``
+        """
+        if not ids:
+            return {'deleted': [], 'not_found': []}
+
+        assert self._db is not None
+        placeholders = ','.join('?' * len(ids))
+        # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
+        # The WHERE guards (status='dead', group_id=?) are enforced atomically so
+        # a concurrent replay or worker cannot slip a row past the eligibility check
+        # between a separate SELECT and DELETE.
+        cursor = await self._db.execute(
+            f"DELETE FROM write_queue "
+            f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
+            f"RETURNING id",
+            (*ids, group_id),
+        )
+        rows = await cursor.fetchall()
+        deleted: set[int] = {
+            (row[0] if isinstance(row, tuple) else row['id']) for row in rows
+        }
+        await self._db.commit()
+
+        return {
+            'deleted': sorted(deleted),
+            'not_found': sorted(set(ids) - deleted),
+        }
+
     async def get_dead_items(
         self,
         group_id: str | None = None,
