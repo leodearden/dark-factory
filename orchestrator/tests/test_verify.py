@@ -2187,8 +2187,9 @@ class TestPersistAttemptLogs:
     """
 
     def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
+        import asyncio  # noqa: PLC0415
+
         from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
             _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)
         ) if asyncio.iscoroutinefunction(_persist_attempt_logs) else _persist_attempt_logs(
@@ -2232,7 +2233,7 @@ class TestPersistAttemptLogs:
         """Log files and summary.json are created under .task/verify/."""
         (tmp_path / '.task').mkdir()
         runs = self._make_runs()
-        paths = self._persist(tmp_path, attempt_id=1, runs=runs)
+        self._persist(tmp_path, attempt_id=1, runs=runs)
 
         verify_dir = tmp_path / '.task' / 'verify'
         test_log = verify_dir / 'attempt-1.test.log'
@@ -2404,7 +2405,7 @@ class TestArchiveAttemptLog:
         sources = self._make_source_logs(tmp_path)
         archive_root = tmp_path / 'data' / 'verify-logs'
         dest_paths = self._archive(sources, archive_root, '42', 1, 'cargo_cli_error')
-        for src, dest in zip(sources, dest_paths):
+        for src, dest in zip(sources, dest_paths, strict=True):
             assert dest.read_text() == src.read_text(), f'Content mismatch: {src} vs {dest}'
 
 
@@ -2422,7 +2423,8 @@ class TestPruneArchive:
     # (a) old files deleted, fresh files kept
     def test_old_files_deleted_fresh_kept(self, tmp_path: Path):
         """Files older than max_age_days are deleted; fresh files survive."""
-        import os, time
+        import os
+        import time
         archive_root = tmp_path / 'archive'
         archive_root.mkdir()
         old = archive_root / 'old.log'
@@ -2439,7 +2441,8 @@ class TestPruneArchive:
     # (b) size cap: oldest files deleted until under cap
     def test_size_cap_deletes_oldest_first(self, tmp_path: Path):
         """When total size > max_total_bytes, oldest files deleted until under cap."""
-        import os, time
+        import os
+        import time
         archive_root = tmp_path / 'archive'
         archive_root.mkdir()
         # Create 3 files of 50 bytes each; cap at 100 bytes → one must be deleted
@@ -2465,7 +2468,8 @@ class TestPruneArchive:
     # (d) directory structure preserved (only files deleted, not dirs)
     def test_directories_preserved(self, tmp_path: Path):
         """Only log files are deleted; empty directories are left intact."""
-        import os, time
+        import os
+        import time
         archive_root = tmp_path / 'archive'
         sub = archive_root / 'sub'
         sub.mkdir(parents=True)
