@@ -189,7 +189,7 @@ _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # unknown_test_failure until added to the allowlist.  Extend when a new
     # cargo CLI failure mode appears in production and needs its own bucket.
     (re.compile(
-        r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|package |could not find|invalid )',
+        r'^error: (--|no such subcommand|failed to (parse|compile|read|find)|package |could not find)',
         re.MULTILINE,
     ), 'cargo_cli_error'),
     # Rust test runner / pytest FAILED lines
