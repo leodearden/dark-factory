@@ -120,6 +120,7 @@ class Mem0Backend:
     ) -> dict[str, Any]:
         """Search memories in Mem0."""
         instance = await self._get_instance(scope)
+        filters: dict | None = None
         try:
             return await asyncio.wait_for(
                 instance.search(
@@ -128,6 +129,7 @@ class Mem0Backend:
                     agent_id=None,
                     run_id=None,
                     limit=limit,
+                    filters=filters,
                 ),
                 timeout=self._read_timeout,
             )
