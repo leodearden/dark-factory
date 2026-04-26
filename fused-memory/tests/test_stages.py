@@ -3095,3 +3095,22 @@ class TestStage2TaskVerificationGuidance:
             "STAGE2_SYSTEM_PROMPT must name the 'tasks_created' stat counter in its "
             "task-verification guidance so agents know which counter to conditionally increment."
         )
+
+    def test_stage2_system_prompt_instructs_get_task_verification_after_status_change(self):
+        """RED (step 7): STAGE2_SYSTEM_PROMPT must instruct agents to call get_task
+        after set_task_status, and to increment tasks_reopened only after confirming
+        the new status was applied.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'set_task_status' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must reference 'set_task_status' in its task-verification guidance."
+        )
+        assert 'get_task' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must instruct agents to call 'get_task' to verify a "
+            "status change was applied before incrementing status-derived counters."
+        )
+        assert 'tasks_reopened' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must name the 'tasks_reopened' stat counter in its "
+            "task-verification guidance so agents know to confirm status before incrementing."
+        )
