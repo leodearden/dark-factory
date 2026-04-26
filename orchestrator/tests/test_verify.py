@@ -2037,6 +2037,27 @@ class TestClassifyFailure:
             f"rustc top-level diagnostics should fall through to unknown_test_failure, got {result!r}"
         )
 
+    def test_rustc_invalid_diagnostic_not_cargo_cli_error(self):
+        """rustc uncoded 'error: invalid …' diagnostic must NOT → cargo_cli_error.
+
+        rustc occasionally emits uncoded diagnostics of the form
+        'error: invalid <attribute/value>' for argument or attribute parsing
+        errors (no error[Exxxx] code, no cargo CLI wrapper).  The `invalid `
+        token in the allowlist is too broad and would mis-bucket these as
+        cargo_cli_error; they must fall through to unknown_test_failure.
+        """
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: invalid attribute value\n'
+        )
+        result = self._classify(output, rc=1, timed_out=False)
+        assert result != 'cargo_cli_error', (
+            f"rustc uncoded 'error: invalid …' must not be mis-bucketed as cargo_cli_error, got {result!r}"
+        )
+        assert result == 'unknown_test_failure', (
+            f"rustc uncoded 'error: invalid …' should fall through to unknown_test_failure, got {result!r}"
+        )
+
     # (d) compile_error: rustc diagnostic error codes
     def test_compile_error_rustc_code(self):
         """'error[E0308]: mismatched types' → compile_error."""
