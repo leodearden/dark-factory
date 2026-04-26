@@ -1088,7 +1088,7 @@ class TestReconcileStrandedInProgress:
         tid = '96'
         harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)
-        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
 
         # Seed a recovered plan entry so the helper has something to pop.
         harness._recovered_plans[tid] = {'task_id': tid, 'steps': []}  # type: ignore[attr-defined]
