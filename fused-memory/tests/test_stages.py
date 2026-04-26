@@ -3115,3 +3115,70 @@ class TestBriefingKnownGapsRefresh:
         assert len(warning_records) == 1
         # The warning must reference the exit code (2)
         assert '2' in warning_records[0].getMessage() or getattr(warning_records[0], 'returncode', None) == 2
+
+    # ------------------------------------------------------------------ #
+    # _queue_briefing_refresh_tasks                                         #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_calls_add_task_for_each_mismatch(self):
+        """No existing tasks → add_task called once per mismatch with canonical title."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.add_task.return_value = {'id': '9001', 'message': 'created'}
+
+        mismatches = [
+            {'task_id': '1751', 'title': 'Old gap title', 'subproject': 'fused-memory', 'what': 'Description of the gap'},
+            {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
+        ]
+
+        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        assert taskmaster.add_task.call_count == 2
+
+        first_call_kwargs = taskmaster.add_task.call_args_list[0][1]
+        assert first_call_kwargs['title'] == 'Refresh briefing: remove task 1751 from known_gaps'
+        assert 'fused-memory' in first_call_kwargs['description']
+        assert 'Old gap title' in first_call_kwargs['description']
+
+        second_call_kwargs = taskmaster.add_task.call_args_list[1][1]
+        assert second_call_kwargs['title'] == 'Refresh briefing: remove task 1820 from known_gaps'
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_skips_existing_pending_with_same_title(self):
+        """Existing pending task with canonical title → add_task not called; skipped list populated."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [{
+                'id': 999,
+                'status': 'pending',
+                'title': 'Refresh briefing: remove task 1751 from known_gaps',
+            }]
+        }
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        taskmaster.add_task.assert_not_called()
+        assert '1751' in result['skipped']
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_creates_when_existing_with_same_title_is_done(self):
+        """Done task with same canonical title → add_task IS called (regression can re-file)."""
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [{
+                'id': 999,
+                'status': 'done',
+                'title': 'Refresh briefing: remove task 1751 from known_gaps',
+            }]
+        }
+        taskmaster.add_task.return_value = {'id': '1000', 'message': 'created'}
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        taskmaster.add_task.assert_called_once()
+        assert '1751' not in result['skipped']
