@@ -658,6 +658,34 @@ class TestDeleteDead:
         proj2_items = await queue.get_dead_items(group_id='proj2')
         assert any(item['id'] == cross_id for item in proj2_items)
 
+    @pytest.mark.asyncio
+    async def test_operational_error_returns_typed_envelope(self, queue, monkeypatch):
+        """An aiosqlite.OperationalError during DELETE returns a typed retriable envelope.
+
+        The function must NOT raise; instead it returns a dict with
+        error_type='TransientSqliteError' and retriable=True.
+        """
+        id1 = await self._insert_dead_row(queue, 'proj1')
+
+        # Replace db.execute with one that raises OperationalError on any DELETE call.
+        original_execute = queue._db.execute
+
+        async def mock_execute(sql, *args, **kwargs):
+            if 'DELETE' in sql.upper():
+                raise aiosqlite.OperationalError('database is locked')
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+
+        result = await queue.delete_dead(group_id='proj1', ids=[id1])
+
+        # Must return a typed error envelope — not raise.
+        assert result.get('error_type') == 'TransientSqliteError'
+        assert result.get('retriable') is True
+        assert 'database is locked' in result.get('error', '')
+        assert 'deleted' in result
+        assert 'remaining' in result
+
 
 class TestStats:
     @pytest.mark.asyncio
