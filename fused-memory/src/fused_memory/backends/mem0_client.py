@@ -116,6 +116,7 @@ class Mem0Backend:
         query: str,
         scope: Scope,
         limit: int = 10,
+        categories: list[str] | None = None,
     ) -> dict[str, Any]:
         """Search memories in Mem0."""
         instance = await self._get_instance(scope)

@@ -789,7 +789,7 @@ class MemoryService:
         if SourceStore.mem0 in route.stores:
             store_list.append(SourceStore.mem0)
             task_list.append(asyncio.create_task(
-                self._search_mem0(query, scope, limit, include_planned=include_planned)
+                self._search_mem0(query, scope, limit, include_planned=include_planned, categories=categories)
             ))
 
         results: list[MemoryResult] = []
@@ -942,14 +942,19 @@ class MemoryService:
         return results[:limit]
 
     async def _search_mem0(
-        self, query: str, scope: Scope, limit: int, include_planned: bool = False
+        self,
+        query: str,
+        scope: Scope,
+        limit: int,
+        include_planned: bool = False,
+        categories: list[str] | None = None,
     ) -> list[MemoryResult]:
         """Search Mem0 and convert results to MemoryResult.
 
         When include_planned=False (default), results tagged with planned=True
         in their metadata are excluded.  When include_planned=True they are returned.
         """
-        response = await self.mem0.search(query=query, scope=scope, limit=limit)
+        response = await self.mem0.search(query=query, scope=scope, limit=limit, categories=categories)
         mem0_results = response.get('results', [])
         results = []
         for item in mem0_results:
