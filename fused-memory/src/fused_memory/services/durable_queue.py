@@ -442,9 +442,18 @@ class DurableWriteQueue:
                 'error':      '<original exception message>',
                 'error_type': 'TransientSqliteError',
                 'retriable':  True,
-                'deleted':    [<ids successfully deleted before the error>],
-                'remaining':  [<ids not yet attempted or failed>],
+                'deleted':    [<ids durably deleted in prior chunks>],
+                'not_found':  [<ineligible ids discovered in prior chunks>],
+                'remaining':  [<ids in the failing chunk and all later chunks>],
             }
+
+        ``remaining`` contains only ids that were *never attempted* — it
+        excludes ineligible ids already classified in prior chunks.  Retrying
+        with ``ids=remaining`` is therefore safe and non-redundant.
+
+        If the recovery ``COMMIT`` after the error also fails (e.g. disk still
+        full), ``deleted`` and ``not_found`` are set to ``[]`` and ``remaining``
+        covers all input ids, so a full retry is safe.
 
         Programmer-bug exceptions (``ProgrammingError``, ``IntegrityError``)
         are NOT caught and propagate to the caller.
@@ -461,6 +470,7 @@ class DurableWriteQueue:
 
         assert self._db is not None
         deleted: set[int] = set()
+        not_found_completed: set[int] = set()
 
         for i in range(0, len(ids), _DELETE_DEAD_BATCH_SIZE):
             chunk = ids[i : i + _DELETE_DEAD_BATCH_SIZE]
@@ -478,23 +488,44 @@ class DurableWriteQueue:
                 )
                 rows = await cursor.fetchall()
             except aiosqlite.OperationalError as exc:
-                await self._db.commit()
+                # Commit prior-chunk deletions durably before returning.
+                # The commit itself can fail (e.g. disk still full), in which case
+                # we cannot guarantee prior deletions landed — return a conservative
+                # envelope covering all inputs so a full retry is safe.
+                try:
+                    await self._db.commit()
+                except aiosqlite.OperationalError as commit_exc:
+                    logger.warning(
+                        'delete_dead: recovery commit failed after OperationalError: %s',
+                        commit_exc,
+                    )
+                    return {
+                        'error': str(exc),
+                        'error_type': 'TransientSqliteError',
+                        'retriable': True,
+                        'deleted': [],
+                        'not_found': [],
+                        'remaining': sorted(ids),
+                    }
                 return {
                     'error': str(exc),
                     'error_type': 'TransientSqliteError',
                     'retriable': True,
                     'deleted': sorted(deleted),
-                    'remaining': sorted(set(ids) - deleted),
+                    'not_found': sorted(not_found_completed),
+                    'remaining': sorted(ids[i:]),
                 }
-            deleted |= {
+            chunk_deleted = {
                 (row[0] if isinstance(row, tuple) else row['id']) for row in rows
             }
+            deleted |= chunk_deleted
+            not_found_completed |= set(chunk) - chunk_deleted
 
         await self._db.commit()
 
         return {
             'deleted': sorted(deleted),
-            'not_found': sorted(set(ids) - deleted),
+            'not_found': sorted(not_found_completed),
         }
 
     async def get_dead_items(

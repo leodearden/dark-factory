@@ -1173,10 +1173,9 @@ def create_mcp_server(
         .. note::
             This tool only covers entries in the *durable write queue* (SQLite).
             Dead letters in the **event_queue** (JSONL) use string UUIDs, not
-            integers.  Passing event_queue ids here is not possible — FastMCP
-            rejects non-integer values at input validation (``InputValidationError``)
-            before the request reaches the tool.  Those entries therefore never
-            appear in ``not_found``; they are rejected before the call is made.
+            integers.  event_queue UUIDs are not valid integer ids and will be
+            rejected at input validation before the request reaches the tool;
+            those entries therefore never appear in ``not_found``.
             Filter ``get_dead_letters`` output on ``source == 'durable_queue'``
             before constructing the ``ids`` list for this tool.
 
@@ -1191,12 +1190,14 @@ def create_mcp_server(
                     'error':      '<exception message>',
                     'error_type': 'TransientSqliteError',
                     'retriable':  True,
-                    'deleted':    [...ids deleted before the error...],
-                    'remaining':  [...ids not yet processed...],
+                    'deleted':    [...ids durably deleted in prior chunks...],
+                    'not_found':  [...ineligible ids from prior chunks...],
+                    'remaining':  [...ids in the failing chunk and later — never attempted...],
                 }
 
-            Re-call the tool with ``ids=remaining`` to resume after the
-            underlying issue is resolved.
+            ``remaining`` excludes ineligible ids already classified in prior
+            chunks, so re-calling with ``ids=remaining`` is safe and
+            non-redundant.  Re-call after the underlying issue is resolved.
 
         Args:
             project_id: Project scope (required — prevents accidental cross-project deletes).
@@ -1206,7 +1207,7 @@ def create_mcp_server(
         Returns:
             On success: ``{'deleted': [...sorted ids removed...], 'not_found': [...sorted ids missed...]}``
 
-            On transient SQLite error: ``{'error': ..., 'error_type': 'TransientSqliteError', 'retriable': True, 'deleted': [...], 'remaining': [...]}``
+            On transient SQLite error: ``{'error': ..., 'error_type': 'TransientSqliteError', 'retriable': True, 'deleted': [...], 'not_found': [...], 'remaining': [...]}``
         """
         if err := validate_project_id(project_id):
             return err
