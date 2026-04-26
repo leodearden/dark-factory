@@ -2549,3 +2549,129 @@ class TestResolveBranchSha:
         """
         result = await git_ops.resolve_branch_sha(bad_ref)
         assert result is None
+
+
+@pytest.mark.asyncio
+class TestFindMergeMarker:
+    """Real-git tests for GitOps.find_merge_marker.
+
+    Tests cover the four cases described in the plan:
+    (a) branch deleted with a merge marker on main → returns SHA
+    (b) branch still exists → returns None (resolve_branch_sha gate)
+    (c) branch never existed, no marker → returns None
+    (d) substring safety: task/1 query must not match 'Merge task/10 into main'
+    """
+
+    async def test_returns_merge_sha_when_branch_deleted_with_marker(
+        self, git_ops: GitOps
+    ):
+        """find_merge_marker returns the merge commit SHA when the branch was
+        merged to main and then deleted via cleanup_worktree.
+
+        Real git fixture: create_worktree → commit → merge_to_main → advance_main
+        → cleanup_merge_worktree → cleanup_worktree (branch deleted), then assert
+        the returned SHA matches the merge commit SHA.
+        """
+        tid = 'mm-1'
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        result = await git_ops.merge_to_main(wt_info.path, tid)
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+
+        adv = await git_ops.advance_main(result.merge_commit)
+        assert adv == 'advanced'
+
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+
+        # Branch is now deleted — find_merge_marker should find the merge commit
+        marker_sha = await git_ops.find_merge_marker(f'task/{tid}')
+
+        assert marker_sha is not None
+        assert marker_sha == result.merge_commit
+        assert len(marker_sha) == 40
+
+    async def test_returns_none_when_branch_still_exists(self, git_ops: GitOps):
+        """find_merge_marker returns None when the branch ref still exists,
+        even if there happens to be a merge commit matching the pattern.
+
+        resolve_branch_sha gates the git-log search: if the branch is still
+        present, is_ancestor is the authoritative check.
+        """
+        tid = 'still-here'
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        # Branch created but NOT merged — still exists
+
+        result = await git_ops.find_merge_marker(f'task/{tid}')
+
+        assert result is None
+
+    async def test_returns_none_when_branch_never_existed_no_marker(
+        self, git_ops: GitOps
+    ):
+        """find_merge_marker returns None when no such branch was ever created
+        and no merge commit matching the pattern exists on main.
+        """
+        result = await git_ops.find_merge_marker('task/never-existed')
+        assert result is None
+
+    async def test_substring_safety_task_1_does_not_match_task_10(
+        self, git_ops: GitOps
+    ):
+        """Substring safety: merging task/10 writes 'Merge task/10 into main'.
+        find_merge_marker('task/1') must NOT match this commit.
+
+        The '^' anchor + trailing ' into ' in the --grep pattern prevent
+        task/1 from being found inside 'Merge task/10 into main'.
+        """
+        # Merge task/10 and delete branch
+        tid = '10'
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'task_{tid}.py').write_text(f'task_{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add task {tid}')
+
+        result = await git_ops.merge_to_main(wt_info.path, tid)
+        assert result.success
+        assert result.merge_commit is not None
+        assert result.merge_worktree is not None
+
+        adv = await git_ops.advance_main(result.merge_commit)
+        assert adv == 'advanced'
+
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+
+        # task/10 branch is deleted; merge marker 'Merge task/10 into main' exists
+        # find_merge_marker('task/1') must NOT find it
+        marker_sha = await git_ops.find_merge_marker('task/1')
+        assert marker_sha is None
+
+    async def test_returns_none_when_branch_deleted_without_merging(
+        self, git_ops: GitOps
+    ):
+        """Branch was created and abandoned: deleted without ever being merged.
+
+        This is subtly different from 'branch never existed' (case c): the
+        branch ref existed at some point but was cleaned up without writing a
+        merge commit on main.  find_merge_marker must return None because there
+        is no matching marker subject to find.
+        """
+        tid = 'abandoned-1'
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        # Delete the worktree and branch WITHOUT merging to main
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+
+        # Branch is gone but no merge marker was ever written on main
+        result = await git_ops.find_merge_marker(f'task/{tid}')
+        assert result is None

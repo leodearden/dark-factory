@@ -110,6 +110,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # Individual tests may override with AsyncMock(return_value=None).
     h.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' + 'a' * 32)
 
+    # Default: find_merge_marker returns None so no deleted-branch guard fires
+    # for existing tests.  Individual tests may override with
+    # AsyncMock(return_value='<sha>') to exercise the marker path.
+    h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+
     return h
 
 
@@ -715,6 +720,198 @@ class TestReconcileStrandedInProgress:
             for msg in warning_messages
         ), f'Expected WARNING with task/53 and rev-parse, got: {warning_messages}'
 
+    # ------------------------------------------------------------------
+    # find_merge_marker guard tests (deleted-branch fast-path)
+    # ------------------------------------------------------------------
+
+    async def test_deleted_branch_with_merge_marker_marked_done(
+        self, harness: Harness
+    ):
+        """Stranded in-progress task whose branch was deleted but whose merge
+        marker is found on main → marked done with {commit, note} provenance.
+
+        is_ancestor=False (branch doesn't exist, so is_ancestor can't resolve it),
+        find_merge_marker returns a SHA → task must be marked done with the marker
+        SHA in done_provenance['commit'] and cleanup_worktree must NOT be called
+        (no worktree dir was created in this test).
+        """
+        tid = '70'
+        marker_sha = 'abc123def' + 'a' * 31
+        harness.git_ops.find_merge_marker = AsyncMock(  # type: ignore[attr-defined]
+            return_value=marker_sha
+        )
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {tid: 'in-progress'}, None
+        )
+        # No worktree dir for task 70
+
+        await harness._reconcile_stranded_in_progress()
+
+        # find_merge_marker must have been invoked with the full branch name
+        harness.git_ops.find_merge_marker.assert_awaited_once_with(  # type: ignore[attr-defined]
+            f'task/{tid}'
+        )
+
+        # Task must be marked done with commit + note provenance
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'note': 'reconcile: branch deleted but merge marker found on main',
+                'commit': marker_sha,
+            },
+        )
+
+        # No worktree to clean up
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_deleted_branch_no_merge_marker_falls_through_to_revert(
+        self, harness: Harness
+    ):
+        """Stranded in-progress task whose branch is deleted and whose marker is
+        absent → falls through to the existing revert-to-pending path.
+
+        Proves the marker guard does NOT swallow the no-lock / no-marker case:
+        the task must still be reverted to pending so it can be re-queued.
+        """
+        tid = '71'
+        # Default: find_merge_marker returns None (already in fixture)
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {tid: 'in-progress'}, None
+        )
+        # No worktree, no lock
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Must fall through to the revert path
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending'
+        )
+
+    async def test_marker_takes_precedence_over_stale_lock(
+        self, harness: Harness, monkeypatch
+    ):
+        """Placement-precedence: find_merge_marker guard fires BEFORE the
+        stale-lock analysis.
+
+        A task with a stale plan.lock AND a merge marker must take the done
+        path with marker provenance.  cleanup_worktree is called once (worktree
+        dir existed), and the stale-lock branch is bypassed entirely.
+        """
+        tid = '72'
+        marker_sha = 'deadc0de' + 'b' * 32
+        harness.git_ops.find_merge_marker = AsyncMock(  # type: ignore[attr-defined]
+            return_value=marker_sha
+        )
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {tid: 'in-progress'}, None
+        )
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+
+        # Create a worktree with a stale plan.lock (dead PID)
+        worktree_path = harness.git_ops.worktree_base / tid
+        lock_dir = worktree_path / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': f'{tid}-dead',
+            'locked_at': '2026-01-01T00:00:00+00:00',
+            'owner_pid': 99999,
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Must be marked done with marker provenance, NOT reverted to pending
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'note': 'reconcile: branch deleted but merge marker found on main',
+                'commit': marker_sha,
+            },
+        )
+
+        # cleanup_worktree IS called — worktree dir existed
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            worktree_path, tid
+        )
+
+        # plan.lock is gone — cleanup_worktree's rmtree side_effect ran,
+        # proving the stale-lock branch was bypassed
+        assert not lock_path.exists(), (
+            'plan.lock should be removed by cleanup_worktree in the marker guard'
+        )
+
+    async def test_marker_drops_recovered_plan_and_cleans_worktree(
+        self, harness: Harness
+    ):
+        """Regression: when find_merge_marker returns a SHA and the task has a
+        recovered plan, the stale _recovered_plans entry must be dropped and the
+        orphaned worktree must be cleaned up.
+
+        Analog of test_already_merged_drops_recovered_plan_and_cleans_worktree
+        for the marker path.
+        """
+        tid = '73'
+        marker_sha = 'cafe1234' + 'c' * 32
+        harness.git_ops.find_merge_marker = AsyncMock(  # type: ignore[attr-defined]
+            return_value=marker_sha
+        )
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {tid: 'in-progress'}, None
+        )
+        # Seed a recovered plan — simulates _recover_crashed_tasks having run
+        harness._recovered_plans[tid] = {'task_id': tid, 'steps': []}
+
+        # Create the worktree dir on disk so the cleanup branch is reachable
+        worktree_path = harness.git_ops.worktree_base / tid
+        worktree_path.mkdir(parents=True)
+
+        await harness._reconcile_stranded_in_progress()
+
+        # (1) Stale recovered-plan entry must be dropped
+        assert tid not in harness._recovered_plans, (
+            '_recovered_plans entry must be popped when marker is found on main'
+        )
+
+        # (2) cleanup_worktree must be called exactly once
+        harness.git_ops.cleanup_worktree.assert_awaited_once_with(  # type: ignore[attr-defined]
+            worktree_path, tid
+        )
+
+        # (3) Task must be marked done with marker provenance
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'note': 'reconcile: branch deleted but merge marker found on main',
+                'commit': marker_sha,
+            },
+        )
+
+        # (4) Worktree dir is gone — cleanup_worktree's rmtree side_effect ran
+        assert not worktree_path.exists(), (
+            'worktree dir must be removed by cleanup_worktree'
+        )
+
+    async def test_find_merge_marker_not_invoked_when_is_ancestor_true(
+        self, harness: Harness
+    ):
+        """Efficiency lock: find_merge_marker is never called when is_ancestor
+        returns True.
+
+        The is_ancestor branch short-circuits via `continue` before the marker
+        guard is reached.
+        """
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'74': 'in-progress'}, None
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        # is_ancestor fired → should NOT call find_merge_marker
+        harness.git_ops.find_merge_marker.assert_not_called()  # type: ignore[attr-defined]
+        # But the task must be marked done via the is_ancestor path
+        harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
+
     async def test_is_ancestor_not_invoked_for_non_in_progress_tasks(
         self, harness: Harness
     ):
@@ -739,6 +936,33 @@ class TestReconcileStrandedInProgress:
 
         # is_ancestor must never be called (no in-progress tasks)
         harness.git_ops.is_ancestor.assert_not_called()  # type: ignore[attr-defined]
+        # No status changes either
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_find_merge_marker_not_invoked_for_non_in_progress_tasks(
+        self, harness: Harness
+    ):
+        """Placement-efficiency regression lock: find_merge_marker is never
+        called when there are no in-progress tasks.
+
+        Proves the guard sits below the `if status != 'in-progress': continue`
+        filter and does not waste git invocations on non-in-progress tasks.
+        """
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {
+                '80': 'pending',
+                '81': 'done',
+                '82': 'blocked',
+                '83': 'cancelled',
+                '84': 'review',
+            },
+            None,
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        # find_merge_marker must never be called (no in-progress tasks)
+        harness.git_ops.find_merge_marker.assert_not_called()  # type: ignore[attr-defined]
         # No status changes either
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 

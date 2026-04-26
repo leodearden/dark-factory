@@ -927,13 +927,25 @@ Output JSON matching the schema. Every task must appear in the output.
         operators can spot the race.  Reconciliation is best-effort and must
         not abort on this edge case; fused-memory accepts note-only provenance.
 
-        Limitation: git_ops.is_ancestor returns False when the task branch does
-        not exist (e.g., merge_queue successfully merged AND deleted the branch
-        before crashing).  In that case the task falls through to the no-lock /
-        stale-lock revert path and may be re-queued even though the work is
-        already on main.  A future improvement could additionally check for a
-        merge marker on main (e.g., a commit message trailer containing the task
-        id) when is_ancestor is False and the branch ref is absent.
+        **Branch-deleted fast-path** (find_merge_marker):
+        ``is_ancestor`` returns False in two cases: (1) the branch ref still
+        exists but isn't on main — revert is correct; (2) the branch ref is
+        gone — ``git merge-base --is-ancestor`` exits non-zero because it
+        cannot resolve the ref.  Case (2) is the realistic post-merge-queue
+        crash scenario: ``advance_main`` succeeded and ``cleanup_worktree``
+        deleted the branch, but ``set_task_status('done')`` never ran.
+
+        To distinguish case (2) from case (1) we call
+        ``git_ops.find_merge_marker(branch)`` immediately after the
+        ``is_ancestor`` block.  ``find_merge_marker`` gates on
+        ``resolve_branch_sha`` (returns None when the branch is still present,
+        so it can only hit the git-log path when the ref is truly gone), then
+        searches recent main commits for a subject matching
+        ``Merge {branch} into {main_branch}`` — the format ``merge_to_main``
+        writes.  A hit is treated identically to the
+        is_ancestor path: pop ``_recovered_plans``, attempt
+        ``cleanup_worktree`` (swallow errors), call
+        ``set_task_status('done', done_provenance={'commit': marker_sha, ...})``.
         """
         statuses, _ = await self.scheduler.get_statuses()
         reverted = 0
@@ -989,6 +1001,38 @@ Output JSON matching the schema. Every task must appear in the output.
                 logger.info(
                     'Reconcile: marked task %s done '
                     '(reason=branch-already-on-main)', tid,
+                )
+                marked_done += 1
+                continue
+
+            # Branch-deleted fast-path: is_ancestor returned False, but the
+            # branch may simply not exist any more (cleanup_worktree ran after
+            # advance_main but before set_task_status).  Search main for the
+            # merge commit subject 'Merge {branch} into {main}' that
+            # merge_to_main writes (git_ops.py:755).
+            marker_sha = await self.git_ops.find_merge_marker(branch)
+            if marker_sha:
+                worktree_path = self.git_ops.worktree_base / tid
+                self._recovered_plans.pop(tid, None)
+                if worktree_path.exists():
+                    try:
+                        await self.git_ops.cleanup_worktree(worktree_path, tid)
+                    except Exception:
+                        logger.warning(
+                            'Reconcile: cleanup_worktree failed for task %s'
+                            ' (branch-deleted-marker-found); continuing',
+                            tid, exc_info=True,
+                        )
+                await self.scheduler.set_task_status(
+                    tid, 'done',
+                    done_provenance={
+                        'note': 'reconcile: branch deleted but merge marker found on main',
+                        'commit': marker_sha,
+                    },
+                )
+                logger.info(
+                    'Reconcile: marked task %s done '
+                    '(reason=branch-deleted-marker-found)', tid,
                 )
                 marked_done += 1
                 continue
