@@ -430,7 +430,7 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
         '42' in record.message
         and 'missing_deliverable' in record.message
         and ('unknown' in record.message or 'malformed' in record.message)
-        and record.levelno >= logging.DEBUG
+        and record.levelno == logging.DEBUG
         for record in caplog.records
     ), (
         f"Expected a DEBUG log mentioning task_id='42', flag_type='missing_deliverable', "
