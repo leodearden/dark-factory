@@ -512,20 +512,22 @@ class DurableWriteQueue:
                     'error_type': 'TransientSqliteError',
                     'retriable': True,
                     'deleted': sorted(deleted),
-                    'not_found': sorted(not_found_completed - deleted),
+                    'not_found': sorted(not_found_completed),
                     'remaining': sorted(ids[i:]),
                 }
             chunk_deleted = {
                 (row[0] if isinstance(row, tuple) else row['id']) for row in rows
             }
             deleted |= chunk_deleted
-            not_found_completed |= set(chunk) - chunk_deleted
+            # Subtract `deleted` at point-of-update so the invariant holds
+            # throughout the loop — any future early-return path is safe.
+            not_found_completed |= (set(chunk) - chunk_deleted) - deleted
 
         await self._db.commit()
 
         return {
             'deleted': sorted(deleted),
-            'not_found': sorted(not_found_completed - deleted),
+            'not_found': sorted(not_found_completed),
         }
 
     async def get_dead_items(
