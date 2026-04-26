@@ -718,7 +718,15 @@ async def _queue_briefing_refresh_tasks(
             if isinstance(result, dict) and 'id' in result:
                 created.append(str(result['id']))
             else:
-                created.append(task_id)
+                logger.warning(
+                    'briefing_refresh_add_task_unexpected_shape',
+                    extra={
+                        'project_root': project_root,
+                        'task_id': task_id,
+                        'result_type': type(result).__name__,
+                    },
+                )
+                failed.append(task_id)
         except Exception:
             logger.warning(
                 'briefing_refresh_add_task_failed',
