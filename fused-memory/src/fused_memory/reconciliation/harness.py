@@ -457,12 +457,16 @@ class ReconciliationHarness:
             # rather than propagating to the outer except (which would drop the write).
             if transition == 'done' and tid:
                 try:
-                    # Limit=20: generous enough to cover typical per-project task
-                    # counts while bounding search cost.  Both sides of the
-                    # transition comparison are coerced to str for safety.
+                    # Constrain by category to reduce false-negatives from
+                    # embedding-similarity ranking when the corpus is large
+                    # (mirroring flag_dedup.py:73-74): after Task 1107's fix
+                    # to push category filtering to the vector store, this
+                    # constrains the corpus before top-N ranking so a matching
+                    # prior is not pushed outside the limit by unrelated rows.
                     results = await self.memory.search(
                         query=f'task {tid} targeted_reconciliation completion done',
                         project_id=project_id,
+                        categories=['observations_and_summaries'],
                         limit=20,
                     )
                     # Both sides coerced to str so that a prior written with
