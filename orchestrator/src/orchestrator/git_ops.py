@@ -711,7 +711,6 @@ class GitOps:
         # --fixed-strings avoids BRE metacharacter interpretation (e.g. dots in
         # branch names would otherwise be wildcards).  The trailing ' into '
         # prevents task/1 from matching 'Merge task/10 into main'.
-        # -n 5000 bounds the scan on large histories; the marker is always recent.
         grep_pattern = f'Merge {branch} into '
         rc, out, _ = await _run(
             [
@@ -719,7 +718,6 @@ class GitOps:
                 '--fixed-strings',
                 f'--grep={grep_pattern}',
                 '--max-count=1',
-                '-n', '5000',
                 '--format=%H',
             ],
             cwd=self.project_root,
