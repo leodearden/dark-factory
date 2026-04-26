@@ -926,13 +926,17 @@ Output JSON matching the schema. Every task must appear in the output.
 
             branch = f'{self.git_ops.config.branch_prefix}{tid}'
             if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
-                # Branch is already on main — mark done.  If a stale worktree
-                # dir exists (orchestrator crashed after merge but before cleanup),
-                # remove it now so future re-use of the same task id doesn't
-                # collide.  Skip cleanup for recovered plans (worktree still
-                # needed for resumption, though that combination is unlikely here).
+                # Branch is already on main — the task is becoming terminal.
+                # Any recovered plan is now stale (no resumption is possible
+                # once the task is 'done'), so drop the entry unconditionally.
+                # Then clean up any orphaned worktree dir so future re-use of
+                # the same task id doesn't collide.
                 worktree_path = self.git_ops.worktree_base / tid
-                if worktree_path.exists() and tid not in self._recovered_plans:
+                # pop(tid, None) is idempotent: if set_task_status fails below
+                # and the next reconcile pass re-enters this branch, the pop
+                # is a cheap no-op and cleanup retries cleanly.
+                self._recovered_plans.pop(tid, None)
+                if worktree_path.exists():
                     try:
                         await self.git_ops.cleanup_worktree(worktree_path, tid)
                     except Exception:
