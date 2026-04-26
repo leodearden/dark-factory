@@ -806,6 +806,18 @@ class VerifyResult:
             )
         if self.cause_hint:
             sections.append(f'## Failure Cause\n\n{self.cause_hint}')
+        # ## Verify Logs — list on-disk paths so the reader can `cat` the full evidence.
+        # Appears between ## Failure Cause and ## Test Failures.
+        if self.worktree_log_paths or self.archive_log_paths:
+            log_lines = ['## Verify Logs', '', 'Worktree:']
+            for p in self.worktree_log_paths:
+                log_lines.append(f'- {p}')
+            if self.archive_log_paths:
+                log_lines.append('')
+                log_lines.append('Archive (durable, survives worktree cleanup):')
+                for p in self.archive_log_paths:
+                    log_lines.append(f'- {p}')
+            sections.append('\n'.join(log_lines))
         if self.test_output and 'FAILED' in self.test_output:
             sections.append(f'## Test Failures\n\n```\n{self.test_output[-3000:]}\n```')
         if self.lint_output and self.lint_output.strip():
