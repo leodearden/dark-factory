@@ -136,26 +136,14 @@ class TestFindDarkFactoryPaths:
         assert 'orchestrator/' in result
 
     def test_nested_path_segment_matches_by_design(self):
-        """A nested path like ``tests/orchestrator/harness.py`` matches
-        ``orchestrator/`` because the slash *before* ``orchestrator/`` satisfies
-        the lookbehind boundary class ``[^A-Za-z0-9_-]``, which admits ``/``.
+        """Filesystem paths like ``tests/orchestrator/harness.py`` match because
+        the slash *before* ``orchestrator/`` satisfies the lookbehind boundary
+        class ``[^A-Za-z0-9_-]``, which admits ``/``.
 
-        Likewise, ``services/graphiti/core.py`` matches ``graphiti/`` for the
-        same reason.
-
-        This over-rejection is intentional and consistent with
-        ``test_url_style_path_matches_by_design`` above and the module's stated
-        design decision ("Word-boundary anchoring for prefix matching").  The
-        guard short-circuits obvious mis-filings; callers either resubmit the
-        task under dark_factory or reword the task description to avoid the
-        prefix — there is no escape hatch by design.  Erring on the side of
-        rejection is cheaper to recover from than letting a mis-filed task slip
-        through undetected.
-
-        Note: if the lookbehind were tightened to whitespace/punctuation only
-        (Option (b) from the task spec), both assertions below would fail
-        because ``/`` is neither whitespace nor punctuation in that narrower
-        class — confirming this test is a meaningful contract, not an
+        This over-rejection is intentional — same contract as
+        ``test_url_style_path_matches_by_design``.  If the lookbehind were
+        tightened to a whitespace-only class (``\\s``), both assertions below
+        would fail, confirming this is a meaningful contract test, not an
         accidentally-passing assertion.
         """
         cases = [
