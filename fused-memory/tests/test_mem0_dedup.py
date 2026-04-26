@@ -135,3 +135,34 @@ async def test_search_exception_returns_none_and_logs_warning(caplog):
         f'Expected a WARNING mentioning task 55 but got: '
         f'{[r.message for r in caplog.records]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 11 — search kwargs forwarding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_kwargs_forwarded():
+    """find_prior_memory forwards query, project_id, categories, and limit as kwargs."""
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[])
+
+    await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': 'foo'},
+        query='Q',
+        categories=['observations_and_summaries'],
+        limit=37,
+    )
+
+    memory_service.search.assert_called_once()
+    call_kwargs = memory_service.search.call_args.kwargs
+    assert call_kwargs.get('query') == 'Q'
+    assert call_kwargs.get('project_id') == 'p'
+    assert call_kwargs.get('categories') == ['observations_and_summaries']
+    assert call_kwargs.get('limit') == 37
