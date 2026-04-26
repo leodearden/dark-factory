@@ -20,7 +20,9 @@ class TestFindDarkFactoryPaths:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        from fused_memory.middleware.dark_factory_path_guard import find_dark_factory_paths  # noqa: PLC0415
+        from fused_memory.middleware.dark_factory_path_guard import (
+            find_dark_factory_paths,  # noqa: PLC0415
+        )
         self.find = find_dark_factory_paths
 
     def test_empty_text_returns_empty_list(self):
@@ -84,7 +86,9 @@ class TestFindDarkFactoryPaths:
 
     def test_all_known_prefixes_are_matched(self):
         """Every canonical dark-factory prefix is detected when present."""
-        from fused_memory.middleware.dark_factory_path_guard import DARK_FACTORY_PATH_PREFIXES  # noqa: PLC0415
+        from fused_memory.middleware.dark_factory_path_guard import (
+            DARK_FACTORY_PATH_PREFIXES,  # noqa: PLC0415
+        )
         for prefix in DARK_FACTORY_PATH_PREFIXES:
             text = f'look at {prefix}some_file.py'
             result = self.find(text)
@@ -109,7 +113,9 @@ class TestPathGuardVerdict:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        from fused_memory.middleware.dark_factory_path_guard import PathGuardVerdict  # noqa: PLC0415
+        from fused_memory.middleware.dark_factory_path_guard import (
+            PathGuardVerdict,  # noqa: PLC0415
+        )
         self.Verdict = PathGuardVerdict
 
     def test_ok_outcome_is_not_rejection(self):
@@ -222,7 +228,9 @@ class TestCheckCandidate:
 
     @pytest.fixture(autouse=True)
     def _import(self):
-        from fused_memory.middleware.dark_factory_path_guard import check_candidate_for_dark_factory_paths  # noqa: PLC0415
+        from fused_memory.middleware.dark_factory_path_guard import (
+            check_candidate_for_dark_factory_paths,  # noqa: PLC0415
+        )
         from fused_memory.middleware.task_curator import CandidateTask  # noqa: PLC0415
         self.check = check_candidate_for_dark_factory_paths
         self.CandidateTask = CandidateTask
