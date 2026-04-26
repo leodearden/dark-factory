@@ -34,6 +34,50 @@ _need_two_accounts = pytest.mark.skipif(
     reason='Requires at least 2 OAuth accounts in env',
 )
 
+# ---------------------------------------------------------------------------
+# Capacity-failure detection helper
+# ---------------------------------------------------------------------------
+
+_CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
+    'capped',
+    'rate limit',
+    'unavailable',
+    'out of extra usage',
+    'usage limit',
+    "you've hit",
+    "you've used",
+)
+
+
+def _looks_like_capacity_failure(result: AgentResult) -> bool:
+    """Return True when *result* looks like a Claude CLI capacity / quota failure.
+
+    The helper inspects both ``result.output`` and ``result.stderr``
+    (case-insensitive substring match) against a small focused list of markers
+    drawn from real Claude CLI cap messages (see ``shared.usage_gate`` inline
+    comments for verbatim examples).
+
+    **Conservative bias (fail loudly when uncertain).** This helper is used
+    at ``pytest.skip`` call sites, so a false positive — skipping on a real
+    regression — is the exact failure mode we are trying to prevent. The list
+    is therefore intentionally small and obvious; anything not matching a
+    well-known capacity signal falls through to an ``assert`` that fails the
+    test loudly.
+
+    **Local list, not imported from ``shared.usage_gate``.** The production
+    cap detector (``usage_gate.detect_cap_hit``) requires BOTH a prefix AND a
+    confirm-keyword match — a strict combined policy designed to avoid marking
+    healthy accounts as capped. Re-using those lists here would either collapse
+    the combined check to a loose OR (pulling in confirm keywords like
+    ``"resets"`` as standalone signals) or miss real cap messages that arrive
+    without the expected prefix. A purpose-built substring list is the correct
+    shape for this use-case.
+    """
+    haystack = f'{result.output}\n{result.stderr}'.lower()
+    return any(marker in haystack for marker in _CAPACITY_FAILURE_MARKERS)
+
+
+# ---------------------------------------------------------------------------
 # Shared invocation kwargs to minimize cost.
 # dict[str, Any] is intentional: invoke_claude_agent parameters have
 # heterogeneous types (Path/str/int/float/list), so a concrete dict type
