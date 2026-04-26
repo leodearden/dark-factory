@@ -4191,6 +4191,23 @@ async def _cancel_interceptor_workers(ti) -> None:
     """Cancel any background ticket-worker tasks on *ti* and await them silently.
 
     Used in test teardown so fixture cleanup (DB close) never races a live worker.
+
+    Why partial cleanup is sufficient here:
+    The production ``TaskInterceptor.close()`` path does five additional things
+    beyond cancelling worker tasks: (1) sets ``_closed = True``, (2) signals all
+    pending ``_ticket_events`` so blocked ``resolve_ticket`` callers unblock,
+    (3) drains fire-and-forget ``_background_tasks``, (4) closes the curator's
+    Qdrant connection, and (5) closes the ``TicketStore`` SQLite connection.
+    This helper skips all five because ``TestSubmitTaskGuardrail`` intentionally
+    exercises none of those paths — no ``resolve_ticket`` waiters are registered,
+    no curator is wired up, no fire-and-forget tasks are scheduled, and the
+    ``ticket_store`` fixture (function-scoped) closes the DB in its own teardown.
+    A class-level ``close()`` hook would race the fixture's per-test DB-close and
+    risk spurious "closed database" errors.
+
+    If a future change wires the suite up to any of these paths (resolve_ticket,
+    curator, fire-and-forget tasks), or relies on close()-only side-effects to
+    surface leaks, switch this teardown to ``await ti.close()`` instead.
     """
     for t in list(ti._worker_tasks.values()):
         if not t.done():
