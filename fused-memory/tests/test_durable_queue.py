@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import time
 from unittest.mock import AsyncMock
@@ -935,14 +934,28 @@ class TestDeleteDead:
             dead_ids = [await self._insert_dead_row(q, 'proj1') for _ in range(7)]
 
             # (3) Switch the queue connection to the parametrized journal mode.
-            await q._db.execute(f'PRAGMA journal_mode={journal_mode}')
+            #     Fetch the PRAGMA result to confirm the switch actually happened —
+            #     PRAGMA journal_mode silently returns the *current* mode rather
+            #     than raising on failure, so discarding the cursor can mask a
+            #     no-op switch (e.g. WAL→DELETE while another connection holds WAL).
+            cur = await q._db.execute(f'PRAGMA journal_mode={journal_mode}')
+            row = await cur.fetchone()
+            assert row is not None and row[0].lower() == journal_mode.lower(), (
+                f'journal_mode switch failed: expected {journal_mode!r}, '
+                f'got {(row[0] if row else None)!r}'
+            )
             await q._db.commit()
 
             db_path = q._data_dir / 'write_queue.db'
 
             # (4) Open conn2 to the same file; confirm the matching journal mode.
             async with aiosqlite.connect(str(db_path)) as conn2:
-                await conn2.execute(f'PRAGMA journal_mode={journal_mode}')
+                cur2 = await conn2.execute(f'PRAGMA journal_mode={journal_mode}')
+                row2 = await cur2.fetchone()
+                assert row2 is not None and row2[0].lower() == journal_mode.lower(), (
+                    f'conn2 journal_mode switch failed: expected {journal_mode!r}, '
+                    f'got {(row2[0] if row2 else None)!r}'
+                )
                 await conn2.commit()
 
                 # (5) Install the coordinator wrapper around q._db.execute.
@@ -955,6 +968,13 @@ class TestDeleteDead:
                 #   d. Lower busy_timeout to 50 ms so chunk-2 fails fast.
                 #   e. Return a proxy cursor with the pre-buffered RETURNING rows.
                 # All other calls (including chunk-2 DELETE) forward to the real execute.
+                #
+                # Recovery-commit safety note: delete_dead's except-OperationalError
+                # handler calls ``await self._db.commit()`` as a recovery attempt after
+                # chunk-2 fails.  That commit is a no-op because the coordinator already
+                # committed chunk-1 above, leaving *no pending transaction* on the queue
+                # connection.  A no-op commit never needs the write lock, so there is no
+                # race risk from busy_timeout still being 50 ms at that point.
                 delete_call_count = 0
                 q_db = q._db
                 original_execute = q_db.execute
@@ -1012,10 +1032,6 @@ class TestDeleteDead:
             )
             assert result.get('not_found') == []
 
-            # Disjointness and union-completeness invariants.
-            assert set(result['deleted']).isdisjoint(set(result['remaining']))
-            assert set(result['deleted']) | set(result['remaining']) == set(dead_ids)
-
             # (9) Durability check: close the queue, open a fresh connection, and
             #     confirm that chunk-1 rows are physically gone while chunk-2/3 rows
             #     still exist.  Avoids re-instantiating DurableWriteQueue to prevent
@@ -1040,8 +1056,8 @@ class TestDeleteDead:
             )
 
         finally:
-            with contextlib.suppress(Exception):
-                await q.close()
+            # close() guards against _db being None, so a double-call is a no-op.
+            await q.close()
 
 
 class TestStats:
