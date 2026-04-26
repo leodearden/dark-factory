@@ -956,31 +956,17 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             branch = f'{self.git_ops.config.branch_prefix}{tid}'
-            if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
-                # Branch is already on main — the task is becoming terminal.
-                # Resolve branch SHA BEFORE cleanup_worktree, which calls
-                # 'git branch -D' (git_ops.py cleanup_worktree) and would
-                # invalidate a post-cleanup rev-parse.
-                branch_sha = await self.git_ops.resolve_branch_sha(branch)
 
-                # Any recovered plan is now stale (no resumption is possible
-                # once the task is 'done'), so drop the entry unconditionally.
-                # Then clean up any orphaned worktree dir so future re-use of
-                # the same task id doesn't collide.
-                worktree_path = self.git_ops.worktree_base / tid
-                # pop(tid, None) is idempotent: if set_task_status fails below
-                # and the next reconcile pass re-enters this branch, the pop
-                # is a cheap no-op and cleanup retries cleanly.
-                self._recovered_plans.pop(tid, None)
-                if worktree_path.exists():
-                    try:
-                        await self.git_ops.cleanup_worktree(worktree_path, tid)
-                    except Exception:
-                        logger.warning(
-                            'Reconcile: cleanup_worktree failed for task %s'
-                            ' (already-on-main); continuing',
-                            tid, exc_info=True,
-                        )
+            # Already-on-main fast-path (is_ancestor == True).
+            # Side-effect sequence shared via _mark_in_progress_done.
+            if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
+                # Resolve branch SHA BEFORE the helper invokes cleanup_worktree
+                # (which calls 'git branch -D' and would invalidate
+                # post-cleanup rev-parse — see git_ops.py cleanup_worktree).
+                # Build provenance before invoking the helper — the helper
+                # performs cleanup, and any post-cleanup git query (e.g.
+                # rev-parse on a deleted branch) would fail.
+                branch_sha = await self.git_ops.resolve_branch_sha(branch)
 
                 provenance: dict[str, str] = {
                     'note': 'reconcile: branch already on main when stranded in-progress',
@@ -994,45 +980,26 @@ Output JSON matching the schema. Every task must appear in the output.
                         branch, tid,
                     )
 
-                await self.scheduler.set_task_status(
-                    tid, 'done',
-                    done_provenance=provenance,
-                )
-                logger.info(
-                    'Reconcile: marked task %s done '
-                    '(reason=branch-already-on-main)', tid,
-                )
+                await self._mark_in_progress_done(tid, provenance, 'branch-already-on-main')
                 marked_done += 1
                 continue
 
-            # Branch-deleted fast-path: is_ancestor returned False, but the
-            # branch may simply not exist any more (cleanup_worktree ran after
-            # advance_main but before set_task_status).  Search main for the
-            # merge commit subject 'Merge {branch} into {main}' that
-            # merge_to_main writes (git_ops.py:755).
+            # Branch-deleted fast-path (find_merge_marker).
+            # is_ancestor returned False, but the branch may simply not exist
+            # any more (cleanup_worktree ran after advance_main but before
+            # set_task_status).  Search main for the merge commit subject
+            # 'Merge {branch} into {main}' that merge_to_main writes
+            # (git_ops.py:755).
+            # Side-effect sequence shared via _mark_in_progress_done.
             marker_sha = await self.git_ops.find_merge_marker(branch)
             if marker_sha:
-                worktree_path = self.git_ops.worktree_base / tid
-                self._recovered_plans.pop(tid, None)
-                if worktree_path.exists():
-                    try:
-                        await self.git_ops.cleanup_worktree(worktree_path, tid)
-                    except Exception:
-                        logger.warning(
-                            'Reconcile: cleanup_worktree failed for task %s'
-                            ' (branch-deleted-marker-found); continuing',
-                            tid, exc_info=True,
-                        )
-                await self.scheduler.set_task_status(
-                    tid, 'done',
-                    done_provenance={
+                await self._mark_in_progress_done(
+                    tid,
+                    {
                         'note': 'reconcile: branch deleted but merge marker found on main',
                         'commit': marker_sha,
                     },
-                )
-                logger.info(
-                    'Reconcile: marked task %s done '
-                    '(reason=branch-deleted-marker-found)', tid,
+                    'branch-deleted-marker-found',
                 )
                 marked_done += 1
                 continue
@@ -1126,6 +1093,48 @@ Output JSON matching the schema. Every task must appear in the output.
                 'Reconcile: %d stranded task(s) reverted to pending; %d marked done (branch already on main)',
                 reverted, marked_done,
             )
+
+    async def _mark_in_progress_done(
+        self,
+        tid: str,
+        provenance: dict[str, str],
+        reason: str,
+    ) -> None:
+        """Mark a stranded in-progress task done.
+
+        Encapsulates the pop/cleanup/set_status/log sequence shared by the
+        is_ancestor and find_merge_marker branches in
+        _reconcile_stranded_in_progress.
+
+        Args:
+            tid: The task id (string form, as it appears in get_statuses).
+            provenance: done_provenance dict — caller is responsible for
+                building this (typically {'note': '...', 'commit': <sha>} or
+                note-only when rev-parse fails).
+            reason: Short slug used in both the cleanup-failure WARNING and
+                the success INFO log (e.g. 'branch-already-on-main',
+                'branch-deleted-marker-found').
+
+        Caller is responsible for incrementing the local marked_done counter
+        and issuing `continue` after this returns.
+        """
+        worktree_path = self.git_ops.worktree_base / tid
+        self._recovered_plans.pop(tid, None)
+        if worktree_path.exists():
+            try:
+                await self.git_ops.cleanup_worktree(worktree_path, tid)
+            except Exception:
+                logger.warning(
+                    'Reconcile: cleanup_worktree failed for task %s'
+                    ' (%s); continuing',
+                    tid, reason, exc_info=True,
+                )
+        await self.scheduler.set_task_status(
+            tid, 'done', done_provenance=provenance,
+        )
+        logger.info(
+            'Reconcile: marked task %s done (reason=%s)', tid, reason,
+        )
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
