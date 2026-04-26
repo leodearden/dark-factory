@@ -417,3 +417,65 @@ class TestCheckCandidate:
         assert result.is_rejection
         assert 'foo/' in result.matched_paths
         assert 'orchestrator/' not in result.matched_paths
+
+
+# ---------------------------------------------------------------------------
+# TestCheckText  (step-1/2 in task-1094)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckText:
+    """Unit tests for check_text_for_dark_factory_paths()."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from fused_memory.middleware.dark_factory_path_guard import (
+            check_text_for_dark_factory_paths,  # noqa: PLC0415
+        )
+        self.check = check_text_for_dark_factory_paths
+
+    def test_dark_factory_project_id_is_always_ok(self):
+        """Even if the text has dark-factory paths, filing under dark_factory is fine."""
+        result = self.check(
+            'Edit orchestrator/harness.py for the deadlock',
+            'dark_factory',
+        )
+        assert result.outcome == 'ok'
+        assert not result.is_rejection
+
+    def test_empty_string_returns_ok(self):
+        result = self.check('', 'reify')
+        assert result.outcome == 'ok'
+        assert not result.is_rejection
+
+    def test_clean_text_non_dark_factory_project_is_ok(self):
+        result = self.check('Refactor foo/bar.py routing', 'reify')
+        assert result.outcome == 'ok'
+        assert not result.is_rejection
+
+    def test_text_with_orchestrator_path_in_wrong_project_is_rejection(self):
+        result = self.check('Edit orchestrator/harness.py for the deadlock', 'reify')
+        assert result.is_rejection
+        assert 'orchestrator/' in result.matched_paths
+
+    def test_rejection_project_id_echoes_input(self):
+        result = self.check('See orchestrator/harness.py', 'some_project')
+        assert result.is_rejection
+        assert result.project_id == 'some_project'
+
+    def test_none_text_returns_ok(self):
+        """None text must be tolerated — returns ok."""
+        result = self.check(None, 'reify')
+        assert result.outcome == 'ok'
+        assert not result.is_rejection
+
+    def test_custom_prefixes_kwarg_overrides_defaults(self):
+        """The ``prefixes`` kwarg overrides the default prefix set end-to-end."""
+        # Custom prefix triggers rejection; default prefix is ignored.
+        result = self.check('edit foo/some_file.py', 'reify', prefixes=('foo/',))
+        assert result.is_rejection
+        assert 'foo/' in result.matched_paths
+
+        # Default prefix must NOT match when the custom set is active.
+        result2 = self.check('edit orchestrator/harness.py', 'reify', prefixes=('foo/',))
+        assert result2.outcome == 'ok'
