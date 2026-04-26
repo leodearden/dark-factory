@@ -2627,8 +2627,8 @@ class TestFindMergeMarker:
         """Substring safety: merging task/10 writes 'Merge task/10 into main'.
         find_merge_marker('task/1') must NOT match this commit.
 
-        The '^' anchor + trailing ' into ' in the --grep pattern prevent
-        task/1 from being found inside 'Merge task/10 into main'.
+        The trailing ' into ' literal in the --fixed-strings --grep pattern
+        means 'Merge task/1 into ' is not a substring of 'Merge task/10 into main'.
         """
         # Merge task/10 and delete branch
         tid = '10'
@@ -2675,3 +2675,64 @@ class TestFindMergeMarker:
         # Branch is gone but no merge marker was ever written on main
         result = await git_ops.find_merge_marker(f'task/{tid}')
         assert result is None
+
+    async def test_returns_single_sha_when_branch_reopened_with_two_merges(
+        self, git_ops: GitOps
+    ):
+        """find_merge_marker returns exactly one 40-char SHA in the re-opened-task
+        scenario described in the function's own docstring: a task branch is merged,
+        deleted, then re-created under the same name, merged again, and deleted again.
+        Both merge commits share the same subject ('Merge task/reopened-1 into main'),
+        so a git-log invocation with conflicting --max-count=1 and -n 5000 flags would
+        return both SHAs newline-joined (last-wins: -n 5000 overrides --max-count=1),
+        corrupting done_provenance={'commit': marker_sha} in harness reconcile.
+        After dropping -n 5000, --max-count=1 alone ensures a single SHA is returned.
+        """
+        tid = 'reopened-1'
+
+        # --- Iteration 1 ---
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'iter1_{tid}.py').write_text(f'iter1_{tid} = True\n')
+        await git_ops.commit(wt_info.path, 'Add iter1')
+
+        result1 = await git_ops.merge_to_main(wt_info.path, tid)
+        assert result1.success
+        assert result1.merge_commit is not None
+        assert result1.merge_worktree is not None
+
+        adv1 = await git_ops.advance_main(result1.merge_commit)
+        assert adv1 == 'advanced'
+
+        await git_ops.cleanup_merge_worktree(result1.merge_worktree)
+        await git_ops.cleanup_worktree(wt_info.path, tid)
+        first_sha = result1.merge_commit
+
+        # --- Iteration 2 (same tid — branch was deleted, so this is a fresh branch) ---
+        wt_info2 = await git_ops.create_worktree(tid)
+        assert wt_info2 is not None
+        (wt_info2.path / f'iter2_{tid}.py').write_text(f'iter2_{tid} = True\n')
+        await git_ops.commit(wt_info2.path, 'Add iter2')
+
+        result2 = await git_ops.merge_to_main(wt_info2.path, tid)
+        assert result2.success
+        assert result2.merge_commit is not None
+        assert result2.merge_worktree is not None
+
+        adv2 = await git_ops.advance_main(result2.merge_commit)
+        assert adv2 == 'advanced'
+
+        await git_ops.cleanup_merge_worktree(result2.merge_worktree)
+        await git_ops.cleanup_worktree(wt_info2.path, tid)
+        second_sha = result2.merge_commit
+
+        # Both merge commits exist on main with the same subject.
+        assert first_sha != second_sha  # sanity: two distinct commits
+
+        # --- Assertion ---
+        marker_sha = await git_ops.find_merge_marker(f'task/{tid}')
+
+        assert marker_sha is not None
+        assert '\n' not in marker_sha   # anti-multiline regression
+        assert len(marker_sha) == 40    # single-SHA shape
+        assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
