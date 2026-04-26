@@ -49,3 +49,21 @@ class TestMem0BackendSearch:
         assert call_kwargs.get('filters') == {'category': 'preferences_and_norms'}, (
             f"Expected filters={{'category': 'preferences_and_norms'}}, got {call_kwargs.get('filters')!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_multiple_categories_builds_in_filter(self, backend):
+        """Multiple categories must produce an in-list filter dict passed to instance.search."""
+        mock_instance = MagicMock()
+        mock_instance.search = AsyncMock(return_value={'results': []})
+        with patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)):
+            await backend.search(
+                query='q',
+                scope=Scope(project_id='p'),
+                limit=5,
+                categories=['preferences_and_norms', 'procedural_knowledge'],
+            )
+        call_kwargs = mock_instance.search.call_args.kwargs
+        expected = {'category': {'in': ['preferences_and_norms', 'procedural_knowledge']}}
+        assert call_kwargs.get('filters') == expected, (
+            f'Expected filters={expected!r}, got {call_kwargs.get("filters")!r}'
+        )
