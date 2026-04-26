@@ -1211,9 +1211,23 @@ def create_mcp_server(
         """
         if err := validate_project_id(project_id):
             return err
-        if not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        if not isinstance(ids, (list, tuple)):
             return {
-                'error': 'ids must be integers (event_queue UUIDs are not supported)',
+                'error': f'ids must be a list of integers, got {type(ids).__name__}',
+                'error_type': 'ValidationError',
+            }
+        _bad_idx = next(
+            (idx for idx, i in enumerate(ids)
+             if not (isinstance(i, int) and not isinstance(i, bool))),
+            None,
+        )
+        if _bad_idx is not None:
+            _bad_val = ids[_bad_idx]
+            return {
+                'error': (
+                    f'ids[{_bad_idx}] must be int, '
+                    f'got {type(_bad_val).__name__}: {_bad_val!r}'
+                ),
                 'error_type': 'ValidationError',
             }
         try:

@@ -577,3 +577,61 @@ class TestDeleteDeadLettersIdGuard:
             f"expected 'ValidationError', got: {result}"
         )
         svc.durable_queue.delete_dead.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_ids_returns_validation_error(self):
+        """ids=None (non-iterable) returns ValidationError instead of falling to the
+        broad except-Exception catch-all.
+
+        When pydantic is bypassed, ids=None reaches the guard directly.  Without an
+        explicit isinstance(ids, (list, tuple)) precheck the generator 'for i in ids'
+        would raise TypeError, which the outer except-Exception block catches and
+        surfaces as a generic error_type (the exception class name) rather than a
+        clean ValidationError envelope.
+        """
+        svc = _make_delete_mock_service()
+        server = create_mcp_server(svc)
+        _tool = server._tool_manager.get_tool('delete_dead_letters')
+        assert _tool is not None, 'delete_dead_letters tool not registered'
+        tool_fn = _tool.fn
+
+        result = await tool_fn(project_id='proj1', ids=None)
+
+        assert isinstance(result, dict), 'expected a dict envelope'
+        assert result.get('error_type') == 'ValidationError', (
+            f"expected 'ValidationError', got: {result}"
+        )
+        svc.durable_queue.delete_dead.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_list_error_message_pinpoints_first_bad_element(self):
+        """Error message includes index, type, and repr of the first bad element.
+
+        When a mixed list like [1, 2, 'uuid-...'] is passed, the operator should be
+        told exactly which element failed so they can fix the caller without extra
+        logging.  The expected format is 'ids[N] must be int, got TYPE: REPR'.
+        """
+        svc = _make_delete_mock_service()
+        server = create_mcp_server(svc)
+        _tool = server._tool_manager.get_tool('delete_dead_letters')
+        assert _tool is not None, 'delete_dead_letters tool not registered'
+        tool_fn = _tool.fn
+
+        bad_uuid = '550e8400-e29b-41d4-a716-446655440000'
+        result = await tool_fn(project_id='proj1', ids=[1, 2, bad_uuid])
+
+        assert isinstance(result, dict), 'expected a dict envelope'
+        assert result.get('error_type') == 'ValidationError', (
+            f"expected 'ValidationError', got: {result}"
+        )
+        error_msg = result.get('error', '')
+        assert 'ids[2]' in error_msg, (
+            f"expected 'ids[2]' in error message, got: {error_msg!r}"
+        )
+        assert 'str' in error_msg, (
+            f"expected type name 'str' in error message, got: {error_msg!r}"
+        )
+        assert bad_uuid in error_msg, (
+            f"expected offending value in error message, got: {error_msg!r}"
+        )
+        svc.durable_queue.delete_dead.assert_not_called()
