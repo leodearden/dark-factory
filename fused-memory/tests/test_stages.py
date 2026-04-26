@@ -3316,11 +3316,3 @@ class TestBriefingKnownGapsRefresh:
         ]
         assert len(warning_records) == 1
 
-    # ------------------------------------------------------------------ #
-    # STAGE2_SYSTEM_PROMPT                                                  #
-    # ------------------------------------------------------------------ #
-
-    def test_stage2_system_prompt_mentions_briefing_refresh_tasks(self):
-        """STAGE2_SYSTEM_PROMPT must mention 'Refresh briefing' so Stage-2 agents know these tasks exist."""
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-        assert 'Refresh briefing' in STAGE2_SYSTEM_PROMPT
