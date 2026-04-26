@@ -422,3 +422,35 @@ class TestGracefulShutdownClosesEventQueue:
         )
 
         memory_service.close.assert_awaited_once()
+
+
+class TestGracefulShutdownDoesNotArmForceExitWatchdog:
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_arm_force_exit_timer(self):
+        """_graceful_shutdown must NOT arm the force-exit watchdog (Task 1080 regression).
+
+        Calling _graceful_shutdown directly (as done in every test in this file) must
+        not leave a 45s daemon threading.Timer behind.  If it does, a long pytest run
+        will be killed by os._exit(1) mid-suite — no individual test failure, just a
+        truncated run with a non-zero exit code.
+        """
+        import fused_memory.server.main as main_mod
+
+        # Ensure clean state before the call.
+        main_mod._cancel_force_exit()
+        assert main_mod._shutdown_watchdog is None, 'precondition: no watchdog before call'
+
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=None,
+        )
+
+        assert main_mod._shutdown_watchdog is None, (
+            'Task 1080 regression: _graceful_shutdown armed a 45s os._exit(1) watchdog. '
+            'The watchdog must only be armed by _shutdown_with_watchdog (the lifespan-only wrapper).'
+        )
