@@ -761,6 +761,23 @@ class TestSearch:
             'Edge with non-null invalid_at must be excluded from search results (task 312)'
         )
 
+    @pytest.mark.asyncio
+    async def test_search_pushes_categories_to_mem0_backend(self, service):
+        """categories kwarg must be forwarded from MemoryService.search → _search_mem0
+        → Mem0Backend.search so the filter is applied server-side (task 1083)."""
+        service.mem0.search = AsyncMock(return_value={'results': []})
+        await service.search(
+            query='x',
+            project_id='test',
+            categories=['preferences_and_norms'],
+            stores=['mem0'],
+        )
+        call_kwargs = service.mem0.search.call_args.kwargs
+        assert 'categories' in call_kwargs, (
+            '_search_mem0 did not forward categories kwarg to mem0.search'
+        )
+        assert call_kwargs['categories'] == ['preferences_and_norms']
+
 
 class TestDeleteMemory:
     @pytest.mark.asyncio
