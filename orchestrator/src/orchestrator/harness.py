@@ -1127,6 +1127,48 @@ Output JSON matching the schema. Every task must appear in the output.
                 reverted, marked_done,
             )
 
+    async def _mark_in_progress_done(
+        self,
+        tid: str,
+        provenance: dict[str, str],
+        reason: str,
+    ) -> None:
+        """Mark a stranded in-progress task done.
+
+        Encapsulates the pop/cleanup/set_status/log sequence shared by the
+        is_ancestor and find_merge_marker branches in
+        _reconcile_stranded_in_progress.
+
+        Args:
+            tid: The task id (string form, as it appears in get_statuses).
+            provenance: done_provenance dict — caller is responsible for
+                building this (typically {'note': '...', 'commit': <sha>} or
+                note-only when rev-parse fails).
+            reason: Short slug used in both the cleanup-failure WARNING and
+                the success INFO log (e.g. 'branch-already-on-main',
+                'branch-deleted-marker-found').
+
+        Caller is responsible for incrementing the local marked_done counter
+        and issuing `continue` after this returns.
+        """
+        worktree_path = self.git_ops.worktree_base / tid
+        self._recovered_plans.pop(tid, None)
+        if worktree_path.exists():
+            try:
+                await self.git_ops.cleanup_worktree(worktree_path, tid)
+            except Exception:
+                logger.warning(
+                    'Reconcile: cleanup_worktree failed for task %s'
+                    ' (%s); continuing',
+                    tid, reason, exc_info=True,
+                )
+        await self.scheduler.set_task_status(
+            tid, 'done', done_provenance=provenance,
+        )
+        logger.info(
+            'Reconcile: marked task %s done (reason=%s)', tid, reason,
+        )
+
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
     ) -> TaskReport | None:
