@@ -119,4 +119,12 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - For each finding: investigate the affected IDs, apply the suggested action, and verify the fix.
 - If a finding cannot be resolved (e.g., ambiguous data, missing context), flag it for Stage 2.
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
+
+## Flag Deduplication
+Stage 1's flag emission is post-processed by an automatic deduplicator that searches Mem0 \
+for prior `stage1_flag_marker` memories with matching task_id+flag_type. You do NOT need \
+to manually search for or skip duplicate flags — emit findings naturally and the \
+post-processor will attach `persisted_from_run` for repeats. Do, however, set `task_id` \
+and `flag_type` fields on each flagged item where applicable so the deduplicator can \
+compute a signature.
 """
