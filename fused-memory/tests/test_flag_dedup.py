@@ -52,3 +52,36 @@ class TestComputeFlagSignature:
 
         flag = {'description': 'some flag'}
         assert compute_flag_signature(flag) is None
+
+
+# ---------------------------------------------------------------------------
+# dedup_flags tests — no-signature path (step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
+    """Flags without task_id/flag_type pass through unchanged with zero I/O calls."""
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    flags = [
+        {'description': 'some flag without task_id'},
+        {'description': 'another flag without flag_type', 'task_id': '42'},
+        {'description': 'flag without task_id', 'flag_type': 'missing_deliverable'},
+        {},
+    ]
+    original_flags = [dict(f) for f in flags]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # All flags returned unchanged
+    assert result == original_flags
+    # Zero I/O calls
+    memory_service.search.assert_not_called()
+    memory_service.add_memory.assert_not_called()
