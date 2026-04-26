@@ -29,7 +29,7 @@ class InputValidationError(ValueError):
     """
 
 
-def _safe_repr(value: str, max_len: int = 200) -> str:
+def _safe_repr(value: object, max_len: int = 200) -> str:
     """Return repr(value) truncated to max_len characters.
 
     If repr(value) exceeds max_len, slices it to max_len characters and appends
@@ -41,6 +41,17 @@ def _safe_repr(value: str, max_len: int = 200) -> str:
     if len(r) > max_len:
         return r[:max_len] + '...(truncated)'
     return r
+
+
+def _is_plain_int(x: object) -> bool:
+    """Return True iff x is a plain int (not a bool subclass).
+
+    Python's bool is a subclass of int, so ``isinstance(True, int)`` is True.
+    This predicate makes the intent explicit: only bare int values are accepted;
+    bool True/False are rejected so callers can't silently pass boolean flags
+    as list[int] element IDs.
+    """
+    return isinstance(x, int) and not isinstance(x, bool)
 
 
 def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
@@ -96,6 +107,36 @@ def validate_run_id(run_id: str) -> dict[str, str] | None:
     return _validate_identifier(run_id, 'run_id')
 
 
+def validate_int_ids(ids: object, *, name: str = 'ids') -> dict[str, str] | None:
+    """Return an error dict if ids is not a list of plain (non-bool) integers, else None.
+
+    Accepted: list or tuple of int values where none are bool subclass instances.
+    Rejected: anything that is not a list/tuple, or any element that is not a plain int.
+
+    The ``name`` keyword argument customises the field label in error messages so
+    the helper generalises to tools that accept e.g. ``row_ids: list[int]``.
+    """
+    if not isinstance(ids, (list, tuple)):
+        return {
+            'error': f'{name} must be a list or tuple of integers, got {type(ids).__name__}',
+            'error_type': 'ValidationError',
+        }
+    bad_idx = next(
+        (i for i, x in enumerate(ids) if not _is_plain_int(x)),
+        None,
+    )
+    if bad_idx is not None:
+        bad_val = ids[bad_idx]
+        return {
+            'error': (
+                f'{name}[{bad_idx}] must be int, '
+                f'got {type(bad_val).__name__}: {_safe_repr(bad_val)}'
+            ),
+            'error_type': 'ValidationError',
+        }
+    return None
+
+
 def require_project_root(project_root: str) -> None:
     """Raise InputValidationError if project_root is not a non-empty absolute path."""
     if err := validate_project_root(project_root):
@@ -111,4 +152,10 @@ def require_project_id(project_id: str) -> None:
 def require_run_id(run_id: str) -> None:
     """Raise InputValidationError if run_id is empty or contains unsafe characters."""
     if err := validate_run_id(run_id):
+        raise InputValidationError(err['error'])
+
+
+def require_int_ids(ids: object, *, name: str = 'ids') -> None:
+    """Raise InputValidationError if ids is not a list of plain (non-bool) integers."""
+    if err := validate_int_ids(ids, name=name):
         raise InputValidationError(err['error'])

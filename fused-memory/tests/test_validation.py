@@ -6,9 +6,11 @@ from fused_memory.utils.validation import (
     InputValidationError,
     _safe_repr,
     _validate_identifier,
+    require_int_ids,
     require_project_id,
     require_project_root,
     require_run_id,
+    validate_int_ids,
     validate_project_id,
     validate_project_root,
     validate_run_id,
@@ -849,3 +851,250 @@ class TestNormalLengthInputsDiagnosticQuality:
         msg = str(exc_info.value)
         assert repr(bad_id) in msg
         assert '...(truncated)' not in msg
+
+
+class TestValidateIntIds:
+    """validate_int_ids returns None for valid int lists, error dict otherwise."""
+
+    # ── Happy paths ──────────────────────────────────────────────────────────
+
+    def test_empty_list_returns_none(self):
+        assert validate_int_ids([]) is None
+
+    def test_single_element_list_returns_none(self):
+        assert validate_int_ids([42]) is None
+
+    def test_multiple_elements_returns_none(self):
+        assert validate_int_ids([1, 2, 3]) is None
+
+    def test_large_list_returns_none(self):
+        assert validate_int_ids(list(range(1000))) is None
+
+    # ── Non-list inputs ──────────────────────────────────────────────────────
+
+    def test_none_returns_error(self):
+        result = validate_int_ids(None)
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'ids must be a list or tuple of integers' in result['error']
+        assert 'NoneType' in result['error']
+
+    def test_string_returns_error(self):
+        result = validate_int_ids('1,2,3')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'str' in result['error']
+
+    def test_dict_returns_error(self):
+        result = validate_int_ids({'a': 1})
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'dict' in result['error']
+
+    def test_scalar_int_returns_error(self):
+        result = validate_int_ids(42)
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'int' in result['error']
+
+    def test_set_returns_error(self):
+        result = validate_int_ids({1, 2, 3})
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'set' in result['error']
+
+    # ── Error envelope shape ─────────────────────────────────────────────────
+
+    def test_error_envelope_has_exactly_two_keys(self):
+        result = validate_int_ids(None)
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_error_type_is_validation_error(self):
+        result = validate_int_ids('bad')
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_does_not_raise_returns_dict(self):
+        """validate_int_ids must not raise — it returns an error dict."""
+        try:
+            result = validate_int_ids(object())
+            assert result is not None
+        except Exception as exc:
+            pytest.fail(f'validate_int_ids raised unexpectedly: {exc}')
+
+    # ── Element-level rejection ───────────────────────────────────────────────
+
+    def test_list_with_str_element_returns_error(self):
+        result = validate_int_ids([1, 2, 'bad'])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'str' in result['error']
+
+    def test_list_with_float_element_returns_error(self):
+        result = validate_int_ids([1, 2.5])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'float' in result['error']
+
+    def test_list_with_none_element_returns_error(self):
+        result = validate_int_ids([1, None])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'NoneType' in result['error']
+
+    def test_list_with_dict_element_returns_error(self):
+        result = validate_int_ids([{}])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'dict' in result['error']
+
+    def test_bool_true_rejected(self):
+        """True is a bool, which is an int subclass — must be rejected."""
+        result = validate_int_ids([True])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_bool_false_rejected(self):
+        """False is a bool subclass — must be rejected."""
+        result = validate_int_ids([False])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_bool_in_mixed_list_rejected(self):
+        result = validate_int_ids([1, 2, True, 4])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+
+    def test_error_pinpoints_first_bad_element_index(self):
+        """Mixed list [1, 2, 'uuid'] — error mentions ids[2]."""
+        bad_uuid = '550e8400-e29b-41d4-a716-446655440000'
+        result = validate_int_ids([1, 2, bad_uuid])
+        assert result is not None
+        assert result['error_type'] == 'ValidationError'
+        assert 'ids[2]' in result['error'], (
+            f"expected 'ids[2]' in error, got: {result['error']!r}"
+        )
+        assert 'str' in result['error']
+        assert bad_uuid in result['error']
+
+    def test_element_error_has_exactly_two_keys(self):
+        result = validate_int_ids([1, 'bad'])
+        assert result is not None
+        assert set(result.keys()) == {'error', 'error_type'}
+
+    def test_element_error_message_format(self):
+        """Element error follows '<name>[<idx>] must be int, got <type>: <repr>' format."""
+        result = validate_int_ids([1, 'oops'])
+        assert result is not None
+        assert 'ids[1]' in result['error']
+        assert 'must be int' in result['error']
+        assert 'str' in result['error']
+
+    def test_1mb_bad_element_produces_short_message(self):
+        """A 1 MB bad element produces an error message shorter than 400 chars."""
+        big_str = 'x' * (1024 * 1024)
+        result = validate_int_ids([big_str])
+        assert result is not None
+        assert len(result['error']) < 400, (
+            f"Error message length {len(result['error'])} exceeds 400 — "
+            'validate_int_ids must use _safe_repr to cap the bad element repr'
+        )
+        assert '...(truncated)' in result['error']
+
+
+class TestValidateIntIdsName:
+    """validate_int_ids `name` kwarg customises error message field label."""
+
+    def test_name_kwarg_in_non_list_error(self):
+        """Non-list branch uses the custom name in the error string."""
+        result = validate_int_ids(None, name='row_ids')
+        assert result is not None
+        assert result['error'].startswith('row_ids must be a list or tuple of integers')
+        assert 'NoneType' in result['error']
+
+    def test_name_kwarg_in_element_error(self):
+        """Element error uses the custom name."""
+        result = validate_int_ids([1, 'bad'], name='task_ids')
+        assert result is not None
+        assert 'task_ids[1]' in result['error']
+        assert 'str' in result['error']
+
+    def test_default_name_is_ids(self):
+        """Default name is 'ids' — regression guard against accidental hardcoding."""
+        result = validate_int_ids(None)
+        assert result is not None
+        assert result['error'].startswith('ids must be a list or tuple of integers')
+
+    def test_default_element_name_is_ids(self):
+        result = validate_int_ids([1, 'x'])
+        assert result is not None
+        assert result['error'].startswith('ids[1]')
+
+
+class TestRequireIntIds:
+    """require_int_ids raises InputValidationError for invalid inputs, returns None for valid ones."""
+
+    # ── Happy paths ──────────────────────────────────────────────────────────
+
+    def test_valid_list_does_not_raise(self):
+        result = require_int_ids([1, 2, 3])
+        assert result is None
+
+    def test_empty_list_does_not_raise(self):
+        require_int_ids([])  # must not raise
+
+    # ── Rejection paths ──────────────────────────────────────────────────────
+
+    def test_none_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_int_ids(None)
+
+    def test_list_with_str_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_int_ids([1, 'bad'])
+
+    def test_bool_in_list_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_int_ids([True])
+
+    # ── Subclass contract ────────────────────────────────────────────────────
+
+    def test_raised_exception_is_catchable_as_valueerror(self):
+        """InputValidationError is a ValueError subclass — existing except ValueError still works."""
+        caught = False
+        try:
+            require_int_ids(None)
+        except ValueError:
+            caught = True
+        assert caught
+
+    # ── Message parity contract ───────────────────────────────────────────────
+
+    def test_exception_message_equals_validate_error_field_non_list(self):
+        invalid = None
+        err_dict = validate_int_ids(invalid)
+        assert err_dict is not None
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids(invalid)
+        assert str(exc_info.value) == err_dict['error']
+
+    def test_exception_message_equals_validate_error_field_bad_element(self):
+        invalid = [1, 'bad']
+        err_dict = validate_int_ids(invalid)
+        assert err_dict is not None
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids(invalid)
+        assert str(exc_info.value) == err_dict['error']
+
+    # ── name kwarg propagation ───────────────────────────────────────────────
+
+    def test_name_kwarg_propagates_into_raised_message_non_list(self):
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids(None, name='row_ids')
+        assert 'row_ids' in str(exc_info.value)
+
+    def test_name_kwarg_propagates_into_raised_message_bad_element(self):
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids([1, 'x'], name='task_ids')
+        assert 'task_ids[1]' in str(exc_info.value)

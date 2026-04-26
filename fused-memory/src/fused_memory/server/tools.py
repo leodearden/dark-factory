@@ -15,7 +15,11 @@ from fused_memory.middleware.task_interceptor import _is_ticket_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.utils.validation import validate_project_id, validate_project_root
+from fused_memory.utils.validation import (
+    validate_int_ids,
+    validate_project_id,
+    validate_project_root,
+)
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -1211,25 +1215,8 @@ def create_mcp_server(
         """
         if err := validate_project_id(project_id):
             return err
-        if not isinstance(ids, (list, tuple)):
-            return {
-                'error': f'ids must be a list of integers, got {type(ids).__name__}',
-                'error_type': 'ValidationError',
-            }
-        _bad_idx = next(
-            (idx for idx, i in enumerate(ids)
-             if not (isinstance(i, int) and not isinstance(i, bool))),
-            None,
-        )
-        if _bad_idx is not None:
-            _bad_val = ids[_bad_idx]
-            return {
-                'error': (
-                    f'ids[{_bad_idx}] must be int, '
-                    f'got {type(_bad_val).__name__}: {_bad_val!r}'
-                ),
-                'error_type': 'ValidationError',
-            }
+        if err := validate_int_ids(ids):
+            return err
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
