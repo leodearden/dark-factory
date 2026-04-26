@@ -6,6 +6,7 @@ from fused_memory.utils.validation import (
     InputValidationError,
     _safe_repr,
     _validate_identifier,
+    require_int_ids,
     require_project_id,
     require_project_root,
     require_run_id,
@@ -1028,3 +1029,71 @@ class TestValidateIntIdsName:
         result = validate_int_ids([1, 'x'])
         assert result is not None
         assert result['error'].startswith('ids[1]')
+
+
+class TestRequireIntIds:
+    """require_int_ids raises InputValidationError for invalid inputs, returns None for valid ones."""
+
+    # ── Happy paths ──────────────────────────────────────────────────────────
+
+    def test_valid_list_does_not_raise(self):
+        result = require_int_ids([1, 2, 3])
+        assert result is None
+
+    def test_empty_list_does_not_raise(self):
+        require_int_ids([])  # must not raise
+
+    # ── Rejection paths ──────────────────────────────────────────────────────
+
+    def test_none_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_int_ids(None)
+
+    def test_list_with_str_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_int_ids([1, 'bad'])
+
+    def test_bool_in_list_raises_input_validation_error(self):
+        with pytest.raises(InputValidationError):
+            require_int_ids([True])
+
+    # ── Subclass contract ────────────────────────────────────────────────────
+
+    def test_raised_exception_is_catchable_as_valueerror(self):
+        """InputValidationError is a ValueError subclass — existing except ValueError still works."""
+        caught = False
+        try:
+            require_int_ids(None)
+        except ValueError:
+            caught = True
+        assert caught
+
+    # ── Message parity contract ───────────────────────────────────────────────
+
+    def test_exception_message_equals_validate_error_field_non_list(self):
+        invalid = None
+        err_dict = validate_int_ids(invalid)
+        assert err_dict is not None
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids(invalid)
+        assert str(exc_info.value) == err_dict['error']
+
+    def test_exception_message_equals_validate_error_field_bad_element(self):
+        invalid = [1, 'bad']
+        err_dict = validate_int_ids(invalid)
+        assert err_dict is not None
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids(invalid)
+        assert str(exc_info.value) == err_dict['error']
+
+    # ── name kwarg propagation ───────────────────────────────────────────────
+
+    def test_name_kwarg_propagates_into_raised_message_non_list(self):
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids(None, name='row_ids')
+        assert 'row_ids' in str(exc_info.value)
+
+    def test_name_kwarg_propagates_into_raised_message_bad_element(self):
+        with pytest.raises(InputValidationError) as exc_info:
+            require_int_ids([1, 'x'], name='task_ids')
+        assert 'task_ids[1]' in str(exc_info.value)
