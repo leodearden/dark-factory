@@ -4653,12 +4653,6 @@ class TestAddSubtaskGuardrail:
 class TestExtractMetaFiles:
     """Unit tests for the TaskInterceptor._extract_meta_files static helper."""
 
-    def test_exists(self):
-        """The helper must be a staticmethod on TaskInterceptor."""
-        assert hasattr(TaskInterceptor, '_extract_meta_files'), (
-            '_extract_meta_files not found on TaskInterceptor'
-        )
-
     def test_dict_metadata_files_to_modify(self):
         """dict metadata with files_to_modify → returns the list verbatim."""
         kwargs = {'metadata': {'files_to_modify': ['orchestrator/harness.py', 'src/foo.py']}}
@@ -4729,6 +4723,38 @@ class TestExtractMetaFiles:
         kwargs = {'metadata': {'files_to_modify': [42, 'src/foo.py']}}
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['42', 'src/foo.py']
+
+    def test_build_candidate_parses_metadata_once(self, monkeypatch):
+        """_build_candidate must call _parse_metadata at most once per invocation.
+
+        Regression guard for the hot-path dedupe: before the fix, _build_candidate
+        called _parse_metadata directly (line 909) AND indirectly via
+        _extract_meta_files (line 910) — two parses per title-bearing submission.
+        After the fix (_build_candidate delegates to _extract_meta_files_from_meta
+        using the meta already in scope), the count drops to ≤1.
+
+        The guard uses <=1 rather than ==1 so a future short-circuit that skips
+        _parse_metadata entirely (count==0) is not penalised; only the regression
+        of calling it more than once (count>=2) fails.
+        """
+        original_parse = TaskInterceptor._parse_metadata
+        call_count: list[int] = [0]
+
+        def counting_parse(kwargs):
+            call_count[0] += 1
+            return original_parse(kwargs)
+
+        monkeypatch.setattr(TaskInterceptor, '_parse_metadata', staticmethod(counting_parse))
+
+        kwargs = {'title': 'Foo', 'metadata': {'files_to_modify': ['a.py']}}
+        candidate = TaskInterceptor._build_candidate(kwargs)
+
+        assert candidate is not None
+        assert candidate.files_to_modify == ['a.py']
+        assert call_count[0] <= 1, (
+            f'_parse_metadata should be called at most once by _build_candidate, '
+            f'but was called {call_count[0]} time(s)'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4921,15 +4947,16 @@ class TestPathGuardOrSkip:
         build_calls: list = []
         guard_calls: list = []
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: (
-                guard_calls.append((candidate, kwargs, project_id)), None)[1],
-        )
+        def fake_build(kwargs):
+            build_calls.append(kwargs)
+            return None
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            return None
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         result = interceptor._path_guard_or_skip(
             {'title': 'Edit orchestrator/harness.py'}, 'dark_factory',
@@ -4956,15 +4983,16 @@ class TestPathGuardOrSkip:
         build_calls: list = []
         guard_calls: list = []
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: (build_calls.append(kwargs), built)[1]),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: (
-                guard_calls.append((candidate, kwargs, project_id)), None)[1],
-        )
+        def fake_build(kwargs):
+            build_calls.append(kwargs)
+            return built
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            return None
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         kwargs = {'title': 'Generic refactor'}
         result = interceptor._path_guard_or_skip(kwargs, 'some_other_project')
@@ -4995,15 +5023,16 @@ class TestPathGuardOrSkip:
         build_calls: list = []
         guard_calls: list = []
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: (build_calls.append(kwargs), None)[1]),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: (
-                guard_calls.append((candidate, kwargs, project_id)), None)[1],
-        )
+        def fake_build(kwargs):
+            build_calls.append(kwargs)
+            return None
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            guard_calls.append((candidate, kwargs, project_id))
+            return None
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         kwargs = {'title': 'Generic refactor'}
         result = interceptor._path_guard_or_skip(kwargs, 'some_other_project', candidate=sentinel)
@@ -5025,14 +5054,14 @@ class TestPathGuardOrSkip:
             'matched_paths': ['orchestrator/'],
         }
 
-        monkeypatch.setattr(
-            TaskInterceptor, '_build_candidate',
-            staticmethod(lambda kwargs: None),
-        )
-        monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_error',
-            lambda self, candidate, kwargs, project_id: rejection,
-        )
+        def fake_build(kwargs):
+            return None
+
+        def fake_guard(self, candidate, kwargs, project_id):
+            return rejection
+
+        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
 
         result = interceptor._path_guard_or_skip({'prompt': 'something'}, 'some_other_project')
         assert result is rejection
