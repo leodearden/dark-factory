@@ -96,18 +96,26 @@ class TestTerminateProcessGroup:
 
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
-        # Poll: subreaper-driven reparented grandchildren may need a beat to be
-        # fully reaped after SIGTERM/SIGKILL.  When bash exits, the OS
-        # reparents its background sleeps to the user's systemd --user
-        # subreaper (or pid 1), which reaps them on its own schedule — a
-        # non-deterministic 0–500 ms window.  5 s is comfortably longer than
-        # any observed subreaper latency on Linux; if the group genuinely
-        # leaks (regression), the loop falls through and the assert fires.
+        # Poll: terminate_process_group's contract is best-effort — it
+        # signals the group and waits for the *leader* (bash) to be reaped
+        # via proc.wait(), but does NOT explicitly waitpid grandchildren.
+        # When bash exits, the OS reparents its background sleeps to the
+        # user's systemd --user subreaper (or pid 1), which reaps them on
+        # its own schedule — a non-deterministic 0–500 ms window.  5 s is
+        # comfortably longer than any observed subreaper latency on Linux;
+        # if the group genuinely leaks (regression), the loop falls through
+        # and the assert fires.
+        #
+        # We also catch PermissionError (EPERM): in the theoretically
+        # possible (though practically negligible) case where the kernel
+        # recycles pgid to a process owned by another user during the poll
+        # window, os.killpg(pgid, 0) raises EPERM rather than ESRCH.  Both
+        # mean "no longer our group to worry about".
         group_gone = False
         for _ in range(50):  # 50 × 0.1 s = 5 s budget
             try:
                 os.killpg(pgid, 0)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 group_gone = True
                 break
             await asyncio.sleep(0.1)
