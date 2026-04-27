@@ -1747,13 +1747,19 @@ class TaskWorkflow:
 
         return verdict
 
-    async def _inter_iteration_rebase(self) -> dict | None:
+    async def _inter_iteration_rebase(
+        self, *, event_label: str = 'rebase',
+    ) -> dict | None:
         """Check if main advanced past our base; if so, rebase.
 
         Returns a dict ``{old_base, new_base, changed_files}`` when a
         rebase was performed, or ``None`` if no rebase was needed or the
         rebase failed (failure is non-blocking — the merge phase will
         handle conflicts).
+
+        ``event_label`` populates the ``event`` field on the
+        iteration_log entry so verify-phase calls (Fix 3) can be
+        distinguished from execute-phase calls in post-mortem analysis.
         """
         assert self.worktree is not None and self.artifacts is not None
 
@@ -1772,7 +1778,9 @@ class TaskWorkflow:
             old_base, current_main,
         )
 
-        # Commit any uncommitted work before rebasing
+        # Commit any uncommitted work before rebasing.  ``commit()`` no-ops
+        # on a clean tree so verify-phase callers (which always run on a
+        # clean tree post-execute) do not produce empty WIP commits.
         await self.git_ops.commit(
             self.worktree, 'chore: save WIP before inter-iteration rebase',
         )
@@ -1790,7 +1798,7 @@ class TaskWorkflow:
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
             'agent': 'orchestrator',
-            'event': 'rebase',
+            'event': event_label,
             'old_base': old_base,
             'new_base': current_main,
             'files_changed_on_main': changed_files[:50],
@@ -1819,6 +1827,19 @@ class TaskWorkflow:
         verify_attempt = 0
 
         while True:
+            # Fix 3: rebase onto main BEFORE each verify (including the first).
+            # Closes the verify-only-retry rebase gap: when main advances
+            # mid-task (e.g. a sibling task fixes the env collision the
+            # verify is failing on), the existing _inter_iteration_rebase
+            # only fires from the EXECUTE loop — it cannot pick up new main
+            # commits while we're cycling verify ↔ debugger.  The helper
+            # short-circuits cheaply when current_main == old_base, so
+            # firing on every retry costs at most one ``git rev-parse``.
+            if self.config.rebase_before_verify:
+                await self._inter_iteration_rebase(
+                    event_label='verify_phase_rebase',
+                )
+
             result = await run_scoped_verification(
                 self.worktree, self.config, self._module_configs, task_files=self._task_files,
                 attempt_id=verify_attempt + 1,
