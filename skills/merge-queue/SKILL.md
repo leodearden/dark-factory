@@ -63,8 +63,9 @@ This call blocks until the merge worker processes your request. It may take a fe
 The tool returns `{ status, reason, conflict_details }`. Handle each status:
 
 **`done`** — Merge succeeded. Main has been advanced atomically.
-- Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<merge-commit-sha>"})`
-  - Use `{"commit": "<sha>"}` when a landing commit on main contains the work (the normal case — the merge tool's return value has the merge SHA). Use `{"note": "<one-sentence explanation>"}` for covered-by-sibling / fast-forward cases where no single commit applies.
+- Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
+  - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case — the merge tool's return value has the merge SHA). The server backstops with `git merge-base --is-ancestor <sha> main`.
+  - Use `{"kind": "found_on_main", "note": "<one-sentence explanation>", "commit": "<optional landing sha>"}` when the implementation is already on main from a sibling task / prior orchestrator run and no merge applied to this branch.
 - Clean up worktree and branch:
   ```bash
   git worktree remove .worktrees/<TASK_ID>

@@ -1348,6 +1348,39 @@ def create_mcp_server(
             }
         return None
 
+    def _reject_done_provenance_in_metadata(
+        metadata: str | dict | None,
+    ) -> dict | None:
+        """Return a ValidationError dict if ``metadata`` carries done_provenance.
+
+        ``set_task_status`` is the only sanctioned writer for
+        ``metadata.done_provenance`` — it validates the schema (kind, commit,
+        note) and runs an ancestor backstop on merge SHAs. Allowing
+        ``update_task`` to write the field bypasses that gate, which is how
+        a workflow agent stamped a self-contradicting "done" record on
+        2026-04-27. Reject the call before it reaches the interceptor.
+        """
+        parsed: dict | None = None
+        if isinstance(metadata, dict):
+            parsed = metadata
+        elif isinstance(metadata, str):
+            try:
+                loaded = json.loads(metadata)
+            except (ValueError, TypeError):
+                return None
+            parsed = loaded if isinstance(loaded, dict) else None
+        if parsed is not None and 'done_provenance' in parsed:
+            return {
+                'error': (
+                    'update_task cannot write metadata.done_provenance. Use '
+                    'set_task_status(status="done", done_provenance={...}) '
+                    'instead — it validates the schema and runs an ancestor '
+                    'backstop on the merge sha.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        return None
+
     @mcp.tool()
     async def get_tasks(
         project_root: str,
@@ -1626,6 +1659,8 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+        if err := _reject_done_provenance_in_metadata(metadata):
+            return err
         try:
             if isinstance(metadata, dict):
                 metadata = json.dumps(metadata)

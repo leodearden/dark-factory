@@ -165,6 +165,63 @@ async def test_update_task_relative_path_returns_validation_error(
 
 
 # ------------------------------------------------------------------
+# update_task rejects metadata.done_provenance (2026-04-27 hardening)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_metadata_done_provenance_dict(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A dict-shaped metadata carrying done_provenance is rejected with a pointer to set_task_status."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': '/project',
+            'metadata': {'done_provenance': {'kind': 'merged', 'commit': 'abc'}},
+        },
+    )
+    assert isinstance(result, dict)
+    assert result.get('error_type') == 'ValidationError'
+    assert 'set_task_status' in result['error']
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_metadata_done_provenance_json_string(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A JSON-string metadata carrying done_provenance is also rejected."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': '/project',
+            'metadata': '{"done_provenance": {"kind": "merged", "commit": "abc"}}',
+        },
+    )
+    assert isinstance(result, dict)
+    assert result.get('error_type') == 'ValidationError'
+    assert 'set_task_status' in result['error']
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_allows_unrelated_metadata(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Other metadata keys still pass through; the gate only blocks done_provenance."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': '/project',
+            'metadata': {'modules': ['orchestrator/'], 'priority': 'high'},
+        },
+    )
+    assert result == {'success': True}
+    task_interceptor.update_task.assert_called_once()
+
+
+# ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
 
