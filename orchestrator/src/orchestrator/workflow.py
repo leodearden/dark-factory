@@ -2794,8 +2794,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         base_commit = self.artifacts.read_base_commit()
         entries, _ = self.artifacts.read_iteration_log()
         if wt_head is not None and base_commit is not None:
+            sha_diverges = wt_head.strip() != base_commit
+            has_iter_log_work = any(
+                e.get('agent') in ('implementer', 'debugger') for e in entries
+            )
+            # Defense in depth: SHA divergence alone is racy under
+            # fused-memory's tasks.json auto-commit to main (the
+            # pre-positioning rev-parse in create_worktree could lag
+            # the actual worktree fork point).  Iteration-log evidence
+            # alone is racy under inherited orphan logs.  Require BOTH
+            # signals before declaring prior implementation work.  See
+            # the audit notes in
+            # ~/.claude/plans/do-2-3-misty-marshmallow.md and the
+            # orphan-log scenario in this method's docstring.
             return _PriorImplStatus(
-                has_work=wt_head.strip() != base_commit,
+                has_work=sha_diverges and has_iter_log_work,
                 entries=entries,
                 base_commit=base_commit,
             )

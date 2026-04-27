@@ -513,7 +513,17 @@ class GitOps:
                 # the latest code — critical for plan revalidation, which
                 # needs the architect to see current file contents.
                 if await self.rebase_onto_main(worktree_path):
-                    actual_base = base_sha.strip()
+                    # Re-capture base from worktree's own merge-base after the
+                    # rebase completes.  The pre-positioning rev-parse at
+                    # line 478 races with fused-memory's tasks.json auto-commit
+                    # to main: if main advances between rev-parse and rebase,
+                    # base_sha lags HEAD's actual fork point.  merge-base from
+                    # inside the worktree is race-immune.
+                    _, mb_out, _ = await _run(
+                        ['git', 'merge-base', self.config.main_branch, 'HEAD'],
+                        cwd=worktree_path,
+                    )
+                    actual_base = mb_out.strip() or base_sha.strip()
                 else:
                     # Rebase failed (conflict) — continue on old base.
                     # Compute the actual merge-base so WorktreeInfo is truthful.
@@ -596,9 +606,28 @@ class GitOps:
                 scrub_result.format_error(prefix=' Error: '),
             )
 
+        # Re-capture base from the worktree's own merge-base after positioning
+        # AND the scrub_task_dir_from_tree call above.  The pre-positioning
+        # rev-parse at line 478 races with fused-memory's tasks.json auto-commit
+        # to main (TaskFileCommitter._schedule_commit fires-and-forgets a commit
+        # to main on every set_task_status): if main advances between rev-parse
+        # and `git worktree add`, base_sha lags worktree HEAD's actual fork
+        # point and downstream callers (notably _recover_if_already_merged)
+        # mis-detect "real work" via wt_head != base_commit.  merge-base from
+        # inside the freshly-created worktree is race-immune: it is the fork
+        # point of HEAD with the freshened start_ref regardless of when main
+        # advanced.  We use start_ref (the ref the worktree was actually based
+        # on — may be origin/main when local main lags) rather than
+        # self.config.main_branch, so the freshen-from-remote semantic is
+        # preserved (see test_create_worktree_freshens_from_remote).
+        _, mb_out, _ = await _run(
+            ['git', 'merge-base', start_ref, 'HEAD'],
+            cwd=worktree_path,
+        )
+        post_create_base = mb_out.strip() or base_sha.strip()
         return WorktreeInfo(
             path=worktree_path,
-            base_commit=base_sha,
+            base_commit=post_create_base,
             stale_commits=stale_commits,
         )
 
