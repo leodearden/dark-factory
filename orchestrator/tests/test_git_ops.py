@@ -958,6 +958,103 @@ class TestMergeConflicts:
 
 
 @pytest.mark.asyncio
+class TestAdvanceMainCasRetrySha:
+    """Regression: advance_main must expose the post-rebase SHA when CAS retry rebases."""
+
+    async def test_last_advanced_sha_is_post_rebase_after_cas_retry(
+        self, git_ops: GitOps,
+    ):
+        """When advance_main rebases the merge worktree onto a moved main,
+        ``_last_advanced_sha`` must hold the post-rebase SHA (the one actually
+        on main), not the original pre-rebase ``MergeResult.merge_commit``.
+
+        The pre-rebase SHA is what merge_queue used to forward to
+        ``set_task_status('done', done_provenance={'kind':'merged', 'commit':...})``;
+        fused-memory's ancestor backstop rejects it because that SHA only
+        exists in the now-discarded merge worktree, not on main. Result was
+        56+ tasks stuck in-progress in reify on 2026-04-27.
+        """
+        # Pin the initial main SHA — B's merge worktree will be based here,
+        # simulating a speculative-merge stack where N+1's merge was prepared
+        # before N landed.
+        _, original_main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        original_main_sha = original_main_sha.strip()
+
+        # Two branches that touch different files (no conflict on rebase).
+        wt_a = await git_ops.create_worktree('cas-a')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a')
+
+        wt_b = await git_ops.create_worktree('cas-b')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b')
+
+        # Land A first — main now has A's merge commit.
+        merge_a = await git_ops.merge_to_main(wt_a.path, 'cas-a')
+        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+        # Merge B with merge worktree pinned to the ORIGINAL main — so B's
+        # merge commit will not be a descendant of current main and
+        # advance_main must rebase to land it.
+        merge_b = await git_ops.merge_to_main(
+            wt_b.path, 'cas-b', base_sha=original_main_sha,
+        )
+        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+        pre_rebase_sha = merge_b.merge_commit
+
+        result = await git_ops.advance_main(
+            pre_rebase_sha,
+            merge_worktree=merge_b.merge_worktree,
+            branch='cas-b',
+        )
+        assert result == 'advanced'
+
+        # Side channel exposes a SHA that's actually on main.
+        advanced_sha = git_ops._last_advanced_sha
+        assert advanced_sha is not None
+
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor',
+             advanced_sha, git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'_last_advanced_sha {advanced_sha} must be on main'
+
+        # And the pre-rebase SHA is NOT on main (the bug we're guarding
+        # against — passing this to done_provenance fails fused-memory's
+        # ancestor backstop).
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor',
+             pre_rebase_sha, git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, (
+            f'pre-rebase SHA {pre_rebase_sha} should NOT be on main; '
+            f'if it is, the test is no longer exercising the rebase path'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+    async def test_last_advanced_sha_equals_input_when_no_rebase_needed(
+        self, git_ops: GitOps,
+    ):
+        """When no CAS retry is needed, ``_last_advanced_sha`` matches the input
+        merge_sha — fast-forward case, both SHAs are on main.
+        """
+        wt = await git_ops.create_worktree('ff-only')
+        (wt.path / 'x.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add x')
+        merge = await git_ops.merge_to_main(wt.path, 'ff-only')
+        assert merge.success and merge.merge_commit
+        assert await git_ops.advance_main(merge.merge_commit) == 'advanced'
+        assert git_ops._last_advanced_sha == merge.merge_commit
+
+
+@pytest.mark.asyncio
 class TestHasUncommittedWork:
     async def test_clean_worktree_returns_false(self, git_ops: GitOps):
         wt_info = await git_ops.create_worktree('clean-wt')

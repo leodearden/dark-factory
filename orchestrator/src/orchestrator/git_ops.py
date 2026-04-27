@@ -1097,6 +1097,12 @@ class GitOps:
         IMPORTANT: This method is the LAST checkpoint before code reaches
         main.  update-ref bypasses ALL git hooks (including pre-commit),
         so the .task/ contamination gate here is the final defense.
+
+        On a successful 'advanced' return, ``self._last_advanced_sha`` holds
+        the SHA actually placed on main.  When CAS retry rebases the merge
+        commit, the post-rebase SHA is captured here — callers must read
+        this side channel for done_provenance instead of the pre-rebase
+        ``MergeResult.merge_commit`` (which is stale after a rebase).
         """
         full_branch = f'{self.config.branch_prefix}{branch}' if branch else None
 
@@ -1368,8 +1374,16 @@ class GitOps:
                         'WIP preserved on recovery branch: %s',
                         branch or merge_sha[:8], recovery,
                     )
+                    # Main was advanced before the stash pop ran — record the
+                    # actually-on-main SHA so callers handling done_wip_recovery
+                    # can record correct done_provenance.
+                    self._last_advanced_sha = merge_sha
                     return 'pop_conflict'
 
+        # Main was advanced — expose the post-rebase SHA so callers can record
+        # done_provenance against the SHA actually on main, not the stale
+        # pre-rebase SHA from MergeResult.merge_commit.
+        self._last_advanced_sha = merge_sha
         return 'advanced'
 
     async def push_main(self) -> PushResult:
