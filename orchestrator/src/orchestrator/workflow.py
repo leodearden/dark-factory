@@ -40,7 +40,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules, normalize_lock
-from orchestrator.task_status import TERMINAL_STATUSES
+from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
@@ -516,6 +516,32 @@ class TaskWorkflow:
                                 're-implementation', self.task_id,
                             )
                             break
+
+                        # Honor steward terminal decisions BEFORE resuming the
+                        # implementer.  The steward may have set the task to
+                        # done / cancelled / deferred / blocked while resolving
+                        # the L0 (e.g. queued a follow-up task that is now the
+                        # durable fix and deferred this one onto it).  Without
+                        # this guard the resume loop keeps invoking the
+                        # implementer/debugger until verify-attempt budget
+                        # exhausts — burning $7-8 per cycle on a task the
+                        # steward already decided to park.  Mirrors the inline
+                        # returns inside _mark_blocked (~L3125–3168) but
+                        # bypasses it so we do NOT file an L1 for what is an
+                        # intentional steward terminal decision.
+                        current_status = await self.scheduler.get_status(self.task_id)
+                        if current_status == 'done':
+                            self._enter_phase(WorkflowState.DONE)
+                            return WorkflowOutcome.DONE
+                        if current_status in WORKFLOW_PRESERVE_STATUSES:
+                            logger.info(
+                                'Task %s: steward set status to %s during '
+                                'escalation resolution — preserving, exiting '
+                                'resume loop',
+                                self.task_id, current_status,
+                            )
+                            self._enter_phase(WorkflowState.BLOCKED)
+                            return WorkflowOutcome.BLOCKED
 
                         # Resume with resolution context
                         logger.info(f'Task {self.task_id}: resuming after escalation resolution')
