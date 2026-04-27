@@ -1553,6 +1553,149 @@ class TestSetTaskStatusForwarding:
             for rec in caplog.records
         )
 
+    @pytest.mark.asyncio
+    async def test_structured_rejection_is_logged_as_warning(
+        self, scheduler: Scheduler, monkeypatch, caplog,
+    ):
+        """fused-memory's structured error dicts (no exception) are surfaced.
+
+        Regression for the silent-rejection bug that left tasks stuck
+        in-progress after CAS retry: workflow.set_task_status('done', ...) was
+        passed a stale merge SHA, fused-memory's done_provenance ancestor
+        check rejected it, scheduler dropped the response on the floor.
+        """
+        import logging as _logging
+        # Structured rejection wrapped in MCP envelope with structuredContent.
+        rejection_response = {
+            'result': {
+                'structuredContent': {
+                    'success': False,
+                    'error': 'done_provenance_invalid',
+                    'hint': 'kind="merged" but commit deadbeef is not on main',
+                },
+                'isError': False,
+            },
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=rejection_response),
+        )
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.set_task_status('42', 'done', done_provenance={
+                'kind': 'merged', 'commit': 'deadbeef',
+            })
+        rejected = [
+            rec for rec in caplog.records
+            if 'rejected by fused-memory' in rec.message
+        ]
+        assert rejected, f'expected a rejection warning, got: {[r.message for r in caplog.records]}'
+        assert 'done_provenance_invalid' in rejected[0].message
+        assert '42' in rejected[0].message
+
+    @pytest.mark.asyncio
+    async def test_success_response_does_not_log_warning(
+        self, scheduler: Scheduler, monkeypatch, caplog,
+    ):
+        """A normal successful set_task_status response must not trigger the warning."""
+        import logging as _logging
+        success_response = {
+            'result': {
+                'structuredContent': {
+                    'message': 'Successfully updated 1 task(s) to "done"',
+                    'tasks': [{
+                        'success': True, 'oldStatus': 'in-progress',
+                        'newStatus': 'done', 'taskId': '42',
+                    }],
+                },
+                'isError': False,
+            },
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=success_response),
+        )
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.set_task_status('42', 'done', done_provenance={
+                'kind': 'merged', 'commit': 'deadbeef',
+            })
+        assert not any(
+            'rejected by fused-memory' in rec.message for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_op_response_does_not_log_warning(
+        self, scheduler: Scheduler, monkeypatch, caplog,
+    ):
+        """The same-status no-op (success: True, no_op: True) is not a rejection."""
+        import logging as _logging
+        noop_response = {
+            'result': {
+                'structuredContent': {
+                    'success': True, 'no_op': True, 'task_id': '42',
+                },
+                'isError': False,
+            },
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=noop_response),
+        )
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.set_task_status('42', 'in-progress')
+        assert not any(
+            'rejected by fused-memory' in rec.message for rec in caplog.records
+        )
+
+
+class TestExtractRejection:
+    """Direct tests of the response-shape parser used by set_task_status."""
+
+    def test_structured_content_with_error(self):
+        from orchestrator.scheduler import extract_rejection
+        msg = extract_rejection({
+            'result': {'structuredContent': {
+                'success': False, 'error': 'done_gate_missing_files',
+                'hint': 'metadata.files lists missing paths',
+            }},
+        })
+        assert msg is not None
+        assert 'done_gate_missing_files' in msg
+        assert 'metadata.files' in msg
+
+    def test_text_block_fallback(self):
+        """When structuredContent is absent, parse the JSON text block."""
+        import json as _json
+        from orchestrator.scheduler import extract_rejection
+        payload = {'success': False, 'error': 'terminal_exit_rejected'}
+        msg = extract_rejection({
+            'result': {
+                'content': [{'type': 'text', 'text': _json.dumps(payload)}],
+            },
+        })
+        assert msg is not None
+        assert 'terminal_exit_rejected' in msg
+
+    def test_success_returns_none(self):
+        from orchestrator.scheduler import extract_rejection
+        assert extract_rejection({
+            'result': {'structuredContent': {
+                'message': 'Successfully updated', 'tasks': [{'success': True}],
+            }},
+        }) is None
+
+    def test_no_op_returns_none(self):
+        from orchestrator.scheduler import extract_rejection
+        assert extract_rejection({
+            'result': {'structuredContent': {
+                'success': True, 'no_op': True, 'task_id': '7',
+            }},
+        }) is None
+
+    def test_empty_response_returns_none(self):
+        from orchestrator.scheduler import extract_rejection
+        assert extract_rejection({}) is None
+        assert extract_rejection(None) is None
+
 
 # ---------------------------------------------------------------------------
 # Value/h scoring: priority inheritance (P1), age boost (P2), CPM weight (P3),

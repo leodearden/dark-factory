@@ -905,7 +905,12 @@ class MergeWorker:
             logger.info(f'Task {req.task_id}: merged to main successfully')
             _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
             push_status = await self._git_ops.push_main()
-            return MergeOutcome('done', merge_sha=merge_result.merge_commit, push_status=push_status)
+            # Use the post-rebase SHA actually placed on main (advance_main
+            # rebases on CAS retry; merge_result.merge_commit is the stale
+            # pre-rebase SHA and would fail done_provenance ancestor check).
+            advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
+                or merge_result.merge_commit
+            return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
         if result in ('wip_overlap', 'pop_conflict'):
             # Halt the queue globally — no more merges until resolved
@@ -1772,7 +1777,13 @@ class SpeculativeMergeWorker:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 push_status = await self._git_ops.push_main()
                 if not req.result.done():
-                    req.result.set_result(MergeOutcome('done', merge_sha=merge_commit, push_status=push_status))
+                    # Use the post-rebase SHA actually placed on main (see
+                    # advance_main docstring — local merge_commit is stale
+                    # after a CAS-retry rebase and fails done_provenance
+                    # ancestor check).
+                    advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
+                        or merge_commit
+                    req.result.set_result(MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status))
                 return True
 
             if result in ('wip_overlap', 'pop_conflict'):

@@ -45,7 +45,45 @@ __all__ = [
     'TaskAssignment',
     'ModuleLockTable',
     'Scheduler',
+    'extract_rejection',
 ]
+
+
+def extract_rejection(response: Any) -> str | None:
+    """Return a one-line description of a fused-memory rejection, or None on success.
+
+    fused-memory's set_task_status returns structured error dicts (terminal-exit
+    gate, phantom-done gate, done_provenance validation) without raising. The
+    payload arrives wrapped in MCP envelope:
+    ``{result: {structuredContent: {...}, content: [{type: text, text: <json>}], isError: bool}}``.
+
+    A rejection has either ``error`` (truthy) or ``success: False`` in the payload.
+    A no-op (same-status) returns ``success: True, no_op: True`` and is treated
+    as success.
+    """
+    if not isinstance(response, dict):
+        return None
+    result = response.get('result', response)
+    if not isinstance(result, dict):
+        return None
+    payload = result.get('structuredContent')
+    if not isinstance(payload, dict):
+        # Fall back to parsing the text content block.
+        for block in result.get('content', []) or []:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                try:
+                    payload = json.loads(block.get('text') or '')
+                except (ValueError, TypeError):
+                    payload = None
+                break
+    if not isinstance(payload, dict):
+        return None
+    if payload.get('error'):
+        hint = payload.get('hint') or payload.get('error_type') or ''
+        return f'{payload["error"]}{" — " + hint if hint else ""}'
+    if payload.get('success') is False:
+        return f'success=False payload={payload!r}'
+    return None
 
 
 @dataclass(frozen=True)
@@ -477,6 +515,12 @@ class Scheduler:
         TaskInterceptor) — this method just forwards the call. Pass
         ``reopen_reason`` to exit a terminal status (done/cancelled);
         orchestrator automation never needs it.
+
+        fused-memory rejects some transitions (terminal-exit gate,
+        phantom-done gate, done_provenance validation) by returning a
+        structured error dict rather than raising. We inspect the response
+        and emit a WARNING so silent rejections don't leave tasks stuck in
+        the wrong state.
         """
         try:
             arguments: dict = {
@@ -488,11 +532,19 @@ class Scheduler:
                 arguments['done_provenance'] = done_provenance
             if reopen_reason is not None:
                 arguments['reopen_reason'] = reopen_reason
-            await self.dispatch_tool('set_task_status', arguments, timeout=15)
+            response = await self.dispatch_tool('set_task_status', arguments, timeout=15)
         except Exception as e:
             logger.exception(
                 'Failed to set task %s status to %s: %s: %s',
                 task_id, status, type(e).__name__, e,
+            )
+            return
+
+        rejection = extract_rejection(response)
+        if rejection is not None:
+            logger.warning(
+                'set_task_status(%s, %s) rejected by fused-memory: %s',
+                task_id, status, rejection,
             )
 
     async def get_status(self, task_id: str) -> str | None:
