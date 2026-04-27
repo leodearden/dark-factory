@@ -90,8 +90,11 @@ def _make_workflow(
     git_ops: GitOps,
     assignment: TaskAssignment,
     worktree: Path,
-) -> TaskWorkflow:
+) -> tuple[TaskWorkflow, TaskArtifacts]:
     """Wire a minimal TaskWorkflow with all heavy collaborators mocked.
+
+    Returns ``(workflow, artifacts)`` so callers can read/mutate artifacts
+    without re-deriving narrowing for ``workflow.artifacts: TaskArtifacts | None``.
 
     Mocks ``_invoke`` (debugger), ``_check_escalations`` (none), and
     ``briefing`` calls so ``_verify_debugfix_loop`` can run end-to-end
@@ -106,8 +109,9 @@ def _make_workflow(
         mcp=MagicMock(),  # type: ignore[arg-type]
     )
     workflow.worktree = worktree
-    workflow.artifacts = TaskArtifacts(worktree)
-    workflow.artifacts.init('42', 'X', 'desc', base_commit='base-sha-old')
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init('42', 'X', 'desc', base_commit='base-sha-old')
+    workflow.artifacts = artifacts
     workflow.plan = {'task_id': '42', 'steps': []}
     # No escalations by default; tests that want to assert otherwise can
     # override via monkeypatching.
@@ -120,7 +124,7 @@ def _make_workflow(
         return_value=AgentResult(success=True, output=''),
     )
     workflow._get_head_commit = AsyncMock(return_value='head-sha')  # type: ignore[method-assign]
-    return workflow
+    return workflow, artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -142,16 +146,16 @@ class TestInterIterationRebaseEventLabel:
         await _run(['git', 'add', 'sibling.txt'], cwd=repo)
         await _run(['git', 'commit', '-m', 'sibling fix'], cwd=repo)
 
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
         # Set base_commit to the original main sha (pre-sibling-fix).
-        workflow.artifacts.update_base_commit(wt_info.base_commit)
+        artifacts.update_base_commit(wt_info.base_commit)
 
         result = await workflow._inter_iteration_rebase(
             event_label='verify_phase_rebase',
         )
 
         assert result is not None, 'Rebase should have happened (main advanced).'
-        entries, _ = workflow.artifacts.read_iteration_log()
+        entries, _ = artifacts.read_iteration_log()
         rebase_entries = [e for e in entries if e.get('event') == 'verify_phase_rebase']
         assert len(rebase_entries) == 1, (
             f'Expected 1 verify_phase_rebase log entry, got {len(rebase_entries)}: {entries}'
@@ -172,13 +176,13 @@ class TestInterIterationRebaseEventLabel:
         await _run(['git', 'add', 'sibling2.txt'], cwd=repo)
         await _run(['git', 'commit', '-m', 'sibling fix 2'], cwd=repo)
 
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
-        workflow.artifacts.update_base_commit(wt_info.base_commit)
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
 
         result = await workflow._inter_iteration_rebase()  # default
 
         assert result is not None
-        entries, _ = workflow.artifacts.read_iteration_log()
+        entries, _ = artifacts.read_iteration_log()
         labels = [e.get('event') for e in entries]
         assert 'rebase' in labels and 'verify_phase_rebase' not in labels, (
             f'Default call must use "rebase"; entries: {entries}'
@@ -197,8 +201,8 @@ class TestInterIterationRebaseEventLabel:
         await _run(['git', 'add', 'sibling3.txt'], cwd=repo)
         await _run(['git', 'commit', '-m', 'clean-tree fix'], cwd=repo)
 
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
-        workflow.artifacts.update_base_commit(wt_info.base_commit)
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
 
         # Capture log SHAs before.
         _, before_shas, _ = await _run(
@@ -234,7 +238,7 @@ class TestVerifyPhaseRebaseInLoop:
     ):
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
 
         rebase_mock = AsyncMock(return_value=None)
         workflow._inter_iteration_rebase = rebase_mock  # type: ignore[method-assign]
@@ -251,6 +255,7 @@ class TestVerifyPhaseRebaseInLoop:
         assert outcome == WorkflowOutcome.DONE
         assert rebase_mock.await_count == 1
         # Must be called with the correct event label.
+        assert rebase_mock.await_args is not None
         _, kwargs = rebase_mock.await_args
         assert kwargs.get('event_label') == 'verify_phase_rebase', (
             f'Verify-phase calls must pass event_label=verify_phase_rebase; '
@@ -263,7 +268,7 @@ class TestVerifyPhaseRebaseInLoop:
         config.rebase_before_verify = False
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
 
         rebase_mock = AsyncMock(return_value=None)
         workflow._inter_iteration_rebase = rebase_mock  # type: ignore[method-assign]
@@ -292,8 +297,8 @@ class TestVerifyPhaseRebaseInLoop:
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
-        workflow.artifacts.update_base_commit(wt_info.base_commit)
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
 
         # Verify passes so loop exits after one iteration.
         monkeypatch.setattr(
@@ -306,7 +311,7 @@ class TestVerifyPhaseRebaseInLoop:
 
         outcome = await workflow._verify_debugfix_loop()
         assert outcome == WorkflowOutcome.DONE
-        entries, _ = workflow.artifacts.read_iteration_log()
+        entries, _ = artifacts.read_iteration_log()
         assert not any(
             e.get('event') == 'verify_phase_rebase' for e in entries
         ), (
@@ -321,7 +326,7 @@ class TestVerifyPhaseRebaseInLoop:
         loop must still proceed — failure is non-blocking."""
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
 
         # Helper returns None (simulating "no rebase needed" or "rebase
         # failed silently"); verify proceeds and passes.
@@ -351,7 +356,7 @@ class TestVerifyPhaseRebaseInLoop:
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        workflow = _make_workflow(config, git_ops, task_assignment, wt)
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
 
         rebase_mock = AsyncMock(return_value=None)
         workflow._inter_iteration_rebase = rebase_mock  # type: ignore[method-assign]
