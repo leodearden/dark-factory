@@ -26,6 +26,7 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageId,
 )
+from fused_memory.models.scope import build_known_projects_map
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -97,6 +98,13 @@ class ReconciliationHarness:
         self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
         self.config = config.reconciliation
         self._backlog_policy = backlog_policy
+        # Multi-project routing: build a {project_id → project_root} map from
+        # the configured project + DASHBOARD_KNOWN_PROJECT_ROOTS env var so
+        # Stage 2 can surface other projects to its LLM and authorise
+        # cross-project task filing.  Reuses the dashboard's existing env var
+        # to avoid two sources of truth — see plans/deep-squishing-lagoon.md
+        # for the trade-off (rename to a neutral name is a tracked followup).
+        self._known_projects: dict[str, str] = build_known_projects_map(self._project_root)
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
@@ -842,6 +850,7 @@ class ReconciliationHarness:
                 current_stage_name = stage.stage_id.value
                 stage.project_id = project_id
                 stage.project_root = project_root
+                stage.known_projects = self._known_projects
 
                 # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                 if isinstance(stage, MemoryConsolidator):
@@ -1117,6 +1126,7 @@ class ReconciliationHarness:
                 current_stage_name = stage.stage_id.value
                 stage.project_id = project_id
                 stage.project_root = project_root
+                stage.known_projects = self._known_projects
 
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,

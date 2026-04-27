@@ -431,6 +431,114 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_id="reify"' in payload
 
 
+class TestTaskKnowledgeSyncKnownProjectsSection:
+    """Stage 2 surfaces a "Known Projects" section so the LLM can re-route findings."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='reify')
+
+    @pytest.mark.asyncio
+    async def test_section_omitted_when_only_one_project_known(self, mock_deps, watermark):
+        """A single-project deployment doesn't have a cross-project dimension —
+        the section would only add noise."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage.known_projects = {'reify': '/home/leo/src/reify'}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        assert '### Known Projects' not in payload
+
+    @pytest.mark.asyncio
+    async def test_section_omitted_when_no_known_projects(self, mock_deps, watermark):
+        """Default empty known_projects (harness hasn't set it) → no section."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        # known_projects unset → empty dict from BaseStage default
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        assert '### Known Projects' not in payload
+
+    @pytest.mark.asyncio
+    async def test_section_rendered_when_multiple_projects_known(
+        self, mock_deps, watermark,
+    ):
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage.known_projects = {
+            'reify': '/home/leo/src/reify',
+            'dark_factory': '/home/leo/src/dark-factory',
+            'autopilot_video': '/home/leo/src/autopilot-video',
+        }
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        assert '### Known Projects (for cross-project routing)' in payload
+        assert 'reify' in payload
+        assert '/home/leo/src/reify' in payload
+        assert 'dark_factory' in payload
+        assert '/home/leo/src/dark-factory' in payload
+        assert 'autopilot_video' in payload
+
+    @pytest.mark.asyncio
+    async def test_section_marks_current_project(self, mock_deps, watermark):
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage.known_projects = {
+            'reify': '/home/leo/src/reify',
+            'dark_factory': '/home/leo/src/dark-factory',
+        }
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        # The current project's row carries the "(current)" marker; others don't.
+        lines = [
+            line for line in payload.splitlines()
+            if line.strip().startswith('-') and (
+                '/home/leo/src/reify' in line
+                or '/home/leo/src/dark-factory' in line
+            )
+        ]
+        # First listed should be the current project with its marker.
+        assert any('reify' in line and '(current)' in line for line in lines)
+        assert all(
+            '(current)' not in line for line in lines if 'dark_factory' in line
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_instructs_cross_project_routing(self, mock_deps, watermark):
+        """The trailing project_root line points the LLM at "Known Projects"
+        for cross-project routing."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage.known_projects = {
+            'reify': '/home/leo/src/reify',
+            'dark_factory': '/home/leo/src/dark-factory',
+        }
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        assert 'tasks scoped to this project' in payload
+        assert 'For cross-project routing see "Known Projects"' in payload
+
+
 class TestDoneProvenanceSection:
     """_render_done_provenance_section and Stage 2 briefing integration."""
 

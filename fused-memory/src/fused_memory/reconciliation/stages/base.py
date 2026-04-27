@@ -53,6 +53,12 @@ class BaseStage:
         self.config = config
         self.project_id: str = ''
         self.project_root: str = ''
+        # Cross-project routing: dict[project_id, project_root] of every
+        # project the harness knows about (including this one).  Stage 2
+        # surfaces this to the LLM so it can re-route a finding to the
+        # correct project_root when the scope demands.  Empty until the
+        # harness sets it per cycle.
+        self.known_projects: dict[str, str] = {}
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
 

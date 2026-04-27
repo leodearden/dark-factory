@@ -4941,9 +4941,11 @@ class TestPathGuardOrSkip:
     def test_path_guard_or_skip_returns_none_for_dark_factory_project(
         self, interceptor, monkeypatch,
     ):
-        """dark_factory short-circuit: returns None without calling
-        _build_candidate or _path_guard_error.
+        """dark_factory short-circuit (back-compat: no registry configured):
+        returns None without calling _build_candidate or _path_guard_check.
         """
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+
         build_calls: list = []
         guard_calls: list = []
 
@@ -4951,20 +4953,22 @@ class TestPathGuardOrSkip:
             build_calls.append(kwargs)
             return None
 
-        def fake_guard(self, candidate, kwargs, project_id):
+        def fake_check(self, candidate, kwargs, project_id):
             guard_calls.append((candidate, kwargs, project_id))
-            return None
+            return PathGuardVerdict(outcome='ok', project_id=project_id)
 
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         result = interceptor._path_guard_or_skip(
-            {'title': 'Edit orchestrator/harness.py'}, 'dark_factory',
+            {'title': 'Edit orchestrator/harness.py'},
+            '/home/leo/src/dark-factory',
+            'dark_factory',
         )
 
         assert result is None
         assert build_calls == [], '_build_candidate must NOT be called for dark_factory'
-        assert guard_calls == [], '_path_guard_error must NOT be called for dark_factory'
+        assert guard_calls == [], '_path_guard_check must NOT be called for dark_factory'
 
     # -- Case 2 -----------------------------------------------------------
     def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
@@ -4972,8 +4976,9 @@ class TestPathGuardOrSkip:
     ):
         """When no candidate is supplied and project is non-dark_factory, the
         helper builds a candidate via _build_candidate and passes it to
-        _path_guard_error.
+        _path_guard_check.
         """
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
         from fused_memory.middleware.task_curator import CandidateTask
 
         built = CandidateTask(
@@ -4987,15 +4992,17 @@ class TestPathGuardOrSkip:
             build_calls.append(kwargs)
             return built
 
-        def fake_guard(self, candidate, kwargs, project_id):
+        def fake_check(self, candidate, kwargs, project_id):
             guard_calls.append((candidate, kwargs, project_id))
-            return None
+            return PathGuardVerdict(outcome='ok', project_id=project_id)
 
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(kwargs, 'some_other_project')
+        result = interceptor._path_guard_or_skip(
+            kwargs, '/some/project_root', 'some_other_project',
+        )
 
         assert result is None
         assert len(build_calls) == 1, (
@@ -5003,7 +5010,7 @@ class TestPathGuardOrSkip:
         )
         assert build_calls[0] is kwargs
         assert len(guard_calls) == 1, (
-            f'Expected _path_guard_error called once, got {len(guard_calls)}'
+            f'Expected _path_guard_check called once, got {len(guard_calls)}'
         )
         assert guard_calls[0][0] is built
 
@@ -5012,8 +5019,9 @@ class TestPathGuardOrSkip:
         self, interceptor, monkeypatch,
     ):
         """When a pre-built candidate is supplied, _build_candidate is NOT called;
-        _path_guard_error is called with the supplied candidate.
+        _path_guard_check is called with the supplied candidate.
         """
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
         from fused_memory.middleware.task_curator import CandidateTask
 
         sentinel = CandidateTask(
@@ -5027,20 +5035,22 @@ class TestPathGuardOrSkip:
             build_calls.append(kwargs)
             return None
 
-        def fake_guard(self, candidate, kwargs, project_id):
+        def fake_check(self, candidate, kwargs, project_id):
             guard_calls.append((candidate, kwargs, project_id))
-            return None
+            return PathGuardVerdict(outcome='ok', project_id=project_id)
 
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         kwargs = {'title': 'Generic refactor'}
-        result = interceptor._path_guard_or_skip(kwargs, 'some_other_project', candidate=sentinel)
+        result = interceptor._path_guard_or_skip(
+            kwargs, '/some/project_root', 'some_other_project', candidate=sentinel,
+        )
 
         assert result is None
         assert build_calls == [], '_build_candidate must NOT be called when candidate is supplied'
         assert len(guard_calls) == 1, (
-            f'Expected _path_guard_error called once, got {len(guard_calls)}'
+            f'Expected _path_guard_check called once, got {len(guard_calls)}'
         )
         assert guard_calls[0][0] is sentinel
 
@@ -5048,20 +5058,180 @@ class TestPathGuardOrSkip:
     def test_path_guard_or_skip_propagates_rejection(
         self, interceptor, monkeypatch,
     ):
-        """When _path_guard_error returns a rejection dict, the helper returns it as-is."""
-        rejection = {
-            'error_type': 'DarkFactoryPathScopeViolation',
-            'matched_paths': ['orchestrator/'],
-        }
+        """When _path_guard_check returns a rejection verdict, the helper
+        returns its to_error_dict() output.
+        """
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='some_other_project',
+            matched_paths=('orchestrator/',),
+            suggested_project='dark_factory',
+        )
 
         def fake_build(kwargs):
             return None
 
-        def fake_guard(self, candidate, kwargs, project_id):
-            return rejection
+        def fake_check(self, candidate, kwargs, project_id):
+            return verdict
 
         monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_error', fake_guard)
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
-        result = interceptor._path_guard_or_skip({'prompt': 'something'}, 'some_other_project')
-        assert result is rejection
+        result = interceptor._path_guard_or_skip(
+            {'prompt': 'something'}, '/some/project_root', 'some_other_project',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
+        assert result.get('matched_paths') == ['orchestrator/']
+        assert result.get('suggested_project') == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Multi-project routing — registry + escalator wiring
+# ---------------------------------------------------------------------------
+
+
+class TestMultiProjectRoutingWiring:
+    """Verify that when prefix_registry + scope_violation_escalator are wired,
+    the path guard runs for every project (including dark_factory) and a
+    rejection fires the escalator with the expected payload.
+    """
+
+    def test_registry_supersedes_dark_factory_short_circuit(
+        self, interceptor, monkeypatch, tmp_path,
+    ):
+        """With a registry configured, dark_factory submissions are also
+        guarded — a reify path landing in dark_factory triggers rejection."""
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        # Build a registry covering both projects.
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([
+            str(tmp_path / 'reify'),
+            str(tmp_path / 'dark-factory'),
+        ])
+        interceptor._prefix_registry = registry
+
+        check_calls: list = []
+
+        def fake_check(self, candidate, kwargs, project_id):
+            check_calls.append(project_id)
+            return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
+
+        result = interceptor._path_guard_or_skip(
+            {'title': 'Edit something'},
+            str(tmp_path / 'dark-factory'),
+            'dark_factory',
+        )
+        # Guard ran for dark_factory (no short-circuit) and returned ok.
+        assert result is None
+        assert check_calls == ['dark_factory']
+
+    def test_rejection_fires_scope_violation_escalator(
+        self, interceptor, monkeypatch, tmp_path,
+    ):
+        """A path-guard rejection invokes scope_violation_escalator.report_rejection
+        with project_root, matched_paths, and suggested_project from the verdict.
+        """
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        # Set up a registry so the new path runs.
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([
+            str(tmp_path / 'reify'),
+            str(tmp_path / 'dark-factory'),
+        ])
+        interceptor._prefix_registry = registry
+
+        # Spy escalator.
+        escalator_calls: list = []
+
+        class FakeEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+                return 'esc-task-path-guard-1'
+
+        interceptor._scope_violation_escalator = FakeEscalator()
+
+        # Force a rejection verdict from the check function.
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='reify',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        result = interceptor._path_guard_or_skip(
+            {'title': 'Edit fused-memory/X'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+        # Rejection error dict is still returned to the caller.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        # Escalator was called exactly once with the routing context.
+        assert len(escalator_calls) == 1
+        call = escalator_calls[0]
+        assert call['project_root'] == str(tmp_path / 'reify')
+        assert call['project_id'] == 'reify'
+        assert call['matched_paths'] == ('fused-memory/',)
+        assert call['suggested_project'] == 'dark_factory'
+        # suggested_root resolved from registry.
+        assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
+
+    def test_escalator_failure_swallowed(
+        self, interceptor, monkeypatch, tmp_path,
+    ):
+        """An escalator that raises must NOT turn the rejection into an exception."""
+        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        class BoomEscalator:
+            def report_rejection(self, **kwargs):
+                raise RuntimeError('boom')
+
+        interceptor._scope_violation_escalator = BoomEscalator()
+        verdict = PathGuardVerdict(
+            outcome='rejection',
+            project_id='other',
+            matched_paths=('crates/',),
+            suggested_project='reify',
+        )
+        monkeypatch.setattr(
+            TaskInterceptor, '_path_guard_check',
+            lambda self, c, k, p: verdict,
+        )
+
+        # Must not raise.
+        result = interceptor._path_guard_or_skip(
+            {'title': 'crates/widget'}, '/foo', 'other',
+        )
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
