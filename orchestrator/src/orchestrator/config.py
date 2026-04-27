@@ -478,6 +478,21 @@ class OrchestratorConfig(BaseSettings):
     max_pre_merge_retries: int = Field(default=2)
     max_merge_retries: int = Field(default=3)
     inter_iteration_rebase: bool = Field(default=True)
+    # Fix 3 — rebase onto main before each verify (including the first) so
+    # transient verify failures fixed by a sibling task on main are picked
+    # up without a full re-execute cycle.  Cheap fast-path when main has
+    # not advanced; default True closes the demonstrated bug, ops can opt
+    # out if it surprises us.
+    rebase_before_verify: bool = Field(default=True)
+    # Fix 2 — thrash threshold for repeated infra-issue resumes on the
+    # same root cause.  Counter increments when an L0 (category=
+    # infra_issue) is resolved without iteration-log growth, resets to 1
+    # when the log grows (steward/agent ran real work).  At threshold the
+    # orchestrator promotes to L1 instead of dispatching the implementer
+    # again.  Three matches the empirical reify task-2289 thrash window
+    # (15 escalations on the same port-1420 collision before
+    # verify-budget exhaustion).
+    max_consecutive_infra_resumes: int = Field(default=3, ge=1)
     requeue_cooldown_secs: float = Field(default=30.0)
     requeue_cap: int = Field(
         default=3,

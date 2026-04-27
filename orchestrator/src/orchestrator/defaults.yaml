@@ -20,6 +20,16 @@ max_advance_attempts: 3
 max_pre_merge_retries: 2
 max_merge_retries: 3
 inter_iteration_rebase: true
+# Rebase onto main before each verify retry (Fix 3 — closes the verify-only
+# rebase gap so a fully-implemented task can pick up sibling fixes on main
+# without re-running execute).
+rebase_before_verify: true
+
+# Fix 2 — thrash threshold for repeated infra-issue resumes on the same
+# root cause.  Counter resets to 1 when the iteration log grows; at
+# threshold the orchestrator escalates to L1 instead of resuming the
+# implementer.  3 matches the empirical reify task-2289 thrash window.
+max_consecutive_infra_resumes: 3
 
 # Per-task retry cap — max WorkflowOutcome.REQUEUED iterations before L1
 # escalation.  Backstop against tight steward→REQUEUED loops (e.g. architect

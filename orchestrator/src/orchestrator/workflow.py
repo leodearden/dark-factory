@@ -40,7 +40,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules, normalize_lock
-from orchestrator.task_status import TERMINAL_STATUSES
+from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
@@ -516,6 +516,43 @@ class TaskWorkflow:
                                 're-implementation', self.task_id,
                             )
                             break
+
+                        # Honor steward terminal decisions BEFORE resuming the
+                        # implementer.  The steward may have set the task to
+                        # done / cancelled / deferred / blocked while resolving
+                        # the L0 (e.g. queued a follow-up task that is now the
+                        # durable fix and deferred this one onto it).  Without
+                        # this guard the resume loop keeps invoking the
+                        # implementer/debugger until verify-attempt budget
+                        # exhausts — burning $7-8 per cycle on a task the
+                        # steward already decided to park.  Mirrors the inline
+                        # returns inside _mark_blocked (~L3125–3168) but
+                        # bypasses it so we do NOT file an L1 for what is an
+                        # intentional steward terminal decision.
+                        current_status = await self.scheduler.get_status(self.task_id)
+                        if current_status == 'done':
+                            self._enter_phase(WorkflowState.DONE)
+                            return WorkflowOutcome.DONE
+                        if current_status in WORKFLOW_PRESERVE_STATUSES:
+                            logger.info(
+                                'Task %s: steward set status to %s during '
+                                'escalation resolution — preserving, exiting '
+                                'resume loop',
+                                self.task_id, current_status,
+                            )
+                            self._enter_phase(WorkflowState.BLOCKED)
+                            return WorkflowOutcome.BLOCKED
+
+                        # Fix 2 — anti-thrash guard for repeated infra-issue
+                        # resumes on the same root cause.  Status is confirmed
+                        # non-terminal here (Fix 1 guard above), so it's safe
+                        # to count this as a real resume attempt.  At
+                        # threshold the helper short-circuits to BLOCKED + L1
+                        # so a human can intervene rather than the orchestrator
+                        # dispatching the implementer/debugger again.
+                        thrash_outcome = await self._check_infra_resume_thrash()
+                        if thrash_outcome is not None:
+                            return thrash_outcome
 
                         # Resume with resolution context
                         logger.info(f'Task {self.task_id}: resuming after escalation resolution')
@@ -1192,6 +1229,117 @@ class TaskWorkflow:
 
         return await self._mark_blocked(reason, detail=detail)
 
+    async def _check_infra_resume_thrash(self) -> WorkflowOutcome | None:
+        """Fix 2 — detect & escalate repeated infra-issue resume thrash.
+
+        Called from the ESCALATED branch of :meth:`run` after the steward
+        has resolved the L0 and Fix 1 confirmed the task status is still
+        non-terminal (pending / in-progress).  If the most recent resolved
+        L0 was an ``infra_issue`` and the iteration log has not grown since
+        the previous resume, increment ``consecutive_infra_resume_failures``
+        in the task metadata.  At ``max_consecutive_infra_resumes``, route
+        to ``_mark_blocked(escalate_to_human=True)`` instead of dispatching
+        the implementer again.
+
+        Returns:
+            ``WorkflowOutcome.BLOCKED`` when the threshold is hit; ``None``
+            to fall through to the existing implementer-resume path.
+
+        The iteration-log growth signal (rather than HEAD SHA) is canonical:
+        steward fix-commits and ``--allow-empty`` commits both advance HEAD
+        without representing real agent progress.  The iteration log is the
+        signal already used by ``_has_prior_implementation``.
+
+        Mirrors :meth:`_handle_no_plan_failure` style — same per-task
+        concurrency assumption as the existing
+        ``consecutive_no_plan_failures`` writer; no new hazard.
+        """
+        assert self.artifacts is not None
+
+        metadata = self.task.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        # Determine the category of the most recent resolved L0 (the one
+        # the steward just handled).  If no escalation queue is wired up
+        # (e.g. eval mode), we cannot classify — fall through.
+        recent_category: str | None = None
+        if self.escalation_queue:
+            resolved = [
+                e
+                for e in self.escalation_queue.get_by_task(self.task_id)
+                if e.level == 0 and e.status == 'resolved'
+            ]
+            if resolved:
+                resolved.sort(
+                    key=lambda e: e.resolved_at or e.timestamp, reverse=True,
+                )
+                recent_category = resolved[0].category
+
+        # Iteration-log entry count is the progress signal.
+        iter_entries, _ = self.artifacts.read_iteration_log()
+        current_iter_count = len(iter_entries)
+
+        try:
+            counter = int(
+                metadata.get('consecutive_infra_resume_failures') or 0
+            )
+        except (TypeError, ValueError):
+            counter = 0
+
+        if recent_category == 'infra_issue':
+            try:
+                last_iter_count = int(
+                    metadata.get('last_infra_resume_iteration_count') or 0
+                )
+            except (TypeError, ValueError):
+                last_iter_count = 0
+            if current_iter_count > last_iter_count:
+                # Steward fix-commits will reset the counter via
+                # iteration-log growth.  This is intentional: a steward
+                # action is forward progress.
+                counter = 1
+            else:
+                counter += 1
+        else:
+            # Non-infra category (or no resolved L0 we could classify) —
+            # the thrash signal does not apply; reset.
+            counter = 0
+
+        new_metadata = dict(metadata)
+        new_metadata['consecutive_infra_resume_failures'] = counter
+        new_metadata['last_infra_resume_iteration_count'] = current_iter_count
+        self.task['metadata'] = new_metadata
+        try:
+            await self.scheduler.update_task(
+                self.task_id, metadata=new_metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+            logger.warning(
+                'Task %s: failed to persist infra-resume thrash counter: %s',
+                self.task_id, exc,
+            )
+
+        if counter >= self.config.max_consecutive_infra_resumes:
+            logger.warning(
+                'Task %s: consecutive_infra_resume_failures=%d at threshold '
+                '%d — infra-issue thrash confirmed; escalating to human',
+                self.task_id, counter,
+                self.config.max_consecutive_infra_resumes,
+            )
+            return await self._mark_blocked(
+                f'Repeated infra-issue resume thrash (counter={counter})',
+                detail=(
+                    f'category={recent_category!r}, '
+                    f'iteration_log_entries={current_iter_count}, '
+                    f'last_iteration_log_entries='
+                    f'{metadata.get("last_infra_resume_iteration_count", 0)}'
+                ),
+                escalate_to_human=True,
+            )
+
+        return None
+
     async def _handle_blocking_dep_report(
         self, *, rebase_retry_used: bool,
     ) -> WorkflowOutcome | None:
@@ -1721,13 +1869,19 @@ class TaskWorkflow:
 
         return verdict
 
-    async def _inter_iteration_rebase(self) -> dict | None:
+    async def _inter_iteration_rebase(
+        self, *, event_label: str = 'rebase',
+    ) -> dict | None:
         """Check if main advanced past our base; if so, rebase.
 
         Returns a dict ``{old_base, new_base, changed_files}`` when a
         rebase was performed, or ``None`` if no rebase was needed or the
         rebase failed (failure is non-blocking — the merge phase will
         handle conflicts).
+
+        ``event_label`` populates the ``event`` field on the
+        iteration_log entry so verify-phase calls (Fix 3) can be
+        distinguished from execute-phase calls in post-mortem analysis.
         """
         assert self.worktree is not None and self.artifacts is not None
 
@@ -1746,7 +1900,9 @@ class TaskWorkflow:
             old_base, current_main,
         )
 
-        # Commit any uncommitted work before rebasing
+        # Commit any uncommitted work before rebasing.  ``commit()`` no-ops
+        # on a clean tree so verify-phase callers (which always run on a
+        # clean tree post-execute) do not produce empty WIP commits.
         await self.git_ops.commit(
             self.worktree, 'chore: save WIP before inter-iteration rebase',
         )
@@ -1764,7 +1920,7 @@ class TaskWorkflow:
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
             'agent': 'orchestrator',
-            'event': 'rebase',
+            'event': event_label,
             'old_base': old_base,
             'new_base': current_main,
             'files_changed_on_main': changed_files[:50],
@@ -1793,6 +1949,19 @@ class TaskWorkflow:
         verify_attempt = 0
 
         while True:
+            # Fix 3: rebase onto main BEFORE each verify (including the first).
+            # Closes the verify-only-retry rebase gap: when main advances
+            # mid-task (e.g. a sibling task fixes the env collision the
+            # verify is failing on), the existing _inter_iteration_rebase
+            # only fires from the EXECUTE loop — it cannot pick up new main
+            # commits while we're cycling verify ↔ debugger.  The helper
+            # short-circuits cheaply when current_main == old_base, so
+            # firing on every retry costs at most one ``git rev-parse``.
+            if self.config.rebase_before_verify:
+                await self._inter_iteration_rebase(
+                    event_label='verify_phase_rebase',
+                )
+
             result = await run_scoped_verification(
                 self.worktree, self.config, self._module_configs, task_files=self._task_files,
                 attempt_id=verify_attempt + 1,
