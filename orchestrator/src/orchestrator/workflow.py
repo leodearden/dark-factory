@@ -543,6 +543,17 @@ class TaskWorkflow:
                             self._enter_phase(WorkflowState.BLOCKED)
                             return WorkflowOutcome.BLOCKED
 
+                        # Fix 2 — anti-thrash guard for repeated infra-issue
+                        # resumes on the same root cause.  Status is confirmed
+                        # non-terminal here (Fix 1 guard above), so it's safe
+                        # to count this as a real resume attempt.  At
+                        # threshold the helper short-circuits to BLOCKED + L1
+                        # so a human can intervene rather than the orchestrator
+                        # dispatching the implementer/debugger again.
+                        thrash_outcome = await self._check_infra_resume_thrash()
+                        if thrash_outcome is not None:
+                            return thrash_outcome
+
                         # Resume with resolution context
                         logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                         resume_prompt = await self.briefing.build_resume_prompt(
@@ -1217,6 +1228,117 @@ class TaskWorkflow:
             )
 
         return await self._mark_blocked(reason, detail=detail)
+
+    async def _check_infra_resume_thrash(self) -> WorkflowOutcome | None:
+        """Fix 2 — detect & escalate repeated infra-issue resume thrash.
+
+        Called from the ESCALATED branch of :meth:`run` after the steward
+        has resolved the L0 and Fix 1 confirmed the task status is still
+        non-terminal (pending / in-progress).  If the most recent resolved
+        L0 was an ``infra_issue`` and the iteration log has not grown since
+        the previous resume, increment ``consecutive_infra_resume_failures``
+        in the task metadata.  At ``max_consecutive_infra_resumes``, route
+        to ``_mark_blocked(escalate_to_human=True)`` instead of dispatching
+        the implementer again.
+
+        Returns:
+            ``WorkflowOutcome.BLOCKED`` when the threshold is hit; ``None``
+            to fall through to the existing implementer-resume path.
+
+        The iteration-log growth signal (rather than HEAD SHA) is canonical:
+        steward fix-commits and ``--allow-empty`` commits both advance HEAD
+        without representing real agent progress.  The iteration log is the
+        signal already used by ``_has_prior_implementation``.
+
+        Mirrors :meth:`_handle_no_plan_failure` style — same per-task
+        concurrency assumption as the existing
+        ``consecutive_no_plan_failures`` writer; no new hazard.
+        """
+        assert self.artifacts is not None
+
+        metadata = self.task.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        # Determine the category of the most recent resolved L0 (the one
+        # the steward just handled).  If no escalation queue is wired up
+        # (e.g. eval mode), we cannot classify — fall through.
+        recent_category: str | None = None
+        if self.escalation_queue:
+            resolved = [
+                e
+                for e in self.escalation_queue.get_by_task(self.task_id)
+                if e.level == 0 and e.status == 'resolved'
+            ]
+            if resolved:
+                resolved.sort(
+                    key=lambda e: e.resolved_at or e.timestamp, reverse=True,
+                )
+                recent_category = resolved[0].category
+
+        # Iteration-log entry count is the progress signal.
+        iter_entries, _ = self.artifacts.read_iteration_log()
+        current_iter_count = len(iter_entries)
+
+        try:
+            counter = int(
+                metadata.get('consecutive_infra_resume_failures') or 0
+            )
+        except (TypeError, ValueError):
+            counter = 0
+
+        if recent_category == 'infra_issue':
+            try:
+                last_iter_count = int(
+                    metadata.get('last_infra_resume_iteration_count') or 0
+                )
+            except (TypeError, ValueError):
+                last_iter_count = 0
+            if current_iter_count > last_iter_count:
+                # Steward fix-commits will reset the counter via
+                # iteration-log growth.  This is intentional: a steward
+                # action is forward progress.
+                counter = 1
+            else:
+                counter += 1
+        else:
+            # Non-infra category (or no resolved L0 we could classify) —
+            # the thrash signal does not apply; reset.
+            counter = 0
+
+        new_metadata = dict(metadata)
+        new_metadata['consecutive_infra_resume_failures'] = counter
+        new_metadata['last_infra_resume_iteration_count'] = current_iter_count
+        self.task['metadata'] = new_metadata
+        try:
+            await self.scheduler.update_task(
+                self.task_id, metadata=new_metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+            logger.warning(
+                'Task %s: failed to persist infra-resume thrash counter: %s',
+                self.task_id, exc,
+            )
+
+        if counter >= self.config.max_consecutive_infra_resumes:
+            logger.warning(
+                'Task %s: consecutive_infra_resume_failures=%d at threshold '
+                '%d — infra-issue thrash confirmed; escalating to human',
+                self.task_id, counter,
+                self.config.max_consecutive_infra_resumes,
+            )
+            return await self._mark_blocked(
+                f'Repeated infra-issue resume thrash (counter={counter})',
+                detail=(
+                    f'category={recent_category!r}, '
+                    f'iteration_log_entries={current_iter_count}, '
+                    f'last_iteration_log_entries='
+                    f'{metadata.get("last_infra_resume_iteration_count", 0)}'
+                ),
+                escalate_to_human=True,
+            )
+
+        return None
 
     async def _handle_blocking_dep_report(
         self, *, rebase_retry_used: bool,
