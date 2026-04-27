@@ -445,6 +445,225 @@ class TestWorktreeLifecycle:
                 f'Leaked merge worktree directories on disk: {leak_dirs}'
             )
 
+    async def test_create_worktree_base_commit_race_safe_new_path(
+        self, git_ops: GitOps,
+    ):
+        """Race regression: main advances between rev-parse and `worktree add`.
+
+        Simulates fused-memory's ``TaskFileCommitter._schedule_commit`` racing
+        against ``create_worktree``: the pre-positioning ``git rev-parse main``
+        captures SHA-A, then a fire-and-forget commit advances main to SHA-B
+        before ``git worktree add`` runs.  ``git worktree add ... main``
+        resolves the symbolic ref at call time, so the new worktree HEAD is at
+        SHA-B.  ``WorktreeInfo.base_commit`` MUST reflect the post-positioning
+        fork point (SHA-B), not the pre-race captured SHA (SHA-A).
+
+        Without the fix, downstream callers like ``_recover_if_already_merged``
+        observe ``wt_head (SHA-B) != base_commit (SHA-A)`` on a worktree that
+        has done zero implementation work, and silently mark the task DONE.
+        See ``~/.claude/plans/do-2-3-misty-marshmallow.md``.
+        """
+        from orchestrator import git_ops as git_ops_mod
+
+        real_run = git_ops_mod._run
+        advance_state = {'fired': False, 'pre_race_sha': None}
+
+        async def racing_run(cmd, cwd=None):
+            # Detect the pre-positioning rev-parse on main and inject a
+            # racing commit between its return and the subsequent
+            # `git worktree add ... main`.  Only fire once so the
+            # subsequent merge-base lookup runs unmodified.
+            is_pre_positioning_revparse = (
+                cmd[:2] == ['git', 'rev-parse']
+                and len(cmd) == 3
+                and cmd[2] == git_ops.config.main_branch
+                and cwd == git_ops.project_root
+                and not advance_state['fired']
+            )
+            result = await real_run(cmd, cwd=cwd)
+            if is_pre_positioning_revparse:
+                advance_state['fired'] = True
+                advance_state['pre_race_sha'] = result[1].strip()
+                # Inject the race: advance main with a new commit before
+                # `git worktree add` runs.  This mirrors fused-memory's
+                # tasks.json fire-and-forget commit landing during the
+                # rev-parse → worktree-add window.
+                (git_ops.project_root / 'racing_commit.txt').write_text(
+                    'committed during create_worktree race window\n'
+                )
+                await real_run(
+                    ['git', 'add', 'racing_commit.txt'],
+                    cwd=git_ops.project_root,
+                )
+                await real_run(
+                    ['git', 'commit', '-m', 'race: advance main mid-create_worktree'],
+                    cwd=git_ops.project_root,
+                )
+            return result
+
+        with patch('orchestrator.git_ops._run', side_effect=racing_run):
+            wt_info = await git_ops.create_worktree('race-new-path')
+
+        # Sanity: the race actually fired
+        assert advance_state['fired'], (
+            'Race injection never fired — test setup is broken'
+        )
+
+        # Read post-race state
+        _, post_race_main_sha, _ = await _run(
+            ['git', 'rev-parse', git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        post_race_main_sha = post_race_main_sha.strip()
+        _, wt_head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=wt_info.path,
+        )
+        wt_head_sha = wt_head_sha.strip()
+
+        # The pre-race SHA differs from the post-race main SHA — race is real
+        assert advance_state['pre_race_sha'] != post_race_main_sha, (
+            'Pre-race SHA must differ from post-race main SHA — race injection '
+            'did not actually advance main'
+        )
+
+        # Worktree HEAD lands on the new main (`git worktree add` resolves
+        # `main` at call time)
+        assert wt_head_sha == post_race_main_sha, (
+            f'Precondition: wt_head ({wt_head_sha[:8]}) must equal post-race '
+            f'main ({post_race_main_sha[:8]}) since `git worktree add` '
+            f'resolves the ref at call time'
+        )
+
+        # Race-immunity guarantee: base_commit equals the worktree's actual
+        # fork point (= new main = wt_head), NOT the pre-race captured SHA
+        assert wt_info.base_commit == wt_head_sha, (
+            f'base_commit ({wt_info.base_commit[:8]}) must equal post-positioning '
+            f'merge-base/HEAD ({wt_head_sha[:8]}), not the pre-race captured SHA '
+            f'({advance_state["pre_race_sha"][:8]}). The fix in create_worktree '
+            f'must compute base_commit from `git merge-base main HEAD` inside '
+            f'the worktree AFTER positioning, not from rev-parse before it.'
+        )
+        assert wt_info.base_commit != advance_state['pre_race_sha'], (
+            'base_commit must NOT equal the pre-race SHA — that is the bug'
+        )
+
+    async def test_create_worktree_base_commit_race_safe_reused_path(
+        self, git_ops: GitOps,
+    ):
+        """Race regression for the reused-worktree path: main advances during rebase.
+
+        Setup mirrors a requeued task: the worktree already exists with a
+        real branch commit, main has advanced once, and a SECOND advance
+        races the reused-path rev-parse → rebase window.
+
+        After ``rebase_onto_main`` completes, ``WorktreeInfo.base_commit``
+        must equal the post-rebase fork point (the new main SHA), not the
+        pre-race captured SHA from line 478.  The rebase brings the branch
+        onto current main (resolved at rebase time), so the worktree's
+        merge-base with main equals the post-rebase main SHA.
+
+        Without the fix, ``actual_base = base_sha.strip()`` on the success
+        branch returns the stale pre-race SHA — producing the same false-
+        positive in ``_recover_if_already_merged`` as the new-path bug.
+        """
+        from orchestrator import git_ops as git_ops_mod
+
+        # 1. Pre-create the worktree and make a real branch commit
+        wt_info1 = await git_ops.create_worktree('race-reused')
+        wt = wt_info1.path
+        (wt / 'branch_work.py').write_text('z = 3\n')
+        await git_ops.commit(wt, 'Branch work for race-reused test')
+
+        # 2. Advance main once via a separate commit (simulates an unrelated merge)
+        (git_ops.project_root / 'first_advance.py').write_text('a = 1\n')
+        await _run(['git', 'add', 'first_advance.py'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'first main advance'],
+            cwd=git_ops.project_root,
+        )
+
+        # 3. Set up race injection for the second advance
+        real_run = git_ops_mod._run
+        advance_state = {'fired': False, 'pre_race_sha': None}
+
+        async def racing_run(cmd, cwd=None):
+            is_pre_positioning_revparse = (
+                cmd[:2] == ['git', 'rev-parse']
+                and len(cmd) == 3
+                and cmd[2] == git_ops.config.main_branch
+                and cwd == git_ops.project_root
+                and not advance_state['fired']
+            )
+            result = await real_run(cmd, cwd=cwd)
+            if is_pre_positioning_revparse:
+                advance_state['fired'] = True
+                advance_state['pre_race_sha'] = result[1].strip()
+                # Inject a SECOND advance to main — between the rev-parse
+                # in create_worktree and the rebase_onto_main inside it.
+                (git_ops.project_root / 'racing_advance.py').write_text(
+                    'b = 2\n'
+                )
+                await real_run(
+                    ['git', 'add', 'racing_advance.py'],
+                    cwd=git_ops.project_root,
+                )
+                await real_run(
+                    ['git', 'commit', '-m', 'race: advance main mid-reuse'],
+                    cwd=git_ops.project_root,
+                )
+            return result
+
+        # 4. Call create_worktree again → reused-worktree path → rebase →
+        #    new merge-base capture.
+        with patch('orchestrator.git_ops._run', side_effect=racing_run):
+            wt_info2 = await git_ops.create_worktree('race-reused')
+
+        assert advance_state['fired'], (
+            'Race injection never fired — test setup is broken'
+        )
+        assert wt_info2.path == wt_info1.path, (
+            'Reused-worktree path must return the same worktree path'
+        )
+
+        # 5. Compute expected post-rebase fork point and compare
+        _, post_race_main_sha, _ = await _run(
+            ['git', 'rev-parse', git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        post_race_main_sha = post_race_main_sha.strip()
+
+        _, mb_actual, _ = await _run(
+            ['git', 'merge-base', git_ops.config.main_branch, 'HEAD'],
+            cwd=wt,
+        )
+        mb_actual = mb_actual.strip()
+
+        # The pre-race SHA differs from the post-race main SHA
+        assert advance_state['pre_race_sha'] != post_race_main_sha, (
+            'Pre-race SHA must differ from post-race main SHA — race injection '
+            'did not actually advance main'
+        )
+
+        # After a successful rebase, the branch's fork point with main is
+        # current main.
+        assert mb_actual == post_race_main_sha, (
+            f'Precondition: post-rebase merge-base ({mb_actual[:8]}) must '
+            f'equal post-race main ({post_race_main_sha[:8]})'
+        )
+
+        # Race-immunity: base_commit equals the post-rebase fork point, NOT
+        # the pre-race captured SHA.
+        assert wt_info2.base_commit == mb_actual, (
+            f'base_commit ({wt_info2.base_commit[:8]}) must equal '
+            f'post-rebase merge-base ({mb_actual[:8]}), not the pre-race '
+            f'captured SHA ({advance_state["pre_race_sha"][:8]}). The fix in '
+            f'create_worktree must promote the merge-base capture to the '
+            f'rebase-success branch as well as the rebase-failed branch.'
+        )
+        assert wt_info2.base_commit != advance_state['pre_race_sha'], (
+            'base_commit must NOT equal the pre-race SHA — that is the bug'
+        )
+
 
 @pytest.mark.asyncio
 class TestFreshenMain:

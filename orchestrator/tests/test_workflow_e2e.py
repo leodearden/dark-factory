@@ -3351,6 +3351,154 @@ class TestRecoverIfAlreadyMerged:
             f'{workflow.state!r}'
         )
 
+    async def test_returns_none_when_sha_diverges_but_iteration_log_empty(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """SHA-divergent worktree with empty iteration log must return None.
+
+        Defense-in-depth regression test for fix #3: even if wt_head differs
+        from base_commit (e.g. due to the fused-memory tasks.json auto-commit
+        race that produces a stale base_commit), the recovery must NOT fire
+        DONE without iteration-log evidence of implementer/debugger work.
+
+        Setup mimics the production phantom-DONE scenario: stamp metadata.json
+        with a stale base_sha (one that predates the worktree HEAD), then
+        merge the branch to main without ever writing an implementer entry
+        to iterations.jsonl.  Under the SHA-only check (pre-fix #3), this
+        returns DONE because wt_head != base_commit.  After fix #3, the
+        SHA-primary path also requires has_iter_log_work=True, so the
+        recovery returns None.
+
+        This is the regression test for the eight phantom-DONE reify tasks
+        identified in today's audit (2010, 2229, 2231, 2292, 2351, 2368,
+        2384, 2397).  See ~/.claude/plans/do-2-3-misty-marshmallow.md.
+        """
+        import json as _json
+
+        # 1. Create worktree
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2. Stamp metadata.json with the CURRENT base_sha (will be stale
+        #    after the impl commit lands)
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+
+        # 3. Make a real commit on the branch (advances wt_head) and merge.
+        #    Deliberately do NOT write an implementer entry to iterations.jsonl —
+        #    this is the crucial difference from the positive test.
+        (wt / 'phantom_impl.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'Phantom impl (no iteration log entry)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 4. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 5. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 6. Assertions: SHA divergence alone must NOT trigger DONE
+        assert outcome is None, (
+            f'Expected None when SHA diverges but iteration log is empty '
+            f'but got {outcome!r} — fix #3 (SHA-primary requires iteration-log '
+            f'evidence) is missing or broken.  Without this guard, the '
+            f'pre-PLAN recovery fires DONE on phantom branches that have '
+            f'commits but no implementer/debugger work — exactly the bug '
+            f'that produced eight phantom-DONE reify tasks today.'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses when iteration log "
+            f"is empty: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE when iteration log is empty: '
+            f'{workflow.state!r}'
+        )
+
+    async def test_returns_none_when_iteration_log_present_but_no_sha_divergence(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Iteration log with implementer but wt_head == base_commit must return None.
+
+        Defense-in-depth complement to fix #3: an inherited/orphan
+        iterations.jsonl alone (with implementer entries but no real branch
+        commits) must NOT trigger DONE on a fresh worktree.  After fix #3,
+        the SHA-primary path requires sha_diverges=True AND has_iter_log_work
+        =True; either signal alone returns has_work=False.
+
+        This complements the existing
+        test_returns_none_for_inherited_iterations_log_on_fresh_worktree
+        regression: that test exercises the SAME state but documents the
+        SHA-equality protection.  This test re-asserts the protection
+        survives the AND-combination introduced by fix #3.
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (wt_head == base_commit, no commits)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Stamp metadata.json so base_commit is non-None
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+
+        # 3. Write implementer entry — simulates inherited contamination on a
+        #    fresh worktree.  Under fix #3 this is one of the two required
+        #    signals; the other (sha_diverges) is False because we make no
+        #    git commits.
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 4. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 5. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 6. Assertions: iteration log alone must NOT trigger DONE
+        assert outcome is None, (
+            f'Expected None when iteration log has implementer but wt_head '
+            f'== base_commit but got {outcome!r} — fix #3 must require BOTH '
+            f'SHA divergence and iteration-log evidence; without the AND '
+            f'combination, orphan iteration logs would fire false-DONE on '
+            f'fresh worktrees.'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses when wt_head "
+            f"== base_commit: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE when wt_head == base_commit: '
+            f'{workflow.state!r}'
+        )
+
     async def test_returns_none_when_branch_not_on_main(
         self, config, git_ops, task_assignment, tmp_path
     ):
