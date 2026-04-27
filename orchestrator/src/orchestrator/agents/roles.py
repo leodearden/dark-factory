@@ -53,6 +53,14 @@ _MEMORY_TOOLS = [
     'mcp__fused-memory__get_entity',
 ]
 
+# Role-gate for terminal-status writes. Every workflow role except steward
+# (and the orchestrator's programmatic happy path in workflow.py) is denied
+# `set_task_status` so a misbehaving subprocess cannot stamp premature
+# done/blocked/cancelled. The schema-side validator in fused-memory is the
+# load-bearing control; this allowlist is the role gate that keeps the
+# attack surface narrow.
+_NO_TASK_STATUS_WRITE = ['mcp__fused-memory__set_task_status']
+
 _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__create_plan',
     'mcp__plan-tools__add_plan_step',
@@ -169,7 +177,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 - If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` parameter.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
-    disallowed_tools=['Edit', 'Write'],
+    disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
@@ -235,6 +243,7 @@ expansion rather than trying to work around the restriction.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+    disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
     default_max_turns=80,
@@ -292,6 +301,7 @@ expansion rather than trying to work around the restriction.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+    disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
@@ -346,7 +356,7 @@ You MUST output ONLY valid JSON matching this schema:
 ## Your Specialization: {specialization}
 """,
         allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
-        disallowed_tools=['Edit', 'Write'],
+        disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
         default_model='sonnet',
         default_budget=2.0,
         default_max_turns=30,
@@ -441,7 +451,7 @@ You MUST output ONLY valid JSON matching the schema provided by the
 --json-schema flag. No markdown fences, no prose outside the JSON.
 """,
     allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
-    disallowed_tools=['Edit', 'Write'],
+    disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
     default_budget=0.50,
     default_max_turns=15,
@@ -508,6 +518,7 @@ git add -- . ':!.task'
 - If the conflict involves architectural changes where both sides restructured the same code differently, mark as BLOCKED — don't attempt a creative merge.
 """ + _ESCALATION_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_JCODEMUNCH_TOOLS],
+    disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
@@ -586,6 +597,10 @@ _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__resolve_ticket',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__get_task',
+    # Steward is the only workflow role allowed to mark tasks done; every
+    # other role has set_task_status in disallowed_tools so a misbehaving
+    # implementer / merger / reviewer cannot stamp premature provenance.
+    'mcp__fused-memory__set_task_status',
 ]
 
 STEWARD = AgentRole(
@@ -705,6 +720,63 @@ choose your response:
 - **STRUCTURAL** — agent succeeded via schema salvage; usually treated as
   success upstream — shouldn't reach you, but if it does, investigate.
 - **UNKNOWN** — no specific signal. Use the full diagnostic_detail to decide.
+
+## Marking tasks done
+
+You are the only workflow role that may call `mcp__fused-memory__set_task_status`
+to mark a task `done`. Implementer/architect/debugger/merger/reviewer roles all
+have the tool denied — if you see them attempt it, that's a bug; report it.
+
+Every `done` write must declare a verifiable `done_provenance.kind`. Two kinds
+are accepted:
+
+### `kind="merged"` — the task's branch landed on main via the merge queue
+
+Use this after `mcp__escalation__merge_request` returns success and you have
+the merge SHA. Required shape:
+
+    set_task_status(
+        id=<task>, status="done", project_root=<root>,
+        done_provenance={"kind": "merged", "commit": "<merge-sha>"},
+    )
+
+Before calling, sanity-check the SHA is actually on main:
+
+    git -C <project_root> merge-base --is-ancestor <merge-sha> main && echo on-main
+
+The server runs the same check as a backstop; it will reject if the SHA is
+only on a feature branch.
+
+### `kind="found_on_main"` — the implementation is already on main from a sibling task
+
+Use this when investigation reveals the task's deliverable is already present
+on main (typically because a sibling task or prior orchestrator run landed
+it). Required shape:
+
+    set_task_status(
+        id=<task>, status="done", project_root=<root>,
+        done_provenance={
+            "kind": "found_on_main",
+            "note": "<why this task is already covered>",
+            "commit": "<optional landing commit>",
+        },
+    )
+
+Before calling, identify the impl-providing commit(s):
+
+    git -C <project_root> log main --oneline -- <relevant_paths>
+
+Cite the commit(s) and the providing-task id (when known) in `note`. The
+server does NOT ancestor-check this kind — your `note` is the audit trail.
+
+### Forbidden
+
+- Never call `set_task_status(..., status="done")` without `done_provenance`.
+- Never use `update_task` to set `metadata.done_provenance`. The server rejects
+  the call; even if it didn't, that bypasses the schema/ancestor backstop.
+- Never mark `done` because the orchestrator looks stuck or a verify phase
+  failed in confusing ways. If neither of the two paths above applies,
+  re-escalate to L1 instead.
 """ + _ESCALATION_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
@@ -831,7 +903,7 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
         'mcp__escalation__escalate_info',
         *_JCODEMUNCH_TOOLS,
     ],
-    disallowed_tools=['Edit', 'Write'],
+    disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=15.0,
     default_max_turns=100,

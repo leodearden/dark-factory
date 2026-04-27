@@ -104,9 +104,12 @@ async def test_valid_commit_sets_done_with_provenance(tmp_path: Path):
     assert args[0] == '50'
     assert args[1] == 'done'
     provenance = kwargs['done_provenance']
+    # 2026-04-27 hardening: kind discriminator added; verified_by/evidence
+    # folded into the structured note field so the schema accepts the call.
+    assert provenance['kind'] == 'found_on_main'
     assert provenance['commit'] == 'abcdef1234567890'
-    assert provenance['verified_by'] == 'architect'
-    assert provenance['evidence'] == 'helpers.foo on main at task 42'
+    assert 'architect' in provenance['note']
+    assert 'helpers.foo on main at task 42' in provenance['note']
     # Artifact cleared so a re-run doesn't see a stale report.
     assert f.artifacts.read_already_done() is None
     # is_ancestor called with (commit, main_sha) — strictly main-membership check.

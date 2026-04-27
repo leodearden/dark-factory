@@ -655,8 +655,12 @@ class TestHappyPath:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        # After step-15: merge_sha 'FEEDFACE' from MergeOutcome must be recorded
-        assert scheduler.provenance.get(task_assignment.task_id) == {'commit': 'FEEDFACE'}
+        # After step-15: merge_sha 'FEEDFACE' from MergeOutcome must be recorded.
+        # The 2026-04-27 done_provenance hardening added a `kind` discriminator;
+        # the workflow now passes kind="merged" alongside the commit.
+        assert scheduler.provenance.get(task_assignment.task_id) == {
+            'kind': 'merged', 'commit': 'FEEDFACE',
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -3669,12 +3673,15 @@ class TestRecoverIfAlreadyMerged:
         - workflow.state == WorkflowState.DONE
         - scheduler.statuses[task_id][-1] == 'done'
         - scheduler.provenance[task_id] == {
+              'kind': 'found_on_main',
+              'commit': <main_sha captured before the call>,
               'note': 'branch already on main at workflow start (pre-PLAN recovery)',
-              'main_sha': <sha captured before the call>,
           }
 
         Previously asserted against _mark_blocked; now retargeted to the
-        new helper directly.
+        new helper directly. The 2026-04-27 done_provenance hardening added
+        the `kind` discriminator and folded `main_sha` into the validated
+        `commit` field.
         """
         import json as _json
 
@@ -3735,14 +3742,18 @@ class TestRecoverIfAlreadyMerged:
         assert prov is not None, (
             f"Expected provenance entry for task {task_assignment.task_id!r}, got None"
         )
-        assert {'note', 'main_sha'} <= prov.keys(), (  # additive expansion won't break this
-            f"Provenance must contain keys {{'note', 'main_sha'}}, got: {set(prov.keys())!r}"
+        assert {'kind', 'commit', 'note'} <= prov.keys(), (  # additive expansion won't break this
+            f"Provenance must contain keys {{'kind', 'commit', 'note'}}, "
+            f"got: {set(prov.keys())!r}"
+        )
+        assert prov['kind'] == 'found_on_main', (
+            f"Unexpected provenance kind: {prov['kind']!r}"
         )
         assert prov['note'] == 'branch already on main at workflow start (pre-PLAN recovery)', (
             f"Unexpected provenance note: {prov['note']!r}"
         )
-        assert prov['main_sha'] == expected_main_sha, (
-            f"Provenance main_sha {prov['main_sha']!r} != expected {expected_main_sha!r}"
+        assert prov['commit'] == expected_main_sha, (
+            f"Provenance commit {prov['commit']!r} != expected main_sha {expected_main_sha!r}"
         )
 
 

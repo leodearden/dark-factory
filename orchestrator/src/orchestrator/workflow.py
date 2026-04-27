@@ -663,7 +663,10 @@ class TaskWorkflow:
             self._enter_phase(WorkflowState.DONE)
             await self.scheduler.set_task_status(
                 self.task_id, 'done',
-                done_provenance={'commit': self._merge_sha} if self._merge_sha else None,
+                done_provenance=(
+                    {'kind': 'merged', 'commit': self._merge_sha}
+                    if self._merge_sha else None
+                ),
             )
             logger.info(
                 f'Task {self.task_id} DONE — '
@@ -1335,9 +1338,12 @@ class TaskWorkflow:
         await self.scheduler.set_task_status(
             self.task_id, 'done',
             done_provenance={
+                'kind': 'found_on_main',
                 'commit': commit,
-                'verified_by': 'architect',
-                'evidence': evidence[:500],
+                'note': (
+                    f'architect-reported task already on main; '
+                    f'evidence: {evidence[:400]}'
+                ),
             },
         )
         return WorkflowOutcome.DONE
@@ -2934,8 +2940,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self.scheduler.set_task_status(
             self.task_id, 'done',
             done_provenance={
-                'note': 'branch already on main at workflow start (pre-PLAN recovery)',
-                'main_sha': main_sha,
+                'kind': 'found_on_main',
+                'commit': main_sha,
+                'note': (
+                    'branch already on main at workflow start '
+                    '(pre-PLAN recovery)'
+                ),
             },
         )
         return WorkflowOutcome.DONE

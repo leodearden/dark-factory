@@ -1911,7 +1911,10 @@ async def test_done_provenance_rejects_invalid_commit_ref(
 
     result = await interceptor.set_task_status(
         '1', 'done', str(tmp_path),
-        done_provenance={'commit': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'},
+        done_provenance={
+            'kind': 'merged',
+            'commit': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+        },
     )
 
     assert result['success'] is False
@@ -1928,13 +1931,15 @@ async def test_done_provenance_resolves_short_sha_and_persists(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path), done_provenance={'commit': sha[:7]},
+        '1', 'done', str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': sha[:7]},
     )
 
     assert 'error' not in result
     taskmaster.update_task.assert_called_once()
     kwargs = taskmaster.update_task.call_args.kwargs
     persisted = json.loads(kwargs['metadata'])
+    assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['commit_input'] == sha[:7]
 
@@ -1943,18 +1948,24 @@ async def test_done_provenance_resolves_short_sha_and_persists(
 async def test_done_provenance_note_only_accepted_and_persisted(
     taskmaster, reconciler, event_buffer
 ):
-    """A note-only payload is accepted without git validation and persisted."""
+    """A found_on_main note-only payload is accepted without git validation and persisted."""
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
         '1', 'done', '/project',
-        done_provenance={'note': 'covered by parent task 1745'},
+        done_provenance={
+            'kind': 'found_on_main',
+            'note': 'covered by parent task 1745',
+        },
     )
 
     assert 'error' not in result
     taskmaster.update_task.assert_called_once()
     persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    assert persisted['done_provenance'] == {'note': 'covered by parent task 1745'}
+    assert persisted['done_provenance'] == {
+        'kind': 'found_on_main',
+        'note': 'covered by parent task 1745',
+    }
 
 
 @pytest.mark.asyncio
@@ -1967,11 +1978,14 @@ async def test_done_provenance_commit_plus_note_both_persisted(
 
     result = await interceptor.set_task_status(
         '1', 'done', str(tmp_path),
-        done_provenance={'commit': sha, 'note': 'ff-merged after review'},
+        done_provenance={
+            'kind': 'merged', 'commit': sha, 'note': 'ff-merged after review',
+        },
     )
 
     assert 'error' not in result
     persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['note'] == 'ff-merged after review'
     # No commit_input when the full SHA was supplied
@@ -2025,14 +2039,224 @@ async def test_done_provenance_included_in_event_payload(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     await interceptor.set_task_status(
-        '1', 'done', str(tmp_path), done_provenance={'commit': sha},
+        '1', 'done', str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': sha},
     )
 
     project_id = resolve_project_id(str(tmp_path))
     events = await event_buffer.peek_buffered(project_id, limit=10)
     assert events, 'event should be buffered'
     payload = events[-1].payload
+    assert payload['done_provenance']['kind'] == 'merged'
     assert payload['done_provenance']['commit'] == sha
+
+
+# ── Tests for done_provenance.kind discriminator (2026-04-27 hardening) ────
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_missing_kind(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """A payload without `kind` is rejected with a helpful pointer."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path), done_provenance={'commit': sha},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'kind' in result['reason'].lower()
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_unknown_kind(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """Only `merged` and `found_on_main` are accepted as kinds."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'kind': 'cherry_picked', 'commit': sha},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'cherry_picked' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_merged_requires_commit(
+    taskmaster, reconciler, event_buffer
+):
+    """kind="merged" without a commit is rejected even with a note."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project',
+        done_provenance={'kind': 'merged', 'note': 'merged via the queue'},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'commit' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_requires_note(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind="found_on_main" without a note is rejected even with a commit."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'kind': 'found_on_main', 'commit': sha},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'note' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_merged_rejects_branch_only_sha(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind="merged" with a SHA that exists but is not on main is rejected.
+
+    This is the key backstop: the steward MUST not be able to record a
+    branch-only SHA as a merge commit. ``git merge-base --is-ancestor`` is
+    the source of truth.
+    """
+    import subprocess
+    _init_git_repo(tmp_path)
+    # Create a branch commit that is NOT on main
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'checkout', '-q', '-b', 'feature'],
+        check=True,
+    )
+    (tmp_path / 'feature.txt').write_text('feature\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', '-A'], check=True)
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'commit', '-q', '-m', 'feature commit'],
+        check=True,
+    )
+    branch_sha = subprocess.run(
+        ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    # Switch back to main so HEAD on the worktree is on main
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'], check=True,
+    )
+
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': branch_sha},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'not on main' in result['reason'] or 'not an ancestor' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_skips_ancestor_check(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind="found_on_main" with an optional commit does NOT run the ancestor backstop.
+
+    The steward justifies the call via ``note``; the commit field is purely
+    advisory ("most relevant landing commit").
+    """
+    import subprocess
+    _init_git_repo(tmp_path)
+    # Branch commit not on main — would fail the ancestor check under "merged"
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'checkout', '-q', '-b', 'feature'],
+        check=True,
+    )
+    (tmp_path / 'feature.txt').write_text('feature\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', '-A'], check=True)
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'commit', '-q', '-m', 'feature commit'],
+        check=True,
+    )
+    branch_sha = subprocess.run(
+        ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'], check=True,
+    )
+
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': branch_sha,
+            'note': 'sibling task 99 landed this on its own branch',
+        },
+    )
+
+    assert 'error' not in result, result
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance']['kind'] == 'found_on_main'
+    assert persisted['done_provenance']['commit'] == branch_sha
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_metadata_done_provenance(
+    taskmaster, reconciler, event_buffer
+):
+    """update_task must NOT be a side door for writing done_provenance.
+
+    The 2026-04-27 incident had a workflow agent stamp self-contradicting
+    provenance via update_task; the role allowlist is layer 2, this schema
+    block is layer 1.
+    """
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.update_task(
+        '1', '/project',
+        metadata=json.dumps(
+            {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+        ),
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_via_update_task'
+    taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_allows_other_metadata(
+    taskmaster, reconciler, event_buffer
+):
+    """The done_provenance block does not affect other metadata writes."""
+    taskmaster.update_task.return_value = {'success': True}
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.update_task(
+        '1', '/project',
+        metadata=json.dumps({'modules': ['orchestrator/']}),
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
 
 
 # ── Tests for background task retention (step-3) ───────────────────────────

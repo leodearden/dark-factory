@@ -2600,6 +2600,10 @@ class TaskInterceptor:
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        if err := _reject_done_provenance_in_update_metadata(
+            task_id, kwargs.get('metadata'),
+        ):
+            return err
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
@@ -2985,6 +2989,9 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
+_VALID_PROVENANCE_KINDS = ('merged', 'found_on_main')
+
+
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -2994,16 +3001,34 @@ async def _validate_done_provenance(
 ) -> tuple[dict | None, dict | None]:
     """Validate + resolve done_provenance for set_task_status(done).
 
+    Schema:
+        {
+            "kind": "merged" | "found_on_main",  # required
+            "commit": <sha-or-ref>,              # required if kind="merged"
+            "note":   <free text>,               # required if kind="found_on_main"
+        }
+
+    - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
+      is required and must resolve via ``git rev-parse``; the resolved SHA is
+      additionally checked with ``git merge-base --is-ancestor <sha> main`` so
+      a steward cannot record a SHA that is only on a feature branch.
+    - ``kind="found_on_main"``: the implementation is already on main from a
+      sibling task / prior orchestrator run. ``note`` is required (free text,
+      typically citing the landing commit or providing-task id). ``commit`` is
+      optional and is resolved (but NOT ancestor-checked) when supplied.
+
     Returns ``(error_payload, resolved_provenance)``. Error payload is a
     structured dict suitable for returning to the MCP caller; when it is
     non-None the transition must be aborted. Resolved provenance is a dict
-    with normalised ``commit`` (full 40-char SHA) and/or ``note`` keys, plus
-    the original ``commit_input`` when a short hash or ref was resolved.
+    with the validated ``kind``, normalised ``commit`` (full 40-char SHA) when
+    supplied, and ``note`` when supplied — plus the original ``commit_input``
+    when a short hash or ref was resolved.
 
     When ``require`` is False, missing/empty provenance logs a warning but
     returns ``(None, None)`` so the transition proceeds. Malformed provenance
-    (wrong type, unresolvable commit) still errors regardless of ``require``
-    — we never want to record corrupt provenance on the task.
+    (wrong type, unknown kind, unresolvable commit, branch-only SHA) always
+    errors regardless of ``require`` — we never want to record corrupt
+    provenance on the task.
     """
     if raw is None or raw == {}:
         if require:
@@ -3011,8 +3036,9 @@ async def _validate_done_provenance(
         logger.warning(
             'set_task_status(%s, done) called without done_provenance; '
             'Stage-2 reconciliation will treat this task as provenance-unknown. '
-            'Pass done_provenance={"commit": "..."} or {"note": "..."} '
-            'to record verified evidence.',
+            'Pass done_provenance={"kind": "merged", "commit": "..."} or '
+            '{"kind": "found_on_main", "note": "..."} to record verified '
+            'evidence.',
             task_id,
         )
         return None, None
@@ -3021,32 +3047,58 @@ async def _validate_done_provenance(
         return (
             _done_provenance_error(
                 task_id,
-                'done_provenance must be an object with keys "commit" and/or "note"',
+                'done_provenance must be an object with keys "kind", '
+                '"commit", and/or "note"',
             ),
             None,
         )
 
+    kind = raw.get('kind')
     commit_input = raw.get('commit')
     note = raw.get('note')
 
+    if kind is not None and not isinstance(kind, str):
+        return _done_provenance_error(task_id, 'kind must be a string'), None
     if commit_input is not None and not isinstance(commit_input, str):
         return _done_provenance_error(task_id, 'commit must be a string'), None
     if note is not None and not isinstance(note, str):
         return _done_provenance_error(task_id, 'note must be a string'), None
 
+    kind = (kind or '').strip() or None
     commit_input = (commit_input or '').strip() or None
     note = (note or '').strip() or None
 
-    if commit_input is None and note is None:
-        return (
-            _done_provenance_error(
-                task_id,
-                'done_provenance requires at least one non-empty commit or note',
-            ),
-            None,
-        )
+    if kind is None:
+        return _done_provenance_error(
+            task_id,
+            'done_provenance.kind is required (must be "merged" or '
+            '"found_on_main"). Use kind="merged" with commit=<merge-sha> '
+            'after a successful merge_request, or kind="found_on_main" with '
+            'note=<explanation> when the implementation is already on main '
+            'from a sibling task.',
+        ), None
+    if kind not in _VALID_PROVENANCE_KINDS:
+        return _done_provenance_error(
+            task_id,
+            f'done_provenance.kind must be "merged" or "found_on_main" '
+            f'(got {kind!r})',
+        ), None
 
-    resolved: dict = {}
+    if kind == 'merged' and commit_input is None:
+        return _done_provenance_error(
+            task_id,
+            'done_provenance with kind="merged" requires commit=<sha-or-ref> '
+            '(the merge commit on main). Use kind="found_on_main" instead '
+            'when no single commit applies.',
+        ), None
+    if kind == 'found_on_main' and note is None:
+        return _done_provenance_error(
+            task_id,
+            'done_provenance with kind="found_on_main" requires note=<text> '
+            'citing the impl-providing task or commit.',
+        ), None
+
+    resolved: dict = {'kind': kind}
     if commit_input is not None:
         sha_or_err = await _resolve_commit_sha(project_root, commit_input)
         if isinstance(sha_or_err, dict):
@@ -3058,10 +3110,55 @@ async def _validate_done_provenance(
         resolved['commit'] = sha_or_err
         if sha_or_err != commit_input:
             resolved['commit_input'] = commit_input
+        if kind == 'merged':
+            ancestor_err = await _verify_commit_on_main(project_root, sha_or_err)
+            if ancestor_err is not None:
+                return _done_provenance_error(
+                    task_id,
+                    f'kind="merged" but commit {sha_or_err} is not on main: '
+                    f'{ancestor_err}. If the implementation lives on a sibling '
+                    f'task that landed separately, use kind="found_on_main" '
+                    f'with a note instead.',
+                ), None
     if note is not None:
         resolved['note'] = note
 
     return None, resolved
+
+
+async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
+    """Verify ``sha`` is reachable from ``main`` via ``merge-base --is-ancestor``.
+
+    Returns None on success (commit is on main), or a reason string on failure.
+    Used as a backstop for kind="merged" provenance so that a SHA from a
+    feature branch cannot pass as a merge commit.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'merge-base', '--is-ancestor', sha, 'main',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except TimeoutError:
+            proc.kill()
+            return 'git merge-base timed out'
+    except FileNotFoundError:
+        return 'git binary not found'
+    except Exception as e:
+        return f'{type(e).__name__}: {e}'
+
+    # Exit codes from `git merge-base --is-ancestor`:
+    #   0 — sha is reachable from main
+    #   1 — sha is NOT reachable from main
+    #   other — git error (e.g. unknown ref `main`)
+    if proc.returncode == 0:
+        return None
+    if proc.returncode == 1:
+        return 'commit is not an ancestor of main'
+    msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
+    return msg
 
 
 async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
@@ -3097,6 +3194,42 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
     return sha
 
 
+def _reject_done_provenance_in_update_metadata(
+    task_id: str, metadata: object,
+) -> dict | None:
+    """Reject ``update_task`` calls that try to write ``metadata.done_provenance``.
+
+    ``set_task_status`` is the only sanctioned writer for ``done_provenance`` —
+    it validates the schema (kind/commit/note) and runs an ancestor backstop on
+    merge SHAs. ``update_task`` accepts a free-form metadata blob, so without
+    this gate any agent could stamp self-contradicting provenance and bypass
+    the role-allowlist enforcement. Defense-in-depth alongside the same check
+    in ``server/tools.py``.
+    """
+    parsed: dict | None = None
+    if isinstance(metadata, dict):
+        parsed = metadata
+    elif isinstance(metadata, str):
+        try:
+            loaded = json.loads(metadata)
+        except (ValueError, TypeError):
+            return None
+        parsed = loaded if isinstance(loaded, dict) else None
+    if parsed is None or 'done_provenance' not in parsed:
+        return None
+    return {
+        'success': False,
+        'error': 'done_provenance_via_update_task',
+        'task_id': task_id,
+        'hint': (
+            'update_task cannot write metadata.done_provenance. Use '
+            'set_task_status(status="done", done_provenance={...}) instead — '
+            'it validates the kind/commit/note schema and runs an ancestor '
+            'backstop on the merge sha.'
+        ),
+    }
+
+
 def _done_provenance_missing_error(task_id: str) -> dict:
     return {
         'success': False,
@@ -3105,10 +3238,10 @@ def _done_provenance_missing_error(task_id: str) -> dict:
         'hint': (
             'Cannot mark task done: done_provenance is required when '
             'reconciliation.require_done_provenance is enabled. Pass '
-            'done_provenance={"commit": "<sha-or-ref>"} with the merge '
-            'commit that landed the implementation, or '
-            'done_provenance={"note": "<explanation>"} when no commit applies '
-            '(fast-forward merge, covered by sibling task, interactive session).'
+            'done_provenance={"kind": "merged", "commit": "<merge-sha>"} when '
+            'the merge_request landed a commit on main, or '
+            'done_provenance={"kind": "found_on_main", "note": "<text>"} when '
+            'the implementation is already on main from a sibling task.'
         ),
     }
 
