@@ -207,6 +207,8 @@ class TaskKnowledgeSync(BaseStage):
             run_stage='stage2',
         )
 
+        known_projects_section = self._format_known_projects_section()
+
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
@@ -215,7 +217,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Stage 1 Flagged Items (Task-Relevant)
 {flagged_text}
-
+{known_projects_section}
 {format_filtered_task_tree(filtered)}
 
 ### Recently Completed Tasks
@@ -239,8 +241,37 @@ that may now be met, and done tasks for missing knowledge capture.
 8. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE2_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
-Use project_root="{self.project_root}" for all task operations.
+Use project_root="{self.project_root}" for tasks scoped to this project.
+For cross-project routing see "Known Projects" above.
 """
+
+    def _format_known_projects_section(self) -> str:
+        """Render the cross-project routing context for the Stage 2 LLM.
+
+        Emits a ``### Known Projects`` markdown section listing every
+        configured project_id and its project_root, marking the current
+        one.  Returns the empty string when fewer than two projects are
+        known — there is no "cross-project" dimension to surface in that
+        case, and the section would only add noise.
+        """
+        known = self.known_projects
+        if len(known) < 2:
+            return ''
+        # Stable ordering: current project first, then alphabetical.
+        ordered = [(self.project_id, known[self.project_id])] if self.project_id in known else []
+        for pid in sorted(p for p in known if p != self.project_id):
+            ordered.append((pid, known[pid]))
+        # Pad the project_id column to a consistent width for readability.
+        width = max(len(pid) for pid, _ in ordered)
+        lines = []
+        for pid, root in ordered:
+            marker = '  (current)' if pid == self.project_id else ''
+            lines.append(f'- {pid:<{width}}  → {root}{marker}')
+        return (
+            '\n### Known Projects (for cross-project routing)\n'
+            + '\n'.join(lines)
+            + '\n'
+        )
 
     @staticmethod
     def _warn_if_count_tasks_mismatch(

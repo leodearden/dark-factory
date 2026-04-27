@@ -32,6 +32,13 @@ from fused_memory.middleware.dark_factory_path_guard import (
     check_candidate_for_dark_factory_paths,
     check_text_for_dark_factory_paths,
 )
+from fused_memory.middleware.path_scope_guard import (
+    PathGuardVerdict,
+    check_candidate_for_scope,
+    check_text_for_scope,
+)
+from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -107,6 +114,8 @@ class TaskInterceptor:
         usage_gate: 'UsageGate | None' = None,
         ticket_store: 'TicketStore | None' = None,
         bulk_reset_guard: 'BulkResetGuard | None' = None,
+        prefix_registry: ProjectPrefixRegistry | None = None,
+        scope_violation_escalator: ScopeViolationEscalator | None = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -197,6 +206,12 @@ class TaskInterceptor:
         # so multiple concurrent waiters (e.g. reconnect/retry patterns) each
         # get their own event.  _signal_ticket_event sets and removes all of them.
         self._ticket_events: dict[str, list[asyncio.Event]] = {}
+        # Multi-project routing (optional, back-compat: None falls back to the
+        # dark-factory-only path guard with no escalation).  When both are set,
+        # _path_guard_or_skip uses the generalised guard against the registry
+        # and fires a scope_violation escalation alongside any rejection.
+        self._prefix_registry = prefix_registry
+        self._scope_violation_escalator = scope_violation_escalator
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -933,72 +948,140 @@ class TaskInterceptor:
             spawn_context=str(meta.get('spawn_context') or 'manual'),
         )
 
-    def _path_guard_error(
+    def _path_guard_check(
         self,
-        candidate,
+        candidate: CandidateTask | None,
         kwargs: dict,
         project_id: str,
-    ) -> dict | None:
-        """Run the dark-factory path-scope guard and return an error dict on rejection.
+    ) -> PathGuardVerdict:
+        """Run the path-scope guard and return its verdict.
 
-        If *candidate* is not None (title-bearing submission), delegates to
-        :func:`check_candidate_for_dark_factory_paths` which scans title,
-        description, details, and files_to_modify.
+        Uses the generalised multi-project guard against
+        :attr:`_prefix_registry` when one is configured; otherwise falls
+        back to the dark-factory-only guard for back-compat with
+        deployments that haven't yet supplied a registry.
 
-        Otherwise (prompt-only submission where ``_build_candidate`` returned
-        ``None``), concatenates ``prompt``, ``title``, ``description``, and
-        ``details`` from *kwargs* and delegates to
-        :func:`check_text_for_dark_factory_paths`.  All four free-form text
-        fields are included so that a path hidden in any of them cannot bypass
-        the guard.  The prompt-only fallback also scans
-        ``metadata['files_to_modify']`` and ``metadata['modules']`` (via
-        :meth:`_extract_meta_files`) for parity with the title-bearing branch
-        — closing the same residual-leak class that task 1094 fixed in the
-        title-bearing path.
-
-        Returns the structured error dict on rejection, or ``None`` when the
-        submission is allowed.  Call-sites pattern:
-        ``if err := self._path_guard_error(candidate, kwargs, project_id): return err``
+        Title-bearing submissions go through ``check_candidate_for_*``;
+        prompt-only submissions concatenate ``prompt + title + description
+        + details`` from *kwargs* (plus any metadata-supplied
+        ``files_to_modify`` / ``modules``) and use ``check_text_for_*``.
+        All four free-form fields and the metadata files are scanned so a
+        path hidden in any of them cannot bypass the guard (parity with
+        the title-bearing branch — closes the residual-leak class that
+        task 1094 fixed).
         """
-        if candidate is not None:
-            v = check_candidate_for_dark_factory_paths(candidate, project_id)
-        else:
+        registry = self._prefix_registry
+        if registry is not None and registry:
+            if candidate is not None:
+                return check_candidate_for_scope(candidate, project_id, registry)
             text = '\n'.join(
                 str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
             )
             meta_files = self._extract_meta_files(kwargs)
             if meta_files:
                 text = text + '\n' + '\n'.join(meta_files)
-            v = check_text_for_dark_factory_paths(text, project_id)
+            return check_text_for_scope(text, project_id, registry)
+        # Back-compat: no multi-project registry → original dark-factory-only guard.
+        if candidate is not None:
+            return check_candidate_for_dark_factory_paths(candidate, project_id)
+        text = '\n'.join(
+            str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
+        )
+        meta_files = self._extract_meta_files(kwargs)
+        if meta_files:
+            text = text + '\n' + '\n'.join(meta_files)
+        return check_text_for_dark_factory_paths(text, project_id)
+
+    def _path_guard_error(
+        self,
+        candidate: CandidateTask | None,
+        kwargs: dict,
+        project_id: str,
+    ) -> dict | None:
+        """Back-compat helper: run :meth:`_path_guard_check` and return its error dict.
+
+        Retained for any external callers / subclass overrides that still
+        invoke this method directly.  Production call sites should prefer
+        :meth:`_path_guard_or_skip`, which also fires the scope-violation
+        escalation on rejection.
+        """
+        v = self._path_guard_check(candidate, kwargs, project_id)
         return v.to_error_dict() if v.is_rejection else None
 
     def _path_guard_or_skip(
         self,
         kwargs: dict[str, Any],
+        project_root: str,
         project_id: str,
         candidate: CandidateTask | None = None,
     ) -> dict | None:
-        """Run the path-scope guard with the dark_factory short-circuit applied.
+        """Run the path-scope guard, escalate on rejection, return error dict.
 
-        Returns the structured error dict on rejection, or ``None`` when the
-        submission is allowed (or the project is dark_factory, in which case
-        the guard is a no-op and the build is skipped on the hot path).
+        Returns the structured error dict on rejection, or ``None`` when
+        the submission is allowed.
+
+        Two modes, selected by whether :attr:`_prefix_registry` is configured:
+
+        * Multi-project (registry configured) — runs the generalised guard
+          for every project, including dark_factory.  No project_id
+          short-circuit; another project's prefixes landing in dark_factory
+          are caught here too.
+        * Back-compat (no registry) — preserves the original dark-factory
+          short-circuit so deployments that haven't supplied a registry
+          behave exactly as task 1088 left them.
+
+        On rejection, fires a ``scope_violation`` escalation via
+        :attr:`_scope_violation_escalator` (when configured) so the
+        operator queue surfaces the misroute even if the calling agent
+        never reports it.  Escalation is purely additive — a queue write
+        failure is logged and swallowed, the rejection error dict is still
+        returned.
 
         The optional *candidate* parameter lets callers pass an already-built
-        :class:`CandidateTask` (as ``add_subtask`` does, since the candidate is
-        consumed downstream by ``_add_subtask_locked``). When ``candidate`` is
-        None and the project is non-dark_factory, the helper lazy-builds via
-        ``_build_candidate`` — preserving ``submit_task``'s hot-path optimisation
-        that skips the build entirely for dark_factory.
+        :class:`CandidateTask` (as ``add_subtask`` does); when ``None`` and
+        the guard needs to scan a candidate, this helper lazy-builds via
+        ``_build_candidate`` so ``submit_task``'s hot-path optimisation
+        that skips the build entirely for dark_factory still applies in
+        back-compat mode.
 
         Call-site pattern:
-            ``if err := self._path_guard_or_skip(kwargs, project_id): return err``
+            ``if err := self._path_guard_or_skip(kwargs, project_root, project_id): return err``
         """
-        if project_id == DARK_FACTORY_PROJECT_ID:
+        registry = self._prefix_registry
+        # Back-compat fast path: no registry + dark_factory → guard is a no-op.
+        if (registry is None or not registry) and project_id == DARK_FACTORY_PROJECT_ID:
             return None
         if candidate is None:
             candidate = self._build_candidate(kwargs)
-        return self._path_guard_error(candidate, kwargs, project_id)
+        verdict = self._path_guard_check(candidate, kwargs, project_id)
+        if not verdict.is_rejection:
+            return None
+        # Fire the scope_violation escalation alongside the rejection.
+        if self._scope_violation_escalator is not None:
+            suggested_root: str | None = None
+            if verdict.suggested_project and registry is not None:
+                suggested_root = registry.root_for_project(verdict.suggested_project)
+            candidate_title = (candidate.title if candidate else '') or str(
+                kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
+            )[:200]
+            try:
+                self._scope_violation_escalator.report_rejection(
+                    project_root=project_root,
+                    project_id=project_id,
+                    candidate_title=candidate_title,
+                    matched_paths=verdict.matched_paths,
+                    suggested_project=verdict.suggested_project,
+                    suggested_root=suggested_root,
+                )
+            except Exception:  # pragma: no cover — defensive only
+                # Escalator is built to never raise (queue failures are
+                # logged), but if a future change regresses we must not
+                # turn a rejection into an exception.
+                logger.exception(
+                    'task_interceptor: scope_violation_escalator raised; '
+                    'continuing with rejection error',
+                )
+        return verdict.to_error_dict()
 
     async def _execute_combine(
         self,
@@ -1522,11 +1605,13 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
 
         # Path-scope guard: reject before persisting if the candidate references
-        # dark-factory module paths but is being filed into a different project.
-        # _path_guard_or_skip handles the dark_factory short-circuit (which skips
-        # _build_candidate entirely for the hot path) and runs the guard otherwise.
+        # paths owned by another project.  When a multi-project registry is
+        # configured the guard runs for every project (including dark_factory);
+        # otherwise it falls back to the dark-factory-only short-circuit so
+        # _build_candidate is skipped on the hot path.  Rejections also fire a
+        # scope_violation escalation when the escalator is configured.
         # Must run before kwargs.pop('metadata') below so the helper can read metadata.
-        if err := self._path_guard_or_skip(kwargs, project_id):
+        if err := self._path_guard_or_skip(kwargs, project_root, project_id):
             return err
 
         # Serialise the full call payload so the worker can reconstruct it.
@@ -2585,7 +2670,7 @@ class TaskInterceptor:
         # Path-scope guard: reject before acquiring the curator lock so a
         # mis-filed task never touches the lock, ticket store, or curator.
         # Pass the pre-built candidate so _path_guard_or_skip doesn't double-build.
-        if err := self._path_guard_or_skip(kwargs, project_id, candidate):
+        if err := self._path_guard_or_skip(kwargs, project_root, project_id, candidate):
             return err
         # curator_lock across curator.curate + note_created/record_task;
         # write_lock acquired internally for the brief tm.add_subtask call.

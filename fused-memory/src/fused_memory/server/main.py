@@ -297,8 +297,47 @@ async def run_server():
     # Single curator escalator shared by both TaskInterceptor construction
     # paths — lazy per-project queue handles live inside it.
     from fused_memory.middleware.curator_escalator import CuratorEscalator
+    from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+    from fused_memory.middleware.scope_violation_escalator import (
+        ScopeViolationEscalator,
+    )
+    from fused_memory.models.scope import (
+        build_known_projects_map,
+        known_project_roots_from_env,
+    )
 
     curator_escalator = CuratorEscalator()
+
+    # Multi-project path-scope guard: built from the configured project +
+    # DASHBOARD_KNOWN_PROJECT_ROOTS env var so the same registry covers
+    # every project the dashboard already knows about.  Empty registry
+    # (no extra roots) leaves the TaskInterceptor in back-compat mode
+    # where the dark-factory-only guard runs.
+    _primary_root = (
+        config.taskmaster.project_root if config.taskmaster else ''
+    ) or ''
+    if _primary_root:
+        _primary_root = str(Path(_primary_root).expanduser().resolve())
+    _extra_roots = known_project_roots_from_env()
+    _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
+    if len(_known_projects_map) > 1:
+        prefix_registry: ProjectPrefixRegistry | None = (
+            ProjectPrefixRegistry.from_roots(list(_known_projects_map.values()))
+        )
+        scope_violation_escalator: ScopeViolationEscalator | None = (
+            ScopeViolationEscalator()
+        )
+        logger.info(
+            '  Path-scope guard: multi-project mode (%d projects)',
+            len(_known_projects_map),
+        )
+    else:
+        prefix_registry = None
+        scope_violation_escalator = None
+        logger.info(
+            '  Path-scope guard: dark-factory-only back-compat mode '
+            '(set DASHBOARD_KNOWN_PROJECT_ROOTS to enable multi-project)',
+        )
 
     # Curator UsageGate — independent instance reading the same shared
     # accounts file the orchestrator / eval runner use. Protects the curator
@@ -446,6 +485,8 @@ async def run_server():
             usage_gate=curator_usage_gate,
             ticket_store=ticket_store,
             bulk_reset_guard=bulk_reset_guard,
+            prefix_registry=prefix_registry,
+            scope_violation_escalator=scope_violation_escalator,
         )
         await task_interceptor.start()
 
@@ -475,6 +516,8 @@ async def run_server():
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
             ticket_store=ticket_store,
+            prefix_registry=prefix_registry,
+            scope_violation_escalator=scope_violation_escalator,
         )
         await task_interceptor.start()
 

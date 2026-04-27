@@ -51,6 +51,22 @@ Note: update Mem0 procedure AFTER task completes, not now.
 - Task marked done, no knowledge captured → Search memory stores for evidence, then write findings.
 - AI-generated task content contradicts knowledge graph → Knowledge graph wins. Flag/modify task.
 
+## Cross-Project Routing
+Each reconciliation cycle is bound to one project. However, a finding may identify work \
+whose scope belongs to a different project (e.g. the underlying bug lives in another repo). \
+When this happens:
+- If the target project appears in the payload's "Known Projects" section, pass that \
+project's project_root to `mcp__fused-memory__submit_task` and its project_id to any \
+memory writes. The path-scope guard validates the routing and rejects tasks that cite paths \
+owned by another project with a structured `DarkFactoryPathScopeViolation` error — its \
+`suggested_project` field tells you where to resubmit.
+- If no project_root in "Known Projects" matches the scope, do NOT file the task in the \
+current project as a workaround. Instead, add a `cross_project_findings` entry to your \
+structured report so the operator can route it manually. Each entry should carry a one-line \
+`summary`, a `target_project_hint` (best-guess project name), and short `evidence` notes.
+- Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
+— follow the Authority Model rules for that.
+
 ## Guidelines
 - Review Stage 1's flagged items first — they identify task-relevant findings.
 - Always review the **Proactive Task Sample** section: check in-progress tasks for completion \

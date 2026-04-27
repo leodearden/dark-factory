@@ -247,11 +247,22 @@ class TestPathGuardVerdict:
         assert 'reify' in error_msg
 
     def test_rejection_error_message_mentions_dark_factory(self):
-        """The error message should tell the caller to file under dark_factory."""
+        """The error message should tell the caller to file under dark_factory.
+
+        Updated 2026-04-27: PathGuardVerdict was generalised to multi-project
+        routing in the cross-project-routing change.  The "Resubmit to X"
+        sentence is now driven by the verdict's suggested_project field, so
+        constructing a verdict that *intends* to suggest dark_factory must
+        pass it explicitly.  The shim's check_candidate_for_dark_factory_paths
+        always sets suggested_project='dark_factory' (since the back-compat
+        single-project registry only knows that one project), so this is
+        accurate for the production code path.
+        """
         v = self.Verdict(
             outcome='rejection',
             project_id='reify',
             matched_paths=('orchestrator/',),
+            suggested_project='dark_factory',
         )
         error_msg = v.to_error_dict()['error']
         assert 'dark_factory' in error_msg
