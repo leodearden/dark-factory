@@ -498,3 +498,242 @@ async def test_get_statuses_interceptor_exception_returns_error_type(
     assert 'error' in result
     assert 'backend failure' in result['error']
     assert result['error_type'] == 'RuntimeError'
+
+
+# ------------------------------------------------------------------
+# planning_mode + resolve_ticket idempotency + commit_planning
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_task_forwards_planning_mode_flag(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task MCP tool forwards planning_mode=True to the interceptor."""
+    from unittest.mock import AsyncMock
+    task_interceptor.submit_task = AsyncMock(
+        return_value={'task_id': '7', 'status': 'deferred', 'planning_mode': True},
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {'project_root': '/project', 'title': 'X', 'planning_mode': True},
+    )
+    assert result == {'task_id': '7', 'status': 'deferred', 'planning_mode': True}
+    kwargs = task_interceptor.submit_task.call_args.kwargs
+    assert kwargs.get('planning_mode') is True
+
+
+@pytest.mark.asyncio
+async def test_submit_task_planning_mode_default_false(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task defaults planning_mode=False when omitted."""
+    from unittest.mock import AsyncMock
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task', {'project_root': '/project', 'title': 'X'},
+    )
+    kwargs = task_interceptor.submit_task.call_args.kwargs
+    assert kwargs.get('planning_mode') is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_idempotent_passthrough_for_numeric_id(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A numeric task id passed to resolve_ticket short-circuits to created/idempotent."""
+    from unittest.mock import AsyncMock
+    task_interceptor.resolve_ticket = AsyncMock()  # Should not be called.
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'resolve_ticket', {'ticket': '42', 'project_root': '/project'},
+    )
+    assert result == {
+        'status': 'created',
+        'task_id': '42',
+        'reason': 'idempotent_passthrough',
+    }
+    task_interceptor.resolve_ticket.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_idempotent_passthrough_strips_whitespace(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Numeric ids with surrounding whitespace are accepted and stripped.
+
+    The MCP wire schema enforces ``ticket: str``, so int passthrough is
+    only meaningful at the interceptor layer; it's covered by the
+    ``_looks_like_task_id`` unit tests in test_task_interceptor.py.
+    """
+    from unittest.mock import AsyncMock
+    task_interceptor.resolve_ticket = AsyncMock()
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'resolve_ticket', {'ticket': '  42  ', 'project_root': '/project'},
+    )
+    assert result == {
+        'status': 'created',
+        'task_id': '42',
+        'reason': 'idempotent_passthrough',
+    }
+    task_interceptor.resolve_ticket.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_rejects_non_ticket_non_numeric(
+    mcp_server_with_tasks,
+):
+    """resolve_ticket still rejects strings that are neither tickets nor numeric ids."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'resolve_ticket', {'ticket': 'not-a-ticket', 'project_root': '/project'},
+    )
+    assert result['error_type'] == 'ValidationError'
+    assert 'tkt_' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_real_ticket_still_resolves(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """tkt_-prefixed tickets still flow to the interceptor's resolve_ticket."""
+    from unittest.mock import AsyncMock
+    task_interceptor.resolve_ticket = AsyncMock(
+        return_value={'status': 'created', 'task_id': '99'},
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'resolve_ticket',
+        {'ticket': 'tkt_abc', 'project_root': '/project'},
+    )
+    assert result == {'status': 'created', 'task_id': '99'}
+    task_interceptor.resolve_ticket.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_forwards_to_set_task_status(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """commit_planning bulk-flips ids via set_task_status with the target_status."""
+    from unittest.mock import AsyncMock
+    task_interceptor.set_task_status = AsyncMock(
+        return_value={'success': True, 'results': []},
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '42,43,44'},
+    )
+    assert result == {'success': True, 'results': []}
+    kwargs = task_interceptor.set_task_status.call_args.kwargs
+    assert kwargs['task_id'] == '42,43,44'
+    assert kwargs['status'] == 'pending'
+    assert kwargs['project_root'] == '/project'
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_target_status_defaults_to_pending(
+    mcp_server_with_tasks, task_interceptor,
+):
+    from unittest.mock import AsyncMock
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '7'},
+    )
+    assert task_interceptor.set_task_status.call_args.kwargs['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_accepts_alternate_targets(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """deferred and cancelled are valid commit targets (commit / abort / discard)."""
+    from unittest.mock import AsyncMock
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    for target in ('deferred', 'cancelled'):
+        await mcp_server_with_tasks._tool_manager.call_tool(
+            'commit_planning',
+            {'project_root': '/project', 'task_ids': '7', 'target_status': target},
+        )
+    statuses = [c.kwargs['status'] for c in task_interceptor.set_task_status.call_args_list]
+    assert statuses == ['deferred', 'cancelled']
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_invalid_target_status(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Statuses other than pending/deferred/cancelled are rejected at the MCP layer."""
+    from unittest.mock import AsyncMock
+    task_interceptor.set_task_status = AsyncMock()
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '7', 'target_status': 'in-progress'},
+    )
+    assert result['error_type'] == 'ValidationError'
+    assert 'in-progress' in result['error']
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_empty_task_ids(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Empty / whitespace task_ids string is rejected."""
+    from unittest.mock import AsyncMock
+    task_interceptor.set_task_status = AsyncMock()
+    for ids in ('', '   ', ',,,'):
+        result = await mcp_server_with_tasks._tool_manager.call_tool(
+            'commit_planning',
+            {'project_root': '/project', 'task_ids': ids},
+        )
+        assert result['error_type'] == 'ValidationError'
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_rejects_ticket_id_in_batch(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """commit_planning rejects ticket UUIDs — only resolved task ids are valid."""
+    from unittest.mock import AsyncMock
+    task_interceptor.set_task_status = AsyncMock()
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '42,tkt_abc,44'},
+    )
+    assert result['error_type'] == 'ValidationError'
+    assert 'tkt_abc' in result['error']
+    task_interceptor.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_relative_path_returns_validation_error(
+    mcp_server_with_tasks,
+):
+    """Relative project_root rejected with the standard ValidationError shape."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': 'relative/path', 'task_ids': '7'},
+    )
+    assert result['error_type'] == 'ValidationError'
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_interceptor_exception_returns_error_type(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Exceptions from set_task_status surface as {'error', 'error_type'}."""
+    from unittest.mock import AsyncMock
+    task_interceptor.set_task_status = AsyncMock(
+        side_effect=RuntimeError('backend down'),
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '7'},
+    )
+    assert result['error_type'] == 'RuntimeError'
+    assert 'backend down' in result['error']
+
+
+def test_commit_planning_registered(mcp_server_with_tasks):
+    """commit_planning shows up in the MCP server's tool list."""
+    tool_names = [t.name for t in mcp_server_with_tasks._tool_manager.list_tools()]
+    assert 'commit_planning' in tool_names

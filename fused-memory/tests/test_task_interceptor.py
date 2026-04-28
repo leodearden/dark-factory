@@ -5459,3 +5459,314 @@ class TestMultiProjectRoutingWiring:
         )
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# planning_mode: synchronous, curator-bypassing submit_task path
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_returns_task_id_synchronously(
+    interceptor_facade, taskmaster,
+):
+    """planning_mode=True returns task_id directly with status=deferred — no ticket."""
+    result = await interceptor_facade.submit_task(
+        '/project', title='Decomposed task', planning_mode=True,
+    )
+    assert result == {
+        'task_id': '2',
+        'status': 'deferred',
+        'planning_mode': True,
+    }
+    taskmaster.add_task.assert_called_once()
+    taskmaster.set_task_status.assert_called_once_with(
+        '2', 'deferred', '/project', None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_persists_human_decomposed_metadata(
+    interceptor_facade, taskmaster,
+):
+    """planning_mode injects human_decomposed=True into the metadata sent to tm.add_task."""
+    await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True,
+    )
+    metadata_arg = taskmaster.add_task.call_args.kwargs.get('metadata')
+    assert metadata_arg is not None
+    assert json.loads(metadata_arg) == {'human_decomposed': True}
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_merges_caller_metadata(
+    interceptor_facade, taskmaster,
+):
+    """Caller-supplied metadata is preserved alongside human_decomposed=True."""
+    await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True,
+        metadata={'source': 'planning-session', 'modules': ['m1', 'm2']},
+    )
+    decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded == {
+        'source': 'planning-session',
+        'modules': ['m1', 'm2'],
+        'human_decomposed': True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_accepts_metadata_json_string(
+    interceptor_facade, taskmaster,
+):
+    """JSON-string metadata is decoded, merged, and re-encoded."""
+    await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True,
+        metadata='{"escalation_id": "esc-1"}',
+    )
+    decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True}
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_rejects_invalid_metadata_string(
+    interceptor_facade,
+):
+    """Non-JSON metadata string returns a structured ValidationError."""
+    result = await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True, metadata='{not json',
+    )
+    assert result.get('error_type') == 'ValidationError'
+    assert 'JSON-decode' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_rejects_non_object_metadata(
+    interceptor_facade,
+):
+    """JSON metadata that decodes to a non-dict is rejected."""
+    result = await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True, metadata='[1,2,3]',
+    )
+    assert result.get('error_type') == 'ValidationError'
+    assert 'object' in result['error']
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_emits_task_created_event(
+    interceptor_facade, event_buffer,
+):
+    """planning_mode emits a task_created event into the buffer."""
+    await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True,
+    )
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_skips_curator_worker(
+    interceptor_facade, monkeypatch,
+):
+    """planning_mode never triggers the per-project curator worker."""
+    started: list[str] = []
+    original = TaskInterceptor._start_worker_if_needed
+
+    def spy(self, project_id):
+        started.append(project_id)
+        return original(self, project_id)
+
+    monkeypatch.setattr(TaskInterceptor, '_start_worker_if_needed', spy)
+
+    await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True,
+    )
+    assert started == [], (
+        f'planning_mode must not start the curator worker; got starts for {started}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_default_false_preserves_two_phase(
+    interceptor_facade,
+):
+    """planning_mode defaults to False; submit_task still returns a ticket."""
+    result = await interceptor_facade.submit_task('/project', title='X')
+    assert 'ticket' in result, f'expected ticket-shape result, got {result!r}'
+    assert 'task_id' not in result
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_deferred_flip_failure_returns_warning(
+    interceptor_facade, taskmaster,
+):
+    """If tm.set_task_status fails after tm.add_task succeeded, return task_id + warning.
+
+    The task exists in pending — losing the response would strand it. The
+    planner can retry the deferred-flip via set_task_status using the
+    returned task_id.
+    """
+    taskmaster.set_task_status.side_effect = RuntimeError('Taskmaster process died')
+    result = await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True,
+    )
+    assert result['task_id'] == '2'
+    assert result['status'] == 'pending'
+    assert result['planning_mode'] is True
+    assert 'warning' in result
+    assert 'Taskmaster process died' in result['warning']
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_add_task_failure_returns_error(
+    interceptor_facade, taskmaster,
+):
+    """If tm.add_task itself fails, planning_mode returns a structured error dict."""
+    taskmaster.add_task.side_effect = RuntimeError('add_task wire failure')
+    result = await interceptor_facade.submit_task(
+        '/project', title='X', planning_mode=True,
+    )
+    assert result.get('error_type') == 'RuntimeError'
+    assert 'add_task wire failure' in result['error']
+    taskmaster.set_task_status.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _looks_like_task_id helper
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_looks_like_task_id_accepts_numeric_strings():
+    from fused_memory.middleware.task_interceptor import _looks_like_task_id
+    assert _looks_like_task_id('42')
+    assert _looks_like_task_id('  42  ')
+    assert _looks_like_task_id('0')
+
+
+def test_looks_like_task_id_accepts_int():
+    from fused_memory.middleware.task_interceptor import _looks_like_task_id
+    assert _looks_like_task_id(42)
+    assert _looks_like_task_id(0)
+
+
+def test_looks_like_task_id_rejects_bool():
+    from fused_memory.middleware.task_interceptor import _looks_like_task_id
+    assert not _looks_like_task_id(True)
+    assert not _looks_like_task_id(False)
+
+
+def test_looks_like_task_id_rejects_negative_and_non_numeric():
+    from fused_memory.middleware.task_interceptor import _looks_like_task_id
+    assert not _looks_like_task_id(-1)
+    assert not _looks_like_task_id('-1')
+    assert not _looks_like_task_id('abc')
+    assert not _looks_like_task_id('')
+    assert not _looks_like_task_id('   ')
+    assert not _looks_like_task_id(None)
+    assert not _looks_like_task_id('tkt_abc')
+    assert not _looks_like_task_id('1.5')
+
+
+# ─────────────────────────────────────────────────────────────────────
+# planning_mode end-to-end: decompose batch → set deps → commit
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
+    """Full planner flow: submit 5 tasks in planning_mode, then commit-flip them.
+
+    Exercises: synchronous returns, no curator interaction, deferred status
+    while batch is in flight, set_task_status CSV-bulk path on commit.  Uses
+    a real TicketStore + EventBuffer so the journaling and ticket-persistence
+    code paths run; mock Taskmaster tracks state in-memory.
+    """
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    # Stateful mock: tracks status per task id.
+    statuses: dict[str, str] = {}
+    next_id = [100]
+
+    async def fake_add_task(**kwargs):
+        tid = str(next_id[0])
+        next_id[0] += 1
+        statuses[tid] = 'pending'
+        return {'id': tid, 'title': kwargs.get('title') or 'untitled'}
+
+    async def fake_set_status(task_id, status, project_root, tag=None):
+        statuses[task_id] = status
+        return {'success': True, 'task_id': task_id, 'status': status}
+
+    async def fake_get_task(task_id, project_root, tag=None):
+        return {'id': task_id, 'status': statuses.get(task_id, 'pending'), 'title': 't'}
+
+    tm = AsyncMock()
+    tm.add_task = AsyncMock(side_effect=fake_add_task)
+    tm.set_task_status = AsyncMock(side_effect=fake_set_status)
+    tm.get_task = AsyncMock(side_effect=fake_get_task)
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.update_task = AsyncMock(return_value={'success': True})
+
+    buf = EventBuffer(db_path=tmp_path / 'e2e_eb.db', buffer_size_threshold=100)
+    await buf.initialize()
+    store = TicketStore(tmp_path / 'e2e_tickets.db')
+    await store.initialize()
+
+    # Spy on store.submit so we can assert it was never called.
+    submit_calls: list[dict] = []
+    original_submit = store.submit
+
+    async def submit_spy(**kwargs):
+        submit_calls.append(kwargs)
+        return await original_submit(**kwargs)
+
+    store.submit = submit_spy  # type: ignore[method-assign]
+
+    interceptor = TaskInterceptor(tm, None, buf, ticket_store=store)
+    try:
+        # Submit 5 sibling tasks in planning_mode.
+        task_ids: list[str] = []
+        for i in range(5):
+            result = await interceptor.submit_task(
+                '/project', title=f'sibling-{i}', planning_mode=True,
+            )
+            assert result['planning_mode'] is True, result
+            assert result['status'] == 'deferred', result
+            task_ids.append(result['task_id'])
+
+        # All 5 are deferred — none picked up by anyone yet.
+        assert all(statuses[tid] == 'deferred' for tid in task_ids), statuses
+
+        # Each created task carries human_decomposed=True in its metadata.
+        for call in tm.add_task.call_args_list:
+            metadata_arg = call.kwargs.get('metadata')
+            assert metadata_arg is not None
+            assert json.loads(metadata_arg).get('human_decomposed') is True
+
+        # Commit the batch: deferred → pending via the CSV bulk path.
+        commit_result = await interceptor.set_task_status(
+            ','.join(task_ids), 'pending', '/project',
+        )
+        assert commit_result['success'] is True
+        # All 5 results report no error.
+        per_results = commit_result['results']
+        assert len(per_results) == 5
+        for r in per_results:
+            assert r['result'].get('error') is None, r
+
+        # Final state: every task pending, ready for the scheduler.
+        assert all(statuses[tid] == 'pending' for tid in task_ids), statuses
+
+        # No tickets were persisted in planning mode — the store's submit()
+        # was never called (verified by tracking the call count via wrapper).
+        assert submit_calls == [], (
+            f'planning_mode must not persist tickets; got: {submit_calls}'
+        )
+    finally:
+        await store.close()
+        for t in list(interceptor._worker_tasks.values()):
+            if not t.done():
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+        await buf.close()

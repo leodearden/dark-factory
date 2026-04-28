@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from fused_memory.middleware.task_interceptor import _is_ticket_id
+from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.services.memory_service import MemoryService
@@ -1543,6 +1543,7 @@ def create_mcp_server(
         priority: str | None = None,
         metadata: str | dict[str, Any] | None = None,
         tag: str | None = None,
+        planning_mode: bool = False,
     ) -> dict[str, Any]:
         """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
 
@@ -1552,6 +1553,18 @@ def create_mcp_server(
 
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
+
+        ``planning_mode=True`` switches to a synchronous, curator-bypassing
+        path for batched human decomposition (e.g., breaking a PRD into ~50
+        tasks).  In planning mode the task is created directly and immediately
+        flipped to ``deferred`` status so the orchestrator scheduler cannot
+        claim it before the planner has wired up sibling dependencies.  The
+        planner commits the batch by calling ``commit_planning`` once all
+        siblings and dependencies are in place.
+
+        Planning mode returns ``{"task_id": "<id>", "status": "deferred",
+        "planning_mode": True}`` synchronously — no ticket, no
+        ``resolve_ticket`` follow-up needed.
 
         Args:
             project_root: Absolute path to project root
@@ -1563,6 +1576,11 @@ def create_mcp_server(
             priority: critical, high, medium, low, or polish (default medium)
             metadata: Task metadata (object or JSON string)
             tag: Tag context (optional)
+            planning_mode: When True, bypass the curator and create the task
+                directly in ``deferred`` status.  Use this during heavy
+                decomposition sessions where you do not want curator
+                deduplication to recombine sibling tasks.  Persists
+                ``human_decomposed=True`` in task metadata.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -1579,6 +1597,7 @@ def create_mcp_server(
                 priority=priority,
                 metadata=metadata,
                 tag=tag,
+                planning_mode=planning_mode,
             )
         except Exception as e:
             logger.error(f'submit_task error: {e}')
@@ -1613,6 +1632,18 @@ def create_mcp_server(
                 parameter cannot hang indefinitely on an orphaned ticket.
         """
         if not _is_ticket_id(ticket):
+            # Idempotent passthrough: if the caller passed a numeric task id,
+            # short-circuit instead of erroring.  This catches agents that
+            # blindly use the two-step submit/resolve dance after a
+            # ``planning_mode=True`` submit_task that already returned a
+            # synchronous ``task_id``.  No store lookup is performed — the
+            # contract is that any numeric id is treated as already-resolved.
+            if _looks_like_task_id(ticket):
+                return {
+                    'status': 'created',
+                    'task_id': str(ticket).strip(),
+                    'reason': 'idempotent_passthrough',
+                }
             return {
                 'error': f'ticket must start with tkt_ (got {ticket!r})',
                 'error_type': 'ValidationError',
@@ -1632,6 +1663,85 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'resolve_ticket error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def commit_planning(
+        project_root: str,
+        task_ids: str,
+        target_status: str = 'pending',
+    ) -> dict[str, Any]:
+        """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
+
+        Flips a comma-separated batch of task ids from ``deferred`` to the
+        target status (default ``pending``) atomically within the per-project
+        write lock, so the orchestrator scheduler sees the batch as a coherent
+        unit on its next ~15 s poll rather than picking up siblings one at a
+        time as planning proceeds.
+
+        Use this paired with ``submit_task(planning_mode=True)`` to safely
+        decompose a large PRD into many tasks plus dependencies before the
+        orchestrator can claim any of them.
+
+        Args:
+            project_root: Absolute path to project root (matches submit_task).
+            task_ids: Comma-separated task ids to flip (e.g. ``"42,43,44"``).
+                Each id is processed under the same per-project write lock as
+                ``set_task_status`` and runs the same gates.
+            target_status: ``pending`` to release for scheduling (default),
+                ``deferred`` to leave them parked, or ``cancelled`` to discard
+                the planned batch.  Other status values are rejected.
+
+        Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
+        the multi-id ``set_task_status`` response shape.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+
+        valid_targets = {'pending', 'deferred', 'cancelled'}
+        if target_status not in valid_targets:
+            return {
+                'error': (
+                    f'commit_planning: target_status must be one of '
+                    f'{sorted(valid_targets)} (got {target_status!r})'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        if not isinstance(task_ids, str) or not task_ids.strip():
+            return {
+                'error': 'commit_planning: task_ids must be a non-empty comma-separated string',
+                'error_type': 'ValidationError',
+            }
+        ids = [t.strip() for t in task_ids.split(',') if t.strip()]
+        if not ids:
+            return {
+                'error': 'commit_planning: task_ids parsed to an empty list',
+                'error_type': 'ValidationError',
+            }
+        for tid in ids:
+            if _is_ticket_id(tid):
+                return {
+                    'error': (
+                        f'commit_planning: task_ids must contain numeric task ids, '
+                        f'not tickets (got {tid!r}). If you got a ticket from '
+                        f'submit_task without planning_mode=True, use resolve_ticket first.'
+                    ),
+                    'error_type': 'ValidationError',
+                }
+
+        try:
+            return await task_interceptor.set_task_status(
+                task_id=','.join(ids),
+                status=target_status,
+                project_root=project_root,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'commit_planning error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
