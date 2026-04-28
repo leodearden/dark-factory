@@ -919,11 +919,17 @@ class MergeWorker:
                 # Main was advanced — push origin even though stash pop failed.
                 push_status = await self._git_ops.push_main()
                 recovery = getattr(self._git_ops, '_last_recovery_branch', None)
+                # Main IS on the post-rebase SHA — propagate it so workflow's
+                # _handle_wip_recovery → set_task_status('done') has valid
+                # done_provenance (otherwise the call hits "kind required").
+                advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
+                    or merge_result.merge_commit
                 return MergeOutcome(
                     'done_wip_recovery',
                     reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
                     recovery_branch=recovery,
                     push_status=push_status,
+                    merge_sha=advanced_sha,
                 )
             else:
                 overlap = getattr(self._git_ops, '_last_overlap_files', None)
@@ -1794,12 +1800,18 @@ class SpeculativeMergeWorker:
                     # Main was advanced — push origin even though stash pop failed.
                     push_status = await self._git_ops.push_main()
                     recovery = getattr(self._git_ops, '_last_recovery_branch', None)
+                    # Main IS on the post-rebase SHA — propagate it so workflow's
+                    # _handle_wip_recovery → set_task_status('done') has valid
+                    # done_provenance (otherwise the call hits "kind required").
+                    advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
+                        or merge_commit
                     if not req.result.done():
                         req.result.set_result(MergeOutcome(
                             'done_wip_recovery',
                             reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
                             recovery_branch=recovery,
                             push_status=push_status,
+                            merge_sha=advanced_sha,
                         ))
                 else:
                     overlap = getattr(self._git_ops, '_last_overlap_files', None)
