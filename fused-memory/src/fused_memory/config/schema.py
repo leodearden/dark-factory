@@ -436,8 +436,13 @@ class CuratorConfig(BaseModel):
 
     enabled: bool = Field(default=True)
     model: str = Field(default='sonnet')
-    timeout_seconds: float = Field(default=240.0)
+    timeout_seconds: float = Field(default=300.0)
     max_budget_usd: float = Field(default=0.30)
+    # Per-call turn cap. Must be ≥ 3: schema burns one tool-use turn, an
+    # optional reasoning turn may precede it, and the final assistant
+    # response is the third. 8 leaves headroom for harder combine-vs-create
+    # decisions without tripping ``error_max_turns``.
+    max_turns: int = Field(default=8, ge=3)
 
     # Corpus caps — see design notes in shared/docs (the four-stream pool).
     pool_module_cap: int = Field(default=15)
@@ -463,7 +468,8 @@ class CuratorConfig(BaseModel):
     # the caps so no single batch blocks resolve_ticket callers indefinitely.
     # Formula: timeout = min(timeout_seconds + per_item_slack_seconds * N,
     #                        batch_timeout_cap_seconds)
-    #          max_turns = min(3 + per_item_turns * N, batch_turns_cap)
+    #          max_turns = min(max_turns + per_item_turns * (N - 1),
+    #                          batch_turns_cap)
     batch_max: int = Field(default=5)
     per_item_slack_seconds: float = Field(default=30.0)
     per_item_turns: int = Field(default=1)
