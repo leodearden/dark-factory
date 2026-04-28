@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from fused_memory.server.main import _graceful_shutdown
+from fused_memory.server.main import _graceful_shutdown, _run_shielded
 
 
 class TestGracefulShutdownCallsMemoryServiceClose:
@@ -457,6 +457,95 @@ class TestGracefulShutdownDoesNotArmForceExitWatchdog:
             )
         finally:
             main_mod._cancel_force_exit()
+
+
+class TestRunShieldedCallerCancelledCompletesInner:
+    """Fix A: caller-cancellation must let the shielded inner task run to completion
+    when it can finish within the remaining step budget — preventing the orphan
+    detached task that wedged ``asyncio.run()`` on 2026-04-28 00:32:15.
+    """
+
+    @pytest.mark.timeout(5)
+    @pytest.mark.asyncio
+    async def test_run_shielded_caller_cancel_waits_for_inner_to_finish(self):
+        """When the caller of _run_shielded is cancelled, the inner cleanup task
+        must finish (not be abandoned as an orphan) provided it can do so within
+        the remaining step budget.
+        """
+        inner_started = asyncio.Event()
+        inner_finished = False
+
+        async def _inner_cleanup():
+            nonlocal inner_finished
+            inner_started.set()
+            # Short, well within the timeout — completes despite caller-cancel.
+            await asyncio.sleep(0.2)
+            inner_finished = True
+
+        async def _outer():
+            await _run_shielded('test_step', _inner_cleanup, timeout=2.0)
+
+        outer_task = asyncio.create_task(_outer())
+        await inner_started.wait()
+        outer_task.cancel()
+
+        # The outer task may itself raise CancelledError when awaited, but the
+        # CONTRACT is that the inner cleanup runs to completion regardless.
+        try:
+            await outer_task
+        except asyncio.CancelledError:
+            pass
+
+        assert inner_finished, (
+            'inner cleanup task was abandoned when caller was cancelled — '
+            'this is the orphan-detached-task bug that wedged asyncio.run()'
+        )
+
+
+class TestRunShieldedCallerCancelledExceedsBudget:
+    """Fix A: when the inner cleanup cannot finish within the remaining budget
+    after caller-cancel, _run_shielded must explicitly cancel it instead of
+    leaving it as a detached orphan.
+    """
+
+    @pytest.mark.timeout(5)
+    @pytest.mark.asyncio
+    async def test_run_shielded_cancels_inner_when_budget_exhausted(self):
+        """If the inner step exceeds its budget after caller-cancel, the inner
+        task must be cancelled (not orphaned) so asyncio.run() can shut down
+        cleanly.
+        """
+        inner_started = asyncio.Event()
+        inner_was_cancelled = False
+
+        async def _inner_cleanup():
+            nonlocal inner_was_cancelled
+            inner_started.set()
+            try:
+                await asyncio.sleep(60)  # would exceed any sane budget
+            except asyncio.CancelledError:
+                inner_was_cancelled = True
+                raise
+
+        async def _outer():
+            # Tight budget so we hit the deadline-expired branch quickly.
+            await _run_shielded('test_step', _inner_cleanup, timeout=0.2)
+
+        outer_task = asyncio.create_task(_outer())
+        await inner_started.wait()
+        outer_task.cancel()
+
+        try:
+            await outer_task
+        except asyncio.CancelledError:
+            pass
+
+        # _run_shielded must have explicitly cancelled the inner task once
+        # the deadline expired — otherwise the inner would still be running.
+        assert inner_was_cancelled, (
+            'inner cleanup task was left as a detached orphan after the '
+            'caller was cancelled and the step budget expired'
+        )
 
 
 class TestShutdownWithWatchdog:

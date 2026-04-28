@@ -55,7 +55,9 @@ _CLEANUP_STEP_TIMEOUT = 5.0
 # Total wall-clock budget between _graceful_shutdown starting and a hard
 # os._exit(1) firing from a background thread. Must exceed the sum of per-step
 # timeouts plus headroom so clean shutdowns never trip it.
-_FORCE_EXIT_BUDGET = 45.0
+# Worst case (Fix A): drain(5)+close(5)+sqlite_watchdog(5)+event_queue(5)
+# +harness_cancel(25)+memory_close(5)+journal_close(5) = 55s; +20s headroom = 75.
+_FORCE_EXIT_BUDGET = 75.0
 
 # systemd watchdog heartbeat interval. Must be comfortably less than
 # WatchdogSec in the unit file (we use 30s there) so a single missed tick
@@ -84,6 +86,11 @@ def _sd_notify(state: str) -> None:
 
 
 _shutdown_watchdog: threading.Timer | None = None
+
+# Set by the operator-stop signal handler (Fix B). main() reads this in its
+# finally clause to choose between exit 0 (operator wanted stop — let systemd
+# leave the service stopped) and exit 1 (cascade — let Restart=on-failure fire).
+_operator_stop_received: bool = False
 
 
 def _arm_force_exit(budget_secs: float = _FORCE_EXIT_BUDGET) -> None:
@@ -130,17 +137,56 @@ async def _run_shielded(
     `coro_factory` is a zero-arg callable that returns the coroutine to run.
     Shielding decouples the cleanup task from the caller's cancellation, so
     cleanup actually makes progress even when _graceful_shutdown itself is
-    running inside a cancelled task. If the step exceeds `timeout`, we log
-    and move on — the force-exit watchdog is the backstop.
+    running inside a cancelled task.
+
+    On caller-cancel: we keep awaiting the shielded inner task (bounded by
+    the step deadline) so cleanup completes instead of being abandoned as
+    an orphan that hangs ``asyncio.run()``. If the deadline expires while
+    the inner is still running, we explicitly cancel it.
+
+    The force-exit watchdog is the ultimate backstop.
     """
+    loop = asyncio.get_running_loop()
+    inner_task = asyncio.ensure_future(coro_factory())
+    deadline = loop.time() + timeout
     try:
-        await asyncio.wait_for(asyncio.shield(coro_factory()), timeout=timeout)
-    except TimeoutError:
-        logger.warning('_graceful_shutdown: %s timed out after %.1fs', name, timeout)
+        await asyncio.wait_for(asyncio.shield(inner_task), timeout=timeout)
     except asyncio.CancelledError:
-        # Caller was cancelled. The shielded task keeps running in the
-        # background; we log and move on so subsequent steps still fire.
-        logger.warning('_graceful_shutdown: %s cancelled (shielded task continues)', name)
+        # Caller was cancelled. The shielded inner task continues running.
+        # Keep waiting (bounded by remaining budget) using asyncio.wait —
+        # which returns instead of raising on timeout, sidestepping the
+        # re-cancel-on-every-await trap.
+        while not inner_task.done():
+            remaining = max(0.0, deadline - loop.time())
+            if remaining <= 0:
+                break
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({inner_task}, timeout=remaining)
+        if not inner_task.done():
+            inner_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait({inner_task}, timeout=1.0)
+        logger.warning(
+            '_graceful_shutdown: %s caller cancelled, finished waiting (done=%s)',
+            name,
+            inner_task.done(),
+        )
+        # Surface a non-cancelled failure of the inner task for observability.
+        if inner_task.done() and not inner_task.cancelled():
+            exc = inner_task.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                logger.exception(
+                    '_graceful_shutdown: %s raised (after caller-cancel)',
+                    name,
+                    exc_info=exc,
+                )
+    except TimeoutError:
+        # Step exceeded its budget — cancel the inner so it can't linger
+        # as a detached orphan that wedges asyncio.run().
+        inner_task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait({inner_task}, timeout=1.0)
+        logger.warning('_graceful_shutdown: %s timed out after %.1fs', name, timeout)
     except Exception:
         logger.exception('_graceful_shutdown: %s raised', name)
 
@@ -528,6 +574,14 @@ async def run_server():
         backlog_policy=backlog_policy,
         event_queue=event_queue,
     )
+
+    # Defence-in-depth wrapper at FastMCP's central tool-dispatch chokepoint.
+    # Catches BaseException escapes (SystemExit, BaseExceptionGroup, etc.) that
+    # would otherwise poison StreamableHTTPSessionManager's shared task group
+    # and cascade into uvicorn's main loop. Re-raises CancelledError because
+    # it is required for asyncio cancellation semantics.
+    _install_safe_tool_wrapper(mcp)
+
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
     mcp.settings.stateless_http = config.server.stateless_http
@@ -590,6 +644,15 @@ async def run_server():
             )
             server = uvicorn.Server(uv_config)
 
+            # Take ownership of SIGTERM/SIGINT before uvicorn's serve() can
+            # install its own handlers. We need to differentiate operator-stop
+            # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
+            # restart) — uvicorn's default handlers don't expose that distinction.
+            server.install_signal_handlers = lambda: None
+            _install_operator_stop_handler(
+                lambda: setattr(server, 'should_exit', True),
+            )
+
             # Systemd watchdog heartbeat: ping every _WATCHDOG_INTERVAL so a
             # wedged asyncio loop (no ticks) triggers a restart via
             # WatchdogSec in the unit file. No-op when NOTIFY_SOCKET unset.
@@ -633,6 +696,94 @@ async def _build_ticket_store(data_dir: Path) -> 'TicketStore':
     store = TicketStore(data_dir / 'tickets.db')
     await store.initialize()
     return store
+
+
+def _install_safe_tool_wrapper(mcp: Any) -> None:
+    """Wrap FastMCP's ToolManager.call_tool to contain BaseException escapes.
+
+    FastMCP's :meth:`ToolManager.call_tool` is the central dispatch chokepoint —
+    every ``@mcp.tool()`` call goes through it. Wrapping here covers all
+    currently-registered tools and any added later, in one place. Wrapping
+    ``add_tool`` would be too late: ``@mcp.tool()`` decorators register at
+    import time, before ``create_mcp_server`` returns.
+
+    Contract:
+
+    - :class:`asyncio.CancelledError` is **re-raised** — required for asyncio
+      cancellation semantics; swallowing it would leak tasks and break
+      structured concurrency.
+    - Every other :class:`BaseException` (including :class:`SystemExit`,
+      :class:`KeyboardInterrupt`, :class:`BaseExceptionGroup`) is logged at
+      ERROR with ``tool_name`` + traceback and a structured error dict is
+      returned to the caller, matching the existing tool error-return shape
+      ({'error': str, 'error_type': str}).
+
+    Idempotent: if already wrapped (re-entry under tests), the existing
+    wrapping is left in place.
+    """
+    tool_manager = mcp._tool_manager
+    if getattr(tool_manager, '_fused_memory_safe_wrapped', False):
+        return
+
+    original_call_tool = tool_manager.call_tool
+
+    async def _safe_call_tool(name: str, arguments: dict, *args: Any, **kwargs: Any):
+        try:
+            return await original_call_tool(name, arguments, *args, **kwargs)
+        except asyncio.CancelledError:
+            # Required: cancellation must propagate. Never swallow.
+            raise
+        except BaseException as exc:
+            logger.exception(
+                'Tool handler escaped exception (defence-in-depth wrapper caught it)',
+                extra={'tool_name': name, 'exc_class': type(exc).__name__},
+            )
+            return {'error': str(exc), 'error_type': type(exc).__name__}
+
+    tool_manager.call_tool = _safe_call_tool
+    tool_manager._fused_memory_safe_wrapped = True
+
+
+def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None:
+    """Install SIGTERM/SIGINT handlers that record operator-initiated shutdown.
+
+    Sets the module-level :data:`_operator_stop_received` flag and invokes the
+    supplied callback (typically ``lambda: setattr(server, 'should_exit', True)``).
+    Mirrors :func:`_register_drain_signal_handler`'s loop / signal.signal
+    fallback pattern.
+
+    Must be called BEFORE ``uvicorn.Server.serve()`` and uvicorn's
+    ``install_signal_handlers`` must be neutered, otherwise uvicorn replaces
+    our handlers from inside ``serve()`` and we never observe SIGTERM.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(
+            '_install_operator_stop_handler: no running event loop; '
+            'SIGTERM/SIGINT handlers not installed',
+        )
+        return
+
+    def _operator_stop(signame: str) -> None:
+        global _operator_stop_received
+        _operator_stop_received = True
+        logger.info('Received %s — initiating operator shutdown', signame)
+        try:
+            on_operator_stop()
+        except Exception:
+            logger.exception('on_operator_stop callback raised')
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _operator_stop, sig.name)
+        except NotImplementedError:
+            # Windows: no add_signal_handler support. signal.signal hands us
+            # (signum, frame); adapt to our (signame,) callback.
+            signal.signal(
+                sig,
+                lambda signum, frame: _operator_stop(signal.Signals(signum).name),
+            )
 
 
 def _register_drain_signal_handler(reconciliation_harness: 'ReconciliationHarness') -> None:
@@ -775,15 +926,22 @@ def _acquire_singleton_lock() -> None:
 
 
 def main():
+    global _operator_stop_received
     _acquire_singleton_lock()
-    exit_code = 0
     try:
         asyncio.run(run_server())
     except KeyboardInterrupt:
-        logger.info('Server shutting down...')
+        # Pre-handler Ctrl-C only (rare race before the asyncio signal handler
+        # is installed). Treat as operator-initiated stop.
+        _operator_stop_received = True
+        logger.info('KeyboardInterrupt before signal handler installed')
+    except asyncio.CancelledError:
+        # Top-level CancelledError indicates a cascade — the shutdown was not
+        # operator-initiated. Let _operator_stop_received stay False so we
+        # exit 1 and systemd's Restart=on-failure brings us back up.
+        logger.warning('Top-level CancelledError — likely cascade shutdown')
     except Exception:
         logger.exception('Server error')
-        exit_code = 1
     finally:
         # asyncio.run() has returned; cleanup either succeeded or the
         # force-exit watchdog will fire. Hard-exit so non-daemon third-party
@@ -791,7 +949,9 @@ def main():
         # alive with a dead event loop and a still-bound listen socket.
         _cancel_force_exit()
         sys.stderr.flush()
-        os._exit(exit_code)
+        # Operator stop → exit 0 (systemd does not restart).
+        # Anything else (cascade, exception) → exit 1 (Restart=on-failure fires).
+        os._exit(0 if _operator_stop_received else 1)
 
 
 if __name__ == '__main__':
