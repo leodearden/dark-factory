@@ -2418,6 +2418,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         WIP has been preserved on a recovery branch. Create a level-1 escalation
         to inform the human, then return DONE (the task's merge succeeded).
         """
+        # Capture the on-main SHA so the success-path set_task_status('done', ...)
+        # in run() can build a valid done_provenance. Without this, _merge_sha
+        # stays None and fused-memory rejects the transition with "kind required".
+        if result.merge_sha is not None:
+            self._merge_sha = result.merge_sha
         recovery_branch = result.recovery_branch or '(unknown)'
         detail = (
             f'Merge for task {self.task_id} landed on main successfully, but '

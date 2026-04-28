@@ -4924,6 +4924,47 @@ class TestWipHaltMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    async def test_done_wip_recovery_propagates_advanced_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """pop_conflict outcome carries the post-rebase on-main SHA via merge_sha.
+
+        Without this, workflow._handle_wip_recovery leaves self._merge_sha=None
+        and the success-path set_task_status('done', done_provenance=None) fails
+        fused-memory's "kind required" validation, leaving the task stuck
+        in-progress despite the merge having landed.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'recov-sha', 'file_recov_sha.py', 'recov_sha = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Simulate advance_main: main IS advanced (records _last_advanced_sha)
+        # but stash pop conflicted (returns 'pop_conflict').
+        async def _pop_conflict(*args, **kwargs):
+            git_ops._last_recovery_branch = 'wip/recovery-recov-sha-20260428T000000'
+            git_ops._last_advanced_sha = 'feedface' * 5  # 40-char fake on-main SHA
+            return 'pop_conflict'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('recov-sha', 'recov-sha', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done_wip_recovery'
+        assert outcome.merge_sha == 'feedface' * 5
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
     async def test_unmerged_state_returns_unmerged_state_and_halts(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -5078,6 +5119,40 @@ class TestWipHaltSpeculativeMergeWorker:
         assert outcome.status == 'done_wip_recovery'
         assert outcome.recovery_branch == 'wip/recovery-srecov-1-20260407T120000'
         assert worker.is_wip_halted
+
+        await worker.stop()
+        await worker_task
+
+    async def test_speculative_done_wip_recovery_propagates_advanced_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Speculative worker pop_conflict path also propagates merge_sha.
+
+        Sister test to MergeWorker's test_done_wip_recovery_propagates_advanced_sha.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'srecov-sha', 'file_srecov_sha.py', 'srecov_sha = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        async def _pop_conflict(*args, **kwargs):
+            git_ops._last_recovery_branch = 'wip/recovery-srecov-sha-20260428T000000'
+            git_ops._last_advanced_sha = 'cafebabe' * 5
+            return 'pop_conflict'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('srecov-sha', 'srecov-sha', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done_wip_recovery'
+        assert outcome.merge_sha == 'cafebabe' * 5
 
         await worker.stop()
         await worker_task
