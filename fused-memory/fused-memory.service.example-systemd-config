@@ -3,8 +3,22 @@ Description=Fused Memory MCP Server (dark-factory)
 Documentation=file:///home/leo/src/dark-factory/DESIGN.md
 After=network.target
 
+# Restart-rate guard: 10 starts within 600s is generous enough for cap-rotation
+# churn and recoverable cascades, but blocks a true tight loop. No
+# StartLimitAction set — default `none` simply stops auto-restart, which is
+# the intended fail-safe (operator inspects journal, then restarts manually).
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
 [Service]
-Type=simple
+# Type=notify: process signals readiness via sd_notify("READY=1") and
+# heartbeats via sd_notify("WATCHDOG=1"). See fused_memory/server/main.py.
+# NotifyAccess=all — ExecStart is `uv run ...` which spawns python as a
+# child; the child is the notifier, not the main PID, so NotifyAccess=main
+# would reject us.
+Type=notify
+NotifyAccess=all
+WatchdogSec=30
 WorkingDirectory=/home/leo/src/dark-factory
 ExecStart=/home/leo/.local/bin/uv run --project fused-memory \
   python -m fused_memory.server.main \
@@ -17,13 +31,23 @@ Environment=CONFIG_PATH=/home/leo/src/dark-factory/fused-memory/config/config.ya
 Environment=PROJECT_ROOT=/home/leo/src/dark-factory
 Environment=TASKMASTER_DIR=/home/leo/src/dark-factory/taskmaster-ai
 
-# Restart policy: always restart on failure, back off up to 60s
+# Restart policy: always restart on failure (including watchdog-triggered),
+# back off up to 60s. main() in fused_memory/server/main.py exits 0 only when
+# an operator-stop signal (SIGTERM/SIGINT) was received — cascades exit 1 so
+# `Restart=on-failure` brings us back up.
 Restart=on-failure
 RestartSec=5
 RestartMaxDelaySec=60
 
-# Give it time to shut down gracefully (async cleanup)
-TimeoutStopSec=30
+# Give it time to shut down gracefully (async cleanup). Must exceed the
+# in-process shutdown watchdog (_FORCE_EXIT_BUDGET=75 in main.py).
+TimeoutStopSec=90
+
+# Startup can take longer than systemd's 90s default: FalkorDB + Qdrant
+# cold-start handshake plus event-buffer replay routinely runs 30-60s.
+# READY=1 fires immediately before uvicorn.serve(), so this bound has to
+# cover the full init path.
+TimeoutStartSec=300
 
 # Logging goes to journalctl --user -u fused-memory
 StandardOutput=journal
