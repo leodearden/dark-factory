@@ -1297,10 +1297,12 @@ class TestCallLlmBatchScaling:
 
     @pytest.mark.asyncio
     async def test_timeout_and_turns_scale_linearly(self):
-        """N=3 → timeout=240+30*(3-1)=300, max_turns=3+1*(3-1)=5.
+        """N=3 → timeout=300+30*(3-1)=360, max_turns=min(8+1*(3-1), 10)=10.
 
-        The formula uses (n-1): baseline timeout/3-turns already cover item 0;
-        each additional item beyond the first adds per_item_slack/per_item_turns.
+        The formula uses (n-1): the single-call budget (timeout_seconds /
+        max_turns) already covers item 0; each additional item beyond the
+        first adds per_item_slack / per_item_turns. With max_turns=8 and
+        batch_turns_cap=10, the turn count clamps at the cap by N=3.
         """
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
@@ -1322,8 +1324,8 @@ class TestCallLlmBatchScaling:
                 project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['timeout_seconds'] == 300.0
-        assert kwargs['max_turns'] == 5
+        assert kwargs['timeout_seconds'] == 360.0
+        assert kwargs['max_turns'] == 10
 
     @pytest.mark.asyncio
     async def test_scaling_clamps_at_caps(self):

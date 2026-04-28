@@ -1311,11 +1311,11 @@ class TaskCurator:
             # ``max_turns=1`` is incompatible with ``--json-schema`` because
             # the schema mechanism burns a tool-use turn; the CLI returns
             # ``error_max_turns`` after the schema turn, even when the
-            # structured payload is already attached. Three leaves room for
-            # an optional reasoning turn, the schema tool-use, and the final
-            # assistant response. Schema salvage in cli_invoke.py covers
-            # the boundary case.
-            max_turns=3,
+            # structured payload is already attached. The configured floor
+            # is 3 (schema tool-use + optional reasoning + final response);
+            # the default of 8 leaves headroom for harder combine-vs-create
+            # decisions. Schema salvage in cli_invoke.py covers the boundary.
+            max_turns=self._config.curator.max_turns,
             max_budget_usd=self._config.curator.max_budget_usd,
             disallowed_tools=['*'],  # no tool access — this is a pure classifier
             output_schema=CURATOR_OUTPUT_SCHEMA,
@@ -1361,17 +1361,19 @@ class TaskCurator:
         n = len(candidates)
         user_prompt = self._build_batch_user_prompt(candidates, pools)
 
-        # Scale by (n-1): timeout_seconds / 3-turns already cover the first
-        # item's baseline; each additional item beyond the first adds its slack.
-        # This avoids over-provisioning a size-2 batch at 2× the single-call
-        # budget.  Note: _call_llm_batch is never called for n<2.
+        # Scale by (n-1): the single-call budget (timeout_seconds /
+        # max_turns) already covers the first item's baseline; each additional
+        # item beyond the first adds its slack.  This avoids over-provisioning
+        # a size-2 batch at 2× the single-call budget.  Note: _call_llm_batch
+        # is never called for n<2.
         timeout = min(
             self._config.curator.timeout_seconds
             + self._config.curator.per_item_slack_seconds * (n - 1),
             self._config.curator.batch_timeout_cap_seconds,
         )
         max_turns = min(
-            3 + self._config.curator.per_item_turns * (n - 1),
+            self._config.curator.max_turns
+            + self._config.curator.per_item_turns * (n - 1),
             self._config.curator.batch_turns_cap,
         )
 
