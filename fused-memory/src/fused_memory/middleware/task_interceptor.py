@@ -82,6 +82,30 @@ def _is_ticket_id(value: object) -> bool:
     return isinstance(value, str) and value.startswith('tkt_')
 
 
+def _looks_like_task_id(value: object) -> bool:
+    """Return True when *value* parses as a non-negative integer task id.
+
+    Accepts ``int`` directly, plus numeric strings (with surrounding whitespace
+    trimmed). Rejects empty strings, negatives, and non-numeric strings.
+
+    Used by ``resolve_ticket`` to short-circuit when a caller passes a numeric
+    task id that came back from ``submit_task(planning_mode=True)`` — the
+    planning-mode path returns the id synchronously, so the two-step
+    submit/resolve dance does not apply, but agents may still call it blindly.
+    """
+    if isinstance(value, bool):
+        # bool is a subclass of int in Python; reject explicitly.
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return False
+        return stripped.isdigit()
+    return False
+
+
 def _format_ticket_result(row: dict) -> dict:
     """Format a terminal ticket row as the public resolve_ticket response dict.
 
@@ -1614,13 +1638,22 @@ class TaskInterceptor:
         if err := self._path_guard_or_skip(kwargs, project_root, project_id):
             return err
 
+        metadata = kwargs.pop('metadata', None)
+        planning_mode = bool(kwargs.pop('planning_mode', False))
+        if planning_mode:
+            return await self._submit_task_planning_mode(
+                project_root=project_root,
+                project_id=project_id,
+                kwargs=kwargs,
+                metadata=metadata,
+            )
+
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
         # No default=str: non-JSON-native values (e.g. datetime, Path, enum)
         # must fail fast here with a TypeError so the caller gets a structured
         # ValidationError rather than silently storing a mangled blob that the
         # worker cannot faithfully execute.
-        metadata = kwargs.pop('metadata', None)
         try:
             blob = json.dumps({
                 'project_root': project_root,
@@ -1642,6 +1675,126 @@ class TaskInterceptor:
         await queue.put(ticket_id)
         self._start_worker_if_needed(project_id)
         return {'ticket': ticket_id}
+
+    async def _submit_task_planning_mode(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        kwargs: dict[str, Any],
+        metadata: Any,
+    ) -> dict:
+        """Synchronous, curator-bypassing path for batched human decomposition.
+
+        Creates the task directly via ``tm.add_task`` and immediately flips its
+        status to ``deferred`` so the orchestrator scheduler cannot claim it
+        before the planner finishes wiring up siblings and dependencies.  The
+        planner releases the batch by calling ``commit_planning`` (deferred →
+        pending) once all sibling tasks and dependencies are in place.
+
+        Skips the ticket store, the per-project curator queue, and the curator
+        LLM round-trip entirely.  Persists ``human_decomposed=True`` in task
+        metadata as a forensic marker so future curator hooks on status
+        transitions can defensively skip these tasks.
+
+        Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously.  Both
+        ``tm.add_task`` and the deferred-flip run under the same per-project
+        ``_write_lock`` so a concurrent caller cannot observe the task in its
+        transient ``pending`` state.  If the deferred-flip fails after the
+        task is already created, the response includes the task_id and a
+        ``warning`` so the planner can retry the flip rather than losing track
+        of a stranded task.
+        """
+        normalized_metadata: dict[str, Any]
+        if metadata is None:
+            normalized_metadata = {}
+        elif isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+            except (TypeError, ValueError) as exc:
+                return {
+                    'error': f'submit_task[planning_mode]: metadata JSON-decode failed: {exc}',
+                    'error_type': 'ValidationError',
+                }
+            if not isinstance(parsed, dict):
+                return {
+                    'error': 'submit_task[planning_mode]: metadata must decode to an object',
+                    'error_type': 'ValidationError',
+                }
+            normalized_metadata = parsed
+        elif isinstance(metadata, Mapping):
+            normalized_metadata = dict(metadata)
+        else:
+            return {
+                'error': 'submit_task[planning_mode]: metadata must be a dict or JSON string',
+                'error_type': 'ValidationError',
+            }
+        normalized_metadata['human_decomposed'] = True
+        try:
+            metadata_json = json.dumps(normalized_metadata)
+        except (TypeError, ValueError) as exc:
+            return {
+                'error': f'submit_task[planning_mode]: metadata not JSON-serialisable: {exc}',
+                'error_type': 'ValidationError',
+            }
+
+        tm = await self._ensure_taskmaster()
+        tag = kwargs.get('tag')
+        task_id_str: str | None = None
+        async with self._write_lock(project_id):
+            try:
+                add_result = await tm.add_task(
+                    project_root=project_root,
+                    metadata=metadata_json,
+                    **kwargs,
+                )
+            except Exception as exc:
+                logger.exception(
+                    'submit_task[planning_mode]: tm.add_task failed for project=%s', project_id,
+                )
+                return {'error': str(exc), 'error_type': type(exc).__name__}
+
+            task_id_str = str(add_result['id'])
+
+            # Flip to deferred via raw tm.set_task_status — bypasses the gates
+            # in _apply_status_transition, which all check invariants that
+            # cannot apply to a task that was just created in this lock scope.
+            try:
+                await tm.set_task_status(task_id_str, 'deferred', project_root, tag)
+            except Exception as exc:
+                logger.warning(
+                    'submit_task[planning_mode]: deferred-flip failed for task %s: %s',
+                    task_id_str, exc,
+                )
+                # Task exists in pending — emit task_created so observers see it,
+                # then return with a warning so the planner can retry the flip.
+                event = self._make_event(
+                    EventType.task_created,
+                    project_root,
+                    {'operation': 'add_task', 'task_id': task_id_str, 'planning_mode': True},
+                )
+                await self._journal(event)
+                self._schedule_commit(project_root, 'add_task[planning_mode]')
+                return {
+                    'task_id': task_id_str,
+                    'status': 'pending',
+                    'planning_mode': True,
+                    'warning': f'deferred-flip failed: {exc}',
+                }
+
+        event = self._make_event(
+            EventType.task_created,
+            project_root,
+            {'operation': 'add_task', 'task_id': task_id_str, 'planning_mode': True},
+        )
+        await self._journal(event)
+        self._schedule_commit(project_root, 'add_task[planning_mode]')
+
+        return {
+            'task_id': task_id_str,
+            'status': 'deferred',
+            'planning_mode': True,
+        }
 
     async def _resolve_ticket_raw(
         self,
