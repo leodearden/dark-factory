@@ -4,7 +4,9 @@
 # ── Runtime data — SQLite DBs, escalation queue, burndown snapshots ──
 # These are live state managed by fused-memory / orchestrator / dashboard.
 # Tracked accidentally; removed from index in commit XXXX.
-data/
+# Anchored at repo root so dashboard/src/dashboard/data/ (Python module) is
+# not silently ignored.
+/data/
 
 # ── Worktrees — orchestrator task branches and eval runs ─────────────
 # Git worktree directories contain .git files pointing to the main repo.
