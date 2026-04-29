@@ -41,7 +41,7 @@ function OverviewTab({ paused }) {
       {/* Row 1: KPI tiles */}
       <div className="col-span-12 grid cols-4">
         <StatTile label="Orchestrators running" value={orchRunning} unit={`/ ${D.ORCHESTRATORS.length}`}
-          spark={[]} sparkColor={P.accent} hint="live" />
+          spark={(D.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={P.accent} hint="live" />
         <StatTile label="Active tasks" value={tasksInP + tasksBlocked} unit={`/ ${tasksTotal}`}
           spark={D.BURNDOWN.in_progress} sparkColor={P.accent} hint={`${tasksDone} done`} />
         <StatTile label="Memory ops / min" value={opsPerMin} unit="ops"

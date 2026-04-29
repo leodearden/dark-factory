@@ -354,6 +354,72 @@ async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
         return []
 
 
+_VELOCITY_FLOOR = 0.1  # tasks/day; prevents forecast from going to infinity
+
+
+def compute_forecast_confidence(series: dict) -> dict:
+    """Return ``{forecast_low, forecast_high}`` days from a burndown series.
+
+    Reads ``done`` and ``pending`` over the series' ``labels`` (each label
+    is a snapshot timestamp).  Computes two velocities — one over the most
+    recent 7 days of data, one over the full series — and returns the
+    forecast clearance window.
+
+    Returns ``{forecast_low: None, forecast_high: None}`` when the series
+    has fewer than 7 distinct days of history (no synthesis on sparse
+    history; the dashboard renders ``—``).
+    """
+    none = {'forecast_low': None, 'forecast_high': None}
+    labels = series.get('labels') or []
+    done = series.get('done') or []
+    pending = series.get('pending') or []
+    if not labels or not done or not pending:
+        return none
+    if len(labels) != len(done) or len(labels) != len(pending):
+        return none
+
+    # Distinct day count from ISO labels (date prefix).
+    day_keys: list[str] = []
+    seen: set[str] = set()
+    for lbl in labels:
+        day = (lbl[:10] if isinstance(lbl, str) and len(lbl) >= 10 else None)
+        if day and day not in seen:
+            seen.add(day)
+            day_keys.append(day)
+    if len(day_keys) < 7:
+        return none
+
+    last_pending = pending[-1] or 0
+    if last_pending <= 0:
+        return {'forecast_low': 0, 'forecast_high': 0}
+
+    last_done = done[-1] or 0
+
+    def _velocity_over(window_days: int) -> float:
+        cutoff = day_keys[-window_days]
+        # First label whose day >= cutoff.
+        first_idx = 0
+        for i, lbl in enumerate(labels):
+            if isinstance(lbl, str) and len(lbl) >= 10 and lbl[:10] >= cutoff:
+                first_idx = i
+                break
+        first_done = done[first_idx] or 0
+        delta_done = max(0, last_done - first_done)
+        # Duration in days, with a minimum of 1.0 to avoid div-by-zero on
+        # narrow windows.
+        return max(_VELOCITY_FLOOR, delta_done / max(1.0, window_days))
+
+    v_recent = _velocity_over(7)
+    v_lifetime = _velocity_over(len(day_keys))
+
+    f_recent = last_pending / v_recent
+    f_lifetime = last_pending / v_lifetime
+    return {
+        'forecast_low': round(min(f_recent, f_lifetime), 1),
+        'forecast_high': round(max(f_recent, f_lifetime), 1),
+    }
+
+
 async def get_burndown_series(
     db: aiosqlite.Connection | None,
     project_id: str,

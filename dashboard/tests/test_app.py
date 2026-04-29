@@ -81,9 +81,12 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
         resp = client.get('/api/v2/dashboard/orchestrators')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {'ORCHESTRATORS', 'PROJECTS'}
+    assert set(body) == {'ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'}
     assert isinstance(body['ORCHESTRATORS'], list)
     assert isinstance(body['PROJECTS'], list)
+    assert isinstance(body['ORCHESTRATORS_SPARK'], dict)
+    assert 'labels' in body['ORCHESTRATORS_SPARK']
+    assert 'values' in body['ORCHESTRATORS_SPARK']
 
 
 def test_tasks_returns_active_tasks_and_file_locks(client):
