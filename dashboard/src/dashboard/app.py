@@ -50,11 +50,23 @@ from dashboard.data.merge_queue import (
     enrich_merges_with_titles,
     load_task_titles,
 )
+from dashboard.data.metrics import (
+    METRICS_SCHEMA,
+    collect_metrics_snapshot,
+    downsample_metrics,
+    get_memory_24h_ago,
+    get_memory_sparks,
+    get_merge_active_series,
+    get_orchestrators_running_series,
+    get_queue_pending_series,
+    get_recon_sparks,
+)
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
+    aggregate_performance_history,
     aggregate_time_centiles,
 )
 from dashboard.data.reconciliation import (
@@ -101,6 +113,22 @@ def _parse_window(request: Request, default: int = 30) -> int:
 # ---------------------------------------------------------------------------
 
 
+_SAMPLE_INTERVAL_SECONDS = 600  # 10 minutes
+_DOWNSAMPLE_INTERVAL_SECONDS = 3600  # 1 hour
+
+
+async def _sleep_to_aligned_tick(interval: int) -> None:
+    """Sleep until the next wall-clock-aligned interval boundary.
+
+    Avoids drift across long uptimes — without alignment, a sleep(600)
+    loop slowly desynchronises from minute boundaries because each
+    iteration's wakeup latency accumulates.
+    """
+    now = time.time()
+    target = (int(now) // interval + 1) * interval
+    await asyncio.sleep(max(0.0, target - now))
+
+
 async def _burndown_loop(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
@@ -112,15 +140,59 @@ async def _burndown_loop(
         logger.warning('Initial burndown snapshot failed', exc_info=True)
     last_downsample = 0.0
     while True:
-        await asyncio.sleep(600)  # 10 minutes
+        await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
         try:
             await collect_snapshot(conn, config)
             now = time.monotonic()
-            if now - last_downsample > 3600:
+            if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
                 await downsample(conn)
                 last_downsample = now
         except Exception:
             logger.warning('Burndown snapshot error', exc_info=True)
+
+
+async def _metrics_loop(
+    conn: aiosqlite.Connection,
+    app: FastAPI,
+) -> None:
+    """Periodically snapshot ephemeral system metrics into metrics.db.
+
+    Uses fresh per-cycle handles for the recon DB and per-project runs.db
+    files so a stale connection cannot strand the loop. Each sampler in
+    collect_metrics_snapshot has its own try/except, so one failed source
+    does not poison the others.
+    """
+    async def _run_once() -> None:
+        config: DashboardConfig = app.state.config
+        pool: DbPool = app.state.db
+        http_client: httpx.AsyncClient = app.state.http_client
+        recon_db = await pool.get(config.reconciliation_db)
+        merge_dbs = await _project_scoped_dbs_labeled(
+            config, pool, Path('data/orchestrator/runs.db'),
+        )
+        await collect_metrics_snapshot(
+            conn=conn,
+            config=config,
+            http_client=http_client,
+            recon_db=recon_db,
+            merge_dbs=merge_dbs,
+        )
+
+    try:
+        await _run_once()
+    except Exception:
+        logger.warning('Initial metrics snapshot failed', exc_info=True)
+    last_downsample = 0.0
+    while True:
+        await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
+        try:
+            await _run_once()
+            now = time.monotonic()
+            if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
+                await downsample_metrics(conn)
+                last_downsample = now
+        except Exception:
+            logger.warning('Metrics snapshot error', exc_info=True)
 
 
 @asynccontextmanager
@@ -140,12 +212,25 @@ async def lifespan(app: FastAPI):
     await burndown_conn.commit()
     collector_task = asyncio.create_task(_burndown_loop(burndown_conn, app.state.config))
 
+    # Metrics snapshot collector (separate WAL writer for sparse-history signals).
+    metrics_path = app.state.config.metrics_db
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_conn = await aiosqlite.connect(str(metrics_path))
+    await metrics_conn.execute('PRAGMA journal_mode=WAL')
+    await metrics_conn.executescript(METRICS_SCHEMA)
+    await metrics_conn.commit()
+    metrics_task = asyncio.create_task(_metrics_loop(metrics_conn, app))
+    app.state.metrics_db_path = metrics_path
+
     yield
 
-    collector_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await collector_task
+    for task in (collector_task, metrics_task):
+        task.cancel()
+    for task in (collector_task, metrics_task):
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     await burndown_conn.close()
+    await metrics_conn.close()
     await app.state.db.close_all()
     await app.state.http_client.aclose()
 
@@ -294,10 +379,18 @@ async def _burndown_dbs(
 async def api_orchestrators(request: Request) -> JSONResponse:
     """ORCHESTRATORS + PROJECTS for the redux dashboard."""
     config: DashboardConfig = request.app.state.config
-    orchestrators = await asyncio.to_thread(discover_orchestrators, config)
+    pool: DbPool = request.app.state.db
+    orchestrators_task = asyncio.to_thread(discover_orchestrators, config)
+    metrics_db = await pool.get(config.metrics_db)
+    orchestrators, running_spark = await asyncio.gather(
+        orchestrators_task,
+        get_orchestrators_running_series(metrics_db, days=1),
+    )
     known_roots = [config.project_root, *config.known_project_roots]
     return JSONResponse(redux_api.shape_orchestrators(
-        orchestrators, known_project_roots=known_roots,
+        orchestrators,
+        known_project_roots=known_roots,
+        running_spark=running_spark,
     ))
 
 
@@ -314,9 +407,19 @@ async def api_memory(request: Request) -> JSONResponse:
     """MEMORY_STATUS, including queue counts and per-project totals."""
     http_client = request.app.state.http_client
     config: DashboardConfig = request.app.state.config
-    status = await memory_data.get_memory_status(http_client, config)
-    queue = await memory_data.get_queue_stats(http_client, config)
-    return JSONResponse(redux_api.shape_memory(status, queue))
+    pool: DbPool = request.app.state.db
+    metrics_db = await pool.get(config.metrics_db)
+    status, queue, sparks, queue_spark, delta_24h = await asyncio.gather(
+        memory_data.get_memory_status(http_client, config),
+        memory_data.get_queue_stats(http_client, config),
+        get_memory_sparks(metrics_db, days=1),
+        get_queue_pending_series(metrics_db, days=1),
+        get_memory_24h_ago(metrics_db),
+    )
+    return JSONResponse(redux_api.shape_memory(
+        status, queue,
+        sparks=sparks, queue_spark=queue_spark, delta_24h=delta_24h,
+    ))
 
 
 @app.get('/api/v2/dashboard/memory-graphs')
@@ -342,12 +445,14 @@ async def api_recon(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     db = await pool.get(config.reconciliation_db)
 
-    bs_r, burst_r, wm_r, verdict_r, runs_r = await asyncio.gather(
+    metrics_db = await pool.get(config.metrics_db)
+    bs_r, burst_r, wm_r, verdict_r, runs_r, sparks_r = await asyncio.gather(
         get_buffer_stats(db),
         get_burst_state(db),
         get_watermarks(db),
         get_latest_verdict(db),
         get_recent_runs(db),
+        get_recon_sparks(metrics_db, days=1),
         return_exceptions=True,
     )
     buffer_stats = safe_gather_result(
@@ -358,9 +463,15 @@ async def api_recon(request: Request) -> JSONResponse:
     watermarks = safe_gather_result(wm_r, [], 'recon/watermarks')
     verdict = safe_gather_result(verdict_r, None, 'recon/verdict')
     runs = safe_gather_result(runs_r, [], 'recon/runs')
+    sparks = safe_gather_result(
+        sparks_r,
+        {'buffered_count': {'labels': [], 'values': []},
+         'active_agents': {'labels': [], 'values': []}},
+        'recon/sparks',
+    )
     return JSONResponse(redux_api.shape_recon(
         buffer_stats=buffer_stats, burst_state=active_burst,
-        watermarks=watermarks, verdict=verdict, runs=runs,
+        watermarks=watermarks, verdict=verdict, runs=runs, sparks=sparks,
     ))
 
 
@@ -397,7 +508,11 @@ async def api_merge_queue(request: Request) -> JSONResponse:
             'recent': enrich_merges_with_titles(data['recent'], titles),
             'active': enrich_merges_with_titles(data.get('active', []), titles),
         }
-    return JSONResponse(redux_api.shape_merge_queue(enriched))
+    metrics_db = await pool.get(config.metrics_db)
+    active_sparks: dict[str, dict] = {}
+    for pid in pids:
+        active_sparks[pid] = await get_merge_active_series(metrics_db, project_id=pid, days=1)
+    return JSONResponse(redux_api.shape_merge_queue(enriched, active_sparks=active_sparks))
 
 
 @app.get('/api/v2/dashboard/costs')
@@ -432,11 +547,13 @@ async def api_performance(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
-    paths_r, esc_r, hist_r, ttc_r = await asyncio.gather(
+    days = _parse_window(request, default=7)
+    paths_r, esc_r, hist_r, ttc_r, history_r = await asyncio.gather(
         aggregate_completion_paths(dbs, esc_dirs),
         aggregate_escalation_rates(dbs, esc_dirs),
         aggregate_loop_histograms(dbs),
         aggregate_time_centiles(dbs),
+        aggregate_performance_history(dbs, days=days),
         return_exceptions=True,
     )
     return JSONResponse(redux_api.shape_performance(
@@ -444,6 +561,7 @@ async def api_performance(request: Request) -> JSONResponse:
         escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
         histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
         ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
+        history=safe_gather_result(history_r, {}, 'perf/history'),
     ))
 
 

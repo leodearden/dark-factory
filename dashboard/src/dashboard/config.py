@@ -73,6 +73,10 @@ class DashboardConfig:
     def burndown_db(self) -> Path:
         return self.project_root / 'data' / 'burndown' / 'burndown.db'
 
+    @property
+    def metrics_db(self) -> Path:
+        return self.project_root / 'data' / 'burndown' / 'metrics.db'
+
     @classmethod
     def from_env(cls) -> DashboardConfig:
         """Create config with DASHBOARD_-prefixed env var overrides."""

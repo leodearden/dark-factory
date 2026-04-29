@@ -13,6 +13,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from dashboard.data.stats_utils import percentile
+
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
@@ -56,13 +58,16 @@ def shape_orchestrators(
     orchestrators: Iterable[Mapping[str, Any]],
     *,
     known_project_roots: Iterable[str | Path] = (),
+    running_spark: Mapping[str, list] | None = None,
 ) -> dict[str, list]:
     """Return ``{ORCHESTRATORS: [...], PROJECTS: [...]}`` for the API.
 
     ``orchestrators`` is the raw list from
     :func:`dashboard.data.orchestrator.discover_orchestrators`.  ``known_project_roots``
     is the union of configured roots; projects without a running orchestrator
-    are still surfaced (with ``active: False``).
+    are still surfaced (with ``active: False``).  ``running_spark`` is an
+    optional ``{labels, values}`` time-series of the total running-orchestrator
+    count over the last day, surfaced as ``ORCHESTRATORS_SPARK``.
     """
     orchestrators = list(orchestrators)
     out_orchs: list[dict] = []
@@ -99,7 +104,17 @@ def shape_orchestrators(
             'active': root in active_roots,
         })
 
-    return {'ORCHESTRATORS': out_orchs, 'PROJECTS': out_projects}
+    spark_block = (
+        {'labels': list(running_spark.get('labels') or []),
+         'values': list(running_spark.get('values') or [])}
+        if running_spark else {'labels': [], 'values': []}
+    )
+
+    return {
+        'ORCHESTRATORS': out_orchs,
+        'PROJECTS': out_projects,
+        'ORCHESTRATORS_SPARK': spark_block,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +122,51 @@ def shape_orchestrators(
 # ---------------------------------------------------------------------------
 
 
-def shape_memory(status: Mapping[str, Any], queue: Mapping[str, Any]) -> dict[str, Any]:
-    """Return ``{MEMORY_STATUS: {...}}`` matching the redux UI's read sites."""
+_EMPTY_SERIES: dict[str, list] = {'labels': [], 'values': []}
+
+
+def _empty_series_dict() -> dict[str, list]:
+    return {'labels': [], 'values': []}
+
+
+def shape_memory(
+    status: Mapping[str, Any],
+    queue: Mapping[str, Any],
+    *,
+    sparks: Mapping[str, Mapping[str, list]] | None = None,
+    queue_spark: Mapping[str, list] | None = None,
+    delta_24h: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return ``{MEMORY_STATUS: {...}}`` matching the redux UI's read sites.
+
+    ``sparks`` (optional) carries ``{graphiti_nodes, mem0_memories}`` time
+    series; ``queue_spark`` carries the pending-queue series; ``delta_24h``
+    carries per-project ``{graphiti_nodes, mem0_memories}`` snapshots from
+    ~24h ago for delta rendering.  All three are populated from
+    metrics.db; absent / empty when history is sparse.
+    """
+    spark_g = (sparks or {}).get('graphiti_nodes') or _EMPTY_SERIES
+    spark_m = (sparks or {}).get('mem0_memories') or _EMPTY_SERIES
+    spark_q = queue_spark or _EMPTY_SERIES
+    delta_map = delta_24h or {}
+
+    def _project_block(pid: str, payload: Mapping[str, Any]) -> dict:
+        before = delta_map.get(pid) or {}
+        return {
+            **dict(payload),
+            'graphiti_nodes_24h_ago': before.get('graphiti_nodes'),
+            'mem0_memories_24h_ago': before.get('mem0_memories'),
+        }
+
     if status.get('offline'):
         return {'MEMORY_STATUS': {
-            'graphiti': {'connected': False, 'node_count': 0, 'edge_count': 0, 'episode_count': 0},
-            'mem0': {'connected': False, 'memory_count': 0},
+            'graphiti': {'connected': False, 'node_count': 0, 'edge_count': 0, 'episode_count': 0,
+                         'spark': _empty_series_dict()},
+            'mem0': {'connected': False, 'memory_count': 0, 'spark': _empty_series_dict()},
             'taskmaster': {'connected': False},
             'queue': {'counts': dict(queue.get('counts') or {}),
-                      'oldest_pending_age_seconds': queue.get('oldest_pending_age_seconds')},
+                      'oldest_pending_age_seconds': queue.get('oldest_pending_age_seconds'),
+                      'spark': _empty_series_dict()},
             'projects': {},
             'offline': True,
             'error': status.get('error'),
@@ -125,9 +176,17 @@ def shape_memory(status: Mapping[str, Any], queue: Mapping[str, Any]) -> dict[st
     graphiti.setdefault('connected', True)
     for _key in ('node_count', 'edge_count', 'episode_count'):
         graphiti.setdefault(_key, 0)
+    graphiti['spark'] = {
+        'labels': list(spark_g.get('labels') or []),
+        'values': list(spark_g.get('values') or []),
+    }
     mem0 = dict(status.get('mem0') or {})
     mem0.setdefault('connected', True)
     mem0.setdefault('memory_count', 0)
+    mem0['spark'] = {
+        'labels': list(spark_m.get('labels') or []),
+        'values': list(spark_m.get('values') or []),
+    }
     taskmaster = dict(status.get('taskmaster') or {})
     taskmaster.setdefault('connected', True)
 
@@ -137,16 +196,23 @@ def shape_memory(status: Mapping[str, Any], queue: Mapping[str, Any]) -> dict[st
     queue_block = {
         'counts': queue_counts,
         'oldest_pending_age_seconds': queue.get('oldest_pending_age_seconds'),
+        'spark': {
+            'labels': list(spark_q.get('labels') or []),
+            'values': list(spark_q.get('values') or []),
+        },
     }
     if queue.get('offline'):
         queue_block['offline'] = True
+
+    raw_projects = dict(status.get('projects') or {})
+    enriched_projects = {pid: _project_block(pid, payload) for pid, payload in raw_projects.items()}
 
     return {'MEMORY_STATUS': {
         'graphiti': graphiti,
         'mem0': mem0,
         'taskmaster': taskmaster,
         'queue': queue_block,
-        'projects': dict(status.get('projects') or {}),
+        'projects': enriched_projects,
     }}
 
 
@@ -192,6 +258,7 @@ def shape_recon(
     watermarks: Iterable[Mapping[str, Any]],
     verdict: Mapping[str, Any] | None,
     runs: Iterable[Mapping[str, Any]],
+    sparks: Mapping[str, Mapping[str, list]] | None = None,
 ) -> dict[str, Any]:
     """Return ``{RECON_STATE: {...}, AGENTS: [...]}``.
 
@@ -210,13 +277,26 @@ def shape_recon(
     runs_list = [dict(r) for r in runs]
     agents = sorted({b['agent_id'] for b in burst_list if b.get('agent_id')})
 
+    sparks = sparks or {}
+    buffered_spark = sparks.get('buffered_count') or _EMPTY_SERIES
+    agents_spark = sparks.get('active_agents') or _EMPTY_SERIES
+
+    buffer_block = {**dict(buffer_stats), 'spark': {
+        'labels': list(buffered_spark.get('labels') or []),
+        'values': list(buffered_spark.get('values') or []),
+    }}
+
     return {
         'RECON_STATE': {
-            'buffer': dict(buffer_stats),
+            'buffer': buffer_block,
             'burst_state': [dict(b) for b in burst_list],
             'watermarks': wm_map,
             'verdict': dict(verdict) if verdict else None,
             'runs': runs_list,
+            'agents_spark': {
+                'labels': list(agents_spark.get('labels') or []),
+                'values': list(agents_spark.get('values') or []),
+            },
         },
         'AGENTS': agents,
     }
@@ -227,17 +307,27 @@ def shape_recon(
 # ---------------------------------------------------------------------------
 
 
-def shape_merge_queue(per_project: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+def shape_merge_queue(
+    per_project: Mapping[str, Mapping[str, Any]],
+    *,
+    active_sparks: Mapping[str, Mapping[str, list]] | None = None,
+) -> dict[str, Any]:
     """Return ``{MERGE_QUEUE: {project_label: {...}}}``.
 
     The aggregator already returns one entry per project; we relabel the keys
     from absolute project_root paths to short basenames so the React side can
     match against ``PROJECTS[].name``.  The shape per-project follows the
     DF_DATA mock: ``depth`` (renamed from ``depth_timeseries``), ``outcomes``,
-    ``latency``, ``recent``, ``speculative``, ``active``.
+    ``latency``, ``recent``, ``speculative``, ``active``, ``active_spark``.
+
+    ``active_sparks`` (optional) carries true active-queue depth over time
+    keyed by absolute project_root path; surfaced as ``active_spark`` per
+    project label so the UI tile no longer falls back to attempt-count.
     """
+    sparks = active_sparks or {}
     out: dict[str, dict] = {}
     for pid, data in per_project.items():
+        spark = sparks.get(pid) or _EMPTY_SERIES
         out[_project_label(pid)] = {
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
             'outcomes': dict(data.get('outcomes') or {'labels': [], 'values': []}),
@@ -245,6 +335,10 @@ def shape_merge_queue(per_project: Mapping[str, Mapping[str, Any]]) -> dict[str,
             'recent': [dict(r) for r in (data.get('recent') or [])],
             'speculative': dict(data.get('speculative') or {}),
             'active': [dict(a) for a in (data.get('active') or [])],
+            'active_spark': {
+                'labels': list(spark.get('labels') or []),
+                'values': list(spark.get('values') or []),
+            },
         }
     return {'MERGE_QUEUE': out}
 
@@ -361,16 +455,51 @@ def shape_costs(
         for ev in events
     ]
 
-    # tokens / p95_run_cost: not aggregated server-side yet.  Returned as None
-    # so the UI can render '—' rather than a misleading 0.  delta_pct comes
-    # from the trend tail above.
+    # Global tokens: component-wise sum across projects.  Returns None when no
+    # project reports tokens (UI renders '—' rather than a misleading 0).
+    global_tokens: dict[str, int] = {
+        'input': 0, 'output': 0, 'cache_read': 0, 'cache_create': 0, 'total': 0,
+    }
+    saw_tokens = False
+    for p in summary.values():
+        t = p.get('tokens') if isinstance(p, Mapping) else None
+        if not isinstance(t, Mapping):
+            continue
+        saw_tokens = True
+        for key in global_tokens:
+            global_tokens[key] += int(t.get(key) or 0)
+    tokens_block = global_tokens if saw_tokens else None
+
+    # Global p95: concatenate per-project run_costs and recompute, so
+    # cross-project distribution drives the org-wide percentile rather than
+    # averaging per-project p95s.
+    all_run_costs: list[float] = []
+    for p in summary.values():
+        rc = p.get('run_costs') if isinstance(p, Mapping) else None
+        if isinstance(rc, list):
+            all_run_costs.extend(float(c) for c in rc if c is not None)
+    if all_run_costs:
+        all_run_costs.sort()
+        p95_run_cost = round(percentile(all_run_costs, 95), 4)
+    else:
+        p95_run_cost = None
+
+    # Hint surfaces the cause of a missing delta so the UI's '—' is
+    # interpretable.  Empty when delta_pct is computable.
+    delta_hint = (
+        'need ≥2 days for delta'
+        if delta_pct is None and len(trend_values) <= 1 and trend_values
+        else None
+    )
+
     summary_block = {
         'total': round(total, 4),
         'runs': runs,
         'today': trend_values[-1] if trend_values else 0.0,
-        'tokens': None,
-        'p95_run_cost': None,
+        'tokens': tokens_block,
+        'p95_run_cost': p95_run_cost,
         'delta_pct': delta_pct,
+        'delta_hint': delta_hint,
     }
 
     return {'COSTS': {
@@ -394,22 +523,35 @@ def shape_performance(
     escalations: Mapping[str, Mapping[str, Any]],
     histograms: Mapping[str, Mapping[str, Any]],
     ttc: Mapping[str, Mapping[str, Any]],
+    history: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Combine the four performance aggregators into the per-project shape.
 
     Output: ``{PERFORMANCE: {project_label: {paths, escalation, hist_outer,
-    hist_inner, ttc}}}``.
+    hist_inner, ttc, time_centiles_history, one_pass_history,
+    escalation_history}}}``.
+
+    ``history`` (optional) carries per-project hour-bucketed histories from
+    :func:`dashboard.data.performance.aggregate_performance_history`. When
+    absent or sparse, the history blocks render as empty {labels, values}.
     """
-    project_ids = set(paths) | set(escalations) | set(histograms) | set(ttc)
+    project_ids = set(paths) | set(escalations) | set(histograms) | set(ttc) | set(history or {})
+    history = history or {}
+    empty_pair = {'labels': [], 'values': []}
+    empty_centiles = {'labels': [], 'p50': [], 'p95': []}
     out: dict[str, dict] = {}
     for pid in project_ids:
         hist = histograms.get(pid) or {}
+        h = history.get(pid) or {}
         out[_project_label(pid)] = {
             'paths': [dict(e) for e in (paths.get(pid) or [])],
             'escalation': dict(escalations.get(pid) or {}),
             'hist_outer': dict(hist.get('outer') or {'labels': [], 'values': []}),
             'hist_inner': dict(hist.get('inner') or {'labels': [], 'values': []}),
             'ttc': dict(ttc.get(pid) or {}),
+            'time_centiles_history': dict(h.get('time_centiles_history') or empty_centiles),
+            'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
+            'escalation_history': dict(h.get('escalation_history') or empty_pair),
         }
     return {'PERFORMANCE': out}
 
@@ -428,16 +570,23 @@ def shape_burndown(
     """Build ``{BURNDOWN, BURNDOWN_BY_PROJECT}`` from per-project series.
 
     ``BURNDOWN`` is the sum across projects, aligned by label.
-    ``BURNDOWN_BY_PROJECT`` is keyed by project basename.
+    ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks
+    carry ``forecast_low`` / ``forecast_high`` (None when <7 days history).
     """
+    # Local import avoids circular import: burndown.py imports stats and
+    # this module imports config/no-burndown.
+    from dashboard.data.burndown import compute_forecast_confidence
+
     by_project: dict[str, dict] = {}
     label_set: set[str] = set()
     for pid, series in series_by_project.items():
         labels = list(series.get('labels') or [])
         label_set.update(labels)
+        forecast = compute_forecast_confidence(series)
         by_project[_project_label(pid)] = {
             'labels': labels,
             **{k: list(series.get(k) or []) for k in _BURNDOWN_KEYS},
+            **forecast,
         }
 
     sorted_labels = sorted(label_set)
@@ -449,5 +598,7 @@ def shape_burndown(
             for lbl, val in zip(labels, series.get(k) or [], strict=False):
                 if lbl in index_map:
                     aggregate[k][index_map[lbl]] += int(val or 0)
+
+    aggregate.update(compute_forecast_confidence(aggregate))
 
     return {'BURNDOWN': aggregate, 'BURNDOWN_BY_PROJECT': by_project}

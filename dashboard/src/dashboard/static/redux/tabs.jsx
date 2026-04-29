@@ -190,7 +190,7 @@ function OrchTab({ projectFilter, search }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
-        <ST label="Orchestrators" value={matches.length} hint={`${matches.filter(o=>o.running).length} running`} spark={[]} sparkColor={CP.accent} />
+        <ST label="Orchestrators" value={matches.length} hint={`${matches.filter(o=>o.running).length} running`} spark={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
         <ST label="Tasks in flight" value={matches.reduce((s,o)=>s+o.summary.in_progress,0)} spark={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
         <ST label="Blocked" value={matches.reduce((s,o)=>s+o.summary.blocked,0)} spark={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
         <ST label="Pending" value={matches.reduce((s,o)=>s+o.summary.pending,0)} spark={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
@@ -344,18 +344,77 @@ function PerfTab({ projectFilter }) {
           const escalation = aggEscalationRate(subset, 'interactive_rate');
           const totalTasks = Object.values(subset).reduce((s, p) => s + (p.ttc?.count || 0), 0);
           const fmtPct = v => v == null ? '—' : `${v.toFixed(1)}`;
+          // Aggregate historical sparks across the in-scope projects.
+          // Per-project hour buckets must be aligned by label before summing.
+          const histKeys = Object.keys(subset);
+          const buildAggSpark = field => {
+            const bucketMap = {};
+            histKeys.forEach(pid => {
+              const h = subset[pid][field] || { labels: [], values: [], p50: [], p95: [] };
+              const labels = h.labels || [];
+              const values = field === 'time_centiles_history' ? (h.p95 || []) : (h.values || []);
+              labels.forEach((lbl, i) => {
+                bucketMap[lbl] = (bucketMap[lbl] || 0) + (values[i] || 0);
+              });
+            });
+            return Object.keys(bucketMap).sort().map(k => bucketMap[k]);
+          };
+          const buildP50Spark = () => {
+            const bucketMap = {};
+            histKeys.forEach(pid => {
+              const h = subset[pid].time_centiles_history || { labels: [], p50: [] };
+              (h.labels || []).forEach((lbl, i) => {
+                // For ttc: average across projects per bucket (medians don't sum).
+                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
+                bucketMap[lbl].sum += (h.p50 || [])[i] || 0;
+                bucketMap[lbl].n += 1;
+              });
+            });
+            return Object.keys(bucketMap).sort()
+              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n)));
+          };
+          const buildP95Spark = () => {
+            const bucketMap = {};
+            histKeys.forEach(pid => {
+              const h = subset[pid].time_centiles_history || { labels: [], p95: [] };
+              (h.labels || []).forEach((lbl, i) => {
+                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
+                bucketMap[lbl].sum += (h.p95 || [])[i] || 0;
+                bucketMap[lbl].n += 1;
+              });
+            });
+            return Object.keys(bucketMap).sort()
+              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n)));
+          };
+          const buildPctSpark = field => {
+            const bucketMap = {};
+            histKeys.forEach(pid => {
+              const h = subset[pid][field] || { labels: [], values: [] };
+              (h.labels || []).forEach((lbl, i) => {
+                bucketMap[lbl] = bucketMap[lbl] || { sum: 0, n: 0 };
+                bucketMap[lbl].sum += (h.values || [])[i] || 0;
+                bucketMap[lbl].n += 1;
+              });
+            });
+            return Object.keys(bucketMap).sort()
+              .map(k => Math.round(bucketMap[k].sum / Math.max(1, bucketMap[k].n) * 10) / 10);
+          };
+          const p50Spark = buildP50Spark();
+          const p95Spark = buildP95Spark();
+          const onePassSpark = buildPctSpark('one_pass_history');
+          const escalationSpark = buildPctSpark('escalation_history');
           return (
             <>
               <ST label="p50 time-to-completion"
                 value={p50 == null ? '—' : fmtMs(p50)}
-                hint={`${totalTasks} tasks (window)`} spark={[]} sparkColor={CP.accent} />
+                hint={`${totalTasks} tasks (window)`} spark={p50Spark} sparkColor={CP.accent} />
               <ST label="p95 time-to-completion"
                 value={p95 == null ? '—' : fmtMs(p95)}
-                hint={`${totalTasks} tasks (window)`} spark={[]} sparkColor={CP.warn} />
+                hint={`${totalTasks} tasks (window)`} spark={p95Spark} sparkColor={CP.warn} />
               <ST label="One-pass success" value={fmtPct(onePass)} unit={onePass == null ? '' : '%'}
-                hint={onePass == null ? 'no tasks' : 'across all paths'} spark={[]} sparkColor={CP.ok} />
+                hint={onePass == null ? 'no tasks' : 'across all paths'} spark={onePassSpark} sparkColor={CP.ok} />
               <ST label="Human escalation rate" value={fmtPct(escalation)} unit={escalation == null ? '' : '%'}
-                hint="interactive" spark={[]} sparkColor={CP.warn} />
+                hint="interactive" spark={escalationSpark} sparkColor={CP.warn} />
             </>
           );
         })()}
@@ -427,9 +486,32 @@ function PerfTab({ projectFilter }) {
                         </div>
                       ))}
                     </div>
-                    {/* Per-project ttc trend would need a time-series of completed-task durations
-                        — the existing aggregator returns a single point-in-time percentile.
-                        Omitted until that history is exposed. */}
+                    {(() => {
+                      const h = p.time_centiles_history || { labels: [], p50: [], p95: [] };
+                      if (!h.labels || h.labels.length < 2) {
+                        return (
+                          <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+                            ttc trend — not enough history yet
+                          </div>
+                        );
+                      }
+                      return (
+                        <div>
+                          <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                            ttc trend · per-hour
+                          </div>
+                          <LC
+                            labels={h.labels}
+                            series={[
+                              { values: h.p50, color: CP.accent },
+                              { values: h.p95, color: CP.warn },
+                            ]}
+                            height={70}
+                            formatY={fmtMs}
+                          />
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
 
@@ -459,15 +541,15 @@ function MemoryTab({ projectFilter }) {
       <div className="col-span-12 grid cols-4">
         <ST label="Graphiti nodes" value={DF.MEMORY_STATUS.graphiti.node_count.toLocaleString()}
             hint={`${DF.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`}
-            spark={[]} sparkColor={CP.accent} />
+            spark={(DF.MEMORY_STATUS.graphiti.spark?.values || []).slice(-30)} sparkColor={CP.accent} />
         <ST label="Mem0 memories" value={DF.MEMORY_STATUS.mem0.memory_count.toLocaleString()}
             hint={`${DF.MEMORY_STATUS.graphiti.episode_count.toLocaleString()} episodes`}
-            spark={[]} sparkColor={CP.info} />
+            spark={(DF.MEMORY_STATUS.mem0.spark?.values || []).slice(-30)} sparkColor={CP.info} />
         <ST label="Write queue" value={DF.MEMORY_STATUS.queue.counts.pending}
             hint={DF.MEMORY_STATUS.queue.oldest_pending_age_seconds != null
               ? `${DF.MEMORY_STATUS.queue.oldest_pending_age_seconds}s oldest`
               : 'idle'}
-            spark={[]} sparkColor={CP.warn} />
+            spark={(DF.MEMORY_STATUS.queue.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
         {(() => {
           // Combined ops (read+write) — last hour bucket, plus a per-hour spark.
           const combined = ts.reads.map((r, i) => r + (ts.writes[i] || 0));
@@ -515,16 +597,34 @@ function MemoryTab({ projectFilter }) {
         <div className="panel-head"><span className="title">Per-project memory</span></div>
         <div className="panel-body flush">
           <table className="tbl">
-            <thead><tr><th>Project</th><th className="num">Graph nodes</th><th className="num">Vector memories</th><th>Mix</th></tr></thead>
+            <thead><tr><th>Project</th><th className="num">Graph nodes</th><th className="num">Vector memories</th><th className="num">Δ-24h</th><th>Mix</th></tr></thead>
             <tbody>
               {projects.map(([pid, s]) => {
                 const total = (s.graphiti_nodes || 0) + (s.mem0_memories || 0);
                 const gPct = total > 0 ? (s.graphiti_nodes / total) * 100 : 0;
+                const fmtDelta = (cur, before) => {
+                  if (before == null || cur == null) return null;
+                  const d = cur - before;
+                  if (d === 0) return '0';
+                  const sign = d > 0 ? '+' : '';
+                  return `${sign}${d.toLocaleString()}`;
+                };
+                const dG = fmtDelta(s.graphiti_nodes, s.graphiti_nodes_24h_ago);
+                const dM = fmtDelta(s.mem0_memories, s.mem0_memories_24h_ago);
                 return (
                   <tr key={pid}>
                     <td className="mono" style={{ color: 'var(--fg-1)' }}>{pid}</td>
                     <td className="num">{(s.graphiti_nodes || 0).toLocaleString()}</td>
                     <td className="num">{(s.mem0_memories || 0).toLocaleString()}</td>
+                    <td className="num mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                      {dG == null && dM == null ? '—' : (
+                        <span>
+                          <span style={{ color: dG && dG.startsWith('-') ? 'var(--bad,#f87171)' : 'var(--fg-2)' }}>{dG ?? '—'}</span>
+                          <span style={{ color: 'var(--fg-3)' }}> / </span>
+                          <span style={{ color: dM && dM.startsWith('-') ? 'var(--bad,#f87171)' : 'var(--fg-2)' }}>{dM ?? '—'}</span>
+                        </span>
+                      )}
+                    </td>
                     <td style={{ width: 240 }}>
                       <div className="stack-bar"><span style={{ width: `${gPct}%`, background: CP.accent }} /><span style={{ width: `${100-gPct}%`, background: CP.info }} /></div>
                     </td>
@@ -574,10 +674,10 @@ function ReconTab({ projectFilter, search }) {
                 hint={r.buffer.oldest_event_age_seconds != null
                   ? `oldest ${r.buffer.oldest_event_age_seconds}s`
                   : 'idle'}
-                spark={[]} sparkColor={CP.warn} />
+                spark={(r.buffer.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
             <ST label="Active agents" value={r.burst_state.length}
                 hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`}
-                spark={[]} sparkColor={CP.accent} />
+                spark={(r.agents_spark?.values || []).slice(-30)} sparkColor={CP.accent} />
             <ST label="Last full run"
                 value={lastFullIso ? window.DF_SHELL.timeago(lastFullIso) : '—'}
                 hint={lastFullProject || 'no completed run'}
@@ -696,9 +796,22 @@ function MergeTab({ projectFilter }) {
           <div className="col-span-12 grid cols-4">
             <ST label="Merges (window)" value={totals.count}
                 spark={aggDepth} sparkColor={CP.accent} />
-            <ST label="In queue now" value={totals.active}
-                hint={`${projects.filter(([_,d])=>d.active.length>0).length} projects`}
-                spark={[]} sparkColor={CP.warn} />
+            {(() => {
+              // Aggregate the per-project active_spark series by label.
+              const labelMap = {};
+              projects.forEach(([, d]) => {
+                const sp = d.active_spark || { labels: [], values: [] };
+                (sp.labels || []).forEach((lbl, i) => {
+                  labelMap[lbl] = (labelMap[lbl] || 0) + ((sp.values || [])[i] || 0);
+                });
+              });
+              const activeSpark = Object.keys(labelMap).sort().map(k => labelMap[k]).slice(-30);
+              return (
+                <ST label="In queue now" value={totals.active}
+                    hint={`${projects.filter(([_,d])=>d.active.length>0).length} projects`}
+                    spark={activeSpark} sparkColor={CP.warn} />
+              );
+            })()}
             <ST label="Speculative hit rate"
                 value={hitPct != null ? hitPct : '—'} unit={hitPct != null ? '%' : ''}
                 hint={`${totals.hits}/${totals.hits + totals.discards} attempts`}
@@ -823,20 +936,31 @@ function CostsTab({ projectFilter }) {
         <ST label="Total spend" value={`$${c.summary.total.toFixed(2)}`}
             delta={c.summary.delta_pct != null ? `${c.summary.delta_pct}%` : null}
             deltaDir={c.summary.delta_pct == null ? null : (c.summary.delta_pct < 0 ? 'down' : 'up')}
-            spark={c.trend.values} sparkColor={CP.accent} hint="window total" />
+            spark={c.trend.values} sparkColor={CP.accent}
+            hint={c.summary.delta_pct == null && c.summary.delta_hint
+              ? c.summary.delta_hint
+              : 'window total'} />
         <ST label="Runs"
             value={c.summary.runs ? c.summary.runs.toLocaleString() : '—'}
             hint={c.summary.runs
               ? `avg $${(c.summary.total / c.summary.runs).toFixed(3)}/run`
               : 'no runs in window'}
             spark={[]} sparkColor={CP.info} />
-        <ST label="Tokens"
-            value={c.summary.tokens != null ? `${(c.summary.tokens/1e6).toFixed(2)}M` : '—'}
-            hint={c.summary.tokens != null ? '' : 'not aggregated yet'}
-            spark={[]} sparkColor={CP.ok} />
+        {(() => {
+          const t = c.summary.tokens;
+          const tot = t && typeof t === 'object' ? t.total : t;
+          const display = tot != null ? `${(tot/1e6).toFixed(2)}M` : '—';
+          const breakdown = (t && typeof t === 'object' && tot != null)
+            ? `in ${(t.input/1e6).toFixed(1)}M · out ${(t.output/1e6).toFixed(1)}M · cache ${((t.cache_read+t.cache_create)/1e6).toFixed(1)}M`
+            : 'no token data';
+          return (
+            <ST label="Tokens" value={display} hint={breakdown}
+                spark={[]} sparkColor={CP.ok} />
+          );
+        })()}
         <ST label="p95 run cost"
             value={c.summary.p95_run_cost != null ? `$${c.summary.p95_run_cost.toFixed(2)}` : '—'}
-            hint={c.summary.p95_run_cost != null ? '' : 'not aggregated yet'}
+            hint={c.summary.p95_run_cost != null ? 'across all runs' : 'no runs in window'}
             spark={[]} sparkColor={CP.warn} />
       </div>
 
@@ -944,12 +1068,27 @@ function BurnTab({ projectFilter }) {
                 delta={`${lastPending - firstPending}`}
                 deltaDir={lastPending < firstPending ? 'down' : 'up'}
                 spark={b.pending} sparkColor={CP.warn} />
-            <ST label="Forecast clear"
-                value={forecastDays != null ? `${forecastDays}d` : '—'}
-                hint={forecastDays != null
-                  ? `${lastPending} / ${velocity.toFixed(1)} per day`
-                  : (velocity === 0 ? 'velocity is zero' : 'no data')}
-                spark={[]} />
+            {(() => {
+              // Server-computed forecast confidence (recent 7d vs lifetime
+              // velocity) is null when <7 days of history. Fall back to the
+              // simple point estimate above so the tile still shows a value
+              // once any history exists.
+              const lo = b.forecast_low;
+              const hi = b.forecast_high;
+              const haveRange = lo != null && hi != null;
+              const display = haveRange
+                ? (lo === hi ? `${lo}d` : `${lo}–${hi}d`)
+                : (forecastDays != null ? `${forecastDays}d` : '—');
+              const hint = haveRange
+                ? `${lastPending} pending · 7d vs lifetime velocity`
+                : (forecastDays != null
+                    ? `${lastPending} / ${velocity.toFixed(1)} per day · need 7d for range`
+                    : (velocity === 0 ? 'velocity is zero' : 'no data'));
+              return (
+                <ST label="Forecast clear" value={display} hint={hint}
+                    spark={b.pending} sparkColor={CP.ok} />
+              );
+            })()}
           </div>
         );
       })()}

@@ -12,7 +12,7 @@
  */
 
 const ENDPOINTS = {
-  '/api/v2/dashboard/orchestrators': ['ORCHESTRATORS', 'PROJECTS'],
+  '/api/v2/dashboard/orchestrators': ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
   '/api/v2/dashboard/tasks':         ['ACTIVE_TASKS', 'FILE_LOCKS'],
   '/api/v2/dashboard/memory':        ['MEMORY_STATUS'],
   '/api/v2/dashboard/memory-graphs': ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
@@ -33,6 +33,7 @@ window.DF_DATA = {
   PROJECTS: [],
   AGENTS: [],
   ORCHESTRATORS: [],
+  ORCHESTRATORS_SPARK: { labels: [], values: [] },
   ACTIVE_TASKS: [],
   FILE_LOCKS: {},
   PERFORMANCE: {},
@@ -54,14 +55,14 @@ window.DF_DATA = {
   },
   MERGE_QUEUE: {},
   COSTS: {
-    summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null },
+    summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },
     by_project: [],
     by_account: [],
     by_role: [],
     trend: { labels: [], values: [] },
     events: [],
   },
-  BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [] },
+  BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], forecast_low: null, forecast_high: null },
   BURNDOWN_BY_PROJECT: {},
 };
 

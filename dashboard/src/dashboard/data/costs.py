@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 import aiosqlite
 
 from dashboard.data.db import with_db
+from dashboard.data.stats_utils import percentile
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +55,31 @@ async def get_cost_summary(
             'SELECT project_id, '
             '       SUM(cost_usd) AS total_spend, '
             '       COUNT(DISTINCT task_id) AS task_count, '
-            '       COUNT(DISTINCT account_name) AS account_count '
+            '       COUNT(DISTINCT account_name) AS account_count, '
+            '       SUM(input_tokens) AS input_tokens, '
+            '       SUM(output_tokens) AS output_tokens, '
+            '       SUM(cache_read_tokens) AS cache_read_tokens, '
+            '       SUM(cache_create_tokens) AS cache_create_tokens '
             '  FROM invocations '
             ' WHERE completed_at >= ? '
             ' GROUP BY project_id',
             (since,),
         )
+
+        # Per-run cost rollups for p95 percentile. Group by run_id within
+        # each project so a single run's many invocations sum to one cost.
+        run_rows = await db.execute_fetchall(
+            'SELECT project_id, run_id, SUM(cost_usd) AS run_cost '
+            '  FROM invocations '
+            ' WHERE completed_at >= ? '
+            ' GROUP BY project_id, run_id',
+            (since,),
+        )
+        run_costs_by_project: dict[str, list[float]] = {}
+        for row in run_rows:
+            run_costs_by_project.setdefault(row['project_id'], []).append(
+                row['run_cost'] or 0.0
+            )
 
         # cap_hit counts per project from account_events
         cap_rows = await db.execute_fetchall(
@@ -79,12 +99,26 @@ async def get_cost_summary(
             total_spend = row['total_spend'] or 0.0
             task_count = row['task_count'] or 0
             account_count = row['account_count']
+            input_t = row['input_tokens'] or 0
+            output_t = row['output_tokens'] or 0
+            cache_read = row['cache_read_tokens'] or 0
+            cache_create = row['cache_create_tokens'] or 0
             result[project_id] = {
                 'total_spend': total_spend,
                 'task_count': task_count,
                 'avg_cost_per_task': total_spend / task_count if task_count else 0.0,
                 'active_accounts': account_count or 0,
                 'cap_events': cap_by_project.get(project_id, 0),
+                'tokens': {
+                    'input': input_t,
+                    'output': output_t,
+                    'cache_read': cache_read,
+                    'cache_create': cache_create,
+                    'total': input_t + output_t + cache_read + cache_create,
+                },
+                # Raw per-run costs for p95 computation; aggregator concatenates
+                # across DBs before sorting so the percentile is correct globally.
+                'run_costs': run_costs_by_project.get(project_id, []),
             }
         return result
 
@@ -580,13 +614,19 @@ async def aggregate_cost_summary(
     *,
     days: int = 7,
 ) -> dict[str, dict]:
-    """Merge :func:`get_cost_summary` results from multiple databases."""
+    """Merge :func:`get_cost_summary` results from multiple databases.
+
+    Token totals are summed component-wise; per-run costs are concatenated
+    across DBs and a single global p95 is computed from the merged list.
+    """
     results = await asyncio.gather(*(get_cost_summary(db, days=days) for db in dbs))
     merged: dict[str, dict] = {}
     for result in results:
         for pid, info in result.items():
             if pid not in merged:
                 merged[pid] = dict(info)
+                merged[pid]['tokens'] = dict(info.get('tokens') or _ZERO_TOKENS)
+                merged[pid]['run_costs'] = list(info.get('run_costs') or [])
             else:
                 m = merged[pid]
                 m['total_spend'] += info['total_spend']
@@ -595,7 +635,22 @@ async def aggregate_cost_summary(
                 m['cap_events'] += info['cap_events']
                 tc = m['task_count']
                 m['avg_cost_per_task'] = m['total_spend'] / tc if tc else 0.0
+                tokens_in = info.get('tokens') or _ZERO_TOKENS
+                for key in _TOKEN_KEYS:
+                    m['tokens'][key] = m['tokens'].get(key, 0) + tokens_in.get(key, 0)
+                m['run_costs'].extend(info.get('run_costs') or [])
+    # Compute p95 once per project from the merged run_costs list. Keep the
+    # raw list in the dict so shape_costs can compute the global p95 by
+    # concatenating across projects.
+    for pid, m in merged.items():
+        run_costs = sorted(m.get('run_costs') or [])
+        m['run_costs'] = run_costs
+        m['p95_run_cost'] = percentile(run_costs, 95) if run_costs else None
     return merged
+
+
+_TOKEN_KEYS = ('input', 'output', 'cache_read', 'cache_create', 'total')
+_ZERO_TOKENS = {k: 0 for k in _TOKEN_KEYS}
 
 
 async def aggregate_cost_by_project(
