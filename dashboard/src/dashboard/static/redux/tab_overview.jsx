@@ -17,12 +17,23 @@ function OverviewTab({ paused }) {
   const queue = D.MEMORY_STATUS.queue.counts;
   const queueDepth = queue.pending + queue.retry + queue.dead;
 
-  const tputSpark = D.makeSpark(40, 5, 2, 0.05);
-  const memWriteSpark = D.MEMORY_TIMESERIES.writes.slice(-24);
-  const memReadSpark = D.MEMORY_TIMESERIES.reads.slice(-24);
-  const reconLatencySpark = D.makeSpark(40, 4, 2);
-  const costSpark = D.COSTS.trend.values.slice(-30);
-  const queueSpark = D.makeSpark(40, 5, 2);
+  // Combined memory throughput sparkline: per-hour read+write counts (last 24h).
+  const memOpsSpark = D.MEMORY_TIMESERIES.reads.map(
+    (r, i) => r + (D.MEMORY_TIMESERIES.writes[i] || 0),
+  );
+  // ops/min in the most recent hour bucket.
+  const opsLast = memOpsSpark.length ? memOpsSpark[memOpsSpark.length - 1] : 0;
+  const opsPerMin = (opsLast / 60).toFixed(1);
+  // Real recon-latency sparkline: most-recent N run durations, oldest first.
+  const reconRuns = D.RECON_STATE.runs || [];
+  const reconLatencySpark = reconRuns
+    .filter(r => r.duration_seconds != null)
+    .slice(0, 40)
+    .map(r => r.duration_seconds)
+    .reverse();
+  const costSpark = (D.COSTS.trend.values || []).slice(-30);
+  const todaySpend = D.COSTS.summary?.today ?? 0;
+  const deltaPct = D.COSTS.summary?.delta_pct;
 
   return (
     <div className="grid cols-12" style={{ gridTemplateRows: 'auto auto 1fr', gap: 12, height: '100%' }}>
@@ -30,13 +41,16 @@ function OverviewTab({ paused }) {
       {/* Row 1: KPI tiles */}
       <div className="col-span-12 grid cols-4">
         <StatTile label="Orchestrators running" value={orchRunning} unit={`/ ${D.ORCHESTRATORS.length}`}
-          spark={D.makeSpark(40, 3, 1, 0.02)} sparkColor={P.accent} delta="+1" deltaDir="up" hint="live" />
+          spark={[]} sparkColor={P.accent} hint="live" />
         <StatTile label="Active tasks" value={tasksInP + tasksBlocked} unit={`/ ${tasksTotal}`}
-          spark={D.makeSpark(40, 8, 2)} sparkColor={P.accent} hint={`${tasksDone} done`} delta="+3 (24h)" deltaDir="up" />
-        <StatTile label="Memory operations / min" value="142" unit="ops"
-          spark={tputSpark} sparkColor={P.ok} delta="+12%" deltaDir="up" hint="rolling 1m" />
-        <StatTile label="Spend (24h)" value="$12.84" delta="−8%" deltaDir="down"
-          spark={costSpark} sparkColor={P.warn} hint={`p95 run $${D.COSTS.summary.p95_run_cost}`} />
+          spark={D.BURNDOWN.in_progress} sparkColor={P.accent} hint={`${tasksDone} done`} />
+        <StatTile label="Memory ops / min" value={opsPerMin} unit="ops"
+          spark={memOpsSpark} sparkColor={P.ok} hint="last 24h hourly" />
+        <StatTile label="Spend (today)" value={`$${todaySpend.toFixed(2)}`}
+          delta={deltaPct != null ? `${deltaPct}%` : null}
+          deltaDir={deltaPct != null ? (deltaPct < 0 ? 'down' : 'up') : null}
+          spark={costSpark} sparkColor={P.warn}
+          hint={D.COSTS.summary?.runs ? `${D.COSTS.summary.runs} runs (window)` : 'no cost data'} />
       </div>
 
       {/* Row 2: Wide chart + side panels */}
@@ -50,7 +64,6 @@ function OverviewTab({ paused }) {
           <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'var(--fg-2)' }}>
             <span><span style={{ display: 'inline-block', width: 10, height: 2, background: P.accent, marginRight: 5, verticalAlign: 'middle' }}></span>memory reads</span>
             <span><span style={{ display: 'inline-block', width: 10, height: 2, background: P.ok, marginRight: 5, verticalAlign: 'middle' }}></span>memory writes</span>
-            <span><span style={{ display: 'inline-block', width: 10, height: 2, background: P.warn, marginRight: 5, verticalAlign: 'middle' }}></span>recon runs</span>
           </div>
           <div style={{ flex: 1, minHeight: 200 }}>
             <LineChart
@@ -58,7 +71,6 @@ function OverviewTab({ paused }) {
               series={[
                 { values: D.MEMORY_TIMESERIES.reads,  color: P.accent },
                 { values: D.MEMORY_TIMESERIES.writes, color: P.ok, fill: false },
-                { values: D.MEMORY_TIMESERIES.reads.map(v => Math.round(v / 50)), color: P.warn, fill: false },
               ]}
               height={210}
               formatY={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : Math.round(v)}
@@ -139,7 +151,12 @@ function OverviewTab({ paused }) {
             { l: 'Mem0',     sub: `${D.MEMORY_STATUS.mem0.memory_count.toLocaleString()} memories`, ok: true },
             { l: 'Taskmaster', sub: 'mcp v0.18 · responsive', ok: true },
             { l: 'Write queue', sub: `${queue.pending} pending · ${queue.retry} retry · ${queue.dead} dead`, ok: queue.dead === 0, warn: queue.pending > 5 || queue.retry > 0 },
-            { l: 'Reconciliation', sub: `verdict: ${D.RECON_STATE.verdict.severity} · ${D.RECON_STATE.verdict.action_taken}`, ok: D.RECON_STATE.verdict.severity !== 'serious', warn: D.RECON_STATE.verdict.severity === 'minor' },
+            (() => {
+              const v = D.RECON_STATE.verdict;
+              const sev = v?.severity || 'none';
+              const action = v?.action_taken || 'none';
+              return { l: 'Reconciliation', sub: `verdict: ${sev} · ${action}`, ok: sev !== 'serious', warn: sev === 'minor' };
+            })(),
           ].map(s => (
             <div key={s.l} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 8, alignItems: 'center' }}>
               <span className={`dot ${s.ok ? (s.warn ? 'warn' : 'ok') : 'bad'}`}></span>

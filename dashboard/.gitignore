@@ -1,0 +1,5 @@
+# Build artefact left behind by an earlier Tailwind toolchain (now removed).
+# The toolchain itself is gone but a stale tailwind.css and bin/tailwindcss
+# may linger in checkouts that were once running it.
+src/dashboard/static/tailwind.css
+bin/

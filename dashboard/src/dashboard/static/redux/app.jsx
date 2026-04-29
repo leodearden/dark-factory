@@ -76,13 +76,15 @@ function App() {
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
-  // Topbar status summary
+  // Topbar status summary — all derived from real data.  `spend24h` is the
+  // current-day total from COSTS.summary.today (server-computed from the
+  // cost trend tail).  Falls back to 0 if cost data hasn't loaded yet.
   const summary = {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
     tasksActive: DD.ORCHESTRATORS.reduce((s, o) => s + o.summary.in_progress + o.summary.blocked, 0),
     queue: DD.MEMORY_STATUS.queue.counts.pending,
-    spend24h: 12.84,
+    spend24h: DD.COSTS?.summary?.today ?? 0,
   };
 
   const railCounts = {

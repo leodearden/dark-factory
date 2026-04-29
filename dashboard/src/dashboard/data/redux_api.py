@@ -335,10 +335,19 @@ def shape_costs(
                 continue
             day_totals[day] = day_totals.get(day, 0.0) + float(entry.get('total') or 0.0)
     sorted_days = sorted(day_totals)
+    trend_values = [round(day_totals[d], 4) for d in sorted_days]
     trend_block = {
         'labels': sorted_days,
-        'values': [round(day_totals[d], 4) for d in sorted_days],
+        'values': trend_values,
     }
+    # Day-over-day delta from the tail of the trend.  Returns None when there
+    # isn't enough history to compute it (consumers render '—').
+    if len(trend_values) >= 2 and trend_values[-2] > 0:
+        delta_pct = round(
+            (trend_values[-1] - trend_values[-2]) / trend_values[-2] * 100, 1,
+        )
+    else:
+        delta_pct = None
 
     # ── events ── (already a flat list, normalise field names)
     events_list = [
@@ -352,13 +361,16 @@ def shape_costs(
         for ev in events
     ]
 
-    # delta_pct/p95_run_cost: not derivable from the existing aggregators in v1.
+    # tokens / p95_run_cost: not aggregated server-side yet.  Returned as None
+    # so the UI can render '—' rather than a misleading 0.  delta_pct comes
+    # from the trend tail above.
     summary_block = {
         'total': round(total, 4),
         'runs': runs,
-        'tokens': 0,
-        'p95_run_cost': 0.0,
-        'delta_pct': 0.0,
+        'today': trend_values[-1] if trend_values else 0.0,
+        'tokens': None,
+        'p95_run_cost': None,
+        'delta_pct': delta_pct,
     }
 
     return {'COSTS': {

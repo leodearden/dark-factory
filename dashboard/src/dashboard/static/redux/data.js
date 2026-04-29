@@ -27,29 +27,6 @@ const ENDPOINTS = {
 // in place rather than reassigning, so cached references stay valid.
 const STABLE_ARRAY_KEYS = new Set(['PROJECTS', 'AGENTS']);
 
-// Deterministic random walk used by every tab for cosmetic KPI sparklines.
-// The original mock data.js exposed this on DF_DATA; the redux components
-// still call DF_DATA.makeSpark even after we wire real data into the same
-// global, so we keep the helper here.
-function _mulberry32(seed) {
-  return function () {
-    let t = (seed += 0x6D2B79F5);
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const _sparkRng = _mulberry32(42);
-function _makeSpark(n, base, amp, trend = 0) {
-  const out = [];
-  let v = base;
-  for (let i = 0; i < n; i++) {
-    v += (_sparkRng() - 0.5) * amp + trend;
-    out.push(Math.max(0, v));
-  }
-  return out;
-}
-
 // ── Empty defaults — all keys initialised so the first render before fetch
 //    completes does not crash any component reading DF_DATA.* ──
 window.DF_DATA = {
@@ -77,7 +54,7 @@ window.DF_DATA = {
   },
   MERGE_QUEUE: {},
   COSTS: {
-    summary: { total: 0, runs: 0, tokens: 0, p95_run_cost: 0, delta_pct: 0 },
+    summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null },
     by_project: [],
     by_account: [],
     by_role: [],
@@ -86,17 +63,6 @@ window.DF_DATA = {
   },
   BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [] },
   BURNDOWN_BY_PROJECT: {},
-  // Sparkline helper exposed to component code (cosmetic only).
-  makeSpark: _makeSpark,
-  // Static templates for the live-feed simulator in shell.jsx.  Not fetched.
-  FEED_TEMPLATES: [
-    ['mem0',     'add_memory · {agent} · {category}'],
-    ['graphiti', 'episode created · {project} · {entities} entities'],
-    ['recon',    'run {run} {status} · {events} events · {dur}'],
-    ['merge',    'merged {task} · {outcome} · {dur}'],
-    ['orch',     'task {task} → {state} · {agent}'],
-    ['cost',     '{account} spend +${amt}'],
-  ],
 };
 
 function applyKey(key, value) {

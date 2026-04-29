@@ -3,7 +3,23 @@ const { useState, useEffect, useMemo, useRef } = React;
 const SP_SHELL = window.DF_CHARTS.Sparkline;
 const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
 const SHELL_AGENTS = window.DF_DATA.AGENTS;
-const SHELL_FEED_TEMPLATES = window.DF_DATA.FEED_TEMPLATES;
+
+// Format a UTC ISO8601 timestamp as a relative string ("now", "12s", "4m", "2h", "1d").
+// Returns "—" for null/undefined/unparseable input.
+function timeago(iso) {
+  if (!iso) return '—';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return '—';
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (sec < 5) return 'now';
+  if (sec < 60) return `${sec}s`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h`;
+  const d = Math.round(hr / 24);
+  return `${d}d`;
+}
 
 // ── Glyphs (simple shapes only — no complex SVG) ──
 const Glyph = ({ kind }) => {
@@ -154,60 +170,81 @@ function Toolbar({
 }
 
 // ── Live feed (pinned bottom of overview) ──
-function makeFeedEntries(n) {
-  const out = [];
-  const cats = ['decisions_and_rationale', 'temporal_facts', 'observations_and_summaries', 'preferences_and_norms'];
-  const states = ['in-progress', 'done', 'blocked', 'pending'];
-  const outcomes = ['done', 'conflict', 'already_merged'];
-  const accs = ['anthropic-pri', 'anthropic-sec', 'openai'];
-  const statuses = ['success', 'partial'];
-  for (let i = 0; i < n; i++) {
-    const tpl = SHELL_FEED_TEMPLATES[Math.floor(Math.random() * SHELL_FEED_TEMPLATES.length)];
-    const project = SHELL_PROJECTS[Math.floor(Math.random() * SHELL_PROJECTS.length)].name;
-    const agent = SHELL_AGENTS[Math.floor(Math.random() * SHELL_AGENTS.length)];
-    const fields = {
-      agent, project,
-      category: cats[Math.floor(Math.random() * cats.length)],
-      entities: 3 + Math.floor(Math.random() * 8),
-      run: 'R-' + (9000 + Math.floor(Math.random() * 300)),
-      events: 5 + Math.floor(Math.random() * 80),
-      dur: (1 + Math.random() * 18).toFixed(1) + 's',
-      task: 'T-' + Math.floor(Math.random() * 30),
-      outcome: outcomes[Math.floor(Math.random() * outcomes.length)],
-      state: states[Math.floor(Math.random() * states.length)],
-      account: accs[Math.floor(Math.random() * accs.length)],
-      amt: (Math.random() * 0.5).toFixed(3),
-      status: statuses[Math.floor(Math.random() * statuses.length)],
-    };
-    let msg = tpl[1];
-    Object.entries(fields).forEach(([k, v]) => { msg = msg.replace(`{${k}}`, v); });
-    const secAgo = i * (3 + Math.floor(Math.random() * 5));
-    out.push({ ts: secAgo === 0 ? 'now' : `${secAgo}s`, src: tpl[0], msg, key: i });
+//
+// Builds a unified stream from real events already present in DF_DATA:
+//   - reconciliation runs (RECON_STATE.runs) — id, status, project, events
+//   - merge queue activity (MERGE_QUEUE[pid].recent + .active) — task, outcome
+//   - cost / account events (COSTS.events) — account, event_type, detail
+// Each source is normalised to {ts, src, msg, key}, sorted by timestamp,
+// trimmed to the most recent 60.
+function buildFeedEntries(D) {
+  const rows = [];
+
+  for (const r of (D.RECON_STATE.runs || [])) {
+    if (!r.started_at) continue;
+    const dur = r.duration_seconds != null ? `${r.duration_seconds.toFixed(1)}s` : '—';
+    rows.push({
+      key: `recon:${r.id}`,
+      iso: r.started_at,
+      src: 'recon',
+      msg: `run ${r.id} ${r.status} · ${r.events_processed ?? 0} events · ${dur}`,
+    });
   }
-  return out;
+
+  for (const [pid, mq] of Object.entries(D.MERGE_QUEUE || {})) {
+    for (const m of (mq.recent || [])) {
+      if (!m.timestamp) continue;
+      const dur = m.duration_ms != null ? `${(m.duration_ms / 1000).toFixed(1)}s` : '—';
+      rows.push({
+        key: `merge:${pid}:${m.task_id}:${m.timestamp}`,
+        iso: m.timestamp,
+        src: 'merge',
+        msg: `${pid} · T-${m.task_id} · ${m.outcome} · ${dur}`,
+      });
+    }
+    for (const a of (mq.active || [])) {
+      if (!a.timestamp) continue;
+      rows.push({
+        key: `mq-active:${pid}:${a.task_id}:${a.timestamp}`,
+        iso: a.timestamp,
+        src: 'queue',
+        msg: `${pid} · T-${a.task_id} ${a.state} · ${a.branch || ''}`.trim(),
+      });
+    }
+  }
+
+  for (const e of (D.COSTS.events || [])) {
+    if (!e.ts) continue;
+    rows.push({
+      key: `cost:${e.account}:${e.ts}`,
+      iso: e.ts,
+      src: 'cost',
+      msg: `${e.account} ${e.event}${e.detail ? ' · ' + e.detail : ''}`,
+    });
+  }
+
+  rows.sort((a, b) => (a.iso < b.iso ? 1 : a.iso > b.iso ? -1 : 0));
+  return rows.slice(0, 60).map(r => ({ ...r, ts: timeago(r.iso) }));
 }
 
 function LiveFeed({ paused }) {
-  const [entries, setEntries] = useState(() => makeFeedEntries(40));
+  const [, tick] = useState(0);
+  // Re-tick every 2s so the relative timeago strings refresh even when
+  // DF_DATA hasn't changed.  Suspends while paused.
   useEffect(() => {
     if (paused) return;
-    const t = setInterval(() => {
-      setEntries(prev => {
-        const fresh = makeFeedEntries(1)[0];
-        fresh.key = Date.now();
-        fresh.ts = 'now';
-        return [fresh, ...prev.slice(0, 60).map(e => {
-          if (e.ts === 'now') return { ...e, ts: '2s' };
-          if (e.ts.endsWith('s')) {
-            const n = parseInt(e.ts) + 2;
-            return { ...e, ts: n >= 60 ? '1m' : `${n}s` };
-          }
-          return e;
-        })];
-      });
-    }, 1800);
+    const t = setInterval(() => tick(n => n + 1), 2000);
     return () => clearInterval(t);
   }, [paused]);
+
+  const entries = buildFeedEntries(window.DF_DATA);
+  if (entries.length === 0) {
+    return (
+      <div className="feed">
+        <div className="row"><span className="msg" style={{ color: 'var(--fg-3)' }}>no recent events</span></div>
+      </div>
+    );
+  }
   return (
     <div className="feed">
       {entries.map(e => (
@@ -301,4 +338,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago };

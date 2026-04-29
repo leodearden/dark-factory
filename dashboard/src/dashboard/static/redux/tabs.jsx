@@ -56,6 +56,46 @@ const fmtMs = ms => {
   return `${(m/60).toFixed(1)}h`;
 };
 
+// ── Cross-project aggregation helpers (no synthetic fallbacks) ──
+// PERFORMANCE is keyed by project; each entry has paths/escalation/hist/ttc.
+// These helpers return null when there's no data so the UI can render '—'.
+function _weightedMean(samples) {
+  // samples: [[value, weight], ...].  Returns null when total weight is 0.
+  let num = 0, den = 0;
+  for (const [v, w] of samples) {
+    if (v == null || !w) continue;
+    num += v * w;
+    den += w;
+  }
+  return den > 0 ? num / den : null;
+}
+
+function aggTtcMs(perf, percentile) {
+  // Weighted by per-project task count so big projects dominate.
+  const samples = Object.values(perf || {})
+    .map(p => [p.ttc?.[percentile], p.ttc?.count || 0]);
+  return _weightedMean(samples);
+}
+
+function aggOnePassPct(perf) {
+  let onePass = 0, total = 0;
+  for (const p of Object.values(perf || {})) {
+    for (const path of (p.paths || [])) {
+      total += path.count || 0;
+      if (path.path === 'one-pass') onePass += path.count || 0;
+    }
+  }
+  return total > 0 ? (onePass / total) * 100 : null;
+}
+
+function aggEscalationRate(perf, kind /* 'steward_rate' | 'interactive_rate' */) {
+  // Each project's escalation block carries a *_count and total_tasks; we don't
+  // get total_tasks back in the redux shape, so weight by ttc.count instead.
+  const samples = Object.values(perf || {})
+    .map(p => [p.escalation?.[kind], p.ttc?.count || 0]);
+  return _weightedMean(samples);
+}
+
 // ── Deps + locks chip lists ──
 function shortPath(p) {
   // strip leading dirs, keep filename + parent
@@ -150,10 +190,10 @@ function OrchTab({ projectFilter, search }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
-        <ST label="Orchestrators" value={matches.length} hint={`${matches.filter(o=>o.running).length} running`} spark={DF.makeSpark(40,3,1,0.02)} sparkColor={CP.accent} />
-        <ST label="Tasks in flight" value={matches.reduce((s,o)=>s+o.summary.in_progress,0)} spark={DF.makeSpark(40,4,2)} sparkColor={CP.accent} />
-        <ST label="Blocked" value={matches.reduce((s,o)=>s+o.summary.blocked,0)} spark={DF.makeSpark(40,1,0.5)} sparkColor={CP.bad} />
-        <ST label="Avg outer-loop count" value="1.6" hint="last 50 tasks" spark={DF.makeSpark(40,1.6,0.3)} sparkColor={CP.warn} />
+        <ST label="Orchestrators" value={matches.length} hint={`${matches.filter(o=>o.running).length} running`} spark={[]} sparkColor={CP.accent} />
+        <ST label="Tasks in flight" value={matches.reduce((s,o)=>s+o.summary.in_progress,0)} spark={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
+        <ST label="Blocked" value={matches.reduce((s,o)=>s+o.summary.blocked,0)} spark={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
+        <ST label="Pending" value={matches.reduce((s,o)=>s+o.summary.pending,0)} spark={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
@@ -270,8 +310,11 @@ function OrchTab({ projectFilter, search }) {
                   </div>
                   <div>
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Started · {o.started}</div>
-                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Throughput · 24h</div>
-                    <div style={{ height: 50 }}><SP values={DF.makeSpark(48, 2, 1.5, 0.05)} color={CP.accent} /></div>
+                    <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · 30d</div>
+                    {(() => {
+                      const pb = DF.BURNDOWN_BY_PROJECT[o.project];
+                      return <div style={{ height: 50 }}><SP values={pb?.done || []} color={CP.accent} /></div>;
+                    })()}
                   </div>
                 </div>
               </div>
@@ -291,10 +334,31 @@ function PerfTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
-        <ST label="p50 time-to-completion" value="18" unit="m" spark={DF.makeSpark(40,18,4)} sparkColor={CP.accent} delta="−12%" deltaDir="down" />
-        <ST label="p95 time-to-completion" value="142" unit="m" spark={DF.makeSpark(40,140,40)} sparkColor={CP.warn} delta="+4%" deltaDir="up" />
-        <ST label="One-pass success" value="51.9" unit="%" spark={DF.makeSpark(40,52,5)} sparkColor={CP.ok} delta="+2.1pp" deltaDir="up" />
-        <ST label="Human escalation rate" value="7.4" unit="%" spark={DF.makeSpark(40,7,2)} sparkColor={CP.warn} hint="interactive" delta="−1.2pp" deltaDir="down" />
+        {(() => {
+          const subset = projectFilter.length === 0
+            ? DF.PERFORMANCE
+            : Object.fromEntries(Object.entries(DF.PERFORMANCE).filter(([pid]) => projectFilter.includes(pid)));
+          const p50 = aggTtcMs(subset, 'p50');
+          const p95 = aggTtcMs(subset, 'p95');
+          const onePass = aggOnePassPct(subset);
+          const escalation = aggEscalationRate(subset, 'interactive_rate');
+          const totalTasks = Object.values(subset).reduce((s, p) => s + (p.ttc?.count || 0), 0);
+          const fmtPct = v => v == null ? '—' : `${v.toFixed(1)}`;
+          return (
+            <>
+              <ST label="p50 time-to-completion"
+                value={p50 == null ? '—' : fmtMs(p50)}
+                hint={`${totalTasks} tasks (window)`} spark={[]} sparkColor={CP.accent} />
+              <ST label="p95 time-to-completion"
+                value={p95 == null ? '—' : fmtMs(p95)}
+                hint={`${totalTasks} tasks (window)`} spark={[]} sparkColor={CP.warn} />
+              <ST label="One-pass success" value={fmtPct(onePass)} unit={onePass == null ? '' : '%'}
+                hint={onePass == null ? 'no tasks' : 'across all paths'} spark={[]} sparkColor={CP.ok} />
+              <ST label="Human escalation rate" value={fmtPct(escalation)} unit={escalation == null ? '' : '%'}
+                hint="interactive" spark={[]} sparkColor={CP.warn} />
+            </>
+          );
+        })()}
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
@@ -363,10 +427,9 @@ function PerfTab({ projectFilter }) {
                         </div>
                       ))}
                     </div>
-                    <div>
-                      <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Trend · 7d</div>
-                      <div style={{ height: 40 }}><SP values={DF.makeSpark(40, p.ttc.p50/60_000, 8)} color={CP.accent} /></div>
-                    </div>
+                    {/* Per-project ttc trend would need a time-series of completed-task durations
+                        — the existing aggregator returns a single point-in-time percentile.
+                        Omitted until that history is exposed. */}
                   </div>
                 </div>
 
@@ -394,10 +457,26 @@ function MemoryTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
-        <ST label="Graphiti nodes" value={DF.MEMORY_STATUS.graphiti.node_count.toLocaleString()} hint={`${DF.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`} spark={DF.makeSpark(40,14000,200,12)} sparkColor={CP.accent} />
-        <ST label="Mem0 memories" value={DF.MEMORY_STATUS.mem0.memory_count.toLocaleString()} hint={`${DF.MEMORY_STATUS.graphiti.episode_count.toLocaleString()} episodes`} spark={DF.makeSpark(40,7800,80,5)} sparkColor={CP.info} />
-        <ST label="Write queue" value={DF.MEMORY_STATUS.queue.counts.pending} hint={`${DF.MEMORY_STATUS.queue.oldest_pending_age_seconds}s oldest`} spark={DF.makeSpark(40,4,2)} sparkColor={CP.warn} />
-        <ST label="Ops / hr" value="912" delta="+4%" deltaDir="up" spark={ts.reads} sparkColor={CP.accent} />
+        <ST label="Graphiti nodes" value={DF.MEMORY_STATUS.graphiti.node_count.toLocaleString()}
+            hint={`${DF.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`}
+            spark={[]} sparkColor={CP.accent} />
+        <ST label="Mem0 memories" value={DF.MEMORY_STATUS.mem0.memory_count.toLocaleString()}
+            hint={`${DF.MEMORY_STATUS.graphiti.episode_count.toLocaleString()} episodes`}
+            spark={[]} sparkColor={CP.info} />
+        <ST label="Write queue" value={DF.MEMORY_STATUS.queue.counts.pending}
+            hint={DF.MEMORY_STATUS.queue.oldest_pending_age_seconds != null
+              ? `${DF.MEMORY_STATUS.queue.oldest_pending_age_seconds}s oldest`
+              : 'idle'}
+            spark={[]} sparkColor={CP.warn} />
+        {(() => {
+          // Combined ops (read+write) — last hour bucket, plus a per-hour spark.
+          const combined = ts.reads.map((r, i) => r + (ts.writes[i] || 0));
+          const last = combined.length ? combined[combined.length - 1] : 0;
+          return (
+            <ST label="Ops / hr" value={last.toLocaleString()}
+                spark={combined} sparkColor={CP.accent} hint="last 24h" />
+          );
+        })()}
       </div>
 
       <div className="col-span-8 panel">
@@ -436,20 +515,19 @@ function MemoryTab({ projectFilter }) {
         <div className="panel-head"><span className="title">Per-project memory</span></div>
         <div className="panel-body flush">
           <table className="tbl">
-            <thead><tr><th>Project</th><th className="num">Graph nodes</th><th className="num">Vector memories</th><th>Mix</th><th className="num">Δ 24h</th></tr></thead>
+            <thead><tr><th>Project</th><th className="num">Graph nodes</th><th className="num">Vector memories</th><th>Mix</th></tr></thead>
             <tbody>
               {projects.map(([pid, s]) => {
-                const total = s.graphiti_nodes + s.mem0_memories;
-                const gPct = s.graphiti_nodes / total * 100;
+                const total = (s.graphiti_nodes || 0) + (s.mem0_memories || 0);
+                const gPct = total > 0 ? (s.graphiti_nodes / total) * 100 : 0;
                 return (
                   <tr key={pid}>
                     <td className="mono" style={{ color: 'var(--fg-1)' }}>{pid}</td>
-                    <td className="num">{s.graphiti_nodes.toLocaleString()}</td>
-                    <td className="num">{s.mem0_memories.toLocaleString()}</td>
+                    <td className="num">{(s.graphiti_nodes || 0).toLocaleString()}</td>
+                    <td className="num">{(s.mem0_memories || 0).toLocaleString()}</td>
                     <td style={{ width: 240 }}>
                       <div className="stack-bar"><span style={{ width: `${gPct}%`, background: CP.accent }} /><span style={{ width: `${100-gPct}%`, background: CP.info }} /></div>
                     </td>
-                    <td className="num" style={{ color: CP.ok }}>+{Math.floor(Math.random()*40+5)}</td>
                   </tr>
                 );
               })}
@@ -464,15 +542,54 @@ function MemoryTab({ projectFilter }) {
 // ── Reconciliation ──
 function ReconTab({ projectFilter, search }) {
   const r = DF.RECON_STATE;
-  const runs = r.runs.filter(x => (projectFilter.length === 0 || projectFilter.includes(x.project)) && (!search || x.id.toLowerCase().includes(search.toLowerCase())));
+  const runs = r.runs.filter(x => {
+    const pid = x.project_id || x.project;
+    return (projectFilter.length === 0 || projectFilter.includes(pid))
+      && (!search || x.id.toLowerCase().includes(search.toLowerCase()));
+  });
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
-      <div className="col-span-12 grid cols-4">
-        <ST label="Buffered events" value={r.buffer.buffered_count} hint={`oldest ${r.buffer.oldest_event_age_seconds}s`} spark={DF.makeSpark(40,40,15)} sparkColor={CP.warn} />
-        <ST label="Active agents" value={r.burst_state.length} hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`} spark={DF.makeSpark(40,4,1)} sparkColor={CP.accent} />
-        <ST label="Last full run" value="8" unit="m ago" delta="success" deltaDir="up" hint="dark_factory" />
-        <ST label="Run success rate" value="92" unit="%" delta="+3pp" deltaDir="up" spark={DF.makeSpark(40,92,5)} sparkColor={CP.ok} />
-      </div>
+      {(() => {
+        // Derive "Last full run" from per-project watermarks: pick the most
+        // recent last_full_run_completed across all projects.
+        let lastFullProject = null, lastFullIso = null;
+        for (const [pid, w] of Object.entries(r.watermarks || {})) {
+          const ts = w.last_full_run_completed;
+          if (ts && (!lastFullIso || ts > lastFullIso)) {
+            lastFullIso = ts; lastFullProject = pid;
+          }
+        }
+        const totalRuns = r.runs.length;
+        const successCount = r.runs.filter(x => x.status === 'success').length;
+        const successPct = totalRuns ? Math.round(successCount / totalRuns * 100) : null;
+        // Sparkline of recent run durations (oldest first).
+        const durSpark = r.runs
+          .filter(x => x.duration_seconds != null)
+          .slice(0, 40)
+          .map(x => x.duration_seconds)
+          .reverse();
+        return (
+          <div className="col-span-12 grid cols-4">
+            <ST label="Buffered events" value={r.buffer.buffered_count}
+                hint={r.buffer.oldest_event_age_seconds != null
+                  ? `oldest ${r.buffer.oldest_event_age_seconds}s`
+                  : 'idle'}
+                spark={[]} sparkColor={CP.warn} />
+            <ST label="Active agents" value={r.burst_state.length}
+                hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`}
+                spark={[]} sparkColor={CP.accent} />
+            <ST label="Last full run"
+                value={lastFullIso ? window.DF_SHELL.timeago(lastFullIso) : '—'}
+                hint={lastFullProject || 'no completed run'}
+                spark={[]} />
+            <ST label="Run success rate"
+                value={successPct != null ? successPct : '—'}
+                unit={successPct != null ? '%' : ''}
+                hint={`${totalRuns} runs · last ${durSpark.length} durations`}
+                spark={durSpark} sparkColor={CP.ok} />
+          </div>
+        );
+      })()}
 
       <div className="col-span-4 panel">
         <div className="panel-head"><span className="title">Burst state</span></div>
@@ -484,7 +601,7 @@ function ReconTab({ projectFilter, search }) {
                 <tr key={b.agent_id}>
                   <td className="mono" style={{ fontSize: 11 }}>{b.agent_id}</td>
                   <td><span className={`badge ${b.state === 'bursting' ? 'accent' : b.state === 'cooling' ? 'warn' : b.state === 'running' ? 'info' : 'muted'}`}>{b.state}</span></td>
-                  <td style={{ color: 'var(--fg-3)' }}>{b.last_write_at}</td>
+                  <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(b.last_write_at)}</td>
                 </tr>
               ))}
             </tbody>
@@ -501,10 +618,10 @@ function ReconTab({ projectFilter, search }) {
               {Object.entries(r.watermarks).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid)).map(([pid, w]) => (
                 <tr key={pid}>
                   <td className="mono" style={{ color: 'var(--fg-1)' }}>{pid}</td>
-                  <td style={{ color: 'var(--fg-2)' }}>{w.last_full_run_completed}</td>
-                  <td style={{ color: 'var(--fg-2)' }}>{w.last_episode_timestamp}</td>
-                  <td style={{ color: 'var(--fg-2)' }}>{w.last_memory_timestamp}</td>
-                  <td style={{ color: 'var(--fg-2)' }}>{w.last_task_change_timestamp}</td>
+                  <td style={{ color: 'var(--fg-2)' }}>{window.DF_SHELL.timeago(w.last_full_run_completed)}</td>
+                  <td style={{ color: 'var(--fg-2)' }}>{window.DF_SHELL.timeago(w.last_episode_timestamp)}</td>
+                  <td style={{ color: 'var(--fg-2)' }}>{window.DF_SHELL.timeago(w.last_memory_timestamp)}</td>
+                  <td style={{ color: 'var(--fg-2)' }}>{window.DF_SHELL.timeago(w.last_task_change_timestamp)}</td>
                 </tr>
               ))}
             </tbody>
@@ -524,14 +641,14 @@ function ReconTab({ projectFilter, search }) {
               {runs.map(rn => (
                 <tr key={rn.id}>
                   <td className="mono" style={{ color: 'var(--accent)' }}>{rn.id}</td>
-                  <td className="mono">{rn.project}</td>
-                  <td style={{ color: 'var(--fg-2)' }}>{rn.trigger}</td>
-                  <td>{rn.type}</td>
-                  <td><span className={`badge ${rn.status === 'success' ? 'ok' : rn.status === 'failed' ? 'bad' : 'warn'}`}>{rn.status}</span></td>
-                  <td className="num">{rn.events}</td>
-                  <td className="num">{rn.duration_seconds}s</td>
-                  <td style={{ color: 'var(--fg-3)' }}>{rn.started_at}</td>
-                  <td className="num"><span className="badge accent">{rn.journal_entry_count}</span></td>
+                  <td className="mono">{rn.project_id || rn.project}</td>
+                  <td style={{ color: 'var(--fg-2)' }}>{rn.trigger_reason || rn.trigger}</td>
+                  <td>{rn.run_type || rn.type}</td>
+                  <td><span className={`badge ${rn.status === 'success' || rn.status === 'completed' ? 'ok' : rn.status === 'failed' ? 'bad' : 'warn'}`}>{rn.status}</span></td>
+                  <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
+                  <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
+                  <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>
+                  <td className="num"><span className="badge accent">{rn.journal_entry_count ?? 0}</span></td>
                 </tr>
               ))}
             </tbody>
@@ -556,12 +673,43 @@ function MergeTab({ projectFilter }) {
   }), { count: 0, hits: 0, discards: 0, active: 0 });
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
-      <div className="col-span-12 grid cols-4">
-        <ST label="Merges (window)" value={totals.count} spark={DF.makeSpark(40,28,5)} sparkColor={CP.accent} />
-        <ST label="In queue now" value={totals.active} hint={`${projects.filter(([_,d])=>d.active.length>0).length} projects`} spark={DF.makeSpark(40,3,1.5)} sparkColor={CP.warn} />
-        <ST label="Speculative hit rate" value={Math.round(totals.hits/(totals.hits+totals.discards||1)*100)} unit="%" delta="+4pp" deltaDir="up" spark={DF.makeSpark(40,70,8)} sparkColor={CP.ok} />
-        <ST label="p95 latency" value="24.1" unit="s" spark={DF.makeSpark(40,24,5)} sparkColor={CP.warn} />
-      </div>
+      {(() => {
+        // Aggregate the per-project queue-depth time-series by index. Different
+        // projects can have different bucket counts; we line them up at the
+        // tail so the most-recent buckets stay aligned.
+        const allDepths = projects.map(([, d]) => d.depth?.values || []);
+        const maxLen = allDepths.reduce((m, a) => Math.max(m, a.length), 0);
+        const aggDepth = Array.from({ length: maxLen }, (_, i) =>
+          allDepths.reduce((s, a) => {
+            const off = a.length - maxLen;
+            const val = a[i + off];
+            return s + (val || 0);
+          }, 0),
+        );
+        // Worst-case p95 across projects (max — informative for SLO).
+        const p95s = projects.map(([, d]) => d.latency?.p95).filter(v => v != null && v > 0);
+        const p95 = p95s.length ? Math.max(...p95s) : null;
+        const hitPct = totals.hits + totals.discards > 0
+          ? Math.round(totals.hits / (totals.hits + totals.discards) * 100)
+          : null;
+        return (
+          <div className="col-span-12 grid cols-4">
+            <ST label="Merges (window)" value={totals.count}
+                spark={aggDepth} sparkColor={CP.accent} />
+            <ST label="In queue now" value={totals.active}
+                hint={`${projects.filter(([_,d])=>d.active.length>0).length} projects`}
+                spark={[]} sparkColor={CP.warn} />
+            <ST label="Speculative hit rate"
+                value={hitPct != null ? hitPct : '—'} unit={hitPct != null ? '%' : ''}
+                hint={`${totals.hits}/${totals.hits + totals.discards} attempts`}
+                spark={[]} sparkColor={CP.ok} />
+            <ST label="p95 latency · worst project"
+                value={p95 != null ? fmtMs(p95) : '—'}
+                hint={p95s.length ? `${p95s.length} projects` : 'no merges'}
+                spark={[]} sparkColor={CP.warn} />
+          </div>
+        );
+      })()}
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
@@ -672,10 +820,24 @@ function CostsTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
-        <ST label="Total spend" value={`$${c.summary.total.toFixed(2)}`} delta={`${c.summary.delta_pct}%`} deltaDir={c.summary.delta_pct < 0 ? 'down' : 'up'} spark={c.trend.values} sparkColor={CP.accent} />
-        <ST label="Runs" value={c.summary.runs.toLocaleString()} hint={`avg $${(c.summary.total/c.summary.runs).toFixed(3)}/run`} spark={DF.makeSpark(40,14,3)} sparkColor={CP.info} />
-        <ST label="Tokens" value={`${(c.summary.tokens/1e6).toFixed(2)}M`} spark={DF.makeSpark(40,50,10)} sparkColor={CP.ok} />
-        <ST label="p95 run cost" value={`$${c.summary.p95_run_cost.toFixed(2)}`} delta="+$0.12" deltaDir="up" spark={DF.makeSpark(40,1.4,0.2)} sparkColor={CP.warn} />
+        <ST label="Total spend" value={`$${c.summary.total.toFixed(2)}`}
+            delta={c.summary.delta_pct != null ? `${c.summary.delta_pct}%` : null}
+            deltaDir={c.summary.delta_pct == null ? null : (c.summary.delta_pct < 0 ? 'down' : 'up')}
+            spark={c.trend.values} sparkColor={CP.accent} hint="window total" />
+        <ST label="Runs"
+            value={c.summary.runs ? c.summary.runs.toLocaleString() : '—'}
+            hint={c.summary.runs
+              ? `avg $${(c.summary.total / c.summary.runs).toFixed(3)}/run`
+              : 'no runs in window'}
+            spark={[]} sparkColor={CP.info} />
+        <ST label="Tokens"
+            value={c.summary.tokens != null ? `${(c.summary.tokens/1e6).toFixed(2)}M` : '—'}
+            hint={c.summary.tokens != null ? '' : 'not aggregated yet'}
+            spark={[]} sparkColor={CP.ok} />
+        <ST label="p95 run cost"
+            value={c.summary.p95_run_cost != null ? `$${c.summary.p95_run_cost.toFixed(2)}` : '—'}
+            hint={c.summary.p95_run_cost != null ? '' : 'not aggregated yet'}
+            spark={[]} sparkColor={CP.warn} />
       </div>
 
       <div className="col-span-7 panel">
@@ -703,13 +865,24 @@ function CostsTab({ projectFilter }) {
       <div className="col-span-6 panel">
         <div className="panel-head"><span className="title">By project · stacked by model</span></div>
         <div className="panel-body">
-          <HBC rows={projects} valueKey="total" labelKey="project"
-               segments={[
-                 { key: 'sonnet', color: CP.accent, label: 'sonnet' },
-                 { key: 'haiku',  color: CP.info,   label: 'haiku' },
-                 { key: 'gpt4o',  color: CP.ok,     label: 'gpt-4o' },
-               ]}
-               formatVal={v => `$${v.toFixed(2)}`} />
+          {(() => {
+            // Discover the set of model keys present in the data; reserved
+            // keys (project / total) are excluded.  Stable color cycle.
+            const reserved = new Set(['project', 'total']);
+            const modelKeys = new Set();
+            for (const row of projects) {
+              for (const k of Object.keys(row)) if (!reserved.has(k)) modelKeys.add(k);
+            }
+            const palette = [CP.accent, CP.info, CP.ok, CP.warn, CP.bad, CP.accent2 || CP.accent];
+            const segments = [...modelKeys].map((k, i) => ({
+              key: k, color: palette[i % palette.length], label: k,
+            }));
+            return (
+              <HBC rows={projects} valueKey="total" labelKey="project"
+                   segments={segments}
+                   formatVal={v => `$${v.toFixed(2)}`} />
+            );
+          })()}
         </div>
       </div>
 
@@ -728,9 +901,9 @@ function CostsTab({ projectFilter }) {
             <tbody>
               {c.events.map((e, i) => (
                 <tr key={i}>
-                  <td className="mono" style={{ color: 'var(--fg-3)' }}>{e.ts}</td>
+                  <td className="mono" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(e.ts)}</td>
                   <td className="mono">{e.account}</td>
-                  <td><span className={`badge ${e.event === 'rate_limited' ? 'warn' : e.event === 'cap_reset' ? 'ok' : 'info'}`}>{e.event}</span></td>
+                  <td><span className={`badge ${e.event === 'rate_limited' || e.event === 'cap_hit' ? 'warn' : e.event === 'cap_reset' || e.event === 'resumed' ? 'ok' : e.event === 'auth_failed' ? 'bad' : 'info'}`}>{e.event}</span></td>
                   <td style={{ color: 'var(--fg-2)' }}>{e.detail}</td>
                 </tr>
               ))}
@@ -753,12 +926,33 @@ function BurnTab({ projectFilter }) {
 
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
-      <div className="col-span-12 grid cols-4">
-        <ST label="Net velocity" value={(b.done.reduce((s,x)=>s+x,0)/30).toFixed(1)} unit="/day" delta="+0.4" deltaDir="up" spark={b.done} sparkColor={CP.ok} />
-        <ST label="Completed (window)" value={b.done.reduce((s,x)=>s+x,0)} spark={b.done} sparkColor={CP.ok} />
-        <ST label="Backlog" value={b.pending[b.pending.length-1]} delta={`${b.pending[b.pending.length-1]-b.pending[0]}`} deltaDir={b.pending[b.pending.length-1]<b.pending[0]?'down':'up'} spark={b.pending} sparkColor={CP.warn} />
-        <ST label="Forecast complete" value="14d" hint="@ current velocity" delta="−2d" deltaDir="down" />
-      </div>
+      {(() => {
+        const totalDone = b.done.reduce((s,x)=>s+x,0);
+        const days = b.labels.length || 1;
+        const velocity = totalDone / days;  // tasks/day average over the window
+        const lastPending = b.pending.length ? b.pending[b.pending.length-1] : 0;
+        const firstPending = b.pending.length ? b.pending[0] : 0;
+        const forecastDays = velocity > 0 ? Math.round(lastPending / velocity) : null;
+        return (
+          <div className="col-span-12 grid cols-4">
+            <ST label="Net velocity" value={velocity.toFixed(1)} unit="/day"
+                hint={`window avg · ${days}d`}
+                spark={b.done} sparkColor={CP.ok} />
+            <ST label="Completed (window)" value={totalDone}
+                spark={b.done} sparkColor={CP.ok} />
+            <ST label="Backlog" value={lastPending}
+                delta={`${lastPending - firstPending}`}
+                deltaDir={lastPending < firstPending ? 'down' : 'up'}
+                spark={b.pending} sparkColor={CP.warn} />
+            <ST label="Forecast clear"
+                value={forecastDays != null ? `${forecastDays}d` : '—'}
+                hint={forecastDays != null
+                  ? `${lastPending} / ${velocity.toFixed(1)} per day`
+                  : (velocity === 0 ? 'velocity is zero' : 'no data')}
+                spark={[]} />
+          </div>
+        );
+      })()}
 
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <Segmented options={[{ value: 'aggregate', label: 'Aggregate' }, { value: 'per-project', label: 'Per project' }]} value={view} onChange={setView} />
