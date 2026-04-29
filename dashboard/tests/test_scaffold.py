@@ -1,7 +1,6 @@
 """Tests for dashboard scaffold: config, app, and fixtures."""
 
 import dataclasses
-import re
 from pathlib import Path
 
 import pytest
@@ -176,101 +175,22 @@ class TestConftestFixtures:
 DASHBOARD_ROOT = Path(__file__).parent.parent
 
 
-class TestGitignore:
-    """Tests that .gitignore excludes generated build artifacts."""
-
-    def test_gitignore_excludes_tailwind_css(self):
-        """tailwind.css is a generated artifact and must be gitignored."""
-        content = (DASHBOARD_ROOT / '.gitignore').read_text()
-        assert 'tailwind.css' in content
-
-    def test_gitignore_excludes_bin(self):
-        """bin/ (downloaded Tailwind binary) must remain gitignored (regression guard)."""
-        content = (DASHBOARD_ROOT / '.gitignore').read_text()
-        assert 'bin/' in content
-
-
-class TestMakefile:
-    """Tests that the Makefile exists and has platform detection + checksum verification."""
-
-    def test_makefile_exists(self):
-        assert (DASHBOARD_ROOT / 'Makefile').is_file()
-
-    def test_makefile_has_platform_detection(self):
-        content = (DASHBOARD_ROOT / 'Makefile').read_text()
-        assert 'uname' in content
-        assert 'linux' in content.lower() or 'Linux' in content
-        assert 'darwin' in content.lower() or 'Darwin' in content
-
-    def test_makefile_has_checksum_verification(self):
-        content = (DASHBOARD_ROOT / 'Makefile').read_text()
-        assert 'sha256' in content
-
-    def test_makefile_checksums_are_valid_sha256(self):
-        """All CHECKSUM_ variables must be exactly 64 hex characters (SHA-256)."""
-        content = (DASHBOARD_ROOT / 'Makefile').read_text()
-        checksums = re.findall(r'CHECKSUM_[\w-]+\s*:=\s*([0-9a-f]+)', content)
-        assert len(checksums) == 4, f'Expected 4 CHECKSUM_ entries, found {len(checksums)}'
-        for checksum in checksums:
-            assert len(checksum) == 64, (
-                f'Checksum {checksum!r} is {len(checksum)} chars, expected 64'
-            )
-
-    def test_makefile_has_delete_on_error(self):
-        """Makefile must include .DELETE_ON_ERROR to clean up stale binaries on failure."""
-        content = (DASHBOARD_ROOT / 'Makefile').read_text()
-        assert '.DELETE_ON_ERROR' in content
-
-    def test_makefile_has_cleanup_guard(self):
-        """Download recipe must chain commands with && and have rm -f on failure (|| guard)."""
-        content = (DASHBOARD_ROOT / 'Makefile').read_text()
-        # The recipe must use && to chain curl/checksum/chmod
-        assert '&&' in content
-        # The || guard must clean up the binary on any failure
-        assert 'rm -f' in content
-
-    def test_makefile_download_is_single_shell_block(self):
-        """curl, checksum, and chmod must be in one backslash-continued shell block."""
-        content = (DASHBOARD_ROOT / 'Makefile').read_text()
-        # In a single-shell block commands are joined with backslash-newline or && on one line
-        # Verify curl and chmod appear together with && chaining (not as separate recipe lines)
-        # A separate recipe line would have curl on its own line without a trailing backslash
-        lines = content.splitlines()
-        curl_line_idx = None
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith('curl ') and 'TAILWIND_BIN' in line:
-                curl_line_idx = i
-                break
-        assert curl_line_idx is not None, 'No curl line found in Makefile'
-        curl_line = lines[curl_line_idx]
-        # The curl line must end with backslash (continuation) or contain &&
-        # indicating it's part of a multi-command shell block
-        assert curl_line.rstrip().endswith('\\') or '&&' in curl_line, (
-            f'curl line is not part of a single shell block: {curl_line!r}'
-        )
-
-
-class TestInputCSS:
-    """Tests that input.css contains all required CSS rules including animations."""
-
-    def test_input_css_has_refresh_pulse_keyframes(self):
-        """input.css must define the @keyframes section-refresh-pulse animation."""
-        content = (DASHBOARD_ROOT / 'src' / 'dashboard' / 'static' / 'input.css').read_text()
-        assert '@keyframes section-refresh-pulse' in content
-
-    def test_input_css_has_section_refreshed_class(self):
-        """input.css must define the .section-refreshed class."""
-        content = (DASHBOARD_ROOT / 'src' / 'dashboard' / 'static' / 'input.css').read_text()
-        assert '.section-refreshed' in content
-
-
 class TestStaticFiles:
-    def test_static_css_served(self, client):
-        """Static CSS file should be served at /static/tailwind.css."""
-        resp = client.get('/static/tailwind.css')
+    def test_redux_index_served_at_root(self, client):
+        """The React SPA HTML is served at ``/``."""
+        resp = client.get('/')
         assert resp.status_code == 200
-        assert 'text/css' in resp.headers['content-type']
+        assert 'text/html' in resp.headers['content-type']
+        body = resp.text
+        assert '<div id="root">' in body
+        # asset paths must be absolute so browser resolves them under /static/redux/
+        assert '/static/redux/data.js' in body
+        assert '/static/redux/styles.css' in body
+
+    def test_redux_jsx_served_at_static_path(self, client):
+        """JSX modules are served by the static mount."""
+        resp = client.get('/static/redux/app.jsx')
+        assert resp.status_code == 200
 
 
 class TestPostInit:
