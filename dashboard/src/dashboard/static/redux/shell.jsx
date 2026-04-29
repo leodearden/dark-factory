@@ -1,0 +1,304 @@
+/* App shell: rail nav, topbar, toolbar (filters), live feed */
+const { useState, useEffect, useMemo, useRef } = React;
+const SP_SHELL = window.DF_CHARTS.Sparkline;
+const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
+const SHELL_AGENTS = window.DF_DATA.AGENTS;
+const SHELL_FEED_TEMPLATES = window.DF_DATA.FEED_TEMPLATES;
+
+// ── Glyphs (simple shapes only — no complex SVG) ──
+const Glyph = ({ kind }) => {
+  const props = { width: 14, height: 14, viewBox: '0 0 14 14', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round' };
+  switch (kind) {
+    case 'overview': return <svg {...props}><rect x="1.5" y="1.5" width="4.5" height="4.5" rx="1"/><rect x="8" y="1.5" width="4.5" height="4.5" rx="1"/><rect x="1.5" y="8" width="4.5" height="4.5" rx="1"/><rect x="8" y="8" width="4.5" height="4.5" rx="1"/></svg>;
+    case 'orch':     return <svg {...props}><circle cx="7" cy="3" r="1.5"/><circle cx="3" cy="11" r="1.5"/><circle cx="11" cy="11" r="1.5"/><path d="M7 4.5 L3.6 9.7 M7 4.5 L10.4 9.7"/></svg>;
+    case 'tasks':    return <svg {...props}><circle cx="3" cy="3" r="1"/><circle cx="3" cy="7" r="1"/><circle cx="3" cy="11" r="1"/><path d="M5 3h7 M5 7h6 M5 11h4"/></svg>;
+    case 'perf':     return <svg {...props}><path d="M2 11 L5 7 L8 9 L12 3"/><path d="M2 12.5 L12 12.5"/></svg>;
+    case 'memory':   return <svg {...props}><rect x="1.5" y="3" width="11" height="8" rx="1"/><path d="M4 3v8 M7 3v8 M10 3v8"/></svg>;
+    case 'recon':    return <svg {...props}><path d="M2 7 a5 5 0 0 1 9-3"/><path d="M12 7 a5 5 0 0 1 -9 3"/><path d="M11 2v2.5h-2.5 M3 12v-2.5h2.5"/></svg>;
+    case 'merge':    return <svg {...props}><circle cx="3" cy="3" r="1.5"/><circle cx="3" cy="11" r="1.5"/><circle cx="11" cy="7" r="1.5"/><path d="M3 4.5v5 M3 4.5 a 5 2.5 0 0 0 7.5 2.5 M3 9.5 a 5 2.5 0 0 1 7.5 -2.5"/></svg>;
+    case 'cost':     return <svg {...props}><circle cx="7" cy="7" r="5"/><path d="M7 4v6 M5.5 5.5h2.5 a1.2 1.2 0 0 1 0 2.5 h-2 a1.2 1.2 0 0 0 0 2.5 h3"/></svg>;
+    case 'burn':     return <svg {...props}><path d="M2 11 L5 8 L8 10 L12 4"/><path d="M2 12.5 L12 12.5"/><circle cx="12" cy="4" r="0.6" fill="currentColor"/></svg>;
+    case 'search':   return <svg {...props}><circle cx="6" cy="6" r="3.5"/><path d="M8.5 8.5 L12 12"/></svg>;
+    case 'filter':   return <svg {...props}><path d="M2 3h10 M3.5 7h7 M5 11h4"/></svg>;
+    case 'chev':     return <svg {...props}><path d="M4 5l3 3 3-3"/></svg>;
+    case 'live':     return <svg {...props}><circle cx="7" cy="7" r="2" fill="currentColor"/><circle cx="7" cy="7" r="5"/></svg>;
+    case 'pause':    return <svg {...props}><rect x="3" y="3" width="3" height="8"/><rect x="8" y="3" width="3" height="8"/></svg>;
+    default: return null;
+  }
+};
+
+// ── Status pill in top bar ──
+function StatStrip({ live, lastUpdate, summary }) {
+  return (
+    <div className="stat-strip">
+      <span className="stat-pill">
+        <span className={`dot ${live ? 'live' : 'warn'}`}></span>
+        <span className="lbl">{live ? 'live' : 'paused'}</span>
+        <span className="val">{lastUpdate}</span>
+      </span>
+      <span className="stat-pill">
+        <span className="lbl">orch</span>
+        <span className="val" style={{ color: 'var(--accent)' }}>{summary.orchRunning}</span>
+        <span style={{ color: 'var(--fg-3)' }}>/</span>
+        <span className="val">{summary.orchTotal}</span>
+      </span>
+      <span className="stat-pill">
+        <span className="lbl">tasks active</span>
+        <span className="val">{summary.tasksActive}</span>
+      </span>
+      <span className="stat-pill">
+        <span className="lbl">queue</span>
+        <span className="val">{summary.queue}</span>
+      </span>
+      <span className="stat-pill">
+        <span className="lbl">spend 24h</span>
+        <span className="val">${summary.spend24h.toFixed(2)}</span>
+      </span>
+    </div>
+  );
+}
+
+// ── Filter chips ──
+function ChipGroup({ options, value, onChange }) {
+  return (
+    <div className="chips">
+      {options.map(o => (
+        <button key={o} className={value === o ? 'on' : ''} onClick={() => onChange(o)}>{o}</button>
+      ))}
+    </div>
+  );
+}
+
+function MultiSelect({ label, options, selected, onChange }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    function onClick(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, []);
+  const allSelected = selected.length === 0 || selected.length === options.length;
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <div className="multi" onClick={() => setOpen(o => !o)}>
+        <span className="lbl">{label}</span>
+        <span style={{ color: 'var(--fg-1)' }}>
+          {allSelected ? 'all' : selected.length === 1 ? selected[0] : `${selected.length} selected`}
+        </span>
+        <span className="cnt">{allSelected ? options.length : selected.length}</span>
+        <Glyph kind="chev" />
+      </div>
+      {open && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 4px)', left: 0, zIndex: 50,
+          background: 'var(--bg-2)', border: '1px solid var(--line)', borderRadius: 5,
+          padding: 6, minWidth: 200, boxShadow: '0 12px 30px rgba(0,0,0,0.5)',
+        }}>
+          <button
+            onClick={() => onChange(allSelected ? [options[0]] : [])}
+            style={{ display: 'block', width: '100%', textAlign: 'left', padding: '4px 8px', fontSize: 11, color: 'var(--accent)', borderRadius: 3 }}>
+            {allSelected ? 'select none' : 'select all'}
+          </button>
+          <div style={{ height: 1, background: 'var(--line)', margin: '4px 0' }} />
+          {options.map(o => {
+            const on = allSelected || selected.includes(o);
+            return (
+              <label key={o} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px', fontSize: 12, cursor: 'pointer', color: on ? 'var(--fg-0)' : 'var(--fg-2)', borderRadius: 3 }}
+                     onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-3)'}
+                     onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                <input type="checkbox" checked={on} onChange={() => {
+                  let next;
+                  if (allSelected) next = options.filter(x => x !== o);
+                  else if (selected.includes(o)) next = selected.filter(x => x !== o);
+                  else next = [...selected, o];
+                  onChange(next);
+                }} style={{ accentColor: 'var(--accent)' }} />
+                <span className="mono" style={{ fontSize: 11 }}>{o}</span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Toolbar (per-tab filter row) ──
+function Toolbar({
+  window: win, onWindow, windows = ['1h', '24h', '7d', '30d', '90d', 'all'],
+  projects, onProjects,
+  agents, onAgents, showAgents = false,
+  search, onSearch, searchPlaceholder = 'Search…',
+  extra,
+}) {
+  return (
+    <div className="toolbar">
+      <span className="lbl">Window</span>
+      <ChipGroup options={windows} value={win} onChange={onWindow} />
+      <MultiSelect label="project" options={SHELL_PROJECTS.map(p => p.name)} selected={projects} onChange={onProjects} />
+      {showAgents && <MultiSelect label="agent" options={SHELL_AGENTS} selected={agents} onChange={onAgents} />}
+      {onSearch && (
+        <span style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
+          <span style={{ position: 'absolute', left: 8, color: 'var(--fg-3)', pointerEvents: 'none', display: 'inline-flex' }}>
+            <Glyph kind="search" />
+          </span>
+          <input className="search-input" style={{ paddingLeft: 28 }}
+                 placeholder={searchPlaceholder} value={search || ''}
+                 onChange={e => onSearch(e.target.value)} />
+        </span>
+      )}
+      <span className="grow"></span>
+      {extra}
+    </div>
+  );
+}
+
+// ── Live feed (pinned bottom of overview) ──
+function makeFeedEntries(n) {
+  const out = [];
+  const cats = ['decisions_and_rationale', 'temporal_facts', 'observations_and_summaries', 'preferences_and_norms'];
+  const states = ['in-progress', 'done', 'blocked', 'pending'];
+  const outcomes = ['done', 'conflict', 'already_merged'];
+  const accs = ['anthropic-pri', 'anthropic-sec', 'openai'];
+  const statuses = ['success', 'partial'];
+  for (let i = 0; i < n; i++) {
+    const tpl = SHELL_FEED_TEMPLATES[Math.floor(Math.random() * SHELL_FEED_TEMPLATES.length)];
+    const project = SHELL_PROJECTS[Math.floor(Math.random() * SHELL_PROJECTS.length)].name;
+    const agent = SHELL_AGENTS[Math.floor(Math.random() * SHELL_AGENTS.length)];
+    const fields = {
+      agent, project,
+      category: cats[Math.floor(Math.random() * cats.length)],
+      entities: 3 + Math.floor(Math.random() * 8),
+      run: 'R-' + (9000 + Math.floor(Math.random() * 300)),
+      events: 5 + Math.floor(Math.random() * 80),
+      dur: (1 + Math.random() * 18).toFixed(1) + 's',
+      task: 'T-' + Math.floor(Math.random() * 30),
+      outcome: outcomes[Math.floor(Math.random() * outcomes.length)],
+      state: states[Math.floor(Math.random() * states.length)],
+      account: accs[Math.floor(Math.random() * accs.length)],
+      amt: (Math.random() * 0.5).toFixed(3),
+      status: statuses[Math.floor(Math.random() * statuses.length)],
+    };
+    let msg = tpl[1];
+    Object.entries(fields).forEach(([k, v]) => { msg = msg.replace(`{${k}}`, v); });
+    const secAgo = i * (3 + Math.floor(Math.random() * 5));
+    out.push({ ts: secAgo === 0 ? 'now' : `${secAgo}s`, src: tpl[0], msg, key: i });
+  }
+  return out;
+}
+
+function LiveFeed({ paused }) {
+  const [entries, setEntries] = useState(() => makeFeedEntries(40));
+  useEffect(() => {
+    if (paused) return;
+    const t = setInterval(() => {
+      setEntries(prev => {
+        const fresh = makeFeedEntries(1)[0];
+        fresh.key = Date.now();
+        fresh.ts = 'now';
+        return [fresh, ...prev.slice(0, 60).map(e => {
+          if (e.ts === 'now') return { ...e, ts: '2s' };
+          if (e.ts.endsWith('s')) {
+            const n = parseInt(e.ts) + 2;
+            return { ...e, ts: n >= 60 ? '1m' : `${n}s` };
+          }
+          return e;
+        })];
+      });
+    }, 1800);
+    return () => clearInterval(t);
+  }, [paused]);
+  return (
+    <div className="feed">
+      {entries.map(e => (
+        <div key={e.key} className="row">
+          <span className="ts">{e.ts}</span>
+          <span className="src">{e.src}</span>
+          <span className="msg">{e.msg}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Rail ──
+function Rail({ active, onSelect, counts }) {
+  const items = [
+    { id: 'overview',  label: 'Overview',     glyph: 'overview', count: '' },
+    { id: 'orch',      label: 'Orchestrators', glyph: 'orch',     count: counts.orch },
+    { id: 'tasks',     label: 'Tasks',        glyph: 'tasks',    count: counts.tasks },
+    { id: 'perf',      label: 'Performance',  glyph: 'perf',     count: '' },
+    { id: 'memory',    label: 'Memory',       glyph: 'memory',   count: '' },
+    { id: 'recon',     label: 'Reconciliation', glyph: 'recon',  count: counts.recon },
+    { id: 'merge',     label: 'Merge Queue',  glyph: 'merge',    count: counts.merge },
+    { id: 'cost',      label: 'Costs',        glyph: 'cost',     count: '' },
+    { id: 'burn',      label: 'Burndown',     glyph: 'burn',     count: '' },
+  ];
+  return (
+    <div className="rail">
+      <div className="rail-brand">
+        <div className="mark"></div>
+        <div>
+          <div className="name">DARK FACTORY</div>
+        </div>
+        <span className="env">v1.7 · prod</span>
+      </div>
+      <div className="rail-section">SECTIONS</div>
+      <div className="rail-nav">
+        {items.map(it => (
+          <button key={it.id} className={active === it.id ? 'active' : ''} onClick={() => onSelect(it.id)}>
+            <span className="glyph"><Glyph kind={it.glyph} /></span>
+            <span>{it.label}</span>
+            {it.count !== '' && <span className="count">{it.count}</span>}
+          </button>
+        ))}
+      </div>
+      <div className="rail-foot">
+        <div className="row"><span>Graphiti</span><span className="mono" style={{ color: 'var(--ok)' }}>● online</span></div>
+        <div className="row"><span>Mem0</span><span className="mono" style={{ color: 'var(--ok)' }}>● online</span></div>
+        <div className="row"><span>Taskmaster</span><span className="mono" style={{ color: 'var(--ok)' }}>● online</span></div>
+        <div className="row" style={{ paddingTop: 6, borderTop: '1px solid var(--line)' }}>
+          <span>Uptime</span>
+          <span className="mono">3d 14h 22m</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Project group (furl/unfurl) ──
+function ProjectGroup({ id, label, open, onToggle, summary, summaryRight, children }) {
+  return (
+    <div className="panel" style={{ overflow: 'hidden' }}>
+      <div className="proj-head" data-open={open ? 'true' : 'false'} onClick={onToggle}
+           style={{ padding: '10px 14px', borderBottom: open ? '1px solid var(--line)' : '1px solid transparent' }}>
+        <span className="twirl">
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+            <path d="M3.5 2L6.5 5L3.5 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        </span>
+        <span className="name">{label}</span>
+        {summary && <span className="summary">{summary}</span>}
+        {summaryRight}
+      </div>
+      {open && <div style={{ padding: '12px 14px 14px' }}>{children}</div>}
+    </div>
+  );
+}
+
+// ── Segmented control ──
+function Segmented({ options, value, onChange }) {
+  return (
+    <div className="seg">
+      {options.map(o => {
+        const v = typeof o === 'string' ? o : o.value;
+        const lbl = typeof o === 'string' ? o : o.label;
+        return (
+          <button key={v} className={value === v ? 'on' : ''} onClick={() => onChange(v)}>{lbl}</button>
+        );
+      })}
+    </div>
+  );
+}
+
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented };
