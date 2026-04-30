@@ -43,6 +43,9 @@ def client(config):
     c = TaskmasterBackend(config)
     mock_session = AsyncMock()
     c._session = mock_session
+    # The supervisor refactor gates ``call_tool`` on ``_session_ready``;
+    # contract tests bypass the supervisor by setting both directly.
+    c._session_ready.set()
     return c, mock_session
 
 
