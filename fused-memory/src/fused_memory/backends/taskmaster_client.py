@@ -1,4 +1,17 @@
-"""MCP client proxy to Taskmaster AI server."""
+"""MCP client proxy to Taskmaster AI server.
+
+The Taskmaster session lives inside a long-running *supervisor task* that owns
+the ``stdio_client`` and ``ClientSession`` async-context managers. Earlier
+versions opened those contexts via raw ``__aenter__`` calls inside the
+``run_server`` task — anyio binds the inner task groups' cancel scopes to the
+opening task, so any internal failure (a dead read loop, a broken pipe write)
+cancelled ``run_server`` and cascaded the entire process to ``exit 1``.
+
+Moving the ``async with`` blocks lexically inside a dedicated task isolates
+the cancel scope: an inner failure cancels only the supervisor, which logs
+the exception, sleeps the reconnect cooldown, and reopens the session. The
+HTTP listener and every other in-process subsystem keep running.
+"""
 
 import asyncio
 import contextlib
@@ -49,7 +62,6 @@ def _unwrap(method_name: str, raw: Any) -> dict:
             f'{method_name}: non-dict response: {raw!r}',
             raw=raw,
         )
-    # createErrorResponse path: text-only content, no JSON.
     text = raw.get('text')
     if isinstance(text, str) and text.startswith('Error:'):
         first_line = text.split('\n', 1)[0]
@@ -80,8 +92,10 @@ def _require_field(method_name: str, data: dict, field: str, raw: Any) -> Any:
 # (see mcp/shared/session.py:296).
 _REQUEST_TIMEOUT_CODE = int(httpx.codes.REQUEST_TIMEOUT)
 
-# Transport-level exception classes that mean the stdio session is dead
-# and should be torn down so ensure_connected() can reconnect.
+# Transport-level exception classes that mean the stdio session is dead.
+# When any of these fire inside ``call_tool``, the caller gets the original
+# exception and ``_session_ready`` is cleared so subsequent calls block
+# until the supervisor respawns the session.
 _TRANSPORT_DEAD_EXCEPTIONS: tuple[type[BaseException], ...] = (
     BrokenPipeError,
     ConnectionError,
@@ -91,9 +105,34 @@ _TRANSPORT_DEAD_EXCEPTIONS: tuple[type[BaseException], ...] = (
     anyio.BrokenResourceError,
 )
 
+# After this long without a healthy session, emit a single structured ERROR
+# log so dashboard / escalation watcher can pick it up.
+_ESCALATE_THRESHOLD_SECONDS = 180.0
+
+# Default for how long ``call_tool`` waits for the session to come up before
+# raising. Short by design: callers expect a fast failure when Taskmaster is
+# down so reconciliation/retry layers can handle it.
+_DEFAULT_SESSION_READY_TIMEOUT = 5.0
+
+# Default for how long ``start()`` blocks waiting on the very first session.
+# If the first connect fails inside this window, ``start()`` logs a warning
+# and returns — the supervisor stays running and keeps retrying.
+_DEFAULT_STARTUP_TIMEOUT = 30.0
+
+# How long ``close()`` waits for the supervisor to exit cleanly before
+# cancelling the task.
+_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
 
 class TaskmasterBackend:
-    """Connects to Taskmaster's MCP server and proxies tool calls."""
+    """Connects to Taskmaster's MCP server and proxies tool calls.
+
+    The session is owned by a long-running supervisor task created in
+    :meth:`start`. Public methods (``call_tool``, ``is_alive``, the
+    ``connected`` property, the convenience wrappers) are unchanged from
+    the prior context-manager-based implementation; only the internal
+    machinery is different.
+    """
 
     def __init__(
         self,
@@ -101,129 +140,326 @@ class TaskmasterBackend:
         reconnect_cooldown_seconds: float = 30.0,
         alive_cache_ttl_seconds: float = 2.0,
         probe_timeout_seconds: float = 2.0,
+        session_ready_timeout_seconds: float = _DEFAULT_SESSION_READY_TIMEOUT,
+        startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT,
     ):
         self.config = config
         self.reconnect_cooldown_seconds = reconnect_cooldown_seconds
-        self._session: ClientSession | None = None
-        self._stdio_ctx = None
-        self._session_ctx = None
-        self._last_reconnect_attempt: float = 0.0
-        self._reconnect_lock = asyncio.Lock()
         self._alive_cache_ttl_seconds = alive_cache_ttl_seconds
         self._probe_timeout_seconds = probe_timeout_seconds
+        self._session_ready_timeout = session_ready_timeout_seconds
+        self._startup_timeout = startup_timeout_seconds
+
+        # Built once in start(); cached to avoid repeating env construction
+        # on every reconnect.
+        self._server_params: StdioServerParameters | None = None
+
+        # Supervisor lifecycle state.
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._session: ClientSession | None = None
+        self._session_ready = asyncio.Event()
+        self._shutdown_event = asyncio.Event()
+        # Set by call_tool when it sees a transport-dead exception. The
+        # supervisor parks on either ``_shutdown_event`` or ``_respawn_event``
+        # — without this signal a clean-EOF child death (which does NOT fire
+        # the inner task group's cancel scope) would leave the supervisor
+        # parked forever.
+        self._respawn_event = asyncio.Event()
+        self._call_lock = asyncio.Lock()
+
+        # Observability + 3-min escalation.
+        self._down_since: float | None = None
+        self._escalated: bool = False
+        self._restart_count: int = 0
+        self._last_error_summary: str | None = None
+
         # (alive, error_msg, monotonic_timestamp)
         self._alive_cache: tuple[bool, str | None, float] | None = None
 
+    # ── Public lifecycle ───────────────────────────────────────────────
+
     @property
     def connected(self) -> bool:
-        """Whether the client has an active session."""
-        return self._session is not None
+        """Whether a Taskmaster session is currently up.
 
-    async def ensure_connected(self) -> None:
-        """Reconnect to Taskmaster if not connected, respecting cooldown."""
-        if self._session is not None:
+        Reads through ``_session_ready`` rather than checking ``_session``
+        directly because ``call_tool`` may have cleared the event after
+        observing a transport-dead exception even if the supervisor
+        hasn't yet noticed.
+        """
+        return self._session_ready.is_set()
+
+    @property
+    def restart_count(self) -> int:
+        """Number of times the supervisor has successfully opened a session."""
+        return self._restart_count
+
+    async def start(self) -> None:
+        """Launch the supervisor task and wait briefly for the first session.
+
+        If the first session does not come up within ``startup_timeout``,
+        returns without raising. The supervisor keeps running and will
+        retry. Callers that hit ``call_tool`` before the first connect see
+        :class:`asyncio.TimeoutError`, consistent with the prior
+        ``RuntimeError('Taskmaster not connected')`` surface.
+        """
+        if self._supervisor_task is not None and not self._supervisor_task.done():
             return
-
-        async with self._reconnect_lock:
-            # Re-check inside lock (another coroutine may have reconnected)
-            if self._session is not None:
-                return
-
-            now = time.monotonic()
-            elapsed = now - self._last_reconnect_attempt
-            if self._last_reconnect_attempt > 0 and elapsed < self.reconnect_cooldown_seconds:
-                remaining = self.reconnect_cooldown_seconds - elapsed
-                raise RuntimeError(
-                    f'Taskmaster reconnection on cooldown ({remaining:.0f}s remaining)'
-                )
-
-            self._last_reconnect_attempt = now
-            try:
-                await self.initialize()
-                logger.info('Taskmaster reconnected successfully')
-            except Exception as exc:
-                raise RuntimeError(f'Taskmaster reconnection failed: {exc}') from exc
-
-    async def initialize(self) -> None:
-        """Start Taskmaster MCP server process and establish client session."""
-        if self.config.transport == 'stdio':
-            env = None
-            if self.config.tool_mode:
-                import os
-
-                env = {
-                    **os.environ,
-                    'TASK_MASTER_TOOLS': self.config.tool_mode,
-                    'TASK_MASTER_ALLOW_METADATA_UPDATES': 'true',
-                }
-
-            # Use project_root as subprocess CWD so relative paths in args
-            # (e.g. ./taskmaster-ai/dist/mcp-server.js) resolve correctly
-            # regardless of where the fused-memory server process was started.
-            cwd = self.config.cwd or self.config.project_root or None
-            if cwd:
-                cwd = str(Path(cwd).resolve())
-            server_params = StdioServerParameters(
-                command=self.config.command,
-                args=self.config.args,
-                cwd=cwd,
-                env=env,
-            )
-            self._stdio_ctx = stdio_client(server_params)
-            try:
-                read_stream, write_stream = await self._stdio_ctx.__aenter__()
-                self._session_ctx = ClientSession(read_stream, write_stream)
-                self._session = await self._session_ctx.__aenter__()
-                await self._session.initialize()
-            except Exception:
-                # Clean up partially opened contexts to prevent dangling cancel scopes
-                await self._cleanup_contexts()
-                raise
-            logger.info('Taskmaster MCP client connected via stdio')
-        else:
+        if self.config.transport != 'stdio':
             raise ValueError(f'Unsupported Taskmaster transport: {self.config.transport}')
 
-    async def _cleanup_contexts(self) -> None:
-        """Best-effort cleanup of partially opened async contexts."""
-        if self._session_ctx:
-            with contextlib.suppress(Exception):
-                await self._session_ctx.__aexit__(None, None, None)
-            self._session_ctx = None
-        if self._stdio_ctx:
-            with contextlib.suppress(Exception):
-                await self._stdio_ctx.__aexit__(None, None, None)
-            self._stdio_ctx = None
-        self._session = None
+        self._server_params = self._build_server_params()
+        self._shutdown_event.clear()
+        self._session_ready.clear()
+        self._respawn_event.clear()
+        self._supervisor_task = asyncio.create_task(
+            self._supervisor_loop(),
+            name='taskmaster-supervisor',
+        )
+        try:
+            await asyncio.wait_for(
+                self._session_ready.wait(),
+                timeout=self._startup_timeout,
+            )
+            logger.info('Taskmaster MCP client connected via stdio')
+        except TimeoutError:
+            logger.warning(
+                'Taskmaster start: first session did not come up within %.1fs; '
+                'supervisor will keep retrying',
+                self._startup_timeout,
+            )
+
+    # Back-compat alias — prior callers (and tests) referenced ``initialize()``.
+    async def initialize(self) -> None:
+        """Alias for :meth:`start` (preserved for back-compat callers)."""
+        await self.start()
+
+    async def ensure_connected(self) -> None:
+        """Wait for the supervisor to bring up a session.
+
+        The previous implementation managed reconnect cooldowns inline; the
+        cooldown now lives inside the supervisor loop, so this is a simple
+        bounded wait. Raises :class:`asyncio.TimeoutError` if the session
+        is not up within ``session_ready_timeout``.
+        """
+        if self._supervisor_task is None:
+            raise RuntimeError('Taskmaster not started — call start() first')
+        if self._session_ready.is_set():
+            return
+        await asyncio.wait_for(
+            self._session_ready.wait(),
+            timeout=self._session_ready_timeout,
+        )
 
     async def close(self) -> None:
-        """Shut down client session and server process."""
-        await self._cleanup_contexts()
+        """Shut down the supervisor and Taskmaster process.
+
+        Sets ``_shutdown_event`` so the supervisor's parking ``await``
+        returns and the loop exits cleanly. If the supervisor doesn't
+        exit within ``_SHUTDOWN_TIMEOUT_SECONDS`` (e.g. a stuck cleanup),
+        the task is cancelled.
+        """
+        if self._supervisor_task is None:
+            return
+        self._shutdown_event.set()
+        self._session_ready.clear()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self._supervisor_task),
+                timeout=_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            self._supervisor_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(self._supervisor_task, timeout=2.0)
+        except BaseException:
+            # Supervisor finished with its own exception; nothing else to do.
+            pass
+        finally:
+            self._supervisor_task = None
+            self._session = None
+            self._session_ready.clear()
         logger.info('Taskmaster MCP client disconnected')
+
+    # ── Supervisor internals ───────────────────────────────────────────
+
+    def _build_server_params(self) -> StdioServerParameters:
+        env = None
+        if self.config.tool_mode:
+            env = {
+                **os.environ,
+                'TASK_MASTER_TOOLS': self.config.tool_mode,
+                'TASK_MASTER_ALLOW_METADATA_UPDATES': 'true',
+            }
+        # Use project_root as subprocess CWD so relative paths in args
+        # (e.g. ./taskmaster-ai/dist/mcp-server.js) resolve correctly
+        # regardless of where the fused-memory server process was started.
+        cwd = self.config.cwd or self.config.project_root or None
+        if cwd:
+            cwd = str(Path(cwd).resolve())
+        return StdioServerParameters(
+            command=self.config.command,
+            args=self.config.args,
+            cwd=cwd,
+            env=env,
+        )
+
+    async def _supervisor_loop(self) -> None:
+        """Long-lived task that owns the stdio + ClientSession contexts.
+
+        The cancel scopes of ``stdio_client`` and ``ClientSession`` bind
+        to *this* task. When an internal subtask in either group fails,
+        only this task is cancelled — ``run_server`` is no longer in the
+        chain. The loop catches the failure, logs, sleeps the cooldown,
+        and reopens.
+        """
+        assert self._server_params is not None  # set by start()
+        loop = asyncio.get_running_loop()
+
+        while not self._shutdown_event.is_set():
+            try:
+                async with (
+                    stdio_client(self._server_params) as (read_stream, write_stream),
+                    ClientSession(read_stream, write_stream) as session,
+                ):
+                    await session.initialize()
+                    self._session = session
+                    self._down_since = None
+                    self._escalated = False
+                    self._respawn_event.clear()
+                    self._restart_count += 1
+                    self._session_ready.set()
+                    logger.info(
+                        'Taskmaster session up (restart #%d)',
+                        self._restart_count,
+                    )
+                    # Park here. Two paths can wake us:
+                    #   (a) An inner subtask raises and anyio fires the
+                    #       cancel scope on this task — surfaces as
+                    #       CancelledError or BaseExceptionGroup.
+                    #   (b) call_tool detects a transport-dead exception
+                    #       (or McpError REQUEST_TIMEOUT) and sets
+                    #       ``_respawn_event`` — clean child-death
+                    #       (process killed while idle) does NOT fire
+                    #       the inner cancel scope, so we need this
+                    #       explicit signal to know we should respawn.
+                    await self._wait_for_wakeup()
+            except asyncio.CancelledError:
+                # close() called supervisor_task.cancel(); honour it.
+                self._session = None
+                self._session_ready.clear()
+                raise
+            except BaseException as exc:
+                self._last_error_summary = f'{type(exc).__name__}: {exc}'
+                logger.exception(
+                    'Taskmaster supervisor: session died, will respawn',
+                )
+            finally:
+                self._session = None
+                self._session_ready.clear()
+
+            if self._shutdown_event.is_set():
+                break
+            if self._down_since is None:
+                self._down_since = loop.time()
+            self._maybe_escalate(now=loop.time())
+            # Sleep up to the cooldown, but break out early if shutdown
+            # arrives mid-sleep — without this, ``close()`` would block
+            # for the full cooldown.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self.reconnect_cooldown_seconds,
+                )
+        logger.info('Taskmaster supervisor exiting')
+
+    async def _wait_for_wakeup(self) -> None:
+        """Park until either ``_shutdown_event`` or ``_respawn_event`` fires.
+
+        Implements the two-event wait without leaking detached tasks: each
+        helper future is created, awaited via :func:`asyncio.wait`, and any
+        survivor is cancelled and reaped before returning.
+        """
+        shutdown_t = asyncio.create_task(self._shutdown_event.wait())
+        respawn_t = asyncio.create_task(self._respawn_event.wait())
+        try:
+            await asyncio.wait(
+                [shutdown_t, respawn_t],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (shutdown_t, respawn_t):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(BaseException):
+                        await t
+
+    def _maybe_escalate(self, *, now: float) -> None:
+        """Emit a one-shot ERROR log if the session has been down ≥ threshold.
+
+        The line is rate-limited via ``_escalated``; it re-arms when the
+        supervisor next opens a session successfully (see
+        :meth:`_supervisor_loop`). ``now`` is passed in (rather than read
+        from the loop here) so unit tests can control the threshold without
+        mocking the loop clock.
+        """
+        if self._escalated or self._down_since is None:
+            return
+        if now - self._down_since < _ESCALATE_THRESHOLD_SECONDS:
+            return
+        logger.error(
+            'TASKMASTER_UNAVAILABLE_3MIN restart_attempts=%d last_error=%s',
+            self._restart_count,
+            self._last_error_summary or 'unknown',
+        )
+        self._escalated = True
 
     def _require_session(self) -> ClientSession:
         if self._session is None:
-            raise RuntimeError('Taskmaster not connected — call initialize() first')
+            raise RuntimeError('Taskmaster not connected — call start() first')
         return self._session
 
+    # ── Tool dispatch ─────────────────────────────────────────────────
+
     async def call_tool(self, name: str, arguments: dict) -> Any:
-        """Call a Taskmaster MCP tool and return the parsed result."""
-        session = self._require_session()
-        try:
-            result = await session.call_tool(name, arguments)
-        except _TRANSPORT_DEAD_EXCEPTIONS:
-            await self._cleanup_contexts()
-            raise
-        except McpError as exc:
-            # Connection-closed and request-timeout live at the transport
-            # layer even though they arrive wrapped in McpError — tear down
-            # so the next mutating call can reconnect. Tool-level errors
-            # (INTERNAL_ERROR, INVALID_PARAMS, …) mean the proxy is alive
-            # and must pass through unchanged.
-            code = getattr(getattr(exc, 'error', None), 'code', None)
-            if code in (CONNECTION_CLOSED, _REQUEST_TIMEOUT_CODE):
-                await self._cleanup_contexts()
-            raise
-        # MCP tool results come as content blocks
+        """Call a Taskmaster MCP tool and return the parsed result.
+
+        Waits up to ``session_ready_timeout`` for the supervisor to bring
+        up a session, then dispatches under ``self._call_lock``. The
+        underlying MCP request-ID + stream-registration block is atomic
+        at the asyncio level (see ``mcp/shared/session.py:240-313``); the
+        lock is cheap insurance against subtle reordering after a
+        cascade-driven outage.
+        """
+        await asyncio.wait_for(
+            self._session_ready.wait(),
+            timeout=self._session_ready_timeout,
+        )
+        session = self._session
+        if session is None:
+            # Window between ready being set and a concurrent close clearing
+            # the session. Surface the same RuntimeError as before so callers
+            # see a consistent contract.
+            raise RuntimeError('Taskmaster not connected')
+        async with self._call_lock:
+            try:
+                result = await session.call_tool(name, arguments)
+            except _TRANSPORT_DEAD_EXCEPTIONS:
+                # Tear-down notice for the next caller AND the supervisor.
+                # A clean-EOF child death does NOT fire the inner task
+                # group's cancel scope, so the supervisor needs an
+                # explicit nudge — without it the session would stay
+                # stuck "ready" until something else cancels it.
+                self._session_ready.clear()
+                self._respawn_event.set()
+                raise
+            except McpError as exc:
+                code = getattr(getattr(exc, 'error', None), 'code', None)
+                if code in (CONNECTION_CLOSED, _REQUEST_TIMEOUT_CODE):
+                    self._session_ready.clear()
+                    self._respawn_event.set()
+                raise
+
         if result.content:
             text_parts = [
                 block.text for block in result.content if isinstance(block, TextContent)
@@ -238,12 +474,13 @@ class TaskmasterBackend:
     async def is_alive(self) -> tuple[bool, str | None]:
         """Report whether the Taskmaster proxy is live right now.
 
-        Result is cached briefly (``_alive_cache_ttl_seconds``) so recon hot
-        paths don't stdio-round-trip on every get_status call.
+        Result is cached briefly (``_alive_cache_ttl_seconds``) so recon
+        hot paths don't stdio-round-trip on every ``get_status`` call.
 
-        On failure, ``call_tool``'s except branch tears down the session so
-        the next mutating call can reconnect via ``ensure_connected``.
-        ``is_alive`` itself is read-only and does not attempt reconnect.
+        On a transport-level failure, ``call_tool`` has already cleared
+        ``_session_ready`` — the next mutating call will block on the
+        supervisor reopening. ``is_alive`` itself is read-only and does
+        not attempt reconnect.
         """
         now = time.monotonic()
         if self._alive_cache is not None:
@@ -252,7 +489,7 @@ class TaskmasterBackend:
                 return cached_alive, cached_err
 
         result: tuple[bool, str | None]
-        if self._session is None:
+        if not self._session_ready.is_set():
             result = (False, 'not connected')
         else:
             try:
@@ -263,7 +500,7 @@ class TaskmasterBackend:
                 result = (True, None)
             except McpError as exc:
                 # Transport-level McpError (CONNECTION_CLOSED / REQUEST_TIMEOUT)
-                # means call_tool already tore down the session — report
+                # means call_tool already cleared ``_session_ready`` — report
                 # dead. Any other McpError is a tool-level response (e.g.
                 # project not found, invalid params) which proves the proxy
                 # is alive.

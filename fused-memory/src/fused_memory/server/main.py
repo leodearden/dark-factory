@@ -331,10 +331,14 @@ async def run_server():
         # first initialize fails. is_alive() will probe the live session.
         memory_service.taskmaster = taskmaster
         try:
-            await taskmaster.initialize()
-            logger.info(f'  Taskmaster: connected via {config.taskmaster.transport}')
+            # start() launches the supervisor task; it returns once the first
+            # session is ready (or after startup_timeout if not). The supervisor
+            # owns the stdio + ClientSession context managers — internal failures
+            # cancel only the supervisor, not run_server.
+            await taskmaster.start()
+            logger.info(f'  Taskmaster: supervisor started ({config.taskmaster.transport})')
         except Exception as e:
-            logger.warning(f'  Taskmaster: failed to connect ({e}), will retry on next tool call')
+            logger.warning(f'  Taskmaster: supervisor start failed ({e}), will retry on next tool call')
 
     # Initialize reconciliation system
     harness_loop_task = None
@@ -678,6 +682,7 @@ async def run_server():
             recon_journal=recon_journal,
             event_queue=event_queue,
             sqlite_watchdog=sqlite_watchdog,
+            taskmaster=taskmaster,
         )
 
 
@@ -829,6 +834,7 @@ async def _graceful_shutdown(
     recon_journal: 'ReconciliationJournal | None',
     event_queue: 'EventQueue | None' = None,
     sqlite_watchdog: 'SqliteWatchdog | None' = None,
+    taskmaster: Any = None,
 ) -> None:
     """Perform an ordered, exception-resilient server shutdown.
 
@@ -841,8 +847,11 @@ async def _graceful_shutdown(
        Must happen BEFORE memory_service.close(), because the drainer writes
        into the SQLite event buffer that memory_service owns.
     5. Cancel harness loop task (stops background reconciliation + escalation server).
-    6. Close memory_service (backends, durable queue, write journal, event buffer).
-    7. Close reconciliation journal (separate SQLite connection).
+    6. Close Taskmaster supervisor (cleanly tears down the Node child after
+       harness/interceptor stop generating new requests). Done before
+       memory_service.close() because MemoryService still holds a reference.
+    7. Close memory_service (backends, durable queue, write journal, event buffer).
+    8. Close reconciliation journal (separate SQLite connection).
 
     Each step runs under asyncio.shield with a bounded timeout so cleanup
     makes progress even when this coroutine itself is being cancelled, and
@@ -877,6 +886,9 @@ async def _graceful_shutdown(
             _await_harness,
             timeout=_HARNESS_CANCEL_TIMEOUT,
         )
+
+    if taskmaster is not None:
+        await _run_shielded('taskmaster.close', taskmaster.close)
 
     await _run_shielded('memory_service.close', memory_service.close)
 
