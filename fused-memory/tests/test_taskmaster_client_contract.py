@@ -408,3 +408,120 @@ async def test_unexpected_shape_raises(client):
         await c.add_task(project_root='/project', prompt='x')
 
     assert exc_info.value.code == 'UNEXPECTED_RESPONSE_SHAPE'
+
+
+# ── respawn-window retry ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_after_supervisor_respawn(client):
+    """If a tool-level Error envelope coincides with a supervisor respawn
+    (``restart_count`` advanced during the call), ``call_tool`` replays
+    the call and returns the second response."""
+    c, session = client
+    c._restart_count = 0
+
+    call_count = 0
+
+    async def fake_call_tool(name, args):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Simulate the supervisor respawning during the call:
+            # increment restart_count and return the spurious Error
+            # envelope that Taskmaster emits inside the respawn window.
+            c._restart_count += 1
+            err = MagicMock()
+            err.content = [TextContent(
+                type='text',
+                text='Error: No tasks found\nVersion: 0.27.0',
+            )]
+            err.isError = True
+            return err
+        return _success_result({
+            'tasks': [{'id': '1', 'title': 'real'}],
+            'stats': {'total': 1},
+        })
+
+    session.call_tool = AsyncMock(side_effect=fake_call_tool)
+
+    # Stand-in for the supervisor: the contract-test fixture sets
+    # ``_session_ready`` directly without launching ``_supervisor_task``,
+    # so the real ``ensure_connected`` raises. Make it a no-op.
+    async def fake_ensure_connected():
+        c._session_ready.set()
+
+    c.ensure_connected = fake_ensure_connected
+
+    dto = await c.get_tasks(project_root='/project')
+
+    assert call_count == 2
+    assert dto['tasks'] == [{'id': '1', 'title': 'real'}]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_does_not_retry_unexpected_response_shape(client):
+    """Malformed envelopes (no ``data``, no ``Error:`` text) signal a
+    contract bug — never retried, even if the supervisor respawned
+    mid-call."""
+    c, session = client
+    c._restart_count = 0
+
+    call_count = 0
+
+    async def fake_call_tool(name, args):
+        nonlocal call_count
+        call_count += 1
+        # Bump restart_count so the *only* gate against retry is the
+        # malformed-envelope branch in ``call_tool``.
+        c._restart_count += 1
+        result = MagicMock()
+        result.content = [TextContent(
+            type='text',
+            text=json.dumps({'unexpected': True}),
+        )]
+        result.isError = False
+        return result
+
+    session.call_tool = AsyncMock(side_effect=fake_call_tool)
+
+    with pytest.raises(TaskmasterError) as exc_info:
+        await c.add_task(project_root='/project', prompt='x')
+
+    assert exc_info.value.code == 'UNEXPECTED_RESPONSE_SHAPE'
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retry_budget_exhausted_surfaces_original_error(client):
+    """Three consecutive transport-dead failures across three respawns:
+    the original exception surfaces after the retry budget (initial + 2
+    retries) is exhausted."""
+    c, session = client
+    c._restart_count = 0
+
+    call_count = 0
+
+    async def fake_call_tool(name, args):
+        nonlocal call_count
+        call_count += 1
+        # Each attempt: pretend the supervisor respawned (restart_count
+        # advances) and then the dispatch hits a dead pipe.
+        c._restart_count += 1
+        raise BrokenPipeError(f'pipe closed #{call_count}')
+
+    session.call_tool = AsyncMock(side_effect=fake_call_tool)
+
+    # Stand-in for the supervisor: re-arm session_ready so the retry
+    # loop's ``ensure_connected`` returns immediately instead of waiting
+    # the real session-ready timeout.
+    async def fake_ensure_connected():
+        c._session_ready.set()
+
+    c.ensure_connected = fake_ensure_connected
+
+    with pytest.raises(BrokenPipeError):
+        await c.call_tool('get_tasks', {'projectRoot': '/project'})
+
+    # Initial attempt + 2 retries.
+    assert call_count == 3

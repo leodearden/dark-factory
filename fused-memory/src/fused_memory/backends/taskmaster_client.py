@@ -430,21 +430,41 @@ class TaskmasterBackend:
         at the asyncio level (see ``mcp/shared/session.py:240-313``); the
         lock is cheap insurance against subtle reordering after a
         cascade-driven outage.
+
+        Includes a defensive retry across the supervisor-respawn boundary.
+        Taskmaster has been observed to surface spurious tool-level
+        failures (e.g. "No tasks found") for calls that land during the
+        window where the stdio session is being torn down and respawned.
+        If a call sees a transport-dead exception, an :class:`McpError`
+        with ``REQUEST_TIMEOUT`` / ``CONNECTION_CLOSED``, or a tool-level
+        ``Error:`` envelope **and** either ``restart_count`` advanced
+        during the call or ``_session_ready`` was cleared during the
+        call, the call is replayed up to two more times after waiting on
+        :meth:`ensure_connected`. Backoffs: ``0.1s``, ``0.5s``.
+
+        Malformed envelopes (``UNEXPECTED_RESPONSE_SHAPE`` — neither a
+        ``data`` field nor an ``Error:`` text) are never retried; they
+        signal a contract bug, not a transient transport condition. The
+        envelope is returned as-is and the caller's ``_unwrap`` raises
+        downstream.
         """
         await asyncio.wait_for(
             self._session_ready.wait(),
             timeout=self._session_ready_timeout,
         )
-        session = self._session
-        if session is None:
-            # Window between ready being set and a concurrent close clearing
-            # the session. Surface the same RuntimeError as before so callers
-            # see a consistent contract.
-            raise RuntimeError('Taskmaster not connected')
-        async with self._call_lock:
+
+        last_envelope: Any = None
+        last_exc: BaseException | None = None
+        for attempt in range(3):
+            snap_restart_count = self._restart_count
+            snap_session_ready_was_set = self._session_ready.is_set()
+
+            retry_signal = False
+            last_envelope = None
+            last_exc = None
             try:
-                result = await session.call_tool(name, arguments)
-            except _TRANSPORT_DEAD_EXCEPTIONS:
+                envelope = await self._dispatch(name, arguments)
+            except _TRANSPORT_DEAD_EXCEPTIONS as exc:
                 # Tear-down notice for the next caller AND the supervisor.
                 # A clean-EOF child death does NOT fire the inner task
                 # group's cancel scope, so the supervisor needs an
@@ -452,14 +472,88 @@ class TaskmasterBackend:
                 # stuck "ready" until something else cancels it.
                 self._session_ready.clear()
                 self._respawn_event.set()
-                raise
+                retry_signal = True
+                last_exc = exc
             except McpError as exc:
                 code = getattr(getattr(exc, 'error', None), 'code', None)
                 if code in (CONNECTION_CLOSED, _REQUEST_TIMEOUT_CODE):
                     self._session_ready.clear()
                     self._respawn_event.set()
-                raise
+                    retry_signal = True
+                    last_exc = exc
+                else:
+                    # Tool-level McpError from the proxy — not a transport
+                    # failure. Re-raise as before.
+                    raise
+            else:
+                last_envelope = envelope
+                if (
+                    isinstance(envelope, dict)
+                    and isinstance(envelope.get('text'), str)
+                    and envelope['text'].startswith('Error:')
+                ):
+                    # Tool-level Error envelope — eligible for retry only
+                    # if the supervisor respawned mid-call.
+                    retry_signal = True
+                else:
+                    # Either a clean success envelope or a malformed one.
+                    # Both surface to the caller as-is — UNEXPECTED_
+                    # RESPONSE_SHAPE is detected downstream in ``_unwrap``
+                    # and is never retried.
+                    if attempt > 0:
+                        logger.info(
+                            'taskmaster.respawn_recovered tool=%s '
+                            'project_root=%s attempt=%d',
+                            name,
+                            self.config.project_root,
+                            attempt,
+                        )
+                    return envelope
 
+            if attempt == 2:
+                break
+            progressed = self._restart_count > snap_restart_count
+            cleared = (
+                snap_session_ready_was_set and not self._session_ready.is_set()
+            )
+            if not (retry_signal and (progressed or cleared)):
+                break
+
+            backoff = 0.1 if attempt == 0 else 0.5
+            await asyncio.sleep(backoff)
+            try:
+                await self.ensure_connected()
+            except (TimeoutError, asyncio.TimeoutError, RuntimeError):
+                # Supervisor not up (RuntimeError) or didn't bring up a
+                # session in time (TimeoutError). Give up retrying and
+                # surface the original failure.
+                break
+
+        # Budget exhausted (or no respawn signal). Surface the last failure
+        # exactly as it would have surfaced without the retry: re-raise
+        # transport / McpError, return tool-error envelope so downstream
+        # ``_unwrap`` raises ``TASKMASTER_TOOL_ERROR``.
+        if last_exc is not None:
+            raise last_exc
+        return last_envelope
+
+    async def _dispatch(self, name: str, arguments: dict) -> Any:
+        """Single dispatch attempt — the IO half of :meth:`call_tool`.
+
+        Acquires :attr:`_call_lock`, invokes the underlying
+        ``session.call_tool``, and returns the parsed envelope (a JSON
+        dict on success, ``{'text': ...}`` for non-JSON content, ``{}``
+        for an empty content block). Exceptions propagate unchanged so
+        the retry layer in :meth:`call_tool` can classify them.
+        """
+        session = self._session
+        if session is None:
+            # Window between ready being set and a concurrent close
+            # clearing the session. Surface the same RuntimeError as
+            # before so callers see a consistent contract.
+            raise RuntimeError('Taskmaster not connected')
+        async with self._call_lock:
+            result = await session.call_tool(name, arguments)
         if result.content:
             text_parts = [
                 block.text for block in result.content if isinstance(block, TextContent)
