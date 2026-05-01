@@ -557,6 +557,16 @@ class OrchestratorConfig(BaseSettings):
     terminal_status_watcher_enabled: bool = Field(default=True)
     terminal_status_poll_interval_secs: float = Field(default=30.0)
 
+    # Stranded-in-progress reconcile sweep — periodic re-run of the
+    # startup ``_reconcile_stranded_in_progress`` pass during a long run.
+    # Catches tasks stranded by transient backend failures (taskmaster
+    # restart, fused-memory crash) that the workflow's own retry layer
+    # exhausted; they sit in-progress with no live claimant otherwise.
+    # Also fires opportunistically when the main loop is stuck-blocked
+    # (no acquirable assignment, no active workflows) — see Fix 4.
+    stranded_reconcile_enabled: bool = Field(default=True)
+    stranded_reconcile_interval_secs: float = Field(default=900.0)
+
     # Legacy scalar — ignored if `timeouts` section is present in config.
     # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)

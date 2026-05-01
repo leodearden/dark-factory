@@ -299,6 +299,20 @@ class TaskWorkflow:
         files = self.plan.get('files', [])
         return files if files else None
 
+    async def _reconcile_metadata_files_for_done(self) -> None:
+        """Set ``metadata.files`` to plan files (or clear) before set_task_status('done').
+
+        The phantom-done gate (fused-memory ``task_interceptor.py``) rejects
+        done transitions when files in ``metadata.files`` don't exist at
+        ``project_root``.  Architect plans often rewrite scope, leaving
+        ``metadata.files`` stale and stranding the task in-progress after a
+        successful merge.  Refresh the field to the architect-declared file set
+        (or clear it on no-plan paths) so the gate validates against current
+        truth.
+        """
+        files = list(self.plan.get('files', [])) if self.plan else []
+        await self.scheduler.update_task(self.task_id, {'files': files})
+
     def _enter_phase(self, new_state: WorkflowState) -> None:
         """Transition to a new workflow phase, emitting events."""
         if self.event_store:
@@ -698,6 +712,7 @@ class TaskWorkflow:
             await self._ensure_steward_started()
             await self._await_steward_completion()
             self._enter_phase(WorkflowState.DONE)
+            await self._reconcile_metadata_files_for_done()
             await self.scheduler.set_task_status(
                 self.task_id, 'done',
                 done_provenance=(
@@ -1483,6 +1498,7 @@ class TaskWorkflow:
             self.task_id, commit[:12],
         )
         self._enter_phase(WorkflowState.DONE)
+        await self._reconcile_metadata_files_for_done()
         await self.scheduler.set_task_status(
             self.task_id, 'done',
             done_provenance={
@@ -3111,6 +3127,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             self.task_id,
         )
         self._enter_phase(WorkflowState.DONE)
+        await self._reconcile_metadata_files_for_done()
         await self.scheduler.set_task_status(
             self.task_id, 'done',
             done_provenance={

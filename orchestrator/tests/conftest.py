@@ -145,4 +145,9 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     config.orphan_l0_timeout_secs = 600.0
     config.terminal_status_watcher_enabled = False
     config.terminal_status_poll_interval_secs = 30.0
+    # Stranded-in-progress reconcile sweep — disabled by default in tests so
+    # the background loop doesn't spin up under fixtures that don't expect
+    # an additional asyncio.Task to manage.
+    config.stranded_reconcile_enabled = False
+    config.stranded_reconcile_interval_secs = 900.0
     return config

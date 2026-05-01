@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -35,6 +36,12 @@ from orchestrator.task_status import TERMINAL_STATUSES
 _INF_SKIP_THRESHOLD: int = 1000
 _GEOMETRIC_SKIP_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000})
 
+# set_task_status transient-failure retry parameters.  Three attempts with
+# 1.5s, 3s gaps lets the taskmaster child finish a typical reconnect window
+# (~2-4s observed) before giving up.
+_TRANSIENT_RETRIES: int = 3
+_TRANSIENT_BACKOFF_BASE: float = 1.5
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -46,7 +53,21 @@ __all__ = [
     'ModuleLockTable',
     'Scheduler',
     'extract_rejection',
+    'is_transient_rejection',
 ]
+
+# Error-type names that indicate a transient backend failure (taskmaster
+# child reconnecting, fused-memory crashed mid-call, network blip).  Matches
+# substring so wrapper-formatted strings like ``"TimeoutError(...)"`` and
+# ``"asyncio.TimeoutError"`` both classify as transient.
+TRANSIENT_ERROR_TYPES = (
+    'TimeoutError',
+    'ConnectionError',
+    'ConnectError',
+    'ReadTimeout',
+    'WriteTimeout',
+    'asyncio.TimeoutError',
+)
 
 
 def extract_rejection(response: Any) -> str | None:
@@ -84,6 +105,20 @@ def extract_rejection(response: Any) -> str | None:
     if payload.get('success') is False:
         return f'success=False payload={payload!r}'
     return None
+
+
+def is_transient_rejection(rejection: str | None) -> bool:
+    """True when ``rejection`` text names a known transient backend error.
+
+    Used by the ``set_task_status`` retry loop to distinguish recoverable
+    backend failures (taskmaster child restarting, fused-memory crashed
+    mid-call) from terminal-business rejections (phantom-done gate,
+    done_provenance validation, terminal-exit gate).  Transient rejections
+    are retried; everything else is surfaced as a warning and returned.
+    """
+    if not rejection:
+        return False
+    return any(name in rejection for name in TRANSIENT_ERROR_TYPES)
 
 
 @dataclass(frozen=True)
@@ -521,31 +556,66 @@ class Scheduler:
         structured error dict rather than raising. We inspect the response
         and emit a WARNING so silent rejections don't leave tasks stuck in
         the wrong state.
-        """
-        try:
-            arguments: dict = {
-                'id': task_id,
-                'status': status,
-                'project_root': self._project_root,
-            }
-            if done_provenance is not None:
-                arguments['done_provenance'] = done_provenance
-            if reopen_reason is not None:
-                arguments['reopen_reason'] = reopen_reason
-            response = await self.dispatch_tool('set_task_status', arguments, timeout=15)
-        except Exception as e:
-            logger.exception(
-                'Failed to set task %s status to %s: %s: %s',
-                task_id, status, type(e).__name__, e,
-            )
-            return
 
-        rejection = extract_rejection(response)
-        if rejection is not None:
-            logger.warning(
-                'set_task_status(%s, %s) rejected by fused-memory: %s',
-                task_id, status, rejection,
+        **Transient-failure retry.** When fused-memory's taskmaster child
+        is restarting or the fused-memory process itself just crashed, the
+        tool wrapper returns ``{'error': 'TimeoutError(...)', 'error_type':
+        'TimeoutError'}`` (or similar).  Without this loop the workflow
+        would treat the call as successful and proceed, leaving the task
+        stranded in-progress.  Retry up to ``_TRANSIENT_RETRIES`` times
+        with exponential back-off; raise on persistent transient failure
+        so callers (notably ``handle_blast_radius_expansion``) can decide
+        whether to release locks.
+        """
+        arguments: dict = {
+            'id': task_id,
+            'status': status,
+            'project_root': self._project_root,
+        }
+        if done_provenance is not None:
+            arguments['done_provenance'] = done_provenance
+        if reopen_reason is not None:
+            arguments['reopen_reason'] = reopen_reason
+
+        last_rejection: str | None = None
+        for attempt in range(_TRANSIENT_RETRIES):
+            try:
+                response = await self.dispatch_tool(
+                    'set_task_status', arguments, timeout=15,
+                )
+            except Exception as e:
+                logger.exception(
+                    'set_task_status(%s, %s) raised on attempt %d/%d: %s: %s',
+                    task_id, status, attempt + 1, _TRANSIENT_RETRIES,
+                    type(e).__name__, e,
+                )
+                last_rejection = f'{type(e).__name__}: {e}'
+                if attempt + 1 < _TRANSIENT_RETRIES:
+                    await asyncio.sleep(_TRANSIENT_BACKOFF_BASE * (2 ** attempt))
+                continue
+
+            rejection = extract_rejection(response)
+            if rejection is None:
+                return  # success
+            last_rejection = rejection
+            if not is_transient_rejection(rejection):
+                logger.warning(
+                    'set_task_status(%s, %s) rejected by fused-memory: %s',
+                    task_id, status, rejection,
+                )
+                return  # non-transient — surface and stop
+            logger.info(
+                'set_task_status(%s, %s) transient rejection '
+                '(attempt %d/%d): %s — retrying',
+                task_id, status, attempt + 1, _TRANSIENT_RETRIES, rejection,
             )
+            if attempt + 1 < _TRANSIENT_RETRIES:
+                await asyncio.sleep(_TRANSIENT_BACKOFF_BASE * (2 ** attempt))
+
+        raise RuntimeError(
+            f'set_task_status({task_id}, {status}) failed after '
+            f'{_TRANSIENT_RETRIES} transient retries: {last_rejection}'
+        )
 
     async def get_status(self, task_id: str) -> str | None:
         """Return the current status of ``task_id``, or ``None`` on failure.
@@ -1133,7 +1203,20 @@ class Scheduler:
                 f'Task {task_id}: metadata update failed (non-critical — '
                 f'using in-memory module cache for scheduling).'
             )
-        await self.set_task_status(task_id, 'pending')
+        try:
+            await self.set_task_status(task_id, 'pending')
+        except RuntimeError as e:
+            # Transient retries exhausted — keep locks held so the worktree
+            # stays reserved for this task; the next reconcile cycle (mid-run
+            # sweep or startup) will revert the in-progress status when the
+            # backend recovers.  Releasing locks here would let another task
+            # claim the modules while this one is still nominally in-progress.
+            logger.warning(
+                'Task %s: set_task_status(pending) failed during '
+                'blast-radius requeue (%s) — keeping locks held for '
+                'reconcile to recover.', task_id, e,
+            )
+            return False
         self.lock_table.release(task_id)
         return False
 

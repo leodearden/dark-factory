@@ -53,6 +53,9 @@ def _make(
     set_task_status = AsyncMock()
     scheduler = MagicMock()
     scheduler.set_task_status = set_task_status
+    # Fix 1: workflow refreshes metadata.files via update_task before
+    # set_task_status('done').  Stub as AsyncMock so the await succeeds.
+    scheduler.update_task = AsyncMock(return_value=True)
 
     is_ancestor = AsyncMock(return_value=commit_on_main)
     get_main_sha = AsyncMock(return_value=main_sha)

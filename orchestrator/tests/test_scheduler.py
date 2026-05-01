@@ -1537,21 +1537,105 @@ class TestSetTaskStatusForwarding:
         assert 'reopen_reason' not in arguments
 
     @pytest.mark.asyncio
-    async def test_mcp_exception_is_swallowed_and_logged(
+    async def test_persistent_mcp_exception_raises_after_retries(
         self, scheduler: Scheduler, monkeypatch, caplog
     ):
-        """MCP failures are logged but don't raise — scheduler ticks survive."""
+        """Persistent MCP exceptions raise RuntimeError after the retry cap.
+
+        Fix 3: previously the scheduler logged + returned silently on any
+        ``dispatch_tool`` exception, which left tasks stranded in-progress
+        when the fused-memory backend was reconnecting.  We now retry
+        ``_TRANSIENT_RETRIES`` times and raise so callers can decide
+        whether to release locks (handle_blast_radius_expansion) or fall
+        through to the workflow's exception handler (workflow.run).
+        """
         import logging as _logging
-        monkeypatch.setattr(
-            'orchestrator.scheduler.mcp_call',
-            AsyncMock(side_effect=OSError(2, 'No such file')),
-        )
+        # Tighten retry timing to keep the test fast.
+        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        mock = AsyncMock(side_effect=OSError(2, 'No such file'))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
         with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'):
-            await scheduler.set_task_status('1', 'in-progress')
-        assert any(
-            'Failed to set task 1 status' in rec.message
-            for rec in caplog.records
+            with pytest.raises(RuntimeError, match='3 transient retries'):
+                await scheduler.set_task_status('1', 'in-progress')
+        # Three attempts before raising.
+        assert mock.await_count == 3, (
+            f'Expected 3 dispatch attempts, got {mock.await_count}'
         )
+        # Each attempt logs an exception traceback at ERROR level.
+        assert sum(
+            1 for rec in caplog.records if 'set_task_status' in rec.message and rec.exc_info
+        ) >= 3
+
+    @pytest.mark.asyncio
+    async def test_transient_rejection_retries_until_success(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """A TimeoutError-shaped rejection retries; later success returns clean."""
+        import logging as _logging
+        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        # Two transient rejections, then success.
+        transient = {
+            'result': {'structuredContent': {
+                'error': "TimeoutError('ensure_connected timed out')",
+                'error_type': 'TimeoutError',
+            }},
+        }
+        success = {
+            'result': {'structuredContent': {
+                'message': 'ok', 'tasks': [{'success': True}],
+            }},
+        }
+        mock = AsyncMock(side_effect=[transient, transient, success])
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+        with caplog.at_level(_logging.INFO, logger='orchestrator.scheduler'):
+            await scheduler.set_task_status('5', 'in-progress')
+        assert mock.await_count == 3
+        # Two transient-retry INFO logs (not WARNING — we only WARN for terminal rejections).
+        retries = [r for r in caplog.records if 'transient rejection' in r.message]
+        assert len(retries) == 2
+
+    @pytest.mark.asyncio
+    async def test_transient_rejection_raises_after_exhaust(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Persistent transient rejection raises RuntimeError after the cap."""
+        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        transient = {
+            'result': {'structuredContent': {
+                'error': "TimeoutError('ensure_connected timed out')",
+                'error_type': 'TimeoutError',
+            }},
+        }
+        mock = AsyncMock(return_value=transient)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+        with pytest.raises(RuntimeError, match='TimeoutError'):
+            await scheduler.set_task_status('5', 'in-progress')
+        assert mock.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_non_transient_rejection_does_not_retry(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """Phantom-done gate (non-transient) is logged once and returns — no retry."""
+        import logging as _logging
+        monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
+        rejection = {
+            'result': {'structuredContent': {
+                'success': False, 'error': 'done_gate_missing_files',
+                'hint': 'metadata.files lists missing paths',
+            }},
+        }
+        mock = AsyncMock(return_value=rejection)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler.set_task_status('42', 'done', done_provenance={
+                'kind': 'merged', 'commit': 'deadbeef',
+            })
+        assert mock.await_count == 1, 'non-transient rejection must not retry'
+        warned = [
+            r for r in caplog.records if 'rejected by fused-memory' in r.message
+        ]
+        assert warned and 'done_gate_missing_files' in warned[0].message
 
     @pytest.mark.asyncio
     async def test_structured_rejection_is_logged_as_warning(
@@ -1695,6 +1779,38 @@ class TestExtractRejection:
         from orchestrator.scheduler import extract_rejection
         assert extract_rejection({}) is None
         assert extract_rejection(None) is None
+
+
+class TestIsTransientRejection:
+    """Classifier for retry decisions in ``Scheduler.set_task_status``."""
+
+    def test_timeout_error_is_transient(self):
+        from orchestrator.scheduler import is_transient_rejection
+        assert is_transient_rejection("TimeoutError('ensure_connected timed out') — TimeoutError")
+        assert is_transient_rejection('asyncio.TimeoutError')
+
+    def test_connection_error_is_transient(self):
+        from orchestrator.scheduler import is_transient_rejection
+        assert is_transient_rejection('ConnectionError: read timeout')
+        assert is_transient_rejection('httpx.ConnectError: refused')
+
+    def test_done_gate_is_not_transient(self):
+        """Phantom-done-gate rejection is a workflow bug, not a backend blip."""
+        from orchestrator.scheduler import is_transient_rejection
+        assert not is_transient_rejection(
+            'done_gate_missing_files — metadata.files lists missing paths'
+        )
+
+    def test_terminal_exit_is_not_transient(self):
+        from orchestrator.scheduler import is_transient_rejection
+        assert not is_transient_rejection(
+            "terminal_exit_rejected — Cannot transition from 'done' to 'pending'"
+        )
+
+    def test_none_and_empty_return_false(self):
+        from orchestrator.scheduler import is_transient_rejection
+        assert not is_transient_rejection(None)
+        assert not is_transient_rejection('')
 
 
 # ---------------------------------------------------------------------------
