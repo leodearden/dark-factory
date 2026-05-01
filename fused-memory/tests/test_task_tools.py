@@ -418,7 +418,7 @@ async def test_id_accepting_tools_reject_ticket_shaped_ids(
     task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
     task_interceptor.update_task = AsyncMock(return_value={'success': True})
     task_interceptor.add_subtask = AsyncMock(return_value={'success': True})
-    task_interceptor.remove_task = AsyncMock(return_value={'success': True})
+    task_interceptor.remove_tasks = AsyncMock(return_value={'success': True})
     task_interceptor.add_dependency = AsyncMock(return_value={'success': True})
     task_interceptor.remove_dependency = AsyncMock(return_value={'success': True})
 
@@ -432,8 +432,11 @@ async def test_id_accepting_tools_reject_ticket_shaped_ids(
     assert 'tkt_' in result.get('error', '') or 'ticket' in result.get('error', '').lower(), (
         f'Error message should mention ticket resolution: {result.get("error")!r}'
     )
-    # Must NOT have called the backend
-    getattr(task_interceptor, tool_name.replace('remove_', 'remove_')).assert_not_called()
+    # Must NOT have called the backend. The wire tool ``remove_task``
+    # dispatches to the interceptor's ``remove_tasks`` method (renamed at
+    # the protocol layer); map the wire name to the interceptor attr.
+    interceptor_attr = 'remove_tasks' if tool_name == 'remove_task' else tool_name
+    getattr(task_interceptor, interceptor_attr).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -453,6 +456,66 @@ async def test_dependency_tools_reject_ticket_shaped_depends_on(
         f'Expected ValidationError for ticket depends_on, got: {result}'
     )
     getattr(task_interceptor, tool_name).assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# remove_task wire-shape normalisation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remove_task_single_id_normalises_to_singleton_list(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A single id on the wire reaches the interceptor as ['<id>']."""
+    task_interceptor.remove_tasks = AsyncMock(
+        return_value={'successful': 1, 'failed': 0, 'removed_ids': ['5']},
+    )
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'remove_task', {'id': '5', 'project_root': '/project'},
+    )
+    task_interceptor.remove_tasks.assert_called_once()
+    _, kwargs = task_interceptor.remove_tasks.call_args
+    assert kwargs['ids'] == ['5']
+
+
+@pytest.mark.asyncio
+async def test_remove_task_csv_normalises_to_list(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """The MCP tool accepts a comma-separated id string and forwards a
+    structured ``list[str]`` to the interceptor — the wire-shape boundary."""
+    task_interceptor.remove_tasks = AsyncMock(
+        return_value={'successful': 3, 'failed': 0,
+                      'removed_ids': ['966.1', '966.2', '1680.1']},
+    )
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'remove_task',
+        {'id': '966.1, 966.2 ,1680.1', 'project_root': '/project'},
+    )
+    task_interceptor.remove_tasks.assert_called_once()
+    _, kwargs = task_interceptor.remove_tasks.call_args
+    # CSV split + per-element strip
+    assert kwargs['ids'] == ['966.1', '966.2', '1680.1']
+
+
+@pytest.mark.asyncio
+async def test_remove_task_empty_after_strip_is_noop(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """All-whitespace / empty-CSV input returns the empty-noop DTO without
+    touching the interceptor."""
+    task_interceptor.remove_tasks = AsyncMock()
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'remove_task', {'id': ' , ,', 'project_root': '/project'},
+    )
+    assert result == {
+        'successful': 0,
+        'failed': 0,
+        'removed_ids': [],
+        'message': 'no ids supplied',
+    }
+    task_interceptor.remove_tasks.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

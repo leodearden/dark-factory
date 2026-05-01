@@ -113,9 +113,9 @@ class TaskBackendProtocol(Protocol):
         tag: str | None = None,
     ) -> AddSubtaskResult: ...
 
-    async def remove_task(
+    async def remove_tasks(
         self,
-        task_id: str,
+        ids: list[str],
         project_root: str,
         tag: str | None = None,
     ) -> RemoveTaskResult: ...

@@ -26,7 +26,7 @@ def taskmaster():
     tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
     tm.update_task = AsyncMock(return_value={'success': True})
     tm.add_subtask = AsyncMock(return_value={'id': '1.1'})
-    tm.remove_task = AsyncMock(return_value={'success': True})
+    tm.remove_tasks = AsyncMock(return_value={'success': True})
     tm.add_dependency = AsyncMock(return_value={'success': True})
     tm.remove_dependency = AsyncMock(return_value={'success': True})
     return tm
@@ -299,7 +299,7 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
     try:
         await _submit_and_resolve(interceptor, '/project', prompt='Test 1')
         await interceptor.set_task_status('1', 'in-progress', '/project')
-        await interceptor.remove_task('1', '/project')
+        await interceptor.remove_tasks(['1'], '/project')
         # Let the drainer catch up.
         await asyncio.wait_for(queue._queue.join(), timeout=1.0)
 
@@ -1279,10 +1279,19 @@ async def test_no_reconciler_still_proxies(taskmaster, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_remove_task_emits_event(interceptor, event_buffer):
-    await interceptor.remove_task('1', '/project')
+async def test_remove_tasks_emits_event_per_id(interceptor, event_buffer):
+    await interceptor.remove_tasks(['1'], '/project')
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_multi_id_emits_one_event_per_id(
+    interceptor, event_buffer,
+):
+    await interceptor.remove_tasks(['1', '2', '3'], '/project')
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 3
 
 
 @pytest.mark.asyncio
@@ -2257,7 +2266,7 @@ async def test_write_methods_commit(interceptor_with_committer, committer):
     await _submit_and_resolve(i, pr, prompt='T')
     await i.update_task('1', pr, prompt='U')
     await i.add_subtask('1', pr, title='S')
-    await i.remove_task('1', pr)
+    await i.remove_tasks(['1'], pr)
     await i.add_dependency('2', '1', pr)
     await i.remove_dependency('2', '1', pr)
 
@@ -2529,8 +2538,8 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
             'get_task', {'id': '1', 'status': 'pending', 'title': 'T'},
         ),
     )
-    overlap_tm.remove_task = AsyncMock(
-        side_effect=instrument('remove_task', {'success': True}),
+    overlap_tm.remove_tasks = AsyncMock(
+        side_effect=instrument('remove_tasks', {'success': True}),
     )
     overlap_tm.add_dependency = AsyncMock(
         side_effect=instrument('add_dependency', {'success': True}),
@@ -2551,7 +2560,7 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
             interceptor.update_task(str(i), '/project', prompt=f'u{i}'),
         )
     # plus a couple of deps + removes
-    coros.append(interceptor.remove_task('7', '/project'))
+    coros.append(interceptor.remove_tasks(['7'], '/project'))
     coros.append(interceptor.add_dependency('3', '2', '/project'))
 
     await asyncio.gather(*coros)

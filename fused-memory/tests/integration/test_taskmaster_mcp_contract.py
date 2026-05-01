@@ -163,8 +163,8 @@ async def test_add_task_get_task_set_status_remove_task_round_trip(taskmaster_ba
         f'Expected "done" in set_task_status message, got: {status_result["message"]!r}'
     )
 
-    # (d) remove_task returns successful==1 and the id in removed_ids
-    remove_result = await backend.remove_task(task_id, project_root=project_root)
+    # (d) remove_tasks returns successful==1 and the id in removed_ids
+    remove_result = await backend.remove_tasks([task_id], project_root=project_root)
     assert remove_result['successful'] == 1, (
         f'Expected successful=1, got: {remove_result!r}'
     )

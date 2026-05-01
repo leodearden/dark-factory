@@ -194,11 +194,11 @@ async def test_add_subtask_raises_on_error(client):
         await c.add_subtask('999', project_root='/project', title='x')
 
 
-# ── remove_task ─────────────────────────────────────────────────────
+# ── remove_tasks ────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_remove_task_returns_flat_dto(client):
+async def test_remove_tasks_single_id_returns_flat_dto(client):
     c, session = client
     session.call_tool = AsyncMock(return_value=_success_result({
         'totalTasks': 1,
@@ -210,20 +210,48 @@ async def test_remove_task_returns_flat_dto(client):
         'tag': 'master',
     }))
 
-    dto = await c.remove_task('5', project_root='/project')
+    dto = await c.remove_tasks(['5'], project_root='/project')
 
     assert dto['successful'] == 1
     assert dto['failed'] == 0
     assert dto['removed_ids'] == ['5']
     assert dto['message'] == 'Removed 1 task'
+    # Verify the comma-joined wire shape is what gets forwarded to the
+    # upstream taskmaster MCP tool.
+    sent_args = session.call_tool.call_args[0][1]
+    assert sent_args['id'] == '5'
 
 
 @pytest.mark.asyncio
-async def test_remove_task_raises_on_error(client):
+async def test_remove_tasks_multi_id_comma_joins_for_upstream(client):
+    c, session = client
+    session.call_tool = AsyncMock(return_value=_success_result({
+        'totalTasks': 2,
+        'successful': 2,
+        'failed': 0,
+        'removedTasks': [
+            {'id': '5', 'title': 'gone-a'},
+            {'id': '6', 'title': 'gone-b'},
+        ],
+        'message': 'Removed 2 tasks',
+        'tasksPath': '/p/.taskmaster/tasks/tasks.json',
+        'tag': 'master',
+    }))
+
+    dto = await c.remove_tasks(['5', '6'], project_root='/project')
+
+    assert dto['successful'] == 2
+    assert dto['removed_ids'] == ['5', '6']
+    sent_args = session.call_tool.call_args[0][1]
+    assert sent_args['id'] == '5,6'
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_raises_on_error(client):
     c, session = client
     session.call_tool = AsyncMock(return_value=_error_result('Task ID is required'))
     with pytest.raises(TaskmasterError):
-        await c.remove_task('', project_root='/project')
+        await c.remove_tasks([''], project_root='/project')
 
 
 # ── add_dependency / remove_dependency ──────────────────────────────

@@ -1843,9 +1843,19 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+        # Wire shape advertises CSV for multi-removal; normalise to list[str]
+        # at the boundary so backends speak a single, structured shape.
+        ids = [s.strip() for s in id.split(',') if s.strip()]
+        if not ids:
+            return {
+                'successful': 0,
+                'failed': 0,
+                'removed_ids': [],
+                'message': 'no ids supplied',
+            }
         try:
-            return await task_interceptor.remove_task(
-                task_id=id, project_root=project_root, tag=tag
+            return await task_interceptor.remove_tasks(
+                ids=ids, project_root=project_root, tag=tag
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
