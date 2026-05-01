@@ -205,6 +205,104 @@ async def test_ensure_connected_propagates_primary_failure(caplog):
 
 
 @pytest.mark.asyncio
+async def test_post_write_verify_logs_state_drift(primary, project_root, caplog):
+    """Read-back verify catches the silent-write-drop case the input-echo
+    comparator was structurally blind to.
+
+    Setup: secondary's ``set_task_status`` returns the same wire shape as
+    primary (so ``_normalize_set_status`` shows zero divergence) but the
+    secondary's ``get_task`` continues to report the OLD status — the
+    write was effectively dropped on the secondary side.
+
+    Assert: the post-write verify task fires, finds the divergence,
+    increments ``verifies_diverged``, and logs ``verify_divergence``.
+    """
+    await primary.add_task(project_root=project_root, title='a')
+
+    secondary = _stub_backend()
+    secondary.set_task_status = AsyncMock(return_value={'tasks': [
+        {'taskId': '1', 'newStatus': 'done'},
+    ]})
+    # Stale read — drop on the secondary side.
+    secondary.get_task = AsyncMock(return_value={
+        'id': 1, 'title': 'a', 'status': 'pending', 'priority': 'medium',
+        'description': '', 'details': '',
+        'dependencies': [], 'subtasks': [],
+    })
+
+    wrapper = DualCompareBackend(primary, secondary)
+
+    with caplog.at_level('WARNING'):
+        await wrapper.set_task_status('1', 'done', project_root)
+        # Drain in-flight verify tasks.
+        for t in list(wrapper._inflight_verifies):
+            await t
+
+    assert wrapper.verifies_total == 1
+    assert wrapper.verifies_diverged == 1
+    assert any(
+        'dual_compare.verify_divergence' in m for m in caplog.messages
+    ), caplog.messages
+    # Per-method counters should also have ticked.
+    by_method = wrapper.verifies_by_method.get('set_task_status', {})
+    assert by_method == {'total': 1, 'diverged': 1}
+
+
+@pytest.mark.asyncio
+async def test_post_write_verify_no_divergence_when_state_matches(
+    primary, project_root, caplog,
+):
+    """Happy path: when both backends agree on post-write state, the
+    verify completes silently and ``verifies_diverged`` stays at zero."""
+    await primary.add_task(project_root=project_root, title='a')
+
+    secondary = _stub_backend()
+    secondary.set_task_status = AsyncMock(return_value={'tasks': [
+        {'taskId': '1', 'newStatus': 'done'},
+    ]})
+    # Apply the write on the primary first so we can hand the secondary a
+    # honest read-back of whatever shape the primary's get_task emits.
+    await primary.set_task_status('1', 'done', project_root)
+    primary_view = await primary.get_task('1', project_root)
+    secondary.get_task = AsyncMock(return_value=dict(primary_view))
+
+    wrapper = DualCompareBackend(primary, secondary)
+    await wrapper.set_task_status('1', 'done', project_root)
+    for t in list(wrapper._inflight_verifies):
+        await t
+
+    assert wrapper.verifies_total == 1
+    assert wrapper.verifies_diverged == 0
+
+
+@pytest.mark.asyncio
+async def test_post_write_verify_remove_task_expects_not_found(
+    primary, project_root, caplog,
+):
+    """``remove_task`` inverts the contract: both sides should now raise
+    ``TaskmasterError`` on the read-back. If secondary still returns
+    the task, that's a divergence."""
+    await primary.add_task(project_root=project_root, title='a')
+
+    secondary = _stub_backend()
+    secondary.remove_task = AsyncMock(return_value={'successful': 1, 'failed': 0})
+    # Stale: secondary still has the task after remove.
+    secondary.get_task = AsyncMock(return_value={
+        'id': 1, 'title': 'a', 'status': 'pending', 'priority': 'medium',
+        'description': '', 'details': '', 'dependencies': [], 'subtasks': [],
+    })
+
+    wrapper = DualCompareBackend(primary, secondary)
+    with caplog.at_level('WARNING'):
+        await wrapper.remove_task('1', project_root)
+        for t in list(wrapper._inflight_verifies):
+            await t
+
+    assert wrapper.verifies_total == 1
+    assert wrapper.verifies_diverged == 1
+
+
+@pytest.mark.asyncio
 async def test_dispatch_cancellation_drains_and_logs_divergence(caplog):
     """Outer cancellation must NOT silently swallow divergence: the inner
     gather is shielded, the caller still sees ``CancelledError``, and a

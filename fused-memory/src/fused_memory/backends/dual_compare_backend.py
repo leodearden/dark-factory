@@ -73,6 +73,17 @@ class DualCompareBackend:
         # divergence went silently unrecorded.
         self.cancelled_dispatch_count = 0
         self._inflight_drains: set[asyncio.Task] = set()
+        # Per-write read-back verification (Commit 5):
+        # the input-echo normalisers (``_normalize_set_status``,
+        # ``_normalize_id_only``) only confirm both backends agreed on what
+        # they were told to do, NOT on the resulting state. Verification
+        # re-reads the affected task on both backends and compares the
+        # normalised wire shape, surfacing the silent-write-drop case the
+        # original comparator was structurally blind to.
+        self.verifies_total = 0
+        self.verifies_diverged = 0
+        self.verifies_by_method: dict[str, dict[str, int]] = {}
+        self._inflight_verifies: set[asyncio.Task] = set()
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -122,9 +133,11 @@ class DualCompareBackend:
 
     async def close(self) -> None:
         # Wait for any in-flight drain tasks to settle so divergence records
-        # for cancelled-during-dispatch calls aren't lost on shutdown.
-        if self._inflight_drains:
-            pending = list(self._inflight_drains)
+        # for cancelled-during-dispatch calls aren't lost on shutdown. Same
+        # for read-back verifies — letting them complete keeps the soak
+        # signal coherent up to the moment of shutdown.
+        pending = list(self._inflight_drains) + list(self._inflight_verifies)
+        if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         await self.primary.close()
         try:
@@ -137,11 +150,11 @@ class DualCompareBackend:
 
     # ── Comparator core ────────────────────────────────────────────────
 
-    async def _dispatch(
+    async def _dispatch_pair(
         self, method_name: str, args: tuple, kwargs: dict,
         *, normalize: Callable[[Any], Any] | None = None,
-    ) -> Any:
-        """Run *method_name* on both backends; log divergences; surface primary.
+    ) -> tuple[Any, BaseException | None, Any, BaseException | None]:
+        """Cancellation-safe dispatch returning both backends' outcomes.
 
         Both calls run concurrently via ``asyncio.gather(return_exceptions=True)``
         wrapped in ``asyncio.shield`` so an outer cancellation can't tear the
@@ -152,6 +165,11 @@ class DualCompareBackend:
         ``_compare`` so the divergence is logged after the fact. The drain
         is tracked on ``self._inflight_drains`` so :meth:`close` can wait
         for it on shutdown.
+
+        Returns ``(primary_value, primary_exc, secondary_value, secondary_exc)``
+        where exactly one of value/exc is non-None on each side. Callers
+        that don't need both outcomes go through :meth:`_dispatch`, which
+        re-raises ``primary_exc`` and returns ``primary_value``.
         """
         primary_method = getattr(self.primary, method_name)
         secondary_method = getattr(self.secondary, method_name)
@@ -182,10 +200,21 @@ class DualCompareBackend:
             secondary_value, secondary_exc,
             normalize=normalize,
         )
+        return primary_value, primary_exc, secondary_value, secondary_exc
 
-        if primary_exc is not None:
-            raise primary_exc
-        return primary_value
+    async def _dispatch(
+        self, method_name: str, args: tuple, kwargs: dict,
+        *, normalize: Callable[[Any], Any] | None = None,
+    ) -> Any:
+        """Backwards-compatible wrapper around :meth:`_dispatch_pair` that
+        exposes only the primary's outcome (re-raising on primary failure).
+        """
+        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
+            method_name, args, kwargs, normalize=normalize,
+        )
+        if p_exc is not None:
+            raise p_exc
+        return p_val
 
     def _spawn_drain(
         self,
@@ -226,6 +255,113 @@ class DualCompareBackend:
         )
         self._inflight_drains.add(drain)
         drain.add_done_callback(self._inflight_drains.discard)
+
+    def _spawn_verify(
+        self,
+        method_name: str,
+        primary_target: str,
+        secondary_target: str,
+        project_root: str,
+        tag: str | None,
+        *,
+        strip_ids: bool = False,
+        expect_not_found: bool = False,
+    ) -> None:
+        """Schedule a fire-and-forget read-back verify of a write.
+
+        After a write, both backends should produce equivalent state on
+        the affected task. Re-read each side independently, normalise via
+        :func:`_normalize_task` (optionally stripping minted ids for
+        ``add_task`` / ``add_subtask`` whose ids legitimately differ),
+        and log a divergence when the wire shapes drift.
+
+        ``expect_not_found=True`` (used by ``remove_task``) inverts the
+        contract: both sides should raise ``TaskmasterError``; either one
+        succeeding is the divergence.
+        """
+        async def _verify() -> None:
+            method_stats = self.verifies_by_method.setdefault(
+                method_name, {'total': 0, 'diverged': 0},
+            )
+            self.verifies_total += 1
+            method_stats['total'] += 1
+
+            async def _read(backend: TaskBackendProtocol, target: str):
+                try:
+                    return ('value', await backend.get_task(target, project_root, tag))
+                except BaseException as exc:  # noqa: BLE001 — surface to compare
+                    return ('exc', exc)
+
+            primary_kind_val, secondary_kind_val = await asyncio.gather(
+                _read(self.primary, primary_target),
+                _read(self.secondary, secondary_target),
+                return_exceptions=False,
+            )
+            p_kind, p_payload = primary_kind_val
+            s_kind, s_payload = secondary_kind_val
+
+            diverged = False
+            if expect_not_found:
+                # Both should be exceptions. If either is a value, that's a
+                # divergence; if both are exceptions, type-equality is enough.
+                if p_kind == 'exc' and s_kind == 'exc':
+                    return  # both raised — no divergence
+                diverged = True
+                self._log_verify_divergence(
+                    method_name, primary_target, secondary_target,
+                    f'{self.primary_label}={p_kind}({_summarize(p_payload)})',
+                    f'{self.secondary_label}={s_kind}({_summarize(s_payload)})',
+                )
+            else:
+                if p_kind != s_kind:
+                    diverged = True
+                    self._log_verify_divergence(
+                        method_name, primary_target, secondary_target,
+                        f'{self.primary_label}={p_kind}({_summarize(p_payload)})',
+                        f'{self.secondary_label}={s_kind}({_summarize(s_payload)})',
+                    )
+                elif p_kind == 'value':
+                    p_norm = _normalize_task(p_payload)
+                    s_norm = _normalize_task(s_payload)
+                    if strip_ids and isinstance(p_norm, dict) and isinstance(s_norm, dict):
+                        p_norm = _strip_ids(p_norm)
+                        s_norm = _strip_ids(s_norm)
+                    if p_norm != s_norm:
+                        diverged = True
+                        self._log_verify_divergence(
+                            method_name, primary_target, secondary_target,
+                            f'{self.primary_label}={_summarize(p_norm)}',
+                            f'{self.secondary_label}={_summarize(s_norm)}',
+                        )
+
+            if diverged:
+                self.verifies_diverged += 1
+                method_stats['diverged'] += 1
+
+        try:
+            verify = asyncio.create_task(
+                _verify(), name=f'dual_compare-verify-{method_name}',
+            )
+        except RuntimeError:
+            # No running loop (rare; e.g. close() races) — fail safe.
+            return
+        self._inflight_verifies.add(verify)
+        verify.add_done_callback(self._inflight_verifies.discard)
+
+    def _log_verify_divergence(
+        self,
+        method_name: str,
+        primary_target: str,
+        secondary_target: str,
+        primary_repr: str,
+        secondary_repr: str,
+    ) -> None:
+        logger.warning(
+            'dual_compare.verify_divergence method=%s primary_target=%s '
+            'secondary_target=%s %s %s',
+            method_name, primary_target, secondary_target,
+            primary_repr, secondary_repr,
+        )
 
     def _compare(
         self,
@@ -305,21 +441,42 @@ class DualCompareBackend:
         project_root: str,
         tag: str | None = None,
     ):
-        return await self._dispatch(
+        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
             'set_task_status',
             (task_id, status, project_root),
             {'tag': tag},
             normalize=_normalize_set_status,
         )
+        if p_exc is not None:
+            raise p_exc
+        # Read-back: both backends should now show the same task state.
+        self._spawn_verify(
+            'set_task_status', str(task_id), str(task_id),
+            project_root, tag,
+        )
+        return p_val
 
     async def add_task(self, project_root: str, **kwargs):
         # add_task mints an id — the two backends won't agree on that, so
         # we strip ids out of the comparator and only check that both either
         # succeeded or both raised.
-        return await self._dispatch(
+        p_val, p_exc, s_val, s_exc = await self._dispatch_pair(
             'add_task', (project_root,), kwargs,
             normalize=_normalize_id_only,
         )
+        if p_exc is not None:
+            raise p_exc
+        # Verify only when both sides minted ids — no read target otherwise.
+        if (
+            isinstance(p_val, dict) and 'id' in p_val
+            and isinstance(s_val, dict) and 'id' in s_val
+        ):
+            self._spawn_verify(
+                'add_task', str(p_val['id']), str(s_val['id']),
+                project_root, kwargs.get('tag'),
+                strip_ids=True,
+            )
+        return p_val
 
     async def update_task(
         self,
@@ -330,30 +487,58 @@ class DualCompareBackend:
         append: bool = False,
         tag: str | None = None,
     ):
-        return await self._dispatch(
+        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
             'update_task',
             (task_id, project_root),
             {'prompt': prompt, 'metadata': metadata, 'append': append, 'tag': tag},
             normalize=_normalize_id_only,
         )
+        if p_exc is not None:
+            raise p_exc
+        self._spawn_verify(
+            'update_task', str(task_id), str(task_id),
+            project_root, tag,
+        )
+        return p_val
 
     async def add_subtask(self, parent_id: str, project_root: str, **kwargs):
-        return await self._dispatch(
+        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
             'add_subtask',
             (parent_id, project_root),
             kwargs,
             normalize=_normalize_id_only,
         )
+        if p_exc is not None:
+            raise p_exc
+        # Read parent on both sides; subtask ids legitimately differ so
+        # ``strip_ids=True`` strips ids from the parent and its subtasks
+        # before comparing.
+        self._spawn_verify(
+            'add_subtask', str(parent_id), str(parent_id),
+            project_root, kwargs.get('tag'),
+            strip_ids=True,
+        )
+        return p_val
 
     async def remove_task(
         self, task_id: str, project_root: str, tag: str | None = None,
     ):
-        return await self._dispatch(
+        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
             'remove_task',
             (task_id, project_root),
             {'tag': tag},
             normalize=_normalize_remove,
         )
+        if p_exc is not None:
+            raise p_exc
+        # Both sides should now report the task as gone. ``expect_not_found``
+        # inverts the contract — exception on both is the OK case.
+        self._spawn_verify(
+            'remove_task', str(task_id), str(task_id),
+            project_root, tag,
+            expect_not_found=True,
+        )
+        return p_val
 
     async def add_dependency(
         self,
@@ -362,12 +547,19 @@ class DualCompareBackend:
         project_root: str,
         tag: str | None = None,
     ):
-        return await self._dispatch(
+        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
             'add_dependency',
             (task_id, depends_on, project_root),
             {'tag': tag},
             normalize=_normalize_id_only,
         )
+        if p_exc is not None:
+            raise p_exc
+        self._spawn_verify(
+            'add_dependency', str(task_id), str(task_id),
+            project_root, tag,
+        )
+        return p_val
 
     async def remove_dependency(
         self,
@@ -376,12 +568,19 @@ class DualCompareBackend:
         project_root: str,
         tag: str | None = None,
     ):
-        return await self._dispatch(
+        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
             'remove_dependency',
             (task_id, depends_on, project_root),
             {'tag': tag},
             normalize=_normalize_id_only,
         )
+        if p_exc is not None:
+            raise p_exc
+        self._spawn_verify(
+            'remove_dependency', str(task_id), str(task_id),
+            project_root, tag,
+        )
+        return p_val
 
     async def validate_dependencies(
         self, project_root: str, tag: str | None = None,
@@ -450,6 +649,19 @@ def _normalize_id_only(result: Any) -> Any:
     if not isinstance(result, dict):
         return result
     return {k: True for k in ('id', 'message') if k in result}
+
+
+def _strip_ids(task: Any) -> Any:
+    """Recursively strip minted ``id`` fields. Used by the read-back
+    verifier for ``add_task`` / ``add_subtask`` where the two backends
+    legitimately mint different ids for the same logical task.
+    """
+    if not isinstance(task, dict):
+        return task
+    out = {k: v for k, v in task.items() if k != 'id'}
+    if 'subtasks' in out and isinstance(out['subtasks'], list):
+        out['subtasks'] = [_strip_ids(s) for s in out['subtasks']]
+    return out
 
 
 def _normalize_remove(result: Any) -> Any:
