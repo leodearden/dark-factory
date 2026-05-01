@@ -23,6 +23,10 @@ ExecStart=__UV_PATH__ run --project fused-memory \
 Environment=CONFIG_PATH=__REPO_ROOT__/fused-memory/config/config.yaml
 Environment=PROJECT_ROOT=__REPO_ROOT__
 Environment=TASKMASTER_DIR=__REPO_ROOT__/taskmaster-ai
+# Multi-project path-scope-guard / project-prefix-registry coverage. Same env var
+# the dashboard reads — keep in sync with dashboard.service.template. Comma-separated
+# (no spaces — systemd treats them as assignment separators).
+Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__,/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live
 
 # Restart policy: always restart on failure (including watchdog-triggered),
 # back off up to 60s
