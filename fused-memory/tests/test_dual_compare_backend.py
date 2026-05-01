@@ -367,6 +367,54 @@ async def test_post_write_verify_remove_task_expects_not_found(
 
 
 @pytest.mark.asyncio
+async def test_dual_compare_writes_per_side_backend_ops(primary, project_root, tmp_path):
+    """When a write_journal is wired, ``_dispatch_pair`` emits one
+    ``backend_op`` per physical backend, both linked to the parent
+    write_op_id propagated through the contextvar by the interceptor.
+
+    Simulates the interceptor's contextvar publication so the wrapper
+    can be tested in isolation.
+    """
+    from fused_memory.backends.dual_compare_backend import _current_write_op_id
+    from fused_memory.services.write_journal import WriteJournal
+
+    secondary = _stub_backend()
+    secondary.set_task_status = AsyncMock(return_value={'tasks': [
+        {'taskId': '1', 'newStatus': 'done'},
+    ]})
+
+    journal = WriteJournal(tmp_path / 'wj_dual')
+    await journal.initialize()
+    try:
+        await primary.add_task(project_root=project_root, title='a')
+        wrapper = DualCompareBackend(primary, secondary)
+        wrapper.set_write_journal(journal)
+
+        wo_id = 'test-write-op-id'
+        token = _current_write_op_id.set(wo_id)
+        try:
+            await wrapper.set_task_status('1', 'done', project_root)
+        finally:
+            _current_write_op_id.reset(token)
+        # Drain post-write verify so close() isn't racing it.
+        for t in list(wrapper._inflight_verifies):
+            await t
+
+        async with journal._db.execute(
+            'SELECT backend FROM backend_ops WHERE write_op_id = ?',
+            (wo_id,),
+        ) as cur:
+            backends = sorted(row[0] for row in await cur.fetchall())
+
+        # Two rows — one per physical backend.
+        assert 'sqlite_task_backend' in backends
+        # Secondary stub's class is AsyncMock — labelled by lowercased class.
+        assert 'asyncmock' in backends or 'taskmaster' in backends
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
 async def test_dispatch_cancellation_drains_and_logs_divergence(caplog):
     """Outer cancellation must NOT silently swallow divergence: the inner
     gather is shielded, the caller still sees ``CancelledError``, and a

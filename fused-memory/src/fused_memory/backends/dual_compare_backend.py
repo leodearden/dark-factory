@@ -18,12 +18,36 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextvars import ContextVar
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
+if TYPE_CHECKING:
+    from fused_memory.services.write_journal import WriteJournal
+
 logger = logging.getLogger(__name__)
+
+# Threaded by the task interceptor's ``_journal_around`` helper so the
+# wrapper can link its per-side ``backend_op`` rows to the parent
+# ``write_op``. ``None`` when no journaling is wired.
+_current_write_op_id: ContextVar[str | None] = ContextVar(
+    'dual_compare_current_write_op_id', default=None,
+)
+
+
+def _resolve_journal_backend_label(backend: Any) -> str:
+    """Stable journal label per physical backend ('taskmaster',
+    'sqlite_task_backend', or the lowercased class name)."""
+    if backend is None:
+        return 'unknown'
+    cls = type(backend).__name__
+    if cls == 'TaskmasterBackend':
+        return 'taskmaster'
+    if cls == 'SqliteTaskBackend':
+        return 'sqlite_task_backend'
+    return cls.lower()
 
 
 def _summarize(value: Any, *, limit: int = 240) -> str:
@@ -84,6 +108,16 @@ class DualCompareBackend:
         self.verifies_diverged = 0
         self.verifies_by_method: dict[str, dict[str, int]] = {}
         self._inflight_verifies: set[asyncio.Task] = set()
+        # Optional write-journal hook: when wired, ``_dispatch_pair`` emits
+        # one ``backend_op`` per physical backend (sqlite + taskmaster)
+        # linked to the parent ``write_op`` via the contextvar populated by
+        # the interceptor's ``_journal_around`` helper. Supports the
+        # post-soak directional-attribution query.
+        self._write_journal: WriteJournal | None = None
+        # Stable per-side labels used by the journal rows; resolved from
+        # the underlying backends' class names so they survive renames.
+        self._primary_journal_label = _resolve_journal_backend_label(primary)
+        self._secondary_journal_label = _resolve_journal_backend_label(secondary)
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -101,6 +135,11 @@ class DualCompareBackend:
         # ``backend.config.project_root`` on the wrapper now gets the
         # primary's config instead of AttributeError.
         return getattr(self.primary, 'config', None)
+
+    def set_write_journal(self, journal: 'WriteJournal') -> None:
+        """Attach a write-journal so per-physical-backend ``backend_op`` rows
+        are emitted alongside the interceptor's combined ``backend_op``."""
+        self._write_journal = journal
 
     async def start(self) -> None:
         await self.primary.start()
@@ -200,7 +239,60 @@ class DualCompareBackend:
             secondary_value, secondary_exc,
             normalize=normalize,
         )
+        # Journal per-physical-backend rows linked to the parent write_op
+        # (set by the interceptor). Only fires when the journal is wired
+        # AND we're inside an interceptor-issued write — read paths leave
+        # the contextvar at None and skip the rows.
+        if self._write_journal is not None:
+            wo_id = _current_write_op_id.get()
+            if wo_id is not None:
+                await self._journal_per_side(
+                    wo_id, method_name, kwargs,
+                    primary_value, primary_exc,
+                    secondary_value, secondary_exc,
+                )
         return primary_value, primary_exc, secondary_value, secondary_exc
+
+    async def _journal_per_side(
+        self,
+        write_op_id: str,
+        method_name: str,
+        kwargs: dict,
+        primary_value: Any,
+        primary_exc: BaseException | None,
+        secondary_value: Any,
+        secondary_exc: BaseException | None,
+    ) -> None:
+        """Emit one ``backend_op`` row per physical backend.
+
+        Failures are logged at debug only — journal misses must never
+        disturb the live request path.
+        """
+        ji = self._write_journal
+        if ji is None:
+            return
+        for label, exc, value in (
+            (self._primary_journal_label, primary_exc, primary_value),
+            (self._secondary_journal_label, secondary_exc, secondary_value),
+        ):
+            try:
+                await ji.log_backend_op(
+                    write_op_id=write_op_id,
+                    backend=label,
+                    operation=method_name,
+                    payload={k: _summarize(v, limit=120) for k, v in kwargs.items()},
+                    result_summary=(
+                        None if exc is not None
+                        else (str(value)[:500] if value is not None else None)
+                    ),
+                    success=exc is None,
+                    error=str(exc)[:500] if exc is not None else None,
+                )
+            except Exception:
+                logger.debug(
+                    'dual_compare: per-side log_backend_op failed (%s)',
+                    label, exc_info=True,
+                )
 
     async def _dispatch(
         self, method_name: str, args: tuple, kwargs: dict,
