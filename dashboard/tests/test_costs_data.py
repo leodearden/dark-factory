@@ -926,6 +926,164 @@ class TestCostByAccount:
         assert ta['status'] == 'active'
         assert ta['resets_at'] is None
 
+    @pytest.mark.asyncio
+    async def test_auth_failed_only_is_capped(self, tmp_path):
+        """Account with only an auth_failed event (no cap_hit, no invocations)
+        is reported as 'capped' and surfaces a parsed resets_at from the
+        reason text.
+
+        This is the dominant production case since Anthropic switched to
+        returning "out of extra usage" as HTTP 429 — UsageGate routes 4xx
+        through _handle_auth_failure, which writes auth_failed (not cap_hit).
+        Without this case the dashboard would mis-report the account as
+        'active' while the gate has it locked out.
+        """
+        db_path = tmp_path / 'auth_failed_only.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        auth_fail_ts = (now - timedelta(minutes=10)).isoformat()
+        # Same reason wording the orchestrator persists for HTTP 429 today.
+        details = (
+            '{"reason": "HTTP 429: You\'re out of extra usage '
+            '\\u00b7 resets in 3h"}'
+        )
+
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('test-acc', 'auth_failed', 'proj', 'r1', details, auth_fail_ts),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        ta = result['test-acc']
+        assert ta['status'] == 'capped', (
+            'auth_failed without recovery must report capped'
+        )
+        assert ta['last_auth_fail'] == auth_fail_ts
+        assert ta['last_cap'] is None
+        # Reason fallback parses "resets in 3h" → ~3h ahead.
+        parsed = datetime.fromisoformat(ta['resets_at'])
+        delta_s = abs((parsed - (now + timedelta(hours=3))).total_seconds())
+        assert delta_s < 60
+
+    @pytest.mark.asyncio
+    async def test_auth_resumed_clears_auth_failed(self, tmp_path):
+        """auth_failed followed by a later auth_resumed clears unavailability."""
+        db_path = tmp_path / 'auth_failed_then_resumed.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        auth_fail_ts = (now - timedelta(hours=2)).isoformat()
+        auth_resumed_ts = (now - timedelta(hours=1)).isoformat()
+
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('test-acc', 'auth_failed', 'proj', 'r1', None, auth_fail_ts),
+                ('test-acc', 'auth_resumed', 'proj', 'r1', None, auth_resumed_ts),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        ta = result['test-acc']
+        assert ta['status'] == 'active'
+        assert ta['resets_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_resumed_after_auth_failed_clears(self, tmp_path):
+        """A regular 'resumed' event later than auth_failed also clears.
+
+        Defensive: usage_gate today only writes auth_resumed for the auth-fail
+        recovery path, but the dashboard should not depend on that asymmetry.
+        Any recovery event (resumed OR auth_resumed) clears any unavailability
+        event (cap_hit OR auth_failed).
+        """
+        db_path = tmp_path / 'resumed_clears_auth.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        auth_fail_ts = (now - timedelta(hours=2)).isoformat()
+        resumed_ts = (now - timedelta(hours=1)).isoformat()
+
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('test-acc', 'auth_failed', 'proj', 'r1', None, auth_fail_ts),
+                ('test-acc', 'resumed', 'proj', 'r1', None, resumed_ts),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        assert result['test-acc']['status'] == 'active'
+
+    @pytest.mark.asyncio
+    async def test_auth_failed_after_resumed_recaptures(self, tmp_path):
+        """An older cap_hit/resumed pair followed by a fresh auth_failed must
+        flip back to 'capped'. Mirrors the production timeline for max-e/max-f
+        on 2026-05-01: stale cap_hit/resumed pair from a prior day, then a
+        new HTTP 429 → auth_failed today.
+        """
+        db_path = tmp_path / 'auth_after_resumed.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        cap_ts = (now - timedelta(days=2)).isoformat()
+        resumed_ts = (now - timedelta(days=2, hours=-1)).isoformat()
+        auth_fail_ts = (now - timedelta(hours=1)).isoformat()
+        details = (
+            '{"reason": "HTTP 429: You\'re out of extra usage '
+            '\\u00b7 resets in 2h"}'
+        )
+
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('test-acc', 'cap_hit', 'proj', 'r1', None, cap_ts),
+                ('test-acc', 'resumed', 'proj', 'r1', None, resumed_ts),
+                ('test-acc', 'auth_failed', 'proj', 'r1', details, auth_fail_ts),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        ta = result['test-acc']
+        assert ta['status'] == 'capped'
+        # resets_at comes from the auth_failed (newer) event's reason text.
+        parsed = datetime.fromisoformat(ta['resets_at'])
+        delta_s = abs((parsed - (now + timedelta(hours=2))).total_seconds())
+        assert delta_s < 60
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_cost_by_role
@@ -1977,6 +2135,80 @@ class TestAggregateCostByAccount:
         result = await aggregate_cost_by_account(two_conns, days=30)
         assert 'max-b' in result
         assert result['max-b']['spend'] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_cross_db_auth_failed_wins(self, tmp_path):
+        """An auth_failed event in one DB makes the account 'capped' globally
+        even when the other DB has only a stale cap_hit/resumed pair.
+
+        Mirrors the production timeline that motivated the auth_failed→
+        unavailable mapping: max-e/max-f had old cap_hit/resumed pairs in
+        the reify DB (showing 'active') and only auth_failed events in
+        know-live (with no later auth_resumed). The aggregator must report
+        capped because the most recent unavailability event globally is the
+        auth_failed.
+        """
+        now = datetime.now(UTC)
+        old_cap = (now - timedelta(days=2)).isoformat()
+        old_resumed = (now - timedelta(days=2, hours=-1)).isoformat()
+        new_auth_fail = (now - timedelta(hours=1)).isoformat()
+
+        db_a = tmp_path / 'cross_auth_a.db'
+        db_b = tmp_path / 'cross_auth_b.db'
+        for p in (db_a, db_b):
+            conn = sqlite3.connect(str(p))
+            conn.executescript(MINIMAL_SCHEMA)
+            conn.close()
+
+        # DB A: stale cap_hit + later resumed (looks 'active' in isolation)
+        conn = sqlite3.connect(str(db_a))
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('max-a', 'cap_hit', 'pa', 'r1',
+                 '{"reason": "old"}', old_cap),
+                ('max-a', 'resumed', 'pa', 'r1', None, old_resumed),
+            ],
+        )
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'pa', 'max-a', 'opus', 'implementer',
+             0.1, 0, old_cap, old_cap),
+        )
+        conn.commit()
+        conn.close()
+
+        # DB B: fresh auth_failed with no recovery
+        conn = sqlite3.connect(str(db_b))
+        auth_details = (
+            '{"reason": "HTTP 429: You\'re out of extra usage '
+            '\\u00b7 resets in 2h"}'
+        )
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('max-a', 'auth_failed', 'pb', 'r2', auth_details, new_auth_fail),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            a.row_factory = aiosqlite.Row
+            b.row_factory = aiosqlite.Row
+            result = await aggregate_cost_by_account([a, b], days=7)
+
+        assert result['max-a']['status'] == 'capped'
+        assert result['max-a']['last_auth_fail'] == new_auth_fail
+        # Reason fallback parses "resets in 2h" → ~2h ahead.
+        parsed = datetime.fromisoformat(result['max-a']['resets_at'])
+        delta_s = abs((parsed - (now + timedelta(hours=2))).total_seconds())
+        assert delta_s < 60
 
 
 class TestAggregateAccountEvents:

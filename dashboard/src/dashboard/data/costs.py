@@ -172,15 +172,27 @@ async def get_cost_by_account(
     *,
     days: int = 7,
 ) -> dict[str, dict]:
-    """Per-account cost summary with cap status.
+    """Per-account cost summary with availability status.
 
-    Returns {account_name: {spend, invocations, cap_events, last_cap, status,
-                            resets_at}}.
-    *status* is 'capped' when the latest in-window ``cap_hit`` has no subsequent
-    ``resumed`` event; otherwise 'active'. Other event types (``auth_failed``,
-    ``failover``, ``near_cap``, ``auth_resumed``) do not affect cap status.
-    *resets_at* is the parsed cap-reset ISO timestamp from the latest cap_hit's
-    details payload (or None when unknown / not capped).
+    Returns {account_name: {spend, invocations, cap_events, last_cap,
+                            last_resumed, last_auth_fail, last_auth_resumed,
+                            status, resets_at}}.
+
+    *status* is ``'capped'`` when the account is unavailable to the
+    orchestrator — i.e. the most recent unavailability event (``cap_hit`` or
+    ``auth_failed``) is later than the most recent recovery event (``resumed``
+    or ``auth_resumed``). Otherwise ``'active'``. The wire string stays
+    ``'capped'`` for UI compatibility; semantically it means "unavailable",
+    matching the gate's ``all(a.capped or a.auth_failed)`` predicate.
+
+    Anthropic's modern cap signal arrives as HTTP 429 (routed through
+    ``UsageGate._handle_auth_failure`` and persisted as ``auth_failed``), so
+    folding ``auth_failed`` in is what makes the dashboard track the gate's
+    actual decision rather than only the legacy stderr-cap path.
+
+    *resets_at* is the parsed reset ISO timestamp from whichever of the
+    latest ``cap_hit`` / ``auth_failed`` details payload is more recent (or
+    None when not unavailable / unknown).
     """
     since = _cutoff(days)
 
@@ -194,17 +206,19 @@ async def get_cost_by_account(
             (since,),
         )
 
-        # Per-account cap / resumed timestamps plus the latest cap_hit's
-        # details payload (for resets_at extraction).
+        # Per-account unavailability / recovery timestamps plus the latest
+        # cap_hit and auth_failed details payloads (for resets_at extraction).
         #
-        # latest_cap picks the newest cap_hit row per account and carries its
-        # `details` field forward. The outer query computes per-account:
-        #   - cap_count: how many cap_hits in the window
-        #   - last_cap_at: timestamp of the most recent cap_hit
-        #   - last_resumed_at: timestamp of the most recent 'resumed' event
-        #     (used to decide whether the last cap is still in effect)
-        # Status comparison uses only 'cap_hit'/'resumed' — unrelated events
-        # like auth_failed/failover must not flip a capped account to active.
+        # latest_cap / latest_auth_fail pick the newest cap_hit / auth_failed
+        # row per account and carry the `details` field forward. The outer
+        # query computes per-account:
+        #   - cap_count: how many cap_hits in the window (kept for reporting)
+        #   - last_cap_at / last_auth_fail_at: most recent unavailability
+        #     timestamps (either flips an account to 'capped' status)
+        #   - last_resumed_at / last_auth_resumed_at: most recent recovery
+        #     timestamps (either clears unavailability)
+        # Status compares max(unavail) vs max(recover); 'failover' / 'near_cap'
+        # are intentionally ignored.
         evt_rows = await db.execute_fetchall(
             'WITH latest_cap AS ( '
             '  SELECT account_name, details, '
@@ -212,18 +226,30 @@ async def get_cost_by_account(
             '           (PARTITION BY account_name ORDER BY created_at DESC) AS rn '
             '    FROM account_events '
             "   WHERE event_type = 'cap_hit' AND created_at >= ? "
+            '), '
+            'latest_auth_fail AS ( '
+            '  SELECT account_name, details, '
+            '         ROW_NUMBER() OVER '
+            '           (PARTITION BY account_name ORDER BY created_at DESC) AS rn '
+            '    FROM account_events '
+            "   WHERE event_type = 'auth_failed' AND created_at >= ? "
             ') '
             'SELECT ae.account_name, '
             "       SUM(CASE WHEN ae.event_type = 'cap_hit' THEN 1 ELSE 0 END) AS cap_count, "
             "       MAX(CASE WHEN ae.event_type = 'cap_hit' THEN ae.created_at END) AS last_cap_at, "
             "       MAX(CASE WHEN ae.event_type = 'resumed' THEN ae.created_at END) AS last_resumed_at, "
-            '       lc.details AS last_cap_details '
+            "       MAX(CASE WHEN ae.event_type = 'auth_failed' THEN ae.created_at END) AS last_auth_fail_at, "
+            "       MAX(CASE WHEN ae.event_type = 'auth_resumed' THEN ae.created_at END) AS last_auth_resumed_at, "
+            '       lc.details AS last_cap_details, '
+            '       laf.details AS last_auth_fail_details '
             '  FROM account_events ae '
             '  LEFT JOIN latest_cap lc '
             '    ON ae.account_name = lc.account_name AND lc.rn = 1 '
+            '  LEFT JOIN latest_auth_fail laf '
+            '    ON ae.account_name = laf.account_name AND laf.rn = 1 '
             ' WHERE ae.created_at >= ? '
             ' GROUP BY ae.account_name',
-            (since, since),
+            (since, since, since),
         )
 
         # Cap counts and status keyed by account_name
@@ -232,42 +258,70 @@ async def get_cost_by_account(
             account_name = row['account_name']
             last_cap_at = row['last_cap_at']
             last_resumed_at = row['last_resumed_at']
-            # Capped iff a cap_hit exists in window with no later 'resumed'.
-            is_capped = last_cap_at is not None and (
-                last_resumed_at is None or last_cap_at > last_resumed_at
+            last_auth_fail_at = row['last_auth_fail_at']
+            last_auth_resumed_at = row['last_auth_resumed_at']
+            last_unavail = _max_ts(last_cap_at, last_auth_fail_at)
+            last_recover = _max_ts(last_resumed_at, last_auth_resumed_at)
+            # Unavailable iff most recent unavailability event has no later
+            # recovery event of either kind.
+            is_unavailable = last_unavail is not None and (
+                last_recover is None or last_unavail > last_recover
             )
-            resets_at = (
-                _extract_resets_at(row['last_cap_details']) if is_capped else None
-            )
+            cap_resets_at = _extract_resets_at(row['last_cap_details'])
+            auth_resets_at = _extract_resets_at(row['last_auth_fail_details'])
+            # `resets_at` is the resets_at paired with whichever unavailability
+            # event is more recent. Surfaces ``None`` when not unavailable.
+            if not is_unavailable:
+                resets_at: str | None = None
+            elif last_cap_at and (
+                last_auth_fail_at is None or last_cap_at >= last_auth_fail_at
+            ):
+                resets_at = cap_resets_at
+            else:
+                resets_at = auth_resets_at
             caps[account_name] = {
                 'cap_events': row['cap_count'] or 0,
                 'last_cap': last_cap_at,  # NULL when no cap_hit in window
                 'last_resumed': last_resumed_at,  # NULL when no resumed in window
-                'status': 'capped' if is_capped else 'active',
+                'last_auth_fail': last_auth_fail_at,
+                'last_auth_resumed': last_auth_resumed_at,
+                # Per-event-type resets_at fields preserved so the cross-DB
+                # aggregator can pair the right one with whichever event won
+                # globally.
+                'cap_resets_at': cap_resets_at,
+                'auth_resets_at': auth_resets_at,
+                'status': 'capped' if is_unavailable else 'active',
                 'resets_at': resets_at,
             }
 
+        default_info = {
+            'cap_events': 0, 'last_cap': None, 'last_resumed': None,
+            'last_auth_fail': None, 'last_auth_resumed': None,
+            'cap_resets_at': None, 'auth_resets_at': None,
+            'status': 'active', 'resets_at': None,
+        }
         result: dict[str, dict] = {}
         for row in inv_rows:
             account_name = row['account_name']
-            cap_info = caps.get(
-                account_name,
-                {'cap_events': 0, 'last_cap': None, 'last_resumed': None,
-                 'status': 'active', 'resets_at': None},
-            )
+            cap_info = caps.get(account_name, default_info)
             result[account_name] = {
                 'spend': row['spend'] or 0.0,
                 'invocations': row['cnt'] or 0,
                 'cap_events': cap_info['cap_events'],
                 'last_cap': cap_info['last_cap'],
                 'last_resumed': cap_info['last_resumed'],
+                'last_auth_fail': cap_info['last_auth_fail'],
+                'last_auth_resumed': cap_info['last_auth_resumed'],
+                'cap_resets_at': cap_info['cap_resets_at'],
+                'auth_resets_at': cap_info['auth_resets_at'],
                 'status': cap_info['status'],
                 'resets_at': cap_info['resets_at'],
             }
 
-        # Second pass: emit cap-only accounts (cap events but no invocations).
-        # These are operationally significant (capped-but-idle) and must be
-        # visible in the dashboard even though they have no spend.
+        # Second pass: emit accounts that have any in-window event but no
+        # invocations. These are operationally significant (idle but
+        # capped/auth_failed) and must be visible in the dashboard even
+        # without spend.
         for account_name, cap_info in caps.items():
             if account_name not in result:
                 result[account_name] = {
@@ -276,12 +330,25 @@ async def get_cost_by_account(
                     'cap_events': cap_info['cap_events'],
                     'last_cap': cap_info['last_cap'],
                     'last_resumed': cap_info['last_resumed'],
+                    'last_auth_fail': cap_info['last_auth_fail'],
+                    'last_auth_resumed': cap_info['last_auth_resumed'],
+                    'cap_resets_at': cap_info['cap_resets_at'],
+                    'auth_resets_at': cap_info['auth_resets_at'],
                     'status': cap_info['status'],
                     'resets_at': cap_info['resets_at'],
                 }
         return result
 
     return await with_db(db, _query, {})
+
+
+def _max_ts(a: str | None, b: str | None) -> str | None:
+    """Return the lexically greater ISO timestamp, or None when both are None."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a > b else b
 
 
 def _extract_resets_at(details: str | None) -> str | None:
@@ -680,15 +747,16 @@ async def aggregate_cost_by_account(
     Accounts are shared across projects (same OAuth token, same Max
     subscription), so cap state is a single global thing — even though each
     project's orchestrator writes its own events. This aggregator computes
-    the global ordering from ``max(last_cap)`` and ``max(last_resumed)``
-    across all source DBs. An account is ``'capped'`` iff the globally
-    newest cap_hit has no later ``'resumed'`` event in ANY DB — so a stale
-    orchestrator that saw a cap and then stopped no longer masks a resumed
-    observed by another running orchestrator.
+    the global ordering from ``max(last_cap)``, ``max(last_resumed)``,
+    ``max(last_auth_fail)``, and ``max(last_auth_resumed)`` across all source
+    DBs. An account is ``'capped'`` iff the globally newest unavailability
+    event (cap_hit *or* auth_failed) has no later recovery event (resumed
+    *or* auth_resumed) in ANY DB — so a stale orchestrator that saw a cap
+    and then stopped no longer masks a resumed observed by another running
+    orchestrator.
 
-    ``last_cap`` takes the globally most recent cap_hit timestamp; its paired
-    ``resets_at`` travels with it. ``last_resumed`` takes the globally most
-    recent resumed timestamp. Spend/invocations/cap_events are summed.
+    The paired ``resets_at`` travels with whichever of cap_hit / auth_failed
+    is globally most recent. Spend/invocations/cap_events are summed.
     """
     results = await asyncio.gather(*(get_cost_by_account(db, days=days) for db in dbs))
     merged: dict[str, dict] = {}
@@ -703,27 +771,54 @@ async def aggregate_cost_by_account(
                 m['cap_events'] += info['cap_events']
                 if info['last_cap'] and (not m['last_cap'] or info['last_cap'] > m['last_cap']):
                     m['last_cap'] = info['last_cap']
-                    # resets_at is meaningful only when paired with its cap_hit,
-                    # so it travels with the winning last_cap.
-                    m['resets_at'] = info.get('resets_at')
+                    # cap_resets_at travels with the winning last_cap (it's
+                    # the resets_at of *that* cap_hit, not of an auth_fail).
+                    m['cap_resets_at'] = info.get('cap_resets_at')
                 info_resumed = info.get('last_resumed')
                 if info_resumed and (
                     not m.get('last_resumed') or info_resumed > m['last_resumed']
                 ):
                     m['last_resumed'] = info_resumed
+                info_auth_fail = info.get('last_auth_fail')
+                if info_auth_fail and (
+                    not m.get('last_auth_fail')
+                    or info_auth_fail > m['last_auth_fail']
+                ):
+                    m['last_auth_fail'] = info_auth_fail
+                    m['auth_resets_at'] = info.get('auth_resets_at')
+                info_auth_resumed = info.get('last_auth_resumed')
+                if info_auth_resumed and (
+                    not m.get('last_auth_resumed')
+                    or info_auth_resumed > m['last_auth_resumed']
+                ):
+                    m['last_auth_resumed'] = info_auth_resumed
 
-    # Recompute status globally now that last_cap and last_resumed reflect
-    # the max across all DBs. Per-DB status latch would mis-report capped
-    # when one stale DB saw a cap_hit but never saw the resumed that another
-    # DB observed later.
+    # Recompute status globally now that last_cap, last_resumed,
+    # last_auth_fail, and last_auth_resumed reflect the max across all DBs.
+    # Per-DB status latch would mis-report when one stale DB saw an
+    # unavailability but never saw the recovery that another DB observed
+    # later.
     for m in merged.values():
         last_cap = m.get('last_cap')
+        last_auth_fail = m.get('last_auth_fail')
         last_resumed = m.get('last_resumed')
-        if last_cap and (not last_resumed or last_cap > last_resumed):
+        last_auth_resumed = m.get('last_auth_resumed')
+        last_unavail = _max_ts(last_cap, last_auth_fail)
+        last_recover = _max_ts(last_resumed, last_auth_resumed)
+        if last_unavail and (not last_recover or last_unavail > last_recover):
             m['status'] = 'capped'
+            # resets_at is paired with whichever event was the global
+            # unavailability winner.
+            if last_cap and (
+                last_auth_fail is None or last_cap >= last_auth_fail
+            ):
+                m['resets_at'] = m.get('cap_resets_at')
+            else:
+                m['resets_at'] = m.get('auth_resets_at')
         else:
             m['status'] = 'active'
-            # resets_at is stale once we know a later resumed cleared the cap.
+            # resets_at is stale once we know a later recovery cleared
+            # everything.
             m['resets_at'] = None
     return merged
 
