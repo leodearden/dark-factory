@@ -18,7 +18,6 @@ class EventType(StrEnum):
     task_created = 'task_created'
     task_modified = 'task_modified'
     task_deleted = 'task_deleted'
-    tasks_bulk_created = 'tasks_bulk_created'
 
 
 class EventSource(StrEnum):

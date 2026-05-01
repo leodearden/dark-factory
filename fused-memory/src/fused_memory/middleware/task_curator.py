@@ -167,7 +167,7 @@ class CandidateTask:
     files_to_modify: list[str] = field(default_factory=list)
     priority: str = DEFAULT_PRIORITY
     spawned_from: str | None = None  # task id of the review-chain anchor
-    spawn_context: str = 'manual'  # review | steward-triage | expand | parse_prd | manual
+    spawn_context: str = 'manual'  # review | steward-triage | planning | manual
 
     def payload_hash(self) -> str:
         """Stable hash over fields the curator actually reads.
@@ -518,10 +518,10 @@ class TaskCurator:
     def _intra_batch_key(title: str, description: str) -> str:
         """Stable 16-char hash over normalised (title, description).
 
-        Used in the intra-batch duplicate-detection pre-pass inside
-        ``_dedupe_bulk_created`` to identify near-identical subtasks that
-        a bulk-creation LLM call (expand_task / parse_prd) emits within
-        the same batch.
+        Used by the planning_mode / curator batch pipeline to identify
+        near-identical entries inside a single LLM-generated batch (the
+        canonical bulk-creation path now that expand_task / parse_prd are
+        gone).
 
         Normalisation delegates to the shared module-level
         :func:`normalize_title` helper — lowercase, strip, and collapse

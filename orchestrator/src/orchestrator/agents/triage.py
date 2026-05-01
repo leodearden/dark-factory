@@ -29,8 +29,8 @@ def sha256_16(data: str) -> str:
 
     * ``CandidateTask.payload_hash()`` (~line 187) — curator decision-cache key;
       combine-on-combine drift guard.
-    * ``TaskCurator._intra_batch_key()`` (~line 532) — intra-batch dedup for
-      bulk-created subtasks from ``expand_task`` / ``parse_prd``.
+    * ``TaskCurator._intra_batch_key()`` (~line 532) — intra-batch dedup
+      for bulk-created subtasks from planning_mode batches.
     * ``TaskCurator._normalize_key()`` (~line 549) — R3 pre-LLM short-circuit
       for raced-reviewer dedupe.
 

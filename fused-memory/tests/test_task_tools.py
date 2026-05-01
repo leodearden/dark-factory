@@ -233,8 +233,12 @@ def test_task_tools_registered_without_interceptor():
     tool_names = [t.name for t in server._tool_manager.list_tools()]
     for name in ['get_tasks', 'get_task', 'set_task_status',
                  'update_task', 'add_subtask', 'remove_task', 'add_dependency',
-                 'remove_dependency', 'expand_task', 'parse_prd']:
+                 'remove_dependency']:
         assert name in tool_names, f'{name} should be registered'
+    for name in ['expand_task', 'parse_prd']:
+        assert name not in tool_names, (
+            f'{name} was retired with the Taskmaster cutover'
+        )
 
 
 def test_add_task_mcp_tool_not_registered():

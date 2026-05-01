@@ -17,9 +17,8 @@ TASKS_REL_PATH = ".taskmaster/tasks/tasks.json"
 class TaskFileCommitter:
     """Git add+commit of tasks.json, serialized per project_root.
 
-    Individual mutations schedule fire-and-forget commits; bulk operations
-    (parse_prd, expand_task) should await ``commit()`` directly so the full
-    batch is captured before the call returns.
+    Mutations schedule fire-and-forget commits. Callers that need the full
+    batch persisted before they return should await ``commit()`` directly.
     """
 
     def __init__(self) -> None:

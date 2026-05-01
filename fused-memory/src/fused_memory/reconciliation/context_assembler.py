@@ -218,7 +218,6 @@ class ContextAssembler:
             EventType.task_modified: self._ctx_task_event,
             EventType.task_deleted: self._ctx_task_deleted,
             EventType.episode_added: self._ctx_episode_added,
-            EventType.tasks_bulk_created: self._ctx_tasks_bulk_created,
         }
         handler = dispatch.get(event.type)
         if handler is None:
@@ -356,23 +355,3 @@ class ContextAssembler:
             for r in results
         ]
 
-    async def _ctx_tasks_bulk_created(
-        self, event: ReconciliationEvent, project_id: str,
-    ) -> list[ContextItem]:
-        """Fetch parent task for bulk-created tasks."""
-        parent_id = event.payload.get('parent_task_id', '')
-        if not parent_id or not self.taskmaster:
-            return []
-        task = await self.taskmaster.get_task(
-            task_id=str(parent_id),
-            project_root=self.project_root,
-        )
-        if not task:
-            return []
-        return [
-            ContextItem(
-                id=f'task:{parent_id}',
-                source='task',
-                formatted=_format_task(task, display_id=str(parent_id)),
-            ),
-        ]

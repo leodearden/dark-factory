@@ -319,26 +319,32 @@ async def run_server():
     await write_journal.initialize()
     memory_service.set_write_journal(write_journal)
 
-    # Initialize Taskmaster backend
+    # Initialize task backend (Taskmaster MCP / SqliteTaskBackend / DualCompare).
     taskmaster = None
     task_interceptor = None
     if config.taskmaster:
-        from fused_memory.backends.taskmaster_client import TaskmasterBackend
-
-        taskmaster = TaskmasterBackend(config.taskmaster)
+        taskmaster = await _build_task_backend(config.taskmaster)
         # Wire the backend into memory_service before initialize() so
         # get_status reports an accurate connection state even if the
         # first initialize fails. is_alive() will probe the live session.
         memory_service.taskmaster = taskmaster
         try:
-            # start() launches the supervisor task; it returns once the first
-            # session is ready (or after startup_timeout if not). The supervisor
-            # owns the stdio + ClientSession context managers — internal failures
-            # cancel only the supervisor, not run_server.
+            # start() launches the supervisor task (Taskmaster) or opens the
+            # SQLite connection lazily (SqliteTaskBackend); both return once
+            # the backend is usable (or after the appropriate startup timeout
+            # if not). For Taskmaster the supervisor owns the stdio +
+            # ClientSession context managers — internal failures cancel only
+            # the supervisor, not run_server.
             await taskmaster.start()
-            logger.info(f'  Taskmaster: supervisor started ({config.taskmaster.transport})')
+            logger.info(
+                '  Task backend: %s (mode=%s)',
+                type(taskmaster).__name__,
+                config.taskmaster.backend_mode,
+            )
         except Exception as e:
-            logger.warning(f'  Taskmaster: supervisor start failed ({e}), will retry on next tool call')
+            logger.warning(
+                '  Task backend: start failed (%s), will retry on next tool call', e,
+            )
 
     # Initialize reconciliation system
     harness_loop_task = None
@@ -684,6 +690,44 @@ async def run_server():
             sqlite_watchdog=sqlite_watchdog,
             taskmaster=taskmaster,
         )
+
+
+async def _build_task_backend(taskmaster_config):
+    """Construct the configured task backend.
+
+    Selection comes from ``taskmaster_config.backend_mode``:
+
+    - ``taskmaster`` (default) — legacy MCP proxy (:class:`TaskmasterBackend`)
+    - ``sqlite`` — in-process SQLite (:class:`SqliteTaskBackend`)
+    - ``dual_compare`` — both, wrapped in :class:`DualCompareBackend` so
+      one is the served primary and the other is mirrored + compared.
+      ``dual_compare_primary`` picks which side serves callers.
+
+    See ``plans/do-1-on-a-happy-pony.md`` §Cycle 2 for the cutover dance.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.backends.taskmaster_client import TaskmasterBackend
+
+    mode = taskmaster_config.backend_mode
+    if mode == 'taskmaster':
+        return TaskmasterBackend(taskmaster_config)
+    if mode == 'sqlite':
+        return SqliteTaskBackend(taskmaster_config)
+    if mode == 'dual_compare':
+        from fused_memory.backends.dual_compare_backend import DualCompareBackend
+
+        tm = TaskmasterBackend(taskmaster_config)
+        sql = SqliteTaskBackend(taskmaster_config)
+        if taskmaster_config.dual_compare_primary == 'sqlite':
+            return DualCompareBackend(
+                primary=sql, secondary=tm,
+                primary_label='sqlite', secondary_label='taskmaster',
+            )
+        return DualCompareBackend(
+            primary=tm, secondary=sql,
+            primary_label='taskmaster', secondary_label='sqlite',
+        )
+    raise ValueError(f'Unknown taskmaster.backend_mode: {mode!r}')
 
 
 async def _build_ticket_store(data_dir: Path) -> 'TicketStore':

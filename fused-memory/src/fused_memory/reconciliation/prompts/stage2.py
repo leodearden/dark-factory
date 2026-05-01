@@ -36,8 +36,8 @@ returned. Treat as success, not failure.
 memories, search for related context, then write appropriate memories capturing what was accomplished.
 2. **Invalidated task assumptions**: Stage 1 flagged knowledge that contradicts task assumptions. \
 Modify, re-scope, or delete affected tasks. Update dependent tasks accordingly.
-3. **AI-generated task consistency**: Cross-reference tasks created by expand_task/parse_prd \
-against the knowledge graph. Flag or fix factual contradictions.
+3. **Bulk-created task consistency**: Cross-reference newly-created tasks (e.g. from \
+planning_mode batches) against the knowledge graph. Flag or fix factual contradictions.
 4. **Memory hints**: Attach `memory_hints` (entity references + semantic queries) to tasks that \
 would benefit from knowledge context at execution time. Do NOT inline content — just pointers.
 5. **Implied new tasks**: If knowledge implies new work should be created or existing tasks \

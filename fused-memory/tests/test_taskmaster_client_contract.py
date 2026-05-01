@@ -279,62 +279,6 @@ async def test_validate_dependencies_returns_flat_dto(client):
     assert dto['message'] == 'Dependencies validated successfully'
 
 
-# ── expand_task ─────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_expand_task_returns_flat_dto(client):
-    c, session = client
-    session.call_tool = AsyncMock(return_value=_success_result({
-        'task': {'id': '7', 'title': 'parent', 'subtasks': [{'id': '7.1'}, {'id': '7.2'}]},
-        'subtasksAdded': 2,
-        'hasExistingSubtasks': False,
-        'telemetryData': {},
-    }))
-
-    dto = await c.expand_task('7', project_root='/project')
-
-    assert dto['subtasks_added'] == 2
-    assert dto['has_existing_subtasks'] is False
-    assert dto['task']['id'] == '7'
-
-
-@pytest.mark.asyncio
-async def test_expand_task_skipped_variant(client):
-    """The JS direct-function emits a skipped variant when subtasks exist
-    and ``force`` isn't passed. DTO should still parse."""
-    c, session = client
-    session.call_tool = AsyncMock(return_value=_success_result({
-        'message': 'Task 7 already has subtasks. Expansion skipped.',
-        'task': {'id': '7', 'subtasks': []},
-        'subtasksAdded': 0,
-        'hasExistingSubtasks': True,
-    }))
-
-    dto = await c.expand_task('7', project_root='/project')
-
-    assert dto['subtasks_added'] == 0
-    assert dto['has_existing_subtasks'] is True
-
-
-# ── parse_prd ───────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_parse_prd_returns_flat_dto(client):
-    c, session = client
-    session.call_tool = AsyncMock(return_value=_success_result({
-        'message': 'Generated 7 tasks',
-        'outputPath': '/p/.taskmaster/tasks/tasks.json',
-        'telemetryData': {},
-    }))
-
-    dto = await c.parse_prd(input_path='/p/prd.md', project_root='/project')
-
-    assert dto['output_path'] == '/p/.taskmaster/tasks/tasks.json'
-    assert '7 tasks' in dto['message']
-
-
 # ── get_tasks ───────────────────────────────────────────────────────
 
 

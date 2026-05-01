@@ -89,17 +89,6 @@ class ValidateDependenciesResult(TypedDict):
     message: str
 
 
-class ExpandTaskResult(TypedDict):
-    task: dict
-    subtasks_added: int
-    has_existing_subtasks: bool
-
-
-class ParsePrdResult(TypedDict):
-    output_path: str
-    message: str
-
-
 class GetTasksResult(TypedDict):
     """DTO for ``get_tasks`` — the task-tree snapshot.
 

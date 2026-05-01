@@ -128,10 +128,14 @@ class TestDismissStaleEscalations:
             side_effect=mock_recover_crashed_tasks
         )
         harness._stop_escalation_server = AsyncMock()
-        harness._populate_tasks = AsyncMock()
         harness._tag_prd_metadata = AsyncMock()
         harness._tag_task_modules = AsyncMock()
         harness.scheduler.get_tasks = AsyncMock(return_value=[])
+        # Seed a pending task so the harness clears the post-cutover
+        # 'No pending tasks found' guard and reaches the dry-run stop.
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'1': 'pending'}, None),
+        )
 
         # Run with dry_run to avoid the task execution loop
         await harness.run(prd_path, dry_run=True)
@@ -206,10 +210,14 @@ class TestDismissStaleEscalationsFatal:
 
         harness._start_escalation_server = AsyncMock()
         harness._stop_escalation_server = AsyncMock()
-        harness._populate_tasks = AsyncMock()
         harness._tag_prd_metadata = AsyncMock()
         harness._tag_task_modules = AsyncMock()
         harness._recover_crashed_tasks = AsyncMock()
+        # Seed a pending task so the harness clears the post-cutover
+        # 'No pending tasks found' guard and reaches the dry-run stop.
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'1': 'pending'}, None),
+        )
 
         error_msg = 'disk full simulated failure'
         harness._dismiss_stale_escalations = AsyncMock(
