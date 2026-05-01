@@ -373,3 +373,43 @@ async def test_concurrent_add_task_yields_unique_ids(backend, project_root):
     results = await asyncio.gather(*coros)
     ids = sorted(int(r['id']) for r in results)
     assert ids == list(range(1, 21))
+
+
+# ── Cancellation hardening ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_status_cancellation_leaves_connection_clean(
+    backend, project_root,
+):
+    """A cancellation arriving while ``set_task_status`` is queued behind
+    the write_lock must not leave the connection mid-transaction.
+
+    Reproduces the soak-cancel signature: hold the per-project write lock,
+    queue a ``set_task_status`` against it, cancel the awaiter via
+    ``wait_for(timeout=0.001)``, then assert the next ``set_task_status``
+    applies cleanly. Pre-fix (Exception-only suppress + unshielded
+    rollback) the connection could end up holding an open BEGIN, which
+    surfaces as ``cannot start a transaction within a transaction``
+    on the next mutation.
+    """
+    # Seed: one task to flip.
+    await backend.add_task(project_root=project_root, title='t0')
+    assert (await backend.get_task('1', project_root))['status'] == 'pending'
+
+    # Acquire the per-project write lock so the next set_task_status blocks.
+    lock = backend._write_lock(project_root)
+    await lock.acquire()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                backend.set_task_status('1', 'in-progress', project_root),
+                timeout=0.001,
+            )
+    finally:
+        lock.release()
+
+    # Connection state must be clean: the next mutation succeeds.
+    res = await backend.set_task_status('1', 'done', project_root)
+    assert res['tasks'][0]['newStatus'] == 'done'
+    assert (await backend.get_task('1', project_root))['status'] == 'done'
