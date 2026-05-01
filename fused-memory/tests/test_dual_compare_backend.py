@@ -276,6 +276,70 @@ async def test_post_write_verify_no_divergence_when_state_matches(
 
 
 @pytest.mark.asyncio
+async def test_get_task_divergence_logs_diff_only(
+    primary, project_root, caplog,
+):
+    """``get_task`` divergence emits ``task=<id> fields={...}`` listing only
+    the differing fields — not the whole 240-char clipped blob."""
+    await primary.add_task(project_root=project_root, title='a')
+    secondary = _stub_backend()
+    # Same id and shape, only ``status`` differs.
+    secondary.get_task = AsyncMock(return_value={
+        'id': 1, 'title': 'a', 'status': 'in-progress', 'priority': 'medium',
+        'description': '', 'details': '', 'testStrategy': '',
+        'dependencies': [], 'subtasks': [],
+    })
+
+    wrapper = DualCompareBackend(primary, secondary)
+
+    with caplog.at_level('WARNING'):
+        await wrapper.get_task('1', project_root=project_root)
+
+    msgs = [m for m in caplog.messages if 'dual_compare.divergence' in m]
+    assert len(msgs) == 1, msgs
+    msg = msgs[0]
+    assert 'task=1' in msg
+    assert 'fields={' in msg
+    assert 'status:' in msg
+    # Only ``status`` differed — not ``title``/``priority``/etc.
+    assert 'title:' not in msg
+    assert 'priority:' not in msg
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_divergence_emits_one_line_per_task(
+    primary, project_root, caplog,
+):
+    """``get_tasks`` walks both arrays keyed by id and emits one log line
+    per task that differs — not one giant unreadable blob."""
+    await primary.add_task(project_root=project_root, title='alpha')
+    await primary.add_task(project_root=project_root, title='beta')
+    primary_listing = await primary.get_tasks(project_root=project_root)
+
+    # Skew task 2's status, leave task 1 alone.
+    skew = []
+    for t in primary_listing['tasks']:
+        copy = dict(t)
+        if str(copy.get('id')) == '2':
+            copy['status'] = 'done'
+        skew.append(copy)
+    secondary = _stub_backend()
+    secondary.get_tasks = AsyncMock(return_value={'tasks': skew})
+
+    wrapper = DualCompareBackend(primary, secondary)
+
+    with caplog.at_level('WARNING'):
+        await wrapper.get_tasks(project_root=project_root)
+
+    msgs = [m for m in caplog.messages if 'dual_compare.divergence' in m]
+    # Exactly one line — only task 2 differed.
+    assert len(msgs) == 1, msgs
+    assert 'task=2' in msgs[0]
+    assert 'task=1' not in msgs[0]
+    assert 'status:' in msgs[0]
+
+
+@pytest.mark.asyncio
 async def test_post_write_verify_remove_task_expects_not_found(
     primary, project_root, caplog,
 ):

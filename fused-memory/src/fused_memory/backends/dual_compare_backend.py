@@ -307,18 +307,16 @@ class DualCompareBackend:
                 if p_kind == 'exc' and s_kind == 'exc':
                     return  # both raised — no divergence
                 diverged = True
-                self._log_verify_divergence(
+                self._log_verify_presence_divergence(
                     method_name, primary_target, secondary_target,
-                    f'{self.primary_label}={p_kind}({_summarize(p_payload)})',
-                    f'{self.secondary_label}={s_kind}({_summarize(s_payload)})',
+                    p_kind, p_payload, s_kind, s_payload,
                 )
             else:
                 if p_kind != s_kind:
                     diverged = True
-                    self._log_verify_divergence(
+                    self._log_verify_presence_divergence(
                         method_name, primary_target, secondary_target,
-                        f'{self.primary_label}={p_kind}({_summarize(p_payload)})',
-                        f'{self.secondary_label}={s_kind}({_summarize(s_payload)})',
+                        p_kind, p_payload, s_kind, s_payload,
                     )
                 elif p_kind == 'value':
                     p_norm = _normalize_task(p_payload)
@@ -328,10 +326,9 @@ class DualCompareBackend:
                         s_norm = _strip_ids(s_norm)
                     if p_norm != s_norm:
                         diverged = True
-                        self._log_verify_divergence(
+                        self._log_verify_field_divergence(
                             method_name, primary_target, secondary_target,
-                            f'{self.primary_label}={_summarize(p_norm)}',
-                            f'{self.secondary_label}={_summarize(s_norm)}',
+                            p_norm, s_norm,
                         )
 
             if diverged:
@@ -348,19 +345,43 @@ class DualCompareBackend:
         self._inflight_verifies.add(verify)
         verify.add_done_callback(self._inflight_verifies.discard)
 
-    def _log_verify_divergence(
+    def _log_verify_presence_divergence(
         self,
         method_name: str,
         primary_target: str,
         secondary_target: str,
-        primary_repr: str,
-        secondary_repr: str,
+        p_kind: str,
+        p_payload: Any,
+        s_kind: str,
+        s_payload: Any,
     ) -> None:
         logger.warning(
             'dual_compare.verify_divergence method=%s primary_target=%s '
-            'secondary_target=%s %s %s',
+            'secondary_target=%s %s=%s(%s) %s=%s(%s)',
             method_name, primary_target, secondary_target,
-            primary_repr, secondary_repr,
+            self.primary_label, p_kind, _summarize(p_payload, limit=120),
+            self.secondary_label, s_kind, _summarize(s_payload, limit=120),
+        )
+
+    def _log_verify_field_divergence(
+        self,
+        method_name: str,
+        primary_target: str,
+        secondary_target: str,
+        p_task: Any,
+        s_task: Any,
+    ) -> None:
+        diff = _field_diff(p_task, s_task)
+        if not diff:
+            return
+        rendered = _format_field_diff(
+            diff, primary_label=self.primary_label,
+            secondary_label=self.secondary_label,
+        )
+        logger.warning(
+            'dual_compare.verify_divergence method=%s primary_target=%s '
+            'secondary_target=%s fields={%s}',
+            method_name, primary_target, secondary_target, rendered,
         )
 
     def _compare(
@@ -375,7 +396,16 @@ class DualCompareBackend:
         *,
         normalize: Callable[[Any], Any] | None,
     ) -> None:
-        """Log a structured divergence line if the two responses disagree."""
+        """Log a structured divergence line if the two responses disagree.
+
+        Format hardening (Commit 6): the previous "primary={blob}
+        secondary={blob}" form clipped at 240 chars mid-content and was
+        unreadable for tasks-tree divergences (743 unintelligible lines
+        in one storm window). For ``get_task`` / ``get_tasks`` we now
+        walk the normalised payload and emit ONE log line per
+        differing task, listing only the differing fields. Other
+        methods (write input-echos) retain the small summary line.
+        """
         primary_kind = type(primary_exc).__name__ if primary_exc else 'value'
         secondary_kind = type(secondary_exc).__name__ if secondary_exc else 'value'
 
@@ -392,10 +422,97 @@ class DualCompareBackend:
         s = normalize(secondary_value) if normalize else secondary_value
         if p == s:
             return
-        self._log_divergence(
-            method_name, args, kwargs,
-            f'{self.primary_label}={_summarize(p)}',
-            f'{self.secondary_label}={_summarize(s)}',
+
+        if method_name == 'get_tasks':
+            self._log_tasks_tree_divergence(method_name, args, kwargs, p, s)
+        elif method_name == 'get_task':
+            self._log_task_field_divergence(method_name, args, kwargs, p, s)
+        else:
+            self._log_divergence(
+                method_name, args, kwargs,
+                f'{self.primary_label}={_summarize(p)}',
+                f'{self.secondary_label}={_summarize(s)}',
+            )
+
+    def _log_tasks_tree_divergence(
+        self,
+        method_name: str,
+        args: tuple,
+        kwargs: dict,
+        p_norm: Any,
+        s_norm: Any,
+    ) -> None:
+        """Walk both ``{tasks: [...]}`` payloads keyed by id and emit one log
+        line per task that differs, listing only the differing fields."""
+        p_by_id = _index_tasks_by_id(p_norm)
+        s_by_id = _index_tasks_by_id(s_norm)
+        all_ids = sorted(set(p_by_id) | set(s_by_id), key=lambda x: str(x))
+        emitted = 0
+        for task_id in all_ids:
+            p_task = p_by_id.get(task_id)
+            s_task = s_by_id.get(task_id)
+            if p_task == s_task:
+                continue
+            self._log_per_task_diff(
+                method_name, args, kwargs, task_id, p_task, s_task,
+            )
+            emitted += 1
+        if emitted == 0 and p_by_id != s_by_id:
+            # Disjoint outer shape (e.g. neither is a tasks list).
+            self._log_divergence(
+                method_name, args, kwargs,
+                f'{self.primary_label}={_summarize(p_norm)}',
+                f'{self.secondary_label}={_summarize(s_norm)}',
+            )
+
+    def _log_task_field_divergence(
+        self,
+        method_name: str,
+        args: tuple,
+        kwargs: dict,
+        p_norm: Any,
+        s_norm: Any,
+    ) -> None:
+        """Single-task divergence — emit only the differing fields."""
+        task_id = (p_norm.get('id') if isinstance(p_norm, dict) else None) \
+                  or (s_norm.get('id') if isinstance(s_norm, dict) else None) \
+                  or '?'
+        self._log_per_task_diff(
+            method_name, args, kwargs, task_id, p_norm, s_norm,
+        )
+
+    def _log_per_task_diff(
+        self,
+        method_name: str,
+        args: tuple,
+        kwargs: dict,
+        task_id: Any,
+        p_task: Any,
+        s_task: Any,
+    ) -> None:
+        if p_task is None or s_task is None:
+            kind = 'primary_only' if s_task is None else 'secondary_only'
+            self.divergence_count += 1
+            logger.warning(
+                'dual_compare.divergence method=%s task=%s presence=%s '
+                '%s=%s %s=%s',
+                method_name, task_id, kind,
+                self.primary_label, _summarize(p_task),
+                self.secondary_label, _summarize(s_task),
+            )
+            return
+
+        diff = _field_diff(p_task, s_task)
+        if not diff:
+            return
+        self.divergence_count += 1
+        rendered = _format_field_diff(
+            diff, primary_label=self.primary_label,
+            secondary_label=self.secondary_label,
+        )
+        logger.warning(
+            'dual_compare.divergence method=%s task=%s fields={%s}',
+            method_name, task_id, rendered,
         )
 
     def _log_divergence(
@@ -649,6 +766,87 @@ def _normalize_id_only(result: Any) -> Any:
     if not isinstance(result, dict):
         return result
     return {k: True for k in ('id', 'message') if k in result}
+
+
+def _index_tasks_by_id(payload: Any) -> dict[Any, Any]:
+    """Return ``{task_id: task_dict}`` for a normalised tasks-tree payload.
+    Empty dict on shape mismatch."""
+    if not isinstance(payload, dict):
+        return {}
+    tasks = payload.get('tasks', [])
+    if not isinstance(tasks, list):
+        return {}
+    out: dict[Any, Any] = {}
+    for task in tasks:
+        if isinstance(task, dict) and 'id' in task:
+            out[task['id']] = task
+    return out
+
+
+def _field_diff(p: Any, s: Any) -> dict[str, tuple[Any, Any]]:
+    """Return ``{field: (primary, secondary)}`` for fields that differ.
+
+    Recurses into ``subtasks`` (list of dicts) to surface subtask-level
+    drift as ``subtasks[<id>].<field>=tm=X sql=Y`` entries instead of the
+    whole subtasks list flagged as one opaque blob.
+    """
+    if not (isinstance(p, dict) and isinstance(s, dict)):
+        return {'<value>': (p, s)} if p != s else {}
+    fields = set(p) | set(s)
+    diff: dict[str, tuple[Any, Any]] = {}
+    for f in sorted(fields):
+        pv = p.get(f, _MISSING)
+        sv = s.get(f, _MISSING)
+        if pv == sv:
+            continue
+        if (
+            f == 'subtasks'
+            and isinstance(pv, list) and isinstance(sv, list)
+        ):
+            sub_diff = _subtasks_diff(pv, sv)
+            for sk, vv in sub_diff.items():
+                diff[f'subtasks[{sk}]'] = vv
+            continue
+        diff[f] = (pv, sv)
+    return diff
+
+
+def _subtasks_diff(
+    p_subs: list, s_subs: list,
+) -> dict[str, tuple[Any, Any]]:
+    """Per-subtask field-diff keyed by subtask id."""
+    p_by_id = {st.get('id'): st for st in p_subs if isinstance(st, dict)}
+    s_by_id = {st.get('id'): st for st in s_subs if isinstance(st, dict)}
+    all_ids = sorted(set(p_by_id) | set(s_by_id), key=lambda x: str(x))
+    out: dict[str, tuple[Any, Any]] = {}
+    for sid in all_ids:
+        ps = p_by_id.get(sid)
+        ss = s_by_id.get(sid)
+        if ps == ss:
+            continue
+        sub_fields = _field_diff(ps, ss) if (ps is not None and ss is not None) \
+            else {'<presence>': (ps, ss)}
+        for fk, fv in sub_fields.items():
+            out[f'{sid}.{fk}'] = fv
+    return out
+
+
+def _format_field_diff(
+    diff: dict[str, tuple[Any, Any]],
+    *,
+    primary_label: str,
+    secondary_label: str,
+) -> str:
+    """Render a field diff as ``field: pl=X sl=Y`` segments, comma-joined."""
+    parts: list[str] = []
+    for field, (pv, sv) in diff.items():
+        pv_repr = '<missing>' if pv is _MISSING else _summarize(pv, limit=80)
+        sv_repr = '<missing>' if sv is _MISSING else _summarize(sv, limit=80)
+        parts.append(f'{field}: {primary_label}={pv_repr} {secondary_label}={sv_repr}')
+    return ', '.join(parts)
+
+
+_MISSING = object()
 
 
 def _strip_ids(task: Any) -> Any:
