@@ -778,51 +778,7 @@ async def test_ctx_task_event_subtask_uses_qualified_id(mock_memory, mock_taskma
     assert '[task:2]' not in item.formatted
 
 
-# ── _ctx_tasks_bulk_created parent_id qualification ──────────────────
-
-
-@pytest.mark.asyncio
-async def test_ctx_tasks_bulk_created_uses_parent_id_as_display_id(
-    mock_memory, mock_taskmaster
-):
-    """_ctx_tasks_bulk_created passes parent_id as display_id to _format_task.
-
-    When the event payload carries parent_task_id='7' but get_task returns a
-    dict where id is None (e.g., a Taskmaster quirk), the ContextItem's
-    formatted text must still contain '[task:7]' — taken from the event's
-    parent_task_id — rather than '[task:None]' from the bare task dict.
-    """
-    mock_taskmaster.get_task = AsyncMock(
-        return_value={
-            'id': None,   # id missing/null from Taskmaster response
-            'title': 'Parent task',
-            'status': 'in-progress',
-            'dependencies': [],
-            'metadata': {},
-        }
-    )
-
-    assembler = _make_assembler(
-        memory_service=mock_memory,
-        taskmaster=mock_taskmaster,
-    )
-    events = [
-        _make_event(
-            event_type=EventType.tasks_bulk_created,
-            payload={'parent_task_id': '7', 'count': 3},
-        ),
-    ]
-    watermark = _make_watermark()
-
-    result = await assembler.assemble(events, watermark, 'test-project')
-
-    assert 'task:7' in result.context_items
-    item = result.context_items['task:7']
-    assert '[task:7]' in item.formatted
-    assert '[task:None]' not in item.formatted
-
-
-# ── Integration: full assemble() with subtask status-change event ────
+# ── subtask qualified-id end-to-end ──────────────────────────────────
 
 
 @pytest.mark.asyncio

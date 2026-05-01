@@ -58,8 +58,6 @@ Task operations (when Taskmaster is connected):
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / add_subtask / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
-- expand_task / parse_prd: Bulk task generation
-
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
 - delete_episode: Remove a Graphiti episode (with optional cascade)
@@ -74,8 +72,6 @@ Management:
 Reconciliation:
 - Task status transitions (done/blocked/cancelled/deferred) trigger targeted reconciliation
   automatically — memory_hints may be attached, completion knowledge written, dependent tasks flagged.
-- Bulk operations (expand_task, parse_prd) trigger cross-referencing between new tasks and
-  existing knowledge.
 - A background pipeline runs periodically for full-cycle reconciliation (consolidation,
   cross-store integrity, task-knowledge sync).
 
@@ -1927,76 +1923,6 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'remove_dependency error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
-
-    @mcp.tool()
-    async def expand_task(
-        id: str,
-        project_root: str,
-        num: str | None = None,
-        prompt: str | None = None,
-        force: bool = False,
-        tag: str | None = None,
-    ) -> dict[str, Any]:
-        """Expand a task into subtasks. Triggers bulk reconciliation.
-
-        Args:
-            id: Task ID to expand
-            project_root: Absolute path to project root
-            num: Number of subtasks to generate
-            prompt: Additional context for generation
-            force: Force expansion even if subtasks exist
-            tag: Tag context (optional)
-        """
-        _normalized = _normalize_project_root(project_root)
-        if isinstance(_normalized, dict):
-            return _normalized
-        project_root = _normalized
-        try:
-            return await task_interceptor.expand_task(
-                task_id=id,
-                project_root=project_root,
-                num=num,
-                prompt=prompt,
-                force=force,
-                tag=tag,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'expand_task error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
-
-    @mcp.tool()
-    async def parse_prd(
-        input: str,
-        project_root: str,
-        num_tasks: str | None = None,
-        tag: str | None = None,
-    ) -> dict[str, Any]:
-        """Parse a PRD document to generate tasks. Triggers bulk reconciliation.
-
-        Args:
-            input: Path to PRD file (.txt, .md, etc.)
-            project_root: Absolute path to project root
-            num_tasks: Approximate number of tasks to generate
-            tag: Tag context (optional)
-        """
-        _normalized = _normalize_project_root(project_root)
-        if isinstance(_normalized, dict):
-            return _normalized
-        project_root = _normalized
-        try:
-            return await task_interceptor.parse_prd(
-                input_path=input,
-                project_root=project_root,
-                num_tasks=num_tasks,
-                tag=tag,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'parse_prd error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp

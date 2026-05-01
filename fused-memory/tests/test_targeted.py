@@ -309,40 +309,6 @@ async def test_blocked_task_update_uses_project_root(reconciler, mock_memory_ser
 
 
 @pytest.mark.asyncio
-async def test_bulk_reconcile_separates_ids(reconciler, mock_memory_service, mock_taskmaster):
-    """reconcile_bulk_tasks uses project_id for memory.search and project_root for taskmaster calls."""
-    mock_taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {'id': '1', 'title': 'Task 1', 'status': 'pending', 'dependencies': []},
-        ]
-    })
-    mock_memory_service.search = AsyncMock(return_value=[
-        MemoryResult(id='m1', content='info', source_store=SourceStore.mem0, entities=['E1']),
-    ])
-
-    await reconciler.reconcile_bulk_tasks(
-        parent_task_id=None,
-        project_id='dark_factory',
-        project_root='/home/leo/src/dark-factory',
-    )
-
-    # taskmaster.get_tasks should use filesystem path
-    mock_taskmaster.get_tasks.assert_called_once_with(
-        project_root='/home/leo/src/dark-factory'
-    )
-    # memory.search should use logical project_id
-    for call in mock_memory_service.search.call_args_list:
-        assert call.kwargs.get('project_id') == 'dark_factory'
-    # update_task for hints should use filesystem path
-    if mock_taskmaster.update_task.called:
-        call_kwargs = mock_taskmaster.update_task.call_args.kwargs
-        assert call_kwargs['project_root'] == '/home/leo/src/dark-factory'
-
-
-# ── Cycle fence (write deferral) tests ────────────────────────────────
-
-
-@pytest.mark.asyncio
 async def test_done_defers_write_during_active_cycle(
     mock_memory_service, mock_taskmaster, journal, config, mock_event_buffer,
 ):
@@ -459,18 +425,6 @@ async def test_reconcile_task_rejects_bad_project_root(reconciler, project_root)
             task_id='1', transition='done', project_id='test-project',
             project_root=project_root,
             task_before={'id': '1', 'title': 'Test', 'status': 'in-progress'},
-        )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('project_root', ['', 'dark_factory', '.'])
-async def test_reconcile_bulk_rejects_bad_project_root(reconciler, project_root):
-    """reconcile_bulk_tasks() raises ValueError for non-absolute project_root values."""
-    with pytest.raises(ValueError, match=re.escape(repr(project_root))):
-        await reconciler.reconcile_bulk_tasks(
-            parent_task_id=None,
-            project_id='test-project',
-            project_root=project_root,
         )
 
 

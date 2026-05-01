@@ -196,6 +196,20 @@ class TaskmasterConfig(BaseModel):
     project_root: str = Field(default='.')
     tool_mode: str = Field(default='all')
 
+    # Backend selection. ``taskmaster`` is the legacy MCP-proxy default;
+    # ``sqlite`` swaps in :class:`SqliteTaskBackend`; ``dual_compare`` runs
+    # both side-by-side and logs divergences (used during cutover soak).
+    # See plans/do-1-on-a-happy-pony.md §Cycle 2 for the cutover dance.
+    backend_mode: Literal['taskmaster', 'sqlite', 'dual_compare'] = Field(
+        default='taskmaster',
+    )
+    # Which backend the dual-compare wrapper serves to callers. The other
+    # backend's responses are compared against this one and divergences
+    # logged. Flipped from ``taskmaster`` → ``sqlite`` after the soak.
+    dual_compare_primary: Literal['taskmaster', 'sqlite'] = Field(
+        default='taskmaster',
+    )
+
 
 # --- Reconciliation ---
 

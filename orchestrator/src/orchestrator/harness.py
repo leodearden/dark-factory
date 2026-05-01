@@ -399,37 +399,43 @@ class Harness:
                     # wait_for_reset=True: probe loop is already running,
                     # workflows will block in before_invoke until gate reopens
 
-            # 2. Parse PRD into tasks (skipped when no PRD given)
+            # 2. PRD decomposition retired with the parse_prd / Taskmaster
+            #    cutover (see plans/do-1-on-a-happy-pony.md §Cycle 2). The
+            #    task tree must be populated before invoking the orchestrator
+            #    — typically via planning_mode + curator from an interactive
+            #    session. The --prd flag is preserved for tagging existing
+            #    tasks with their source PRD so review can trace provenance.
             if prd_path is not None:
-                logger.info(f'Parsing PRD: {prd_path}')
+                logger.info(
+                    'PRD decomposition removed — assuming task tree is '
+                    'already populated. Tagging tasks with source PRD: %s',
+                    prd_path,
+                )
                 _pre_statuses, _ = await self.scheduler.get_statuses()
                 pre_ids = set(_pre_statuses.keys())
-                await self._populate_tasks(prd_path)
-
-                # 2a. Tag newly-created tasks with PRD source
+                # 2a. Tag any tasks that don't yet carry a PRD with this one.
                 await self._tag_prd_metadata(prd_path, pre_ids)
-            else:
-                logger.info('No PRD given — running existing tasks')
-                existing_statuses, err = await self.scheduler.get_statuses()
-                if 'pending' not in existing_statuses.values():
-                    if not existing_statuses:
-                        # Distinguish transport failure from genuinely empty tree.
-                        if err is not None:
-                            raise RuntimeError(
-                                f'Failed to reach fused-memory: '
-                                f'{type(err).__name__}: {err}'
-                            ) from err
-                        # Genuinely empty: point operators at the fused-memory
-                        # logs in case tasks should exist but weren't returned.
-                        logger.error(
-                            'get_statuses returned an empty mapping — if tasks '
-                            'should exist, check fused-memory logs for transport '
-                            'errors before assuming the task tree is empty.'
-                        )
-                    raise RuntimeError(
-                        'No PRD given and no pending tasks found. '
-                        'Pass --prd to decompose a PRD, or create tasks first.'
+
+            existing_statuses, err = await self.scheduler.get_statuses()
+            if 'pending' not in existing_statuses.values():
+                if not existing_statuses:
+                    # Distinguish transport failure from genuinely empty tree.
+                    if err is not None:
+                        raise RuntimeError(
+                            f'Failed to reach fused-memory: '
+                            f'{type(err).__name__}: {err}'
+                        ) from err
+                    # Genuinely empty: point operators at the fused-memory
+                    # logs in case tasks should exist but weren't returned.
+                    logger.error(
+                        'get_statuses returned an empty mapping — if tasks '
+                        'should exist, check fused-memory logs for transport '
+                        'errors before assuming the task tree is empty.'
                     )
+                raise RuntimeError(
+                    'No pending tasks found. Populate the task tree via '
+                    'planning_mode + curator before invoking the orchestrator.'
+                )
 
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
@@ -659,34 +665,6 @@ class Harness:
 
         logger.info(self.report.summary())
         return self.report
-
-    async def _populate_tasks(self, prd_path: Path) -> None:
-        """Use taskmaster parse_prd to decompose PRD into tasks."""
-        try:
-            result = await mcp_call(
-                f'{self.mcp.url}/mcp',
-                'tools/call',
-                {
-                    'name': 'parse_prd',
-                    'arguments': {
-                        'input': str(prd_path.resolve()),
-                        'project_root': str(self.config.project_root),
-                    },
-                },
-                timeout=120,  # PRD parsing can be slow
-            )
-            content = result.get('result', {}).get('content', [{}])
-            text = content[0].get('text', '') if content else ''
-            if content and content[0].get('isError'):
-                raise RuntimeError(f'parse_prd error: {text}')
-            logger.info(f'PRD parsed: {text[:200]}')
-        except RuntimeError as e:
-            if 'already contains' in str(e):
-                logger.info('Task tree already populated — skipping parse_prd')
-            else:
-                raise
-        except Exception as e:
-            raise RuntimeError(f'Failed to parse PRD: {e}') from e
 
     async def _tag_prd_metadata(self, prd_path: Path, pre_parse_ids: set[str]) -> None:
         """Tag tasks with the PRD they were created from."""

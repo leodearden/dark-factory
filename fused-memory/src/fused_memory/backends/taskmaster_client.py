@@ -33,9 +33,7 @@ from fused_memory.backends.taskmaster_types import (
     AddSubtaskResult,
     AddTaskResult,
     DependencyResult,
-    ExpandTaskResult,
     GetTasksResult,
-    ParsePrdResult,
     RemoveTaskResult,
     SetTaskStatusResult,
     TaskmasterError,
@@ -842,48 +840,3 @@ class TaskmasterBackend:
         data = _unwrap('validate_dependencies', raw)
         return {'message': str(data.get('message', ''))}
 
-    async def expand_task(
-        self,
-        task_id: str,
-        project_root: str,
-        num: str | None = None,
-        prompt: str | None = None,
-        force: bool = False,
-        tag: str | None = None,
-    ) -> ExpandTaskResult:
-        args = self._base_args(project_root, tag)
-        args['id'] = task_id
-        if num:
-            args['num'] = num
-        if prompt:
-            args['prompt'] = prompt
-        if force:
-            args['force'] = True
-        raw = await self.call_tool('expand_task', args)
-        data = _unwrap('expand_task', raw)
-        task = data.get('task')
-        if not isinstance(task, dict):
-            task = {}
-        return {
-            'task': task,
-            'subtasks_added': int(data.get('subtasksAdded', 0) or 0),
-            'has_existing_subtasks': bool(data.get('hasExistingSubtasks', False)),
-        }
-
-    async def parse_prd(
-        self,
-        input_path: str,
-        project_root: str,
-        num_tasks: str | None = None,
-        tag: str | None = None,
-    ) -> ParsePrdResult:
-        args = self._base_args(project_root, tag)
-        args['input'] = input_path
-        if num_tasks:
-            args['numTasks'] = num_tasks
-        raw = await self.call_tool('parse_prd', args)
-        data = _unwrap('parse_prd', raw)
-        return {
-            'output_path': str(data.get('outputPath', '')),
-            'message': str(data.get('message', '')),
-        }

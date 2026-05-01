@@ -26,7 +26,7 @@ except ImportError:
 
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
-from fused_memory.backends.taskmaster_client import TaskmasterBackend
+from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.dark_factory_path_guard import (
     DARK_FACTORY_PROJECT_ID,
     check_candidate_for_dark_factory_paths,
@@ -123,11 +123,10 @@ class TaskInterceptor:
     """Wraps Taskmaster operations, intercepts state transitions for targeted reconciliation."""
 
     STATUS_TRIGGERS = {'done', 'blocked', 'cancelled', 'deferred'}
-    BULK_TRIGGERS = {'parse_prd', 'expand_task'}
 
     def __init__(
         self,
-        taskmaster: TaskmasterBackend | None,
+        taskmaster: TaskBackendProtocol | None,
         targeted_reconciler: 'TargetedReconciler | None',
         event_buffer: EventBuffer,
         task_committer: 'TaskFileCommitter | None' = None,
@@ -237,8 +236,8 @@ class TaskInterceptor:
         self._prefix_registry = prefix_registry
         self._scope_violation_escalator = scope_violation_escalator
 
-    async def _ensure_taskmaster(self) -> TaskmasterBackend:
-        """Return a connected TaskmasterBackend, or raise with a structured error."""
+    async def _ensure_taskmaster(self) -> TaskBackendProtocol:
+        """Return a connected task backend, or raise with a structured error."""
         if self.taskmaster is None:
             raise RuntimeError('Taskmaster is not configured.')
         await self.taskmaster.ensure_connected()
@@ -644,143 +643,6 @@ class TaskInterceptor:
             task.add_done_callback(lambda t: self._background_tasks.discard(t))
             task.add_done_callback(self._on_reconciliation_done)
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
-
-        return result
-
-    # ── Bulk operations (with targeted reconciliation) ─────────────────
-
-    async def expand_task(
-        self,
-        task_id: str,
-        project_root: str,
-        num: str | None = None,
-        prompt: str | None = None,
-        force: bool = False,
-        tag: str | None = None,
-    ) -> dict:
-        if err := await self._backlog_gate(project_root):
-            return err
-        tm = await self._ensure_taskmaster()
-        project_id = resolve_project_id(project_root)
-
-        # WP-E: serialise the pre-snapshot + bulk mutation + commit so a
-        # concurrent add_task can't slip a task into the snapshot gap and
-        # get misclassified as newly-bulk-created.
-        async with self._write_lock(project_id):
-            # Pre-snapshot: capture the task tree before Taskmaster generates subtasks
-            try:
-                pre_snapshot = await tm.get_tasks(project_root)
-            except Exception as pre_exc:
-                logger.warning(
-                    'bulk_dedup: pre-snapshot failed for expand_task(%s): %s', task_id, pre_exc,
-                )
-                pre_snapshot = None
-
-            result: dict[str, Any] = dict(await tm.expand_task(
-                task_id, project_root, num=num, prompt=prompt, force=force, tag=tag,
-            ))
-            await self._await_commit(project_root, f'expand_task({task_id})')
-        event = self._make_event(
-            EventType.tasks_bulk_created,
-            project_root,
-            {'parent_task_id': task_id, 'operation': 'expand_task'},
-        )
-        await self._journal(event)
-
-        # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
-        try:
-            if pre_snapshot is not None:
-                dedup = await self._dedupe_bulk_created(
-                    project_root, pre_snapshot, parent_task_id=task_id,
-                )
-            else:
-                dedup = {
-                    'removed': [], 'kept': [], 'errors': [],
-                    'skipped_reason': 'pre_snapshot_failed',
-                }
-            result['dedup'] = dedup
-        except Exception as dedup_exc:
-            logger.warning(
-                'bulk_dedup: dedup block failed for expand_task(%s): %s', task_id, dedup_exc,
-            )
-            result['dedup'] = {'skipped_reason': f'exception: {dedup_exc}'}
-
-        if self.reconciler:
-            task = asyncio.create_task(
-                self.reconciler.reconcile_bulk_tasks(
-                    parent_task_id=task_id,
-                    project_id=resolve_project_id(project_root),
-                    project_root=project_root,
-                ),
-                name=f'bulk-recon-expand-{task_id}',
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(lambda t: self._background_tasks.discard(t))
-            task.add_done_callback(self._on_reconciliation_done)
-            result['reconciliation'] = {'status': 'async', 'task_id': task_id}
-
-        return result
-
-    async def parse_prd(
-        self,
-        input_path: str,
-        project_root: str,
-        num_tasks: str | None = None,
-        tag: str | None = None,
-    ) -> dict:
-        if err := await self._backlog_gate(project_root):
-            return err
-        tm = await self._ensure_taskmaster()
-        project_id = resolve_project_id(project_root)
-
-        # WP-E: serialise pre-snapshot + bulk mutation + commit; see
-        # expand_task for the rationale.
-        async with self._write_lock(project_id):
-            # Pre-snapshot: capture the task tree before Taskmaster generates tasks
-            try:
-                pre_snapshot = await tm.get_tasks(project_root)
-            except Exception as pre_exc:
-                logger.warning('bulk_dedup: pre-snapshot failed for parse_prd: %s', pre_exc)
-                pre_snapshot = None
-
-            result: dict[str, Any] = dict(await tm.parse_prd(
-                input_path, project_root, num_tasks=num_tasks, tag=tag,
-            ))
-            await self._await_commit(project_root, 'parse_prd')
-        event = self._make_event(
-            EventType.tasks_bulk_created,
-            project_root,
-            {'input_path': input_path, 'operation': 'parse_prd'},
-        )
-        await self._journal(event)
-
-        # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
-        try:
-            if pre_snapshot is not None:
-                dedup = await self._dedupe_bulk_created(project_root, pre_snapshot)
-            else:
-                dedup = {
-                    'removed': [], 'kept': [], 'errors': [],
-                    'skipped_reason': 'pre_snapshot_failed',
-                }
-            result['dedup'] = dedup
-        except Exception as dedup_exc:
-            logger.warning('bulk_dedup: dedup block failed for parse_prd: %s', dedup_exc)
-            result['dedup'] = {'skipped_reason': f'exception: {dedup_exc}'}
-
-        if self.reconciler:
-            task = asyncio.create_task(
-                self.reconciler.reconcile_bulk_tasks(
-                    parent_task_id=None,
-                    project_id=resolve_project_id(project_root),
-                    project_root=project_root,
-                ),
-                name='bulk-recon-parse-prd',
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(lambda t: self._background_tasks.discard(t))
-            task.add_done_callback(self._on_reconciliation_done)
-            result['reconciliation'] = {'status': 'async', 'operation': 'parse_prd'}
 
         return result
 
@@ -1217,277 +1079,15 @@ class TaskInterceptor:
             )
             return None
 
-    async def _dedupe_bulk_created(
-        self,
-        project_root: str,
-        pre_snapshot: Mapping[str, Any],
-        parent_task_id: str | None = None,
-    ) -> dict:
-        """Post-hoc deduplication after a bulk task-creation operation.
-
-        Reads the current task tree, diffs against pre_snapshot, then runs
-        a two-pass deduplication on the newly-created tasks:
-
-        **Pass 1 — intra-batch dedup (pre-pass)**:
-        Groups new tasks by normalised (title, description) hash.  First
-        occurrence wins; each subsequent duplicate is removed immediately
-        under ``_write_lock`` with ``reason='intra_batch_duplicate'``.
-        This is cheap (no LLM) and prevents duplicate curator calls.
-
-        **Pass 2 — cross-task curator pass**:
-        Invokes ``curator.curate()`` on each unique survivor from pass 1.
-        Drop → remove the new task.  Combine → rewrite the target then
-        remove the new task.  Create → keep and record.
-
-        Called by both ``expand_task`` and ``parse_prd``; the two-pass
-        structure is path-agnostic (``parent_task_id`` is only used as
-        ``spawned_from`` metadata for curator candidates).
-
-        Returns ``{'removed': [...], 'kept': [...], 'errors': []}``.
-        Each ``removed`` entry carries a ``reason`` field that is one of:
-
-        - ``'intra_batch_duplicate'`` — removed in pass 1 (mechanical,
-          no LLM); entry has ``matched_task_id`` (first-occurrence id)
-          but no ``justification``.
-        - ``'curator_drop'`` — removed in pass 2 by the curator.
-        - ``'curator_combine'`` — merged into an existing task in pass 2.
-
-        **Partial-failure dual-append contract**: when ``tm.remove_task``
-        raises during the intra-batch pre-pass for a duplicate, that task
-        is appended to ``errors`` (with the exception text) and re-enters
-        pass 2 via the unique-survivor list, so it lands in either ``kept``
-        or ``removed`` depending on the curator decision — never silently
-        lost from all three outputs.  This is intentional defence-in-depth:
-        a transient backend failure must not silently lose the task, so the
-        caller can detect the anomaly via ``errors`` while the task is still
-        present in exactly one of ``kept`` or ``removed``.
-        """
-        removed: list[dict] = []
-        kept: list[dict] = []
-        errors: list[dict] = []
-
-        tm = await self._ensure_taskmaster()
-        project_id = resolve_project_id(project_root)
-
-        pre_ids = {
-            str(t.get('id', '')) for t in flatten_task_tree(pre_snapshot)
-            if t.get('id')
-        }
-        post_snapshot = await tm.get_tasks(project_root)
-        new_task_dicts = [
-            t for t in flatten_task_tree(post_snapshot)
-            if str(t.get('id', '')) and str(t.get('id', '')) not in pre_ids
-        ]
-        if not new_task_dicts:
-            return {'removed': removed, 'kept': kept, 'errors': errors}
-
-        # ── Intra-batch dedup pre-pass ──────────────────────────────────────
-        # Detect and remove tasks that are near-identical duplicates of another
-        # task created in the SAME batch (e.g. the LLM emits 3 variants of the
-        # same subtask).  This runs BEFORE the per-task curator loop so we
-        # avoid wasting LLM calls on tasks we are about to remove.
-        #
-        # Key: normalised (title, description) hash — case + whitespace
-        # insensitive, excluding files_to_modify (often absent).
-        # First occurrence wins (matches curate_batch hash_to_first_idx
-        # convention).
-        #
-        # Two-phase discipline:
-        #   Phase A (outside the lock): hash each task, update seen_keys /
-        #   unique_new_tasks, and collect duplicates into dups_to_remove.
-        #   All work here is pure local-state; no I/O.
-        #   Phase B (inside ONE _write_lock scope): issue all tm.remove_task
-        #   calls with per-item try/except so a transient backend failure on
-        #   one removal does not abort the rest of the batch.  The
-        #   dual-append-on-error fall-through (failing task → errors AND
-        #   unique_new_tasks, landing in kept or removed per curator) is
-        #   preserved inside the lock.
-        #
-        #   Why pass-1 batches but pass-2 (curator drop/combine, lines below)
-        #   stays per-item: duplicates here are removed by back-to-back
-        #   tm.remove_task() calls with no LLM round-trips between them.
-        #   Holding the lock across the whole batch prevents partial
-        #   interleaving with concurrent writers on the same project without
-        #   adding latency beyond the cumulative tm.remove_task time.
-        #   Pass-2 MUST remain per-item because curator.curate() is a full
-        #   LLM round-trip that happens between each removal — serialising
-        #   those under the write lock would block all concurrent writers for
-        #   the entire LLM sequence, which is unacceptable.
-        #
-        #   Lock-hold trade-off: the lock is held for the duration of all N
-        #   mechanical remove_task() calls.  This blocks concurrent writers
-        #   on the same project longer than the old per-item form, but
-        #   eliminates N-1 redundant lock-handoff round-trips and prevents
-        #   partial interleaving.  No LLM calls are made under the lock;
-        #   tail-latency risk is bounded solely by tm.remove_task backend
-        #   latency.
-        seen_keys: dict[str, str] = {}   # key → first-occurrence task_id
-        unique_new_tasks: list[dict] = []
-        dups_to_remove: list[tuple] = []  # (tid, title, t, first_id)
-        for t in new_task_dicts:
-            tid = str(t.get('id', ''))
-            title = str(t.get('title', ''))
-            description = str(t.get('description', '') or '')
-
-            # Guard: tasks with a blank title get an identical
-            # _intra_batch_key('', '') hash regardless of description,
-            # which would incorrectly collapse all malformed subtasks
-            # into the first one.  Pass them straight through and let
-            # the curator path's own empty-title guard decide.
-            if not title.strip():
-                unique_new_tasks.append(t)
-                continue
-
-            key = TaskCurator._intra_batch_key(title, description)
-            if key not in seen_keys:
-                seen_keys[key] = tid
-                unique_new_tasks.append(t)
-            else:
-                first_id = seen_keys[key]
-                dups_to_remove.append((tid, title, t, first_id))
-
-        # Phase B: issue all removals inside a single lock scope (see trade-off
-        # discussion in the two-phase comment above).  Per-item try/except
-        # inside the lock preserves the partial-failure dual-append fall-through:
-        # a transient backend error on one removal does not abort the rest.
-        if dups_to_remove:
-            async with self._write_lock(project_id):
-                for tid, title, t, first_id in dups_to_remove:
-                    try:
-                        await tm.remove_task(tid, project_root)
-                        removed.append({
-                            'task_id': tid,
-                            'title': title,
-                            'reason': 'intra_batch_duplicate',
-                            'matched_task_id': first_id,
-                        })
-                        logger.info(
-                            'bulk_dedup: intra-batch duplicate %s removed (matches %s)',
-                            tid, first_id,
-                        )
-                    except Exception as exc:
-                        errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
-                        # Removal failed transiently — fall through to curator so
-                        # this task appears in either `kept` or `removed` depending
-                        # on the curator decision, rather than silently disappearing.
-                        unique_new_tasks.append(t)
-
-        curator = await self._get_curator()
-        if curator is None:
-            for t in unique_new_tasks:
-                kept.append({
-                    'task_id': str(t.get('id', '')),
-                    'title': str(t.get('title', '')),
-                })
-            return {'removed': removed, 'kept': kept, 'errors': errors}
-
-        for t in unique_new_tasks:
-            tid = str(t.get('id', ''))
-            title = str(t.get('title', ''))
-            pool_entry = _to_pool_entry(t, source='module', lock_depth=2)
-            files = pool_entry.files_to_modify if pool_entry is not None else []
-            candidate = CandidateTask(
-                title=title,
-                description=str(t.get('description', '') or ''),
-                details=str(t.get('details', '') or ''),
-                files_to_modify=files,
-                priority=str(t.get('priority', 'medium')),
-                spawned_from=parent_task_id,
-                spawn_context='expand' if parent_task_id else 'parse_prd',
-            )
-            if not candidate.title.strip():
-                kept.append({'task_id': tid, 'title': title})
-                continue
-
-            try:
-                decision = await curator.curate(candidate, project_id, project_root)
-            except Exception as exc:
-                logger.warning('bulk_curator: curate() failed for %s: %s', tid, exc)
-                kept.append({'task_id': tid, 'title': title})
-                continue
-
-            if decision.action == 'drop' and decision.target_id:
-                try:
-                    # WP-E: serialise the tasks.json mutation.
-                    async with self._write_lock(project_id):
-                        await tm.remove_task(tid, project_root)
-                    removed.append({
-                        'task_id': tid,
-                        'title': title,
-                        'reason': 'curator_drop',
-                        'matched_task_id': decision.target_id,
-                        'justification': decision.justification[:200],
-                    })
-                    logger.warning(
-                        'bulk_curator: dropped duplicate task %s (matched %s): %s',
-                        tid, decision.target_id, decision.justification[:80],
-                    )
-                except Exception as exc:
-                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
-                continue
-
-            if decision.action == 'combine' and decision.target_id:
-                # WP-E: combine writes to the target *and* removes the new
-                # task — hold the lock across both so no concurrent writer
-                # can observe the intermediate "new still present" state.
-                try:
-                    async with self._write_lock(project_id):
-                        combine_result = await self._execute_combine(project_root, decision)
-                        if combine_result is None:
-                            kept.append({'task_id': tid, 'title': title})
-                            continue
-                        await tm.remove_task(tid, project_root)
-                except Exception as exc:
-                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
-                    continue
-                removed.append({
-                    'task_id': tid,
-                    'title': title,
-                    'reason': 'curator_combine',
-                    'matched_task_id': decision.target_id,
-                    'justification': decision.justification[:200],
-                })
-                if decision.rewritten_task is not None:
-                    rt_candidate = CandidateTask(
-                        title=decision.rewritten_task.title,
-                        description=decision.rewritten_task.description,
-                        details=decision.rewritten_task.details,
-                        files_to_modify=decision.rewritten_task.files_to_modify,
-                        priority=decision.rewritten_task.priority,
-                    )
-                    bg = asyncio.create_task(
-                        curator.reembed_task(
-                            decision.target_id, rt_candidate, project_id,
-                        ),
-                        name=f'curator-reembed-{decision.target_id}',
-                    )
-                    self._background_tasks.add(bg)
-                    bg.add_done_callback(lambda t: self._background_tasks.discard(t))
-                continue
-
-            # action == 'create' or degenerate fall-through
-            kept.append({'task_id': tid, 'title': title})
-            bg = asyncio.create_task(
-                curator.record_task(tid, candidate, project_id),
-                name=f'curator-record-{tid}',
-            )
-            self._background_tasks.add(bg)
-            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
-
-        return {'removed': removed, 'kept': kept, 'errors': errors}
-
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
     def _write_lock(self, project_id: str) -> asyncio.Lock:
         """Per-project lock for tasks.json mutations.
 
-        Short-held; covers a single Taskmaster stdio write, OR a back-to-back
-        batch of mechanical writes with no LLM/IO between them — see
-        ``_dedupe_bulk_created`` Phase B for the canonical batched usage.
-        Every mutating op (set_task_status, update_task, add_dependency,
-        remove_dependency, the actual tm.add_task/tm.add_subtask/tm.remove_task
-        calls, and the bulk expand/parse_prd pre-snapshot+mutation) takes this
-        lock.
+        Short-held; covers a single Taskmaster stdio write or an equivalent
+        sqlite mutation. Every mutating op (set_task_status, update_task,
+        add_dependency, remove_dependency, the actual tm.add_task /
+        tm.add_subtask / tm.remove_task calls) takes this lock.
         """
         lock = self._write_locks.get(project_id)
         if lock is None:

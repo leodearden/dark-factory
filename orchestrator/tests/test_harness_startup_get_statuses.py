@@ -89,7 +89,7 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
     # get_statuses seeded empty so the no-pending RuntimeError path fires.
     get_statuses_mock.return_value = ({}, None)
 
-    with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
+    with pytest.raises(RuntimeError, match='No pending tasks found'):
         await h.run(prd_path=None)
 
     # get_statuses IS the call site for the pending-task check.
@@ -211,5 +211,5 @@ async def test_startup_noprd_empty_without_cached_error_raises_legitimate_error(
     h = startup_harness
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
-    with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
+    with pytest.raises(RuntimeError, match='No pending tasks found'):
         await h.run(prd_path=None)

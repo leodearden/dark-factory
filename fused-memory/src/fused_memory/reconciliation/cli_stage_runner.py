@@ -33,8 +33,6 @@ DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__remove_task',
     'mcp__fused-memory__add_dependency',
     'mcp__fused-memory__remove_dependency',
-    'mcp__fused-memory__expand_task',
-    'mcp__fused-memory__parse_prd',
 ]
 
 # Memory write tools (disallowed in Stage 3 — read-only integrity check)

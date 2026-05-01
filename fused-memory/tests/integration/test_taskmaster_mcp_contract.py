@@ -8,18 +8,18 @@ These tests drive a real Taskmaster MCP subprocess (via
 
 The companion canned-payload suite lives in
 ``tests/test_taskmaster_client_contract.py`` and mocks ``session.call_tool`` with
-hand-crafted wire envelopes to cover all 12 wrapper methods.  These live tests
+hand-crafted wire envelopes to cover the wrapper methods.  These live tests
 exist exclusively to catch wire-shape drift between Taskmaster's JS tools and the
 canned mocks — drift that static mocks cannot detect.
 
 **Intentional scope**: only the basic CRUD path (``add_task``, ``get_task``,
 ``set_task_status``, ``remove_task``) and one error path are tested here.
-Methods like ``update_task``, ``add_subtask``, ``expand_task``,
-``add_dependency``, and ``parse_prd`` are fully covered by the canned suite;
-adding live calls for each would not meaningfully raise drift-detection probability
-(wire shapes are symmetric — if ``add_task`` round-trips correctly the others
-overwhelmingly will too).  Expand this suite only when a specific wrapper's wire
-shape has been observed to drift in the field.
+Methods like ``update_task``, ``add_subtask``, and ``add_dependency`` are
+fully covered by the canned suite; adding live calls for each would not
+meaningfully raise drift-detection probability (wire shapes are symmetric —
+if ``add_task`` round-trips correctly the others overwhelmingly will too).
+Expand this suite only when a specific wrapper's wire shape has been
+observed to drift in the field.
 
 **Skip semantics**: this suite is skipped automatically unless
 ``taskmaster-ai/dist/mcp-server.js`` is present.  To enable it::
