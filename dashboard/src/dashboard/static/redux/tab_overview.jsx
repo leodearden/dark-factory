@@ -74,6 +74,7 @@ function OverviewTab({ paused }) {
               ]}
               height={210}
               formatY={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : Math.round(v)}
+              formatX={window.DF_SHELL.fmtDateTime}
             />
           </div>
         </div>

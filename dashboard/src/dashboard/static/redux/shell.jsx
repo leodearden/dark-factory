@@ -51,6 +51,30 @@ function timeago(iso) {
   return `${d}d`;
 }
 
+// Format an ISO8601 timestamp as "YYYY-MM-DD HH:MM" in UTC — minute precision,
+// space instead of T, no seconds/subseconds/timezone suffix. Date-only inputs
+// ("YYYY-MM-DD") pass through unchanged. Returns "—" on null/undefined/unparseable.
+//
+// ISO strings without an explicit timezone (e.g. "2026-04-26T12:00") are
+// interpreted as UTC — Python serialisers in this app uniformly emit UTC, but
+// ECMAScript Date.parse would default unzoned values to local time.
+function fmtDateTime(iso) {
+  if (iso == null || iso === '') return '—';
+  if (typeof iso !== 'string') return String(iso);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  const tzPart = iso.split('T')[1] || '';
+  const naive = iso.includes('T') && !/[Zz]|[+-]\d{2}:?\d{2}$/.test(tzPart);
+  const t = Date.parse(naive ? iso + 'Z' : iso);
+  if (isNaN(t)) return iso;
+  const d = new Date(t);
+  const Y = d.getUTCFullYear();
+  const M = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const D = String(d.getUTCDate()).padStart(2, '0');
+  const h = String(d.getUTCHours()).padStart(2, '0');
+  const m = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${Y}-${M}-${D} ${h}:${m}`;
+}
+
 // ── Glyphs (simple shapes only — no complex SVG) ──
 const Glyph = ({ kind }) => {
   const props = { width: 14, height: 14, viewBox: '0 0 14 14', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round' };
@@ -368,4 +392,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, taskId, dailyDeltas };
