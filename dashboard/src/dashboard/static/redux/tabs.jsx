@@ -1031,7 +1031,7 @@ function CostsTab({ projectFilter }) {
                   <td className="mono" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(e.ts)}</td>
                   <td className="mono">{e.account}</td>
                   <td><span className={`badge ${e.event === 'rate_limited' || e.event === 'cap_hit' ? 'warn' : e.event === 'cap_reset' || e.event === 'resumed' ? 'ok' : e.event === 'auth_failed' ? 'bad' : 'info'}`}>{e.event}</span></td>
-                  <td style={{ color: 'var(--fg-2)' }}>{e.detail}</td>
+                  <td style={{ color: 'var(--fg-2)' }}>{window.DF_SHELL.scrubIsos(e.detail)}</td>
                 </tr>
               ))}
             </tbody>
