@@ -770,14 +770,17 @@ class TaskmasterBackend:
             'subtask': subtask,
         }
 
-    async def remove_task(
+    async def remove_tasks(
         self,
-        task_id: str,
+        ids: list[str],
         project_root: str,
         tag: str | None = None,
     ) -> RemoveTaskResult:
+        # Upstream Taskmaster's remove_task tool already accepts a comma-
+        # separated id string for multi-removal. Shim is single-shot for the
+        # dual_compare window; goes away when taskmaster is retired.
         args = self._base_args(project_root, tag)
-        args['id'] = task_id
+        args['id'] = ','.join(ids)
         args['confirm'] = True
         raw = await self.call_tool('remove_task', args)
         data = _unwrap('remove_task', raw)

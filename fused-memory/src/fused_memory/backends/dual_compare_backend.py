@@ -729,24 +729,28 @@ class DualCompareBackend:
         )
         return p_val
 
-    async def remove_task(
-        self, task_id: str, project_root: str, tag: str | None = None,
+    async def remove_tasks(
+        self, ids: list[str], project_root: str, tag: str | None = None,
     ):
         p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
-            'remove_task',
-            (task_id, project_root),
+            'remove_tasks',
+            (ids, project_root),
             {'tag': tag},
             normalize=_normalize_remove,
         )
         if p_exc is not None:
             raise p_exc
-        # Both sides should now report the task as gone. ``expect_not_found``
-        # inverts the contract — exception on both is the OK case.
-        self._spawn_verify(
-            'remove_task', str(task_id), str(task_id),
-            project_root, tag,
-            expect_not_found=True,
-        )
+        # Each removed id should now be absent on both sides — verify
+        # per-id so partial divergence (one side missed a delete) surfaces.
+        for raw in ids:
+            target = str(raw).strip()
+            if not target:
+                continue
+            self._spawn_verify(
+                'remove_tasks', target, target,
+                project_root, tag,
+                expect_not_found=True,
+            )
         return p_val
 
     async def add_dependency(

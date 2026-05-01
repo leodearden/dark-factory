@@ -257,16 +257,16 @@ async def test_set_status_on_subtask_via_dotted_id(backend, project_root):
     assert parent['subtasks'][0]['status'] == 'done'
 
 
-# ── remove_task with cascade ───────────────────────────────────────
+# ── remove_tasks with cascade ──────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_remove_task_cascades_to_subtasks(backend, project_root):
+async def test_remove_tasks_cascades_to_subtasks(backend, project_root):
     await backend.add_task(project_root=project_root, title='parent')
     await backend.add_subtask('1', project_root=project_root, title='A')
     await backend.add_subtask('1', project_root=project_root, title='B')
 
-    dto = await backend.remove_task('1', project_root=project_root)
+    dto = await backend.remove_tasks(['1'], project_root=project_root)
 
     assert dto['successful'] == 3
     assert dto['failed'] == 0
@@ -277,10 +277,73 @@ async def test_remove_task_cascades_to_subtasks(backend, project_root):
 
 
 @pytest.mark.asyncio
-async def test_remove_task_unknown_id_returns_failure_dto(backend, project_root):
-    dto = await backend.remove_task('99', project_root=project_root)
+async def test_remove_tasks_unknown_id_returns_failure_dto(backend, project_root):
+    dto = await backend.remove_tasks(['99'], project_root=project_root)
     assert dto['successful'] == 0
     assert dto['failed'] == 1
+    assert dto['removed_ids'] == []
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_batch_mixed_existing_missing(backend, project_root):
+    # Two top-levels exist (1, 2); 3 and 99 do not.
+    await backend.add_task(project_root=project_root, title='alpha')
+    await backend.add_task(project_root=project_root, title='beta')
+
+    dto = await backend.remove_tasks(
+        ['1', '2', '3', '99'], project_root=project_root,
+    )
+
+    assert dto['successful'] == 2
+    assert dto['failed'] == 2
+    assert sorted(dto['removed_ids']) == ['1', '2']
+    assert '3' in dto['message']
+    assert '99' in dto['message']
+
+    listing = await backend.get_tasks(project_root=project_root)
+    assert listing['tasks'] == []
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_cascades_with_explicit_subtask(backend, project_root):
+    # Caller asks to remove parent 1 AND its subtask 1.1; cascade naturally
+    # pulls in 1.1 as well — must report once, not twice.
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='A')
+    await backend.add_subtask('1', project_root=project_root, title='B')
+
+    dto = await backend.remove_tasks(
+        ['1', '1.1'], project_root=project_root,
+    )
+
+    # 1, 1.1, 1.2 — three rows actually deleted; no double-count of 1.1.
+    assert dto['successful'] == 3
+    assert dto['failed'] == 0
+    assert sorted(dto['removed_ids']) == ['1', '1.1', '1.2']
+    assert dto['removed_ids'].count('1.1') == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_atomicity_on_malformed_id(backend, project_root):
+    await backend.add_task(project_root=project_root, title='alpha')
+    await backend.add_task(project_root=project_root, title='beta')
+
+    with pytest.raises(TaskmasterError):
+        # 'oops' is not a parseable id — the whole batch fails before any
+        # delete runs. Verify state is unchanged afterwards.
+        await backend.remove_tasks(
+            ['1', 'oops', '2'], project_root=project_root,
+        )
+
+    listing = await backend.get_tasks(project_root=project_root)
+    assert sorted(t['id'] for t in listing['tasks']) == ['1', '2']
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_empty_list_is_noop(backend, project_root):
+    dto = await backend.remove_tasks([], project_root=project_root)
+    assert dto['successful'] == 0
+    assert dto['failed'] == 0
     assert dto['removed_ids'] == []
 
 
@@ -321,7 +384,7 @@ async def test_validate_dependencies_reports_dangling(backend, project_root):
     await backend.add_task(project_root=project_root, title='b')
     await backend.add_dependency('2', '1', project_root=project_root)
     # Remove the target so the dependency on it dangles.
-    await backend.remove_task('1', project_root=project_root)
+    await backend.remove_tasks(['1'], project_root=project_root)
     res = await backend.validate_dependencies(project_root=project_root)
     assert 'Dangling dependencies' in res['message']
     assert '2 -> 1' in res['message']

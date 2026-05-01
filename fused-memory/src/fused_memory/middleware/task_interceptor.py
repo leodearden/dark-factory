@@ -2682,17 +2682,17 @@ class TaskInterceptor:
                 )
         return result
 
-    async def remove_task(
-        self, task_id: str, project_root: str, tag: str | None = None
+    async def remove_tasks(
+        self, ids: list[str], project_root: str, tag: str | None = None
     ) -> dict:
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # curator_lock (conservative): a concurrent add_task / add_subtask
-        # curator decision of ``combine target=task_id`` would hold the
-        # curator_lock; blocking remove_task here prevents the target
-        # from vanishing between the curator's decision and
+        # curator decision of ``combine target=<one of these ids>`` would
+        # hold the curator_lock; blocking remove_tasks here prevents the
+        # target from vanishing between the curator's decision and
         # _execute_combine's guarded write. _execute_combine also has a
         # fingerprint-and-status guard that degrades to ``create`` on
         # mismatch, so this is belt-and-braces, not load-bearing.
@@ -2701,18 +2701,23 @@ class TaskInterceptor:
             self._write_lock(project_id),
         ):
             result = dict(await self._journal_around(
-                'remove_task',
+                'remove_tasks',
                 project_root,
-                {'task_id': task_id, 'tag': tag},
-                tm.remove_task(task_id, project_root, tag),
+                {'ids': list(ids), 'tag': tag},
+                tm.remove_tasks(list(ids), project_root, tag),
             ))
-        event = self._make_event(
-            EventType.task_deleted,
-            project_root,
-            {'task_id': task_id, 'operation': 'remove_task'},
-        )
-        await self._journal(event)
-        self._schedule_commit(project_root, f'remove_task({task_id})')
+        # One task_deleted event per requested id — clearer reconciliation
+        # signal than a single batched event, and matches the existing
+        # per-id semantics elsewhere in the journal.
+        for task_id in ids:
+            event = self._make_event(
+                EventType.task_deleted,
+                project_root,
+                {'task_id': task_id, 'operation': 'remove_task'},
+            )
+            await self._journal(event)
+        # One commit for the batch — file-committer coalesces anyway.
+        self._schedule_commit(project_root, f'remove_tasks({len(ids)})')
         return result
 
     async def add_dependency(

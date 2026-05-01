@@ -340,16 +340,16 @@ async def test_get_tasks_divergence_emits_one_line_per_task(
 
 
 @pytest.mark.asyncio
-async def test_post_write_verify_remove_task_expects_not_found(
+async def test_post_write_verify_remove_tasks_expects_not_found(
     primary, project_root, caplog,
 ):
-    """``remove_task`` inverts the contract: both sides should now raise
+    """``remove_tasks`` inverts the contract: both sides should now raise
     ``TaskmasterError`` on the read-back. If secondary still returns
     the task, that's a divergence."""
     await primary.add_task(project_root=project_root, title='a')
 
     secondary = _stub_backend()
-    secondary.remove_task = AsyncMock(return_value={'successful': 1, 'failed': 0})
+    secondary.remove_tasks = AsyncMock(return_value={'successful': 1, 'failed': 0})
     # Stale: secondary still has the task after remove.
     secondary.get_task = AsyncMock(return_value={
         'id': 1, 'title': 'a', 'status': 'pending', 'priority': 'medium',
@@ -358,12 +358,57 @@ async def test_post_write_verify_remove_task_expects_not_found(
 
     wrapper = DualCompareBackend(primary, secondary)
     with caplog.at_level('WARNING'):
-        await wrapper.remove_task('1', project_root)
+        await wrapper.remove_tasks(['1'], project_root)
         for t in list(wrapper._inflight_verifies):
             await t
 
     assert wrapper.verifies_total == 1
     assert wrapper.verifies_diverged == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_multi_id_zero_divergence_when_secondary_agrees(
+    primary, project_root,
+):
+    """Multi-id parity: secondary agrees on the count → no divergence."""
+    await primary.add_task(project_root=project_root, title='a')
+    await primary.add_task(project_root=project_root, title='b')
+
+    secondary = _stub_backend()
+    # Wire shape primary returns: successful=2, failed=0.
+    secondary.remove_tasks = AsyncMock(return_value={
+        'successful': 2, 'failed': 0,
+    })
+
+    wrapper = DualCompareBackend(primary, secondary)
+    out = await wrapper.remove_tasks(['1', '2'], project_root)
+
+    assert out['successful'] == 2
+    assert wrapper.divergence_count == 0
+    # Verify the secondary received the list, not a comma-string.
+    sent_args, _ = secondary.remove_tasks.call_args
+    assert sent_args[0] == ['1', '2']
+
+
+@pytest.mark.asyncio
+async def test_remove_tasks_multi_id_divergence_on_count_mismatch(
+    primary, project_root, caplog,
+):
+    """Multi-id divergence: secondary disagrees on the successful count."""
+    await primary.add_task(project_root=project_root, title='a')
+    await primary.add_task(project_root=project_root, title='b')
+
+    secondary = _stub_backend()
+    secondary.remove_tasks = AsyncMock(return_value={
+        'successful': 1, 'failed': 1,
+    })
+
+    wrapper = DualCompareBackend(primary, secondary)
+    with caplog.at_level('WARNING'):
+        await wrapper.remove_tasks(['1', '2'], project_root)
+
+    assert wrapper.divergence_count == 1
+    assert any('dual_compare.divergence' in m for m in caplog.messages)
 
 
 @pytest.mark.asyncio

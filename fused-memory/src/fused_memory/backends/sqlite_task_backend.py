@@ -661,69 +661,145 @@ class SqliteTaskBackend:
             'subtask': subtask_dict,
         }
 
-    async def remove_task(
+    async def remove_tasks(
         self,
-        task_id: str,
+        ids: list[str],
         project_root: str,
         tag: str | None = None,
     ) -> RemoveTaskResult:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        tid, parent_id = _parse_task_id(task_id)
-        parent_db = parent_id if parent_id is not None else _TOP_LEVEL_SENTINEL
+
+        if not ids:
+            return {
+                'successful': 0,
+                'failed': 0,
+                'removed_ids': [],
+                'message': 'no ids supplied',
+            }
+
+        # Parse all upfront — a single bad id fails the whole batch (caller
+        # sent garbage; no partial-success on malformed input). Order is
+        # preserved so the reported removed_ids and missing list mirror the
+        # caller's input order.
+        parsed: list[tuple[int, int | None]] = [_parse_task_id(raw) for raw in ids]
 
         async with self._write_lock(project_root):
             async with self._txn(project_root) as conn:
+                # One SELECT to identify which requested rows exist. SQLite's
+                # default SQL parameter limit (999) bounds batch size; realistic
+                # callers stay well under it.
+                where_pairs = ' OR '.join(
+                    '(id = ? AND parent_id = ?)' for _ in parsed
+                )
+                params: list[Any] = [tag]
+                for tid, parent_id in parsed:
+                    parent_db = (
+                        parent_id if parent_id is not None
+                        else _TOP_LEVEL_SENTINEL
+                    )
+                    params.extend([tid, parent_db])
                 cursor = await conn.execute(
-                    'SELECT id, parent_id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid, parent_db),
+                    f'SELECT id, parent_id FROM tasks '
+                    f'WHERE tag = ? AND ({where_pairs})',
+                    params,
                 )
-                row = await cursor.fetchone()
-                if row is None:
-                    return {
-                        'successful': 0,
-                        'failed': 1,
-                        'removed_ids': [],
-                        'message': f'Task {task_id} not found',
-                    }
+                existing_keys: set[tuple[int, int]] = {
+                    (row['id'], row['parent_id'])
+                    for row in await cursor.fetchall()
+                }
 
-                removed: list[str] = [task_id]
-                if parent_id is None:
-                    # Cascade: pull subtask ids, then delete them and their deps.
+                # Classify into existing (to remove) vs missing. Dedupe by
+                # (id, parent_id) so duplicate caller input doesn't double-count.
+                removed_keys: set[tuple[int, int]] = set()
+                removed_display: list[str] = []
+                existing_top_tids: set[int] = set()
+                failed_display: list[str] = []
+                failed_seen: set[str] = set()
+
+                for tid, parent_id in parsed:
+                    parent_db = (
+                        parent_id if parent_id is not None
+                        else _TOP_LEVEL_SENTINEL
+                    )
+                    key = (tid, parent_db)
+                    disp = _format_task_id(tid, parent_id)
+                    if key not in existing_keys:
+                        if disp not in failed_seen:
+                            failed_display.append(disp)
+                            failed_seen.add(disp)
+                        continue
+                    if key not in removed_keys:
+                        removed_keys.add(key)
+                        removed_display.append(disp)
+                    if parent_id is None:
+                        existing_top_tids.add(tid)
+
+                # Cascade: every existing top-level pulls in its subtasks.
+                # Skip subtasks already explicitly listed by the caller so
+                # they aren't reported twice.
+                if existing_top_tids:
+                    top_list = list(existing_top_tids)
+                    top_placeholders = ','.join('?' for _ in top_list)
                     sub_cursor = await conn.execute(
-                        'SELECT id FROM tasks WHERE tag = ? AND parent_id = ?',
-                        (tag, tid),
+                        f'SELECT id, parent_id FROM tasks '
+                        f'WHERE tag = ? AND parent_id IN ({top_placeholders})',
+                        [tag, *top_list],
                     )
-                    for sub_row in await sub_cursor.fetchall():
-                        removed.append(_format_task_id(sub_row['id'], tid))
-                    await conn.execute(
-                        'DELETE FROM tasks WHERE tag = ? AND parent_id = ?',
-                        (tag, tid),
+                    sub_rows = sorted(
+                        await sub_cursor.fetchall(),
+                        key=lambda r: (r['parent_id'], r['id']),
                     )
+                    for sub_row in sub_rows:
+                        sub_key = (sub_row['id'], sub_row['parent_id'])
+                        if sub_key in removed_keys:
+                            continue
+                        removed_keys.add(sub_key)
+                        removed_display.append(
+                            _format_task_id(sub_row['id'], sub_row['parent_id']),
+                        )
+
+                # Two batch DELETEs — tasks then their owning dependencies.
+                # Cross-task deps pointing AT removed ids stay dangling on
+                # purpose (matches the original single-id behaviour and lets
+                # validate_dependencies surface them).
+                if removed_keys:
+                    keys_list = list(removed_keys)
+                    task_pairs = ' OR '.join(
+                        '(id = ? AND parent_id = ?)' for _ in keys_list
+                    )
+                    task_params: list[Any] = [tag]
+                    for tid, pdb in keys_list:
+                        task_params.extend([tid, pdb])
                     await conn.execute(
-                        'DELETE FROM dependencies WHERE tag = ? AND parent_id = ?',
-                        (tag, tid),
+                        f'DELETE FROM tasks WHERE tag = ? AND ({task_pairs})',
+                        task_params,
+                    )
+                    dep_pairs = ' OR '.join(
+                        '(task_id = ? AND parent_id = ?)' for _ in keys_list
+                    )
+                    dep_params: list[Any] = [tag]
+                    for tid, pdb in keys_list:
+                        dep_params.extend([tid, pdb])
+                    await conn.execute(
+                        f'DELETE FROM dependencies WHERE tag = ? AND ({dep_pairs})',
+                        dep_params,
                     )
 
-                await conn.execute(
-                    'DELETE FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid, parent_db),
-                )
-                await conn.execute(
-                    'DELETE FROM dependencies WHERE tag = ? AND task_id = ? AND parent_id = ?',
-                    (tag, tid, parent_db),
-                )
-                # NOTE: cross-task dependencies pointing AT the removed task
-                # are intentionally LEFT in the dependencies table so
-                # validate_dependencies surfaces them as dangling — matches
-                # Taskmaster's behaviour of letting the operator decide
-                # whether to repoint or drop.
-
+        successful = len(removed_display)
+        failed = len(failed_display)
+        if failed_display:
+            msg = (
+                f'Removed {successful} task(s); '
+                f'{failed} not found: {", ".join(failed_display)}'
+            )
+        else:
+            msg = f'Removed {successful} task(s)'
         return {
-            'successful': len(removed),
-            'failed': 0,
-            'removed_ids': removed,
-            'message': f'Removed {len(removed)} task',
+            'successful': successful,
+            'failed': failed,
+            'removed_ids': removed_display,
+            'message': msg,
         }
 
     async def add_dependency(
