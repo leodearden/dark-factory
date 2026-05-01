@@ -227,6 +227,12 @@ class Harness:
         # See zombie-escalation fix Step 5.
         self._terminal_status_watcher_task: asyncio.Task | None = None
 
+        # Background sweep: periodic re-run of the startup
+        # ``_reconcile_stranded_in_progress`` pass during a long run, so
+        # tasks stranded by transient backend failures get unstrandred
+        # without waiting for the next orchestrator restart.  See Fix 4.
+        self._stranded_reconcile_task: asyncio.Task | None = None
+
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
         self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
@@ -356,6 +362,11 @@ class Harness:
             # for tens of minutes after the human has finished the task.
             self._start_terminal_status_watcher()
 
+            # 1c1c. Start periodic stranded-in-progress reconcile (Fix 4).
+            # Catches tasks stranded by transient backend failures during a
+            # long run so they don't accumulate until the next restart.
+            self._start_stranded_reconcile()
+
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
                 hours, rem = divmod(delay_secs, 3600)
@@ -462,6 +473,20 @@ class Harness:
 
                 if assignment is None:
                     if not active:
+                        # Before treating as "all done", sweep stranded
+                        # in-progress.  Tasks stranded by transient backend
+                        # failures may unblock pending dependents; a clean
+                        # exit here would leave them for the next restart.
+                        # See Fix 4 — stuck-blocked recovery.
+                        changed = await self._reconcile_stranded_in_progress(
+                            mid_run=True,
+                        )
+                        if changed > 0:
+                            logger.info(
+                                'Mid-run reconcile freed %d task(s) '
+                                '— continuing main loop', changed,
+                            )
+                            continue
                         break  # all done or all blocked
                     # Wait for any active task to complete, then retry.
                     # Timeout ensures newly-added tasks are discovered
@@ -590,6 +615,10 @@ class Harness:
                 await self._stop_terminal_status_watcher()
             except Exception as e:
                 logger.warning(f'_stop_terminal_status_watcher() failed: {e}')
+            try:
+                await self._stop_stranded_reconcile()
+            except Exception as e:
+                logger.warning(f'_stop_stranded_reconcile() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -923,16 +952,26 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'{cleaned} worktrees cleaned'
             )
 
-    async def _reconcile_stranded_in_progress(self) -> None:
-        """Startup sweep: revert stranded in-progress tasks to pending.
+    async def _reconcile_stranded_in_progress(self, *, mid_run: bool = False) -> int:
+        """Sweep stranded in-progress tasks back to pending (or done).
 
         Examines every task that is currently in-progress and checks whether
         it has a live claimant via plan.lock / owner_pid.  Any task without a
         live claimant is reverted to pending so the scheduler can re-acquire it.
 
-        This method is called AFTER _recover_crashed_tasks() (which may unlink
-        plan.lock for recovered worktrees) and BEFORE the first
-        scheduler.acquire_next() call, so self._dispatched is always empty here.
+        At startup (``mid_run=False``) this is called AFTER
+        ``_recover_crashed_tasks()`` (which may unlink plan.lock for recovered
+        worktrees) and BEFORE the first ``scheduler.acquire_next()`` call, so
+        ``self.scheduler._dispatched`` is always empty.
+
+        When ``mid_run=True`` the harness has dispatched tasks during this
+        run; those are NOT stranded — they are actively held by the scheduler
+        — and must be filtered before any liveness check.  Without the filter
+        the sweep would race the workflow that legitimately holds the task.
+
+        Returns the number of tasks reverted or marked done so the caller can
+        decide whether to keep the main loop running (Fix 4: stuck-blocked
+        recovery).
 
         **Already-on-main fast-path** (is_ancestor == True):
         When the task branch is already an ancestor of main, the task is
@@ -976,9 +1015,16 @@ Output JSON matching the schema. Every task must appear in the output.
         statuses, _ = await self.scheduler.get_statuses()
         reverted = 0
         marked_done = 0
+        log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
 
         for tid, status in statuses.items():
             if status != 'in-progress':
+                continue
+            if mid_run and (
+                tid in self.scheduler._dispatched
+                or tid in self.scheduler.lock_table._held
+            ):
+                # Actively held by this run's scheduler — not stranded.
                 continue
 
             branch = f'{self.git_ops.config.branch_prefix}{tid}'
@@ -1114,9 +1160,11 @@ Output JSON matching the schema. Every task must appear in the output.
 
         if reverted or marked_done:
             logger.info(
-                'Reconcile: %d stranded task(s) reverted to pending; %d marked done (branch already on main)',
-                reverted, marked_done,
+                '%s: %d stranded task(s) reverted to pending; '
+                '%d marked done (branch already on main)',
+                log_prefix, reverted, marked_done,
             )
+        return reverted + marked_done
 
     async def _mark_in_progress_done(
         self,
@@ -1776,6 +1824,56 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
                 cancelled += 1
         return cancelled
+
+    # ------------------------------------------------------------------
+    # Stranded-in-progress periodic sweep (Fix 4)
+    # ------------------------------------------------------------------
+
+    def _start_stranded_reconcile(self) -> None:
+        """Start the periodic stranded-in-progress sweep.
+
+        Mirrors the terminal-status watcher: a long-lived asyncio.Task
+        wakes every ``stranded_reconcile_interval_secs`` and re-runs
+        ``_reconcile_stranded_in_progress(mid_run=True)``.  The mid_run
+        filter skips tasks the scheduler is actively dispatching, so the
+        sweep can't race a healthy workflow.
+        """
+        if not self.config.stranded_reconcile_enabled:
+            return
+        if (
+            self._stranded_reconcile_task is not None
+            and not self._stranded_reconcile_task.done()
+        ):
+            return
+        self._stranded_reconcile_task = asyncio.create_task(
+            self._stranded_reconcile_loop(),
+            name='stranded-reconcile',
+        )
+        logger.info(
+            'Stranded-in-progress reconcile started (interval=%.0fs)',
+            self.config.stranded_reconcile_interval_secs,
+        )
+
+    async def _stop_stranded_reconcile(self) -> None:
+        """Cancel the stranded-in-progress sweep loop."""
+        if self._stranded_reconcile_task is not None:
+            self._stranded_reconcile_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._stranded_reconcile_task
+            self._stranded_reconcile_task = None
+            logger.info('Stranded-in-progress reconcile stopped')
+
+    async def _stranded_reconcile_loop(self) -> None:
+        """Wake periodically and run the mid-run stranded sweep."""
+        interval = self.config.stranded_reconcile_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._reconcile_stranded_in_progress(mid_run=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Stranded-in-progress reconcile pass failed')
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""

@@ -1210,6 +1210,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._dismiss_stale_escalations = AsyncMock()
     h._start_orphan_l0_reaper = MagicMock()
     h._start_terminal_status_watcher = MagicMock()
+    h._start_stranded_reconcile = MagicMock()
     h._tag_task_modules = AsyncMock()
 
     # Provide one pending task so the "no pending tasks" check passes.
@@ -1228,8 +1229,9 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._recover_crashed_tasks = _fake_recover
 
     # Track ordering: _reconcile_stranded_in_progress
-    async def _fake_reconcile():
+    async def _fake_reconcile(*, mid_run: bool = False) -> int:
         call_order.append('reconcile')
+        return 0
     h._reconcile_stranded_in_progress = _fake_reconcile
 
     # Track ordering: acquire_next — append then raise to break the loop
@@ -1287,3 +1289,82 @@ async def test_non_in_progress_statuses_ignored(harness: Harness):
     assert calls[0].args[0] == '25'
     assert calls[0].args[1] == 'pending'
 
+
+# ---------------------------------------------------------------------------
+# Mid-run filter (Fix 4)
+#
+# When the sweep runs *during* a live orchestrator run (mid_run=True), tasks
+# that the scheduler is actively dispatching (in ``_dispatched``) or holding
+# locks for (``lock_table._held``) must be skipped — they are not stranded,
+# they're being worked on right now, and reverting their status would race
+# the running workflow.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mid_run_skips_dispatched_tasks(harness: Harness):
+    """Task in scheduler._dispatched is not stranded — left untouched."""
+    # Replace the scheduler MagicMock attrs with real containers so the
+    # mid-run guard can inspect membership.
+    harness.scheduler._dispatched = {'40'}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'40': 'in-progress'}, None,
+    )
+    # No worktree for task 40 — would normally trigger no-lock revert.
+
+    changed = await harness._reconcile_stranded_in_progress(mid_run=True)
+
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_mid_run_skips_lock_held_tasks(harness: Harness):
+    """Task with active lock_table membership is not stranded — left untouched."""
+    harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table._held = {'41': {'mod_a'}}  # type: ignore[attr-defined]
+
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'41': 'in-progress'}, None,
+    )
+
+    changed = await harness._reconcile_stranded_in_progress(mid_run=True)
+
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_mid_run_reverts_genuine_strand(harness: Harness):
+    """Task NOT in _dispatched / _held but in-progress → genuinely stranded."""
+    harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'42': 'in-progress'}, None,
+    )
+
+    changed = await harness._reconcile_stranded_in_progress(mid_run=True)
+
+    assert changed == 1
+    harness.scheduler.set_task_status.assert_called_once_with('42', 'pending')  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_returns_change_count(harness: Harness):
+    """Reconcile returns int count (revert + marked-done) for main-loop hook."""
+    harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+
+    # No in-progress tasks → nothing to do.
+    harness.scheduler.get_statuses.return_value = ({'10': 'pending'}, None)  # type: ignore[attr-defined]
+    assert await harness._reconcile_stranded_in_progress() == 0
+
+    # One stranded task → returns 1.
+    harness.scheduler.get_statuses.return_value = ({'11': 'in-progress'}, None)  # type: ignore[attr-defined]
+    assert await harness._reconcile_stranded_in_progress() == 1
