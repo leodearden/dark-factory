@@ -267,6 +267,15 @@ class Harness:
         """
         self.report.started_at = datetime.now(UTC).isoformat()
 
+        # Install the usage-gate SIGHUP handler now that we're inside
+        # asyncio.run(). The gate's __init__ runs before the loop exists
+        # (Harness is constructed in the sync body of cli.run()), so its
+        # auto-registration is a no-op there. The call is idempotent —
+        # gates constructed inside an event loop (evals, fused-memory)
+        # already installed the handler in __init__.
+        if self.usage_gate is not None:
+            self.usage_gate.register_signal_handlers()
+
         # 0. Singleton lock — prevent concurrent orchestrators on same project
         self._lock_file = _acquire_project_lock(self.config.project_root)
 
