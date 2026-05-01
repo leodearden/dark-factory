@@ -51,6 +51,17 @@ function timeago(iso) {
   return `${d}d`;
 }
 
+// Replace any ISO8601 timestamps embedded inside a free-form string with the
+// minute-precision UTC form. Used for fields like cost-event `detail` where
+// the API returns a stringified JSON blob containing raw timestamps.
+function scrubIsos(s) {
+  if (typeof s !== 'string' || !s) return s;
+  return s.replace(
+    /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/g,
+    m => fmtDateTime(m),
+  );
+}
+
 // Format an ISO8601 timestamp as "YYYY-MM-DD HH:MM" in UTC — minute precision,
 // space instead of T, no seconds/subseconds/timezone suffix. Date-only inputs
 // ("YYYY-MM-DD") pass through unchanged. Returns "—" on null/undefined/unparseable.
@@ -273,7 +284,7 @@ function buildFeedEntries(D) {
       key: `cost:${e.account}:${e.ts}`,
       iso: e.ts,
       src: 'cost',
-      msg: `${e.account} ${e.event}${e.detail ? ' · ' + e.detail : ''}`,
+      msg: `${e.account} ${e.event}${e.detail ? ' · ' + scrubIsos(e.detail) : ''}`,
     });
   }
 
