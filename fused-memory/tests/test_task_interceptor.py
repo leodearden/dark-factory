@@ -4755,3 +4755,144 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
         await buf.close()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _get_curator survives DualCompareBackend wrapper
+# ─────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Write-journal integration (Commit 7)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_journaled_write_emits_write_op_and_backend_op(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """A write through the interceptor with a journal wired must leave
+    one ``write_op`` row and at least one ``backend_op`` row, both tagged
+    with the same ``write_op_id``."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(tmp_path / 'wj')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        # update_task is the simplest path.
+        await interceptor.update_task('1', '/project', prompt='tweak')
+
+        # Verify the rows.
+        async with journal._db.execute(
+            "SELECT id, operation FROM write_ops WHERE operation = 'update_task'",
+        ) as cur:
+            wo_rows = list(await cur.fetchall())
+        assert len(wo_rows) == 1, wo_rows
+        write_op_id = wo_rows[0][0]
+
+        async with journal._db.execute(
+            "SELECT backend, success FROM backend_ops "
+            "WHERE write_op_id = ? AND operation = 'update_task'",
+            (write_op_id,),
+        ) as cur:
+            bo_rows = list(await cur.fetchall())
+        assert len(bo_rows) >= 1, bo_rows
+        # Backend label resolves from AsyncMock's class — 'unknown' is
+        # acceptable, what matters is the row exists and is tied to the
+        # same write_op.
+        assert all(row[1] == 1 for row in bo_rows), bo_rows
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_journaled_write_logs_failure_row(
+    reconciler, event_buffer, tmp_path,
+):
+    """A failing tm.* call still produces a write_op row plus a failed
+    backend_op row — never silently disappears."""
+    from fused_memory.backends.taskmaster_types import TaskmasterError
+    from fused_memory.services.write_journal import WriteJournal
+
+    failing_tm = AsyncMock()
+    failing_tm.update_task = AsyncMock(side_effect=TaskmasterError(
+        'TASKMASTER_TOOL_ERROR', 'simulated',
+    ))
+
+    journal = WriteJournal(tmp_path / 'wj_fail')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(failing_tm, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        with pytest.raises(TaskmasterError):
+            await interceptor.update_task('1', '/project', prompt='x')
+
+        async with journal._db.execute(
+            "SELECT COUNT(*) FROM write_ops WHERE operation = 'update_task'",
+        ) as cur:
+            wo_count = (await cur.fetchone())[0]
+        assert wo_count == 1
+        async with journal._db.execute(
+            "SELECT success, error FROM backend_ops WHERE operation = 'update_task'",
+        ) as cur:
+            bo_rows = list(await cur.fetchall())
+        assert len(bo_rows) == 1
+        assert bo_rows[0][0] == 0
+        assert 'simulated' in (bo_rows[0][1] or '')
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_get_curator_survives_dual_compare_wrapper(
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path, caplog,
+):
+    """Reproduces the silent-disable bug.
+
+    Before the fix, ``_get_curator`` reached for ``self.taskmaster.config``;
+    when the backend was wrapped in :class:`DualCompareBackend` (which has
+    no ``config`` attribute), the AttributeError was swallowed by the
+    broad ``except Exception`` and the curator stayed off the entire soak.
+
+    Now the interceptor reads ``project_root`` from its own ``self._config``
+    so the wrapper composition is irrelevant.
+    """
+    from fused_memory.backends.dual_compare_backend import DualCompareBackend
+    from fused_memory.config.schema import TaskmasterConfig
+    from fused_memory.middleware.task_curator import TaskCurator
+
+    # Wire a TaskmasterConfig so _get_curator can resolve project_root.
+    curator_enabled_config.taskmaster = TaskmasterConfig(project_root=str(tmp_path))
+
+    secondary = AsyncMock()
+    secondary.connected = True
+    secondary.restart_count = 0
+    secondary.start = AsyncMock()
+    secondary.close = AsyncMock()
+
+    wrapped = DualCompareBackend(taskmaster, secondary)
+    interceptor = TaskInterceptor(
+        wrapped, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    try:
+        with caplog.at_level('WARNING'):
+            curator = await interceptor._get_curator()
+
+        assert curator is not None
+        assert isinstance(curator, TaskCurator)
+        assert not any(
+            'Failed to create TaskCurator' in m for m in caplog.messages
+        ), caplog.messages
+    finally:
+        # Cancel any backfill bg task spawned by _get_curator.
+        for t in list(interceptor._background_tasks):
+            if not t.done():
+                t.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, Exception,
+                ):
+                    await t

@@ -661,19 +661,32 @@ class TestRunBackfill:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _make_interceptor_config() -> FusedMemoryConfig:
-    """Make a config with curator enabled."""
+def _make_interceptor_config(project_root: str | None = None) -> FusedMemoryConfig:
+    """Make a config with curator enabled.
+
+    ``project_root`` is now read by the interceptor from its OWN config
+    (post-Commit 1 fix to stop reaching into ``taskmaster.config``), so
+    callers that need the curator's backfill path must wire it here.
+    """
+    from fused_memory.config.schema import TaskmasterConfig
+
     cfg = _make_config()
     cfg.curator.enabled = True
+    if project_root is not None:
+        cfg.taskmaster = TaskmasterConfig(project_root=project_root)
     return cfg
 
 
 class TestAutoBackfill:
     """Tests for the auto-backfill hook in TaskInterceptor._maybe_backfill_corpus()."""
 
-    def _make_interceptor(self, mock_taskmaster) -> TaskInterceptor:
+    def _make_interceptor(
+        self, mock_taskmaster, project_root: str | None = None,
+    ) -> TaskInterceptor:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
-        config = _make_interceptor_config()
+        # ``project_root`` is now read from the interceptor's own config
+        # (Commit 1 fix); pass it through here when a backfill path needs it.
+        config = _make_interceptor_config(project_root=project_root)
         return TaskInterceptor(
             taskmaster=mock_taskmaster,
             targeted_reconciler=None,
@@ -840,12 +853,12 @@ class TestAutoBackfill:
             ],
         }
         mock_taskmaster = AsyncMock()
-        # Provide project_root so _get_curator() extracts it and calls _maybe_backfill_corpus.
-        mock_taskmaster.config = MagicMock()
-        mock_taskmaster.config.project_root = '/fake/project'
         mock_taskmaster.get_tasks = AsyncMock(return_value=canned_task_tree)
-
-        interceptor = self._make_interceptor(mock_taskmaster)
+        # Project_root now lives on the interceptor's own config — see
+        # Commit 1's curator fix. Wire it through ``_make_interceptor``.
+        interceptor = self._make_interceptor(
+            mock_taskmaster, project_root='/fake/project',
+        )
 
         backfill_called_with: list[tuple] = []
 

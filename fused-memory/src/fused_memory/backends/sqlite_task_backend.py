@@ -296,14 +296,28 @@ class SqliteTaskBackend:
 
     @contextlib.asynccontextmanager
     async def _txn(self, project_root: str):
-        """Explicit transaction wrapper: commit on success, rollback otherwise."""
+        """Explicit transaction wrapper: commit on success, rollback otherwise.
+
+        Cancellation hardening (soak fix):
+
+        * ``commit()`` and ``rollback()`` are wrapped in ``asyncio.shield`` so
+          an outer cancellation arriving mid-flush can't tear the transaction
+          across the wire and leave the connection in a half-committed
+          ``BEGIN`` state.
+
+        * ``contextlib.suppress(BaseException)`` (was ``Exception``) — the
+          previous form let ``CancelledError`` (a ``BaseException``, not an
+          ``Exception``) escape past the rollback, so cancellation-during-
+          rollback could leave the connection mid-transaction *and* take the
+          original exception with it.
+        """
         conn = await self._get_connection(project_root)
         try:
             yield conn
-            await conn.commit()
+            await asyncio.shield(conn.commit())
         except BaseException:
-            with contextlib.suppress(Exception):
-                await conn.rollback()
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(conn.rollback())
             raise
 
     # ── Read helpers ───────────────────────────────────────────────────

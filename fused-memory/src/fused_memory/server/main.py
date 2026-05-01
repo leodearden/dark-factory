@@ -545,6 +545,11 @@ async def run_server():
             scope_violation_escalator=scope_violation_escalator,
         )
         await task_interceptor.start()
+        # Wire the write journal so task writes leave durable audit rows.
+        # ``set_write_journal`` also pushes the journal into the
+        # DualCompareBackend wrapper (when present) so per-physical-side
+        # ``backend_op`` rows accompany the interceptor's combined row.
+        task_interceptor.set_write_journal(write_journal)
 
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
@@ -576,6 +581,7 @@ async def run_server():
             scope_violation_escalator=scope_violation_escalator,
         )
         await task_interceptor.start()
+        task_interceptor.set_write_journal(write_journal)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(

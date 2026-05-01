@@ -67,8 +67,43 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.targeted import TargetedReconciler
+    from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+
+def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
+    """Best-effort clip of a value for journal ``params`` dict storage.
+
+    Strings are truncated; everything else is passed through unchanged
+    so JSON-serialisable structures (ints, lists, etc.) keep their
+    natural shape. The journal layer JSON-encodes the dict; large
+    free-form prompt fields are the dominant size driver, so clipping
+    those is sufficient.
+    """
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + '…'
+    return value
+
+
+def _resolve_backend_label(taskmaster: Any) -> str:
+    """Return a stable journal label for the configured task backend.
+
+    'dual_compare' / 'taskmaster' / 'sqlite_task_backend' / 'unknown' —
+    used as ``backend`` on ``backend_ops`` rows so the post-hoc
+    directional-attribution query (``SELECT backend, success FROM ...``)
+    can split the soak signal by physical backend.
+    """
+    if taskmaster is None:
+        return 'unknown'
+    cls = type(taskmaster).__name__
+    if cls == 'DualCompareBackend':
+        return 'dual_compare'
+    if cls == 'TaskmasterBackend':
+        return 'taskmaster'
+    if cls == 'SqliteTaskBackend':
+        return 'sqlite_task_backend'
+    return cls.lower()
 
 # Terminal statuses the server refuses to exit without a reopen_reason.
 # Duplicated from orchestrator.task_status.TERMINAL_STATUSES — the server
@@ -235,6 +270,111 @@ class TaskInterceptor:
         # and fires a scope_violation escalation alongside any rejection.
         self._prefix_registry = prefix_registry
         self._scope_violation_escalator = scope_violation_escalator
+
+        # Task write-journal (Commit 7): mirrors MemoryService's
+        # ``set_write_journal`` pattern. When wired by the bootstrap, every
+        # mutation logs a ``write_op`` row at the public method top
+        # (regardless of cancellation/failure outcome) and a ``backend_op``
+        # row for the combined dual_compare outcome. ``DualCompareBackend``
+        # owns its own per-physical-side ``backend_op`` rows linked via
+        # ``write_op_id``. Without a journal, the helpers no-op.
+        self._write_journal: WriteJournal | None = None
+
+    def set_write_journal(self, journal: 'WriteJournal') -> None:
+        """Wire the write journal for durable auditing of task writes.
+
+        Bootstrap calls this once at startup. After the call, the public
+        mutation methods emit ``write_op`` + ``backend_op`` rows; before
+        the call (and for tests that don't configure a journal) the
+        instrumentation is a no-op.
+        """
+        self._write_journal = journal
+        # Push the same journal into the dual-compare wrapper (if any) so
+        # it can emit per-physical-backend ``backend_op`` rows alongside
+        # the interceptor-level rows. Use a class-name check rather than
+        # ``hasattr`` because AsyncMock test doubles answer ``True`` to
+        # every ``hasattr`` and would auto-vivify a phantom async method.
+        if (
+            self.taskmaster is not None
+            and type(self.taskmaster).__name__ == 'DualCompareBackend'
+        ):
+            self.taskmaster.set_write_journal(journal)
+
+    async def _journal_around(
+        self,
+        operation: str,
+        project_root: str | None,
+        params: dict[str, Any],
+        body,
+    ) -> Any:
+        """Wrap *body* (an awaitable) with write_op + backend_op journaling.
+
+        Logs a ``write_op`` row before awaiting (so cancelled/failed writes
+        still leave an intent record), publishes the generated id on
+        ``_current_write_op_id`` for downstream backends to link against,
+        and logs a ``backend_op`` row on success or failure with
+        ``backend=`` resolved from the configured task backend.
+
+        No-ops when :meth:`set_write_journal` was never called.
+        """
+        from fused_memory.backends.dual_compare_backend import _current_write_op_id
+
+        ji = self._write_journal
+        write_op_id = str(uuid_mod.uuid4())
+        backend_label = _resolve_backend_label(self.taskmaster)
+        project_id = (
+            resolve_project_id(project_root) if project_root else None
+        )
+        if ji is not None:
+            try:
+                await ji.log_write_op(
+                    write_op_id=write_op_id,
+                    operation=operation,
+                    project_id=project_id,
+                    agent_id='task-interceptor',
+                    params=params,
+                )
+            except Exception:
+                logger.debug('write_journal: log_write_op failed', exc_info=True)
+        token = _current_write_op_id.set(write_op_id)
+        try:
+            result = await body
+        except BaseException as exc:
+            if ji is not None:
+                try:
+                    await ji.log_backend_op(
+                        write_op_id=write_op_id,
+                        backend=backend_label,
+                        operation=operation,
+                        payload=params,
+                        success=False,
+                        error=str(exc)[:500],
+                    )
+                except Exception:
+                    logger.debug(
+                        'write_journal: log_backend_op (error path) failed',
+                        exc_info=True,
+                    )
+            raise
+        finally:
+            _current_write_op_id.reset(token)
+        if ji is not None:
+            try:
+                summary = str(result)[:500] if result is not None else None
+                await ji.log_backend_op(
+                    write_op_id=write_op_id,
+                    backend=backend_label,
+                    operation=operation,
+                    payload=params,
+                    result_summary=summary,
+                    success=True,
+                )
+            except Exception:
+                logger.debug(
+                    'write_journal: log_backend_op (success path) failed',
+                    exc_info=True,
+                )
+        return result
 
     async def _ensure_taskmaster(self) -> TaskBackendProtocol:
         """Return a connected task backend, or raise with a structured error."""
@@ -607,7 +747,12 @@ class TaskInterceptor:
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
             result: dict[str, Any] = dict(
-                await tm.set_task_status(task_id, status, project_root, tag)
+                await self._journal_around(
+                    'set_task_status',
+                    project_root,
+                    {'task_id': task_id, 'status': status, 'tag': tag},
+                    tm.set_task_status(task_id, status, project_root, tag),
+                )
             )
 
         # 5. Emit event
@@ -668,11 +813,18 @@ class TaskInterceptor:
 
             cwd = None
             project_root: str | None = None
-            if self.taskmaster is not None:
-                pr = getattr(self.taskmaster.config, 'project_root', None)
-                if pr:
-                    cwd = _Path(pr)
-                    project_root = str(pr)
+            # Read project_root from our own config — DualCompareBackend (and
+            # any other wrapper) doesn't expose ``.config``, so reaching into
+            # ``self.taskmaster.config`` raises AttributeError that the broad
+            # except below would swallow, silently disabling the curator.
+            pr = (
+                self._config.taskmaster.project_root
+                if self._config and self._config.taskmaster
+                else None
+            )
+            if pr:
+                cwd = _Path(pr)
+                project_root = str(pr)
             self._curator = TaskCurator(
                 config=self._config,
                 taskmaster=self.taskmaster,
@@ -2364,8 +2516,13 @@ class TaskInterceptor:
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
         async with self._write_lock(project_id):
-            result: dict[str, Any] = dict(await tm.update_task(
-                task_id=task_id, project_root=project_root, **kwargs,
+            result: dict[str, Any] = dict(await self._journal_around(
+                'update_task',
+                project_root,
+                {'task_id': task_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
+                tm.update_task(
+                    task_id=task_id, project_root=project_root, **kwargs,
+                ),
             ))
         event = self._make_event(
             EventType.task_modified,
@@ -2494,8 +2651,13 @@ class TaskInterceptor:
         # set_task_status / update_task on the same project see a consistent
         # tasks.json view.
         async with self._write_lock(project_id):
-            result = dict(await tm.add_subtask(
-                parent_id=parent_id, project_root=project_root, **kwargs,
+            result = dict(await self._journal_around(
+                'add_subtask',
+                project_root,
+                {'parent_id': parent_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
+                tm.add_subtask(
+                    parent_id=parent_id, project_root=project_root, **kwargs,
+                ),
             ))
         event = self._make_event(
             EventType.task_created,
@@ -2538,7 +2700,12 @@ class TaskInterceptor:
             self._curator_lock(project_id),
             self._write_lock(project_id),
         ):
-            result = dict(await tm.remove_task(task_id, project_root, tag))
+            result = dict(await self._journal_around(
+                'remove_task',
+                project_root,
+                {'task_id': task_id, 'tag': tag},
+                tm.remove_task(task_id, project_root, tag),
+            ))
         event = self._make_event(
             EventType.task_deleted,
             project_root,
@@ -2561,8 +2728,13 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
         async with self._write_lock(project_id):
-            result = dict(await tm.add_dependency(
-                task_id, depends_on, project_root, tag,
+            result = dict(await self._journal_around(
+                'add_dependency',
+                project_root,
+                {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
+                tm.add_dependency(
+                    task_id, depends_on, project_root, tag,
+                ),
             ))
         event = self._make_event(
             EventType.task_modified,
@@ -2586,8 +2758,13 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
         async with self._write_lock(project_id):
-            result = dict(await tm.remove_dependency(
-                task_id, depends_on, project_root, tag,
+            result = dict(await self._journal_around(
+                'remove_dependency',
+                project_root,
+                {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
+                tm.remove_dependency(
+                    task_id, depends_on, project_root, tag,
+                ),
             ))
         event = self._make_event(
             EventType.task_modified,
