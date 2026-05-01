@@ -83,6 +83,108 @@ class TestHandleAuthFailure:
         assert gate._accounts[0].probe_in_flight is False
 
 
+class TestAuthFailedPersistsResetsAt:
+    """auth_failed event details carry the parsed resets_at when the reason
+    text contains a "resets …" phrase. Source of truth for cap-time parsing
+    is the gate's _parse_resets_at; the dashboard reads what we persist
+    rather than re-parsing the reason string itself.
+    """
+
+    def _capture_fired_details(self, gate: UsageGate) -> list[tuple[str, str, str]]:
+        """Replace gate._fire_cost_event with a sync recorder. Returns the
+        list it appends to so tests can assert on it.
+        """
+        captured: list[tuple[str, str, str]] = []
+
+        def _record(account_name: str, event_type: str, details: str) -> None:
+            captured.append((account_name, event_type, details))
+
+        gate._fire_cost_event = _record  # type: ignore[assignment]
+        # Provide a truthy cost_store so the firing branch executes; the
+        # recorder above bypasses real persistence.
+        gate._cost_store = object()  # type: ignore[assignment]
+        return captured
+
+    def test_persists_resets_at_for_relative_reason(self):
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        gate._handle_auth_failure(
+            "HTTP 429: You're out of extra usage · resets in 3h",
+            oauth_token='fake-token-a',
+        )
+        assert len(captured) == 1
+        _, event_type, details_json = captured[0]
+        assert event_type == 'auth_failed'
+        details = json.loads(details_json)
+        assert 'resets_at' in details
+        # ISO-format string parses; should be ~3h ahead.
+        assert isinstance(details['resets_at'], str)
+        assert details['resets_at'].endswith('+00:00')
+
+    def test_persists_resets_at_for_date_prefixed_reason(self):
+        """Production reason form for multi-day cap windows.
+
+        Regression: prior to the regex widening, the gate's parser
+        silently fell through to the 1-hour fallback for any month name
+        of length ≥ 4. With the fix, "resets May 2, 6pm (Europe/London)"
+        produces a real reset timestamp.
+        """
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        gate._handle_auth_failure(
+            "HTTP 429: You're out of extra usage · resets May 2, 6pm "
+            "(Europe/London)",
+            oauth_token='fake-token-a',
+        )
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'resets_at' in details
+        from datetime import datetime as _dt
+        parsed = _dt.fromisoformat(details['resets_at'])
+        assert parsed.month == 5
+        assert parsed.day == 2
+
+    def test_persists_resets_at_for_full_month_name(self):
+        """Full English month names (e.g. 'June', 'September') parse —
+        not just 3-letter abbreviations.
+        """
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        gate._handle_auth_failure(
+            "HTTP 429: You're out of extra usage · resets September 1, "
+            "6am (UTC)",
+            oauth_token='fake-token-a',
+        )
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'resets_at' in details
+        from datetime import datetime as _dt
+        parsed = _dt.fromisoformat(details['resets_at'])
+        assert parsed.month == 9
+        assert parsed.day == 1
+
+    def test_no_resets_at_for_pure_auth_error(self):
+        """True OAuth-revocation reasons (no "resets" phrase) must NOT
+        synthesize a bogus 1-hour fallback in the persisted details. A
+        blank cell in the dashboard is correct here — there is no reset
+        time for a permanently-revoked token.
+        """
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        gate._handle_auth_failure(
+            'HTTP 403: token has been revoked',
+            oauth_token='fake-token-a',
+        )
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'resets_at' not in details
+        assert details['reason'] == 'HTTP 403: token has been revoked'
+
+
 @pytest.mark.asyncio
 class TestBeforeInvokeSkipsAuthFailed:
 

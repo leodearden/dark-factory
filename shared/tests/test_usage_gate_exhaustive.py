@@ -867,6 +867,32 @@ class TestResetTimeParsing:
         if now.month > 1 or (now.month == 1 and now.day > 1):
             assert result.year >= now.year
 
+    def test_full_month_name(self):
+        """Full month names ("June", "April") parse identically to their
+        3-letter abbreviations ("Jun", "Apr"). Regression: previously
+        [A-Za-z]{3} required exactly 3 characters, silently falling
+        through to the 1-hour fallback for any month with a 4+ char name.
+        """
+        result = _parse_resets_at('resets June 5, 7pm (UTC)')
+        assert result.month == 6
+        assert result.day == 5
+        assert result.hour == 19
+        assert result.minute == 0
+
+    def test_full_month_name_april(self):
+        result = _parse_resets_at('resets April 15, 9:30am (UTC)')
+        assert result.month == 4
+        assert result.day == 15
+        assert result.hour == 9
+        assert result.minute == 30
+
+    def test_full_month_name_september(self):
+        # 9-char month name, the longest English month
+        result = _parse_resets_at('resets September 1, 6am (UTC)')
+        assert result.month == 9
+        assert result.day == 1
+        assert result.hour == 6
+
 
 # =========================================================================
 # TestExtractCapMessage

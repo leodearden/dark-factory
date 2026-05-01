@@ -517,8 +517,16 @@ class UsageGate:
         acct.probing = False
         logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
         if self._cost_store:
+            # In production, HTTP 429 with "out of extra usage" carries a
+            # "resets ..." phrase in the body — parse and persist it so the
+            # dashboard can surface a reset ETA without re-parsing reason
+            # strings downstream. Skip the 1h fallback when there's no
+            # "resets" hint at all (true 401/403 token revocation).
+            details: dict[str, str] = {'reason': reason}
+            if 'resets' in reason.lower():
+                details['resets_at'] = _parse_resets_at(reason).isoformat()
             self._fire_cost_event(
-                acct.name, 'auth_failed', json.dumps({'reason': reason}),
+                acct.name, 'auth_failed', json.dumps(details),
             )
         self._start_auth_reprobe(acct)
 
@@ -1140,16 +1148,20 @@ def _parse_resets_at(text: str) -> datetime:
         }.get(unit, timedelta(hours=1))
         return datetime.now(UTC) + delta
 
-    # Absolute with date: "resets Mar 30, 6pm (Europe/London)"
+    # Absolute with date: "resets Mar 30, 6pm (Europe/London)" or
+    # "resets June 5, 7pm (Europe/London)". Month accepts 3-9 chars
+    # (any abbreviation through full name) and is matched against
+    # _MONTH_ABBR by its lowercased first three characters, since every
+    # English month is uniquely identified by them.
     m = re.search(
-        r'resets\s+([A-Za-z]{3})\s+(\d{1,2}),?\s+'
+        r'resets\s+([A-Za-z]{3,9})\s+(\d{1,2}),?\s+'
         r'(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
         text, re.IGNORECASE,
     )
     if m:
         try:
             import zoneinfo
-            month_str = m.group(1).lower()
+            month_str = m.group(1).lower()[:3]
             day = int(m.group(2))
             time_str = m.group(3).strip()
             tz_str = m.group(4).strip()
