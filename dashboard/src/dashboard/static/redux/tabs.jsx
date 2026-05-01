@@ -106,20 +106,21 @@ function shortPath(p) {
 function DepChip({ dep }) {
   return (
     <span className={`chip ${dep.done ? 'dep-done' : 'dep-pending'}`} title={`${dep.id}: ${dep.title}${dep.done ? ' (complete)' : ' (incomplete)'}`}>
-      {dep.id}
+      {window.DF_SHELL.taskId(dep.id)}
     </span>
   );
 }
 
 function LockChip({ path, holder, currentTaskId }) {
   let cls, hint;
+  const holderDisplay = window.DF_SHELL.taskId(holder);
   if (!holder) { cls = 'lock-free'; hint = 'available'; }
   else if (holder === currentTaskId) { cls = 'lock-mine'; hint = 'held by this task'; }
-  else { cls = 'lock-taken'; hint = `held by ${holder}`; }
+  else { cls = 'lock-taken'; hint = `held by ${holderDisplay}`; }
   return (
     <span className={`chip ${cls}`} title={`${path} · ${hint}`}>
       {shortPath(path)}
-      {cls === 'lock-taken' && <span className="holder">⊘ {holder}</span>}
+      {cls === 'lock-taken' && <span className="holder">⊘ {holderDisplay}</span>}
     </span>
   );
 }
@@ -244,7 +245,7 @@ function OrchTab({ projectFilter, search }) {
 
                   <table className="tbl" style={{ marginTop: 4, tableLayout: 'fixed', width: '100%' }}>
                     <colgroup>
-                      <col style={{ width: 56 }} />
+                      <col style={{ width: 80 }} />
                       <col />
                       <col style={{ width: 130 }} />
                       <col style={{ width: 60 }} />
@@ -268,7 +269,7 @@ function OrchTab({ projectFilter, search }) {
                         const isPending = t.status === 'pending';
                         return (
                           <tr key={t.id}>
-                            <td className="mono" style={{ color: 'var(--fg-1)' }}>{t.id}</td>
+                            <td className="mono" style={{ color: 'var(--fg-1)', whiteSpace: 'nowrap' }}>{window.DF_SHELL.taskId(t.id)}</td>
                             <td style={{ color: isDone ? 'var(--fg-2)' : 'var(--fg-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.title}>{t.title}</td>
                             <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.agent || '—'}</td>
                             <td className="num">{t.loops}</td>
@@ -313,7 +314,8 @@ function OrchTab({ projectFilter, search }) {
                     <div style={{ fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>Completed / day · 30d</div>
                     {(() => {
                       const pb = DF.BURNDOWN_BY_PROJECT[o.project];
-                      return <div style={{ height: 50 }}><SP values={pb?.done || []} color={CP.accent} /></div>;
+                      const rates = window.DF_SHELL.dailyDeltas(pb?.labels, pb?.done);
+                      return <div style={{ height: 50 }}><SP values={rates} color={CP.accent} /></div>;
                     })()}
                   </div>
                 </div>

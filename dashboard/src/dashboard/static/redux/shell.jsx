@@ -4,6 +4,36 @@ const SP_SHELL = window.DF_CHARTS.Sparkline;
 const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
 const SHELL_AGENTS = window.DF_DATA.AGENTS;
 
+// Strip the "T-" prefix from a task identifier so the bare numeric portion shows.
+// Accepts plain ids ("T-19") and project-scoped uids ("dark_factory/T-19").
+function taskId(id) {
+  return id == null ? '' : String(id).replace(/T-/g, '');
+}
+
+// Convert a series of cumulative-state snapshots into per-day deltas.
+// `labels` are ISO timestamps (ascending); `values` are the cumulative count
+// at each timestamp. Buckets by date prefix and returns the day-to-day diff,
+// floored at 0. Length is (#distinct days - 1); empty for sparse history.
+function dailyDeltas(labels, values) {
+  if (!labels || !values || labels.length === 0 || values.length === 0) return [];
+  const byDay = {};
+  const order = [];
+  const n = Math.min(labels.length, values.length);
+  for (let i = 0; i < n; i++) {
+    const lbl = labels[i];
+    const day = (typeof lbl === 'string' && lbl.length >= 10) ? lbl.slice(0, 10) : null;
+    if (!day) continue;
+    if (!(day in byDay)) order.push(day);
+    byDay[day] = values[i];
+  }
+  order.sort();
+  const out = [];
+  for (let i = 1; i < order.length; i++) {
+    out.push(Math.max(0, (byDay[order[i]] || 0) - (byDay[order[i - 1]] || 0)));
+  }
+  return out;
+}
+
 // Format a UTC ISO8601 timestamp as a relative string ("now", "12s", "4m", "2h", "1d").
 // Returns "—" for null/undefined/unparseable input.
 function timeago(iso) {
@@ -199,7 +229,7 @@ function buildFeedEntries(D) {
         key: `merge:${pid}:${m.task_id}:${m.timestamp}`,
         iso: m.timestamp,
         src: 'merge',
-        msg: `${pid} · T-${m.task_id} · ${m.outcome} · ${dur}`,
+        msg: `${pid} · ${m.task_id} · ${m.outcome} · ${dur}`,
       });
     }
     for (const a of (mq.active || [])) {
@@ -208,7 +238,7 @@ function buildFeedEntries(D) {
         key: `mq-active:${pid}:${a.task_id}:${a.timestamp}`,
         iso: a.timestamp,
         src: 'queue',
-        msg: `${pid} · T-${a.task_id} ${a.state} · ${a.branch || ''}`.trim(),
+        msg: `${pid} · ${a.task_id} ${a.state} · ${a.branch || ''}`.trim(),
       });
     }
   }
@@ -338,4 +368,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, taskId, dailyDeltas };

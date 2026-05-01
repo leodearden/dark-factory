@@ -46,7 +46,7 @@ def test_shape_orchestrators_picks_execute_phase_for_current_task():
         },
     }]
     body = redux_api.shape_orchestrators(raw)
-    assert body['ORCHESTRATORS'][0]['current_task'] == 'T-9: doing-this'
+    assert body['ORCHESTRATORS'][0]['current_task'] == '9: doing-this'
 
 
 def test_shape_orchestrators_marks_inactive_known_projects():

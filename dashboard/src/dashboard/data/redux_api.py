@@ -43,7 +43,7 @@ def _current_task_for_orchestrator(orchestrator: Mapping[str, Any]) -> str:
         tid = meta.get('task_id')
         title = meta.get('title') or ''
         if tid is not None:
-            return f'T-{tid}: {title}' if title else f'T-{tid}'
+            return f'{tid}: {title}' if title else f'{tid}'
         return title or '—'
 
     for desired in ('EXECUTE', 'PLAN'):
