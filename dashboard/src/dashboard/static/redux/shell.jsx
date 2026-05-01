@@ -403,4 +403,4 @@ function Segmented({ options, value, onChange }) {
   );
 }
 
-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, taskId, dailyDeltas };
+window.DF_SHELL = { Glyph, StatStrip, ChipGroup, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, scrubIsos, taskId, dailyDeltas };
