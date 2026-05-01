@@ -226,7 +226,8 @@ class UsageGate:
 
         self._probe_config_dir = TaskConfigDir('usage-gate-probe')
         self._accounts: list[AccountState] = self._init_accounts()
-        self._register_sighup_handler()
+        self._sighup_handler_installed: bool = False
+        self.register_signal_handlers()
 
     def _init_accounts(self) -> list[AccountState]:
         """Resolve account tokens from env vars.
@@ -614,23 +615,37 @@ class UsageGate:
                 return cfg.oauth_token_env
         return None
 
-    def _register_sighup_handler(self) -> None:
-        """Install a SIGHUP handler that triggers an immediate auth re-probe.
+    def register_signal_handlers(self) -> None:
+        """Install a SIGHUP handler that triggers a token-reload + reprobe.
+
+        Idempotent: safe to call multiple times. Tracks installation via
+        ``self._sighup_handler_installed`` so a second call is a no-op.
 
         Uses ``loop.add_signal_handler`` to avoid the pitfalls of
         ``signal.signal`` inside asyncio (interrupting asyncio internals at
-        arbitrary bytecode). No-op when no event loop is running (typical
-        in unit tests that construct the gate outside of run_until_complete).
+        arbitrary bytecode). When no event loop is running (e.g. when the
+        gate is constructed before ``asyncio.run()``), this returns silently
+        with a debug breadcrumb; callers that need the handler must invoke
+        this method again from inside the loop.
         """
+        if self._sighup_handler_installed:
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            logger.debug(
+                'SIGHUP handler deferred: no running event loop at __init__; '
+                'callers must invoke register_signal_handlers() inside the loop',
+            )
             return
         try:
             loop.add_signal_handler(signal.SIGHUP, self._on_sighup)
         except (NotImplementedError, ValueError):
             # NotImplementedError: Windows. ValueError: not main thread.
             logger.debug('SIGHUP handler not installed (unsupported on this platform/thread)')
+            return
+        self._sighup_handler_installed = True
+        logger.info('SIGHUP handler installed for usage gate token reload')
 
     def _on_sighup(self) -> None:
         """Signal-handler entry point — schedules the async reprobe trigger."""
@@ -646,17 +661,50 @@ class UsageGate:
         task.add_done_callback(self._background_tasks.discard)
 
     async def _on_sighup_async(self) -> None:
-        """Re-probe all auth_failed accounts immediately."""
+        """Reload tokens + reset cap/auth state for ALL accounts, then probe.
+
+        Treats SIGHUP as an operator-driven "refresh everything" signal:
+        - reload .env (override existing env vars)
+        - cancel any in-flight resume / auth-reprobe tasks
+        - refresh each account's token from its env var if it changed
+        - clear capped / auth_failed / probing state so every account is
+          probe-worthy
+        - reopen the global gate
+        - fire a probe per account in parallel
+
+        ``cumulative_cost`` is intentionally NOT reset — it is a budget
+        counter, unrelated to token state.
+        """
         load_dotenv(override=True)
-        failing = [a for a in self._accounts if a.auth_failed]
-        if not failing:
-            logger.info('SIGHUP received but no auth_failed accounts — no-op')
-            return
+        for acct in self._accounts:
+            if acct.resume_task is not None and not acct.resume_task.done():
+                acct.resume_task.cancel()
+            if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
+                acct.auth_reprobe_task.cancel()
+            token_env = self._token_env_for(acct)
+            if token_env:
+                fresh = os.environ.get(token_env)
+                if fresh and fresh != acct.token:
+                    logger.info(
+                        f'SIGHUP: account {acct.name} env token changed — refreshing'
+                    )
+                    acct.token = fresh
+            acct.capped = False
+            acct.resets_at = None
+            acct.pause_started_at = None
+            acct.auth_failed = False
+            acct.auth_failed_at = None
+            acct.near_cap = False
+            acct.probing = False
+            acct.probe_in_flight = False
+            acct.probe_count = 0
+        self._open.set()
+        self._paused_reason = ''
         logger.info(
-            f'SIGHUP: re-probing {len(failing)} auth_failed account(s)'
+            f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes'
         )
         await asyncio.gather(
-            *(self._reprobe_account(a) for a in failing),
+            *(self._reprobe_account(a) for a in self._accounts),
             return_exceptions=True,
         )
 

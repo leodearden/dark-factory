@@ -274,9 +274,9 @@ class TestAuthReprobeReReadsEnv:
 
 @pytest.mark.asyncio
 class TestSighupTriggersReprobe:
-    """SIGHUP handler triggers an immediate re-probe of all auth_failed accounts."""
+    """SIGHUP handler reloads tokens and probes ALL accounts (not just auth_failed)."""
 
-    async def test_sighup_handler_reprobes_auth_failed(self):
+    async def test_sighup_handler_reprobes_every_account(self):
         gate = _make_gate(['a', 'b'])
         gate._accounts[0].auth_failed = True
         gate._accounts[0].auth_failed_at = datetime.now(UTC)
@@ -285,19 +285,133 @@ class TestSighupTriggersReprobe:
         with patch('shared.usage_gate.load_dotenv'):
             await gate._on_sighup_async()
 
-        # Account a was re-probed and uncapped
+        # Both accounts probed; auth_failed cleared on the failing one.
+        assert gate._run_probe.await_count == 2
         assert gate._accounts[0].auth_failed is False
-        # Account b never auth_failed; should remain untouched
         assert gate._accounts[1].auth_failed is False
 
-    async def test_sighup_noop_when_no_auth_failed(self):
+    async def test_sighup_probes_even_when_no_auth_failed(self):
         gate = _make_gate(['a'])
         gate._run_probe = AsyncMock(return_value=True)
-        with patch('shared.usage_gate.load_dotenv') as mock_load:
+        with patch('shared.usage_gate.load_dotenv'):
             await gate._on_sighup_async()
-        # Nothing to reprobe: load_dotenv still called once to refresh env,
-        # but no probes fire.
-        gate._run_probe.assert_not_called()
-        # load_dotenv may or may not be called; implementation-dependent.
-        # We don't assert on it either way.
-        _ = mock_load
+        # New semantics: SIGHUP always probes every account.
+        gate._run_probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestSighupClearsAllBlockedState:
+    """SIGHUP must put every account back in a probe-worthy state."""
+
+    async def test_sighup_clears_capped_state(self):
+        gate = _make_gate(['a'])
+        gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = datetime.now(UTC)
+        gate._accounts[0].pause_started_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with patch('shared.usage_gate.load_dotenv'):
+            await gate._on_sighup_async()
+
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[0].resets_at is None
+        assert gate._accounts[0].pause_started_at is None
+        gate._run_probe.assert_awaited_once()
+
+    async def test_sighup_refreshes_token_from_env(self):
+        env_var = 'TEST_AUTH_TOKEN_A'
+        with patch.dict(os.environ, {env_var: 'old-token'}):
+            config = UsageCapConfig(
+                accounts=[AccountConfig(name='a', oauth_token_env=env_var)],
+                wait_for_reset=False,
+                auth_reprobe_secs=0,
+            )
+            gate = UsageGate(config)
+        gate._run_probe = AsyncMock(return_value=True)
+        assert gate._accounts[0].token == 'old-token'
+
+        with (
+            patch('shared.usage_gate.load_dotenv'),
+            patch.dict(os.environ, {env_var: 'new-token'}, clear=False),
+        ):
+            await gate._on_sighup_async()
+
+        assert gate._accounts[0].token == 'new-token'
+
+    async def test_sighup_reopens_global_gate(self):
+        gate = _make_gate(['a', 'b'])
+        gate._open.clear()
+        gate._accounts[0].capped = True
+        gate._accounts[1].capped = True
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with patch('shared.usage_gate.load_dotenv'):
+            await gate._on_sighup_async()
+
+        assert gate._open.is_set() is True
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
+    async def test_sighup_clears_probe_lifecycle_state(self):
+        gate = _make_gate(['a'])
+        gate._accounts[0].probing = True
+        gate._accounts[0].probe_in_flight = True
+        gate._accounts[0].probe_count = 5
+        gate._accounts[0].near_cap = True
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with patch('shared.usage_gate.load_dotenv'):
+            await gate._on_sighup_async()
+
+        assert gate._accounts[0].probing is False
+        assert gate._accounts[0].probe_in_flight is False
+        assert gate._accounts[0].probe_count == 0
+        assert gate._accounts[0].near_cap is False
+
+    async def test_sighup_preserves_cumulative_cost(self):
+        """cumulative_cost is a budget counter — SIGHUP must not reset it."""
+        gate = _make_gate(['a'])
+        gate._cumulative_cost = 12.34
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with patch('shared.usage_gate.load_dotenv'):
+            await gate._on_sighup_async()
+
+        assert gate._cumulative_cost == 12.34
+
+    async def test_sighup_cancels_in_flight_resume_tasks(self):
+        gate = _make_gate(['a'])
+        gate._run_probe = AsyncMock(return_value=True)
+
+        async def _hang():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise
+
+        resume_task = asyncio.create_task(_hang())
+        reprobe_task = asyncio.create_task(_hang())
+        gate._accounts[0].resume_task = resume_task
+        gate._accounts[0].auth_reprobe_task = reprobe_task
+
+        with patch('shared.usage_gate.load_dotenv'):
+            await gate._on_sighup_async()
+
+        # Allow the cancelled tasks to settle.
+        await asyncio.sleep(0)
+        assert resume_task.cancelled() or resume_task.done()
+        assert reprobe_task.cancelled() or reprobe_task.done()
+
+
+@pytest.mark.asyncio
+class TestRegisterSignalHandlersIdempotent:
+    """register_signal_handlers must be safe to call multiple times."""
+
+    async def test_idempotent_double_registration(self):
+        gate = _make_gate(['a'])
+        # First call: should install (we're inside an asyncio test loop).
+        gate.register_signal_handlers()
+        assert gate._sighup_handler_installed is True
+        # Second call: must be a no-op, no exception.
+        gate.register_signal_handlers()
+        assert gate._sighup_handler_installed is True
