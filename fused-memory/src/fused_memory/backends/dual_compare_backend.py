@@ -73,6 +73,13 @@ class DualCompareBackend:
     def restart_count(self) -> int:
         return self.primary.restart_count
 
+    @property
+    def config(self) -> Any:
+        # Belt-and-braces: any caller that still does
+        # ``backend.config.project_root`` on the wrapper now gets the
+        # primary's config instead of AttributeError.
+        return getattr(self.primary, 'config', None)
+
     async def start(self) -> None:
         await self.primary.start()
         try:

@@ -668,11 +668,18 @@ class TaskInterceptor:
 
             cwd = None
             project_root: str | None = None
-            if self.taskmaster is not None:
-                pr = getattr(self.taskmaster.config, 'project_root', None)
-                if pr:
-                    cwd = _Path(pr)
-                    project_root = str(pr)
+            # Read project_root from our own config — DualCompareBackend (and
+            # any other wrapper) doesn't expose ``.config``, so reaching into
+            # ``self.taskmaster.config`` raises AttributeError that the broad
+            # except below would swallow, silently disabling the curator.
+            pr = (
+                self._config.taskmaster.project_root
+                if self._config and self._config.taskmaster
+                else None
+            )
+            if pr:
+                cwd = _Path(pr)
+                project_root = str(pr)
             self._curator = TaskCurator(
                 config=self._config,
                 taskmaster=self.taskmaster,

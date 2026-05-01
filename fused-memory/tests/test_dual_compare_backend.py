@@ -153,3 +153,14 @@ async def test_primary_label_routes_via_dual_compare_primary(tmp_path):
     # is what callers see.
     assert out['id'] == '999'
     await primary.close()
+
+
+@pytest.mark.asyncio
+async def test_config_property_proxies_to_primary(primary, project_root):
+    """``wrapper.config`` proxies primary's config so callers that still
+    reach into ``backend.config`` (rather than carrying their own) keep
+    working — closes the AttributeError silent-disable hole that kept the
+    curator off the entire soak."""
+    secondary = _stub_backend()
+    wrapper = DualCompareBackend(primary, secondary)
+    assert wrapper.config is primary.config
