@@ -119,7 +119,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   );
 }
 
-function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(v) }) {
+function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(v), formatX = v => v }) {
   // stacks: [{ key, color, values }]
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -161,7 +161,7 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
         {labels.map((lab, i) => {
           if (n > 8 && i % Math.ceil(n / 6) !== 0 && i !== n - 1) return null;
           const x = padL + i * stepX;
-          return <text key={i} x={x} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{lab}</text>;
+          return <text key={i} x={x} y={height - 6} fontSize="9" fill={PALETTE.fg3} textAnchor="middle" fontFamily="JetBrains Mono">{formatX(lab)}</text>;
         })}
         {stacks.map((st, li) => {
           const top = cumLayers[li];

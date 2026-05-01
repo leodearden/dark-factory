@@ -510,6 +510,7 @@ function PerfTab({ projectFilter }) {
                             ]}
                             height={70}
                             formatY={fmtMs}
+                            formatX={window.DF_SHELL.fmtDateTime}
                           />
                         </div>
                       );
@@ -574,7 +575,7 @@ function MemoryTab({ projectFilter }) {
             <LC labels={ts.labels} series={[
               { values: ts.reads, color: CP.accent },
               { values: ts.writes, color: CP.ok },
-            ]} height={240} />
+            ]} height={240} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       </div>
@@ -844,7 +845,7 @@ function MergeTab({ projectFilter }) {
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
                   <div className="panel-head"><span className="title">Merge attempts · 15-min buckets</span></div>
-                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} /></div>
+                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatX={window.DF_SHELL.fmtDateTime} /></div>
                 </div>
 
                 <div className="col-span-5 panel">
@@ -892,7 +893,7 @@ function MergeTab({ projectFilter }) {
                               <td>{row.title}</td>
                               <td><span className={`badge ${row.state === 'in_flight' ? 'warn' : 'info'}`}>{row.state}</span></td>
                               <td className="mono" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{row.branch}</td>
-                              <td className="num" style={{ color: 'var(--fg-3)' }}>{row.timestamp}</td>
+                              <td className="num" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.fmtDateTime(row.timestamp)}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -912,7 +913,7 @@ function MergeTab({ projectFilter }) {
                             <td>{row.title}</td>
                             <td><span className={`badge ${row.outcome === 'done' ? 'ok' : row.outcome === 'conflict' ? 'warn' : row.outcome === 'blocked' ? 'bad' : 'info'}`}>{row.outcome}</span></td>
                             <td className="num">{fmtMs(row.duration_ms)}</td>
-                            <td className="num" style={{ color: 'var(--fg-3)' }}>{row.timestamp}</td>
+                            <td className="num" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.fmtDateTime(row.timestamp)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -980,7 +981,7 @@ function CostsTab({ projectFilter }) {
               <div key={a.account} style={{ display: 'grid', gridTemplateColumns: '8px 1fr auto auto', gap: 6, alignItems: 'center', fontSize: 11 }}>
                 <span style={{ width: 8, height: 8, background: [CP.accent, CP.warn, CP.ok, CP.info][i % 4], borderRadius: 2 }}></span>
                 <span className="mono" style={{ color: 'var(--fg-1)' }}>{a.account}</span>
-                <span className={`badge ${a.status === 'capped' ? 'warn' : 'muted'}`} style={{ fontSize: 9 }}>{a.status === 'capped' ? a.resets_at : a.status}</span>
+                <span className={`badge ${a.status === 'capped' ? 'warn' : 'muted'}`} style={{ fontSize: 9 }}>{a.status === 'capped' ? window.DF_SHELL.fmtDateTime(a.resets_at) : a.status}</span>
                 <span className="mono" style={{ color: 'var(--fg-1)' }}>${a.total.toFixed(2)}</span>
               </div>
             ))}
@@ -1117,7 +1118,7 @@ function BurnTab({ projectFilter }) {
               { key: 'in_progress', color: CP.accent, values: b.in_progress },
               { key: 'blocked',     color: CP.bad,    values: b.blocked },
               { key: 'pending',     color: CP.warn,   values: b.pending },
-            ]} height={300} />
+            ]} height={300} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       )}
@@ -1186,7 +1187,7 @@ function BurnTab({ projectFilter }) {
                       { key: 'in_progress', color: CP.accent, values: pb.in_progress },
                       { key: 'blocked',     color: CP.bad,    values: pb.blocked },
                       { key: 'pending',     color: CP.warn,   values: pb.pending },
-                    ]} height={220} />
+                    ]} height={220} formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>
 
