@@ -62,6 +62,10 @@ class DualCompareBackend:
         self.primary_label = primary_label
         self.secondary_label = secondary_label
         self.divergence_count = 0
+        # Counter incremented when the secondary's ``ensure_connected`` raises;
+        # primary's failure still propagates (preserves the existing contract
+        # that the wrapper is transparent on the primary's hot path).
+        self.secondary_health_failures = 0
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -94,7 +98,20 @@ class DualCompareBackend:
         await self.start()
 
     async def ensure_connected(self) -> None:
-        await self.primary.ensure_connected()
+        # Mirror the start() pattern: poke both sides so a silently-broken
+        # secondary connection can't keep limping unobserved across the
+        # whole soak. Primary failures still propagate (callers depend on
+        # this); secondary failures are logged and counted only.
+        p_task = asyncio.ensure_future(self.primary.ensure_connected())
+        s_task = asyncio.ensure_future(self.secondary.ensure_connected())
+        p_res, s_res = await asyncio.gather(p_task, s_task, return_exceptions=True)
+        if isinstance(p_res, BaseException):
+            raise p_res
+        if isinstance(s_res, BaseException):
+            self.secondary_health_failures += 1
+            logger.warning(
+                'dual_compare: secondary.ensure_connected failed: %s', s_res,
+            )
 
     async def close(self) -> None:
         await self.primary.close()

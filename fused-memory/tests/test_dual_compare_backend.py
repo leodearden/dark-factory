@@ -164,3 +164,41 @@ async def test_config_property_proxies_to_primary(primary, project_root):
     secondary = _stub_backend()
     wrapper = DualCompareBackend(primary, secondary)
     assert wrapper.config is primary.config
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_pokes_both_sides(primary, caplog):
+    """``ensure_connected`` must drive *both* backends so a silently-broken
+    secondary connection surfaces as a counter increment + warning log
+    rather than going unobserved."""
+    secondary = _stub_backend()
+    secondary.ensure_connected = AsyncMock(
+        side_effect=RuntimeError('secondary down'),
+    )
+    wrapper = DualCompareBackend(primary, secondary)
+
+    with caplog.at_level('WARNING'):
+        # Primary still succeeds → no exception propagates.
+        await wrapper.ensure_connected()
+
+    secondary.ensure_connected.assert_awaited_once()
+    assert wrapper.secondary_health_failures == 1
+    assert any(
+        'secondary.ensure_connected failed' in m for m in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_propagates_primary_failure(caplog):
+    """A primary failure must still surface — secondary's outcome is
+    incidental on the failure path."""
+    primary = _stub_backend()
+    primary.ensure_connected = AsyncMock(
+        side_effect=RuntimeError('primary down'),
+    )
+    secondary = _stub_backend()
+    wrapper = DualCompareBackend(primary, secondary)
+
+    with pytest.raises(RuntimeError, match='primary down'):
+        await wrapper.ensure_connected()
+    assert wrapper.secondary_health_failures == 0
