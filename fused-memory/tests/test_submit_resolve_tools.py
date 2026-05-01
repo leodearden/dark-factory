@@ -103,11 +103,18 @@ async def test_resolve_ticket_mcp_tool_signature_and_forwarding(mcp_server, task
 
 @pytest.mark.asyncio
 async def test_resolve_ticket_mcp_tool_rejects_non_prefixed_id(mcp_server, task_interceptor):
-    """resolve_ticket MCP tool returns ValidationError for non-tkt_ prefixed input."""
+    """resolve_ticket MCP tool returns ValidationError for inputs that are
+    neither ``tkt_…`` tickets nor numeric task ids.
+
+    Numeric inputs (``'42'``, ``42``) are intentionally short-circuited as
+    ``idempotent_passthrough`` since planning_mode landed — see
+    test_task_tools.py for that coverage. This test pins the rejection
+    path for everything else.
+    """
     result = await mcp_server._tool_manager.call_tool(
         'resolve_ticket',
         {
-            'ticket': '42',
+            'ticket': 'not-a-ticket',
             'project_root': '/project',
         },
     )

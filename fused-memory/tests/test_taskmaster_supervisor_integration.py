@@ -101,6 +101,7 @@ def _find_node_child(parent_pid: int) -> psutil.Process | None:
 
 
 @requires_taskmaster
+@pytest.mark.timeout(180)
 @pytest.mark.asyncio
 async def test_supervisor_reconnects_after_node_kill(config: TaskmasterConfig) -> None:
     """SIGKILL the Taskmaster Node child; supervisor must reopen the
@@ -109,6 +110,11 @@ async def test_supervisor_reconnects_after_node_kill(config: TaskmasterConfig) -
     This is the kill-drill that demonstrates the supervisor pattern works
     on the real cascade trigger — anyio fires the cancel scope when the
     stdio read pipe goes EOF after the child dies.
+
+    Real-time budget: 20s startup + 10s failure-detect + 30s respawn
+    routinely exceeds the 60s default under -n auto load, and a default
+    timeout fires `os._exit(1)` (thread method) which crashes the
+    xdist worker and can deadlock the controller near end-of-suite.
     """
     backend = TaskmasterBackend(
         config,
@@ -116,56 +122,61 @@ async def test_supervisor_reconnects_after_node_kill(config: TaskmasterConfig) -
         startup_timeout_seconds=20.0,
         session_ready_timeout_seconds=20.0,
     )
-    await backend.start()
-    assert backend.connected, 'first session did not come up'
-    assert backend.restart_count == 1
+    try:
+        await backend.start()
+        assert backend.connected, 'first session did not come up'
+        assert backend.restart_count == 1
 
-    # Sanity probe — the proxy responds to get_tasks.
-    result = await backend.call_tool('get_tasks', {'projectRoot': config.project_root})
-    assert isinstance(result, dict)
+        # Sanity probe — the proxy responds to get_tasks.
+        result = await backend.call_tool('get_tasks', {'projectRoot': config.project_root})
+        assert isinstance(result, dict)
 
-    # Locate and kill the Node child.
-    child = _find_node_child(os.getpid())
-    assert child is not None, 'could not find Taskmaster Node child'
-    child_pid = child.pid
-    os.kill(child_pid, signal.SIGKILL)
+        # Locate and kill the Node child.
+        child = _find_node_child(os.getpid())
+        assert child is not None, 'could not find Taskmaster Node child'
+        child_pid = child.pid
+        os.kill(child_pid, signal.SIGKILL)
 
-    # Try a call_tool — this should fail with a transport-dead exception
-    # once the supervisor / MCP read loop notices the dead pipe. Some
-    # transports detect EOF on the next attempt to write, others surface
-    # it asynchronously via the read loop. Either way the error must
-    # propagate without crashing the test process.
-    failed = False
-    deadline = asyncio.get_running_loop().time() + 10.0
-    while asyncio.get_running_loop().time() < deadline:
-        try:
-            await backend.call_tool('get_tasks', {'projectRoot': config.project_root})
-        except Exception:
-            failed = True
-            break
-        await asyncio.sleep(0.2)
-    assert failed, 'call_tool against killed Node child must surface an error'
+        # Wait for the supervisor to detect the cascade and respawn the
+        # session.  This is the real assertion for the kill-drill: the
+        # restart_count counter only advances on a successful re-open.
+        #
+        # Note: call_tool now defensively retries across the respawn boundary
+        # (taskmaster_client.call_tool, retry budget = 2 + backoffs 0.1s/0.5s),
+        # so a SIGKILL no longer surfaces as a caller-visible error — the
+        # retry transparently recovers once the supervisor reopens. Driving
+        # traffic in this loop nudges the supervisor (call_tool sets
+        # ``_respawn_event`` on transport-dead) without expecting failures.
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while asyncio.get_running_loop().time() < deadline:
+            if backend.restart_count >= 2 and backend.connected:
+                break
+            try:
+                await backend.call_tool(
+                    'get_tasks', {'projectRoot': config.project_root},
+                )
+            except Exception:
+                # Retry budget can still be exhausted under load; either
+                # outcome is fine — restart_count is the signal we await.
+                pass
+            await asyncio.sleep(0.5)
+        assert backend.restart_count >= 2, (
+            f'supervisor did not respawn (restart_count={backend.restart_count})'
+        )
+        assert backend.connected, 'session not ready after respawn'
 
-    # Wait for the supervisor to detect the cascade and respawn the session.
-    deadline = asyncio.get_running_loop().time() + 30.0
-    while asyncio.get_running_loop().time() < deadline:
-        if backend.restart_count >= 2 and backend.connected:
-            break
-        await asyncio.sleep(0.5)
-    assert backend.restart_count >= 2, (
-        f'supervisor did not respawn (restart_count={backend.restart_count})'
-    )
-    assert backend.connected, 'session not ready after respawn'
+        # Verify the new child is *different* from the killed one.
+        new_child = _find_node_child(os.getpid())
+        assert new_child is not None, 'no Node child after respawn'
+        assert new_child.pid != child_pid, 'expected a new Node PID after kill'
 
-    # Verify the new child is *different* from the killed one.
-    new_child = _find_node_child(os.getpid())
-    assert new_child is not None, 'no Node child after respawn'
-    assert new_child.pid != child_pid, 'expected a new Node PID after kill'
-
-    # And calls still work.
-    result = await backend.call_tool('get_tasks', {'projectRoot': config.project_root})
-    assert isinstance(result, dict)
-
-    await backend.close()
+        # And calls still work.
+        result = await backend.call_tool('get_tasks', {'projectRoot': config.project_root})
+        assert isinstance(result, dict)
+    finally:
+        # Always shut down the supervisor + Node child, even on assertion
+        # failure — otherwise the leaked subprocess wedges the worker and
+        # the leaked supervisor task wedges the asyncio loop teardown.
+        await backend.close()
     # The respawned Node child should also be gone.
     assert _find_node_child(os.getpid()) is None
