@@ -749,51 +749,23 @@ class TestCostByAccount:
         assert ta['resets_at'] == reset_iso
 
     @pytest.mark.asyncio
-    async def test_resets_at_none_for_legacy_details(self, tmp_path):
-        """Legacy cap_hit rows with an unparseable reason expose resets_at=None.
+    async def test_resets_at_none_when_not_persisted(self, tmp_path):
+        """Event rows without a persisted resets_at field expose resets_at=None.
 
-        The transitional fallback (removes on 2026-04-28) only recognises
-        specific time-wording formats; a bare "hit your limit" has nothing to
-        extract and should not synthesize a bogus countdown.
+        The dashboard surfaces only what the gate persisted; reason-text
+        regex parsing was removed in favour of a single source of truth in
+        ``shared.usage_gate._parse_resets_at`` (called at the write site).
+        Older rows pre-dating the persistence convention render as a blank
+        cell — accepted in exchange for not duplicating parser logic.
         """
-        db_path = tmp_path / 'legacy_details.db'
+        db_path = tmp_path / 'no_persisted.db'
         conn = sqlite3.connect(str(db_path))
         conn.executescript(COSTS_SCHEMA)
 
         now = datetime.now(UTC)
         cap_ts = (now - timedelta(hours=1)).isoformat()
-        # Legacy shape: only reason, no resets_at, no parseable time info
-        legacy_details = '{"reason": "You\'ve hit your limit"}'
-
-        conn.execute(
-            'INSERT INTO account_events '
-            '(account_name, event_type, project_id, run_id, details, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?)',
-            ('test-acc', 'cap_hit', 'proj', 'r1', legacy_details, cap_ts),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as aconn:
-            aconn.row_factory = aiosqlite.Row
-            result = await get_cost_by_account(aconn)
-
-        ta = result['test-acc']
-        assert ta['status'] == 'capped'
-        assert ta['resets_at'] is None
-
-    @pytest.mark.asyncio
-    async def test_resets_at_fallback_parses_relative(self, tmp_path):
-        """Transitional fallback parses 'resets in Xh' from legacy rows.
-
-        Remove this test with the fallback on 2026-04-28.
-        """
-        db_path = tmp_path / 'fallback_relative.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(COSTS_SCHEMA)
-
-        now = datetime.now(UTC)
-        cap_ts = (now - timedelta(minutes=1)).isoformat()
+        # No resets_at field, even though the reason text contains a parseable
+        # "resets in 3h" — the dashboard must NOT re-parse.
         legacy_details = '{"reason": "You\'ve hit your limit — resets in 3h"}'
 
         conn.execute(
@@ -811,84 +783,7 @@ class TestCostByAccount:
 
         ta = result['test-acc']
         assert ta['status'] == 'capped'
-        parsed = datetime.fromisoformat(ta['resets_at'])
-        expected = datetime.now(UTC) + timedelta(hours=3)
-        delta_s = abs((parsed - expected).total_seconds())
-        assert delta_s < 60, (
-            f'expected ~3h ahead, got {ta["resets_at"]!r} '
-            f'(delta {delta_s:.0f}s from expected)'
-        )
-
-    @pytest.mark.asyncio
-    async def test_resets_at_fallback_parses_absolute(self, tmp_path):
-        """Transitional fallback parses 'resets Xpm (tz)' from legacy rows.
-
-        Remove this test with the fallback on 2026-04-28.
-        """
-        db_path = tmp_path / 'fallback_absolute.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(COSTS_SCHEMA)
-
-        now = datetime.now(UTC)
-        cap_ts = (now - timedelta(minutes=1)).isoformat()
-        legacy_details = (
-            '{"reason": "You\'ve hit your limit \\u00b7 resets 7pm (Europe/London)"}'
-        )
-
-        conn.execute(
-            'INSERT INTO account_events '
-            '(account_name, event_type, project_id, run_id, details, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?)',
-            ('test-acc', 'cap_hit', 'proj', 'r1', legacy_details, cap_ts),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as aconn:
-            aconn.row_factory = aiosqlite.Row
-            result = await get_cost_by_account(aconn)
-
-        ta = result['test-acc']
-        assert ta['status'] == 'capped'
-        # Fallback produces a UTC ISO string that parses and is in the future.
-        # Full exact-match would couple to local date/DST; not needed.
-        parsed = datetime.fromisoformat(ta['resets_at'])
-        assert parsed > datetime.now(UTC), (
-            f'expected future resets_at, got {ta["resets_at"]!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_resets_at_persisted_wins_over_fallback(self, tmp_path):
-        """When both persisted field and parseable reason exist, the persisted
-        field is authoritative (the fallback is strictly a legacy bridge).
-
-        Remove this test with the fallback on 2026-04-28.
-        """
-        db_path = tmp_path / 'both.db'
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(COSTS_SCHEMA)
-
-        now = datetime.now(UTC)
-        cap_ts = (now - timedelta(minutes=1)).isoformat()
-        persisted = (now + timedelta(hours=7)).isoformat()
-        # Reason would parse to +3h; persisted says +7h; persisted must win.
-        details = ('{"reason": "You\'ve hit your limit — resets in 3h", '
-                   f'"resets_at": "{persisted}"}}')
-
-        conn.execute(
-            'INSERT INTO account_events '
-            '(account_name, event_type, project_id, run_id, details, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?)',
-            ('test-acc', 'cap_hit', 'proj', 'r1', details, cap_ts),
-        )
-        conn.commit()
-        conn.close()
-
-        async with aiosqlite.connect(str(db_path)) as aconn:
-            aconn.row_factory = aiosqlite.Row
-            result = await get_cost_by_account(aconn)
-
-        assert result['test-acc']['resets_at'] == persisted
+        assert ta['resets_at'] is None
 
     @pytest.mark.asyncio
     async def test_resets_at_none_when_active(self, tmp_path):
@@ -929,8 +824,7 @@ class TestCostByAccount:
     @pytest.mark.asyncio
     async def test_auth_failed_only_is_capped(self, tmp_path):
         """Account with only an auth_failed event (no cap_hit, no invocations)
-        is reported as 'capped' and surfaces a parsed resets_at from the
-        reason text.
+        is reported as 'capped' and surfaces the persisted resets_at.
 
         This is the dominant production case since Anthropic switched to
         returning "out of extra usage" as HTTP 429 — UsageGate routes 4xx
@@ -944,10 +838,13 @@ class TestCostByAccount:
 
         now = datetime.now(UTC)
         auth_fail_ts = (now - timedelta(minutes=10)).isoformat()
-        # Same reason wording the orchestrator persists for HTTP 429 today.
+        persisted = (now + timedelta(hours=3)).isoformat()
+        # Mirrors what _handle_auth_failure persists in production:
+        # reason text + the parsed resets_at ISO string.
         details = (
             '{"reason": "HTTP 429: You\'re out of extra usage '
-            '\\u00b7 resets in 3h"}'
+            '\\u00b7 resets in 3h", '
+            f'"resets_at": "{persisted}"}}'
         )
 
         conn.execute(
@@ -969,10 +866,7 @@ class TestCostByAccount:
         )
         assert ta['last_auth_fail'] == auth_fail_ts
         assert ta['last_cap'] is None
-        # Reason fallback parses "resets in 3h" → ~3h ahead.
-        parsed = datetime.fromisoformat(ta['resets_at'])
-        delta_s = abs((parsed - (now + timedelta(hours=3))).total_seconds())
-        assert delta_s < 60
+        assert ta['resets_at'] == persisted
 
     @pytest.mark.asyncio
     async def test_auth_resumed_clears_auth_failed(self, tmp_path):
@@ -1055,9 +949,11 @@ class TestCostByAccount:
         cap_ts = (now - timedelta(days=2)).isoformat()
         resumed_ts = (now - timedelta(days=2, hours=-1)).isoformat()
         auth_fail_ts = (now - timedelta(hours=1)).isoformat()
+        persisted = (now + timedelta(hours=2)).isoformat()
         details = (
             '{"reason": "HTTP 429: You\'re out of extra usage '
-            '\\u00b7 resets in 2h"}'
+            '\\u00b7 resets in 2h", '
+            f'"resets_at": "{persisted}"}}'
         )
 
         conn.executemany(
@@ -1079,10 +975,8 @@ class TestCostByAccount:
 
         ta = result['test-acc']
         assert ta['status'] == 'capped'
-        # resets_at comes from the auth_failed (newer) event's reason text.
-        parsed = datetime.fromisoformat(ta['resets_at'])
-        delta_s = abs((parsed - (now + timedelta(hours=2))).total_seconds())
-        assert delta_s < 60
+        # resets_at comes from the auth_failed (newer) event's persisted field.
+        assert ta['resets_at'] == persisted
 
 
 # ---------------------------------------------------------------------------
@@ -2183,11 +2077,13 @@ class TestAggregateCostByAccount:
         conn.commit()
         conn.close()
 
-        # DB B: fresh auth_failed with no recovery
+        # DB B: fresh auth_failed with persisted resets_at, no recovery
         conn = sqlite3.connect(str(db_b))
+        persisted = (now + timedelta(hours=2)).isoformat()
         auth_details = (
             '{"reason": "HTTP 429: You\'re out of extra usage '
-            '\\u00b7 resets in 2h"}'
+            '\\u00b7 resets in 2h", '
+            f'"resets_at": "{persisted}"}}'
         )
         conn.execute(
             'INSERT INTO account_events '
@@ -2205,10 +2101,7 @@ class TestAggregateCostByAccount:
 
         assert result['max-a']['status'] == 'capped'
         assert result['max-a']['last_auth_fail'] == new_auth_fail
-        # Reason fallback parses "resets in 2h" → ~2h ahead.
-        parsed = datetime.fromisoformat(result['max-a']['resets_at'])
-        delta_s = abs((parsed - (now + timedelta(hours=2))).total_seconds())
-        assert delta_s < 60
+        assert result['max-a']['resets_at'] == persisted
 
 
 class TestAggregateAccountEvents:
