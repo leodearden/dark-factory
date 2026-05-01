@@ -66,6 +66,13 @@ class DualCompareBackend:
         # primary's failure still propagates (preserves the existing contract
         # that the wrapper is transparent on the primary's hot path).
         self.secondary_health_failures = 0
+        # Counters and bookkeeping for cancellation-safe dispatch (Commit 4):
+        # without these, an outer cancel of the request handler tore _dispatch
+        # mid-flight — sqlite's local commit often landed while tm's stdio +
+        # tasks.json rewrite did not — and the comparator never ran, so the
+        # divergence went silently unrecorded.
+        self.cancelled_dispatch_count = 0
+        self._inflight_drains: set[asyncio.Task] = set()
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -114,6 +121,11 @@ class DualCompareBackend:
             )
 
     async def close(self) -> None:
+        # Wait for any in-flight drain tasks to settle so divergence records
+        # for cancelled-during-dispatch calls aren't lost on shutdown.
+        if self._inflight_drains:
+            pending = list(self._inflight_drains)
+            await asyncio.gather(*pending, return_exceptions=True)
         await self.primary.close()
         try:
             await self.secondary.close()
@@ -132,18 +144,30 @@ class DualCompareBackend:
         """Run *method_name* on both backends; log divergences; surface primary.
 
         Both calls run concurrently via ``asyncio.gather(return_exceptions=True)``
-        so an outer cancellation propagates to both subtasks (no detached
-        secondary survives) and exceptions from the secondary are captured
-        without disturbing the primary's outcome.
+        wrapped in ``asyncio.shield`` so an outer cancellation can't tear the
+        underlying gather mid-flight (which previously left sqlite-committed +
+        tm-not-committed silent drift). On caller cancel we still raise
+        ``CancelledError`` to honour the cancellation contract, but a
+        background drain task awaits the inner pair to completion and runs
+        ``_compare`` so the divergence is logged after the fact. The drain
+        is tracked on ``self._inflight_drains`` so :meth:`close` can wait
+        for it on shutdown.
         """
         primary_method = getattr(self.primary, method_name)
         secondary_method = getattr(self.secondary, method_name)
 
-        primary_outcome, secondary_outcome = await asyncio.gather(
+        inner = asyncio.ensure_future(asyncio.gather(
             primary_method(*args, **kwargs),
             secondary_method(*args, **kwargs),
             return_exceptions=True,
-        )
+        ))
+
+        try:
+            primary_outcome, secondary_outcome = await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            self.cancelled_dispatch_count += 1
+            self._spawn_drain(method_name, args, kwargs, inner, normalize)
+            raise
 
         primary_exc = primary_outcome if isinstance(primary_outcome, BaseException) else None
         primary_value = None if primary_exc is not None else primary_outcome
@@ -162,6 +186,46 @@ class DualCompareBackend:
         if primary_exc is not None:
             raise primary_exc
         return primary_value
+
+    def _spawn_drain(
+        self,
+        method_name: str,
+        args: tuple,
+        kwargs: dict,
+        inner: asyncio.Future,
+        normalize: Callable[[Any], Any] | None,
+    ) -> None:
+        """Schedule a background drain that awaits *inner* and runs the
+        comparator, so cancellation-during-dispatch still produces a
+        divergence record. Tracked on ``self._inflight_drains``.
+        """
+        async def _drain() -> None:
+            try:
+                primary_outcome, secondary_outcome = await inner
+            except BaseException as exc:
+                # If the gather itself was cancelled (e.g. event loop
+                # shutdown), there's nothing to compare; skip silently.
+                logger.debug(
+                    'dual_compare: drain inner await failed: %s', exc,
+                )
+                return
+            try:
+                p_exc = primary_outcome if isinstance(primary_outcome, BaseException) else None
+                s_exc = secondary_outcome if isinstance(secondary_outcome, BaseException) else None
+                self._compare(
+                    method_name, args, kwargs,
+                    None if p_exc else primary_outcome, p_exc,
+                    None if s_exc else secondary_outcome, s_exc,
+                    normalize=normalize,
+                )
+            except Exception as exc:
+                logger.warning('dual_compare: drain compare failed: %s', exc)
+
+        drain = asyncio.create_task(
+            _drain(), name=f'dual_compare-drain-{method_name}',
+        )
+        self._inflight_drains.add(drain)
+        drain.add_done_callback(self._inflight_drains.discard)
 
     def _compare(
         self,

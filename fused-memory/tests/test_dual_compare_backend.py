@@ -202,3 +202,59 @@ async def test_ensure_connected_propagates_primary_failure(caplog):
     with pytest.raises(RuntimeError, match='primary down'):
         await wrapper.ensure_connected()
     assert wrapper.secondary_health_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_drains_and_logs_divergence(caplog):
+    """Outer cancellation must NOT silently swallow divergence: the inner
+    gather is shielded, the caller still sees ``CancelledError``, and a
+    background drain runs ``_compare`` once the inner settles.
+
+    Pre-fix this was the headline soak bug — sqlite's local commit fired
+    before cancel propagated, tm's stdio + tasks.json rewrite often did
+    not, and ``_compare`` never ran. The result: zero ``set_task_status``
+    divergences logged in the storm window despite confirmed state drift.
+    """
+    import asyncio
+
+    primary = _stub_backend()
+    secondary = _stub_backend()
+
+    # Secondary returns immediately; primary is slow so cancellation can
+    # land mid-flight.
+    secondary.set_task_status = AsyncMock(return_value={'tasks': [
+        {'taskId': '1', 'newStatus': 'done'},
+    ]})
+
+    async def slow_primary(*a, **k):
+        await asyncio.sleep(0.05)
+        return {'tasks': [{'taskId': '1', 'newStatus': 'in-progress'}]}
+
+    primary.set_task_status = AsyncMock(side_effect=slow_primary)
+
+    wrapper = DualCompareBackend(primary, secondary)
+
+    async def caller():
+        await wrapper.set_task_status('1', 'done', '/proj')
+
+    task = asyncio.create_task(caller())
+    # Let both inner subtasks start, then cancel the caller.
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert wrapper.cancelled_dispatch_count == 1
+    # Drain should have spawned and still be in flight (or just settled).
+    drains = list(wrapper._inflight_drains)
+    assert drains  # registered
+
+    with caplog.at_level('WARNING'):
+        # Wait for inner gather + drain to settle.
+        if drains:
+            await asyncio.gather(*drains, return_exceptions=True)
+
+    # Once settled, the comparator must have run and logged the
+    # in-progress vs done divergence.
+    assert wrapper.divergence_count == 1
+    assert any('dual_compare.divergence' in m for m in caplog.messages), caplog.messages
