@@ -101,6 +101,13 @@ class TaskBackendProtocol(Protocol):
         metadata: str | None = None,
         append: bool = False,
         tag: str | None = None,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+        dependencies: list[str] | None = None,
     ) -> UpdateTaskResult: ...
 
     async def add_subtask(

@@ -520,12 +520,14 @@ async def test_curator_combine_updates_target_and_returns_id(
 
     assert result['id'] == '50'
     assert result['action'] == 'combine'
-    # Combine calls update_task with a prompt instructing the rewrite.
+    # Combine writes structured fields directly — no prompt, no LLM rewrite.
     taskmaster.update_task.assert_called_once()
     call = taskmaster.update_task.call_args
     assert call.kwargs['task_id'] == '50'
-    assert 'Harden parser' in call.kwargs['prompt']
-    assert 'line 42' in call.kwargs['prompt']  # specifics preserved verbatim
+    assert call.kwargs.get('prompt') is None
+    assert call.kwargs['title'] == 'Harden parser'
+    assert call.kwargs['priority'] == 'high'
+    assert 'line 42' in call.kwargs['details']  # specifics preserved verbatim
     taskmaster.add_task.assert_not_called()
 
 

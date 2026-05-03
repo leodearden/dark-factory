@@ -124,6 +124,12 @@ async def test_update_task_param_forwarding(
         'task_id': '1',
         'project_root': '/project',
         'metadata': None,
+        'title': None,
+        'description': None,
+        'details': None,
+        'priority': None,
+        'status': None,
+        'dependencies': None,
     }
     expected_kwargs = {**base_kwargs, **expected_overrides}
     task_interceptor.update_task.assert_called_once_with(**expected_kwargs)

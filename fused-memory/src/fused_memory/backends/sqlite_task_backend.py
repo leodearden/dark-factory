@@ -534,7 +534,20 @@ class SqliteTaskBackend:
         metadata: str | None = None,
         append: bool = False,
         tag: str | None = None,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+        dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
+        # Structured fields (title/description/details/priority/status/dependencies)
+        # land deterministically — any non-None value overrides the current row.
+        # ``prompt`` is kept for backward compatibility: when no explicit
+        # ``details`` is passed it feeds the details path (replace, or append
+        # when ``append=True``). ``metadata`` retains the merge-or-replace
+        # semantics keyed off ``append``.
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid, parent_id = _parse_task_id(task_id)
@@ -553,21 +566,89 @@ class SqliteTaskBackend:
                         f'No tasks found for ID(s): {task_id}',
                     )
 
-                new_details = row['details'] or ''
-                if prompt is not None:
+                # Build the SET clause from non-None structured fields plus
+                # the prompt-derived details path.
+                set_columns: list[str] = []
+                set_values: list[Any] = []
+
+                if title is not None:
+                    set_columns.append('title = ?')
+                    set_values.append(title)
+                if description is not None:
+                    set_columns.append('description = ?')
+                    set_values.append(description)
+                if priority is not None:
+                    set_columns.append('priority = ?')
+                    set_values.append(priority)
+                if status is not None:
+                    set_columns.append('status = ?')
+                    set_values.append(status)
+
+                # details: explicit param wins over prompt. Both honor ``append``.
+                existing_details = row['details'] or ''
+                if details is not None:
                     new_details = (
-                        f'{new_details}\n\n{prompt}' if (append and new_details) else prompt
+                        f'{existing_details}\n\n{details}'
+                        if (append and existing_details) else details
                     )
+                    set_columns.append('details = ?')
+                    set_values.append(new_details)
+                elif prompt is not None:
+                    new_details = (
+                        f'{existing_details}\n\n{prompt}'
+                        if (append and existing_details) else prompt
+                    )
+                    set_columns.append('details = ?')
+                    set_values.append(new_details)
 
-                new_metadata: str | None = row['metadata']
                 if metadata is not None:
-                    new_metadata = _merge_metadata(row['metadata'], metadata, append=append)
+                    new_metadata = _merge_metadata(
+                        row['metadata'], metadata, append=append,
+                    )
+                    set_columns.append('metadata = ?')
+                    set_values.append(new_metadata)
 
+                # updated_at always advances, even on a no-op write — matches
+                # the original behaviour and avoids surprising "stale" reads.
+                set_columns.append('updated_at = ?')
+                set_values.append(_now())
+
+                set_clause = ', '.join(set_columns)
+                set_values.extend([tag, tid, parent_db])
                 await conn.execute(
-                    'UPDATE tasks SET details = ?, metadata = ?, updated_at = ? '
-                    'WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (new_details, new_metadata, _now(), tag, tid, parent_db),
+                    f'UPDATE tasks SET {set_clause} '
+                    f'WHERE tag = ? AND id = ? AND parent_id = ?',
+                    set_values,
                 )
+
+                # Dependencies: replace-mode only. Subtask deps are unsupported
+                # (matches add_dependency); structured callers pass top-level
+                # ids only. Empty list clears all deps.
+                if dependencies is not None:
+                    if parent_id is not None:
+                        raise TaskmasterError(
+                            'TASKMASTER_TOOL_ERROR',
+                            'update_task: subtask dependencies are not supported',
+                        )
+                    parsed_deps: list[int] = []
+                    for raw in dependencies:
+                        dep_tid, dep_parent = _parse_task_id(raw)
+                        if dep_parent is not None:
+                            raise TaskmasterError(
+                                'TASKMASTER_TOOL_ERROR',
+                                'update_task: subtask dependencies are not supported',
+                            )
+                        parsed_deps.append(dep_tid)
+                    await conn.execute(
+                        'DELETE FROM dependencies WHERE tag = ? AND task_id = ? AND parent_id = ?',
+                        (tag, tid, _TOP_LEVEL_SENTINEL),
+                    )
+                    for dep in parsed_deps:
+                        await conn.execute(
+                            'INSERT OR IGNORE INTO dependencies '
+                            '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
+                            (tag, tid, _TOP_LEVEL_SENTINEL, dep),
+                        )
 
                 refreshed_cursor = await conn.execute(
                     'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',

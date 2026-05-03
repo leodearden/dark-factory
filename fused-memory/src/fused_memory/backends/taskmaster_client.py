@@ -714,7 +714,21 @@ class TaskmasterBackend:
         metadata: str | None = None,
         append: bool = False,
         tag: str | None = None,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+        dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
+        # Taskmaster's MCP ``update_task`` is LLM-driven and only accepts
+        # ``prompt`` + ``metadata`` + ``append``. Structured fields are
+        # accepted for protocol compatibility (DualCompareBackend dispatches
+        # them per-field) but are not forwarded here. The DualCompareBackend
+        # layer is responsible for translating structured intent into the
+        # appropriate TM tool calls (set_task_status / add_dependency /
+        # verbatim-replace prompt).
         args = self._base_args(project_root, tag)
         args['id'] = task_id
         if prompt:

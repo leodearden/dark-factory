@@ -695,20 +695,340 @@ class DualCompareBackend:
         metadata: str | None = None,
         append: bool = False,
         tag: str | None = None,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+        dependencies: list[str] | None = None,
     ):
-        p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
-            'update_task',
-            (task_id, project_root),
-            {'prompt': prompt, 'metadata': metadata, 'append': append, 'tag': tag},
+        """Asymmetric per-side dispatch for the sqlite↔taskmaster cutover.
+
+        The legacy ``update_task`` path treats both sides symmetrically
+        (same args to both backends). That hides two real issues:
+
+        1. Sqlite's old ``update_task`` only wrote details/metadata/updated_at
+           — a structured priority/status change funnelled through the
+           prompt-based wire silently dropped.
+        2. TM's ``update_task`` is LLM-driven; passing structured fields to
+           it would either be ignored or trigger an LLM rewrite, producing
+           drift.
+
+        New semantics:
+
+        * **Case 1 — caller passes structured fields**: sqlite gets the
+          structured form directly (no prompt). TM is dispatched per-field
+          where it has a per-field tool (``set_task_status``); for
+          title/description/details/priority TM's only knob is its LLM
+          ``update_task``, so we feed it a verbatim-replace prompt that
+          constrains the LLM to copy verbatim.
+        * **Case 2 — legacy prompt-only call**: TM runs its LLM rewrite
+          first; sqlite is teed with the structured fields extracted from
+          TM's resolved ``updated_task``. Sqlite never runs an LLM.
+
+        For non-(sqlite+TM) wrappings (test fixtures, future combos) this
+        falls back to the prior symmetric ``_dispatch`` behaviour with the
+        full kwarg surface.
+        """
+        sqlite_be = self._side_of_class('SqliteTaskBackend')
+        tm_be = self._side_of_class('TaskmasterBackend')
+        common_kwargs: dict[str, Any] = {
+            'prompt': prompt, 'metadata': metadata, 'append': append, 'tag': tag,
+            'title': title, 'description': description, 'details': details,
+            'priority': priority, 'status': status, 'dependencies': dependencies,
+        }
+
+        if sqlite_be is None or tm_be is None:
+            # Symmetric fallback — neither side is the cutover pair we
+            # know how to translate for. Pass the full kwarg surface to
+            # both and let them raise/ignore as they choose.
+            p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(
+                'update_task',
+                (task_id, project_root),
+                common_kwargs,
+                normalize=_normalize_id_only,
+            )
+            if p_exc is not None:
+                raise p_exc
+            self._spawn_verify(
+                'update_task', str(task_id), str(task_id), project_root, tag,
+            )
+            return p_val
+
+        primary_is_sqlite = sqlite_be is self.primary
+        structured_present = any(
+            v is not None
+            for v in (title, description, details, priority, status, dependencies)
+        )
+
+        if structured_present:
+            sqlite_value, sqlite_exc, tm_value, tm_exc = (
+                await self._update_task_concurrent(
+                    task_id, project_root,
+                    sqlite_be=sqlite_be, tm_be=tm_be,
+                    prompt=prompt, metadata=metadata, append=append, tag=tag,
+                    title=title, description=description, details=details,
+                    priority=priority, status=status, dependencies=dependencies,
+                )
+            )
+        else:
+            sqlite_value, sqlite_exc, tm_value, tm_exc = (
+                await self._update_task_tee_legacy(
+                    task_id, project_root,
+                    sqlite_be=sqlite_be, tm_be=tm_be,
+                    prompt=prompt, metadata=metadata, append=append, tag=tag,
+                )
+            )
+
+        if primary_is_sqlite:
+            primary_value, primary_exc = sqlite_value, sqlite_exc
+            secondary_value, secondary_exc = tm_value, tm_exc
+        else:
+            primary_value, primary_exc = tm_value, tm_exc
+            secondary_value, secondary_exc = sqlite_value, sqlite_exc
+
+        self._compare(
+            'update_task', (task_id, project_root), common_kwargs,
+            primary_value, primary_exc, secondary_value, secondary_exc,
             normalize=_normalize_id_only,
         )
-        if p_exc is not None:
-            raise p_exc
+        if self._write_journal is not None:
+            wo_id = _current_write_op_id.get()
+            if wo_id is not None:
+                await self._journal_per_side(
+                    wo_id, 'update_task', common_kwargs,
+                    primary_value, primary_exc, secondary_value, secondary_exc,
+                )
+
+        if primary_exc is not None:
+            raise primary_exc
         self._spawn_verify(
-            'update_task', str(task_id), str(task_id),
-            project_root, tag,
+            'update_task', str(task_id), str(task_id), project_root, tag,
         )
-        return p_val
+        return primary_value
+
+    def _side_of_class(self, class_name: str) -> Any:
+        """Return whichever side (primary or secondary) is an instance of
+        *class_name* (matched on ``type(...).__name__``), or ``None``.
+
+        Class-name string match avoids importing ``SqliteTaskBackend`` /
+        ``TaskmasterBackend`` here — keeps this module free of circular
+        dependencies on the concrete backends it routes between.
+        """
+        if type(self.primary).__name__ == class_name:
+            return self.primary
+        if type(self.secondary).__name__ == class_name:
+            return self.secondary
+        return None
+
+    async def _update_task_concurrent(
+        self,
+        task_id: str,
+        project_root: str,
+        *,
+        sqlite_be: Any,
+        tm_be: Any,
+        prompt: str | None,
+        metadata: str | None,
+        append: bool,
+        tag: str | None,
+        title: str | None,
+        description: str | None,
+        details: str | None,
+        priority: str | None,
+        status: str | None,
+        dependencies: list[str] | None,
+    ) -> tuple[Any, BaseException | None, Any, BaseException | None]:
+        """Case 1 — both sides run concurrently with per-side translation.
+
+        Returns ``(sqlite_value, sqlite_exc, tm_value, tm_exc)`` mirroring
+        the layout of :meth:`_dispatch_pair`. Cancellation is shielded so
+        a torn outer await still produces a consistent compare downstream.
+        """
+
+        async def _sqlite_call() -> Any:
+            return await sqlite_be.update_task(
+                task_id=task_id,
+                project_root=project_root,
+                prompt=None,
+                metadata=metadata,
+                append=append,
+                tag=tag,
+                title=title,
+                description=description,
+                details=details,
+                priority=priority,
+                status=status,
+                dependencies=dependencies,
+            )
+
+        async def _tm_call() -> Any:
+            # Verbatim prompt covers the fields TM has no per-field tool
+            # for. Status is dispatched separately (TM has set_task_status).
+            # Dependencies replacement is intentionally skipped on TM —
+            # rare in practice, and post-cutover TM's tasks.json is
+            # discarded anyway.
+            verbatim_pairs: list[tuple[str, str]] = []
+            if title is not None:
+                verbatim_pairs.append(('TITLE', title))
+            if description is not None:
+                verbatim_pairs.append(('DESCRIPTION', description))
+            if priority is not None:
+                verbatim_pairs.append(('PRIORITY', priority))
+            if details is not None:
+                verbatim_pairs.append(('DETAILS', details))
+
+            tm_result: Any = None
+            if verbatim_pairs:
+                lines = [
+                    'Replace this task with EXACTLY the following fields, '
+                    'verbatim. Do not paraphrase, do not merge with existing '
+                    'content, do not add commentary.',
+                ]
+                for label, value in verbatim_pairs:
+                    lines.append(f'{label}: {value}')
+                tm_prompt = '\n\n'.join(lines)
+                tm_result = await tm_be.update_task(
+                    task_id=task_id,
+                    project_root=project_root,
+                    prompt=tm_prompt,
+                    metadata=metadata,
+                    append=append,
+                    tag=tag,
+                )
+            if status is not None:
+                await tm_be.set_task_status(task_id, status, project_root, tag)
+
+            if tm_result is None:
+                # Synthesize a deterministic result so the caller-side
+                # comparator sees a recognisable shape (status-only or
+                # deps-only updates).
+                tm_result = {
+                    'id': str(task_id),
+                    'message': 'TM update applied via per-field tools only',
+                    'updated': True,
+                    'updated_task': None,
+                }
+            return tm_result
+
+        inner = asyncio.ensure_future(asyncio.gather(
+            _sqlite_call(), _tm_call(), return_exceptions=True,
+        ))
+        try:
+            sqlite_outcome, tm_outcome = await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            self.cancelled_dispatch_count += 1
+            self._spawn_drain_pair('update_task', task_id, project_root, inner)
+            raise
+
+        sqlite_exc = sqlite_outcome if isinstance(sqlite_outcome, BaseException) else None
+        sqlite_value = None if sqlite_exc is not None else sqlite_outcome
+        tm_exc = tm_outcome if isinstance(tm_outcome, BaseException) else None
+        tm_value = None if tm_exc is not None else tm_outcome
+        return sqlite_value, sqlite_exc, tm_value, tm_exc
+
+    async def _update_task_tee_legacy(
+        self,
+        task_id: str,
+        project_root: str,
+        *,
+        sqlite_be: Any,
+        tm_be: Any,
+        prompt: str | None,
+        metadata: str | None,
+        append: bool,
+        tag: str | None,
+    ) -> tuple[Any, BaseException | None, Any, BaseException | None]:
+        """Case 2 — sequential TM-then-sqlite tee for the legacy prompt path.
+
+        TM's LLM rewrite runs first; whatever it materialised in
+        ``updated_task`` is then fed to sqlite as structured fields, so
+        sqlite's ``tasks.db`` ends up with the deterministic image of
+        TM's rewrite. The tee dies with TM at final cutover — at that
+        point any caller still passing ``prompt=`` becomes a fallback or
+        a hard error per the cleanup PR.
+        """
+        tm_value: Any = None
+        tm_exc: BaseException | None = None
+        try:
+            tm_value = await tm_be.update_task(
+                task_id=task_id,
+                project_root=project_root,
+                prompt=prompt,
+                metadata=metadata,
+                append=append,
+                tag=tag,
+            )
+        except BaseException as exc:  # noqa: BLE001 — surface to compare
+            tm_exc = exc
+
+        sqlite_value: Any = None
+        sqlite_exc: BaseException | None = None
+        if tm_exc is not None:
+            # TM blew up — don't fabricate a sqlite write. Mirror the
+            # exception type so the comparator sees matching kinds.
+            sqlite_exc = tm_exc
+        else:
+            sqlite_kwargs: dict[str, Any] = {
+                'task_id': task_id,
+                'project_root': project_root,
+                'prompt': None,
+                'metadata': metadata,
+                # Structured tee always replaces — TM's resolved fields are
+                # the deterministic source of truth. ``append`` only made
+                # sense for the prompt path.
+                'append': False,
+                'tag': tag,
+            }
+            updated_task = (
+                tm_value.get('updated_task')
+                if isinstance(tm_value, dict) else None
+            )
+            if isinstance(updated_task, dict):
+                for field in ('title', 'description', 'details',
+                              'priority', 'status'):
+                    val = updated_task.get(field)
+                    if val is not None:
+                        sqlite_kwargs[field] = val
+                deps = updated_task.get('dependencies')
+                if isinstance(deps, list):
+                    sqlite_kwargs['dependencies'] = [str(d) for d in deps]
+            try:
+                sqlite_value = await sqlite_be.update_task(**sqlite_kwargs)
+            except BaseException as exc:  # noqa: BLE001
+                sqlite_exc = exc
+
+        return sqlite_value, sqlite_exc, tm_value, tm_exc
+
+    def _spawn_drain_pair(
+        self,
+        method_name: str,
+        task_id: str,
+        project_root: str,
+        inner: asyncio.Future,
+    ) -> None:
+        """Drain helper for the asymmetric concurrent dispatch.
+
+        Mirrors :meth:`_spawn_drain` but skips the comparator (asymmetric
+        compare requires per-side context that we don't hold here on a
+        cancellation); the goal is just to settle ``inner`` so the
+        underlying writes complete and the loop doesn't leak the future.
+        """
+        async def _drain() -> None:
+            try:
+                await inner
+            except BaseException as exc:
+                logger.debug(
+                    'dual_compare: %s drain await failed: %s',
+                    method_name, exc,
+                )
+
+        drain = asyncio.create_task(
+            _drain(), name=f'dual_compare-drain-{method_name}',
+        )
+        self._inflight_drains.add(drain)
+        drain.add_done_callback(self._inflight_drains.discard)
 
     async def add_subtask(self, parent_id: str, project_root: str, **kwargs):
         p_val, p_exc, _s_val, _s_exc = await self._dispatch_pair(

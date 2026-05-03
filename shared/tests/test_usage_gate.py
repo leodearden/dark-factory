@@ -669,3 +669,76 @@ class TestUsageGateProbeExitCodeClassification:
             result = await gate._run_probe(acct)
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# wait_for_open — used by curator worker for AllAccountsCappedException defer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWaitForOpen:
+    """Used by :meth:`fused_memory.middleware.task_interceptor.TaskInterceptor._curator_worker`
+    to defer a whole batch when ``invoke_with_cap_retry`` raises
+    :exc:`AllAccountsCappedException`.  Returns True when at least one
+    account becomes available; False on timeout."""
+
+    async def test_returns_true_immediately_when_open(self):
+        """Fast path: not currently paused → returns True without sleeping."""
+        gate = make_gate(['A'])
+        # Default: account is not capped → gate is open.
+        assert gate.is_paused is False
+        assert await gate.wait_for_open(timeout=0.5) is True
+
+    async def test_returns_true_after_account_uncaps_via_event(self):
+        """Cap → other coroutine clears cap and sets _open → wait_for_open
+        returns True."""
+        gate = make_gate(['A'])
+        acct = gate._accounts[0]
+        acct.capped = True
+        gate._open.clear()
+        assert gate.is_paused is True
+
+        async def uncap_after_delay():
+            await asyncio.sleep(0.05)
+            acct.capped = False
+            gate._open.set()
+
+        task = asyncio.create_task(uncap_after_delay())
+        try:
+            ok = await gate.wait_for_open(timeout=1.0)
+        finally:
+            await task
+        assert ok is True
+
+    async def test_returns_false_on_timeout_when_still_capped(self):
+        """All-capped + no reset → wait_for_open returns False after timeout."""
+        gate = make_gate(['A'])
+        acct = gate._accounts[0]
+        acct.capped = True
+        # Push reset far into the future so _refresh_capped_accounts won't
+        # flip it during the wait.
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
+        gate._open.clear()
+
+        ok = await gate.wait_for_open(timeout=0.05)
+        assert ok is False
+
+    async def test_returns_true_when_reset_already_passed(self):
+        """If an account's ``resets_at`` is in the past at call time,
+        ``_refresh_capped_accounts`` flips it to probing and we open up."""
+        gate = make_gate(['A'])
+        acct = gate._accounts[0]
+        acct.capped = True
+        acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+        gate._open.clear()
+
+        ok = await gate.wait_for_open(timeout=0.5)
+        assert ok is True
+        assert acct.capped is False  # refreshed → uncapped (probing)
+
+    async def test_no_accounts_configured_is_treated_as_open(self):
+        """No-account mode (e.g. tests) returns True immediately; the gate
+        cannot be paused if it has no accounts."""
+        gate = make_gate([])  # no accounts configured
+        assert await gate.wait_for_open(timeout=0.05) is True

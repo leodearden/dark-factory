@@ -1036,6 +1036,40 @@ class UsageGate:
             return False
         return all(a.capped or a.auth_failed for a in self._accounts)
 
+    async def wait_for_open(self, timeout: float | None = None) -> bool:
+        """Block until at least one account is available, or *timeout* elapses.
+
+        Returns True if the gate opened (an account is available, or its reset
+        time has passed), False if the timeout elapsed while still all-capped.
+
+        Unlike :meth:`before_invoke`, this does not claim a probe slot or
+        return a token — it is intended for callers that want to defer work
+        until accounts uncap (e.g. the curator worker after a batch hit
+        :class:`AllAccountsCappedException`) and then re-enter their normal
+        invocation path. With ``timeout=None``, blocks indefinitely.
+
+        Honours the same reset-time refresh as ``before_invoke``: if any
+        account's ``resets_at`` has passed when this is called, returns
+        immediately without sleeping.
+        """
+        if not self._accounts:
+            # No-account mode behaves like permanently-open.
+            return True
+        # Cheap fast-path: check current state before claiming the lock.
+        if not self.is_paused:
+            return True
+        # Give expired-reset accounts a chance to flip before we wait.
+        if await self._refresh_capped_accounts():
+            return True
+        try:
+            if timeout is None:
+                await self._open.wait()
+            else:
+                await asyncio.wait_for(self._open.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
     @property
     def paused_reason(self) -> str:
         return self._paused_reason

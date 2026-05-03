@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 from shared.locking import files_to_modules
 
+from fused_memory.reconciliation.context_assembler import estimate_tokens
+
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
 
@@ -58,10 +60,14 @@ class CuratorFailureError(RuntimeError):
     errors; instead the interceptor translates this into an L1 escalation or
     a hard failure at the MCP boundary so operators notice breakage.
 
-    Attaches ``timed_out`` and ``duration_ms`` from the underlying
-    ``AgentResult`` so :class:`CuratorEscalator` can surface them in the L1
-    escalation detail. Defaults make the attributes safe to read even when
-    the failure originates outside :meth:`TaskCurator._call_llm`.
+    Attaches ``timed_out``, ``duration_ms``, and ``subtype`` from the
+    underlying ``AgentResult`` so :class:`CuratorEscalator` can surface them
+    in the L1 escalation detail and so the bisecting fallback in
+    :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
+    failure subtype without leaking the underlying ``AgentResult`` outside
+    :meth:`TaskCurator._call_llm` / :meth:`TaskCurator._call_llm_batch`.
+    Defaults make the attributes safe to read even when the failure
+    originates outside those call sites.
     """
 
     def __init__(
@@ -70,10 +76,12 @@ class CuratorFailureError(RuntimeError):
         *,
         timed_out: bool | None = None,
         duration_ms: int | None = None,
+        subtype: str | None = None,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
         self.duration_ms = duration_ms
+        self.subtype = subtype
 
 
 Action = Literal['drop', 'combine', 'create']
@@ -255,6 +263,23 @@ class CuratorDecision:
             'latency_ms': self.latency_ms,
             'cost_usd': self.cost_usd,
         }
+
+
+@dataclass
+class PreparedCandidate:
+    """Per-candidate batch input prepared by :meth:`TaskCurator.prepare_candidate`.
+
+    Carries the candidate, its assembled corpus pool, pool sizes, and the
+    estimated user-prompt token count for this candidate's section of the
+    batched prompt.  The token estimate is what the worker uses to decide
+    whether adding this candidate to the in-flight batch would exceed the
+    soft ``batch_token_threshold``.
+    """
+
+    candidate: CandidateTask
+    pool: list[_PoolEntry]
+    pool_sizes: dict[str, int]
+    prompt_tokens: int
 
 
 @dataclass
@@ -747,6 +772,44 @@ class TaskCurator:
         )
         return decision
 
+    async def prepare_candidate(
+        self,
+        candidate: CandidateTask,
+        project_id: str,
+        project_root: str,
+    ) -> PreparedCandidate:
+        """Build the corpus + section-token estimate for one candidate.
+
+        Split out from :meth:`curate_batch` so the interceptor's curator
+        worker can incrementally accumulate prepared candidates and decide,
+        before fetching the next ticket, whether the in-flight batch has
+        already exceeded the soft ``batch_token_threshold``.  Corpus failures
+        degrade to an empty pool — same behaviour as inside ``curate_batch``.
+        """
+        try:
+            pool, pool_sizes = await self._build_corpus(
+                candidate, project_id, project_root,
+            )
+        except Exception as exc:
+            logger.warning(
+                'task_curator: corpus assembly failed for candidate %r, '
+                'continuing with empty pool: %s',
+                candidate.title,
+                exc,
+                exc_info=True,
+            )
+            pool = []
+            pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        # batch_index=0 is fine for the estimate — only a couple of digits of
+        # rendered length difference at most across realistic batch sizes.
+        section = self._build_batch_section(candidate, pool, 0)
+        return PreparedCandidate(
+            candidate=candidate,
+            pool=pool,
+            pool_sizes=pool_sizes,
+            prompt_tokens=estimate_tokens(section),
+        )
+
     async def curate_batch(
         self,
         candidates: list[CandidateTask],
@@ -755,17 +818,50 @@ class TaskCurator:
     ) -> list[CuratorDecision]:
         """Issue a batched drop/combine/create decision for *candidates* in one round-trip.
 
+        Thin wrapper over :meth:`curate_batch_prepared`: builds a
+        :class:`PreparedCandidate` per input via :meth:`prepare_candidate`
+        then delegates.  Preserves the public surface that existing callers
+        (single-shot scripts, tests) depend on.
+
         * N=0 → return ``[]`` immediately.
         * N=1 → delegate to :meth:`curate` (inherits caches + escalator wiring).
         * N>1 → one :func:`invoke_with_cap_retry` call with the batched prompt/schema.
-                On whole-batch failure falls back to N serial :meth:`curate` calls.
+                On whole-batch failure the bisecting fallback in
+                :meth:`_call_llm_batch_with_fallback` retries each half.
         """
         if not candidates:
             return []
         if len(candidates) == 1:
             return [await self.curate(candidates[0], project_id, project_root)]
+        prepared = [
+            await self.prepare_candidate(c, project_id, project_root)
+            for c in candidates
+        ]
+        return await self.curate_batch_prepared(
+            prepared, project_id, project_root,
+        )
 
-        # N>1: build per-candidate corpus, call the batched LLM, cache results.
+    async def curate_batch_prepared(
+        self,
+        prepared: list[PreparedCandidate],
+        project_id: str,
+        project_root: str,
+    ) -> list[CuratorDecision]:
+        """Run pre-batch dedup + cache + bisecting LLM dispatch over already-prepared candidates.
+
+        The split between this and :meth:`curate_batch` lets the worker
+        accumulate prepared candidates incrementally so it can stop adding
+        tickets to a batch once the estimated prompt size exceeds the soft
+        :attr:`CuratorConfig.batch_token_threshold`.
+        """
+        if not prepared:
+            return []
+        if len(prepared) == 1:
+            return [
+                await self.curate(prepared[0].candidate, project_id, project_root),
+            ]
+
+        candidates = [p.candidate for p in prepared]
         start = time.monotonic()
 
         # ── Pre-batch deduplication by payload_hash ────────────────────────────
@@ -776,9 +872,7 @@ class TaskCurator:
         # task_id.  This preserves the single-ticket invariant where the second
         # identical add_task call sees the first's outcome via note_created/cache.
         hash_to_first_idx: dict[str, int] = {}
-        # Maps full-list index → synthetic drop decision (for duplicates)
         pre_dedup_decisions: dict[int, CuratorDecision] = {}
-        # Indices of candidates that will go to the LLM (unique ones only)
         unique_indices: list[int] = []
         for i, candidate in enumerate(candidates):
             h = candidate.payload_hash()
@@ -791,8 +885,6 @@ class TaskCurator:
             else:
                 hash_to_first_idx[h] = i
                 unique_indices.append(i)
-
-        unique_candidates = [candidates[i] for i in unique_indices]
         # ── End pre-batch dedup ────────────────────────────────────────────────
 
         # ── Decision cache check ───────────────────────────────────────────────
@@ -810,61 +902,47 @@ class TaskCurator:
             else:
                 llm_k_list.append(k)
 
-        # ── Corpus assembly (only for non-cached unique candidates) ───────────
-        pools: list[list[_PoolEntry]] = []
-        pool_sizes_list: list[dict[str, int]] = []
-        for k in llm_k_list:
-            candidate = candidates[unique_indices[k]]
-            try:
-                pool, pool_sizes = await self._build_corpus(
-                    candidate, project_id, project_root,
-                )
-            except Exception as exc:
-                logger.warning(
-                    'task_curator: corpus assembly failed for candidate %r, '
-                    'continuing with empty pool: %s',
-                    candidate.title,
-                    exc,
-                    exc_info=True,
-                )
-                pool = []
-                pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
-            pools.append(pool)
-            pool_sizes_list.append(pool_sizes)
-
-        # ── LLM call (only for non-cached unique candidates) ──────────────────
+        # ── LLM dispatch for non-cached unique candidates ────────────────────
+        # Re-use the pre-built pools/pool_sizes from the prepared bundles
+        # (skipping cache hits).  No second corpus build.
         llm_raw_decisions: list[CuratorDecision] = []
         if llm_k_list:
-            to_llm_candidates = [unique_candidates[k] for k in llm_k_list]
+            to_llm_candidates = [
+                candidates[unique_indices[k]] for k in llm_k_list
+            ]
+            pools = [prepared[unique_indices[k]].pool for k in llm_k_list]
+            pool_sizes_list = [
+                prepared[unique_indices[k]].pool_sizes for k in llm_k_list
+            ]
             try:
-                llm_raw_decisions = await self._call_llm_batch(
+                llm_raw_decisions = await self._call_llm_batch_with_fallback(
                     to_llm_candidates, pools, pool_sizes_list, start,
                     project_id, project_root,
                 )
+            except AllAccountsCappedException:
+                # Cap exhaustion bubbles up so the caller (worker) can defer
+                # the whole batch instead of N×size-1 amplification of the
+                # cap-retry storm.
+                raise
             except Exception as exc:
-                # Catches CuratorFailureError, AllAccountsCappedException, and
-                # unexpected LLM-layer errors.  CancelledError (BaseException)
-                # is not caught here.
+                # CancelledError (BaseException) is not caught here.  Anything
+                # else that escaped the bisect helper is unexpected — log and
+                # degrade to N serial curate() calls (legacy fallback).
                 logger.warning(
-                    'curate_batch: whole-batch LLM failed (%s), falling back to '
-                    '%d size-1 curate calls',
-                    exc,
+                    'curate_batch: bisect helper raised unexpected %s; '
+                    'falling back to %d size-1 curate calls',
+                    type(exc).__name__,
                     len(to_llm_candidates),
                 )
-                # Each curate() call handles its own caching, so no re-store
-                # is needed for fallback decisions below.
                 llm_raw_decisions = [
-                    await self.curate(unique_candidates[k], project_id, project_root)
-                    for k in llm_k_list
+                    await self.curate(c, project_id, project_root)
+                    for c in to_llm_candidates
                 ]
 
         # ── Merge: build unique_decision_map with original-space indices ───────
-        # The LLM (or fallback curate()) saw to_llm_candidates at LLM-local
-        # positions 0..M-1 (M = len(llm_k_list)).  batch_target_index from the
-        # LLM is in LLM-local space; remap to original-space via:
-        #   LLM-local j → llm_k_list[j] (unique-space k) → unique_indices[k]
-        # Cache hits have batch_target_index=None (within-batch drops are never
-        # cached, so there is nothing to remap for them).
+        # batch_target_index from the helper is in LLM-local space (positions
+        # within to_llm_candidates).  Remap LLM-local → unique-space →
+        # original-space.  Cache hits have batch_target_index=None.
         unique_decisions_by_k: dict[int, CuratorDecision] = dict(cache_hit_map)
         for llm_j, k in enumerate(llm_k_list):
             dec = llm_raw_decisions[llm_j]
@@ -1334,6 +1412,7 @@ class TaskCurator:
                 f'configured_timeout_secs={self._config.curator.timeout_seconds}',
                 timed_out=agent_result.timed_out,
                 duration_ms=agent_result.duration_ms,
+                subtype=agent_result.subtype or None,
             )
 
         return _parse_decision(
@@ -1362,10 +1441,10 @@ class TaskCurator:
         user_prompt = self._build_batch_user_prompt(candidates, pools)
 
         # Scale by (n-1): the single-call budget (timeout_seconds /
-        # max_turns) already covers the first item's baseline; each additional
-        # item beyond the first adds its slack.  This avoids over-provisioning
-        # a size-2 batch at 2× the single-call budget.  Note: _call_llm_batch
-        # is never called for n<2.
+        # max_turns / max_budget_usd) already covers the first item's
+        # baseline; each additional item beyond the first adds its slack.
+        # This avoids over-provisioning a size-2 batch at 2× the single-call
+        # budget.  Note: _call_llm_batch is never called for n<2.
         timeout = min(
             self._config.curator.timeout_seconds
             + self._config.curator.per_item_slack_seconds * (n - 1),
@@ -1375,6 +1454,14 @@ class TaskCurator:
             self._config.curator.max_turns
             + self._config.curator.per_item_turns * (n - 1),
             self._config.curator.batch_turns_cap,
+        )
+        # R1: scale max_budget_usd. Batch prompts are several × bigger than
+        # single-call prompts and burn the flat per-call budget in 1–2 turns,
+        # tripping error_max_budget_usd before the model can answer.
+        budget = min(
+            self._config.curator.max_budget_usd
+            + self._config.curator.per_item_budget_usd * (n - 1),
+            self._config.curator.batch_budget_cap_usd,
         )
 
         agent_result: AgentResult = await invoke_with_cap_retry(
@@ -1386,7 +1473,7 @@ class TaskCurator:
             cwd=cwd,
             model=self._config.curator.model,
             max_turns=max_turns,
-            max_budget_usd=self._config.curator.max_budget_usd,
+            max_budget_usd=budget,
             disallowed_tools=['*'],
             output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
@@ -1405,6 +1492,7 @@ class TaskCurator:
                 f'configured_timeout_secs={timeout}',
                 timed_out=agent_result.timed_out,
                 duration_ms=agent_result.duration_ms,
+                subtype=agent_result.subtype or None,
             )
 
         return _parse_batch_decisions(
@@ -1413,6 +1501,83 @@ class TaskCurator:
             pool_sizes_list=pool_sizes_list,
             latency_ms=latency_ms,
         )
+
+    async def _call_llm_batch_with_fallback(
+        self,
+        candidates: list[CandidateTask],
+        pools: list[list[_PoolEntry]],
+        pool_sizes_list: list[dict[str, int]],
+        start: float,
+        project_id: str,
+        project_root: str,
+    ) -> list[CuratorDecision]:
+        """Try one batched LLM call; on :exc:`CuratorFailureError` bisect and retry each half.
+
+        Decisions returned to the caller are in **input-local space** for this
+        invocation (positions 0..N-1 of the *candidates* arg).  The bisect
+        remaps right-half ``batch_target_index`` values by ``+mid`` before
+        concatenating so a within-batch drop emitted by the right-half LLM
+        call still points at the correct input-local position.
+
+        Failure-type branching:
+
+        * :exc:`AllAccountsCappedException` — re-raised (the caller defers
+          the whole batch instead of repeating the cap-retry storm N times).
+        * :exc:`CuratorFailureError` — bisects.  Both recognised subtypes
+          (``error_max_budget_usd``, ``error_empty_output``,
+          ``error_max_turns``, …) and unknown subtypes shrink with smaller
+          batches; worst case bisects all the way to size-1 and lets
+          :meth:`curate` handle its own cache + escalator wiring.
+        * Other ``Exception`` — propagated; ``curate_batch_prepared``'s
+          guarded ``except Exception`` block decides what to do.
+        """
+        n = len(candidates)
+        if n == 1:
+            # Reached size-1 — single-call path through curate() inherits
+            # idempotency cache, the pre-LLM exact-match short-circuit, and
+            # the escalator.  curate() returns batch_target_index=None, which
+            # remap-by-offset leaves untouched.
+            return [
+                await self.curate(candidates[0], project_id, project_root),
+            ]
+
+        try:
+            return await self._call_llm_batch(
+                candidates, pools, pool_sizes_list, start,
+                project_id, project_root,
+            )
+        except AllAccountsCappedException:
+            raise
+        except CuratorFailureError as exc:
+            mid = n // 2
+            logger.warning(
+                'curate_batch: bisecting size-%d batch on %s '
+                '(subtype=%s timed_out=%s) → halves of %d and %d',
+                n,
+                type(exc).__name__,
+                exc.subtype,
+                exc.timed_out,
+                mid,
+                n - mid,
+            )
+            left, right = await asyncio.gather(
+                self._call_llm_batch_with_fallback(
+                    candidates[:mid], pools[:mid], pool_sizes_list[:mid],
+                    start, project_id, project_root,
+                ),
+                self._call_llm_batch_with_fallback(
+                    candidates[mid:], pools[mid:], pool_sizes_list[mid:],
+                    start, project_id, project_root,
+                ),
+            )
+            # Right-half decisions came back in [0, n-mid)-local space; shift
+            # by mid so within-batch drops point at correct input-local
+            # positions in the concatenated [0, n) result list.  Left-half
+            # batch_target_index values are already input-local — no shift.
+            shifted_right = [
+                _shift_batch_target_index(d, mid) for d in right
+            ]
+            return left + shifted_right
 
     def _build_user_prompt(
         self, candidate: CandidateTask, pool: list[_PoolEntry],
@@ -1452,6 +1617,51 @@ class TaskCurator:
         )
         return '\n'.join(lines)
 
+    def _build_batch_section(
+        self,
+        candidate: CandidateTask,
+        pool: list[_PoolEntry],
+        batch_index: int,
+    ) -> str:
+        """Build one candidate's section of the batched user prompt.
+
+        Mirrors the per-candidate block layout previously inlined in
+        :meth:`_build_batch_user_prompt`; extracted so :meth:`prepare_candidate`
+        can estimate the section's token cost for the worker's batch-sizing
+        decision (the soft ``batch_token_threshold`` accumulator) without
+        having to re-implement the prompt format.
+        """
+        desc_cap = self._config.curator.entry_description_chars
+        details_cap = self._config.curator.entry_details_chars
+
+        lines: list[str] = []
+        lines.append(f'# Candidate batch_index={batch_index}')
+        lines.append(f'  title: {candidate.title}')
+        lines.append(f'  priority: {candidate.priority}')
+        lines.append(f'  spawn_context: {candidate.spawn_context}')
+        if candidate.spawned_from:
+            lines.append(f'  spawned_from: {candidate.spawned_from}')
+        if candidate.description:
+            lines.append(f'  description: {candidate.description[:desc_cap]}')
+        if candidate.details:
+            lines.append(f'  details: {candidate.details[:details_cap]}')
+        if candidate.files_to_modify:
+            lines.append(
+                '  files_to_modify: '
+                + ', '.join(candidate.files_to_modify),
+            )
+        lines.append('')
+
+        lines.append(f'# Pool for batch_index={batch_index} ({len(pool)} tasks)')
+        if not pool:
+            lines.append('  (empty — no candidates; answer "create")')
+        else:
+            for entry in pool:
+                lines.append(entry.render(desc_cap, details_cap))
+                lines.append('')
+        lines.append('')
+        return '\n'.join(lines)
+
     def _build_batch_user_prompt(
         self,
         candidates: list[CandidateTask],
@@ -1463,42 +1673,17 @@ class TaskCurator:
         is prefixed ``# Candidate batch_index={i}`` so the model can address
         decisions by index.  Pools are kept per-candidate (not unioned).
         """
-        desc_cap = self._config.curator.entry_description_chars
-        details_cap = self._config.curator.entry_details_chars
-
-        lines: list[str] = []
-        for i, (candidate, pool) in enumerate(zip(candidates, pools, strict=True)):
-            lines.append(f'# Candidate batch_index={i}')
-            lines.append(f'  title: {candidate.title}')
-            lines.append(f'  priority: {candidate.priority}')
-            lines.append(f'  spawn_context: {candidate.spawn_context}')
-            if candidate.spawned_from:
-                lines.append(f'  spawned_from: {candidate.spawned_from}')
-            if candidate.description:
-                lines.append(f'  description: {candidate.description[:desc_cap]}')
-            if candidate.details:
-                lines.append(f'  details: {candidate.details[:details_cap]}')
-            if candidate.files_to_modify:
-                lines.append(
-                    '  files_to_modify: '
-                    + ', '.join(candidate.files_to_modify),
-                )
-            lines.append('')
-
-            lines.append(f'# Pool for batch_index={i} ({len(pool)} tasks)')
-            if not pool:
-                lines.append('  (empty — no candidates; answer "create")')
-            else:
-                for entry in pool:
-                    lines.append(entry.render(desc_cap, details_cap))
-                    lines.append('')
-            lines.append('')
-
-        lines.append(
+        sections = [
+            self._build_batch_section(candidate, pool, i)
+            for i, (candidate, pool) in enumerate(
+                zip(candidates, pools, strict=True),
+            )
+        ]
+        instruction = (
             'Return one decision per candidate as {"decisions": [...]} '
-            'with a candidate_index field on each item, per the schema.',
+            'with a candidate_index field on each item, per the schema.'
         )
-        return '\n'.join(lines)
+        return '\n'.join([*sections, instruction])
 
 
 # ----------------------------------------------------------------------
@@ -1803,6 +1988,21 @@ def _parse_decision(
         latency_ms=latency_ms,
         cost_usd=agent_result.cost_usd,
     )
+
+
+def _shift_batch_target_index(
+    decision: CuratorDecision, offset: int,
+) -> CuratorDecision:
+    """Add *offset* to ``decision.batch_target_index`` (no-op if None).
+
+    Used by :meth:`TaskCurator._call_llm_batch_with_fallback` to rebase the
+    half-local indices returned by a bisected sub-call into the input-local
+    space of the helper invocation that issued the bisect.
+    """
+    bti = decision.batch_target_index
+    if bti is None:
+        return decision
+    return replace(decision, batch_target_index=bti + offset)
 
 
 def _parse_batch_decisions(

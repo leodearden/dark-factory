@@ -478,17 +478,30 @@ class CuratorConfig(BaseModel):
     entry_details_chars: int = Field(default=1500)
 
     # Batch-curator knobs — the worker drains up to batch_max tickets per
-    # round-trip; timeout and turns scale linearly with N and are clamped at
-    # the caps so no single batch blocks resolve_ticket callers indefinitely.
-    # Formula: timeout = min(timeout_seconds + per_item_slack_seconds * N,
+    # round-trip; timeout, turns, and budget scale linearly with N and are
+    # clamped at the caps so no single batch blocks resolve_ticket callers
+    # indefinitely.
+    # Formula: timeout = min(timeout_seconds + per_item_slack_seconds * (N-1),
     #                        batch_timeout_cap_seconds)
     #          max_turns = min(max_turns + per_item_turns * (N - 1),
     #                          batch_turns_cap)
+    #          budget    = min(max_budget_usd + per_item_budget_usd * (N-1),
+    #                          batch_budget_cap_usd)
     batch_max: int = Field(default=5)
     per_item_slack_seconds: float = Field(default=30.0)
     per_item_turns: int = Field(default=1)
+    per_item_budget_usd: float = Field(default=0.30)
     batch_timeout_cap_seconds: float = Field(default=540.0)
     batch_turns_cap: int = Field(default=10)
+    batch_budget_cap_usd: float = Field(default=2.00)
+    # Soft cap on batched user-prompt tokens: the worker stops adding tickets
+    # to a batch when the next ticket's prepared section would push the
+    # estimate over this threshold. A single oversized ticket still fires as
+    # a size-1 batch (first ticket is always included). ~50K tokens ≈ 200KB
+    # of prompt — aggressive enough to keep batch fan-in high; the scaled
+    # budget (per_item_budget_usd) and the bisecting fallback are the safety
+    # net for occasional stalls. Tunable.
+    batch_token_threshold: int = Field(default=50_000)
 
 
 # --- Top-level ---

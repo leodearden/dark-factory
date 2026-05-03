@@ -15,6 +15,7 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
+    _parse_batch_decisions,
     _parse_decision,
     _parse_decision_dict,
     _PoolEntry,
@@ -1398,6 +1399,407 @@ class TestCallLlmBatchFailure:
 
 
 # ----------------------------------------------------------------------
+# TaskCurator._call_llm_batch — R1: scaled max_budget_usd
+# ----------------------------------------------------------------------
+
+
+class TestCallLlmBatchBudgetScaling:
+    """Fix R1 — the per-call ``max_budget_usd`` cap scales with batch size.
+
+    Whole-batch failures in the 24h trace had 5 ``error_max_budget_usd``
+    misses because the flat $0.30 single-call budget was burned in 1–2
+    turns by a much-larger batch prompt.  The scaling formula mirrors the
+    existing timeout/turns scaling and clamps at ``batch_budget_cap_usd``.
+    """
+
+    def _ar(self, n: int) -> AgentResult:
+        decisions = [
+            {'candidate_index': i, 'action': 'create', 'justification': f'c{i}'}
+            for i in range(n)
+        ]
+        return AgentResult(
+            success=True, output='', cost_usd=0.0,
+            structured_output={'decisions': decisions},
+        )
+
+    @pytest.mark.asyncio
+    async def test_n1_uses_baseline_budget(self):
+        """Batch size 1 (defensive — _call_llm_batch is normally never called
+        for n<2): budget == max_budget_usd (0.30 default), no scaling."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._ar(1))
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title='T0')],
+                pools=[[]], pool_sizes_list=[{}],
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(0.30)
+
+    @pytest.mark.asyncio
+    async def test_n2_scales_by_one_per_item(self):
+        """N=2 → budget = 0.30 + 0.30*(2-1) = 0.60."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._ar(2))
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title=f'T{i}') for i in range(2)],
+                pools=[[], []], pool_sizes_list=[{}, {}],
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(0.60)
+
+    @pytest.mark.asyncio
+    async def test_n5_scales_linearly(self):
+        """N=5 → budget = 0.30 + 0.30*4 = 1.50, well below the $2.00 cap."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._ar(5))
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title=f'T{i}') for i in range(5)],
+                pools=[[]] * 5, pool_sizes_list=[{}] * 5,
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(1.50)
+
+    @pytest.mark.asyncio
+    async def test_clamps_at_batch_budget_cap_usd(self):
+        """N=20 → budget would be 0.30 + 0.30*19 = 6.00; clamped at $2.00."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._ar(20))
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title=f'T{i}') for i in range(20)],
+                pools=[[]] * 20, pool_sizes_list=[{}] * 20,
+                start=0.0, project_id='p', project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
+
+
+# ----------------------------------------------------------------------
+# CuratorFailureError carries subtype from AgentResult (Fix R5)
+# ----------------------------------------------------------------------
+
+
+class TestCuratorFailureErrorSubtype:
+    """Fix R5 — ``CuratorFailureError`` carries the underlying agent
+    result's ``subtype`` so the bisecting fallback can branch on it
+    without leaking the ``AgentResult`` outside the LLM call sites."""
+
+    @pytest.mark.asyncio
+    async def test_subtype_propagated_from_call_llm_batch(self):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        failed = AgentResult(
+            success=False, output='budget',
+            subtype='error_max_budget_usd',
+            turns=2, timed_out=False, duration_ms=4500,
+        )
+        mock = AsyncMock(return_value=failed)
+        with (
+            pytest.raises(CuratorFailureError) as exc_info,
+            patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ),
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title='X'), CandidateTask(title='Y')],
+                pools=[[], []], pool_sizes_list=[{}, {}],
+                start=0.0, project_id='p', project_root='/x',
+            )
+        assert exc_info.value.subtype == 'error_max_budget_usd'
+
+    @pytest.mark.asyncio
+    async def test_subtype_propagated_from_call_llm_single(self):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        failed = AgentResult(
+            success=False, output='timeout',
+            subtype='error_empty_output',
+            turns=0, timed_out=True, duration_ms=300_000,
+        )
+        mock = AsyncMock(return_value=failed)
+        with (
+            pytest.raises(CuratorFailureError) as exc_info,
+            patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ),
+        ):
+            await curator._call_llm(
+                CandidateTask(title='X'),
+                pool=[], pool_sizes={'anchor': 0},
+                start=0.0, project_id='p', project_root='/x',
+            )
+        assert exc_info.value.subtype == 'error_empty_output'
+        assert exc_info.value.timed_out is True
+
+    def test_subtype_defaults_to_none_when_omitted(self):
+        """Defensive: failures originating outside _call_llm[_batch] still
+        construct a CFE without the subtype kwarg.  Default must be None."""
+        err = CuratorFailureError('some other failure')
+        assert err.subtype is None
+
+
+# ----------------------------------------------------------------------
+# _call_llm_batch_with_fallback — bisecting + subtype-aware
+# ----------------------------------------------------------------------
+
+
+class TestCallLlmBatchWithFallback:
+    """Fix R2 — the bisecting helper retries each half on
+    :exc:`CuratorFailureError` (recognised + unknown subtypes alike) and
+    re-raises :exc:`AllAccountsCappedException` without falling back."""
+
+    @pytest.mark.asyncio
+    async def test_n1_base_case_delegates_to_curate(self):
+        """At n=1 the helper bypasses the batch prompt and calls curate()."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        c = CandidateTask(title='T')
+        d = CuratorDecision(action='create', justification='ok')
+        with patch.object(curator, 'curate', new=AsyncMock(return_value=d)) as mc:
+            result = await curator._call_llm_batch_with_fallback(
+                [c], [[]], [{}], 0.0, 'p', '/x',
+            )
+        assert result == [d]
+        mc.assert_awaited_once_with(c, 'p', '/x')
+
+    @pytest.mark.asyncio
+    async def test_curator_failure_error_bisects(self):
+        """A CuratorFailureError on the whole batch bisects into halves."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidates = [CandidateTask(title=f'T{i}') for i in range(4)]
+        pools = [[]] * 4
+        sizes = [{}] * 4
+
+        # First call fails with CFE; bisected halves succeed.
+        call_log: list[int] = []
+        succ = lambda n: AgentResult(  # noqa: E731
+            success=True, output='', cost_usd=0.0,
+            structured_output={
+                'decisions': [
+                    {'candidate_index': i, 'action': 'create',
+                     'justification': f'half-{n}-{i}'}
+                    for i in range(n)
+                ],
+            },
+        )
+
+        async def fake_call_llm_batch(cs, ps, pss, st, pid, pr):
+            n = len(cs)
+            call_log.append(n)
+            if n == len(candidates):
+                raise CuratorFailureError(
+                    'whole-batch boom', subtype='error_max_turns',
+                )
+            return _parse_batch_decisions(
+                succ(n), pools=ps, pool_sizes_list=pss, latency_ms=0,
+            )
+
+        with patch.object(
+            curator, '_call_llm_batch', side_effect=fake_call_llm_batch,
+        ):
+            decisions = await curator._call_llm_batch_with_fallback(
+                candidates, pools, sizes, 0.0, 'p', '/x',
+            )
+        assert len(decisions) == 4
+        assert all(d.action == 'create' for d in decisions)
+        # 1 whole-batch attempt + 2 half attempts = 3 calls; both halves were
+        # size 2 (batch_max bisect halves to size n//2 and n-n//2).
+        assert call_log == [4, 2, 2]
+
+    @pytest.mark.asyncio
+    async def test_unknown_subtype_also_bisects(self):
+        """Both recognised AND unknown subtypes bisect — the rationale is
+        that most LLM-side failures shrink with smaller batches."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidates = [CandidateTask(title=f'T{i}') for i in range(2)]
+
+        async def always_fail(*a, **k):
+            raise CuratorFailureError(
+                'boom', subtype='something_brand_new_we_have_not_seen',
+            )
+
+        # Each curate at n=1 returns a synthetic create.
+        d = CuratorDecision(action='create', justification='from-curate')
+        with patch.object(curator, '_call_llm_batch', side_effect=always_fail), \
+             patch.object(curator, 'curate', new=AsyncMock(return_value=d)) as mc:
+            decisions = await curator._call_llm_batch_with_fallback(
+                candidates, [[], []], [{}, {}], 0.0, 'p', '/x',
+            )
+        # Bisect to n=1 twice; each delegates to curate().
+        assert decisions == [d, d]
+        assert mc.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_all_accounts_capped_propagates_without_bisect(self):
+        """Cap exhaustion on the whole batch must NOT bisect; re-raise so
+        the worker can defer the whole batch instead of repeating the
+        cap-retry storm N times."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidates = [CandidateTask(title=f'T{i}') for i in range(4)]
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=120.0, label='task-curator-batch[p]',
+        )
+        with patch.object(curator, '_call_llm_batch', side_effect=cap_exc), \
+             patch.object(curator, 'curate', new=AsyncMock()) as mc, \
+             pytest.raises(AllAccountsCappedException):
+            await curator._call_llm_batch_with_fallback(
+                candidates, [[]] * 4, [{}] * 4, 0.0, 'p', '/x',
+            )
+        # No fallback to per-item curate.
+        assert mc.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_right_half_batch_target_index_remapped_to_input_local_space(self):
+        """A within-half drop emitted by the right-half LLM call points at a
+        sibling in the right half (right-local idx).  The helper shifts that
+        index by ``mid`` so it indexes the input-local concatenated result.
+        """
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidates = [CandidateTask(title=f'T{i}') for i in range(4)]
+
+        # Whole batch fails → bisects into [T0,T1] and [T2,T3].
+        # Right half emits: T2 = create, T3 = drop with batch_target_index=0
+        # (right-local 0 == T2).  After shift by mid=2, batch_target_index=2
+        # in input-local space (which IS T2's input-local index).
+        async def fake(cs, ps, pss, st, pid, pr):
+            n = len(cs)
+            if n == 4:
+                raise CuratorFailureError('top fail', subtype='error_empty_output')
+            if n == 2:
+                # Identify left vs right by candidate identity.
+                if cs[0] is candidates[0]:
+                    # Left half — both create.
+                    return _parse_batch_decisions(
+                        AgentResult(
+                            success=True, output='', cost_usd=0.0,
+                            structured_output={'decisions': [
+                                {'candidate_index': 0, 'action': 'create',
+                                 'justification': 'L0'},
+                                {'candidate_index': 1, 'action': 'create',
+                                 'justification': 'L1'},
+                            ]},
+                        ),
+                        pools=ps, pool_sizes_list=pss, latency_ms=0,
+                    )
+                # Right half — T2 create; T3 drops to right-local 0 (== T2).
+                return _parse_batch_decisions(
+                    AgentResult(
+                        success=True, output='', cost_usd=0.0,
+                        structured_output={'decisions': [
+                            {'candidate_index': 0, 'action': 'create',
+                             'justification': 'R0'},
+                            {'candidate_index': 1, 'action': 'drop',
+                             'batch_target_index': 0,
+                             'justification': 'dups R0'},
+                        ]},
+                    ),
+                    pools=ps, pool_sizes_list=pss, latency_ms=0,
+                )
+            raise AssertionError(f'unexpected n={n}')
+
+        with patch.object(curator, '_call_llm_batch', side_effect=fake):
+            decisions = await curator._call_llm_batch_with_fallback(
+                candidates, [[]] * 4, [{}] * 4, 0.0, 'p', '/x',
+            )
+
+        # Sanity assertions on the helper's input-local space: T3 (idx 3)
+        # drops to batch_target_index=2 (T2 in input-local space), NOT 0
+        # (which would be T0 — the wrong sibling, in the LEFT half).
+        assert decisions[2].action == 'create'
+        assert decisions[3].action == 'drop'
+        assert decisions[3].batch_target_index == 2, (
+            f'right-half within-half drop must be remapped to input-local '
+            f'idx 2 (T2), got {decisions[3].batch_target_index}'
+        )
+
+
+# ----------------------------------------------------------------------
+# prepare_candidate — Fix R2/R5 split for token-budget accumulator
+# ----------------------------------------------------------------------
+
+
+class TestPrepareCandidate:
+    """The new public split that lets the worker accumulator estimate batch
+    prompt size before fetching the next ticket."""
+
+    @pytest.mark.asyncio
+    async def test_returns_prepared_candidate_with_token_estimate(self):
+        from fused_memory.middleware.task_curator import (
+            PreparedCandidate,
+            estimate_tokens,
+        )
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidate = CandidateTask(
+            title='Add tests for the bisect helper',
+            description='Cover the right-half remap path',
+            details='Drive the bisect path manually via a fake _call_llm_batch.',
+            files_to_modify=['tests/test_task_curator.py'],
+        )
+        # Empty corpus keeps the section deterministic.
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
+            prepared = await curator.prepare_candidate(candidate, 'p', '/x')
+        assert isinstance(prepared, PreparedCandidate)
+        assert prepared.candidate is candidate
+        assert prepared.pool == []
+        assert prepared.pool_sizes['anchor'] == 0
+
+        # Token estimate matches estimate_tokens() of the section the curator
+        # would emit for this candidate at batch_index=0.
+        section = curator._build_batch_section(candidate, [], 0)
+        assert prepared.prompt_tokens == estimate_tokens(section)
+        assert prepared.prompt_tokens > 0  # candidate has real text
+
+    @pytest.mark.asyncio
+    async def test_corpus_failure_degrades_to_empty_pool(self):
+        """Per the existing curate_batch contract, corpus errors degrade to
+        an empty pool so the curator can still call the LLM."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        async def boom(*a, **k):
+            raise RuntimeError('qdrant down')
+        with patch.object(curator, '_build_corpus', side_effect=boom):
+            prepared = await curator.prepare_candidate(
+                CandidateTask(title='X'), 'p', '/x',
+            )
+        assert prepared.pool == []
+        assert prepared.pool_sizes == {
+            'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
+        }
+
+
+# ----------------------------------------------------------------------
 # curate_batch N>1 happy path
 # ----------------------------------------------------------------------
 
@@ -1557,23 +1959,24 @@ class TestCurateBatchWholeBatchFailure:
 
 
 # ----------------------------------------------------------------------
-# curate_batch: fallback on AllAccountsCappedException
+# curate_batch: AllAccountsCappedException now propagates
 # ----------------------------------------------------------------------
 
 
 class TestCurateBatchAllAccountsCapped:
     @pytest.mark.asyncio
-    async def test_cap_exception_falls_back_to_per_candidate_curate(self):
-        """AllAccountsCappedException from _call_llm_batch triggers N serial curate() calls."""
+    async def test_cap_exception_propagates_without_per_candidate_fallback(self):
+        """``AllAccountsCappedException`` from ``_call_llm_batch`` re-raises out of
+        ``curate_batch`` instead of fanning out to N×size-1 ``curate()`` calls.
+
+        Each fallback ``curate()`` would itself burn the ~10-min cap-retry
+        loop; the worker is responsible for deferring the whole batch via
+        :meth:`UsageGate.wait_for_open` (see Fix R5 / R2).
+        """
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         c1 = CandidateTask(title='Cap One')
         c2 = CandidateTask(title='Cap Two')
-
-        fallback_decisions = [
-            CuratorDecision(action='create', justification='cap-fb1'),
-            CuratorDecision(action='create', justification='cap-fb2'),
-        ]
 
         async def empty_corpus(*a, **k):
             return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
@@ -1586,16 +1989,13 @@ class TestCurateBatchAllAccountsCapped:
                      label='task-curator-batch[p]',
                  )),
              ), \
-             patch.object(
-                 curator, 'curate',
-                 new=AsyncMock(side_effect=fallback_decisions),
-             ) as mock_curate:
-            result = await curator.curate_batch([c1, c2], 'p', '/x')
+             patch.object(curator, 'curate', new=AsyncMock()) as mock_curate, \
+             pytest.raises(AllAccountsCappedException):
+            await curator.curate_batch([c1, c2], 'p', '/x')
 
-        assert result == fallback_decisions
-        assert mock_curate.await_count == 2
-        assert mock_curate.call_args_list[0].args[0] is c1
-        assert mock_curate.call_args_list[1].args[0] is c2
+        # Cap exhaustion must NOT trigger the size-1 curate() fallback
+        # (each fallback would repeat the cap-retry storm).
+        assert mock_curate.await_count == 0
 
 
 # ----------------------------------------------------------------------
@@ -1790,7 +2190,10 @@ class TestCurateBatchCacheCheck:
 
     @pytest.mark.asyncio
     async def test_partial_cache_hit_sends_only_uncached_to_llm(self):
-        """Two candidates cached, one uncached → LLM call contains only the uncached one."""
+        """Two candidates cached, one uncached → uncached one goes to the curator
+        single-item path (the bisecting fallback's ``n==1`` base case calls
+        :meth:`TaskCurator.curate` rather than burning a batch prompt for one
+        item)."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         c_cached1 = CandidateTask(title='Cached-One')
@@ -1802,36 +2205,30 @@ class TestCurateBatchCacheCheck:
         curator._store_cache(c_cached1.payload_hash(), d_cached1)
         curator._store_cache(c_cached2.payload_hash(), d_cached2)
 
-        llm_result = AgentResult(
-            success=True,
-            output='',
-            structured_output={'decisions': [
-                {'candidate_index': 0, 'action': 'create', 'justification': 'new-from-llm'},
-            ]},
-            cost_usd=0.01,
-        )
+        d_new = CuratorDecision(action='create', justification='new-from-llm')
 
         async def empty_corpus(*a, **k):
             return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
-        call_candidates: list = []
+        single_calls: list = []
 
-        async def capture_batch(candidates, pools, pool_sizes_list, start, pid, proot):
-            call_candidates.extend(candidates)
-            from fused_memory.middleware.task_curator import _parse_batch_decisions
-            return _parse_batch_decisions(
-                llm_result, pools=pools, pool_sizes_list=pool_sizes_list, latency_ms=0,
-            )
+        async def capture_curate(candidate, project_id, project_root):
+            single_calls.append(candidate)
+            return d_new
 
+        # _call_llm_batch must NOT fire — only one uncached candidate means the
+        # bisecting helper's size-1 base case routes through curate() instead.
+        batch_mock = AsyncMock()
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch.object(curator, '_call_llm_batch', side_effect=capture_batch):
+             patch.object(curator, '_call_llm_batch', new=batch_mock), \
+             patch.object(curator, 'curate', side_effect=capture_curate):
             result = await curator.curate_batch(
                 [c_cached1, c_new, c_cached2], 'p', '/x',
             )
 
-        # LLM should only see the one uncached candidate.
-        assert len(call_candidates) == 1
-        assert call_candidates[0] is c_new
+        assert batch_mock.await_count == 0
+        assert len(single_calls) == 1
+        assert single_calls[0] is c_new
 
         # Result order matches original candidate list.
         assert len(result) == 3

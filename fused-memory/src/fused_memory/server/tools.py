@@ -1748,16 +1748,37 @@ def create_mcp_server(
         metadata: str | dict | None = None,
         append: bool = False,
         tag: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+        dependencies: list[str] | None = None,
     ) -> dict[str, Any]:
         """Update an existing task.
+
+        Prefer structured fields (``title``, ``description``, ``details``,
+        ``priority``, ``status``, ``dependencies``) — agents already have
+        the full context needed to set them directly. Each non-None field
+        overwrites the corresponding column.
+
+        ``prompt`` is legacy: it routes through the LLM-driven Taskmaster
+        path which can drift on re-rewrite. It will be removed once the
+        sqlite cutover is complete.
 
         Args:
             id: Task ID to update
             project_root: Absolute path to project root
-            prompt: New information to incorporate
+            prompt: DEPRECATED — pass structured fields instead.
             metadata: JSON metadata to merge (object or JSON string)
-            append: Append instead of full update
+            append: Append instead of full update (applies to details + metadata)
             tag: Tag context (optional)
+            title: New title (overwrites)
+            description: New description (overwrites)
+            details: New details (overwrites, or appends when ``append=True``)
+            priority: New priority (e.g. "high"/"medium"/"low")
+            status: New status (e.g. "pending"/"in-progress"/"done")
+            dependencies: Replacement list of dependency task ids (top-level only)
         """
         if err := _reject_if_ticket_id('id', id):
             return err
@@ -1777,6 +1798,12 @@ def create_mcp_server(
                 metadata=metadata,
                 append=append,
                 tag=tag,
+                title=title,
+                description=description,
+                details=details,
+                priority=priority,
+                status=status,
+                dependencies=dependencies,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise

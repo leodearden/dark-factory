@@ -68,7 +68,7 @@ taskmaster:
   args: ["${TASKMASTER_DIR:./taskmaster-ai}/dist/mcp-server.js"]
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "all"
-  backend_mode: dual_compare
+  backend_mode: sqlite
   dual_compare_primary: taskmaster
 
 reconciliation:

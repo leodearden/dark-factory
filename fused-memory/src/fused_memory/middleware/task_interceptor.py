@@ -43,6 +43,7 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
+    PreparedCandidate,
     TaskCurator,
     _to_pool_entry,
     flatten_task_tree,
@@ -139,6 +140,40 @@ def _looks_like_task_id(value: object) -> bool:
             return False
         return stripped.isdigit()
     return False
+
+
+@dataclasses.dataclass
+class _PreparedTicket:
+    """Per-ticket bundle accumulated by :meth:`TaskInterceptor._curator_worker`.
+
+    Carries the ticket-store row + parsed blob plus the curator's prepared
+    candidate (corpus pool, pool sizes, prompt-token estimate).  The token
+    estimate is what the worker uses to gate the in-flight batch on the soft
+    :attr:`CuratorConfig.batch_token_threshold` accumulator before fetching
+    the next ticket from the queue.
+
+    ``prepared`` is None when ``candidate`` is None (no title — curator
+    cannot judge it) or when prepare_candidate raised; the dispatch path
+    treats those tickets the same way the legacy "candidate is None" branch
+    did (skip the curator decision, go straight to ``tm.add_task``).
+    """
+
+    ticket_id: str
+    project_root: str
+    project_id: str
+    kwargs: dict
+    metadata: Any
+    candidate: CandidateTask | None
+    prepared: PreparedCandidate | None
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Estimated user-prompt token cost for this ticket's batch section.
+
+        Returns 0 when there is no prepared bundle (the ticket bypasses the
+        curator and contributes nothing to the LLM prompt).
+        """
+        return self.prepared.prompt_tokens if self.prepared is not None else 0
 
 
 def _format_ticket_result(row: dict) -> dict:
@@ -1185,17 +1220,16 @@ class TaskInterceptor:
             )
             return None
 
+        # The curator already produced the coherent rewrite — push it to the
+        # backend as structured fields. No prompt, no LLM rewrite at the
+        # write boundary; sqlite writes the columns directly and the
+        # DualCompareBackend translates per-field for TM. The
+        # files_to_modify list is encoded into details (Taskmaster has no
+        # column for it; readers parse it back from the FILES_TO_MODIFY
+        # marker — kept for compatibility with existing parsers).
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
-        combine_prompt = (
-            'Replace this task with EXACTLY the following fields, verbatim. '
-            'Do not paraphrase, do not merge with existing content, do not add '
-            'commentary. The task curator already produced this coherent '
-            "rewrite that subsumes a duplicate task's work.\n\n"
-            f'TITLE: {rt.title}\n\n'
-            f'DESCRIPTION: {rt.description}\n\n'
-            f'PRIORITY: {rt.priority}\n\n'
-            f'FILES_TO_MODIFY:\n{files_block}\n\n'
-            f'DETAILS:\n{rt.details}\n'
+        details_with_files = (
+            f'FILES_TO_MODIFY:\n{files_block}\n\nDETAILS:\n{rt.details}'
         )
         combine_metadata = json.dumps({
             'curator_action': 'combine',
@@ -1220,9 +1254,12 @@ class TaskInterceptor:
             return dict(await tm.update_task(
                 task_id=decision.target_id,
                 project_root=project_root,
-                prompt=combine_prompt,
                 metadata=combine_metadata,
                 append=False,
+                title=rt.title,
+                description=rt.description,
+                details=details_with_files,
+                priority=rt.priority,
             ))
         except Exception as exc:
             logger.warning(
@@ -1715,62 +1752,237 @@ class TaskInterceptor:
     async def _curator_worker(self, project_id: str) -> None:
         """Drain pending tickets for *project_id* from its per-project queue.
 
-        Processes tickets in batches: blocks on ``queue.get()`` for the first
-        ticket, then opportunistically drains up to ``batch_max - 1`` more via
-        ``queue.get_nowait()`` (non-blocking).  This preserves low-latency for
-        single submitters (no wait for batch fill) while amortising LLM cost
-        when tickets arrive back-to-back under orchestrator load.
+        Builds each batch with a token-budgeted accumulator: blocks on
+        ``queue.get()`` for the first ticket, then opportunistically drains
+        more via ``queue.get_nowait()`` while both ``len(batch) < batch_max``
+        AND the running prompt-token estimate stays under the soft
+        :attr:`CuratorConfig.batch_token_threshold`.  When the next prepared
+        candidate would push the batch over the threshold, it is parked as
+        ``lookahead_ticket_id`` and processed first in the next cycle (where
+        it is re-prepared so its corpus snapshot stays fresh).
 
-        Independent workers per project restore the per-project fairness of the
-        old curator_lock approach: project B is never blocked by a slow LLM
-        call for project A.
+        Failure handling:
 
-        Lifecycle: cancellable; ``close()`` cancels all worker tasks and awaits
-        them so in-flight work is not silently dropped.
+        * :class:`AllAccountsCappedException` — defer the whole batch back to
+          the queue and wait on :meth:`UsageGate.wait_for_open` instead of
+          falling through to N×size-1 individual ``curate()`` retries that
+          would each repeat the cap-retry storm.
+        * Any other exception — log and signal so ``resolve_ticket`` callers
+          are not blocked forever; ticket terminal state is best-effort.
+
+        Independent workers per project restore the per-project fairness of
+        the old curator_lock approach: project B is never blocked by a slow
+        LLM call for project A.
+
+        Lifecycle: cancellable; ``close()`` cancels all worker tasks and
+        awaits them so in-flight work is not silently dropped.
         """
         queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
-        # Determine batch_max from config; fall back to the documented default (5)
-        # when no config is available so that tests without explicit config still
-        # exercise the batch path rather than silently falling back to serial.
-        _raw = getattr(getattr(self._config, 'curator', None), 'batch_max', None)
+        curator_cfg = getattr(self._config, 'curator', None)
+        # Defaults mirror CuratorConfig: batch_max=5, batch_token_threshold=50_000.
+        # Falling back to the documented defaults (instead of disabling the
+        # batch path) keeps tests without explicit config exercising the same
+        # code path that runs in production.
+        _raw = getattr(curator_cfg, 'batch_max', None)
         batch_max: int = (
             _raw
             if isinstance(_raw, int) and not isinstance(_raw, bool) and _raw >= 1
             else 5
-        )  # falls back to CuratorConfig default (5) for None, bool, non-int, or ≤0
+        )
+        _tt = getattr(curator_cfg, 'batch_token_threshold', None)
+        threshold_tokens: int = (
+            _tt
+            if isinstance(_tt, int) and not isinstance(_tt, bool) and _tt >= 1
+            else 50_000
+        )
+
+        # Carries one ticket between cycles when adding it would have pushed
+        # the previous batch over the token threshold.  Stored as a bare
+        # ticket_id (NOT a prepared bundle) so the next cycle re-prepares it
+        # under the fresh curator_lock — avoids dispatching against a corpus
+        # snapshot that went stale across cycles.
+        lookahead_ticket_id: str | None = None
 
         try:
             while True:
-                # Block on the first ticket — never spin.
-                first_ticket = await queue.get()
-                batch: list[str] = [first_ticket]
+                # Resolve the first ticket of this cycle: prefer the carried-
+                # over lookahead from the previous cycle.  Otherwise block.
+                if lookahead_ticket_id is not None:
+                    first_ticket_id: str = lookahead_ticket_id
+                    lookahead_ticket_id = None
+                else:
+                    first_ticket_id = await queue.get()
 
-                # Opportunistic drain: grab more tickets without waiting.
-                while len(batch) < batch_max:
-                    try:
-                        batch.append(queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-
+                batch_ticket_ids: list[str] = [first_ticket_id]
                 try:
-                    await self._process_add_tickets_batch(batch)
+                    prepared_batch: list[_PreparedTicket] = []
+                    first_prepared = await self._prepare_ticket(first_ticket_id)
+                    if first_prepared is not None:
+                        prepared_batch.append(first_prepared)
+                        batch_tokens = first_prepared.prompt_tokens
+                    else:
+                        # _prepare_ticket already wrote terminal + signalled.
+                        batch_tokens = 0
+
+                    # Opportunistic drain with token-budget gate.  First-ticket-
+                    # always-included is preserved by the threshold check
+                    # gating only AFTER the first prepared sits in the batch.
+                    while len(prepared_batch) < batch_max:
+                        try:
+                            tid = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        prep = await self._prepare_ticket(tid)
+                        if prep is None:
+                            # Skipped (missing/terminal/bad-json) — queue
+                            # accounting still needs the get to be balanced.
+                            queue.task_done()
+                            continue
+                        if (
+                            prepared_batch
+                            and batch_tokens + prep.prompt_tokens
+                            > threshold_tokens
+                        ):
+                            # Park as lookahead; do NOT add to batch.  The
+                            # corresponding queue.task_done() runs below in
+                            # the success/finally branch only for tickets
+                            # that *were* in batch_ticket_ids.  This ticket
+                            # was got() but not task_done()'d — instead we
+                            # re-claim it as the first ticket of the next
+                            # cycle and balance with task_done() then.
+                            lookahead_ticket_id = tid
+                            break
+                        prepared_batch.append(prep)
+                        batch_ticket_ids.append(tid)
+                        batch_tokens += prep.prompt_tokens
+
+                    if prepared_batch:
+                        await self._process_add_tickets_batch_prepared(
+                            prepared_batch,
+                        )
+                except AllAccountsCappedException as exc:
+                    # All accounts capped — N×size-1 fallback would each
+                    # repeat the cap-retry storm (~10 min per ticket).
+                    # Re-enqueue only the tickets that were ``get()``-ed and
+                    # counted in ``batch_ticket_ids`` (the finally block will
+                    # ``task_done()`` each of those, balancing the new put).
+                    # Any lookahead was ``get()``-ed but never added to
+                    # ``batch_ticket_ids``: leave it parked in
+                    # ``lookahead_ticket_id`` so the next cycle re-prepares it
+                    # via the lookahead branch (no new get + no extra put,
+                    # preserving the put/task_done balance).
+                    logger.warning(
+                        '_curator_worker: AllAccountsCappedException for '
+                        'project %s (retries=%d, elapsed=%.1fs); deferring '
+                        '%d batch tickets%s and waiting for cap reset',
+                        project_id, exc.retries, exc.elapsed_secs,
+                        len(batch_ticket_ids),
+                        ' (+1 lookahead held in worker)'
+                        if lookahead_ticket_id is not None else '',
+                    )
+                    for tid in batch_ticket_ids:
+                        queue.put_nowait(tid)
+                    if self._usage_gate is not None:
+                        await self._usage_gate.wait_for_open(timeout=300)
                 except Exception:
                     logger.exception(
-                        '_curator_worker: unhandled error processing batch of %d '
-                        'tickets for project %s',
-                        len(batch), project_id,
+                        '_curator_worker: unhandled error processing batch '
+                        'of %d tickets for project %s',
+                        len(batch_ticket_ids), project_id,
                     )
-                    # Signal all ticket waiters so resolve_ticket callers are not
-                    # blocked forever if _process_add_tickets_batch raised before
-                    # calling _signal_ticket_event for each ticket.
-                    for tid in batch:
+                    # Signal so resolve_ticket callers are not blocked forever
+                    # when _process_add_tickets_batch_prepared raised before
+                    # mark_resolved + signal for each ticket.
+                    for tid in batch_ticket_ids:
                         self._signal_ticket_event(tid)
                 finally:
-                    # Mark all drained tickets as done in the queue.
-                    for _ in batch:
+                    # Balance queue.task_done() for every ticket we got() in
+                    # this cycle's batch (including those we re-enqueued for
+                    # a cap-defer — the put_nowait() created a fresh entry).
+                    for _ in batch_ticket_ids:
                         queue.task_done()
         except asyncio.CancelledError:
             pass
+
+    async def _prepare_ticket(self, ticket_id: str) -> _PreparedTicket | None:
+        """Load + parse a ticket and prepare its curator corpus.
+
+        Returns ``None`` if the ticket is missing, already terminal, or has
+        bad ``candidate_json``.  In the bad-JSON case the ticket is marked
+        ``failed`` and waiters are signalled before returning ``None``.
+
+        Returns a populated :class:`_PreparedTicket` for valid tickets.
+        ``prepared`` is ``None`` when the ticket has no title (curator cannot
+        judge it) or the curator instance is not yet available — the
+        downstream dispatch path treats those the same way the legacy
+        ``candidate is None`` branch did.
+        """
+        if self._ticket_store is None:
+            return None
+        row = await self._ticket_store.get(ticket_id)
+        if row is None:
+            logger.warning(
+                '_prepare_ticket: ticket %s not found in store, skipping',
+                ticket_id,
+            )
+            return None
+        if row['status'] != 'pending':
+            logger.warning(
+                '_prepare_ticket: ticket %s already terminal (%s), skipping',
+                ticket_id, row['status'],
+            )
+            return None
+
+        try:
+            blob = json.loads(row['candidate_json'])
+        except Exception:
+            logger.exception(
+                '_prepare_ticket: bad candidate_json for %s', ticket_id,
+            )
+            await self._ticket_store.mark_resolved(
+                ticket_id, status='failed', reason='bad_candidate_json',
+            )
+            self._signal_ticket_event(ticket_id)
+            return None
+
+        project_root: str = blob['project_root']
+        kwargs: dict = dict(blob.get('kwargs', {}))
+        metadata = blob.get('metadata')
+        project_id = resolve_project_id(project_root)
+
+        kwargs_for_candidate = dict(kwargs)
+        if metadata is not None:
+            kwargs_for_candidate['metadata'] = metadata
+        candidate = self._build_candidate(kwargs_for_candidate)
+
+        prepared: PreparedCandidate | None = None
+        if candidate is not None:
+            curator = await self._get_curator()
+            if curator is not None:
+                try:
+                    prepared = await curator.prepare_candidate(
+                        candidate, project_id, project_root,
+                    )
+                except Exception:
+                    # prepare_candidate already swallows corpus-build failure
+                    # to an empty pool; an exception here is unexpected.
+                    # Continue with prepared=None — dispatch falls through
+                    # to a per-ticket curate() call inside the prepared
+                    # variant of _process_add_tickets_batch.
+                    logger.exception(
+                        '_prepare_ticket: curator.prepare_candidate failed '
+                        'for ticket %s', ticket_id,
+                    )
+
+        return _PreparedTicket(
+            ticket_id=ticket_id,
+            project_root=project_root,
+            project_id=project_id,
+            kwargs=kwargs,
+            metadata=metadata,
+            candidate=candidate,
+            prepared=prepared,
+        )
 
     async def _dispatch_ticket_decision(
         self,
@@ -2133,12 +2345,37 @@ class TaskInterceptor:
         self._signal_ticket_event(ticket_id)
 
     async def _process_add_tickets_batch(self, ticket_ids: list[str]) -> None:
-        """Run the full curator + write pipeline for a batch of tickets.
+        """Thin wrapper: prepare each ticket and delegate to the prepared variant.
 
-        Calls ``curator.curate_batch`` once for all candidates, then dispatches
-        each per-ticket decision under a single ``_curator_lock`` acquisition
-        (R3 invariant).  All tickets in a batch must share the same project_id
-        (guaranteed by the per-project queue draining in ``_curator_worker``).
+        Preserves the historical entry point used by tests that drove batches
+        via raw ticket IDs (the worker now calls
+        :meth:`_process_add_tickets_batch_prepared` directly so it can
+        accumulate prepared bundles under the soft token threshold).  Tickets
+        that ``_prepare_ticket`` rejects (missing/terminal/bad-json) are
+        dropped here; the prepare step already wrote the failure terminal
+        and signalled waiters.
+        """
+        if not ticket_ids:
+            return
+        prepared: list[_PreparedTicket] = []
+        for tid in ticket_ids:
+            p = await self._prepare_ticket(tid)
+            if p is not None:
+                prepared.append(p)
+        if prepared:
+            await self._process_add_tickets_batch_prepared(prepared)
+
+    async def _process_add_tickets_batch_prepared(
+        self, prepared_tickets: list[_PreparedTicket],
+    ) -> None:
+        """Run the full curator + write pipeline for a batch of pre-prepared tickets.
+
+        Calls :meth:`TaskCurator.curate_batch_prepared` once for all candidates
+        (re-using the already-built corpus pools carried on each
+        :class:`_PreparedTicket`), then dispatches each per-ticket decision
+        under a single ``_curator_lock`` acquisition (R3 invariant).  All
+        tickets in a batch must share the same project_id — guaranteed by the
+        per-project queue draining in :meth:`_curator_worker`.
 
         Terminal status values written (per ticket):
         - ``created``  — task was created via ``tm.add_task``
@@ -2147,203 +2384,213 @@ class TaskInterceptor:
 
         Per-ticket failures are isolated: one ticket failing does not prevent
         other tickets from being processed.
+
+        Cap exhaustion contract: :class:`AllAccountsCappedException` raised
+        from the curator propagates to the caller (the worker), which defers
+        the whole batch back to the queue and waits on
+        :meth:`UsageGate.wait_for_open` instead of falling through to N
+        size-1 curate() calls (each of which would repeat the cap-retry
+        storm).
         """
         if self._ticket_store is None:
             return
-        if not ticket_ids:
+        if not prepared_tickets:
             return
 
-        # ── Load and validate all tickets ─────────────────────────────────────
-        # Build per-ticket data; skip missing or already-terminal rows.
-        ticket_data: list[tuple[str, dict, dict, str, dict, Any, CandidateTask | None]] = []
-        # (ticket_id, row, blob, project_root, kwargs, metadata, candidate)
-
-        project_id: str | None = None
-        project_root: str | None = None
-
-        for ticket_id in ticket_ids:
-            row = await self._ticket_store.get(ticket_id)
-            if row is None:
-                logger.warning(
-                    '_process_add_tickets_batch: ticket %s not found in store, skipping',
-                    ticket_id,
-                )
-                continue
-            if row['status'] != 'pending':
-                logger.warning(
-                    '_process_add_tickets_batch: ticket %s already terminal (%s), skipping',
-                    ticket_id, row['status'],
-                )
-                continue
-
-            try:
-                blob = json.loads(row['candidate_json'])
-            except Exception:
-                logger.exception(
-                    '_process_add_tickets_batch: bad candidate_json for %s', ticket_id,
-                )
-                await self._ticket_store.mark_resolved(
-                    ticket_id, status='failed', reason='bad_candidate_json',
-                )
-                self._signal_ticket_event(ticket_id)
-                continue
-
-            t_project_root: str = blob['project_root']
-            t_kwargs: dict = dict(blob.get('kwargs', {}))
-            t_metadata = blob.get('metadata')
-            t_project_id = resolve_project_id(t_project_root)
-
-            # All tickets in the batch must share project_id (per-project queue invariant).
-            if project_id is None:
-                project_id = t_project_id
-                project_root = t_project_root
-            elif t_project_id != project_id:
-                logger.warning(
-                    '_process_add_tickets_batch: ticket %s has project_id=%s, '
-                    'expected %s; skipping',
-                    ticket_id, t_project_id, project_id,
-                )
-                continue
-
-            # Rebuild candidate for curator.
-            kwargs_for_candidate = dict(t_kwargs)
-            if t_metadata is not None:
-                kwargs_for_candidate['metadata'] = t_metadata
-            candidate = self._build_candidate(kwargs_for_candidate)
-
-            ticket_data.append((
-                ticket_id, row, blob, t_project_root, t_kwargs, t_metadata, candidate,
-            ))
-
-        if not ticket_data or project_id is None or project_root is None:
-            return
+        # All tickets in the batch must share project_id (per-project queue
+        # invariant).  Reject mixed-project batches defensively.
+        project_id = prepared_tickets[0].project_id
+        project_root = prepared_tickets[0].project_root
+        ticket_data = [
+            t for t in prepared_tickets
+            if t.project_id == project_id
+        ]
+        if len(ticket_data) != len(prepared_tickets):
+            for t in prepared_tickets:
+                if t.project_id != project_id:
+                    logger.warning(
+                        '_process_add_tickets_batch_prepared: ticket %s has '
+                        'project_id=%s, expected %s; skipping',
+                        t.ticket_id, t.project_id, project_id,
+                    )
 
         # ── Curator + dispatch under a single curator_lock ─────────────────────
         async with self._curator_lock(project_id):
-            # Get curator once for the whole batch.
             curator = await self._get_curator()
 
             # ── R4 idempotency checks (per-ticket, before curator call) ──────
-            # Same short-circuit that _process_add_ticket performs.  Tickets
-            # that match an existing non-cancelled task are resolved 'combined'
-            # immediately and excluded from the curate_batch call.
-            active_ticket_data: list[tuple] = []
-            for entry in ticket_data:
-                tid, _, _, t_pr, _, t_meta, _ = entry
+            # Tickets that match an existing non-cancelled task are resolved
+            # 'combined' immediately and excluded from the curate call.
+            active_ticket_data: list[_PreparedTicket] = []
+            for t in ticket_data:
                 idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=t_pr, metadata=t_meta,
+                    project_root=t.project_root, metadata=t.metadata,
                 )
                 if idempotency_hit is not None:
                     existing_id = str(idempotency_hit.get('id', ''))
                     await self._ticket_store.mark_resolved(
-                        tid,
+                        t.ticket_id,
                         status='combined',
                         task_id=existing_id or None,
                         reason='idempotency_hit',
                         result_json=json.dumps(idempotency_hit),
                     )
-                    self._signal_ticket_event(tid)
+                    self._signal_ticket_event(t.ticket_id)
                 else:
-                    active_ticket_data.append(entry)
+                    active_ticket_data.append(t)
             ticket_data = active_ticket_data
 
             if not ticket_data:
                 return  # All tickets short-circuited by idempotency
 
-            # Build candidates list for curate_batch.
             candidates: list[CandidateTask | None] = [
-                entry[6] for entry in ticket_data
+                t.candidate for t in ticket_data
             ]
-            non_none_candidates = [c for c in candidates if c is not None]
+            # non_none-space slice that goes to the curator.  We pass the
+            # already-prepared bundles so the curator skips the second
+            # corpus build it would otherwise do inside curate_batch.
+            non_none_prepared: list[PreparedCandidate] = [
+                t.prepared for t in ticket_data
+                if t.candidate is not None and t.prepared is not None
+            ]
+            non_none_to_ticket_data = [
+                i for i, t in enumerate(ticket_data)
+                if t.candidate is not None and t.prepared is not None
+            ]
+            # Tickets that have a candidate but no prepared bundle — usually
+            # because :meth:`_prepare_ticket` could not invoke
+            # ``prepare_candidate`` (transient error, or a mock without the
+            # method during tests).  These are dispatched via single-item
+            # ``curate()`` after the main batch so we still get the curator's
+            # decision for them instead of falling straight through to
+            # ``tm.add_task`` (the latter would silently bypass the gate).
+            unprepared_indices: list[int] = [
+                i for i, t in enumerate(ticket_data)
+                if t.candidate is not None and t.prepared is None
+            ]
             # Per-ticket curator degrade reason (populated on fallback path).
             curator_degrade_reasons: list[str | None] = [None] * len(ticket_data)
 
-            # Call curate_batch — one LLM round-trip for all candidates.
+            # Call curate_batch_prepared — one LLM round-trip for all candidates.
             decisions: list[CuratorDecision | None]
-            if curator is not None and non_none_candidates:
+            if curator is not None and non_none_prepared:
                 try:
-                    batch_decisions = await curator.curate_batch(
-                        non_none_candidates, project_id, project_root,
+                    batch_decisions = await curator.curate_batch_prepared(
+                        non_none_prepared, project_id, project_root,
                     )
-                    # Map decisions back to ticket_data-space (some candidates are None).
-                    # batch_target_index emitted by curate_batch is in non_none-space
-                    # (positions within non_none_candidates, which is what the LLM saw).
-                    # We must remap it to ticket_data-space (positions in candidates)
-                    # before the topological dispatch loop, which keys resolved_task_ids
-                    # by ticket_data-space indices.
-                    non_none_to_ticket_data = [
-                        i for i, c in enumerate(candidates) if c is not None
-                    ]
+                    # Map decisions back to ticket_data-space (some candidates
+                    # are None).  batch_target_index emitted by the curator is
+                    # in non_none-space (positions within non_none_prepared,
+                    # which is what the LLM saw).  Remap to ticket_data-space
+                    # so the topological dispatch loop can index
+                    # resolved_task_ids by ticket_data-space indices.
                     batch_idx = 0
                     decisions = []
-                    for c in candidates:
-                        if c is None:
+                    for i, t in enumerate(ticket_data):
+                        if t.candidate is None or t.prepared is None:
                             decisions.append(None)
-                        else:
-                            bd = (
-                                batch_decisions[batch_idx]
-                                if batch_idx < len(batch_decisions)
-                                else None
-                            )
-                            # Remap batch_target_index: non_none-space → ticket_data-space.
-                            # Single-item curate() calls in the fallback path cannot emit
-                            # batch_target_index, so no remap is needed there.
-                            if bd is not None and bd.batch_target_index is not None:
-                                local_bti = bd.batch_target_index
-                                if 0 <= local_bti < len(non_none_to_ticket_data):
-                                    remapped_bti = non_none_to_ticket_data[local_bti]
-                                    bd = dataclasses.replace(
-                                        bd, batch_target_index=remapped_bti,
-                                    )
-                                else:
-                                    # Out-of-range in non_none-space: degrade to create
-                                    # to avoid substituting a wrong task_id.
-                                    logger.warning(
-                                        '_process_add_tickets_batch: batch_target_index=%d '
-                                        'out of non_none range [0, %d) for ticket %d; '
-                                        'degrading to create',
-                                        local_bti, len(non_none_to_ticket_data), batch_idx,
-                                    )
-                                    bd = CuratorDecision(
-                                        action='create',
-                                        justification=(
-                                            f'batch-target-out-of-range: '
-                                            f'local={local_bti}'
-                                        ),
-                                    )
-                            decisions.append(bd)
-                            batch_idx += 1
-                except (CuratorFailureError, AllAccountsCappedException) as exc:
-                    # Whole batch LLM failure: fall back to individual curate() calls.
-                    # This path preserves per-ticket curator_degrade_reason so that
-                    # result_json records the failure reason (same as _process_add_ticket).
+                            continue
+                        bd = (
+                            batch_decisions[batch_idx]
+                            if batch_idx < len(batch_decisions)
+                            else None
+                        )
+                        # Remap batch_target_index: non_none-space → ticket_data-space.
+                        if bd is not None and bd.batch_target_index is not None:
+                            local_bti = bd.batch_target_index
+                            if 0 <= local_bti < len(non_none_to_ticket_data):
+                                remapped_bti = non_none_to_ticket_data[local_bti]
+                                bd = dataclasses.replace(
+                                    bd, batch_target_index=remapped_bti,
+                                )
+                            else:
+                                # Out-of-range in non_none-space: degrade to
+                                # create to avoid substituting a wrong task_id.
+                                logger.warning(
+                                    '_process_add_tickets_batch_prepared: '
+                                    'batch_target_index=%d out of non_none '
+                                    'range [0, %d) for ticket %s; degrading '
+                                    'to create',
+                                    local_bti, len(non_none_to_ticket_data),
+                                    t.ticket_id,
+                                )
+                                bd = CuratorDecision(
+                                    action='create',
+                                    justification=(
+                                        f'batch-target-out-of-range: '
+                                        f'local={local_bti}'
+                                    ),
+                                )
+                        decisions.append(bd)
+                        batch_idx += 1
+                except AllAccountsCappedException:
+                    # Cap exhaustion bubbles to the worker, which defers the
+                    # whole batch and waits for cap reset.  Re-raising here
+                    # avoids the wasteful N×size-1 fallback that the legacy
+                    # path used to take on cap exhaustion (each fallback call
+                    # would repeat the ~10-min cap-retry storm).
+                    raise
+                except CuratorFailureError as exc:
+                    # The bisecting fallback in curate_batch_prepared no
+                    # longer surfaces CuratorFailureError to the caller for
+                    # ordinary per-batch failures (it bisects all the way to
+                    # size-1, where curate() handles its own degrade).  But
+                    # keep this catch as a defensive net for any escape — same
+                    # legacy behaviour: degrade all candidates to a per-item
+                    # curate() call so per-ticket curator_degrade_reason is
+                    # still recorded in result_json.
                     logger.warning(
-                        '_process_add_tickets_batch: curate_batch raised %s for '
-                        'project %s; falling back to %d individual curate() calls',
-                        type(exc).__name__, project_id, len(non_none_candidates),
+                        '_process_add_tickets_batch_prepared: '
+                        'curate_batch_prepared raised CuratorFailureError '
+                        'for project %s; falling back to %d individual '
+                        'curate() calls',
+                        project_id, len(non_none_prepared),
                     )
-                    batch_idx = 0
                     decisions = []
-                    for i, c in enumerate(candidates):
-                        if c is None:
+                    for i, t in enumerate(ticket_data):
+                        if t.candidate is None:
                             decisions.append(None)
-                        else:
-                            try:
-                                d = await curator.curate(c, project_id, project_root)
-                                decisions.append(d)
-                            except CuratorFailureError as e:
-                                decisions.append(CuratorDecision(action='create'))
-                                curator_degrade_reasons[i] = str(e)
-                            batch_idx += 1
+                            continue
+                        try:
+                            d = await curator.curate(
+                                t.candidate, project_id, project_root,
+                            )
+                            decisions.append(d)
+                        except CuratorFailureError as e:
+                            decisions.append(CuratorDecision(action='create'))
+                            curator_degrade_reasons[i] = str(e)
+                    # Refer to exc to satisfy linters; main signal logged above.
+                    _ = exc
                 except Exception:  # pyright: ignore[reportUnusedExcept]
                     logger.exception(
-                        '_process_add_tickets_batch: curate_batch failed for project %s; '
+                        '_process_add_tickets_batch_prepared: '
+                        'curate_batch_prepared failed for project %s; '
                         'degrading all %d candidates to create',
-                        project_id, len(non_none_candidates),
+                        project_id, len(non_none_prepared),
                     )
                     decisions = [None] * len(ticket_data)
             else:
                 decisions = [None] * len(ticket_data)
+
+            # Backfill any unprepared candidates via single-item curate() so
+            # we still get a curator decision instead of falling through to
+            # tm.add_task on prepare failures.  In production prepare_candidate
+            # itself swallows corpus errors to an empty pool, so this loop is
+            # rarely hit.  In tests where the curator mock omits
+            # prepare_candidate, this restores the legacy curate-then-dispatch
+            # behaviour the tests rely on.
+            if curator is not None and unprepared_indices:
+                for i in unprepared_indices:
+                    t = ticket_data[i]
+                    if t.candidate is None:
+                        continue
+                    try:
+                        decisions[i] = await curator.curate(
+                            t.candidate, project_id, project_root,
+                        )
+                    except CuratorFailureError as exc:
+                        decisions[i] = CuratorDecision(action='create')
+                        curator_degrade_reasons[i] = str(exc)
 
             # ── Topologically-ordered dispatch ────────────────────────────────
             # Items with batch_target_index wait for their target to be
@@ -2394,16 +2641,17 @@ class TaskInterceptor:
                         else:
                             # Sibling failed — degrade this item to create.
                             logger.warning(
-                                '_process_add_tickets_batch: batch_target_index=%d '
-                                'for ticket %s had no task_id; degrading to create',
-                                batch_target, ticket_data[i][0],
+                                '_process_add_tickets_batch_prepared: '
+                                'batch_target_index=%d for ticket %s had no '
+                                'task_id; degrading to create',
+                                batch_target, ticket_data[i].ticket_id,
                             )
                             effective_decision = CuratorDecision(
                                 action='create',
                                 justification='batch-sibling-failed: degraded to create',
                             )
 
-                    ticket_id, _, _, t_project_root, t_kwargs, t_metadata, candidate = ticket_data[i]
+                    t = ticket_data[i]
                     status = 'failed'
                     task_id: str | None = None
                     reason: str | None = None
@@ -2412,13 +2660,13 @@ class TaskInterceptor:
                     try:
                         status, task_id, reason, result_dict, _ = (
                             await self._dispatch_ticket_decision(
-                                ticket_id=ticket_id,
-                                project_root=t_project_root,
+                                ticket_id=t.ticket_id,
+                                project_root=t.project_root,
                                 project_id=project_id,
-                                candidate=candidate,
+                                candidate=t.candidate,
                                 decision=effective_decision,
-                                kwargs=t_kwargs,
-                                metadata=t_metadata,
+                                kwargs=t.kwargs,
+                                metadata=t.metadata,
                                 curator=curator,
                                 curator_degrade_reason=(
                                     curator_degrade_reasons[i]
@@ -2431,8 +2679,8 @@ class TaskInterceptor:
                         raise
                     except Exception as exc:
                         logger.exception(
-                            '_process_add_tickets_batch: dispatch failed for ticket %s',
-                            ticket_id,
+                            '_process_add_tickets_batch_prepared: dispatch '
+                            'failed for ticket %s', t.ticket_id,
                         )
                         status = 'failed'
                         reason = str(exc)
@@ -2442,7 +2690,7 @@ class TaskInterceptor:
                     # Persist terminal state.
                     await asyncio.shield(
                         self._ticket_store.mark_resolved(
-                            ticket_id,
+                            t.ticket_id,
                             status=status,
                             task_id=task_id,
                             reason=reason,
@@ -2454,13 +2702,13 @@ class TaskInterceptor:
                     if status == 'created' and task_id:
                         event = self._make_event(
                             EventType.task_created,
-                            t_project_root,
+                            t.project_root,
                             {'operation': 'add_task', 'task_id': task_id},
                         )
                         await self._journal(event)
-                        self._schedule_commit(t_project_root, 'add_task')
+                        self._schedule_commit(t.project_root, 'add_task')
 
-                    self._signal_ticket_event(ticket_id)
+                    self._signal_ticket_event(t.ticket_id)
 
                     # Record this item's result for downstream sibling drops.
                     resolved_task_ids[i] = task_id
@@ -2472,8 +2720,9 @@ class TaskInterceptor:
                     # Remaining items form a cycle (should not happen after parser
                     # cycle detection, but handle defensively).
                     logger.warning(
-                        '_process_add_tickets_batch: cycle in batch_target_index '
-                        'graph for project %s; coercing %d items to create',
+                        '_process_add_tickets_batch_prepared: cycle in '
+                        'batch_target_index graph for project %s; coercing '
+                        '%d items to create',
                         project_id, len(pending_indices),
                     )
                     for i in pending_indices:
