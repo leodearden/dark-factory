@@ -1066,6 +1066,18 @@ class TaskWorkflow:
                 self.task_id, self.modules, plan_modules
             )
             if not expanded:
+                # Annotate the requeue so the per-task retry-cap report can
+                # name *why* — without this, three blast-radius requeues in a
+                # row produce a cap-exhaust report with phase/reason='unknown'.
+                additional = sorted(set(plan_modules) - set(self.modules))
+                self._last_block_phase = self.state.value
+                self._last_block_reason = 'plan_blast_radius_lock_conflict'
+                self._last_block_detail = (
+                    f'Plan expansion blocked: additional locks {additional} '
+                    f'unavailable (held by other tasks). '
+                    f'Held modules: {sorted(self.modules)}; '
+                    f'plan modules: {sorted(plan_modules)}.'
+                )
                 return WorkflowOutcome.REQUEUED
             self.modules = plan_modules
             self._module_configs = self._resolve_module_configs()
