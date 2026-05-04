@@ -366,6 +366,115 @@ class TestGetTasksExceptionLogging:
         assert 'Traceback' in caplog.text
 
 
+class TestGetTasksNormalizesMetadata:
+    """get_tasks() must coerce ``task['metadata']`` to a dict at the boundary.
+
+    The fused-memory wire format may surface metadata as a JSON string,
+    a dict, ``None``, or an unparseable string. Downstream consumers
+    (briefing._format_task, _get_modules, workflow no-plan/infra-thrash
+    counters) all read dict-keyed sub-fields. Normalizing once here lets
+    every consumer assume ``isinstance(task['metadata'], dict)``.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @staticmethod
+    def _envelope(tasks: list[dict]) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': _json.dumps({'tasks': tasks}),
+                    }
+                ]
+            }
+        }
+
+    @pytest.mark.parametrize(
+        'raw_metadata, expected',
+        [
+            ('{"foo": 1}', {'foo': 1}),
+            ({'foo': 1}, {'foo': 1}),
+            (None, {}),
+            ('not-json', {}),
+            ('"just-a-string"', {}),
+            ('[1,2,3]', {}),
+        ],
+        ids=[
+            'json-string',
+            'dict-passthrough',
+            'absent',
+            'invalid-string',
+            'parses-to-string',
+            'parses-to-list',
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_metadata_is_normalized_to_dict(
+        self, scheduler: Scheduler, monkeypatch, raw_metadata, expected
+    ):
+        task = {'id': '1', 'metadata': raw_metadata}
+        # Some envelopes intentionally omit metadata entirely (None case
+        # also exercises the absent-key path through .get()).
+        if raw_metadata is None:
+            task.pop('metadata')
+
+        envelope = self._envelope([task])
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=envelope),
+        )
+
+        tasks = await scheduler.get_tasks()
+
+        assert len(tasks) == 1
+        assert isinstance(tasks[0]['metadata'], dict)
+        assert tasks[0]['metadata'] == expected
+
+    @pytest.mark.asyncio
+    async def test_normalize_is_in_place(self, scheduler: Scheduler, monkeypatch):
+        """All tasks in a multi-task response are normalized."""
+        envelope = self._envelope([
+            {'id': '1', 'metadata': '{"a": 1}'},
+            {'id': '2', 'metadata': {'b': 2}},
+            {'id': '3', 'metadata': 'garbage'},
+            {'id': '4'},
+        ])
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=envelope),
+        )
+
+        tasks = await scheduler.get_tasks()
+
+        assert [t['metadata'] for t in tasks] == [
+            {'a': 1},
+            {'b': 2},
+            {},
+            {},
+        ]
+
+    def test_normalize_helper_directly(self):
+        """Unit-level coverage of the static helper."""
+        cases = [
+            ({'metadata': '{"foo": 1}'}, {'foo': 1}),
+            ({'metadata': {'foo': 1}}, {'foo': 1}),
+            ({'metadata': None}, {}),
+            ({'metadata': 'not-json'}, {}),
+            ({'metadata': '"just-a-string"'}, {}),
+            ({'metadata': '[1,2,3]'}, {}),
+            ({}, {}),
+        ]
+        for task, expected in cases:
+            Scheduler._normalize_task_metadata(task)
+            assert task['metadata'] == expected, f'failed for input: {task}'
+
+
 class TestParseToolTextResultWarning:
     """_parse_tool_text_result must emit a WARNING when JSON parsing fails.
 
@@ -839,57 +948,65 @@ class TestDepsSatisfiedLogging:
 
 
 class TestGetModulesJsonStringMetadata:
-    """_get_modules must parse JSON string metadata, not just dict metadata."""
+    """_get_modules consumes the post-normalization invariant.
+
+    Scheduler.get_tasks coerces ``task['metadata']`` to a dict before any
+    consumer sees it (see TestGetTasksNormalizesMetadata). _get_modules is
+    therefore expected to receive a dict and degrade gracefully to a
+    task-<id> fallback if it ever receives a non-dict (malformed test
+    fixture, eval-mode bypass, etc.).
+    """
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
         return Scheduler(config)
 
-    def test_get_modules_extracts_modules_from_json_string_metadata(
+    def test_get_modules_extracts_modules_from_dict_metadata(
         self, scheduler: Scheduler
     ):
-        """_get_modules returns normalized module list when metadata is a JSON string with 'modules'."""
+        """_get_modules returns normalized module list from dict metadata."""
         task = {
             'id': '5',
-            'metadata': '{"modules": ["backend", "server"]}',
+            'metadata': {'modules': ['backend', 'server']},
         }
         result = scheduler._get_modules(task)
-        # Should NOT fall back to task-5 — must extract modules from JSON string
         assert result != ['task-5'], (
-            f'Expected modules from JSON string, got fallback: {result}'
+            f'Expected modules from dict metadata, got fallback: {result}'
         )
-        # Should have normalized module entries
         assert len(result) > 0
         assert all(isinstance(m, str) for m in result)
-        # Verify neither entry is the fallback
         assert 'task-5' not in result
 
-    def test_get_modules_extracts_files_from_json_string_metadata(
+    def test_get_modules_extracts_files_from_dict_metadata(
         self, scheduler: Scheduler
     ):
-        """_get_modules returns file-derived modules when metadata is a JSON string with 'files'."""
+        """_get_modules returns file-derived modules from dict metadata."""
         task = {
             'id': '6',
-            'metadata': '{"files": ["src/server/app.py", "src/server/routes.py"]}',
+            'metadata': {'files': ['src/server/app.py', 'src/server/routes.py']},
         }
         result = scheduler._get_modules(task)
-        # Should NOT fall back to task-6 — must extract from JSON string
         assert result != ['task-6'], (
-            f'Expected file-derived modules from JSON string, got fallback: {result}'
+            f'Expected file-derived modules from dict metadata, got fallback: {result}'
         )
         assert len(result) > 0
         assert 'task-6' not in result
 
-    def test_get_modules_handles_malformed_json_string_metadata(
+    def test_get_modules_falls_back_on_string_metadata(
         self, scheduler: Scheduler
     ):
-        """_get_modules gracefully degrades to task-<id> fallback on malformed JSON string."""
+        """_get_modules degrades to task-<id> when handed non-dict metadata.
+
+        After the boundary normalizer landed in get_tasks, _get_modules
+        should never receive a string in production. If it does (e.g. a
+        test synthesizes one), the isinstance guard kicks in and we fall
+        back rather than crash.
+        """
         task = {
             'id': '7',
             'metadata': 'not valid json',
         }
-        # Should not raise — must degrade gracefully to fallback
         result = scheduler._get_modules(task)
         assert result == ['task-7']
 
