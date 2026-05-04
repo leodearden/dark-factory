@@ -531,7 +531,7 @@ class TestRunBackfill:
     def _run_backfill_context(self, *, assert_close: bool = True):
         """Yield ``(mock_curator, mock_tm_cls)`` with the common patch stack applied.
 
-        Patches applied: ``maintenance_service``, ``TaskmasterBackend``, ``TaskCurator``.
+        Patches applied: ``maintenance_service``, ``SqliteTaskBackend``, ``TaskCurator``.
         ``TaskCurator`` is pre-wired to return ``mock_curator``; tests configure
         ``mock_tm_cls.return_value`` themselves.
 
@@ -549,7 +549,7 @@ class TestRunBackfill:
             'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
             new=fake_maintenance_service,
         ), patch(
-            'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
+            'fused_memory.maintenance.backfill_curator_corpus.SqliteTaskBackend',
         ) as mock_tm_cls, patch(
             'fused_memory.maintenance.backfill_curator_corpus.TaskCurator',
         ) as mock_curator_cls:

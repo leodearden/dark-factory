@@ -319,28 +319,17 @@ async def run_server():
     await write_journal.initialize()
     memory_service.set_write_journal(write_journal)
 
-    # Initialize task backend (Taskmaster MCP / SqliteTaskBackend / DualCompare).
+    # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
     task_interceptor = None
     if config.taskmaster:
         taskmaster = await _build_task_backend(config.taskmaster)
-        # Wire the backend into memory_service before initialize() so
-        # get_status reports an accurate connection state even if the
-        # first initialize fails. is_alive() will probe the live session.
         memory_service.taskmaster = taskmaster
         try:
-            # start() launches the supervisor task (Taskmaster) or opens the
-            # SQLite connection lazily (SqliteTaskBackend); both return once
-            # the backend is usable (or after the appropriate startup timeout
-            # if not). For Taskmaster the supervisor owns the stdio +
-            # ClientSession context managers — internal failures cancel only
-            # the supervisor, not run_server.
+            # start() opens SQLite connections lazily on first project access;
+            # returns once the backend is usable.
             await taskmaster.start()
-            logger.info(
-                '  Task backend: %s (mode=%s)',
-                type(taskmaster).__name__,
-                config.taskmaster.backend_mode,
-            )
+            logger.info('  Task backend: %s', type(taskmaster).__name__)
         except Exception as e:
             logger.warning(
                 '  Task backend: start failed (%s), will retry on next tool call', e,
@@ -504,7 +493,7 @@ async def run_server():
 
         # Targeted reconciler (needs memory_service + taskmaster + journal)
         targeted = None
-        if taskmaster and taskmaster.connected:
+        if taskmaster is not None and taskmaster.connected:
             targeted = TargetedReconciler(
                 memory_service, taskmaster, recon_journal, config, event_buffer,
             )
@@ -546,9 +535,6 @@ async def run_server():
         )
         await task_interceptor.start()
         # Wire the write journal so task writes leave durable audit rows.
-        # ``set_write_journal`` also pushes the journal into the
-        # DualCompareBackend wrapper (when present) so per-physical-side
-        # ``backend_op`` rows accompany the interceptor's combined row.
         task_interceptor.set_write_journal(write_journal)
 
         # Full reconciliation harness (background loop)
@@ -616,6 +602,39 @@ async def run_server():
             prev = count
 
     asyncio.create_task(_thread_monitor())
+
+    # Ticket janitor — periodic sweep that surfaces failed tickets to the
+    # orchestrator as info-severity ticket_failure escalations. Replaces the
+    # per-call resolve_ticket wait the steward / deep_reviewer used to chain.
+    janitor_task: asyncio.Task[None] | None = None
+    janitor_cfg = getattr(config.curator, 'janitor', None)
+    if janitor_cfg is not None and janitor_cfg.enabled and ticket_store is not None:
+        from fused_memory.middleware.ticket_janitor import TicketJanitor
+
+        _janitor_primary_root = (
+            config.taskmaster.project_root if config.taskmaster else ''
+        ) or ''
+        if _janitor_primary_root:
+            _janitor_primary_root = str(
+                Path(_janitor_primary_root).expanduser().resolve(),
+            )
+        ticket_janitor = TicketJanitor(
+            ticket_store,
+            cooldown_secs=janitor_cfg.cooldown_seconds,
+            batch_limit=janitor_cfg.batch_limit,
+            primary_project_root=_janitor_primary_root,
+        )
+        janitor_task = asyncio.create_task(
+            ticket_janitor.run_loop(janitor_cfg.interval_seconds),
+        )
+        logger.info(
+            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d)',
+            janitor_cfg.interval_seconds,
+            janitor_cfg.cooldown_seconds,
+            janitor_cfg.batch_limit,
+        )
+    else:
+        logger.info('  Ticket janitor: disabled')
 
     # Run transport
     transport = config.server.transport
@@ -687,6 +706,10 @@ async def run_server():
             watchdog_task.cancel()
             with contextlib.suppress(BaseException):
                 await watchdog_task
+        if janitor_task is not None:
+            janitor_task.cancel()
+            with contextlib.suppress(BaseException):
+                await janitor_task
         await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
@@ -701,39 +724,13 @@ async def run_server():
 async def _build_task_backend(taskmaster_config):
     """Construct the configured task backend.
 
-    Selection comes from ``taskmaster_config.backend_mode``:
-
-    - ``taskmaster`` (default) — legacy MCP proxy (:class:`TaskmasterBackend`)
-    - ``sqlite`` — in-process SQLite (:class:`SqliteTaskBackend`)
-    - ``dual_compare`` — both, wrapped in :class:`DualCompareBackend` so
-      one is the served primary and the other is mirrored + compared.
-      ``dual_compare_primary`` picks which side serves callers.
-
-    See ``plans/do-1-on-a-happy-pony.md`` §Cycle 2 for the cutover dance.
+    The backend is :class:`SqliteTaskBackend` — the legacy Taskmaster MCP
+    proxy and the dual-compare wrapper were retired after the SQLite
+    cutover (commit ``a3e966861c``).
     """
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
-    from fused_memory.backends.taskmaster_client import TaskmasterBackend
 
-    mode = taskmaster_config.backend_mode
-    if mode == 'taskmaster':
-        return TaskmasterBackend(taskmaster_config)
-    if mode == 'sqlite':
-        return SqliteTaskBackend(taskmaster_config)
-    if mode == 'dual_compare':
-        from fused_memory.backends.dual_compare_backend import DualCompareBackend
-
-        tm = TaskmasterBackend(taskmaster_config)
-        sql = SqliteTaskBackend(taskmaster_config)
-        if taskmaster_config.dual_compare_primary == 'sqlite':
-            return DualCompareBackend(
-                primary=sql, secondary=tm,
-                primary_label='sqlite', secondary_label='taskmaster',
-            )
-        return DualCompareBackend(
-            primary=tm, secondary=sql,
-            primary_label='taskmaster', secondary_label='sqlite',
-        )
-    raise ValueError(f'Unknown taskmaster.backend_mode: {mode!r}')
+    return SqliteTaskBackend(taskmaster_config)
 
 
 async def _build_ticket_store(data_dir: Path) -> 'TicketStore':

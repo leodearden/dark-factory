@@ -63,13 +63,8 @@ queue:
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
 
 taskmaster:
-  transport: "stdio"
-  command: "node"
-  args: ["${TASKMASTER_DIR:./taskmaster-ai}/dist/mcp-server.js"]
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "all"
-  backend_mode: sqlite
-  dual_compare_primary: taskmaster
 
 reconciliation:
   enabled: true
@@ -115,3 +110,14 @@ reconciliation:
     probe_interval_secs: 300
     max_probe_interval_secs: 1800
     accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"
+
+curator:
+  # Background ticket janitor — see middleware/ticket_janitor.py.
+  # Replaces per-call resolve_ticket waits with a server-side sweep that
+  # batches failed tickets into one info-severity ticket_failure escalation
+  # per (task_id, escalation_id) group.
+  janitor:
+    enabled: true
+    interval_seconds: 60
+    cooldown_seconds: 3600
+    batch_limit: 100

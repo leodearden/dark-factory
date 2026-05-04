@@ -23,7 +23,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
-    from fused_memory.backends.taskmaster_client import TaskmasterBackend
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.services.memory_service import MemoryService
 
@@ -41,7 +41,7 @@ class BaseStage:
         self,
         stage_id: StageId,
         memory_service: MemoryService,
-        taskmaster: TaskmasterBackend | None,
+        taskmaster: 'TaskBackendProtocol | None',
         journal: ReconciliationJournal,
         config: ReconciliationConfig,
         usage_gate=None,

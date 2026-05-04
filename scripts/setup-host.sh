@@ -107,23 +107,7 @@ for proj in shared escalation fused-memory orchestrator dashboard; do
 done
 
 # ---------------------------------------------------------------------------
-# 4. Taskmaster AI — npm install + build
-# ---------------------------------------------------------------------------
-info "Building taskmaster-ai"
-
-if [ -d "$REPO_ROOT/taskmaster-ai" ]; then
-  (cd "$REPO_ROOT/taskmaster-ai" && npm install --silent && npm run build --silent)
-  if [ -f "$REPO_ROOT/taskmaster-ai/dist/mcp-server.js" ]; then
-    ok "taskmaster-ai built (dist/mcp-server.js)"
-  else
-    fail "taskmaster-ai build did not produce dist/mcp-server.js"
-  fi
-else
-  warn "taskmaster-ai/ not found — did you clone with --recurse-submodules?"
-fi
-
-# ---------------------------------------------------------------------------
-# 5. Systemd user unit for fused-memory
+# 4. Systemd user unit for fused-memory
 # ---------------------------------------------------------------------------
 info "Installing fused-memory systemd unit"
 

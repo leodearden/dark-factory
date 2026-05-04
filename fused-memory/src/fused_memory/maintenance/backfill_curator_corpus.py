@@ -5,8 +5,9 @@ for vector-similarity deduplication.  Tasks are recorded individually via
 ``record_task()`` after each create, but the collection starts empty for existing
 projects — making the curator blind to all pre-existing work.
 
-This script fetches the full task tree from Taskmaster, flattens it, and calls
-``TaskCurator.backfill_corpus()`` to populate the collection in one pass.
+This script fetches the full task tree from the SQLite task backend,
+flattens it, and calls ``TaskCurator.backfill_corpus()`` to populate the
+collection in one pass.
 
 The operation is idempotent: re-running just re-upserts the same deterministic
 point IDs, leaving nothing duplicated.
@@ -26,12 +27,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from fused_memory.backends.taskmaster_client import TaskmasterBackend
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.maintenance._utils import maintenance_service
 from fused_memory.middleware.task_curator import BackfillResult, TaskCurator, flatten_task_tree
 from fused_memory.models.scope import resolve_project_id
+
+if TYPE_CHECKING:
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +58,11 @@ class BackfillManager:
 
     Args:
         config: FusedMemoryConfig (for curator + embedder settings).
-        taskmaster: An already-configured TaskmasterBackend.
+        taskmaster: An already-configured task backend.
         curator: A TaskCurator instance (uses its backfill_corpus method).
     """
 
-    def __init__(self, config, taskmaster: TaskmasterBackend, curator: TaskCurator) -> None:
+    def __init__(self, config, taskmaster: 'TaskBackendProtocol', curator: TaskCurator) -> None:
         self.config = config
         self.taskmaster = taskmaster
         self.curator = curator
@@ -101,11 +106,11 @@ async def run_backfill(
     config_path: str | None = None,
     project_root: str = '.',
 ) -> BackfillResult:
-    """Load config, connect to Taskmaster, run backfill, and close resources.
+    """Load config, open the task backend, run backfill, and close resources.
 
     This is the CLI-callable entrypoint.  It:
     1. Loads FusedMemoryConfig (honouring CONFIG_PATH env var or config_path arg).
-    2. Creates a TaskmasterBackend from config.taskmaster and connects it.
+    2. Creates a SqliteTaskBackend from config.taskmaster and connects it.
     3. Creates a TaskCurator and runs BackfillManager.backfill().
     4. Returns a BackfillResult with upserted/skipped/errors counts.
 
@@ -124,14 +129,15 @@ async def run_backfill(
     # intentional — it keeps parity with other maintenance scripts and ensures
     # the backing stores are healthy before the backfill begins.
     async with maintenance_service(config_path) as (config, _service):
-        # Build a Taskmaster client.  If no [taskmaster] section exists in the
+        # Build a SQLite task backend.  If no [taskmaster] section exists in the
         # config we fall back to a minimal TaskmasterConfig so the script still
         # works when project_root is supplied explicitly on the CLI.
         if config.taskmaster is not None:
             tm_config = config.taskmaster.model_copy(update={'project_root': project_root})
         else:
             tm_config = TaskmasterConfig(project_root=project_root)
-        taskmaster = TaskmasterBackend(config=tm_config)
+        taskmaster = SqliteTaskBackend(config=tm_config)
+        await taskmaster.start()
 
         # Build a TaskCurator (lazy — connects on first use).
         curator = TaskCurator(config=config, taskmaster=taskmaster)
@@ -141,6 +147,7 @@ async def run_backfill(
             report = await manager.backfill(project_root=project_root)
         finally:
             await curator.close()
+            await taskmaster.close()
 
         return BackfillResult(
             upserted=report.upserted,
@@ -155,7 +162,7 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
 
     parser = argparse.ArgumentParser(
-        description='Backfill the task_curator Qdrant corpus from the full Taskmaster task tree.',
+        description='Backfill the task_curator Qdrant corpus from the full task tree.',
     )
     parser.add_argument(
         '--project-root',

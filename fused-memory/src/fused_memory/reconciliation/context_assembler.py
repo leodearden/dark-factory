@@ -26,7 +26,7 @@ from fused_memory.models.reconciliation import (
 from fused_memory.utils.async_utils import propagate_cancellations
 
 if TYPE_CHECKING:
-    from fused_memory.backends.taskmaster_client import TaskmasterBackend
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.config.schema import ReconciliationConfig
     from fused_memory.services.memory_service import MemoryService
 
@@ -82,7 +82,7 @@ class ContextAssembler:
     def __init__(
         self,
         memory_service: MemoryService,
-        taskmaster: TaskmasterBackend | None,
+        taskmaster: 'TaskBackendProtocol | None',
         config: ReconciliationConfig,
         project_root: str = '',
     ):

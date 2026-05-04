@@ -1,10 +1,4 @@
-"""Contract tests for :class:`SqliteTaskBackend`.
-
-The wire-shape surface mirrors
-``tests/test_taskmaster_client_contract.py`` so the dual-compare soak runs
-clean: every method here returns the same DTO shapes the legacy
-TaskmasterBackend wrappers do.
-"""
+"""Contract tests for :class:`SqliteTaskBackend`."""
 
 from __future__ import annotations
 
@@ -20,13 +14,13 @@ from fused_memory.backends.sqlite_task_backend import (
     _format_task_id,
     _parse_task_id,
 )
-from fused_memory.backends.taskmaster_types import TaskmasterError
+from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import TaskmasterConfig
 
 
 @pytest_asyncio.fixture
 async def backend(tmp_path):
-    cfg = TaskmasterConfig(project_root=str(tmp_path), backend_mode='sqlite')
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
     b = SqliteTaskBackend(cfg)
     await b.start()
     yield b
@@ -409,7 +403,7 @@ async def test_db_file_lives_at_taskmaster_tasks_dir(backend, project_root):
 
 @pytest.mark.asyncio
 async def test_state_survives_close_and_reopen(tmp_path):
-    cfg = TaskmasterConfig(project_root=str(tmp_path), backend_mode='sqlite')
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
     project_root = str(tmp_path / 'proj')
     b1 = SqliteTaskBackend(cfg)
     await b1.start()

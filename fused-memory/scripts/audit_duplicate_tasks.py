@@ -493,7 +493,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     import os  # noqa: PLC0415
 
-    from fused_memory.backends.taskmaster_client import TaskmasterBackend  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
 
     if args.config:
@@ -501,15 +501,15 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = FusedMemoryConfig()
     if config.taskmaster is None:
-        logger.error('Taskmaster backend not configured in fused-memory config')
+        logger.error('Task backend not configured in fused-memory config')
         return 1
 
-    backend = TaskmasterBackend(config.taskmaster)
-    await backend.initialize()
+    backend = SqliteTaskBackend(config.taskmaster)
+    await backend.start()
     try:
         raw = await backend.get_tasks(args.project_root, args.tag)
         tasks = _extract_tasks(raw)
-        logger.info('Fetched %d task(s) from Taskmaster', len(tasks))
+        logger.info('Fetched %d task(s) from task backend', len(tasks))
 
         plan = build_audit_plan(tasks, threshold=args.threshold, min_id=args.min_id)
         print(json.dumps(plan, indent=2, default=str))

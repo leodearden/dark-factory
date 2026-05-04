@@ -1,14 +1,8 @@
-"""In-process SQLite-backed task backend (drop-in for ``TaskmasterBackend``).
+"""In-process SQLite-backed task backend.
 
 Per-project DB file at ``<project_root>/.taskmaster/tasks/tasks.db``.
-Mirrors the existing tasks.json layout — rollback is "stop using db, the
-JSON file is still there." WAL mode handles concurrent readers natively;
-mutations are serialised per project_root by an :class:`asyncio.Lock`.
-
-Wire shapes are kept identical to the Taskmaster MCP wrapper outputs in
-:mod:`fused_memory.backends.taskmaster_client` so the
-:class:`fused_memory.backends.dual_compare_backend.DualCompareBackend`
-soak runs cleanly during cutover.
+WAL mode handles concurrent readers natively; mutations are serialised
+per project_root by an :class:`asyncio.Lock`.
 
 Subtasks live as their own rows with ``parent_id`` set to their parent's
 top-level id; the dotted display form (``"292.1"``) is composed at read
@@ -27,14 +21,14 @@ from typing import Any
 
 import aiosqlite
 
-from fused_memory.backends.taskmaster_types import (
+from fused_memory.backends.task_backend_errors import TaskmasterError
+from fused_memory.backends.task_backend_types import (
     AddSubtaskResult,
     AddTaskResult,
     DependencyResult,
     GetTasksResult,
     RemoveTaskResult,
     SetTaskStatusResult,
-    TaskmasterError,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
@@ -196,9 +190,9 @@ class SqliteTaskBackend:
         self._write_locks: dict[str, asyncio.Lock] = {}
         self._closed = False
         self._started = False
-        # Keep wire-compatible with TaskmasterBackend's restart-count surface;
-        # SQLite connections don't restart, so it's pinned at 1 once start()
-        # is called (matches "session up" semantics for downstream callers).
+        # SQLite connections don't restart, so the counter is pinned at 1
+        # once start() is called (matches "session up" semantics for
+        # downstream callers).
         self._restart_count = 0
 
     # ── Lifecycle ──────────────────────────────────────────────────────

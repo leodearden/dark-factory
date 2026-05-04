@@ -4769,11 +4769,6 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _get_curator survives DualCompareBackend wrapper
-# ─────────────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────────────
 # Write-journal integration (Commit 7)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -4825,7 +4820,7 @@ async def test_journaled_write_logs_failure_row(
 ):
     """A failing tm.* call still produces a write_op row plus a failed
     backend_op row — never silently disappears."""
-    from fused_memory.backends.taskmaster_types import TaskmasterError
+    from fused_memory.backends.task_backend_errors import TaskmasterError
     from fused_memory.services.write_journal import WriteJournal
 
     failing_tm = AsyncMock()
@@ -4858,52 +4853,3 @@ async def test_journaled_write_logs_failure_row(
         await journal.close()
 
 
-@pytest.mark.asyncio
-async def test_get_curator_survives_dual_compare_wrapper(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path, caplog,
-):
-    """Reproduces the silent-disable bug.
-
-    Before the fix, ``_get_curator`` reached for ``self.taskmaster.config``;
-    when the backend was wrapped in :class:`DualCompareBackend` (which has
-    no ``config`` attribute), the AttributeError was swallowed by the
-    broad ``except Exception`` and the curator stayed off the entire soak.
-
-    Now the interceptor reads ``project_root`` from its own ``self._config``
-    so the wrapper composition is irrelevant.
-    """
-    from fused_memory.backends.dual_compare_backend import DualCompareBackend
-    from fused_memory.config.schema import TaskmasterConfig
-    from fused_memory.middleware.task_curator import TaskCurator
-
-    # Wire a TaskmasterConfig so _get_curator can resolve project_root.
-    curator_enabled_config.taskmaster = TaskmasterConfig(project_root=str(tmp_path))
-
-    secondary = AsyncMock()
-    secondary.connected = True
-    secondary.restart_count = 0
-    secondary.start = AsyncMock()
-    secondary.close = AsyncMock()
-
-    wrapped = DualCompareBackend(taskmaster, secondary)
-    interceptor = TaskInterceptor(
-        wrapped, reconciler, event_buffer, config=curator_enabled_config,
-    )
-    try:
-        with caplog.at_level('WARNING'):
-            curator = await interceptor._get_curator()
-
-        assert curator is not None
-        assert isinstance(curator, TaskCurator)
-        assert not any(
-            'Failed to create TaskCurator' in m for m in caplog.messages
-        ), caplog.messages
-    finally:
-        # Cancel any backfill bg task spawned by _get_curator.
-        for t in list(interceptor._background_tasks):
-            if not t.done():
-                t.cancel()
-                with contextlib.suppress(
-                    asyncio.CancelledError, Exception,
-                ):
-                    await t

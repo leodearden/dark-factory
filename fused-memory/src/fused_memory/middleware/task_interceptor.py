@@ -88,23 +88,18 @@ def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
 
 
 def _resolve_backend_label(taskmaster: Any) -> str:
-    """Return a stable journal label for the configured task backend.
+    """Return the stable journal label for the configured task backend.
 
-    'dual_compare' / 'taskmaster' / 'sqlite_task_backend' / 'unknown' —
-    used as ``backend`` on ``backend_ops`` rows so the post-hoc
-    directional-attribution query (``SELECT backend, success FROM ...``)
-    can split the soak signal by physical backend.
+    Used as ``backend`` on ``backend_ops`` rows. After the SQLite cutover
+    the only production backend is :class:`SqliteTaskBackend`; tests with
+    AsyncMock doubles fall through to ``'unknown'``.
     """
     if taskmaster is None:
         return 'unknown'
     cls = type(taskmaster).__name__
-    if cls == 'DualCompareBackend':
-        return 'dual_compare'
-    if cls == 'TaskmasterBackend':
-        return 'taskmaster'
     if cls == 'SqliteTaskBackend':
         return 'sqlite_task_backend'
-    return cls.lower()
+    return 'unknown'
 
 # Terminal statuses the server refuses to exit without a reopen_reason.
 # Duplicated from orchestrator.task_status.TERMINAL_STATUSES — the server
@@ -310,9 +305,8 @@ class TaskInterceptor:
         # ``set_write_journal`` pattern. When wired by the bootstrap, every
         # mutation logs a ``write_op`` row at the public method top
         # (regardless of cancellation/failure outcome) and a ``backend_op``
-        # row for the combined dual_compare outcome. ``DualCompareBackend``
-        # owns its own per-physical-side ``backend_op`` rows linked via
-        # ``write_op_id``. Without a journal, the helpers no-op.
+        # row for the resolved task backend. Without a journal, the
+        # helpers no-op.
         self._write_journal: WriteJournal | None = None
 
     def set_write_journal(self, journal: 'WriteJournal') -> None:
@@ -324,16 +318,6 @@ class TaskInterceptor:
         instrumentation is a no-op.
         """
         self._write_journal = journal
-        # Push the same journal into the dual-compare wrapper (if any) so
-        # it can emit per-physical-backend ``backend_op`` rows alongside
-        # the interceptor-level rows. Use a class-name check rather than
-        # ``hasattr`` because AsyncMock test doubles answer ``True`` to
-        # every ``hasattr`` and would auto-vivify a phantom async method.
-        if (
-            self.taskmaster is not None
-            and type(self.taskmaster).__name__ == 'DualCompareBackend'
-        ):
-            self.taskmaster.set_write_journal(journal)
 
     async def _journal_around(
         self,
@@ -345,15 +329,12 @@ class TaskInterceptor:
         """Wrap *body* (an awaitable) with write_op + backend_op journaling.
 
         Logs a ``write_op`` row before awaiting (so cancelled/failed writes
-        still leave an intent record), publishes the generated id on
-        ``_current_write_op_id`` for downstream backends to link against,
-        and logs a ``backend_op`` row on success or failure with
-        ``backend=`` resolved from the configured task backend.
+        still leave an intent record) and a ``backend_op`` row on success
+        or failure with ``backend=`` resolved from the configured task
+        backend.
 
         No-ops when :meth:`set_write_journal` was never called.
         """
-        from fused_memory.backends.dual_compare_backend import _current_write_op_id
-
         ji = self._write_journal
         write_op_id = str(uuid_mod.uuid4())
         backend_label = _resolve_backend_label(self.taskmaster)
@@ -371,7 +352,6 @@ class TaskInterceptor:
                 )
             except Exception:
                 logger.debug('write_journal: log_write_op failed', exc_info=True)
-        token = _current_write_op_id.set(write_op_id)
         try:
             result = await body
         except BaseException as exc:
@@ -391,8 +371,6 @@ class TaskInterceptor:
                         exc_info=True,
                     )
             raise
-        finally:
-            _current_write_op_id.reset(token)
         if ji is not None:
             try:
                 summary = str(result)[:500] if result is not None else None
@@ -848,10 +826,8 @@ class TaskInterceptor:
 
             cwd = None
             project_root: str | None = None
-            # Read project_root from our own config — DualCompareBackend (and
-            # any other wrapper) doesn't expose ``.config``, so reaching into
-            # ``self.taskmaster.config`` raises AttributeError that the broad
-            # except below would swallow, silently disabling the curator.
+            # Read project_root from our own config; the task backend is not
+            # required to expose its own config attribute.
             pr = (
                 self._config.taskmaster.project_root
                 if self._config and self._config.taskmaster
@@ -1222,11 +1198,10 @@ class TaskInterceptor:
 
         # The curator already produced the coherent rewrite — push it to the
         # backend as structured fields. No prompt, no LLM rewrite at the
-        # write boundary; sqlite writes the columns directly and the
-        # DualCompareBackend translates per-field for TM. The
-        # files_to_modify list is encoded into details (Taskmaster has no
-        # column for it; readers parse it back from the FILES_TO_MODIFY
-        # marker — kept for compatibility with existing parsers).
+        # write boundary; sqlite writes the columns directly. The
+        # files_to_modify list is encoded into details (no dedicated
+        # column; readers parse it back from the FILES_TO_MODIFY marker —
+        # kept for compatibility with existing parsers).
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
         details_with_files = (
             f'FILES_TO_MODIFY:\n{files_block}\n\nDETAILS:\n{rt.details}'
@@ -2080,7 +2055,7 @@ class TaskInterceptor:
                 result = await tm.add_task(project_root=project_root, **kwargs)
                 atomic_metadata_written = False
 
-            # TaskmasterBackend.add_task is contractually guaranteed to return
+            # The task backend's add_task is contractually guaranteed to return
             # an AddTaskResult DTO with a non-empty `id` — anything else raises
             # TaskmasterError, which propagates out of the try block above.
             task_id_str = str(result['id'])
@@ -3443,9 +3418,9 @@ def _extract_task_dict(raw: Any) -> dict | None:
     """Return ``raw`` if it's a dict, else None.
 
     Retained as a thin guard for callers that still want defensive
-    None-handling; the TaskmasterBackend adapter now returns a flat task
-    dict from ``get_task``, so the legacy ``{'data': {...}}`` unwrap
-    path is no longer needed.
+    None-handling; the task backend now returns a flat task dict from
+    ``get_task``, so the legacy ``{'data': {...}}`` unwrap path is no
+    longer needed.
     """
     return raw if isinstance(raw, dict) else None
 

@@ -40,8 +40,6 @@ DARK_FACTORY_PATH_PREFIXES: tuple[str, ...] = (
     'fused_memory/',
     'mem0/',
     'graphiti/',
-    'taskmaster-ai/',
-    'taskmaster_ai/',
     'dashboard/',
 )
 

@@ -1,22 +1,19 @@
 """Protocol that codifies the task-backend surface used by ``TaskInterceptor``.
 
-Both :class:`fused_memory.backends.taskmaster_client.TaskmasterBackend`
-(the legacy MCP-proxy) and :class:`fused_memory.backends.sqlite_task_backend.
-SqliteTaskBackend` (the in-process replacement) implement this protocol, so
-the interceptor can be typed against a single surface and the
-``DualCompareBackend`` soak wrapper can hold either.
+:class:`fused_memory.backends.sqlite_task_backend.SqliteTaskBackend`
+implements this protocol; new task backends slot in by satisfying the same
+surface so the interceptor can be typed against a single shape.
 
-``parse_prd`` and ``expand_task`` are intentionally absent. They were the
-last Taskmaster-specific features still wired in; both were retired in the
-same change that introduced this protocol — orchestrator-side PRD
-decomposition now goes through ``planning_mode`` + the curator instead.
+``parse_prd`` and ``expand_task`` are intentionally absent —
+orchestrator-side PRD decomposition goes through ``planning_mode`` + the
+curator instead.
 """
 
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from fused_memory.backends.taskmaster_types import (
+from fused_memory.backends.task_backend_types import (
     AddSubtaskResult,
     AddTaskResult,
     DependencyResult,

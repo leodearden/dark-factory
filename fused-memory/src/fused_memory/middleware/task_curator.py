@@ -46,7 +46,7 @@ from fused_memory.reconciliation.context_assembler import estimate_tokens
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
 
-    from fused_memory.backends.taskmaster_client import TaskmasterBackend
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
 
@@ -436,7 +436,7 @@ class TaskCurator:
     def __init__(
         self,
         config: FusedMemoryConfig,
-        taskmaster: TaskmasterBackend | None = None,
+        taskmaster: TaskBackendProtocol | None = None,
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
         escalator: CuratorEscalator | None = None,

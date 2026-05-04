@@ -187,7 +187,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     import os  # noqa: PLC0415
 
-    from fused_memory.backends.taskmaster_client import TaskmasterBackend  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
@@ -203,9 +203,9 @@ async def _run(args: argparse.Namespace) -> int:
                     len(candidates), args.project)
 
         if config.taskmaster is None:
-            raise RuntimeError('Taskmaster backend not configured — cannot verify provenance')
-        tm = TaskmasterBackend(config.taskmaster)
-        await tm.initialize()
+            raise RuntimeError('Task backend not configured — cannot verify provenance')
+        tm = SqliteTaskBackend(config.taskmaster)
+        await tm.start()
 
         to_invalidate: list[EdgeCandidate] = []
         for c in candidates:

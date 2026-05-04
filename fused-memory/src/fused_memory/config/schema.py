@@ -186,29 +186,21 @@ class QueueConfig(BaseModel):
 # --- Taskmaster ---
 
 class TaskmasterConfig(BaseModel):
-    """Connection to Taskmaster MCP server."""
+    """Configuration for the SQLite-backed task store.
 
-    transport: str = Field(default='stdio', description='stdio or http')
-    command: str = Field(default='node')
-    args: list[str] = Field(default_factory=lambda: ['mcp-server/server.js'])
+    The class name is preserved for back-compat with consumers that still
+    import :class:`TaskmasterConfig`. Only ``project_root`` and
+    ``tool_mode`` are read by :class:`SqliteTaskBackend`; the other fields
+    are kept dormant so existing config files don't fail to load.
+    """
+
+    transport: str = Field(default='stdio', description='Unused after SQLite cutover')
+    command: str = Field(default='node', description='Unused after SQLite cutover')
+    args: list[str] = Field(default_factory=list, description='Unused after SQLite cutover')
     cwd: str = Field(default='')
     http_url: str = Field(default='')
     project_root: str = Field(default='.')
     tool_mode: str = Field(default='all')
-
-    # Backend selection. ``taskmaster`` is the legacy MCP-proxy default;
-    # ``sqlite`` swaps in :class:`SqliteTaskBackend`; ``dual_compare`` runs
-    # both side-by-side and logs divergences (used during cutover soak).
-    # See plans/do-1-on-a-happy-pony.md §Cycle 2 for the cutover dance.
-    backend_mode: Literal['taskmaster', 'sqlite', 'dual_compare'] = Field(
-        default='taskmaster',
-    )
-    # Which backend the dual-compare wrapper serves to callers. The other
-    # backend's responses are compared against this one and divergences
-    # logged. Flipped from ``taskmaster`` → ``sqlite`` after the soak.
-    dual_compare_primary: Literal['taskmaster', 'sqlite'] = Field(
-        default='taskmaster',
-    )
 
 
 # --- Reconciliation ---
@@ -439,6 +431,22 @@ class ReconciliationConfig(BaseModel):
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
 
+class TicketJanitorConfig(BaseModel):
+    """Background sweep that surfaces failed tickets to the orchestrator.
+
+    Replaces the per-call ``resolve_ticket`` wait the steward / deep_reviewer
+    used to chain after every ``submit_task`` (drop plan). On a fixed
+    interval the janitor terminalises expired pending tickets, batches
+    failed rows by ``(project_id, task_id, escalation_id)``, and submits one
+    info-severity ``ticket_failure`` escalation per batch.
+    """
+
+    enabled: bool = Field(default=True)
+    interval_seconds: float = Field(default=60.0)
+    cooldown_seconds: float = Field(default=3600.0)
+    batch_limit: int = Field(default=100)
+
+
 class CuratorConfig(BaseModel):
     """Task curator gate — LLM-judged drop/combine/create decision on task creation.
 
@@ -502,6 +510,9 @@ class CuratorConfig(BaseModel):
     # budget (per_item_budget_usd) and the bisecting fallback are the safety
     # net for occasional stalls. Tunable.
     batch_token_threshold: int = Field(default=50_000)
+
+    # Background janitor that surfaces failed tickets to the orchestrator.
+    janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
 
 
 # --- Top-level ---

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from fused_memory.backends.taskmaster_client import TaskmasterBackend
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -684,7 +684,7 @@ async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | Non
 
 
 async def _queue_briefing_refresh_tasks(
-    taskmaster: TaskmasterBackend,
+    taskmaster: 'TaskBackendProtocol',
     project_root: str,
     mismatches: list[dict],
     existing_tasks: list[dict] | None = None,

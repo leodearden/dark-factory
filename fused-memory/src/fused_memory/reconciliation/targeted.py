@@ -7,7 +7,6 @@ import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
     MemoryHints,
@@ -22,6 +21,7 @@ from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import InputValidationError, require_project_root
 
 if TYPE_CHECKING:
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ class TargetedReconciler:
     def __init__(
         self,
         memory_service: MemoryService,
-        taskmaster: TaskmasterBackend,
+        taskmaster: 'TaskBackendProtocol',
         journal: ReconciliationJournal,
         config: FusedMemoryConfig,
         event_buffer: EventBuffer | None = None,

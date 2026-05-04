@@ -11,12 +11,12 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import UsageGate
 
-from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -40,6 +40,9 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
 from fused_memory.services.memory_service import MemoryService
+
+if TYPE_CHECKING:
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
@@ -82,7 +85,7 @@ class ReconciliationHarness:
     def __init__(
         self,
         memory_service: MemoryService,
-        taskmaster: TaskmasterBackend | None,
+        taskmaster: 'TaskBackendProtocol | None',
         journal: ReconciliationJournal,
         event_buffer: EventBuffer,
         config: FusedMemoryConfig,
@@ -344,7 +347,7 @@ class ReconciliationHarness:
             counts. Returns empty FilteredTaskTree if taskmaster is unavailable,
             project_root is empty, non-absolute, or the fetch fails.
             Non-absolute paths are rejected before calling taskmaster to avoid
-            silent failures from TaskmasterBackend's absolute-path validator.
+            silent failures from the backend's absolute-path validator.
 
         Log-level policy:
             Anomaly branches (taskmaster disabled, empty/non-absolute project_root)

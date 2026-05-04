@@ -146,7 +146,6 @@ _PROJECT_CWD_MAP = {
     'dark-factory': Path('/home/leo/src/dark-factory'),
     'reify': Path('/home/leo/src/reify'),
     'reify-gui': Path('/home/leo/src/reify/gui'),
-    'taskmaster-ai': Path('/home/leo/src/dark-factory/taskmaster-ai'),
 }
 
 
