@@ -1273,6 +1273,11 @@ class TestBlastRadiusExpansion:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.REQUEUED
+        # The retry-cap report reads block_phase/reason/detail off the workflow
+        # via TaskReport — annotate so cap exhaustion does not say 'unknown'.
+        assert workflow._last_block_phase == 'plan'
+        assert workflow._last_block_reason == 'plan_blast_radius_lock_conflict'
+        assert 'locked_module.py' in workflow._last_block_detail
 
 
 # ---------------------------------------------------------------------------
