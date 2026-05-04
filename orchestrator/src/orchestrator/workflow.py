@@ -1214,8 +1214,6 @@ class TaskWorkflow:
             current_main_sha = ''
 
         metadata = self.task.get('metadata') or {}
-        if not isinstance(metadata, dict):
-            metadata = {}
         last_sha = str(metadata.get('last_no_plan_main_sha') or '')
         try:
             counter = int(metadata.get('consecutive_no_plan_failures') or 0)
@@ -1284,8 +1282,6 @@ class TaskWorkflow:
         assert self.artifacts is not None
 
         metadata = self.task.get('metadata') or {}
-        if not isinstance(metadata, dict):
-            metadata = {}
 
         # Determine the category of the most recent resolved L0 (the one
         # the steward just handled).  If no escalation queue is wired up

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import math
@@ -482,6 +481,30 @@ class Scheduler:
         )
 
     @staticmethod
+    def _normalize_task_metadata(task: dict) -> None:
+        """Coerce ``task['metadata']`` to a dict in place.
+
+        The fused-memory wire format may surface metadata as a JSON string,
+        a dict, or absent. Normalize once at this boundary so every consumer
+        can assume ``isinstance(task['metadata'], dict)`` without re-parsing.
+
+        A non-JSON or non-dict-shaped value collapses to ``{}`` — every
+        consumer reads dict-keyed sub-fields, so a non-dict carries no
+        information they can use.
+        """
+        raw = task.get('metadata')
+        if isinstance(raw, dict):
+            return
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            task['metadata'] = parsed if isinstance(parsed, dict) else {}
+            return
+        task['metadata'] = {}
+
+    @staticmethod
     def _parse_tool_text_result(result: dict, key: str) -> Any:
         """Parse a text-content MCP result block and return ``inner[key]``.
 
@@ -525,6 +548,9 @@ class Scheduler:
             )
             tasks = self._parse_tool_text_result(result, 'tasks')
             if isinstance(tasks, list):
+                for t in tasks:
+                    if isinstance(t, dict):
+                        self._normalize_task_metadata(t)
                 return tasks
         except Exception as e:
             # logger.exception preserves the traceback + exception class so the
@@ -1409,10 +1435,7 @@ class Scheduler:
         # Check in-memory cache first (survives metadata update failures)
         if task_id in self._module_cache:
             return self._module_cache[task_id]
-        metadata = task.get('metadata', {})
-        if isinstance(metadata, str):
-            with contextlib.suppress(json.JSONDecodeError, TypeError):
-                metadata = json.loads(metadata)
+        metadata = task.get('metadata') or {}
         if isinstance(metadata, dict):
             # Prefer file-derived modules (most accurate)
             files = metadata.get('files', [])
