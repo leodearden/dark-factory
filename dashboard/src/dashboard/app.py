@@ -45,6 +45,7 @@ from dashboard.data.costs import (
     aggregate_cost_trend,
 )
 from dashboard.data.db import DbPool
+from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
     enrich_merges_with_titles,
@@ -487,8 +488,12 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     project_dbs = await _project_scoped_dbs_labeled(
         config, pool, Path('data/orchestrator/runs.db'),
     )
-    projects_raw = await build_per_project_merge_queue(
-        project_dbs, hours=hours, now=effective_now, recent_window_minutes=15,
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    projects_raw, halt_status = await asyncio.gather(
+        build_per_project_merge_queue(
+            project_dbs, hours=hours, now=effective_now, recent_window_minutes=15,
+        ),
+        get_merge_halt_status(http_client, config.escalation_urls),
     )
     pids = list(projects_raw.keys())
     title_maps = await asyncio.gather(*(
@@ -512,7 +517,9 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     active_sparks: dict[str, dict] = {}
     for pid in pids:
         active_sparks[pid] = await get_merge_active_series(metrics_db, project_id=pid, days=1)
-    return JSONResponse(redux_api.shape_merge_queue(enriched, active_sparks=active_sparks))
+    return JSONResponse(redux_api.shape_merge_queue(
+        enriched, active_sparks=active_sparks, halt_status=halt_status,
+    ))
 
 
 @app.get('/api/v2/dashboard/costs')
