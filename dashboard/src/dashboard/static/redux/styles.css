@@ -458,6 +458,16 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-done.selected       { --sel-color: var(--ok);     background: oklch(0.30 0.08 155 / 0.16); }
 .taskgraph .node.s-blocked.selected    { --sel-color: var(--bad);    background: oklch(0.32 0.10  25 / 0.18); }
 .taskgraph .node.s-pending.selected    { --sel-color: var(--warn);   background: oklch(0.32 0.10  75 / 0.18); }
+.taskgraph .node.s-deferred.selected   { --sel-color: var(--fg-3); }
+.taskgraph .node.in-tree {
+  box-shadow: 0 0 0 1px var(--sel-color, var(--accent)) inset;
+  border-color: var(--sel-color, var(--accent));
+}
+.taskgraph .node.s-in-progress.in-tree { --sel-color: var(--accent); }
+.taskgraph .node.s-done.in-tree        { --sel-color: var(--ok); }
+.taskgraph .node.s-blocked.in-tree     { --sel-color: var(--bad); }
+.taskgraph .node.s-pending.in-tree     { --sel-color: var(--warn); }
+.taskgraph .node.s-deferred.in-tree    { --sel-color: var(--fg-3); }
 .taskgraph .node .id { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
 .taskgraph .node .ttl { font-size: 11px; color: var(--fg-1); line-height: 1.25; white-space: normal; }
 .taskgraph .node .meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
@@ -467,7 +477,9 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-done       .status-pip { background: var(--ok); }
 .taskgraph .node.s-blocked    .status-pip { background: var(--bad); }
 .taskgraph .node.s-pending    .status-pip { background: var(--warn); }
-.taskgraph .node.s-done   { opacity: 0.78; }
+.taskgraph .node.s-deferred   .status-pip { background: var(--fg-3); }
+.taskgraph .node.s-done     { opacity: 0.78; }
+.taskgraph .node.s-deferred { opacity: 0.78; }
 .taskgraph .empty-tier { color: var(--fg-3); font-size: 10px; font-family: var(--mono); padding: 4px; }
 
 .task-detail { padding: 12px 14px; font-size: 12px; color: var(--fg-1); line-height: 1.5; }

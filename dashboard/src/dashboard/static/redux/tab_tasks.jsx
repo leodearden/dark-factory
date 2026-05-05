@@ -38,12 +38,13 @@ function computeTiers(tasks) {
 }
 
 // ── Edge router: draw curves from each parent (dep) to each child node ──
-function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId }) {
+function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhood }) {
   const [paths, setPaths] = uS_T([]);
 
   // Stable signature: edges flicker because the parent's `tasks` is a new array
   // every render (overview clock ticks force re-renders). Only re-run when the
   // *content* changes — task ids, statuses, dep edges, selection.
+  // neighborhood is derived from selectedId+tasks so it is already covered.
   const signature = uM_T(() => {
     const parts = tasks.map(t => `${t.id}:${t.status}:${(t.deps||[]).map(d=>d.id+(d.done?'1':'0')).join(',')}`);
     return parts.join('|') + '|sel=' + (selectedId || '');
@@ -51,14 +52,14 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId }) {
 
   // Capture latest tasks/selection in a ref so recompute() always reads fresh
   // values without us having to put them in the effect deps array.
-  const latest = uR_T({ tasks, selectedId });
-  latest.current = { tasks, selectedId };
+  const latest = uR_T({ tasks, selectedId, neighborhood });
+  latest.current = { tasks, selectedId, neighborhood };
 
   uLE_T(() => {
     function recompute() {
       const cont = containerRef.current;
       if (!cont) return;
-      const { tasks: ts, selectedId: sel } = latest.current;
+      const { tasks: ts, selectedId: sel, neighborhood: nb } = latest.current;
       const visible = new Set(ts.map(t => t.id));
       const cb = cont.getBoundingClientRect();
       const out = [];
@@ -76,7 +77,7 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId }) {
           const x2 = cBox.left - cb.left + cBox.width / 2;
           const y2 = cBox.top  - cb.top;
           const dy = Math.max(12, (y2 - y1) / 2);
-          const involved = sel && (sel === t.id || sel === d.id);
+          const involved = nb && nb.has(t.id) && nb.has(d.id);
           const blocking = !d.done;
           out.push({
             d: `M ${x1} ${y1} C ${x1} ${y1 + dy}, ${x2} ${y2 - dy}, ${x2} ${y2}`,
@@ -133,7 +134,7 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
     const arr = Array.from({ length: max + 1 }, () => []);
     for (const t of tasks) arr[tiers.get(t.id) || 0].push(t);
     // Within a tier, sort by status priority: blocked → in-progress → pending → done
-    const order = { blocked: 0, 'in-progress': 1, pending: 2, done: 3 };
+    const order = { blocked: 0, 'in-progress': 1, pending: 2, deferred: 3, done: 4 };
     arr.forEach(row => row.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9)));
     return arr;
   }, [tasks, tiers]);
@@ -168,16 +169,18 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
 
   return (
     <div className="taskgraph" ref={containerRef}>
-      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={tasks} selectedId={selectedId} />
+      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={tasks}
+                      selectedId={selectedId} neighborhood={neighborhood} />
       {rows.map((row, ri) => (
         <div key={ri} className="row">
           {row.length === 0 ? <div className="empty-tier">—</div> : row.map(t => {
             const isSel = selectedId === t.id;
+            const inTree = neighborhood && neighborhood.has(t.id) && !isSel;
             const dim = neighborhood && !neighborhood.has(t.id);
             return (
               <div key={t.id}
                    ref={el => { if (el) nodeRefs.current[t.id] = el; else delete nodeRefs.current[t.id]; }}
-                   className={`node s-${t.status} ${isSel ? 'selected' : ''} ${dim ? 'dim' : ''}`}
+                   className={`node s-${t.status} ${isSel ? 'selected' : ''} ${inTree ? 'in-tree' : ''} ${dim ? 'dim' : ''}`}
                    onClick={() => onSelect(isSel ? null : t.id)}>
                 <div className="meta">
                   <span className="status-pip"></span>
@@ -243,7 +246,7 @@ function TaskDetail({ task, allTasks }) {
 
       <div className="kv">
         <span className="k">status</span>
-        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'pending' ? 'warn' : 'accent'}`}>{task.status}</span></span>
+        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'pending' ? 'warn' : 'accent'}`}>{task.status}</span></span>
         <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.loops}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.attempts}</span>
@@ -295,7 +298,8 @@ function TasksTab({ projectFilter, search }) {
   const [selectedId, setSelectedId] = uS_T(null);
 
   // Filter, default {active, pending} on
-  const [filters, setFilters] = tasksPersistedState('df.tasksFilters', { active: true, pending: true, complete: false });
+  const [filters, setFilters] = tasksPersistedState('df.tasksFilters',
+    { active: true, pending: true, complete: false, deferred: false });
   const flipFilter = (k) => setFilters(f => ({ ...f, [k]: !f[k] }));
 
   const allTasks = DF_T.ACTIVE_TASKS;
@@ -305,14 +309,17 @@ function TasksTab({ projectFilter, search }) {
 
   function statusMatches(s) {
     if (filters.active   && (s === 'in-progress' || s === 'blocked')) return true;
-    if (filters.pending  && s === 'pending') return true;
-    if (filters.complete && s === 'done') return true;
+    if (filters.pending  && s === 'pending')  return true;
+    if (filters.complete && s === 'done')     return true;
+    if (filters.deferred && s === 'deferred') return true;
     return false;
   }
   function searchMatches(t) {
     if (!search) return true;
-    const q = search.toLowerCase();
-    return t.id.toLowerCase().includes(q) || t.title.toLowerCase().includes(q);
+    const terms = search.toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return true;
+    const haystack = `${t.id} ${t.title}`.toLowerCase();
+    return terms.every(term => haystack.includes(term));
   }
 
   const selectedTask = selectedId ? allTasks.find(t => t.id === selectedId) : null;
@@ -326,6 +333,7 @@ function TasksTab({ projectFilter, search }) {
           <button className={filters.active   ? 'on' : ''} onClick={() => flipFilter('active')}>active</button>
           <button className={filters.pending  ? 'on' : ''} onClick={() => flipFilter('pending')}>pending</button>
           <button className={filters.complete ? 'on' : ''} onClick={() => flipFilter('complete')}>complete</button>
+          <button className={filters.deferred ? 'on' : ''} onClick={() => flipFilter('deferred')}>deferred</button>
         </div>
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
           click a task to inspect →
