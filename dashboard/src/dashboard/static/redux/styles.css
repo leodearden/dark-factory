@@ -367,6 +367,16 @@ table { border-collapse: collapse; width: 100%; }
   display: inline-flex; align-items: center; gap: 5px;
 }
 .proj-head .summary .pip-dot { width: 7px; height: 7px; border-radius: 50%; }
+
+.halt-pill {
+  display: inline-flex; align-items: center;
+  padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 500;
+  font-family: var(--mono); letter-spacing: 0.02em;
+  border: 1px solid var(--line);
+}
+.halt-pill--halted  { color: var(--bad);  border-color: oklch(0.68 0.18 25  / 0.4); background: oklch(0.68 0.18 25  / 0.10); }
+.halt-pill--running { color: var(--ok);   border-color: oklch(0.74 0.14 155 / 0.4); background: oklch(0.74 0.14 155 / 0.10); }
+.halt-pill--offline { color: var(--fg-3); background: var(--bg-2); }
 .proj-head .mini-bar {
   width: 120px; height: 6px; border-radius: 3px; overflow: hidden;
   background: var(--bg-2); display: flex;

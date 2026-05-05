@@ -762,6 +762,23 @@ function ReconTab({ projectFilter, search }) {
   );
 }
 
+// ── Halt-status pill (rendered in each MergeTab project summary) ──
+function HaltPill({ halt }) {
+  const h = halt || { offline: true };
+  let cls, text;
+  if (h.halted) {
+    cls = 'halt-pill halt-pill--halted';
+    text = h.owner_esc_id ? `Halted · esc:${h.owner_esc_id}` : 'Halted';
+  } else if (h.wired) {
+    cls = 'halt-pill halt-pill--running';
+    text = 'Running';
+  } else {
+    cls = 'halt-pill halt-pill--offline';
+    text = 'Offline';
+  }
+  return <span className={cls}>{text}</span>;
+}
+
 // ── Merge Queue ──
 function MergeTab({ projectFilter }) {
   const projects = Object.entries(DF.MERGE_QUEUE).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
@@ -833,6 +850,7 @@ function MergeTab({ projectFilter }) {
         const hitPct = Math.round(d.speculative.hit_rate * 100);
         const summary = (
           <>
+            <HaltPill halt={d.halt} />
             <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{d.latency.count} attempts</span>
             <span className="pip"><span className="pip-dot" style={{ background: CP.warn }}></span>{d.active.length} queued</span>
             <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{fmtMs(d.latency.p50)} p50</span>

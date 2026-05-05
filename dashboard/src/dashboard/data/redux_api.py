@@ -311,6 +311,7 @@ def shape_merge_queue(
     per_project: Mapping[str, Mapping[str, Any]],
     *,
     active_sparks: Mapping[str, Mapping[str, list]] | None = None,
+    halt_status: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return ``{MERGE_QUEUE: {project_label: {...}}}``.
 
@@ -318,17 +319,25 @@ def shape_merge_queue(
     from absolute project_root paths to short basenames so the React side can
     match against ``PROJECTS[].name``.  The shape per-project follows the
     DF_DATA mock: ``depth`` (renamed from ``depth_timeseries``), ``outcomes``,
-    ``latency``, ``recent``, ``speculative``, ``active``, ``active_spark``.
+    ``latency``, ``recent``, ``speculative``, ``active``, ``active_spark``,
+    ``halt``.
 
     ``active_sparks`` (optional) carries true active-queue depth over time
     keyed by absolute project_root path; surfaced as ``active_spark`` per
     project label so the UI tile no longer falls back to attempt-count.
+
+    ``halt_status`` (optional) is keyed by project basename and carries
+    ``{wired, halted, owner_esc_id, offline}`` per orchestrator. Missing
+    projects fall back to ``{offline: True}`` so the UI can render an Offline
+    pill on every panel.
     """
     sparks = active_sparks or {}
+    halts = halt_status or {}
     out: dict[str, dict] = {}
     for pid, data in per_project.items():
         spark = sparks.get(pid) or _EMPTY_SERIES
-        out[_project_label(pid)] = {
+        label = _project_label(pid)
+        out[label] = {
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
             'outcomes': dict(data.get('outcomes') or {'labels': [], 'values': []}),
             'latency': dict(data.get('latency') or {}),
@@ -339,6 +348,7 @@ def shape_merge_queue(
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),
             },
+            'halt': dict(halts.get(label) or {'offline': True}),
         }
     return {'MERGE_QUEUE': out}
 

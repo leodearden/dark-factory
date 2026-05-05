@@ -167,6 +167,49 @@ def test_shape_merge_queue_relabels_and_renames_depth():
     section = body['MERGE_QUEUE']['dark-factory']
     assert section['depth'] == {'labels': [0, 1], 'values': [3, 4]}
     assert section['recent'] == [{'task_id': '17'}]
+    # Default: no halt_status passed → offline fallback per project.
+    assert section['halt'] == {'offline': True}
+
+
+def test_shape_merge_queue_injects_halt_status_per_project():
+    raw = {
+        '/home/leo/src/reify': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {'hit_rate': 0.0},
+            'active': [],
+        },
+        '/home/leo/src/know-live': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {'hit_rate': 0.0},
+            'active': [],
+        },
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'speculative': {'hit_rate': 0.0},
+            'active': [],
+        },
+    }
+    halt_status = {
+        'reify': {'wired': True, 'halted': True, 'owner_esc_id': 'esc-42', 'offline': False},
+        'know-live': {'wired': True, 'halted': False, 'owner_esc_id': None, 'offline': False},
+        # dark-factory deliberately absent → offline fallback
+    }
+    body = redux_api.shape_merge_queue(raw, halt_status=halt_status)
+    mq = body['MERGE_QUEUE']
+    assert mq['reify']['halt']['halted'] is True
+    assert mq['reify']['halt']['owner_esc_id'] == 'esc-42'
+    assert mq['know-live']['halt']['halted'] is False
+    assert mq['know-live']['halt']['wired'] is True
+    assert mq['dark-factory']['halt'] == {'offline': True}
 
 
 # ---------------------------------------------------------------------------
