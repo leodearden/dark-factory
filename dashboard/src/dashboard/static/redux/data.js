@@ -11,17 +11,22 @@
  * render and can be replaced freely.
  */
 
-const ENDPOINTS = {
-  '/api/v2/dashboard/orchestrators': ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
-  '/api/v2/dashboard/tasks':         ['ACTIVE_TASKS', 'FILE_LOCKS'],
-  '/api/v2/dashboard/memory':        ['MEMORY_STATUS'],
-  '/api/v2/dashboard/memory-graphs': ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
-  '/api/v2/dashboard/recon':         ['RECON_STATE', 'AGENTS'],
-  '/api/v2/dashboard/merge-queue':   ['MERGE_QUEUE'],
-  '/api/v2/dashboard/costs':         ['COSTS'],
-  '/api/v2/dashboard/performance':   ['PERFORMANCE'],
-  '/api/v2/dashboard/burndown':      ['BURNDOWN', 'BURNDOWN_BY_PROJECT'],
-};
+// Endpoint → DF_DATA keys map, parameterised on the active window chip.
+// Only the four windowed endpoints append ?window=; the rest stay static.
+function endpointsFor(win) {
+  const w = encodeURIComponent(win);
+  return {
+    '/api/v2/dashboard/orchestrators':                ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
+    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'FILE_LOCKS'],
+    '/api/v2/dashboard/memory':                       ['MEMORY_STATUS'],
+    '/api/v2/dashboard/memory-graphs':                ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
+    '/api/v2/dashboard/recon':                        ['RECON_STATE', 'AGENTS'],
+    [`/api/v2/dashboard/merge-queue?window=${w}`]:    ['MERGE_QUEUE'],
+    [`/api/v2/dashboard/costs?window=${w}`]:          ['COSTS'],
+    [`/api/v2/dashboard/performance?window=${w}`]:    ['PERFORMANCE'],
+    [`/api/v2/dashboard/burndown?window=${w}`]:       ['BURNDOWN', 'BURNDOWN_BY_PROJECT'],
+  };
+}
 
 // Keys whose array reference is captured at module-load by shell.jsx — mutate
 // in place rather than reassigning, so cached references stay valid.
@@ -88,8 +93,13 @@ async function refreshOne(url, keys) {
   }
 }
 
-async function refreshDFData() {
-  await Promise.all(Object.entries(ENDPOINTS).map(([url, keys]) => refreshOne(url, keys)));
+// Module-scope window — updated by DF_REFRESH(win); 3 s polling reads from it
+// so chip changes take effect on the next tick without restarting the loop.
+let currentWin = '24h';
+
+async function refreshDFData(win) {
+  if (typeof win === 'string' && win) currentWin = win;
+  await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keys]) => refreshOne(url, keys)));
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
 }
 

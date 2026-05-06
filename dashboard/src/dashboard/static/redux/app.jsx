@@ -63,6 +63,12 @@ function App() {
     window.__DF_PAUSE = !!tw.pauseLive;
   }, [tw.pauseLive]);
 
+  // Re-fetch with the new window when the chip changes. Unwindowed endpoints
+  // ignore ?window= silently, so passing it from chip-less tabs is harmless.
+  uE(() => {
+    if (window.DF_REFRESH) window.DF_REFRESH(win);
+  }, [win]);
+
   const tabs = [
     { id: 'overview', label: 'Overview' },
     { id: 'orch',     label: 'Orchestrators' },
@@ -111,17 +117,26 @@ function App() {
     }
   }
 
-  // Per-tab toolbar config
+  // Per-tab toolbar config.
+  //
+  // showWindow / windows are scoped per Option-A "honest scoping": the chip
+  // appears only on tabs whose endpoints actually consume ?window=, and the
+  // chip set is restricted to values the server maps. Specifically:
+  //   - Costs / Performance / Merge / Overview-cost-spark obey app.py's
+  //     _WINDOW_DAYS = {24h, 7d, 30d, all} — no 1h, no 90d.
+  //   - Burndown obeys _BURNDOWN_WINDOWS = {24h, 7d, 30d, 90d} — no all.
+  const WIN_DEFAULT  = ['24h', '7d', '30d', 'all'];
+  const WIN_BURNDOWN = ['24h', '7d', '30d', '90d'];
   const toolbarConfig = {
-    overview: { showAgents: false, search: false },
-    orch:     { showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
-    tasks:    { showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
-    perf:     { showAgents: false, search: false },
-    memory:   { showAgents: true,  search: false },
-    recon:    { showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
-    merge:    { showAgents: false, search: false },
-    cost:     { showAgents: false, search: false },
-    burn:     { showAgents: false, search: false },
+    overview: { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
+    orch:     { showWindow: false,                        showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
+    tasks:    { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
+    perf:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
+    memory:   { showWindow: false,                        showAgents: true,  search: false },
+    recon:    { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
+    merge:    { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
+    cost:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
+    burn:     { showWindow: true,  windows: WIN_BURNDOWN, showAgents: false, search: false },
   }[tab] || {};
 
   return (
@@ -138,6 +153,8 @@ function App() {
       <div className="main">
         <Toolbar
           window={win} onWindow={setWin}
+          showWindow={toolbarConfig.showWindow !== false}
+          windows={toolbarConfig.windows}
           projects={projects} onProjects={setProjects}
           agents={agents} onAgents={setAgents}
           showAgents={toolbarConfig.showAgents}
