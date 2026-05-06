@@ -536,7 +536,7 @@ class TestAcquireNextNoDuplicates:
             'title': 'Task one',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task])
 
@@ -557,14 +557,14 @@ class TestAcquireNextNoDuplicates:
             'title': 'Task A',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         task_b = {
             'id': '2',
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['frontend']},
+            'metadata': {'files': ['frontend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
@@ -589,7 +589,7 @@ class TestAcquireNextNoDuplicates:
             'title': 'Task one',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task])
 
@@ -616,21 +616,21 @@ class TestAcquireNextNoDuplicates:
                 'title': 'Backend task',
                 'status': 'pending',
                 'dependencies': [],
-                'metadata': {'modules': ['backend']},
+                'metadata': {'files': ['backend']},
             },
             {
                 'id': '2',
                 'title': 'Frontend task',
                 'status': 'pending',
                 'dependencies': [],
-                'metadata': {'modules': ['frontend']},
+                'metadata': {'files': ['frontend']},
             },
             {
                 'id': '3',
                 'title': 'Infra task',
                 'status': 'pending',
                 'dependencies': [],
-                'metadata': {'modules': ['infra']},
+                'metadata': {'files': ['infra']},
             },
         ]
         scheduler.get_tasks = AsyncMock(return_value=tasks)
@@ -655,14 +655,14 @@ class TestAcquireNextNoDuplicates:
             'title': 'Task A',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         task_b = {
             'id': 'B',
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
@@ -763,14 +763,14 @@ class TestAcquireNextDependencyGating:
             'title': 'Task A',
             'status': 'in-progress',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         task_b = {
             'id': 'B',
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [{'id': 'A'}],
-            'metadata': {'modules': ['frontend']},
+            'metadata': {'files': ['frontend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
@@ -788,14 +788,14 @@ class TestAcquireNextDependencyGating:
             'title': 'Task A',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         task_b = {
             'id': 'B',
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [{'id': 'A'}],
-            'metadata': {'modules': ['frontend']},
+            'metadata': {'files': ['frontend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
@@ -818,14 +818,14 @@ class TestAcquireNextDependencyGating:
             'title': 'Task A',
             'status': 'done',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         task_b = {
             'id': 'B',
             'title': 'Task B',
             'status': 'pending',
             'dependencies': [{'id': 'A'}],
-            'metadata': {'modules': ['frontend']},
+            'metadata': {'files': ['frontend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
 
@@ -843,21 +843,21 @@ class TestAcquireNextDependencyGating:
             'title': 'Task A',
             'status': 'done',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         task_b = {
             'id': 'B',
             'title': 'Task B',
             'status': 'in-progress',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         task_c = {
             'id': 'C',
             'title': 'Task C',
             'status': 'pending',
             'dependencies': [{'id': 'A'}, {'id': 'B'}],
-            'metadata': {'modules': ['frontend']},
+            'metadata': {'files': ['frontend']},
         }
         scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b, task_c])
 
@@ -876,7 +876,7 @@ class TestAcquireNextDependencyGating:
             'title': 'Task int dep',
             'status': 'pending',
             'dependencies': [1],  # integer format
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
         # Task with string dep ID
         task_str = {
@@ -884,7 +884,7 @@ class TestAcquireNextDependencyGating:
             'title': 'Task str dep',
             'status': 'pending',
             'dependencies': ['1'],  # string format
-            'metadata': {'modules': ['frontend']},
+            'metadata': {'files': ['frontend']},
         }
         # Task with dict dep ID
         task_dict = {
@@ -892,14 +892,14 @@ class TestAcquireNextDependencyGating:
             'title': 'Task dict dep',
             'status': 'pending',
             'dependencies': [{'id': 1}],  # dict format
-            'metadata': {'modules': ['ops']},
+            'metadata': {'files': ['ops']},
         }
         dep_done = {
             'id': '1',
             'title': 'Dep task',
             'status': 'done',
             'dependencies': [],
-            'metadata': {'modules': []},
+            'metadata': {'files': []},
         }
         scheduler.get_tasks = AsyncMock(
             return_value=[dep_done, task_int, task_str, task_dict]
@@ -968,7 +968,7 @@ class TestGetModulesJsonStringMetadata:
         """_get_modules returns normalized module list from dict metadata."""
         task = {
             'id': '5',
-            'metadata': {'modules': ['backend', 'server']},
+            'metadata': {'files': ['backend', 'server']},
         }
         result = scheduler._get_modules(task)
         assert result != ['task-5'], (
@@ -977,6 +977,23 @@ class TestGetModulesJsonStringMetadata:
         assert len(result) > 0
         assert all(isinstance(m, str) for m in result)
         assert 'task-5' not in result
+
+    def test_get_modules_ignores_legacy_metadata_modules_key(
+        self, scheduler: Scheduler
+    ):
+        """_get_modules must NOT read metadata.modules — only metadata.files.
+
+        Regression guard for the principled rename: any task that still carries
+        the legacy ``metadata.modules`` key (e.g. submitted before the migration
+        ran) must fall through to the ``task-<id>`` fallback, not silently
+        derive locks from the stale key.
+        """
+        task = {
+            'id': '99',
+            'metadata': {'modules': ['legacy-key-should-not-be-read']},
+        }
+        result = scheduler._get_modules(task)
+        assert result == ['task-99']
 
     def test_get_modules_extracts_files_from_dict_metadata(
         self, scheduler: Scheduler
@@ -1075,7 +1092,7 @@ class TestUpdateTaskMetadataSerialization:
 
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
 
-        await scheduler.update_task('1', {'modules': ['backend']})
+        await scheduler.update_task('1', {'files': ['backend']})
 
         assert len(captured_args) == 1
         arguments = captured_args[0]['arguments']
@@ -1084,7 +1101,7 @@ class TestUpdateTaskMetadataSerialization:
         assert isinstance(metadata, str), f'Expected str metadata, got {type(metadata)}: {metadata}'
         # Must be valid JSON that round-trips correctly
         parsed = json.loads(metadata)
-        assert parsed == {'modules': ['backend']}
+        assert parsed == {'files': ['backend']}
 
     @pytest.mark.asyncio
     async def test_update_task_passes_string_metadata_through(
@@ -1144,7 +1161,7 @@ class TestRequeueCooldown:
             'title': 'Cooldown test task',
             'status': 'pending',
             'dependencies': [],
-            'metadata': {'modules': ['backend']},
+            'metadata': {'files': ['backend']},
         }
 
     @pytest.fixture
@@ -1354,7 +1371,7 @@ class TestFairness:
             'status': 'pending',
             'priority': 'high',
             'dependencies': [],
-            'metadata': {'modules': ['compiler/src', 'eval/src']},
+            'metadata': {'files': ['compiler/src', 'eval/src']},
         }
 
     @staticmethod
@@ -1365,7 +1382,7 @@ class TestFairness:
             'status': 'pending',
             'priority': priority,
             'dependencies': [],
-            'metadata': {'modules': [module]},
+            'metadata': {'files': [module]},
         }
 
     @pytest.mark.asyncio
@@ -1941,7 +1958,7 @@ def _pending_task(
     *,
     priority: str = 'medium',
     deps: list[str] | None = None,
-    modules: list[str] | None = None,
+    files: list[str] | None = None,
     status: str = 'pending',
 ) -> dict:
     """Helper: build a task dict with all fields the scheduler reads."""
@@ -1951,7 +1968,7 @@ def _pending_task(
         'status': status,
         'priority': priority,
         'dependencies': [{'id': d} for d in (deps or [])],
-        'metadata': {'modules': modules or [f'mod{task_id}']},
+        'metadata': {'files': files or [f'mod{task_id}']},
     }
 
 
@@ -2317,9 +2334,9 @@ class TestLegacyOrderingPreserved:
         config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
-            _pending_task('1', priority='low', modules=['modA']),
-            _pending_task('2', priority='high', modules=['modB']),
-            _pending_task('3', priority='medium', modules=['modC']),
+            _pending_task('1', priority='low', files=['modA']),
+            _pending_task('2', priority='high', files=['modB']),
+            _pending_task('3', priority='medium', files=['modC']),
         ]
         scheduler.get_tasks = AsyncMock(return_value=tasks)
         result = await scheduler.acquire_next()
@@ -2332,8 +2349,8 @@ class TestLegacyOrderingPreserved:
         config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
-            _pending_task('1', priority='high', modules=['modA']),
-            _pending_task('2', priority='critical', modules=['modB']),
+            _pending_task('1', priority='high', files=['modA']),
+            _pending_task('2', priority='critical', files=['modB']),
         ]
         scheduler.get_tasks = AsyncMock(return_value=tasks)
         result = await scheduler.acquire_next()
@@ -2346,8 +2363,8 @@ class TestLegacyOrderingPreserved:
         config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
-            _pending_task('1', priority='polish', modules=['modA']),
-            _pending_task('2', priority='low', modules=['modB']),
+            _pending_task('1', priority='polish', files=['modA']),
+            _pending_task('2', priority='low', files=['modB']),
         ]
         scheduler.get_tasks = AsyncMock(return_value=tasks)
         result = await scheduler.acquire_next()
@@ -2362,9 +2379,9 @@ class TestLegacyOrderingPreserved:
         # Task 1 (medium, available) is needed by task 2 (critical, blocked).
         # Inheritance should lift task 1 above task 3 (high, available).
         tasks = [
-            _pending_task('1', priority='medium', modules=['modA']),
-            _pending_task('2', priority='critical', deps=['1'], modules=['modB']),
-            _pending_task('3', priority='high', modules=['modC']),
+            _pending_task('1', priority='medium', files=['modA']),
+            _pending_task('2', priority='critical', deps=['1'], files=['modB']),
+            _pending_task('3', priority='high', files=['modC']),
         ]
         scheduler.get_tasks = AsyncMock(return_value=tasks)
         result = await scheduler.acquire_next()
@@ -2377,7 +2394,7 @@ class TestDispatchPriorityBookkeeping:
     @pytest.mark.asyncio
     async def test_release_clears_dispatched_priority(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-        task = _pending_task('1', priority='high', modules=['modA'])
+        task = _pending_task('1', priority='high', files=['modA'])
         scheduler.get_tasks = AsyncMock(return_value=[task])
         result = await scheduler.acquire_next()
         assert result is not None
@@ -2392,8 +2409,8 @@ class TestDispatchPriorityBookkeeping:
         config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
-            _pending_task('1', priority='medium', modules=['modA']),
-            _pending_task('2', priority='critical', deps=['1'], modules=['modB']),
+            _pending_task('1', priority='medium', files=['modA']),
+            _pending_task('2', priority='critical', deps=['1'], files=['modB']),
         ]
         scheduler.get_tasks = AsyncMock(return_value=tasks)
         result = await scheduler.acquire_next()

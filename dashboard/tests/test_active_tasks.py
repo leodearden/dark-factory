@@ -48,7 +48,7 @@ def test_minutes_since_returns_zero_on_missing_or_bad():
 def _make_project(root, *, project_dir, tasks, worktrees=None):
     """Lay out a synthetic project with .taskmaster/tasks.json + optional worktrees.
 
-    ``worktrees`` is a list of (task_id, metadata_dict, plan_modules,
+    ``worktrees`` is a list of (task_id, metadata_dict, plan_files,
     iteration_lines, review_files) tuples.  Any element after metadata may be
     None / [] to skip writing that artefact.
     """
@@ -63,15 +63,15 @@ def _make_project(root, *, project_dir, tasks, worktrees=None):
 
     worktrees_dir = project_root / '.worktrees'
     worktrees_dir.mkdir()
-    for task_id, metadata, modules, iteration_lines, review_files in worktrees:
+    for task_id, metadata, files, iteration_lines, review_files in worktrees:
         wt = worktrees_dir / str(task_id)
         wt.mkdir()
         task_dir = wt / '.task'
         task_dir.mkdir()
         if metadata is not None:
             (task_dir / 'metadata.json').write_text(json.dumps(metadata))
-        if modules is not None:
-            (task_dir / 'plan.json').write_text(json.dumps({'steps': [], 'modules': modules}))
+        if files is not None:
+            (task_dir / 'plan.json').write_text(json.dumps({'steps': [], 'files': files}))
         if iteration_lines is not None:
             (task_dir / 'iterations.jsonl').write_text(
                 '\n'.join('{}' for _ in range(iteration_lines)) + ('\n' if iteration_lines else ''),

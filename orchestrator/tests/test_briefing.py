@@ -33,26 +33,26 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
 
 
 class TestFormatTaskMetadataInvariant:
-    def test_dict_metadata_with_modules(self, briefing: BriefingAssembler):
+    def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
         task = {
             'id': '424',
             'title': 'Trivial DRY consolidation',
             'description': 'Move three helpers',
-            'metadata': {'modules': ['orchestrator', 'shared']},
+            'metadata': {'files': ['orchestrator', 'shared']},
         }
         out = briefing._format_task(task)
         assert '**ID:** 424' in out
-        assert '**Modules:** orchestrator, shared' in out
+        assert '**Files:** orchestrator, shared' in out
 
     def test_empty_dict_metadata(self, briefing: BriefingAssembler):
         task = {
             'id': '1',
-            'title': 'No modules',
+            'title': 'No files',
             'metadata': {},
         }
         out = briefing._format_task(task)
         assert '**ID:** 1' in out
-        assert 'Modules' not in out
+        assert 'Files' not in out
 
     def test_metadata_absent(self, briefing: BriefingAssembler):
         task = {'id': '2', 'title': 'No metadata key'}

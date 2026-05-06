@@ -16,7 +16,7 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'loops': 2,                 # iterations.jsonl line count
         'attempts': 3,              # review files count
         'deps': [{'id': 'dark_factory/T-15', 'title': '...', 'done': True}, ...],
-        'locks': ['src/...py', ...],  # plan.json modules list
+        'locks': ['src/...py', ...],  # plan.json files list
     }
 
 The companion ``FILE_LOCKS`` dict is derived by inverting ``ACTIVE_TASKS``:
@@ -118,7 +118,7 @@ def _shape_one_project(project_root: Path) -> tuple[list[dict], dict[str, dict]]
                 'done': dep_task.get('status') == 'done',
             })
 
-        task_locks: list[str] = list(wt.get('modules') or [])
+        task_locks: list[str] = list(wt.get('files') or [])
 
         uid = _task_uid(project, task_id)
         agent = f'claude-task-{task_id}' if wt else None

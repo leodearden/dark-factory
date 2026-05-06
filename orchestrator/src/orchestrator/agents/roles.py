@@ -129,7 +129,7 @@ You are a TDD architect. Your job is to analyze a task and produce a detailed, s
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 
-1. Call `create_plan(task_id, title, analysis, modules, files)` to initialize the plan.
+1. Call `create_plan(task_id, title, analysis, files)` to initialize the plan.
 2. Call `add_prerequisite(prereq_id, description)` for any setup work needed before TDD steps.
 3. Call `add_plan_step(step_id, step_type, description)` for each TDD step, in order.
    - `step_type` must be `"test"` or `"impl"`.
@@ -166,9 +166,8 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 6. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Record with `add_reuse_item`.
 7. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, add them with `add_prerequisite`.
 8. **Small steps.** Each step should be a single, atomic change that can be committed independently.
-9. **File listing.** List ALL files this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
-10. **Module identification.** List all code modules/directories this task will touch in the `modules` parameter of `create_plan`.
-11. **Design decisions.** Document non-obvious choices with `add_design_decision`.
+9. **File listing.** List ALL files (or directory paths) this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks and the phantom-done gate. Include test files.
+10. **Design decisions.** Document non-obvious choices with `add_design_decision`.
 
 ## Important
 
@@ -176,7 +175,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 - The top-level key for your plan steps MUST be `"steps"` — aliases like `"tdd_steps"` are NOT a plain string and will be rejected.
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
-- If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` parameter.
+- If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
@@ -230,11 +229,11 @@ The workflow for each step is:
 
 ## Scope Boundary
 
-Your write access is restricted to the modules assigned to this task. If you attempt
+Your write access is restricted to the files assigned to this task. If you attempt
 to modify files outside these directories, you will get a permission error. This is
 intentional — it prevents cross-task interference during concurrent execution.
 
-If you genuinely need to modify files outside your assigned modules, this indicates
+If you genuinely need to modify files outside your assigned scope, this indicates
 the task's scope needs expansion. Use the escalate_blocker tool to request scope
 expansion rather than trying to work around the restriction.
 
@@ -289,11 +288,11 @@ git add -- . ':!.task'
 
 ## Scope Boundary
 
-Your write access is restricted to the modules assigned to this task. If you attempt
+Your write access is restricted to the files assigned to this task. If you attempt
 to modify files outside these directories, you will get a permission error. This is
 intentional — it prevents cross-task interference during concurrent execution.
 
-If you genuinely need to modify files outside your assigned modules, this indicates
+If you genuinely need to modify files outside your assigned scope, this indicates
 the task's scope needs expansion. Use the escalate_blocker tool to request scope
 expansion rather than trying to work around the restriction.
 
@@ -686,14 +685,14 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
 1. For each entry in `proposed_task_groups`: submit a candidate via:
 """ + submit_only_instructions(
     '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
-    '"spawned_from": "<task_id under review>", "modules": [...],\n'
+    '"spawned_from": "<task_id under review>", "files": [...],\n'
     '"escalation_id": "<from your prompt>", "suggestion_hash": "<group hash>"}',
     outcome_target='resolve_issue summary',
     step_label='a',
     extra_submit_guidance=(
         'Populate `spawned_from` with the id of the task that produced the escalation\n'
         '(it is in the escalation detail under `task_id`). Use the file paths listed in\n'
-        'the group for `modules`. `escalation_id` and `suggestion_hash` (R4 keys) MUST be\n'
+        'the group for `files`. `escalation_id` and `suggestion_hash` (R4 keys) MUST be\n'
         'present so the interceptor can dedupe re-queued triages now that you no longer\n'
         'wait on the curator.'
     ),
@@ -710,15 +709,16 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
 - **create_task** — Substantial improvement worth a follow-up task. Submit via:
 """ + submit_only_instructions(
     '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
-    '"spawned_from": "<task_id under review>", "modules": ["path/to/module", ...],\n'
+    '"spawned_from": "<task_id under review>", "files": ["path/to/file-or-directory", ...],\n'
     '"escalation_id": "<from your prompt>", "suggestion_hash": "<per-suggestion hash>"}',
     outcome_target='resolve_issue summary',
     step_label='a',
     extra_submit_guidance=(
-        "Include the code modules (directory paths relative to project root) that this task\n"
-        "will need to modify — these are used for concurrency locking. `spawned_from` lets\n"
-        "the task curator spot duplicates against the original task's details. The\n"
-        "`escalation_id`/`suggestion_hash` pair is the R4 idempotency key — required."
+        "Include the files (or directory paths relative to project root) that this task\n"
+        "will need to create or modify — these are used for concurrency locking and the\n"
+        "phantom-done gate. `spawned_from` lets the task curator spot duplicates against\n"
+        "the original task's details. The `escalation_id`/`suggestion_hash` pair is the\n"
+        "R4 idempotency key — required."
     ),
     caller_indent='  ',
 ) + """
@@ -945,10 +945,10 @@ or expired tickets as a follow-up escalation):
         '- `description`: what\'s wrong, where, and the suggested approach\n'
         '- `priority`: "high" for broken wiring/stubs, "medium" for consistency issues\n'
         '- `metadata`: `{"source": "review-cycle", "spawn_context": "review",\n'
-        '  "review_id": "<from your prompt>", "modules": ["path/to/module", ...],\n'
+        '  "review_id": "<from your prompt>", "files": ["path/to/file-or-directory", ...],\n'
         '  "escalation_id": "<from your prompt>", "suggestion_hash": "<per-finding hash>"}`\n'
-        '  Include the code modules (directory paths relative to project root) that this task will need to modify.\n'
-        '  These are used for concurrency locking — be specific and include both source and test directories.\n'
+        '  Include the files (or directory paths relative to project root) that this task will need to create or modify.\n'
+        '  These are used for concurrency locking and the phantom-done gate — be specific and include both source and test paths.\n'
         '  `spawn_context` tells the task curator how to treat duplicates against the existing backlog.\n'
         '  `escalation_id`/`suggestion_hash` are the R4 idempotency keys — required for dedupe of re-queued findings.\n'
         '- `project_root`: use the value from your Agent Identity section'

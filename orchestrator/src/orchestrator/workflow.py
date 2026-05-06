@@ -1195,7 +1195,6 @@ class TaskWorkflow:
             '  "task_id": "<task id>",\n'
             '  "title": "<task title>",\n'
             '  "files": ["path/to/file1.py"],\n'
-            '  "modules": ["<module1>"],\n'
             '  "analysis": "<analysis>",\n'
             '  "prerequisites": [\n'
             '    {"id": "pre-1", "description": "...", "status": "pending", "commit": null}\n'

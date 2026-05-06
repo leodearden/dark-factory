@@ -89,7 +89,7 @@ def task_assignment() -> TaskAssignment:
             'title': 'X',
             'description': 'Y',
             'status': 'pending',
-            'metadata': {'modules': ['lib']},
+            'metadata': {'files': ['lib']},
             'dependencies': [],
         },
         modules=['lib'],
@@ -99,7 +99,6 @@ def task_assignment() -> TaskAssignment:
 PLAN = {
     'task_id': '42',
     'title': 'X',
-    'modules': ['lib'],
     'files': ['lib.py'],
     'analysis': '',
     'prerequisites': [],

@@ -706,13 +706,13 @@ class Harness:
             logger.info(f'Tagged {tagged} tasks with PRD: {resolved_prd}')
 
     async def _tag_task_modules(self, force: bool = False) -> None:
-        """Invoke a Claude agent to tag each task with the code modules it touches.
+        """Invoke a Claude agent to tag each task with the files it touches.
 
-        Uses structured output to get a JSON mapping of task_id → [modules],
-        then persists via scheduler.update_task().
+        Uses structured output to get a JSON mapping of task_id → [files],
+        then persists via scheduler.update_task() as ``metadata.files``.
 
         When *force* is ``True``, retag all non-done/cancelled tasks even if
-        they already have module metadata.
+        they already have file metadata.
         """
         tasks = await self.scheduler.get_tasks()
 
@@ -723,8 +723,8 @@ class Harness:
                 continue
             if not force:
                 metadata = t.get('metadata') or {}
-                modules = metadata.get('modules', [])
-                if modules:
+                files = metadata.get('files', [])
+                if files:
                     continue
             untagged.append(t)
 
@@ -733,7 +733,7 @@ class Harness:
             return
 
         if force:
-            logger.info(f'Force-retagging {len(untagged)} tasks with module metadata')
+            logger.info(f'Force-retagging {len(untagged)} tasks with file metadata')
 
         # Get top-level directory listing for context
         try:
@@ -761,11 +761,10 @@ class Harness:
                             'files': {
                                 'type': 'array',
                                 'items': {'type': 'string'},
-                                'description': 'Predicted file paths this task will create or modify',
+                                'description': 'Predicted file paths (or directory paths) this task will create or modify',
                             },
-                            'modules': {'type': 'array', 'items': {'type': 'string'}},
                         },
-                        'required': ['id', 'files', 'modules'],
+                        'required': ['id', 'files'],
                     },
                 },
             },
@@ -774,14 +773,12 @@ class Harness:
 
         prompt = f"""\
 Given these tasks and this codebase structure, predict which files each task
-will create or modify, and which code modules (directories) it will touch.
+will create or modify.
 
 Be specific and exhaustive with file predictions — include source files AND
 test files. Use paths relative to the project root. The `files` field is used
 to derive concurrency locks, so accuracy prevents unnecessary serialization.
-
-The `modules` field should list directory-level groupings (e.g. "src/backends",
-"src/server", "tests") as a human-readable summary.
+Directory paths are accepted when an entire directory will be touched.
 
 # Codebase top-level directories
 {json.dumps(entries)}
@@ -828,30 +825,20 @@ Output JSON matching the schema. Every task must appear in the output.
         tagged_count = 0
         for entry in mapping.get('tasks', []):
             task_id = str(entry.get('id', ''))
-            modules = entry.get('modules', [])
             files = entry.get('files', [])
-            if task_id and (modules or files):
-                metadata: dict = {}
-                if files:
-                    metadata['files'] = files
-                if modules:
-                    metadata['modules'] = modules
-                await self.scheduler.update_task(task_id, json.dumps(metadata))
+            if task_id and files:
+                await self.scheduler.update_task(
+                    task_id, json.dumps({'files': files})
+                )
                 # Also populate in-memory cache so modules are available
                 # immediately without re-fetching from taskmaster
                 depth = self.config.lock_depth
-                if files:
-                    derived = files_to_modules(files, depth)
-                    if derived:
-                        self.scheduler._module_cache[task_id] = derived
-                elif modules:
-                    from orchestrator.scheduler import normalize_lock
-                    self.scheduler._module_cache[task_id] = [
-                        normalize_lock(m, depth) for m in modules
-                    ]
+                derived = files_to_modules(files, depth)
+                if derived:
+                    self.scheduler._module_cache[task_id] = derived
                 tagged_count += 1
 
-        logger.info(f'Tagged {tagged_count}/{len(untagged)} tasks with module metadata')
+        logger.info(f'Tagged {tagged_count}/{len(untagged)} tasks with file metadata')
         logger.info(f'Module cache has {len(self.scheduler._module_cache)} entries')
         if self.scheduler._module_cache:
             sample = dict(list(self.scheduler._module_cache.items())[:3])

@@ -177,7 +177,7 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     """
     import json
 
-    metadata = {'source': 'review-cycle', 'modules': ['my-project/src']}
+    metadata = {'source': 'review-cycle', 'files': ['my-project/src']}
     result = await _submit_and_resolve(interceptor_facade, '/project', prompt='Test', metadata=metadata)
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
@@ -957,7 +957,7 @@ async def test_r4_idempotency_hit_add_task(
     metadata = {
         'escalation_id': 'esc-r4-986',
         'suggestion_hash': 'h986h986h986h986',
-        'modules': ['fused-memory/src'],
+        'files': ['fused-memory/src'],
     }
     try:
         result = await _submit_and_resolve(interceptor,
@@ -1013,7 +1013,7 @@ async def test_r4_idempotency_hit_submit_task(
     metadata = {
         'escalation_id': 'esc-r4-986',
         'suggestion_hash': 'h986h986h986h986',
-        'modules': ['fused-memory/src'],
+        'files': ['fused-memory/src'],
     }
     try:
         submit_result = await interceptor.submit_task(
@@ -2185,7 +2185,7 @@ async def test_update_task_allows_other_metadata(
 
     result = await interceptor.update_task(
         '1', '/project',
-        metadata=json.dumps({'modules': ['orchestrator/']}),
+        metadata=json.dumps({'files': ['orchestrator/']}),
     )
 
     assert 'error' not in result
@@ -3879,17 +3879,17 @@ class TestExtractMetaFiles:
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['orchestrator/harness.py', 'src/foo.py']
 
-    def test_dict_metadata_modules_only(self):
-        """dict metadata with only modules → returns modules (fallback)."""
-        kwargs = {'metadata': {'modules': ['fused-memory/src', 'orchestrator/']}}
+    def test_dict_metadata_files_only(self):
+        """dict metadata with only files (canonical key) → returns files."""
+        kwargs = {'metadata': {'files': ['fused-memory/src', 'orchestrator/']}}
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['fused-memory/src', 'orchestrator/']
 
-    def test_dict_metadata_both_keys_prefers_files_to_modify(self):
-        """dict metadata with BOTH keys → returns files_to_modify (precedence over modules)."""
+    def test_dict_metadata_both_keys_prefers_files(self):
+        """dict metadata with BOTH keys → returns files (precedence over files_to_modify)."""
         kwargs = {'metadata': {
-            'files_to_modify': ['a.py'],
-            'modules': ['module_a'],
+            'files': ['a.py'],
+            'files_to_modify': ['legacy.py'],
         }}
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['a.py']
@@ -3983,14 +3983,14 @@ class TestExtractMetaFiles:
 
 
 class TestPathGuardFallbackMetadataFiles:
-    """Regression tests: prompt-only path-guard also scans metadata files/modules.
+    """Regression tests: prompt-only path-guard also scans metadata files.
 
     4 parametrised cases (2 meta_key × 2 endpoint) verify that hiding a
-    dark-factory path inside metadata['files_to_modify'] or metadata['modules']
+    dark-factory path inside metadata['files'] or metadata['files_to_modify']
     cannot bypass the path-scope guard when the free-text fields are clean.
     """
 
-    @pytest.mark.parametrize('meta_key', ['files_to_modify', 'modules'])
+    @pytest.mark.parametrize('meta_key', ['files', 'files_to_modify'])
     @pytest.mark.asyncio
     async def test_submit_task_fallback_rejects_dark_factory_path_in_metadata(
         self, meta_key, interceptor_with_store, ticket_store, taskmaster,
@@ -4028,7 +4028,7 @@ class TestPathGuardFallbackMetadataFiles:
         # Taskmaster backend must never have been called
         taskmaster.add_task.assert_not_called()
 
-    @pytest.mark.parametrize('meta_key', ['files_to_modify', 'modules'])
+    @pytest.mark.parametrize('meta_key', ['files', 'files_to_modify'])
     @pytest.mark.asyncio
     async def test_add_subtask_fallback_rejects_dark_factory_path_in_metadata(
         self, meta_key, interceptor, taskmaster,
@@ -4501,12 +4501,12 @@ async def test_planning_mode_merges_caller_metadata(
     """Caller-supplied metadata is preserved alongside human_decomposed=True."""
     await interceptor_facade.submit_task(
         '/project', title='X', planning_mode=True,
-        metadata={'source': 'planning-session', 'modules': ['m1', 'm2']},
+        metadata={'source': 'planning-session', 'files': ['m1', 'm2']},
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
     assert decoded == {
         'source': 'planning-session',
-        'modules': ['m1', 'm2'],
+        'files': ['m1', 'm2'],
         'human_decomposed': True,
     }
 

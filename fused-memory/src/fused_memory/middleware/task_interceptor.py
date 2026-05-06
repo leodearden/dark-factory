@@ -940,16 +940,17 @@ class TaskInterceptor:
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
-        """Extract the file/module list from an already-parsed metadata dict.
+        """Extract the file list from an already-parsed metadata dict.
 
-        Prefers ``files_to_modify`` over ``modules``, coerces the result to a
-        list of non-empty strings, and returns ``[]`` when neither key is
-        present or the value is empty / falsy.
+        Priority: ``files`` (canonical orchestrator field) →
+        ``files_to_modify`` (legacy curator-internal name). Coerces the
+        result to a list of non-empty strings, and returns ``[]`` when
+        neither key is present or the value is empty / falsy.
 
         Callers that have not yet parsed metadata should use the kwargs-taking
         entry point :meth:`_extract_meta_files` instead.
         """
-        files = meta.get('files_to_modify') or meta.get('modules') or []
+        files = meta.get('files') or meta.get('files_to_modify') or []
         if isinstance(files, str):
             files = [files]
         return [str(f) for f in files if f]

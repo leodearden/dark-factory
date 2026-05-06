@@ -41,15 +41,13 @@ def _create_plan(
     task_id: str,
     title: str,
     analysis: str,
-    modules: list[str],
-    files: list[str] | None = None,
+    files: list[str],
 ) -> dict[str, Any]:
     plan = {
         'task_id': task_id,
         'title': title,
         'analysis': analysis,
-        'modules': modules,
-        'files': files or [],
+        'files': files,
         'prerequisites': [],
         'steps': [],
         'design_decisions': [],
@@ -181,7 +179,6 @@ def _mark_step_done(
 
 def _update_plan_metadata(
     artifacts: TaskArtifacts,
-    modules: list[str] | None = None,
     files: list[str] | None = None,
     analysis: str | None = None,
 ) -> dict[str, Any]:
@@ -189,8 +186,6 @@ def _update_plan_metadata(
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
-    if modules is not None:
-        plan['modules'] = modules
     if files is not None:
         plan['files'] = files
     if analysis is not None:
@@ -198,7 +193,6 @@ def _update_plan_metadata(
     artifacts.write_plan(plan)
     return {
         'status': 'ok',
-        'modules': len(plan.get('modules', [])),
         'files': len(plan.get('files', [])),
     }
 
@@ -369,8 +363,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         task_id: str,
         title: str,
         analysis: str,
-        modules: list[str],
-        files: list[str] | None = None,
+        files: list[str],
     ) -> dict[str, Any]:
         """Initialize a new implementation plan with metadata.
 
@@ -382,10 +375,10 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             task_id: The task identifier (e.g. "df_task_13").
             title: Human-readable task title.
             analysis: Your analysis of the task, existing code, and approach.
-            modules: Code directories this task will touch.
-            files: ALL files expected to be created or modified (drives concurrency locks).
+            files: List of files (or directory paths) this task will create or modify.
+                Drives concurrency locks and the phantom-done gate.
         """
-        return _create_plan(artifacts, task_id, title, analysis, modules, files)
+        return _create_plan(artifacts, task_id, title, analysis, files)
 
     @mcp.tool()
     def add_plan_step(
@@ -466,22 +459,21 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     @mcp.tool()
     def update_plan_metadata(
-        modules: list[str] | None = None,
         files: list[str] | None = None,
         analysis: str | None = None,
     ) -> dict[str, Any]:
         """Update the plan's top-level metadata without touching steps or prerequisites.
 
-        Use during plan revalidation to update the file list, module list,
-        or analysis after reviewing changes on main. All parameters are
-        optional — only non-None values are updated.
+        Use during plan revalidation to update the file list or analysis
+        after reviewing changes on main. All parameters are optional — only
+        non-None values are updated.
 
         Args:
-            modules: Updated list of code directories this task will touch.
-            files: Updated list of ALL files expected to be created or modified.
+            files: Updated list of files (or directory paths) this task will
+                create or modify. Drives concurrency locks and the phantom-done gate.
             analysis: Updated analysis text.
         """
-        return _update_plan_metadata(artifacts, modules, files, analysis)
+        return _update_plan_metadata(artifacts, files, analysis)
 
     @mcp.tool()
     def remove_plan_step(

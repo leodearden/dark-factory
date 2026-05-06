@@ -330,7 +330,7 @@ class ReviewCheckpoint:
 
         submit_resolve_block = submit_only_instructions(
             f'{{"source": "review-cycle", "review_id": "{review_id}", '
-            f'"modules": ["path/to/module", ...], '
+            f'"files": ["path/to/file-or-directory", ...], '
             f'"escalation_id": "<review escalation id>", '
             f'"suggestion_hash": "<per-finding hash>"}}',
             outcome_target='finding description',
@@ -345,8 +345,8 @@ class ReviewCheckpoint:
             scope_block = f"""\
 ## Scope: Focused Review
 
-The following modules have been modified since the last review checkpoint.
-Focus your analysis on interactions **between** these modules and the rest of
+The following paths have been modified since the last review checkpoint.
+Focus your analysis on interactions **between** these areas and the rest of
 the codebase. Pay special attention to wiring at module boundaries.
 
 {mod_list}

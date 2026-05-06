@@ -220,7 +220,7 @@ async def test_update_task_allows_unrelated_metadata(
         'update_task',
         {
             'id': '1', 'project_root': '/project',
-            'metadata': {'modules': ['orchestrator/'], 'priority': 'high'},
+            'metadata': {'files': ['orchestrator/'], 'priority': 'high'},
         },
     )
     assert result == {'success': True}

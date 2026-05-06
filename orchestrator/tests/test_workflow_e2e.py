@@ -82,7 +82,7 @@ def task_assignment() -> TaskAssignment:
             'title': 'Add farewell function',
             'description': 'Add a farewell(name) function to lib.py with tests',
             'status': 'pending',
-            'metadata': {'modules': ['lib']},
+            'metadata': {'files': ['lib']},
             'dependencies': [],
         },
         modules=['lib'],
@@ -96,7 +96,6 @@ def task_assignment() -> TaskAssignment:
 PLAN = {
     'task_id': '42',
     'title': 'Add farewell function',
-    'modules': ['lib'],
     'files': ['lib.py', 'test_lib.py'],
     'analysis': 'Simple function addition with TDD',
     'prerequisites': [],
@@ -2434,7 +2433,7 @@ class StringPrereqsArchitectStub(AgentStub):
         bad_plan = {
             'task_id': '42',
             'title': 'Add farewell function',
-            'modules': ['lib'],
+            'files': ['lib.py'],
             'analysis': 'Simple function addition with TDD',
             'prerequisites': ['install deps', 'set up config'],  # plain strings — invalid
             'steps': [

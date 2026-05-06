@@ -200,7 +200,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t1', 'T1', 'desc')
         artifacts.write_plan({
             'files': ['alpha.py', 'beta.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -236,7 +235,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t2', 'T2', 'desc')
         artifacts.write_plan({
             'files': ['present.py', 'absent.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -276,7 +274,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t2b', 'T2b', 'desc')
         artifacts.write_plan({
             'files': ['keep.py', 'scratch.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -324,7 +321,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t2c', 'T2c', 'desc')
         artifacts.write_plan({
             'files': ['retained.py', 'dropped.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -358,7 +354,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t2d', 'T2d', 'desc')
         artifacts.write_plan({
             'files': ['contested.py', 'other.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -450,7 +445,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t3', 'T3', 'desc')
         artifacts.write_plan({
             'files': [],
-            'modules': [],
             'steps': [],
         })
 
@@ -495,7 +489,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-del', 'T-del', 'desc')
         artifacts.write_plan({
             'files': ['created_then_deleted.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -558,7 +551,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-mixed', 'T-mixed', 'desc')
         artifacts.write_plan({
             'files': ['kept.py', 'deleted.py', 'never_created.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -607,7 +599,6 @@ class TestCheckPlanTargetsInTree:
         # Step that performed the deletion has status='pending' — must NOT be trusted
         artifacts.write_plan({
             'files': ['would_delete.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -654,7 +645,6 @@ class TestCheckPlanTargetsInTree:
         # Step is done but commit is None — must NOT be trusted
         artifacts.write_plan({
             'files': ['would_delete.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -702,7 +692,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-bad-sha', 'T-bad-sha', 'desc')
         artifacts.write_plan({
             'files': ['gone.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -764,7 +753,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-unresolved', 'T-unresolved', 'desc')
         artifacts.write_plan({
             'files': ['gone.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -844,7 +832,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-empty-diff', 'T-empty-diff', 'desc')
         artifacts.write_plan({
             'files': ['present.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -923,7 +910,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-merge-del', 'T-merge-del', 'desc')
         artifacts.write_plan({
             'files': ['f.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -977,7 +963,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-rename', 'T-rename', 'desc')
         artifacts.write_plan({
             'files': ['a.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -1047,7 +1032,6 @@ class TestCheckPlanTargetsInTree:
         # so missing is non-empty and the done-step loop is entered.
         artifacts.write_plan({
             'files': ['file_a.py', 'forces_loop.py'],
-            'modules': [],
             'steps': [
                 {'id': 'step-1', 'description': 's1', 'status': 'done', 'commit': sha_c1},
                 {'id': 'step-2', 'description': 's2', 'status': 'done', 'commit': sha_c2},
@@ -1134,7 +1118,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-malformed', 'T-malformed', 'desc')
         artifacts.write_plan({
             'files': ['phantom.py', 'real.py'],
-            'modules': [],
             'steps': [
                 None,                                                   # non-dict
                 'plain string step',                                    # non-dict
@@ -1233,7 +1216,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('orphan-test', 'Orphan test', 'desc')
         artifacts.write_plan({
             'files': ['F.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -1333,7 +1315,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('gc-prune', 'GC prune', 'desc')
         artifacts.write_plan({
             'files': ['F.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -1409,7 +1390,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('dgr-test', 'DGR test', 'desc')
         artifacts.write_plan({
             'files': ['kept.py', 'extra.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -1488,7 +1468,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('struct-warn', 'Struct warn', 'desc')
         artifacts.write_plan({
             'files': ['file1.py', 'file2.py', 'file3.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-good',
@@ -1560,7 +1539,6 @@ class TestCheckPlanTargetsInTree:
             artifacts2.init('sw-empty', 'SW empty', 'desc')
             artifacts2.write_plan({
                 'files': ['present.py'],
-                'modules': [],
                 'steps': [],
             })
             merge_result2 = await git_ops.merge_to_main(worktree2, 'struct-warn-empty')
@@ -1633,7 +1611,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-issue2', 'T-issue2', 'desc')
         artifacts.write_plan({
             'files': ['file_a.py', 'file_b.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-0',
@@ -1727,7 +1704,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-issue1', 'T-issue1', 'desc')
         artifacts.write_plan({
             'files': ['gone.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -1803,7 +1779,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-issue5', 'T-issue5', 'desc')
         artifacts.write_plan({
             'files': ['gone.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 123,                  # integer, not str → must become None
@@ -1867,7 +1842,6 @@ class TestCheckPlanTargetsInTree:
         artifacts.init('t-issue6', 'T-issue6', 'desc')
         artifacts.write_plan({
             'files': ['gone.py'],
-            'modules': [],
             'steps': [
                 {
                     'id': 'step-1',
@@ -1992,7 +1966,6 @@ class TestMergeWorker:
         artifacts.init('drop-guard', 'Drop guard', 'desc')
         artifacts.write_plan({
             'files': ['kept.py', 'dropped.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -2057,7 +2030,6 @@ class TestMergeWorker:
         artifacts.init('drop-guard-real', 'Drop guard real', 'desc')
         artifacts.write_plan({
             'files': ['retained.py', 'dropped.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -2115,7 +2087,6 @@ class TestMergeWorker:
         artifacts.init('drop-unresolved', 'Drop unresolved', 'desc')
         artifacts.write_plan({
             'files': ['kept.py', 'dropped.py'],
-            'modules': [],
             'steps': [],
         })
 
@@ -4148,7 +4119,6 @@ class TestSpeculativeMergeWorker:
         artifacts.init('spec-drop-unresolved', 'Spec drop unresolved', 'desc')
         artifacts.write_plan({
             'files': ['kept.py', 'dropped.py'],
-            'modules': [],
             'steps': [],
         })
 
