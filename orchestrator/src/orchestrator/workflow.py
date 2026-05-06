@@ -33,9 +33,10 @@ from orchestrator.agents.roles import (
     JUDGE,
     MERGER,
     ROLES,
+    SIMPLE_TASK,
     AgentRole,
 )
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
@@ -136,6 +137,10 @@ class _BriefingLike(Protocol):
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict,
         changed_files: list[str], worktree: Path | None = ...,
+        context: str | None = ...,
+    ) -> str: ...
+    async def build_simple_task_prompt(
+        self, task: dict, worktree: Path | None = ...,
         context: str | None = ...,
     ) -> str: ...
     async def build_completion_judge_prompt(
@@ -413,7 +418,46 @@ class TaskWorkflow:
             if recovery == WorkflowOutcome.DONE:
                 return recovery
 
-            # PLAN (skip if initial_plan was provided — eval mode)
+            # ── Lever C: SIMPLE_TASK optimistic path ──────────────────
+            # When the task title matches a small/well-bounded change and
+            # auto_eval_redo metadata is absent, dispatch a single Sonnet
+            # agent that explores, plans (via plan-tools MCP), and
+            # implements end-to-end. Falls through to the architect path
+            # on any failure (no plan written, unactionable artifact,
+            # no steps marked done).
+            if (
+                not self.initial_plan
+                and self.config.simple_task_enabled
+                and not (self.task.get('metadata') or {}).get('auto_eval_redo')
+                and not (self.task.get('metadata') or {}).get('force_full_path')
+            ):
+                from orchestrator.agents.triage import classify_simple_task
+                if classify_simple_task(self.task):
+                    self._enter_phase(WorkflowState.PLAN)
+                    simple_outcome = await self._run_simple_task()
+                    if simple_outcome == WorkflowOutcome.PLANNED:
+                        # Plan written + step(s) marked done by SIMPLE_TASK.
+                        # _execute_iterations will see no pending steps and
+                        # return cleanly, allowing VERIFY to take over.
+                        pass  # fall through to the post-PLAN section below
+                    elif simple_outcome == WorkflowOutcome.DONE:
+                        # SIMPLE_TASK reported task_already_done.
+                        return simple_outcome
+                    elif simple_outcome == WorkflowOutcome.BLOCKED:
+                        # SIMPLE_TASK reported unactionable_task — terminal.
+                        return simple_outcome
+                    else:
+                        # Fallthrough sentinel — drop the plan so the
+                        # architect path runs cleanly.
+                        if self.artifacts is not None:
+                            plan_path = self.artifacts.root / 'plan.json'
+                            plan_path.unlink(missing_ok=True)
+                            (self.artifacts.root / 'plan.lock').unlink(
+                                missing_ok=True,
+                            )
+
+            # PLAN (skip if initial_plan was provided — eval mode, or if
+            # the SIMPLE_TASK path above already populated self.plan)
             if self.initial_plan:
                 plan_tid = self.initial_plan.get('task_id')
                 if plan_tid and plan_tid != self.task_id:
@@ -422,7 +466,11 @@ class TaskWorkflow:
                         f'task_id {plan_tid} — discarding, will re-plan'
                     )
                     self.initial_plan = None
-            if self.initial_plan:
+            if self.plan:
+                # SIMPLE_TASK already populated self.plan — skip the
+                # initial_plan / _plan() branch entirely.
+                pass
+            elif self.initial_plan:
                 self.artifacts.write_plan(self.initial_plan)
                 self.artifacts.stamp_plan_provenance(self.session_id)
                 self.artifacts.lock_plan(self.session_id)
@@ -923,6 +971,26 @@ class TaskWorkflow:
                 '(%d changed files, %d overlap with plan)',
                 self.task_id, len(revalidation_changed_files), len(overlap),
             )
+
+            # ── Lever B: revalidation skip ────────────────────────────
+            # When main has gained no changes that touch the plan's files,
+            # the architect's revalidation pass is a near-certain no-op.
+            # Short-circuit by stamping _revalidated_at and bumping
+            # base_commit ourselves, then return PLANNED. Falls through to
+            # the existing architect path on any pre-flight failure.
+            if (
+                self.config.revalidation_skip_enabled
+                and not overlap
+                and await self._can_skip_revalidation(existing_plan)
+            ):
+                skipped = await self._apply_revalidation_skip(
+                    existing_plan, current_main,
+                )
+                if skipped is not None:
+                    return skipped
+                # Pre-flight check failed inside _apply_revalidation_skip
+                # (e.g. blast-radius lock denied) — fall through.
+
             prompt = await self.briefing.build_revalidation_prompt(
                 self.task, existing_plan, revalidation_changed_files,
                 worktree=self.worktree,
@@ -1136,6 +1204,299 @@ class TaskWorkflow:
             f'{len(self.plan.get("steps", []))} steps'
         )
         return WorkflowOutcome.PLANNED
+
+    async def _can_skip_revalidation(self, plan: dict) -> bool:
+        """Lever B pre-flight checks for the revalidation skip.
+
+        All checks must pass for the optimisation to apply. Conservative —
+        on any uncertainty, return False so the existing architect-driven
+        revalidation runs.
+        """
+        assert self.worktree is not None
+        # Schema version must match — bumped schemas mean the architect
+        # may need to refresh fields the orchestrator can't synthesise.
+        if plan.get('_schema_version') != PLAN_SCHEMA_VERSION:
+            logger.info(
+                'Task %s: revalidation skip declined — schema mismatch '
+                '(plan=%r, current=%r)',
+                self.task_id,
+                plan.get('_schema_version'),
+                PLAN_SCHEMA_VERSION,
+            )
+            return False
+        # Every plan file must still exist in the worktree.
+        for f in plan.get('files', []):
+            if not (self.worktree / f).exists():
+                logger.info(
+                    'Task %s: revalidation skip declined — plan file %r '
+                    'missing in worktree',
+                    self.task_id, f,
+                )
+                return False
+        # Plan provenance age bound.
+        created_at = plan.get('_created_at') or plan.get('_revalidated_at')
+        if created_at:
+            try:
+                stamped = datetime.fromisoformat(str(created_at))
+                if stamped.tzinfo is None:
+                    stamped = stamped.replace(tzinfo=UTC)
+                age_hours = (
+                    datetime.now(UTC) - stamped
+                ).total_seconds() / 3600.0
+                if age_hours > self.config.max_revalidation_age_hours:
+                    logger.info(
+                        'Task %s: revalidation skip declined — plan age '
+                        '%.1fh exceeds bound %.1fh',
+                        self.task_id, age_hours,
+                        self.config.max_revalidation_age_hours,
+                    )
+                    return False
+            except (TypeError, ValueError):
+                logger.info(
+                    'Task %s: revalidation skip declined — could not parse '
+                    '_created_at=%r',
+                    self.task_id, created_at,
+                )
+                return False
+        # Conservative: if the prior run blocked at REVIEW, the architect
+        # path may be needed to refresh strategy. Read the iteration log
+        # for the most recent block annotation.
+        metadata = self.task.get('metadata') or {}
+        if (
+            metadata.get('last_block_phase') == 'review'
+            and metadata.get('last_block_outcome') == 'blocked'
+        ):
+            logger.info(
+                'Task %s: revalidation skip declined — prior block at REVIEW',
+                self.task_id,
+            )
+            return False
+        return True
+
+    async def _apply_revalidation_skip(
+        self, plan: dict, current_main: str,
+    ) -> WorkflowOutcome | None:
+        """Lever B side-effect path. Returns PLANNED on success, or None to
+        signal the caller should fall through to the architect path."""
+        assert self.artifacts is not None and self.worktree is not None
+
+        # Re-derive modules from plan files; if scope grew, ask scheduler
+        # to expand the lock. Denial means a sibling task holds an
+        # overlapping module — fall through to the architect path which
+        # already handles the requeue case.
+        plan_files = plan.get('files', [])
+        plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+        if set(plan_modules) != set(self.modules):
+            expanded = await self.scheduler.handle_blast_radius_expansion(
+                self.task_id, self.modules, plan_modules,
+            )
+            if not expanded:
+                logger.info(
+                    'Task %s: revalidation skip declined — blast-radius '
+                    'expansion denied',
+                    self.task_id,
+                )
+                return None
+            self.modules = plan_modules
+            self._module_configs = self._resolve_module_configs()
+
+        # Bump revalidation stamp + base commit (mirrors confirm_plan).
+        try:
+            self.artifacts.bump_revalidation_stamp(
+                self.session_id, base_commit=current_main,
+            )
+        except ValueError as exc:
+            logger.warning(
+                'Task %s: revalidation skip declined — bump_revalidation_stamp '
+                'rejected plan: %s',
+                self.task_id, exc,
+            )
+            return None
+
+        # Acquire plan lock (the architect path also does this; the eval
+        # path skips it entirely).  If another session holds the lock,
+        # fall through to the architect path which has its own retry logic.
+        if not self.artifacts.lock_plan(self.session_id):
+            logger.info(
+                'Task %s: revalidation skip declined — plan.lock contended',
+                self.task_id,
+            )
+            return None
+
+        self.plan = self.artifacts.read_plan()
+
+        # Stamp optimistic-path metadata for the auto-eval hook.
+        await self._stamp_optimistic_path('revalidation_skip')
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.phase_skipped,
+                task_id=self.task_id,
+                phase='plan',
+                data={
+                    'reason': 'revalidation_skipped_no_overlap',
+                    'plan_session_id': str(plan.get('_session_id') or ''),
+                    'plan_files': plan_files,
+                    'main_sha': current_main,
+                },
+            )
+
+        logger.info(
+            'Task %s: Lever B — revalidation skipped (overlap=0, '
+            'main %s -> stamped on plan)',
+            self.task_id, current_main[:12],
+        )
+        return WorkflowOutcome.PLANNED
+
+    async def _run_simple_task(self) -> WorkflowOutcome:
+        """Lever C — single-agent simple-task path.
+
+        Dispatches the SIMPLE_TASK role (sonnet) to explore, register a
+        plan via the plan-tools MCP server, edit the listed files, and
+        mark the step(s) done in one session.
+
+        Returns:
+            ``PLANNED`` — plan.json was written and at least one step
+                marked done; the workflow continues to VERIFY without
+                invoking the implementer.
+            ``DONE`` — SIMPLE_TASK reported the work is already on main.
+            ``BLOCKED`` — SIMPLE_TASK reported the task is unactionable.
+            ``REQUEUED`` (sentinel) — SIMPLE_TASK gave up partway; caller
+                falls through to the architect path.
+        """
+        assert self.worktree is not None and self.artifacts is not None
+
+        prompt = await self.briefing.build_simple_task_prompt(
+            self.task, worktree=self.worktree,
+        )
+
+        try:
+            result = await self._invoke(SIMPLE_TASK, prompt, self.worktree)
+        except Exception as exc:  # noqa: BLE001 — fall through to architect
+            logger.warning(
+                'Task %s: SIMPLE_TASK invocation failed (%s) — '
+                'falling through to architect path',
+                self.task_id, exc,
+            )
+            return WorkflowOutcome.REQUEUED
+
+        if not result.success:
+            cls = classify_agent_failure(result)
+            logger.info(
+                'Task %s: SIMPLE_TASK did not succeed (%s) — '
+                'falling through to architect path',
+                self.task_id, cls.kind.value,
+            )
+            return WorkflowOutcome.REQUEUED
+
+        # Architect-style escape hatches — same artifacts so the existing
+        # handlers work unchanged.
+        if self.artifacts.read_unactionable_task() is not None:
+            return await self._handle_unactionable_task_report()
+        if self.artifacts.read_already_done() is not None:
+            return await self._handle_already_done_report()
+        if self.artifacts.read_blocking_dependency() is not None:
+            # Falling through — the architect path's
+            # _handle_blocking_dep_report logic re-acquires base_commit
+            # context and registers the dependency cleanly.
+            return WorkflowOutcome.REQUEUED
+
+        plan = self.artifacts.read_plan()
+        if not plan or not plan.get('steps'):
+            logger.info(
+                'Task %s: SIMPLE_TASK wrote no plan — falling through',
+                self.task_id,
+            )
+            return WorkflowOutcome.REQUEUED
+
+        # Verify at least one step is done — the SIMPLE_TASK contract is
+        # plan + implement + mark-done. Anything less and we let the
+        # architect path take over to avoid handing a half-built plan to
+        # _execute_iterations.
+        any_done = any(
+            isinstance(s, dict) and s.get('status') == 'done'
+            for col in ('prerequisites', 'steps')
+            for s in plan.get(col, [])
+        )
+        if not any_done:
+            logger.info(
+                'Task %s: SIMPLE_TASK plan has no steps marked done — '
+                'falling through to architect path',
+                self.task_id,
+            )
+            return WorkflowOutcome.REQUEUED
+
+        # Stamp provenance + acquire plan lock (same shape as _plan()).
+        try:
+            self.artifacts.stamp_plan_provenance(self.session_id)
+        except ValueError as exc:
+            logger.warning(
+                'Task %s: SIMPLE_TASK provenance stamp failed (%s) — '
+                'falling through',
+                self.task_id, exc,
+            )
+            return WorkflowOutcome.REQUEUED
+        self.artifacts.lock_plan(self.session_id)
+        self.plan = self.artifacts.read_plan()
+
+        # Refresh module assignments from the plan's files (handles the
+        # case where the SIMPLE_TASK agent expanded scope by one file).
+        plan_files = self.plan.get('files', [])
+        if plan_files:
+            plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+            if set(plan_modules) != set(self.modules):
+                expanded = await self.scheduler.handle_blast_radius_expansion(
+                    self.task_id, self.modules, plan_modules,
+                )
+                if expanded:
+                    self.modules = plan_modules
+                    self._module_configs = self._resolve_module_configs()
+
+        await self._stamp_optimistic_path('simple_task')
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.phase_skipped,
+                task_id=self.task_id,
+                phase='plan',
+                data={
+                    'reason': 'architect_skipped_simple_task',
+                    'classifier_signals': {
+                        'title': str(self.task.get('title') or ''),
+                        'files': list(
+                            (self.task.get('metadata') or {}).get('files') or []
+                        ),
+                        'priority': str(self.task.get('priority') or ''),
+                    },
+                    'plan_files': plan_files,
+                },
+            )
+
+        logger.info(
+            'Task %s: Lever C — SIMPLE_TASK produced plan with %d step(s)',
+            self.task_id, len(self.plan.get('steps', [])),
+        )
+        return WorkflowOutcome.PLANNED
+
+    async def _stamp_optimistic_path(self, kind: str) -> None:
+        """Stamp ``metadata.optimistic_path`` on the task so the harness's
+        auto-eval hook can detect that this task took the optimistic path
+        on its current attempt.
+
+        Fire-and-forget — failure logs a warning and does not block.
+        """
+        try:
+            metadata = dict(self.task.get('metadata') or {})
+            metadata['optimistic_path'] = kind
+            self.task['metadata'] = metadata
+            await self.scheduler.update_task(
+                self.task_id, metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                'Task %s: failed to stamp optimistic_path=%s: %s',
+                self.task_id, kind, exc,
+            )
 
     async def _validate_prerequisites_or_block(
         self, context: str

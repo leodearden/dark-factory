@@ -182,6 +182,69 @@ and either confirm it, update it, or recreate it from scratch.
 5. Do NOT remove or replace steps with status "done".
 """
 
+    async def build_simple_task_prompt(
+        self,
+        task: dict,
+        worktree: Path | None = None,
+        context: str | None = None,
+    ) -> str:
+        """Build prompt for the SIMPLE_TASK agent (Lever C).
+
+        The agent will explore briefly, register a single-step plan via the
+        plan-tools MCP server, edit the listed files, commit, then call
+        ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
+        without invoking the implementer.
+        """
+        if context is None:
+            context = await self._get_memory_context(task.get('id'))
+
+        task_block = self._format_task(task)
+        identity = self._agent_identity(task.get('id'), 'simple_task')
+
+        files = (task.get('metadata') or {}).get('files') or []
+        if files:
+            files_list = '\n'.join(f'- `{f}`' for f in files)
+            files_section = f'## Listed files\n\n{files_list}'
+        else:
+            files_section = '_No files listed in task metadata — explore briefly to identify the target file(s)._'
+
+        return f"""\
+{context}
+
+{identity}
+
+# Task
+
+{task_block}
+
+# Action
+
+This task was routed to the SIMPLE_TASK path because the title and scope
+suggest a small, well-bounded change (doc, comment, rename, typo, small
+refactor). Your job is to do the change end-to-end in a single session:
+
+1. **Read the listed files** below. Confirm the requested change is small.
+2. **Register a plan via plan-tools MCP** — call
+   `mcp__plan-tools__create_plan(task_id, title, analysis, files)`.
+   - For doc/comment-only or behaviour-preserving refactors: add a single
+     `impl` step via `add_plan_step`.
+   - If a new test belongs here: add `test` then `impl`.
+3. **Implement** — edit the file(s), run any tests touching the module,
+   commit (excluding `.task/`), then call
+   `mcp__plan-tools__mark_step_done(step_id, commit_sha)`.
+4. **Stop after marking done.** Do not loop further.
+
+If the task turns out to be larger than expected (touches many files,
+needs architectural thought, requires new abstractions), STOP without
+calling `create_plan`. The orchestrator will route to the full architect
+path on the next dispatch.
+
+If the task spec itself is broken or unworkable, call
+`mcp__plan-tools__report_unactionable_task(reason, evidence)` and stop.
+
+{files_section}
+"""
+
     async def build_implementer_prompt(
         self,
         plan: dict,

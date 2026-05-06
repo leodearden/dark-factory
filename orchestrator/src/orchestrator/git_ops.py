@@ -1550,6 +1550,69 @@ class GitOps:
         await _run(['git', 'merge', '--abort'], cwd=cwd)
         logger.info('Merge aborted')
 
+    async def rename_worktree(
+        self,
+        old_path: Path,
+        new_path: Path,
+        old_branch: str,
+        new_branch: str,
+    ) -> None:
+        """Rename a registered worktree and its branch atomically.
+
+        Used by the auto-eval hook to preserve the original
+        attempt's branch + worktree (suffixed ``-skip-attempt``) so the
+        full-architect redo can use the original branch name without
+        clobbering the artefacts of the optimistic-path attempt.
+
+        Args:
+            old_path: Current worktree path (registered with git).
+            new_path: Destination worktree path (must not exist).
+            old_branch: Branch name without the ``branch_prefix``.
+            new_branch: Destination branch name without the ``branch_prefix``.
+
+        Raises:
+            RuntimeError: if ``git worktree move`` or ``git branch -m``
+                returns a non-zero exit code. The caller is expected to
+                surface this as an auto-eval failure and fall back to the
+                normal block path.
+        """
+        full_old = f'{self.config.branch_prefix}{old_branch}'
+        full_new = f'{self.config.branch_prefix}{new_branch}'
+
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+
+        rc, _, err = await _run(
+            ['git', 'worktree', 'move', str(old_path), str(new_path)],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'rename_worktree: git worktree move {old_path} -> '
+                f'{new_path} failed (rc={rc}): {err}'
+            )
+
+        rc, _, err = await _run(
+            ['git', 'branch', '-m', full_old, full_new],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            # Best-effort rollback of the worktree move so the caller can
+            # retry. The directory rename is the half that actually
+            # surfaces conflicts; the branch rename rarely fails alone.
+            await _run(
+                ['git', 'worktree', 'move', str(new_path), str(old_path)],
+                cwd=self.project_root,
+            )
+            raise RuntimeError(
+                f'rename_worktree: git branch -m {full_old} -> {full_new} '
+                f'failed (rc={rc}): {err}'
+            )
+
+        logger.info(
+            'Renamed worktree %s -> %s and branch %s -> %s',
+            old_path, new_path, full_old, full_new,
+        )
+
     async def cleanup_worktree(self, worktree: Path, branch: str) -> None:
         """Remove worktree and delete branch."""
         full_branch = f'{self.config.branch_prefix}{branch}'

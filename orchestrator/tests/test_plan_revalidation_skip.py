@@ -1,0 +1,318 @@
+"""Tests for the Lever B revalidation skip in ``TaskWorkflow._plan``.
+
+When the prior plan has provenance and the diff main has gained since the
+plan was stamped does not overlap any plan files, the architect's
+revalidation pass is short-circuited. The orchestrator stamps
+``_revalidated_at`` and bumps ``base_commit`` directly (mirroring
+``confirm_plan``), then returns PLANNED without invoking the architect.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.event_store import EventType
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+
+@dataclass
+class _Fixture:
+    wf: TaskWorkflow
+    artifacts: TaskArtifacts
+    handle_blast_radius_expansion: AsyncMock
+    update_task: AsyncMock
+    get_main_sha: AsyncMock
+    get_changed_files: AsyncMock
+    invoke_called: list[bool]
+    event_emit: MagicMock
+
+
+def _make(
+    *,
+    worktree: Path,
+    project_root: Path,
+    task_id: str = '101',
+    plan_files: list[str] | None = None,
+    plan_session_id: str = 'prior-session-aaa',
+    plan_age_hours: float = 1.0,
+    schema_version: int = PLAN_SCHEMA_VERSION,
+    old_main_sha: str = 'oldmain123',
+    new_main_sha: str = 'newmain456',
+    changed_files: list[str] | None = None,
+    revalidation_skip_enabled: bool = True,
+    max_revalidation_age_hours: float = 24.0,
+    blast_radius_grants: bool = True,
+    task_metadata: dict | None = None,
+    modules: list[str] | None = None,
+    create_plan_files_on_disk: bool = True,
+) -> _Fixture:
+    if plan_files is None:
+        plan_files = ['mod_a/file.py']
+    if changed_files is None:
+        changed_files = ['unrelated/other.py']
+    if modules is None:
+        modules = ['mod_a']
+
+    worktree.mkdir(parents=True, exist_ok=True)
+    project_root.mkdir(parents=True, exist_ok=True)
+
+    if create_plan_files_on_disk:
+        for f in plan_files:
+            full = worktree / f
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text('# stub\n')
+
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init(task_id, 'T', 'd', base_commit=old_main_sha)
+
+    plan = {
+        'task_id': task_id,
+        'title': 'T',
+        'analysis': 'analysis',
+        'files': plan_files,
+        'prerequisites': [],
+        'steps': [
+            {'id': 'step-1', 'type': 'test', 'description': 'test',
+             'status': 'pending', 'commit': None},
+            {'id': 'step-2', 'type': 'impl', 'description': 'impl',
+             'status': 'pending', 'commit': None},
+        ],
+        '_session_id': plan_session_id,
+        '_created_at': (
+            datetime.now(UTC) - timedelta(hours=plan_age_hours)
+        ).isoformat(),
+        '_schema_version': schema_version,
+    }
+    # Write directly (bypassing artifacts.write_plan, which clobbers
+    # _schema_version) so the schema-mismatch test can stage stale plans.
+    (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {
+        'id': task_id, 'title': 'T', 'description': 'd',
+        'metadata': task_metadata or {},
+    }
+    assignment.modules = list(modules)
+
+    config = MagicMock()
+    config.fused_memory.project_id = 'dark_factory'
+    config.fused_memory.url = 'http://localhost:8002'
+    config.max_review_cycles = 2
+    config.max_amendment_rounds = 1
+    config.lock_depth = 2
+    config.steward_completion_timeout = 300.0
+    config.project_root = project_root
+    config.revalidation_skip_enabled = revalidation_skip_enabled
+    config.max_revalidation_age_hours = max_revalidation_age_hours
+
+    handle_blast_radius_expansion = AsyncMock(return_value=blast_radius_grants)
+    update_task = AsyncMock(return_value=True)
+    scheduler = MagicMock()
+    scheduler.set_task_status = AsyncMock()
+    scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
+    scheduler.update_task = update_task
+
+    get_main_sha = AsyncMock(return_value=new_main_sha)
+    get_changed_files = AsyncMock(return_value=changed_files)
+    git_ops = MagicMock()
+    git_ops.get_main_sha = get_main_sha
+    git_ops.get_changed_files = get_changed_files
+
+    briefing = MagicMock()
+    briefing.build_revalidation_prompt = AsyncMock(return_value='revalidate-prompt')
+    briefing.build_architect_prompt = AsyncMock(return_value='architect-prompt')
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=briefing,
+        mcp=MagicMock(),
+    )
+
+    wf.artifacts = artifacts
+    wf.worktree = worktree
+    wf._old_plan_base = old_main_sha
+
+    invoke_called: list[bool] = []
+
+    async def _fail_invoke(*args, **kwargs):
+        invoke_called.append(True)
+        raise AssertionError(
+            'architect must NOT be invoked when revalidation skip applies'
+        )
+
+    wf._invoke = _fail_invoke  # type: ignore[assignment]
+
+    event_emit = MagicMock()
+    wf.event_store = MagicMock()
+    wf.event_store.emit = event_emit
+
+    return _Fixture(
+        wf=wf,
+        artifacts=artifacts,
+        handle_blast_radius_expansion=handle_blast_radius_expansion,
+        update_task=update_task,
+        get_main_sha=get_main_sha,
+        get_changed_files=get_changed_files,
+        invoke_called=invoke_called,
+        event_emit=event_emit,
+    )
+
+
+@pytest.mark.asyncio
+async def test_overlap_zero_short_circuits(tmp_path: Path):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []  # architect never invoked
+
+    plan = f.artifacts.read_plan()
+    assert '_revalidated_at' in plan
+    assert plan['_revalidated_by_session'] == f.wf.session_id
+
+    # base_commit advanced to current main SHA
+    assert f.artifacts.read_base_commit() == 'newmain456'
+
+    # phase_skipped event emitted with the right reason
+    skip_calls = [c for c in f.event_emit.call_args_list
+                  if c.args and c.args[0] == EventType.phase_skipped]
+    assert len(skip_calls) == 1
+    data = skip_calls[0].kwargs['data']
+    assert data['reason'] == 'revalidation_skipped_no_overlap'
+    assert data['plan_session_id'] == 'prior-session-aaa'
+    assert data['main_sha'] == 'newmain456'
+
+    # optimistic_path metadata stamped for auto-eval
+    update_calls = [
+        c for c in f.update_task.call_args_list
+        if c.kwargs.get('metadata', {}).get('optimistic_path')
+    ]
+    assert update_calls
+    assert update_calls[-1].kwargs['metadata']['optimistic_path'] == 'revalidation_skip'
+
+
+@pytest.mark.asyncio
+async def test_overlap_nonzero_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_files=['mod_a/file.py'],
+        changed_files=['mod_a/file.py', 'other/x.py'],  # overlap with plan
+    )
+
+    # Architect not stubbed for success — falling through means it gets
+    # invoked, which our _fail_invoke surfaces. Test expectation: assertion
+    # error from _fail_invoke confirms fall-through behavior.
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+@pytest.mark.asyncio
+async def test_revalidation_skip_disabled_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        revalidation_skip_enabled=False,
+    )
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+@pytest.mark.asyncio
+async def test_missing_plan_file_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_files=['mod_a/file.py'],
+        create_plan_files_on_disk=False,
+    )
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+@pytest.mark.asyncio
+async def test_schema_version_mismatch_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        schema_version=PLAN_SCHEMA_VERSION + 99,
+    )
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+@pytest.mark.asyncio
+async def test_age_bound_exceeded_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_age_hours=72.0,
+        max_revalidation_age_hours=24.0,
+    )
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+@pytest.mark.asyncio
+async def test_prior_review_block_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_metadata={
+            'last_block_phase': 'review',
+            'last_block_outcome': 'blocked',
+        },
+    )
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+@pytest.mark.asyncio
+async def test_blast_radius_denied_falls_through(tmp_path: Path):
+    # Plan declares files in a *different* module from the held lock —
+    # forces blast-radius expansion. Scheduler denies → fall through.
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_files=['mod_b/x.py'],   # module mod_b
+        modules=['mod_a'],            # held lock is mod_a
+        blast_radius_grants=False,
+    )
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+@pytest.mark.asyncio
+async def test_blast_radius_granted_succeeds(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_files=['mod_b/x.py'],
+        modules=['mod_a'],
+        blast_radius_grants=True,
+    )
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+    f.handle_blast_radius_expansion.assert_awaited_once()
+    # modules updated to the plan's modules (lock_depth=2 keeps file path)
+    assert set(f.wf.modules) == {'mod_b/x.py'}

@@ -1,0 +1,266 @@
+"""Tests for ``TaskWorkflow._run_simple_task`` — Lever C integration."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from shared.cli_invoke import AgentResult
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.event_store import EventType
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+
+@dataclass
+class _Fixture:
+    wf: TaskWorkflow
+    artifacts: TaskArtifacts
+    handle_blast_radius_expansion: AsyncMock
+    update_task: AsyncMock
+    invocation_count: list[int]
+    event_emit: MagicMock
+
+
+def _make_result(
+    *,
+    success: bool = True,
+    output: str = 'done',
+    cost_usd: float = 0.10,
+    turns: int = 5,
+    duration_ms: int = 1000,
+) -> AgentResult:
+    return AgentResult(
+        success=success,
+        output=output,
+        cost_usd=cost_usd,
+        duration_ms=duration_ms,
+        turns=turns,
+        session_id='sid',
+        structured_output=None,
+        subtype='success' if success else 'error',
+        stderr='',
+        account_name='test',
+        timed_out=False,
+        schema_salvaged=False,
+    )
+
+
+def _make(
+    *,
+    worktree: Path,
+    project_root: Path,
+    task_id: str = '500',
+    plan_to_write: dict | None = None,
+    invoke_outcome: AgentResult | None = None,
+    write_unactionable: bool = False,
+    blast_radius_grants: bool = True,
+    task_metadata: dict | None = None,
+) -> _Fixture:
+    worktree.mkdir(parents=True, exist_ok=True)
+    project_root.mkdir(parents=True, exist_ok=True)
+
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init(task_id, 'Document foo', 'd', base_commit='base123')
+
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {
+        'id': task_id,
+        'title': 'Document foo',
+        'description': 'Add a docstring to foo.',
+        'metadata': {**(task_metadata or {}), 'files': ['mod_a/foo.py']},
+    }
+    assignment.modules = ['mod_a']
+
+    config = MagicMock()
+    config.fused_memory.project_id = 'dark_factory'
+    config.fused_memory.url = 'http://localhost:8002'
+    config.lock_depth = 2
+    config.steward_completion_timeout = 300.0
+    config.project_root = project_root
+    config.simple_task_enabled = True
+    config.simple_task_budget_usd = 1.50
+    config.simple_task_max_turns = 30
+
+    handle_blast_radius_expansion = AsyncMock(return_value=blast_radius_grants)
+    update_task = AsyncMock(return_value=True)
+    scheduler = MagicMock()
+    scheduler.set_task_status = AsyncMock()
+    scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
+    scheduler.update_task = update_task
+
+    git_ops = MagicMock()
+    git_ops.is_ancestor = AsyncMock(return_value=True)
+    git_ops.get_main_sha = AsyncMock(return_value='mainsha')
+
+    briefing = MagicMock()
+    briefing.build_simple_task_prompt = AsyncMock(return_value='simple-task-prompt')
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=briefing,
+        mcp=MagicMock(),
+    )
+    wf.artifacts = artifacts
+    wf.worktree = worktree
+
+    invocation_count = [0]
+
+    async def _fake_invoke(role, prompt, worktree_arg):
+        invocation_count[0] += 1
+        # Side-effects to simulate the agent: write plan + mark done.
+        if plan_to_write is not None:
+            (artifacts.root / 'plan.json').write_text(json.dumps(plan_to_write))
+        if write_unactionable:
+            artifacts.write_unactionable_task(reason='spec broken', evidence='nope')
+        if invoke_outcome is not None:
+            return invoke_outcome
+        return _make_result()
+
+    wf._invoke = _fake_invoke  # type: ignore[assignment]
+    wf._handle_unactionable_task_report = AsyncMock(  # type: ignore[assignment]
+        return_value=WorkflowOutcome.BLOCKED,
+    )
+    wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[assignment]
+
+    event_emit = MagicMock()
+    wf.event_store = MagicMock()
+    wf.event_store.emit = event_emit
+
+    return _Fixture(
+        wf=wf,
+        artifacts=artifacts,
+        handle_blast_radius_expansion=handle_blast_radius_expansion,
+        update_task=update_task,
+        invocation_count=invocation_count,
+        event_emit=event_emit,
+    )
+
+
+def _good_plan() -> dict:
+    return {
+        'task_id': '500',
+        'title': 'Document foo',
+        'analysis': 'Add a docstring',
+        'files': ['mod_a/foo.py'],
+        'prerequisites': [],
+        'steps': [
+            {'id': 'step-1', 'type': 'impl', 'description': 'add docstring',
+             'status': 'done', 'commit': 'abc123'},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_simple_task_success_returns_planned(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_good_plan(),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invocation_count == [1]
+    plan = f.artifacts.read_plan()
+    assert plan['_session_id'] == f.wf.session_id
+
+    skip_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.phase_skipped
+    ]
+    assert len(skip_calls) == 1
+    data = skip_calls[0].kwargs['data']
+    assert data['reason'] == 'architect_skipped_simple_task'
+    assert data['classifier_signals']['title'] == 'Document foo'
+
+    # optimistic_path stamped for auto-eval
+    update_calls = [
+        c for c in f.update_task.call_args_list
+        if c.kwargs.get('metadata', {}).get('optimistic_path') == 'simple_task'
+    ]
+    assert update_calls
+
+
+@pytest.mark.asyncio
+async def test_simple_task_no_plan_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=None,  # agent doesn't write plan.json
+    )
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome == WorkflowOutcome.REQUEUED
+
+
+@pytest.mark.asyncio
+async def test_simple_task_no_steps_done_falls_through(tmp_path: Path):
+    plan = _good_plan()
+    plan['steps'][0]['status'] = 'pending'  # nothing marked done
+    plan['steps'][0]['commit'] = None
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+    )
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome == WorkflowOutcome.REQUEUED
+
+
+@pytest.mark.asyncio
+async def test_simple_task_unactionable_returns_blocked(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        write_unactionable=True,
+    )
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome == WorkflowOutcome.BLOCKED
+    f.wf._handle_unactionable_task_report.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_simple_task_invoke_failure_falls_through(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        invoke_outcome=_make_result(success=False, output=''),
+    )
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome == WorkflowOutcome.REQUEUED
+
+
+@pytest.mark.asyncio
+async def test_simple_task_invoke_exception_falls_through(tmp_path: Path):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+    async def _raising(*args, **kwargs):
+        raise RuntimeError('transient')
+
+    f.wf._invoke = _raising  # type: ignore[assignment]
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome == WorkflowOutcome.REQUEUED
+
+
+@pytest.mark.asyncio
+async def test_blast_radius_expansion_invoked_when_files_grow(tmp_path: Path):
+    plan = _good_plan()
+    plan['files'] = ['mod_b/x.py']  # different module from mod_a
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+    )
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome == WorkflowOutcome.PLANNED
+    f.handle_blast_radius_expansion.assert_awaited_once()

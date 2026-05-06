@@ -9,7 +9,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -255,6 +255,10 @@ class Harness:
 
         # Cost store — per-invocation cost tracking (shares runs.db)
         self.cost_store: CostStore | None = None
+
+        # Auto-eval — process-local set of redo task ids dispatched during
+        # this run. Used by the daily-budget query in ``_maybe_auto_eval``.
+        self._auto_eval_redo_task_ids: set[str] = set()
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
@@ -1357,8 +1361,252 @@ Output JSON matching the schema. Every task must appear in the output.
                 requeued = await self._apply_retry_cap(
                     assignment.task_id, report, requeued,
                 )
+                # Auto-eval: when the optimistic path blocks at a phase we
+                # care about, dispatch a sibling redo on the full architect
+                # path. Best-effort — never blocks slot release.
+                try:
+                    await self._maybe_auto_eval(assignment, report)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        'Task %s: auto-eval hook failed (non-fatal): %s',
+                        assignment.task_id, exc,
+                    )
             self.scheduler.release(assignment.task_id, requeued=requeued)
             sem.release()
+
+    async def _maybe_auto_eval(
+        self, assignment, report: TaskReport,
+    ) -> None:
+        """Dispatch an auto-eval redo when the optimistic path blocked.
+
+        Triggers when:
+        - ``report.outcome`` is BLOCKED.
+        - The original task carries ``metadata.optimistic_path`` (set by
+          Lever B or Lever C).
+        - The original task is NOT itself an auto-eval redo.
+        - ``report.block_phase`` is in ``config.auto_eval_phases``.
+        - The 24h auto-eval USD budget has not been exhausted.
+
+        On success, the original branch + worktree are renamed with a
+        ``-skip-attempt`` suffix and a sibling task is submitted via
+        ``submit_task(planning_mode=True)`` (curator dedupe bypass) with
+        ``metadata.force_full_path=True`` to prevent the redo from taking
+        an optimistic path itself.
+        """
+        if not getattr(self.config, 'auto_eval_enabled', False):
+            return
+        if report.outcome != WorkflowOutcome.BLOCKED:
+            return
+        if report.block_phase not in self.config.auto_eval_phases:
+            return
+
+        task_metadata = (assignment.task.get('metadata') or {})
+        optimistic_path = str(task_metadata.get('optimistic_path') or '')
+        if not optimistic_path:
+            return
+        if task_metadata.get('auto_eval_redo'):
+            return
+
+        # Daily budget check — skip the redo when exhausted.
+        used = await self._auto_eval_budget_used_24h()
+        if used >= self.config.auto_eval_redo_budget_usd:
+            logger.info(
+                'Task %s: auto-eval budget exhausted ($%.2f used of $%.2f) — '
+                'skipping redo',
+                assignment.task_id, used, self.config.auto_eval_redo_budget_usd,
+            )
+            return
+
+        original_id = assignment.task_id
+
+        # Rename the original branch + worktree so the new task can use a
+        # fresh task/<original_id>-redo branch (sibling task gets its own
+        # branch from create_worktree on dispatch).
+        old_branch = original_id
+        new_branch = f'{original_id}-skip-attempt'
+        old_path = self.git_ops.worktree_base / old_branch
+        new_path = self.git_ops.worktree_base / new_branch
+        renamed = False
+        if old_path.exists():
+            try:
+                await self.git_ops.rename_worktree(
+                    old_path=old_path,
+                    new_path=new_path,
+                    old_branch=old_branch,
+                    new_branch=new_branch,
+                )
+                renamed = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'Task %s: auto-eval rename failed (%s) — continuing '
+                    'without rename',
+                    original_id, exc,
+                )
+
+        redo_metadata = {
+            'auto_eval_redo': True,
+            'auto_eval_pair': str(original_id),
+            'spawned_from': str(original_id),
+            'force_full_path': True,
+            'modules': list(task_metadata.get('modules') or []),
+            'files': list(task_metadata.get('files') or []),
+        }
+
+        title = (
+            f'[auto-eval redo] {assignment.task.get("title", "")}'
+        )[:200]
+        description = (
+            f'Automated full-architect redo of task {original_id} '
+            f'(blocked at phase={report.block_phase} via optimistic path '
+            f'{optimistic_path!r}). Original branch+worktree renamed to '
+            f'{new_branch} for forensic comparison.'
+        )
+
+        try:
+            submit_result = await self.scheduler.dispatch_tool(
+                'submit_task',
+                {
+                    'project_root': str(self.config.project_root),
+                    'title': title,
+                    'description': description,
+                    'priority': str(
+                        assignment.task.get('priority') or 'medium'
+                    ),
+                    'metadata': redo_metadata,
+                    'planning_mode': True,
+                },
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: auto-eval submit_task raised (%s) — aborting redo',
+                original_id, exc,
+            )
+            return
+
+        new_task_id = self._extract_task_id(submit_result)
+        if not new_task_id:
+            logger.warning(
+                'Task %s: auto-eval submit_task returned no task_id (%r)',
+                original_id, submit_result,
+            )
+            return
+
+        # Flip the new task from deferred → pending so the scheduler picks
+        # it up on the next tick.
+        try:
+            await self.scheduler.dispatch_tool(
+                'set_task_status',
+                {
+                    'project_root': str(self.config.project_root),
+                    'id': new_task_id,
+                    'status': 'pending',
+                },
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: auto-eval status flip to pending failed (%s) — '
+                'redo task %s left deferred',
+                original_id, exc, new_task_id,
+            )
+
+        # Cross-reference the new id back onto the original task.
+        try:
+            await self.scheduler.update_task(
+                original_id,
+                metadata={
+                    **task_metadata,
+                    'auto_eval_pair': str(new_task_id),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: auto-eval back-link update failed (%s)',
+                original_id, exc,
+            )
+
+        # Track for budget accounting.
+        self._auto_eval_redo_task_ids.add(str(new_task_id))
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.auto_eval_dispatched,
+                task_id=str(new_task_id),
+                data={
+                    'original_task_id': str(original_id),
+                    'optimistic_path': optimistic_path,
+                    'block_phase': report.block_phase,
+                    'rename_succeeded': renamed,
+                    'budget_used_24h': used,
+                },
+            )
+
+        logger.info(
+            'Task %s: auto-eval dispatched redo task %s '
+            '(rename=%s, budget_used=$%.2f)',
+            original_id, new_task_id, renamed, used,
+        )
+
+    async def _auto_eval_budget_used_24h(self) -> float:
+        """Sum cost_usd from invocations table for known auto-eval redo
+        task_ids in the trailing 24h.
+
+        Process-local: the redo set resets on harness restart. Acceptable
+        because auto-eval is rollout instrumentation that will be sunset
+        once metrics stabilise.
+        """
+        if not self._auto_eval_redo_task_ids:
+            return 0.0
+        if self.cost_store is None:
+            return 0.0
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        try:
+            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
+            placeholders = ','.join('?' for _ in self._auto_eval_redo_task_ids)
+            cur = await conn.execute(
+                f'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+                f'WHERE task_id IN ({placeholders}) '
+                f'AND completed_at >= ?',
+                (*self._auto_eval_redo_task_ids, cutoff),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                'auto_eval_budget_used_24h: query failed (%s) — assume zero',
+                exc,
+            )
+            return 0.0
+
+    @staticmethod
+    def _extract_task_id(submit_result: Any) -> str | None:
+        """Pull the task_id out of an MCP tools/call response wrapper.
+
+        ``dispatch_tool`` returns the raw MCP result envelope. The shape may
+        be ``{'task_id': ...}``, ``{'content': [{'text': '{...}'}], ...}``,
+        or ``{'structuredContent': {...}}`` depending on transport. Normalise.
+        """
+        if not isinstance(submit_result, dict):
+            return None
+        if submit_result.get('task_id'):
+            return str(submit_result['task_id'])
+        for key in ('structuredContent', 'result'):
+            inner = submit_result.get(key)
+            if isinstance(inner, dict) and inner.get('task_id'):
+                return str(inner['task_id'])
+        content = submit_result.get('content')
+        if isinstance(content, list):
+            for chunk in content:
+                if isinstance(chunk, dict) and chunk.get('type') == 'text':
+                    try:
+                        parsed = json.loads(str(chunk.get('text') or ''))
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(parsed, dict) and parsed.get('task_id'):
+                        return str(parsed['task_id'])
+        return None
 
     async def _apply_retry_cap(
         self, task_id: str, report: TaskReport, requeued: bool,

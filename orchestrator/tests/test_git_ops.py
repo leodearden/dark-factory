@@ -341,6 +341,55 @@ class TestWorktreeLifecycle:
         await git_ops.cleanup_worktree(worktree_info.path, 'feature-5')
         assert not worktree_info.path.exists()
 
+    async def test_rename_worktree_moves_path_and_branch(
+        self, git_ops: GitOps,
+    ):
+        info = await git_ops.create_worktree('orig-task')
+        old_path = info.path
+        new_path = git_ops.worktree_base / 'orig-task-skip-attempt'
+
+        await git_ops.rename_worktree(
+            old_path=old_path,
+            new_path=new_path,
+            old_branch='orig-task',
+            new_branch='orig-task-skip-attempt',
+        )
+
+        assert not old_path.exists()
+        assert new_path.exists()
+
+        # Branch was renamed too
+        rc, branches, _ = await _run(
+            ['git', 'branch', '--list'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert 'task/orig-task-skip-attempt' in branches
+        assert 'task/orig-task ' not in branches  # exact-match exclusion
+
+        # New worktree is registered with git
+        rc, listing, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert str(new_path.resolve()) in listing
+
+    async def test_rename_worktree_unregistered_path_raises(
+        self, git_ops: GitOps,
+    ):
+        # An unregistered directory (not a real worktree) cannot be moved.
+        bogus_old = git_ops.worktree_base / 'never-registered'
+        bogus_old.mkdir(parents=True)
+        new_path = git_ops.worktree_base / 'should-not-exist'
+
+        with pytest.raises(RuntimeError, match='git worktree move'):
+            await git_ops.rename_worktree(
+                old_path=bogus_old,
+                new_path=new_path,
+                old_branch='never-registered',
+                new_branch='renamed',
+            )
+
     async def test_merge_to_main(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-6')
         (worktree_info.path / 'merged.py').write_text('merged = True\n')
