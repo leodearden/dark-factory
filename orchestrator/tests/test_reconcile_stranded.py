@@ -354,6 +354,62 @@ class TestReconcileStrandedInProgress:
         # Task must still be reverted to pending (recovery runs separately)
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
+    async def test_no_lock_worktree_preserved_when_in_preserved_set(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Worktree dir exists but has no plan.lock and task IS in
+        _preserved_worktrees → cleanup_worktree is NOT called (worktree
+        preserved for revalidation), task still reverted to pending.
+
+        Mirrors test_no_lock_worktree_preserved_when_recovered for the
+        crash-recovery-stamped-but-not-pre-loaded case (the architect filed
+        a stamped plan that was rejected by blast-radius lock conflict).
+        """
+        tid = '34'
+        harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        worktree_path.mkdir(parents=True)
+        # Mark task as preserved (architect ran, plan stamped, no done steps).
+        harness._preserved_worktrees.add(str(tid))
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert worktree_path.exists()
+        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
+
+    async def test_stale_lock_worktree_preserved_when_in_preserved_set(
+        self, harness: Harness, monkeypatch
+    ):
+        """Stale plan.lock + task IS in _preserved_worktrees →
+        cleanup_worktree NOT called, worktree kept, stale lock unlinked,
+        task reverted.  Defensive: _recover_crashed_tasks already unlinks
+        plan.lock when adding to _preserved_worktrees, so this combined
+        state shouldn't appear in practice — locks the invariant against
+        future drift, mirroring test_stale_lock_worktree_preserved_when_recovered.
+        """
+        tid = '35'
+        harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+
+        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': f'{tid}-dead',
+            'locked_at': '2026-01-01T00:00:00+00:00',
+            'owner_pid': 99999,
+        }))
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        harness._preserved_worktrees.add(str(tid))
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert worktree_path.exists()
+        assert not lock_path.exists()
+        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
+
     async def test_stale_lock_worktree_cleaned_when_not_recovered(
         self, harness: Harness, monkeypatch
     ):

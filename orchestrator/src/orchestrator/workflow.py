@@ -926,6 +926,20 @@ class TaskWorkflow:
                 self.task, worktree=self.worktree,
             )
 
+        # Snapshot pre-architect open L0 ids so the post-loop check can
+        # detect "architect filed an L0 in lieu of writing a plan."  This is
+        # the deterministic catch for RC2 — if it fires, we route directly
+        # to L1 without re-invoking the architect (the no-plan loop burned
+        # 16 successive Opus calls on task 917 because the cycle counter
+        # reset every time main moved).
+        pre_l0_ids: set[str] = set()
+        if self.escalation_queue:
+            pre_l0_ids = {
+                e.id for e in self.escalation_queue.get_by_task(
+                    self.task_id, status='pending', level=0,
+                )
+            }
+
         result: AgentResult | None = None
         rebase_retry_used = False
         for _outer_attempt in range(2):  # at most one rebase-retry round-trip
@@ -987,6 +1001,30 @@ class TaskWorkflow:
             break
 
         assert result is not None  # range(2) always executes at least once
+
+        # RC2 deterministic catch: the architect filed a fresh L0 escalation
+        # in lieu of writing a plan.  Route straight to L1 (skip the steward,
+        # skip the no-plan loop) — the architect already filed an L0, so
+        # _mark_blocked must not create another one.
+        if not self.plan and self.escalation_queue:
+            post_l0 = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            new_l0 = [e for e in post_l0 if e.id not in pre_l0_ids]
+            if new_l0:
+                summary = new_l0[0].summary
+                logger.warning(
+                    'Task %s: architect filed L0 without plan (%s) — '
+                    'auto-promoting to L1 to break no-plan loop',
+                    self.task_id, summary[:120],
+                )
+                return await self._mark_blocked(
+                    f'Architect filed L0 without plan: {summary}',
+                    detail=new_l0[0].detail,
+                    escalate_to_human=True,
+                    skip_escalation=True,  # the architect already filed one
+                )
+
         if not self.plan:
             cls = classify_agent_failure(result)
             logger.error(
@@ -1219,16 +1257,26 @@ class TaskWorkflow:
             counter = int(metadata.get('consecutive_no_plan_failures') or 0)
         except (TypeError, ValueError):
             counter = 0
+        try:
+            total = int(metadata.get('total_no_plan_failures') or 0)
+        except (TypeError, ValueError):
+            total = 0
 
         if not current_main_sha or last_sha != current_main_sha:
             counter = 1
         else:
             counter += 1
 
-        # Persist the new counter (best-effort — never block on this).
+        # Total counter never resets — backstops the SHA-keyed counter when
+        # main keeps moving and the per-SHA counter never reaches 2 (the
+        # bug behind 16 successive Opus calls on task 917).
+        total += 1
+
+        # Persist the new counters (best-effort — never block on this).
         new_metadata = dict(metadata)
         new_metadata['last_no_plan_main_sha'] = current_main_sha
         new_metadata['consecutive_no_plan_failures'] = counter
+        new_metadata['total_no_plan_failures'] = total
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(self.task_id, metadata=new_metadata)
@@ -1238,15 +1286,19 @@ class TaskWorkflow:
                 self.task_id, exc,
             )
 
-        if counter >= 2:
+        if counter >= 2 or total >= 3:
+            trigger = (
+                'same-SHA counter' if counter >= 2 else 'total counter'
+            )
             logger.warning(
-                'Task %s: consecutive_no_plan_failures=%d on main SHA %s — '
-                'no-plan loop confirmed; escalating to human',
-                self.task_id, counter, current_main_sha[:12] or '<unknown>',
+                'Task %s: no-plan loop confirmed (%s) — '
+                'consecutive=%d on main SHA %s, total=%d; escalating to human',
+                self.task_id, trigger, counter,
+                current_main_sha[:12] or '<unknown>', total,
             )
             full_reason = (
-                f'Repeated no-plan failure (counter={counter}) on same '
-                f'main SHA: {reason}'
+                f'Repeated no-plan failure (counter={counter}, total={total}) '
+                f'via {trigger}: {reason}'
             )
             return await self._mark_blocked(
                 full_reason, detail=detail, escalate_to_human=True,

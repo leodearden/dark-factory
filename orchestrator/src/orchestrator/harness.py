@@ -191,6 +191,14 @@ class Harness:
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
+        # Worktrees that survived crash recovery with a stamped pre-EXECUTE
+        # plan (no completed steps) but were NOT pre-loaded into
+        # _recovered_plans — we want _plan() to re-run revalidation against
+        # the existing stamped plan rather than skipping straight to EXECUTE
+        # via initial_plan.  Membership protects them from the
+        # _reconcile_stranded_in_progress sweep, which otherwise wipes any
+        # worktree not in _recovered_plans.
+        self._preserved_worktrees: set[str] = set()
 
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
@@ -912,8 +920,35 @@ Output JSON matching the schema. Every task must appear in the output.
             ]
 
             if not completed:
+                # Provenance-stamped plans deserve preservation: the architect
+                # ran successfully and wrote a plan that subsequently got the
+                # session_id stamp.  A common path here is the blast-radius
+                # lock-conflict requeue (workflow.py:1071-1088), which leaves
+                # a stamped pre-EXECUTE plan behind.  Wiping the worktree
+                # forces the next acquisition to call the architect again —
+                # 17-20 wasted Opus calls per 14d.  Keep the worktree, unlink
+                # plan.lock, and add to _preserved_worktrees so the next
+                # acquisition reuses it; _plan() will then take the
+                # revalidation branch via _old_plan_base.  We deliberately
+                # do NOT pre-load into _recovered_plans because that bypasses
+                # _plan() entirely.
+                if plan.get('_session_id'):
+                    logger.info(
+                        f'Recovery: worktree {task_id} has stamped plan with '
+                        f'no completed steps — preserving for revalidation'
+                    )
+                    lock_path = entry / '.task' / 'plan.lock'
+                    if lock_path.exists():
+                        lock_path.unlink()
+                        logger.info(
+                            f'Recovery: cleared stale plan.lock for '
+                            f'preserved task {task_id}'
+                        )
+                    self._preserved_worktrees.add(task_id)
+                    recovered += 1
+                    continue
                 logger.info(
-                    f'Recovery: worktree {task_id} has plan but no '
+                    f'Recovery: worktree {task_id} has unstamped plan with no '
                     f'completed steps — cleaning up'
                 )
                 await self.git_ops.cleanup_worktree(entry, task_id)
@@ -1069,7 +1104,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 # If the worktree directory exists and we haven't promised to
                 # resume this task's plan, clean it up so the scheduler can
                 # create a fresh worktree on re-acquisition without colliding.
-                if worktree_path.exists() and tid not in self._recovered_plans:
+                if (
+                    worktree_path.exists()
+                    and tid not in self._recovered_plans
+                    and tid not in self._preserved_worktrees
+                ):
                     try:
                         await self.git_ops.cleanup_worktree(worktree_path, tid)
                     except Exception:
@@ -1118,7 +1157,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # Stale lock — clear it and revert.
-            if tid not in self._recovered_plans:
+            if (
+                tid not in self._recovered_plans
+                and tid not in self._preserved_worktrees
+            ):
                 # Full cleanup: remove worktree dir + branch so re-acquisition
                 # creates a fresh worktree without colliding.
                 try:
@@ -1218,6 +1260,8 @@ Output JSON matching the schema. Every task must appear in the output.
             self._workflow_cancel_events[assignment.task_id] = cancel_event
 
             recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
+            # Drop any preserved-worktree marker once the slot picks the task up.
+            self._preserved_worktrees.discard(assignment.task_id)
 
             # Build steward factory — steward starts when the workflow
             # creates its worktree (it needs the path).
