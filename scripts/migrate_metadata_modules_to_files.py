@@ -162,11 +162,21 @@ async def _migrate_one_project(
         files = meta.get('files') or []
         task_id = str(task.get('id', ''))
 
+        # Build a full new metadata dict (None-deletion via merge doesn't
+        # work — append=True keeps existing keys; append=False replaces the
+        # whole blob, so we copy the existing metadata, mutate, and write
+        # the complete result.)
+        # Strip done_provenance — update_task rejects metadata writes that
+        # carry it (set_task_status is the only sanctioned writer); we
+        # already skip done/cancelled, but be defensive about orphan stamps.
+        new_meta = {
+            k: v for k, v in meta.items()
+            if k not in ('modules', 'done_provenance')
+        }
         if not files:
-            new_meta = {'files': modules, 'modules': None}
+            new_meta['files'] = modules
             action = 'copy'
         else:
-            new_meta = {'modules': None}
             action = 'drop'
 
         if dry_run:
@@ -180,7 +190,7 @@ async def _migrate_one_project(
                     'id': task_id,
                     'project_root': project_root,
                     'metadata': json.dumps(new_meta),
-                    'append': True,
+                    'append': False,
                 })
                 print(
                     f'  [{project_root}] task={task_id} action={action}',
