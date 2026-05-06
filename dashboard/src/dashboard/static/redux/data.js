@@ -17,7 +17,7 @@ function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
     '/api/v2/dashboard/orchestrators':                ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
-    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'FILE_LOCKS'],
+    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'FILE_LOCKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS'],
     '/api/v2/dashboard/memory':                       ['MEMORY_STATUS'],
     '/api/v2/dashboard/memory-graphs':                ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
     '/api/v2/dashboard/recon':                        ['RECON_STATE', 'AGENTS'],
@@ -41,6 +41,8 @@ window.DF_DATA = {
   ORCHESTRATORS_SPARK: { labels: [], values: [] },
   ACTIVE_TASKS: [],
   FILE_LOCKS: {},
+  TASKS_OFFLINE: false,
+  TASKS_OFFLINE_PROJECTS: [],
   PERFORMANCE: {},
   MEMORY_STATUS: {
     graphiti: { connected: false, node_count: 0, edge_count: 0, episode_count: 0 },

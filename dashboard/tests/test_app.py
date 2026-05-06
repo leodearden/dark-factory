@@ -76,7 +76,8 @@ def test_health_endpoint(client):
 def test_orchestrators_returns_orchestrators_and_projects(client):
     """Even with no running orchestrators the response carries both keys."""
     with patch(
-        'dashboard.app.discover_orchestrators', return_value=[],
+        'dashboard.app.discover_orchestrators',
+        new=AsyncMock(return_value=[]),
     ):
         resp = client.get('/api/v2/dashboard/orchestrators')
     assert resp.status_code == 200
@@ -91,14 +92,30 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
 
 def test_tasks_returns_active_tasks_and_file_locks(client):
     with patch(
-        'dashboard.app.collect_active_tasks', return_value=([], {}),
+        'dashboard.app.collect_active_tasks',
+        new=AsyncMock(return_value=([], {}, [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {'ACTIVE_TASKS', 'FILE_LOCKS'}
+    assert {'ACTIVE_TASKS', 'FILE_LOCKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS'} <= set(body)
     assert isinstance(body['ACTIVE_TASKS'], list)
     assert isinstance(body['FILE_LOCKS'], dict)
+    assert body['TASKS_OFFLINE'] is False
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+
+
+def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
+    """When collect_active_tasks reports offline projects, the payload sets ``offline=True``."""
+    with patch(
+        'dashboard.app.collect_active_tasks',
+        new=AsyncMock(return_value=([], {}, ['dark-factory'])),
+    ):
+        resp = client.get('/api/v2/dashboard/tasks')
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['TASKS_OFFLINE'] is True
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['dark-factory']
 
 
 def test_memory_returns_memory_status(client):

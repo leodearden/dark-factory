@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import sqlite3
@@ -17,7 +18,6 @@ from dashboard.data.burndown import (
     _INSERT_SNAPSHOT_SQL,
     BURNDOWN_SCHEMA,
     _count_statuses,
-    _tasks_json_for,
     aggregate_burndown_projects,
     aggregate_burndown_series,
     collect_snapshot,
@@ -25,6 +25,35 @@ from dashboard.data.burndown import (
     get_burndown_projects,
     get_burndown_series,
 )
+
+
+def _statuses(tasks_or_dict):
+    """Coerce a list[{'status': X}] into the {int: status} dict shape that
+    fetch_statuses returns; pass through dicts unchanged."""
+    if isinstance(tasks_or_dict, dict):
+        return tasks_or_dict
+    return {i: t.get('status', 'pending') for i, t in enumerate(tasks_or_dict)}
+
+
+def _root_key(root):
+    """Canonicalised key for fetch_statuses-stub maps."""
+    return str(Path(root).resolve())
+
+
+class _AsyncReturn:
+    """Sync callable suitable for ``side_effect=`` on AsyncMock-patched async targets.
+
+    ``unittest.mock.patch`` upgrades to AsyncMock when the original is detected
+    as a coroutine function; AsyncMock awaits the side_effect's *result*, so the
+    side_effect itself must be sync (returning the value directly), otherwise
+    the AsyncMock returns the coroutine without awaiting it.
+    """
+
+    def __init__(self, value):
+        self._value = value
+
+    def __call__(self, *args, **kwargs):
+        return self._value
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,8 +122,22 @@ def _assert_snapshot_counts(
     )
 
 
-def _fake_load(tasks_map):
-    return lambda path: tasks_map[path]
+def _fake_load(by_root_map):
+    """Async fetch_statuses fake; *by_root_map* is keyed by project_root (Path or str).
+
+    Each value may be a list of ``{'status': X}`` dicts (auto-converted) or a
+    pre-built ``{id: status}`` dict.  Look-up is canonical-path keyed so that
+    symlinked roots collapse onto the same entry.
+    """
+    canonical = {_root_key(k): v for k, v in by_root_map.items()}
+
+    async def _fake(client, config, project_root):
+        key = _root_key(project_root)
+        if key not in canonical:
+            raise KeyError(f'Unmapped project_root: {key}')
+        return _statuses(canonical[key])
+
+    return _fake
 
 
 # ---------------------------------------------------------------------------
@@ -147,57 +190,40 @@ async def burndown_env(burndown_conn_with_config):
 
 
 class TestCountStatuses:
-    def test_empty_list(self):
-        assert _count_statuses([]) == {
+    def test_empty_dict(self):
+        assert _count_statuses({}) == {
             'pending': 0, 'in_progress': 0, 'blocked': 0,
             'deferred': 0, 'cancelled': 0, 'done': 0,
         }
 
     def test_standard_statuses(self):
-        tasks = [
-            {'status': 'pending'},
-            {'status': 'pending'},
-            {'status': 'in-progress'},
-            {'status': 'done'},
-            {'status': 'blocked'},
-            {'status': 'cancelled'},
-            {'status': 'deferred'},
-        ]
-        result = _count_statuses(tasks)
+        statuses = {
+            1: 'pending',
+            2: 'pending',
+            3: 'in-progress',
+            4: 'done',
+            5: 'blocked',
+            6: 'cancelled',
+            7: 'deferred',
+        }
+        result = _count_statuses(statuses)
         assert result == {
             'pending': 2, 'in_progress': 1, 'blocked': 1,
             'deferred': 1, 'cancelled': 1, 'done': 1,
         }
 
     def test_review_merges_into_in_progress(self):
-        tasks = [{'status': 'review'}, {'status': 'in-progress'}]
-        result = _count_statuses(tasks)
+        result = _count_statuses({1: 'review', 2: 'in-progress'})
         assert result['in_progress'] == 2
 
     def test_unknown_status_defaults_to_pending(self):
-        tasks = [{'status': 'something-weird'}]
-        result = _count_statuses(tasks)
+        result = _count_statuses({1: 'something-weird'})
         assert result['pending'] == 1
 
     def test_missing_status_key_defaults_to_pending(self):
-        tasks = [{'title': 'no status field'}]
-        result = _count_statuses(tasks)
+        # In the new API, a missing/None status maps to 'pending'.
+        result = _count_statuses({1: None})
         assert result['pending'] == 1
-
-
-# ---------------------------------------------------------------------------
-# _tasks_json_for
-# ---------------------------------------------------------------------------
-
-
-class TestTasksJsonFor:
-    def test_constructs_expected_path(self, tmp_path):
-        result = _tasks_json_for(tmp_path)
-        assert result == tmp_path / '.taskmaster' / 'tasks' / 'tasks.json'
-
-    def test_result_is_relative_to_root(self, tmp_path):
-        result = _tasks_json_for(tmp_path)
-        assert result.is_relative_to(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +244,10 @@ class TestCollectSnapshot:
         ]
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', return_value=fake_tasks),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn(_statuses(fake_tasks))),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = await cur.fetchall()
@@ -244,11 +270,11 @@ class TestCollectSnapshot:
 
         async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
                 patch('dashboard.data.burndown._resolve_project_root', return_value=real_dir.resolve()),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -272,11 +298,11 @@ class TestCollectSnapshot:
         fake_orchestrators = [{'prd': str(config.project_root / 'prd.md'), 'project_root': str(config.project_root)}]
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._resolve_project_root', return_value=config.project_root),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
@@ -303,16 +329,16 @@ class TestCollectSnapshot:
         # Path-keyed dispatch: asyncio.gather fires load_task_tree calls
         # concurrently, so an ordered side_effect list can race. Look up by path.
         _tasks_map = {
-            config.tasks_json: main_tasks,
-            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
-            autopilot_root / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
+            config.project_root: main_tasks,
+            reify_root: reify_tasks,
+            autopilot_root: autopilot_tasks,
         }
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = await cur.fetchall()
@@ -346,10 +372,10 @@ class TestCollectSnapshot:
         )
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         # PRIMARY: exact-key invariant — this project_id has exactly one row.
         # Catches bugs where the main-project row is omitted while a differently-
@@ -381,10 +407,10 @@ class TestCollectSnapshot:
         # project_root is the symlink; known_project_roots contains the resolved real path
         async with burndown_conn_with_config(project_root=link, known_project_roots=[real_dir]) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -417,16 +443,16 @@ class TestCollectSnapshot:
         # reify_root, and production burndown.py passes that raw value through to the
         # tasks.json path construction (see roots_to_snapshot.append around line 100).
         _tasks_map = {
-            config.tasks_json: [],
-            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+            config.project_root: [],
+            reify_root: [{'status': 'done'}],
         }
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
                                 (str(reify_root),)) as cur:
@@ -444,10 +470,10 @@ class TestCollectSnapshot:
 
         async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -470,16 +496,16 @@ class TestCollectSnapshot:
         # Path-keyed dispatch because asyncio.gather fires calls concurrently —
         # an ordered side_effect list can race on thread scheduling.
         _tasks_map = {
-            config.tasks_json: [],
-            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
+            config.project_root: [],
+            reify_root: reify_tasks,
         }
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute('SELECT * FROM snapshots ORDER BY project_id') as cur:
             rows = await cur.fetchall()
@@ -503,28 +529,30 @@ class TestCollectSnapshot:
         root_a_tasks = [{'status': 'done'}]
         root_c_tasks = [{'status': 'in-progress'}]
 
-        # Path-keyed dispatch: asyncio.gather fires load_task_tree calls
-        # concurrently, so an ordered side_effect list can race. The bad path
-        # raises PermissionError; return_exceptions=True isolates the failure.
-        bad_tasks_json = root_b.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        # Per-root dispatch: asyncio.gather fires fetch_statuses calls
+        # concurrently. The bad root raises PermissionError; return_exceptions=True
+        # isolates the failure.
+        bad_root_str = _root_key(root_b)
 
         async with burndown_conn_with_config(known_project_roots=[root_a, root_b, root_c]) as (db_path, config, conn):
             _tasks_map = {
-                config.tasks_json: main_tasks,
-                root_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_a_tasks,
-                root_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_c_tasks,
+                config.project_root: main_tasks,
+                root_a.resolve(): root_a_tasks,
+                root_c.resolve(): root_c_tasks,
             }
+            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            def fake_load(path):
-                if path == bad_tasks_json:
+            async def fake_load(client, config, project_root):
+                key = _root_key(project_root)
+                if key == bad_root_str:
                     raise PermissionError('Permission denied')
-                return _tasks_map[path]
+                return _statuses(_by_key[key])
 
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -542,22 +570,24 @@ class TestCollectSnapshot:
     async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog):
         """A WARNING is logged naming the failing root when PermissionError occurs."""
         bad_root = Path('/fake/project/bad_root')
-        bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        bad_root_str = _root_key(bad_root)
 
         async with burndown_conn_with_config(known_project_roots=[bad_root]) as (db_path, config, conn):
-            _tasks_map: dict = {config.tasks_json: []}
+            _tasks_map: dict = {config.project_root: []}
+            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            def fake_load(path):
-                if path == bad_tasks_json:
+            async def fake_load(client, config, project_root):
+                key = _root_key(project_root)
+                if key == bad_root_str:
                     raise PermissionError('Permission denied')
-                return _tasks_map[path]
+                return _statuses(_by_key[key])
 
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
         # At least one WARNING record should name the failing root
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -576,24 +606,26 @@ class TestCollectSnapshot:
         main_tasks = [{'status': 'pending'}]
         good_tasks = [{'status': 'done'}, {'status': 'done'}]
 
-        bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        bad_root_str = _root_key(bad_root)
 
         async with burndown_conn_with_config(known_project_roots=[bad_root, good_root]) as (db_path, config, conn):
             _tasks_map = {
-                config.tasks_json: main_tasks,
-                good_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_tasks,
+                config.project_root: main_tasks,
+                good_root.resolve(): good_tasks,
             }
+            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            def fake_load(path):
-                if path == bad_tasks_json:
+            async def fake_load(client, config, project_root):
+                key = _root_key(project_root)
+                if key == bad_root_str:
                     raise PermissionError('denied')
-                return _tasks_map[path]
+                return _statuses(_by_key[key])
 
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT project_id, done FROM snapshots ORDER BY project_id') as cur:
                 rows = list(await cur.fetchall())
@@ -635,13 +667,13 @@ class TestCollectSnapshot:
 
         async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
                 # _resolve_project_root is NOT mocked — it runs for real and falls
                 # back to config.project_root (the symlink) because prd_path has no
                 # .taskmaster in its ancestor chain.
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -669,24 +701,27 @@ class TestCollectSnapshot:
         n_roots = 3
         barrier = threading.Barrier(n_roots, timeout=10.0)
 
-        def fake_load(path):
+        async def fake_load(client, config, project_root):
+            await asyncio.to_thread(_wait_or_fail, barrier)
+            return {}
+
+        def _wait_or_fail(b):
             try:
-                barrier.wait()
+                b.wait()
             except threading.BrokenBarrierError:
                 pytest.fail(
-                    'load_task_tree calls did not reach the barrier within 10s — '
-                    'possible causes: (1) sequential execution (calls not running '
+                    'fetch_statuses calls did not reach the barrier within 10s — '
+                    'possible causes: (1) sequential awaits (calls not running '
                     'concurrently via asyncio.gather); (2) severe scheduler latency '
                     '(threads starved by contention or a slow CI host)'
                 )
-            return []
 
         async with burndown_conn_with_config(known_project_roots=[reify_root, autopilot_root]) as (db_path, config, conn):
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -706,26 +741,28 @@ class TestCollectSnapshot:
         reify_root = Path('/nonexistent/known/reify')
         autopilot_root = Path('/nonexistent/known/autopilot')
 
-        # The path that will raise OSError — reify is the failing root.
-        bad_path = reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        # The root that will raise OSError — reify is the failing root.
+        bad_root_str = _root_key(reify_root)
 
         async with burndown_conn_with_config(known_project_roots=[reify_root, autopilot_root]) as (db_path, config, conn):
             # Only map the two healthy roots; the failing root is intentionally absent.
             _tasks_map = {
-                config.tasks_json: [],
-                autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+                config.project_root: [],
+                autopilot_root.resolve(): [{'status': 'done'}],
             }
+            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            def fake_load(path):
-                if path == bad_path:
+            async def fake_load(client, config, project_root):
+                key = _root_key(project_root)
+                if key == bad_root_str:
                     raise OSError('mock disk error')
-                return _tasks_map[path]
+                return _statuses(_by_key[key])
 
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -754,27 +791,29 @@ class TestCollectSnapshot:
         good_1_tasks = [{'status': 'done'}, {'status': 'done'}]
         good_2_tasks = [{'status': 'done'}]
 
-        bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        bad_root_str = _root_key(bad_root)
 
         async with burndown_conn_with_config(known_project_roots=[bad_root, good_root_1, good_root_2]) as (db_path, config, conn):
             _tasks_map = {
-                config.tasks_json: main_tasks,
-                good_root_1.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_1_tasks,
-                good_root_2.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_2_tasks,
+                config.project_root: main_tasks,
+                good_root_1.resolve(): good_1_tasks,
+                good_root_2.resolve(): good_2_tasks,
             }
+            _by_key = {_root_key(k): v for k, v in _tasks_map.items()}
 
-            def fake_load(path):
-                if path == bad_tasks_json:
+            async def fake_load(client, config, project_root):
+                key = _root_key(project_root)
+                if key == bad_root_str:
                     raise OSError('mock disk error')
-                return _tasks_map[path]
+                return _statuses(_by_key[key])
 
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
                 # Must NOT raise even though bad_root fails — return_exceptions=True absorbs it
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
 
             async with conn.execute('SELECT * FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -829,24 +868,26 @@ class TestCollectSnapshot:
         """
         db_path, config, conn = burndown_env
 
-        bad_path = config.tasks_json  # the main project's tasks.json path
+        bad_root_str = _root_key(config.project_root)
 
         unexpected_calls: list = []
 
-        def fake_load(path):
-            if path == bad_path:
+        async def fake_load(client, config, project_root):
+            key = _root_key(project_root)
+            if key == bad_root_str:
                 raise PermissionError('Permission denied')
-            unexpected_calls.append(path)
+            unexpected_calls.append(key)
+            return {}
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
         ):
             # Must NOT raise — return_exceptions=True absorbs the PermissionError.
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
-        assert unexpected_calls == [], f'Unexpected load_task_tree calls: {unexpected_calls}'
+        assert unexpected_calls == [], f'Unexpected fetch_statuses calls: {unexpected_calls}'
 
         # (b) zero rows committed — the only root failed, so snapshots is empty.
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
@@ -857,7 +898,7 @@ class TestCollectSnapshot:
         # (c) at least one WARNING record must name the main project and carry exc_info.
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'Expected at least one WARNING log record'
-        expected_msg = f'Failed to load tasks for {config.project_root}'
+        expected_msg = f'Failed to fetch statuses for {config.project_root}'
         assert any(expected_msg in r.getMessage() for r in warning_records), f'No warning record matched expected message: {expected_msg!r}'
         assert any(r.exc_info for r in warning_records)
 
@@ -892,16 +933,16 @@ class TestCollectSnapshot:
         _, config, conn = burndown_env
 
         _tasks_map = {
-            config.tasks_json: [],
-            canonical_root / '.taskmaster' / 'tasks' / 'tasks.json': [],
+            config.project_root: [],
+            canonical_root: [],
         }
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[orchestrator_dict]),
             patch(patch_target, return_value=canonical_root),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute(
             'SELECT project_id FROM snapshots WHERE project_id = ?', (str(canonical_root),)
@@ -929,11 +970,11 @@ class TestCollectSnapshot:
         ]
 
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load({config.tasks_json: []})),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load({config.project_root: []})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=None),
         ):
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         # Only the main project's snapshot row should exist; the orchestrator was skipped.
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
@@ -1317,14 +1358,14 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         main_tasks = [{'status': 'pending'}]
         known_tasks = [{'status': 'done'}]
         _tasks_map = {
-            config.tasks_json: main_tasks,
-            known_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': known_tasks,
+            config.project_root: main_tasks,
+            known_root.resolve(): known_tasks,
         }
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'))
             stack.enter_context(
-                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map))
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map))
             )
             stack.enter_context(
                 patch('dashboard.data.burndown.find_running_orchestrators', **find_orch_kwargs)
@@ -1332,7 +1373,7 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
             if secondary_target is not None:
                 stack.enter_context(patch(secondary_target, **secondary_kwargs))
             # Must NOT raise despite the injected failure
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute('SELECT project_id FROM snapshots') as cur:
             rows = list(await cur.fetchall())
@@ -1377,8 +1418,8 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         main_tasks = [{'status': 'pending'}]
         good_orch_tasks = [{'status': 'done'}]
         _tasks_map = {
-            config.tasks_json: main_tasks,
-            good_orch_root / '.taskmaster' / 'tasks' / 'tasks.json': good_orch_tasks,
+            config.project_root: main_tasks,
+            good_orch_root: good_orch_tasks,
         }
 
         # Capture bad_prefix BEFORE patching (established pattern from
@@ -1408,12 +1449,12 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         with (
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             patch.object(Path, 'resolve', selective_bad_resolve),
-            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=orchestrator_entries),
             patch('dashboard.data.burndown._resolve_project_root', side_effect=fake_resolve_project_root),
         ):
             # Must NOT raise despite the injected OSError from project_root.resolve()
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client=None)
 
         async with conn.execute('SELECT project_id FROM snapshots') as cur:
             rows = list(await cur.fetchall())
@@ -1504,8 +1545,8 @@ class TestCollectSnapshotInsertFailureIsolation:
         main_tasks = [{'status': 'pending'}]
         extra_tasks = [{'status': 'done'}]
         _tasks_map = {
-            config.tasks_json: main_tasks,
-            extra_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_tasks,
+            config.project_root: main_tasks,
+            extra_root.resolve(): extra_tasks,
         }
 
         extra_id = str(extra_root.resolve())
@@ -1514,12 +1555,12 @@ class TestCollectSnapshotInsertFailureIsolation:
         conn.execute = wrapper
         try:
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
                 # Must NOT raise despite the extra's INSERT failing
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
         finally:
             conn.execute = original_execute
 
@@ -1572,10 +1613,10 @@ class TestCollectSnapshotInsertFailureIsolation:
         extra_b_tasks = [{'status': 'done'}, {'status': 'done'}]
         extra_c_tasks = [{'status': 'in-progress'}]
         _tasks_map = {
-            config.tasks_json: main_tasks,
-            extra_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_a_tasks,
-            extra_b.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_b_tasks,
-            extra_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_c_tasks,
+            config.project_root: main_tasks,
+            extra_a.resolve(): extra_a_tasks,
+            extra_b.resolve(): extra_b_tasks,
+            extra_c.resolve(): extra_c_tasks,
         }
 
         extra_b_id = str(extra_b.resolve())
@@ -1584,11 +1625,11 @@ class TestCollectSnapshotInsertFailureIsolation:
         conn.execute = wrapper
         try:
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
         finally:
             conn.execute = original_execute
 
@@ -1639,8 +1680,8 @@ class TestCollectSnapshotInsertFailureIsolation:
         main_tasks = [{'status': 'pending'}]
         extra_tasks = [{'status': 'done'}]
         _tasks_map = {
-            config.tasks_json: main_tasks,
-            extra_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_tasks,
+            config.project_root: main_tasks,
+            extra_root.resolve(): extra_tasks,
         }
 
         main_id = str(base_config.project_root)
@@ -1649,11 +1690,11 @@ class TestCollectSnapshotInsertFailureIsolation:
         conn.execute = wrapper
         try:
             with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
         finally:
             conn.execute = original_execute
 
@@ -1737,7 +1778,7 @@ class TestCollectSnapshotExplicitRollback:
                 _patch('dashboard.data.burndown.datetime', _FakeDatetime),
                 pytest.raises(RuntimeError, match='clock failure'),
             ):
-                await collect_snapshot(conn, config)
+                await collect_snapshot(conn, config, client=None)
         finally:
             conn.rollback = original_rollback
 

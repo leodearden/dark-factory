@@ -575,13 +575,6 @@ class Harness:
                 except Exception as e:
                     logger.error(f'Full review failed: {e}')
 
-            # Commit accumulated task status changes so they survive
-            # working-tree resets and are visible to future merge worktrees.
-            if self.report.completed > 0:
-                sha = await self.git_ops.commit_task_statuses()
-                if sha:
-                    logger.info(f'Committed task statuses: {sha[:8]}')
-
         finally:
             # 4. Shutdown
             # 4a. Cancel any in-flight workflow tasks BEFORE shutting down

@@ -92,10 +92,6 @@ class DashboardConfig:
         return self.project_root / 'data' / 'reconciliation' / 'write_journal.db'
 
     @property
-    def tasks_json(self) -> Path:
-        return self.project_root / '.taskmaster' / 'tasks' / 'tasks.json'
-
-    @property
     def worktrees_dir(self) -> Path:
         return self.project_root / '.worktrees'
 

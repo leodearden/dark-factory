@@ -501,8 +501,6 @@ async def run_server():
             # episodes when tasks complete (otherwise the promotion code is dead code).
             targeted.planned_episode_registry = memory_service.planned_episode_registry
 
-        from fused_memory.middleware.task_file_committer import TaskFileCommitter
-
         # Task 918: defence-in-depth bulk-reset circuit-breaker.  Constructed
         # here (inside the reconciliation branch) so it shares the same lifecycle
         # as the other reconciliation-layer guards.  When reconciliation is
@@ -520,10 +518,9 @@ async def run_server():
             ),
         )
 
-        task_committer = TaskFileCommitter()
         ticket_store = await _build_ticket_store(Path(config.reconciliation.data_dir))
         task_interceptor = TaskInterceptor(
-            taskmaster, targeted, event_buffer, task_committer,
+            taskmaster, targeted, event_buffer,
             config=config, escalator=curator_escalator,
             event_queue=event_queue,
             backlog_policy=backlog_policy,
@@ -549,17 +546,15 @@ async def run_server():
         _register_drain_signal_handler(reconciliation_harness)
     else:
         # Always create task_interceptor for tool registration
-        from fused_memory.middleware.task_file_committer import TaskFileCommitter
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.event_buffer import EventBuffer
 
         event_buffer = EventBuffer(db_path=None)
         await event_buffer.initialize()
-        task_committer = TaskFileCommitter()
         _disabled_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
         ticket_store = await _build_ticket_store(_disabled_data_dir)
         task_interceptor = TaskInterceptor(
-            taskmaster, None, event_buffer, task_committer,
+            taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
             ticket_store=ticket_store,

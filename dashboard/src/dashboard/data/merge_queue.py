@@ -15,20 +15,20 @@ in-flight queue state is in-memory and not persisted to the events table.
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import math
-import os
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import aiosqlite
+import httpx
 
+from dashboard.config import DashboardConfig
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
-from dashboard.data.orchestrator import load_task_tree
 from dashboard.data.stats_utils import percentile
+from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import parse_utc, safe_gather_result
 
 logger = logging.getLogger(__name__)
@@ -647,57 +647,44 @@ def enrich_merges_with_titles(
     return result
 
 
-# 32 comfortably covers the expected number of concurrently enumerated projects.
-# If the working set exceeds 32, the LRU evicts the oldest entry and the next access
-# triggers one extra load_task_tree call (a single JSON re-parse) — there is NO
-# correctness impact. Bumping maxsize or switching to maxsize=None is therefore
-# rarely worthwhile and risks unbounded memory growth if callers ever supply many
-# distinct tasks.json paths (e.g., a buggy loop).
-@functools.lru_cache(maxsize=32)
-def _load_task_titles_cached(path_str: str, mtime_ns: int) -> dict[str, str]:
-    """Cache body for :func:`load_task_titles`, keyed on ``(path, mtime_ns)``.
+# Per-project TTL cache for load_task_titles.  Keyed on project_root_str.
+# 10s window comfortably covers the dashboard's poll cadence (one refresh
+# per few seconds) without introducing user-visible staleness on title
+# lookups.  Cache is in-process; multi-worker deployments will each pay
+# their own MCP roundtrip on first lookup.
+_TASK_TITLES_TTL_SECONDS = 10.0
+_task_titles_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
-    Only called when the file's ``st_mtime_ns`` differs from the last observed
-    value; otherwise :func:`load_task_titles` returns the cached result without
-    entering this function.
 
-    The returned dict is shared across callers via the LRU cache — do NOT
-    mutate it.  :func:`load_task_titles` returns a shallow copy to callers so
-    they cannot reach this cached object.
+def _task_titles_cache_clear() -> None:
+    """Clear the task-titles TTL cache (test/admin hook)."""
+    _task_titles_cache.clear()
+
+
+async def load_task_titles(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str,
+) -> dict[str, str]:
+    """Return a ``{str(task_id): title}`` map for *project_root* via fused-memory MCP.
+
+    Fetches the dashboard-shaped task list and projects out (id → title) for
+    rows that have a non-empty title.  Results are cached per project_root
+    for ``_TASK_TITLES_TTL_SECONDS`` (~10 s) so that the dashboard's per-poll
+    enrichment doesn't hammer the MCP server.  An MCP failure returns ``{}``
+    so the merge-queue tab still renders (titles fall back to empty strings).
     """
-    return {str(t['id']): t['title'] for t in load_task_tree(Path(path_str)) if t.get('title')}
+    now = time.monotonic()
+    cached = _task_titles_cache.get(project_root)
+    if cached is not None and (now - cached[0]) < _TASK_TITLES_TTL_SECONDS:
+        return dict(cached[1])
 
-
-def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
-    """Return a {str(task_id): title} map from a Taskmaster tasks.json file.
-
-    Wraps :func:`dashboard.data.orchestrator.load_task_tree` and builds the
-    mapping needed by :func:`enrich_merges_with_titles`.  Tasks without a
-    title (``title=None`` or missing) are omitted.
-
-    Results are mtime-keyed: repeat calls where the file's ``st_mtime_ns`` has
-    not changed return a cached ``dict`` in O(1) without re-reading the file.
-    A missing or inaccessible file short-circuits to ``{}`` before the cache is
-    consulted, preserving the original OSError-safe contract.
-
-    The path is resolved to its real path before caching so that different
-    spellings of the same file (symlinks, relative vs. absolute) map to the
-    same cache entry.  A fresh shallow copy of the cached mapping is returned
-    to callers so that downstream mutation cannot poison the shared cache entry.
-
-    Args:
-        tasks_json_path: Path to the ``.taskmaster/tasks/tasks.json`` file.
-
-    Returns:
-        Dict mapping ``str(task.id)`` to ``task.title``.  Returns ``{}`` on
-        missing file, invalid JSON, or missing tasks structure.
-    """
-    real_path = os.path.realpath(tasks_json_path)
-    try:
-        mtime_ns = os.stat(real_path).st_mtime_ns
-    except OSError:
+    fetched = await fetch_tasks(client, config, project_root)
+    if not isinstance(fetched, list):
         return {}
-    return dict(_load_task_titles_cached(real_path, mtime_ns))
+    titles = {str(t['id']): t['title'] for t in fetched if t.get('title')}
+    _task_titles_cache[project_root] = (now, titles)
+    return dict(titles)
 
 
 async def build_per_project_merge_queue(

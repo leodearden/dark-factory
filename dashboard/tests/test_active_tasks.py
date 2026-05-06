@@ -41,54 +41,62 @@ def test_minutes_since_returns_zero_on_missing_or_bad():
 
 
 # ---------------------------------------------------------------------------
-# collect_active_tasks against synthetic on-disk fixture
+# collect_active_tasks against in-memory MCP-shaped fixture
 # ---------------------------------------------------------------------------
 
 
-def _make_project(root, *, project_dir, tasks, worktrees=None):
-    """Lay out a synthetic project with .taskmaster/tasks.json + optional worktrees.
+def _shape_task(task: dict) -> dict:
+    """Build a row in the dashboard's per-task wire shape."""
+    return {
+        'id': int(task['id']),
+        'title': task.get('title') or '',
+        'status': task.get('status'),
+        'priority': task.get('priority'),
+        'dependencies': list(task.get('dependencies') or []),
+        'metadata': task.get('metadata', {}),
+    }
 
-    ``worktrees`` is a list of (task_id, metadata_dict, plan_files,
-    iteration_lines, review_files) tuples.  Any element after metadata may be
-    None / [] to skip writing that artefact.
+
+def _make_project(root, *, project_dir, tasks, worktrees=None):
+    """Lay down per-worktree .task/ artifacts and return ``(project_root, shaped_tasks)``.
+
+    The tasks themselves no longer live on disk — fused-memory MCP owns task
+    state — so we return them in their dashboard-shaped form for the caller
+    to register against ``fetch_tasks`` via monkeypatch.
     """
     project_root = root / project_dir
     project_root.mkdir(parents=True, exist_ok=True)
-    tasks_dir = project_root / '.taskmaster' / 'tasks'
-    tasks_dir.mkdir(parents=True)
-    (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
 
-    if not worktrees:
-        return project_root
+    if worktrees:
+        worktrees_dir = project_root / '.worktrees'
+        worktrees_dir.mkdir()
+        for task_id, metadata, files, iteration_lines, review_files in worktrees:
+            wt = worktrees_dir / str(task_id)
+            wt.mkdir()
+            task_dir = wt / '.task'
+            task_dir.mkdir()
+            if metadata is not None:
+                (task_dir / 'metadata.json').write_text(json.dumps(metadata))
+            if files is not None:
+                (task_dir / 'plan.json').write_text(json.dumps({'steps': [], 'files': files}))
+            if iteration_lines is not None:
+                (task_dir / 'iterations.jsonl').write_text(
+                    '\n'.join('{}' for _ in range(iteration_lines)) + ('\n' if iteration_lines else ''),
+                )
+            if review_files is not None:
+                reviews = task_dir / 'reviews'
+                reviews.mkdir()
+                for i, verdict in enumerate(review_files):
+                    (reviews / f'r{i}.json').write_text(json.dumps({'verdict': verdict}))
 
-    worktrees_dir = project_root / '.worktrees'
-    worktrees_dir.mkdir()
-    for task_id, metadata, files, iteration_lines, review_files in worktrees:
-        wt = worktrees_dir / str(task_id)
-        wt.mkdir()
-        task_dir = wt / '.task'
-        task_dir.mkdir()
-        if metadata is not None:
-            (task_dir / 'metadata.json').write_text(json.dumps(metadata))
-        if files is not None:
-            (task_dir / 'plan.json').write_text(json.dumps({'steps': [], 'files': files}))
-        if iteration_lines is not None:
-            (task_dir / 'iterations.jsonl').write_text(
-                '\n'.join('{}' for _ in range(iteration_lines)) + ('\n' if iteration_lines else ''),
-            )
-        if review_files is not None:
-            reviews = task_dir / 'reviews'
-            reviews.mkdir()
-            for i, verdict in enumerate(review_files):
-                (reviews / f'r{i}.json').write_text(json.dumps({'verdict': verdict}))
-    return project_root
+    return project_root, [_shape_task(t) for t in tasks]
 
 
 @pytest.fixture()
-def two_project_config(tmp_path):
-    """Lay down dark-factory + reify projects with a mix of tasks/statuses."""
+def two_project_config(tmp_path, monkeypatch):
+    """Two-project layout with shaped task lists registered against fetch_tasks."""
     started = (datetime.now(UTC) - timedelta(minutes=14)).isoformat()
-    df_root = _make_project(
+    df_root, df_tasks = _make_project(
         tmp_path,
         project_dir='dark-factory',
         tasks=[
@@ -113,7 +121,7 @@ def two_project_config(tmp_path):
              ['PASS']),
         ],
     )
-    reify_root = _make_project(
+    reify_root, reify_tasks = _make_project(
         tmp_path,
         project_dir='reify',
         tasks=[{'id': 8, 'title': 'parser recovery', 'status': 'blocked',
@@ -122,11 +130,20 @@ def two_project_config(tmp_path):
                         'created_at': started},
                     ['parser/recovery.rs'], 0, [])],
     )
+
+    by_root = {df_root.resolve(): df_tasks, reify_root.resolve(): reify_tasks}
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(by_root.get(project_root.resolve(), []))
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+
     return DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
 
 
-def test_collect_active_tasks_filters_to_active_statuses(two_project_config):
-    active, _ = collect_active_tasks(two_project_config)
+@pytest.mark.asyncio
+async def test_collect_active_tasks_filters_to_active_statuses(two_project_config):
+    active, _, _ = await collect_active_tasks(client=None, config=two_project_config)
     statuses = {t['status'] for t in active}
     assert statuses <= {'in-progress', 'blocked', 'pending'}
     # Done tasks (17, 15) should not appear.
@@ -135,8 +152,9 @@ def test_collect_active_tasks_filters_to_active_statuses(two_project_config):
     assert 'dark-factory/T-15' not in ids
 
 
-def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_config):
-    active, _ = collect_active_tasks(two_project_config)
+@pytest.mark.asyncio
+async def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_config):
+    active, _, _ = await collect_active_tasks(client=None, config=two_project_config)
     by_id = {t['id']: t for t in active}
     t19 = by_id['dark-factory/T-19']
     assert {d['id']: d['done'] for d in t19['deps']} == {
@@ -148,8 +166,9 @@ def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_config):
     assert t23['deps'] == [{'id': 'dark-factory/T-21', 'title': 'dedup index', 'done': False}]
 
 
-def test_collect_active_tasks_pulls_metadata_and_locks(two_project_config):
-    active, _ = collect_active_tasks(two_project_config)
+@pytest.mark.asyncio
+async def test_collect_active_tasks_pulls_metadata_and_locks(two_project_config):
+    active, _, _ = await collect_active_tasks(client=None, config=two_project_config)
     t19 = next(t for t in active if t['id'] == 'dark-factory/T-19')
     assert t19['agent'] == 'claude-task-19'
     assert t19['loops'] == 2
@@ -159,14 +178,20 @@ def test_collect_active_tasks_pulls_metadata_and_locks(two_project_config):
     assert 13 <= t19['started'] <= 15
 
 
-def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path):
+@pytest.mark.asyncio
+async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, monkeypatch):
     """A pending task with no worktree should still appear with empty fields."""
-    root = _make_project(
+    root, shaped = _make_project(
         tmp_path, project_dir='solo',
         tasks=[{'id': 1, 'title': 'lonely', 'status': 'pending', 'dependencies': []}],
     )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, _ = collect_active_tasks(cfg)
+    active, _, _ = await collect_active_tasks(client=None, config=cfg)
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'status': 'pending', 'agent': None, 'started': 0, 'loops': 0,
@@ -174,11 +199,29 @@ def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path):
     }]
 
 
-def test_collect_active_tasks_inverts_locks_into_file_locks(two_project_config):
-    _, locks = collect_active_tasks(two_project_config)
+@pytest.mark.asyncio
+async def test_collect_active_tasks_inverts_locks_into_file_locks(two_project_config):
+    _, locks, _ = await collect_active_tasks(client=None, config=two_project_config)
     df = locks['dark-factory']
     assert df['src/agents/consolidation.py'] == {'holder': 'dark-factory/T-19'}
     assert df['src/store/dedup.py'] == {'holder': 'dark-factory/T-21'}
     # blocked tasks count as holders too
     reify = locks['reify']
     assert reify['parser/recovery.rs'] == {'holder': 'reify/T-8'}
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypatch):
+    """A project whose MCP fetch returns an offline marker is reported."""
+    root = tmp_path / 'offline-project'
+    root.mkdir()
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return {'offline': True, 'error': 'connection refused'}
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    cfg = DashboardConfig(project_root=root)
+    active, locks, offline_projects = await collect_active_tasks(client=None, config=cfg)
+    assert active == []
+    assert locks == {}
+    assert offline_projects == ['offline-project']

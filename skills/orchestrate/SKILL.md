@@ -139,7 +139,7 @@ Iterate until the user is satisfied.
 
 ### 4. Write tasks to Taskmaster
 
-Use the `TARGET_PROJECT` you captured at the top of the session as `project_root`. (`.taskmaster/tasks/tasks.json` lives under that directory.) **Never** hardcode `/home/leo/src/dark-factory` here unless the user is actually in dark-factory.
+Use the `TARGET_PROJECT` you captured at the top of the session as `project_root`. (Fused-memory owns task state — there is no on-disk `tasks.json` to inspect.) **Never** hardcode `/home/leo/src/dark-factory` here unless the user is actually in dark-factory.
 
 Write each task via fused-memory MCP tools using the two-phase pattern:
 

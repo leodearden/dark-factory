@@ -307,6 +307,12 @@ function TasksTab({ projectFilter, search }) {
     projectFilter.length === 0 || projectFilter.includes(p.id)
   );
 
+  // Surface a single-line banner when fused-memory is unreachable for any
+  // discovered project — without it the Tasks tab renders an empty grid that
+  // looks indistinguishable from "no active work".
+  const tasksOffline = !!DF_T.TASKS_OFFLINE;
+  const offlineProjects = DF_T.TASKS_OFFLINE_PROJECTS || [];
+
   function statusMatches(s) {
     if (filters.active   && (s === 'in-progress' || s === 'blocked')) return true;
     if (filters.pending  && s === 'pending')  return true;
@@ -326,6 +332,21 @@ function TasksTab({ projectFilter, search }) {
 
   return (
     <div className="grid cols-12" style={{ gap: 16 }}>
+      {tasksOffline && (
+        <div className="col-span-12" data-testid="tasks-offline-banner"
+             style={{
+               padding: '8px 12px',
+               border: '1px solid var(--line)',
+               borderRadius: 4,
+               background: 'var(--bg-2)',
+               color: 'var(--fg-3)',
+               fontFamily: 'var(--mono)',
+               fontSize: 11,
+             }}>
+          fused-memory offline — task data unavailable
+          {offlineProjects.length > 0 && ` (${offlineProjects.join(', ')})`}
+        </div>
+      )}
       {/* Filter bar */}
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>

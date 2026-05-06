@@ -113,26 +113,34 @@ async def empty_merge_events_conn(empty_merge_events_db):
 
 
 @pytest.fixture()
-def counted_load_task_tree(monkeypatch):
-    """Patches dashboard.data.merge_queue.load_task_tree with a counting wrapper.
+def counted_fetch_tasks(monkeypatch):
+    """Patches dashboard.data.merge_queue.fetch_tasks with a counting wrapper.
 
-    Yields an object with a ``count`` attribute that increments on every call
-    to the patched function. The original is restored automatically via
-    ``monkeypatch`` teardown.
+    Yields an object with a ``count`` attribute that increments on every call,
+    plus a ``set_response`` method to register the canned shaped-task list per
+    project_root.  Each call returns a copy of the registered list, so callers
+    can mutate without poisoning subsequent reads.  Resets the TTL cache on
+    setup so tests start from a clean slate.
     """
     import dashboard.data.merge_queue as _mq
 
+    _mq._task_titles_cache_clear()
+
     class _Counter:
-        count = 0
+        def __init__(self):
+            self.count = 0
+            self._responses: dict[str, list[dict]] = {}
+
+        def set_response(self, project_root, tasks):
+            self._responses[str(project_root)] = list(tasks)
 
     counter = _Counter()
-    original = _mq.load_task_tree
 
-    def _counting(path):
+    async def _counting(client, config, project_root):
         counter.count += 1
-        return original(path)
+        return list(counter._responses.get(str(project_root), []))
 
-    monkeypatch.setattr(_mq, 'load_task_tree', _counting)
+    monkeypatch.setattr(_mq, 'fetch_tasks', _counting)
     return counter
 
 
@@ -1426,219 +1434,91 @@ class TestEnrichMergesWithTitles:
 
 
 class TestLoadTaskTitles:
-    """Tests for merge_queue.load_task_titles."""
+    """Tests for merge_queue.load_task_titles (now MCP-backed with a TTL cache)."""
 
-    def _write_tasks_json(self, path, tasks, format='master'):
-        """Write a tasks.json file in the given format."""
-        import json
-        data = {'master': {'tasks': tasks}} if format == 'master' else {'tasks': tasks}
-        path.write_text(json.dumps(data))
-
-    def test_master_format_returns_str_keyed_dict(self, tmp_path):
-        """Reads {'master': {'tasks': [...]}} format and returns {str(id): title}."""
+    async def test_returns_str_keyed_dict_from_mcp(self, counted_fetch_tasks):
+        """fetch_tasks rows are projected to {str(id): title}."""
         from dashboard.data.merge_queue import load_task_titles
 
-        tasks_path = tmp_path / 'tasks.json'
-        self._write_tasks_json(tasks_path, [
+        counted_fetch_tasks.set_response('/proj/A', [
             {'id': 1, 'title': 'A'},
             {'id': 2, 'title': 'B'},
         ])
-        result = load_task_titles(tasks_path)
+        result = await load_task_titles(client=None, config=None, project_root='/proj/A')
         assert result == {'1': 'A', '2': 'B'}
 
-    def test_flat_format_also_works(self, tmp_path):
-        """Reads {'tasks': [...]} format correctly."""
-        from dashboard.data.merge_queue import load_task_titles
+    async def test_offline_returns_empty_dict(self, monkeypatch):
+        """An offline marker from fetch_tasks short-circuits to ``{}``."""
+        import dashboard.data.merge_queue as _mq
+        _mq._task_titles_cache_clear()
 
-        tasks_path = tmp_path / 'tasks.json'
-        self._write_tasks_json(tasks_path, [
-            {'id': 1, 'title': 'A'},
-            {'id': 2, 'title': 'B'},
-        ], format='flat')
-        result = load_task_titles(tasks_path)
-        assert result == {'1': 'A', '2': 'B'}
+        async def _offline(client, config, project_root):
+            return {'offline': True, 'error': 'connection refused'}
 
-    def test_missing_file_returns_empty_dict(self, tmp_path):
-        """Returns {} when the file does not exist."""
-        from dashboard.data.merge_queue import load_task_titles
-
-        result = load_task_titles(tmp_path / 'nonexistent.json')
+        monkeypatch.setattr(_mq, 'fetch_tasks', _offline)
+        result = await _mq.load_task_titles(client=None, config=None, project_root='/proj/B')
         assert result == {}
 
-    def test_malformed_json_returns_empty_dict(self, tmp_path):
-        """Returns {} for invalid JSON."""
-        from dashboard.data.merge_queue import load_task_titles
-
-        tasks_path = tmp_path / 'tasks.json'
-        tasks_path.write_text('{ invalid json ]')
-        result = load_task_titles(tasks_path)
-        assert result == {}
-
-    def test_none_title_is_omitted(self, tmp_path):
+    async def test_none_title_is_omitted(self, counted_fetch_tasks):
         """Tasks with title=None are omitted from the result."""
         from dashboard.data.merge_queue import load_task_titles
 
-        tasks_path = tmp_path / 'tasks.json'
-        self._write_tasks_json(tasks_path, [
+        counted_fetch_tasks.set_response('/proj/C', [
             {'id': 1, 'title': None},
             {'id': 2, 'title': 'B'},
         ])
-        result = load_task_titles(tasks_path)
+        result = await load_task_titles(client=None, config=None, project_root='/proj/C')
         assert '1' not in result
         assert result.get('2') == 'B'
 
-    def test_repeat_calls_cached_via_mtime(self, tmp_path, counted_load_task_tree):
-        """Two calls with unchanged mtime invoke load_task_tree exactly once."""
-        from dashboard.data.merge_queue import (
-            _load_task_titles_cached,
-            load_task_titles,
-        )
+    async def test_repeat_calls_within_ttl_window_hit_cache(self, counted_fetch_tasks):
+        """Two calls inside the TTL window invoke fetch_tasks exactly once."""
+        from dashboard.data.merge_queue import load_task_titles
 
-        _load_task_titles_cached.cache_clear()
+        counted_fetch_tasks.set_response('/proj/D', [{'id': 1, 'title': 'A'}])
 
-        tasks_path = tmp_path / 'tasks.json'
-        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
+        result1 = await load_task_titles(client=None, config=None, project_root='/proj/D')
+        result2 = await load_task_titles(client=None, config=None, project_root='/proj/D')
 
-        result1 = load_task_titles(tasks_path)
-        result2 = load_task_titles(tasks_path)
+        assert counted_fetch_tasks.count == 1
+        assert result1 == result2 == {'1': 'A'}
 
-        assert counted_load_task_tree.count == 1, f"load_task_tree called {counted_load_task_tree.count} times, expected 1"
-        assert result1 == {'1': 'A'}
-        assert result2 == {'1': 'A'}
+    async def test_distinct_projects_cached_separately(self, counted_fetch_tasks):
+        """Different project_roots produce independent cache entries."""
+        from dashboard.data.merge_queue import load_task_titles
 
-    def test_mtime_change_invalidates_cache(self, tmp_path):
-        """Bumping st_mtime_ns causes the next call to return fresh content."""
-        import os
+        counted_fetch_tasks.set_response('/proj/E', [{'id': 1, 'title': 'Alpha'}])
+        counted_fetch_tasks.set_response('/proj/F', [{'id': 2, 'title': 'Beta'}])
 
-        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
+        result_e = await load_task_titles(client=None, config=None, project_root='/proj/E')
+        result_f = await load_task_titles(client=None, config=None, project_root='/proj/F')
 
-        _load_task_titles_cached.cache_clear()
+        assert result_e == {'1': 'Alpha'}
+        assert result_f == {'2': 'Beta'}
+        assert counted_fetch_tasks.count == 2
 
-        tasks_path = tmp_path / 'tasks.json'
-        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
+    async def test_ttl_expiry_refetches(self, counted_fetch_tasks, monkeypatch):
+        """When the cached entry exceeds TTL the next call refetches."""
+        import dashboard.data.merge_queue as _mq
 
-        result1 = load_task_titles(tasks_path)
-        assert result1 == {'1': 'A'}
+        # Tighten TTL to 0 so any subsequent call is a miss.
+        monkeypatch.setattr(_mq, '_TASK_TITLES_TTL_SECONDS', 0.0)
 
-        # Overwrite content then bump mtime explicitly to guarantee a new key
-        stat = os.stat(tasks_path)
-        orig_mtime_ns = stat.st_mtime_ns
-        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'Z'}])
-        os.utime(tasks_path, ns=(stat.st_atime_ns, orig_mtime_ns + 1))
+        counted_fetch_tasks.set_response('/proj/G', [{'id': 1, 'title': 'A'}])
+        await _mq.load_task_titles(client=None, config=None, project_root='/proj/G')
+        await _mq.load_task_titles(client=None, config=None, project_root='/proj/G')
 
-        result2 = load_task_titles(tasks_path)
-        assert result2 == {'1': 'Z'}
+        assert counted_fetch_tasks.count == 2
 
-    def test_missing_file_does_not_invoke_load_task_tree(self, tmp_path, counted_load_task_tree):
-        """A missing file short-circuits before touching load_task_tree or the cache."""
-        from dashboard.data.merge_queue import (
-            _load_task_titles_cached,
-            load_task_titles,
-        )
+    async def test_returned_dict_is_a_copy(self, counted_fetch_tasks):
+        """Mutating the returned dict must not poison the cached entry."""
+        from dashboard.data.merge_queue import load_task_titles
 
-        _load_task_titles_cached.cache_clear()
-
-        result = load_task_titles(tmp_path / 'nope.json')
-
-        assert result == {}
-        assert counted_load_task_tree.count == 0, f"load_task_tree was called {counted_load_task_tree.count} time(s); expected 0"
-
-    def test_distinct_paths_cached_separately(self, tmp_path):
-        """Different task files produce independent cache entries."""
-        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
-
-        _load_task_titles_cached.cache_clear()
-
-        path_a = tmp_path / 'proj_a' / 'tasks.json'
-        path_b = tmp_path / 'proj_b' / 'tasks.json'
-        path_a.parent.mkdir()
-        path_b.parent.mkdir()
-        self._write_tasks_json(path_a, [{'id': 1, 'title': 'Alpha'}])
-        self._write_tasks_json(path_b, [{'id': 2, 'title': 'Beta'}])
-
-        result_a = load_task_titles(path_a)
-        result_b = load_task_titles(path_b)
-
-        assert result_a == {'1': 'Alpha'}, f"project A returned unexpected titles: {result_a}"
-        assert result_b == {'2': 'Beta'}, f"project B returned unexpected titles: {result_b}"
-        assert result_a != result_b
-
-    def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, counted_load_task_tree):
-        """A symlink and the real path resolve to the same LRU entry via os.path.realpath."""
-        import os
-
-        from dashboard.data.merge_queue import (
-            _load_task_titles_cached,
-            load_task_titles,
-        )
-
-        _load_task_titles_cached.cache_clear()
-
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        real_path = real_dir / 'tasks.json'
-        self._write_tasks_json(real_path, [{'id': 1, 'title': 'A'}])
-
-        link_path = tmp_path / 'link.json'
-        try:
-            link_path.symlink_to(real_path)
-        except (OSError, NotImplementedError):
-            pytest.skip("symlinks unsupported on this filesystem")
-
-        assert os.path.realpath(link_path) == os.path.realpath(real_path), (
-            f"symlink {link_path!r} and real {real_path!r} must share realpath before the cache test is meaningful"
-        )
-
-        result_real = load_task_titles(real_path)
-        result_link = load_task_titles(link_path)
-
-        assert result_real == {'1': 'A'}, f"real path returned unexpected titles: {result_real}"
-        assert result_link == {'1': 'A'}, f"symlink returned unexpected titles: {result_link}"
-        assert counted_load_task_tree.count == 1, (
-            f"load_task_tree called {counted_load_task_tree.count} time(s); expected 1 "
-            "(os.path.realpath should collapse both spellings to one cache key)"
-        )
-
-    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path, counted_load_task_tree):
-        """Empty-dict from corrupt JSON is cached and then invalidated when mtime bumps.
-
-        Verifies two distinct behaviors:
-        1. {} is a legitimate cached value (not a cache-skipping sentinel): a second call
-           with unchanged mtime must not re-invoke load_task_tree.
-        2. Bumping st_mtime_ns by 1s causes the next call to pick up the valid content,
-           distinct from test_mtime_change_invalidates_cache where both sides are valid.
-        """
-        import os
-
-        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
-
-        _load_task_titles_cached.cache_clear()
-
-        tasks_path = tmp_path / 'tasks.json'
-        tasks_path.write_text('{ invalid json ]')
-
-        result_corrupt = load_task_titles(tasks_path)
-        assert result_corrupt == {}, f"corrupt JSON should return {{}}, got {result_corrupt!r}"
-
-        # Second call with unchanged mtime must hit the cache — {} is not a sentinel
-        result_corrupt2 = load_task_titles(tasks_path)
-        assert result_corrupt2 == {}
-        assert counted_load_task_tree.count == 1, (
-            f"load_task_tree called {counted_load_task_tree.count} time(s) for two reads with unchanged mtime; "
-            "expected 1 (empty dict must be a legitimate cached value, not a sentinel)"
-        )
-
-        # Overwrite with valid content and bump mtime by 1s to guarantee a distinct cache key.
-        # Capture stat before the overwrite so the bump is relative to the corrupt-JSON mtime;
-        # 1_000_000_000 ns = 1 s ensures the delta is honored even on second-resolution filesystems.
-        stat = os.stat(tasks_path)
-        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
-        os.utime(tasks_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
-
-        result_valid = load_task_titles(tasks_path)
-        assert result_valid == {'1': 'A'}, (
-            f"after mtime bump to valid content, expected {{'1': 'A'}}, got {result_valid!r}"
-        )
+        counted_fetch_tasks.set_response('/proj/H', [{'id': 1, 'title': 'A'}])
+        first = await load_task_titles(client=None, config=None, project_root='/proj/H')
+        first['hacked'] = 'oops'
+        second = await load_task_titles(client=None, config=None, project_root='/proj/H')
+        assert second == {'1': 'A'}
 
 
 # ---------------------------------------------------------------------------
