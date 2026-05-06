@@ -509,6 +509,40 @@ class TaskArtifacts:
 
         return None
 
+    def bump_revalidation_stamp(
+        self, session_id: str, base_commit: str | None = None,
+    ) -> None:
+        """Stamp ``_revalidated_at`` on plan.json and update metadata.json's
+        ``base_commit`` to *base_commit*. Mirrors the write semantics of the
+        ``confirm_plan`` plan-tools MCP call but is invoked by orchestrator
+        code (Lever B — overlap=0 revalidation skip) rather than by an
+        architect tool call.
+
+        Args:
+            session_id: Current orchestrator session id, written into
+                ``_revalidated_by_session`` for telemetry / audit. The
+                plan.json's existing ``_session_id`` (the original planner)
+                is preserved.
+            base_commit: New main SHA the plan is now tracked against. When
+                ``None``, metadata.json is left untouched (typical for tests
+                that exercise only the plan.json side-effect).
+
+        Raises:
+            ValueError: if plan.json is missing or has no ``steps`` —
+                callers should never invoke this on an empty plan.
+        """
+        plan = self.read_plan()
+        if not plan.get('steps'):
+            raise ValueError(
+                'bump_revalidation_stamp called before plan.json contains a '
+                'valid plan (missing or empty steps).'
+            )
+        plan['_revalidated_at'] = datetime.now(UTC).isoformat()
+        plan['_revalidated_by_session'] = session_id
+        self._write_json(self.root / 'plan.json', plan)
+        if base_commit is not None:
+            self.update_base_commit(base_commit)
+
     def stamp_plan_provenance(self, session_id: str) -> None:
         """Stamp _session_id and _created_at into plan.json.
 

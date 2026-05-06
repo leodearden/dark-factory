@@ -539,6 +539,51 @@ class OrchestratorConfig(BaseSettings):
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
 
+    # ── Architect cost optimisations ────────────────────────────────────
+    # Lever B — skip the revalidation architect call when the diff main has
+    # gained since the prior plan was stamped does not overlap the plan's
+    # files. The orchestrator updates _revalidated_at and base_commit
+    # directly, mirroring the confirm_plan MCP write semantics.
+    revalidation_skip_enabled: bool = Field(default=True)
+    max_revalidation_age_hours: float = Field(
+        default=24.0,
+        description=(
+            'Maximum age (hours) of the prior plan provenance for the '
+            'overlap=0 short-circuit to apply. Older plans always go through '
+            'a full architect revalidation regardless of overlap.'
+        ),
+    )
+
+    # Lever C — replace architect+implementer with a single SIMPLE_TASK
+    # (sonnet) agent when the classifier matches a trivial doc/comment/
+    # rename/typo task with at most a couple of files in scope.
+    simple_task_enabled: bool = Field(default=True)
+    simple_task_budget_usd: float = Field(default=1.50)
+    simple_task_max_turns: int = Field(default=30)
+
+    # Auto-eval — when the optimistic path (B-skip or C-simple) blocks at
+    # plan/execute/verify/review, automatically rerun the same task from the
+    # same branchpoint via the full architect path. The original branch and
+    # worktree are renamed with a `-skip-attempt` suffix; the redo is
+    # submitted via planning_mode (bypassing curator dedupe) and dispatched
+    # in `in-progress` state so the harness picks it up directly.
+    auto_eval_enabled: bool = Field(default=True)
+    auto_eval_redo_budget_usd: float = Field(
+        default=50.0,
+        description=(
+            'Daily USD budget cap for auto-eval redo invocations. Computed '
+            'as the sum of cost_usd from the invocations table for tasks '
+            'with metadata.auto_eval_redo=True in the trailing 24h.'
+        ),
+    )
+    auto_eval_phases: set[str] = Field(
+        default_factory=lambda: {'plan', 'execute', 'verify', 'review'},
+        description=(
+            'Block phases that trigger auto-eval. Merge/infra failures are '
+            'excluded — they are unlikely to differ on the full path.'
+        ),
+    )
+
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
     # against a synthetic ``review-*`` task_id).  Without this, such

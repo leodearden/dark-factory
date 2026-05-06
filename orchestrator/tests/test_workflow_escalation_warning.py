@@ -117,7 +117,9 @@ class TestEscalationCapableRolesDerivation:
         even though they carry _ESCALATION_TOOLS; every member must also be a
         valid ROLES entry.
         """
-        expected = frozenset({'architect', 'implementer', 'debugger', 'merger'})
+        expected = frozenset(
+            {'architect', 'implementer', 'debugger', 'merger', 'simple_task'}
+        )
         assert expected == _ESCALATION_CAPABLE_ROLES
         assert 'steward' not in _ESCALATION_CAPABLE_ROLES, (
             "'steward' must not be in _ESCALATION_CAPABLE_ROLES (TaskSteward dispatcher carve-out)"

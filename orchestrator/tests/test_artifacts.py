@@ -285,6 +285,39 @@ class TestPlanProvenance:
             plan_path.chmod(0o644)
 
 
+class TestBumpRevalidationStamp:
+    """Tests for ``bump_revalidation_stamp`` — Lever B's confirm_plan-equivalent."""
+
+    def test_stamps_revalidated_at_and_session(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.bump_revalidation_stamp('sess-1')
+        updated = artifacts.read_plan()
+        assert '_revalidated_at' in updated
+        assert updated['_revalidated_by_session'] == 'sess-1'
+
+    def test_updates_base_commit_when_provided(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.bump_revalidation_stamp('sess-1', base_commit='newsha456')
+        assert artifacts.read_base_commit() == 'newsha456'
+
+    def test_leaves_base_commit_when_none(self, worktree: Path):
+        worktree.mkdir(parents=True, exist_ok=True)
+        ta = TaskArtifacts(worktree)
+        ta.init('task-1', 'T', 'd', base_commit='originalsha')
+        ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.bump_revalidation_stamp('sess-1')  # base_commit=None default
+        assert ta.read_base_commit() == 'originalsha'
+
+    def test_raises_on_missing_plan(self, artifacts: TaskArtifacts):
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.bump_revalidation_stamp('sess-1')
+
+    def test_raises_on_empty_steps(self, artifacts: TaskArtifacts):
+        (artifacts.root / 'plan.json').write_text('{"steps": []}')
+        with pytest.raises(ValueError, match='valid plan'):
+            artifacts.bump_revalidation_stamp('sess-1')
+
+
 class TestStalePlanLock:
     """Tests for stale plan.lock detection and cleanup."""
 

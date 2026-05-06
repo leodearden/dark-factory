@@ -80,6 +80,16 @@ class EventType(StrEnum):
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
 
+    # Phase skipped — emitted when an optimistic-path optimisation
+    # short-circuits a workflow phase (B: revalidation skipped on overlap=0;
+    # C: full architect+implementer skipped via SIMPLE_TASK).
+    phase_skipped = 'phase_skipped'
+
+    # Auto-eval — original task's branch + worktree renamed and a sibling
+    # redo task dispatched on the full-architect path so the optimistic
+    # path's outcome can be ground-truthed against a baseline.
+    auto_eval_dispatched = 'auto_eval_dispatched'
+
     # Retry cap — per-task REQUEUED counter exceeded; emitted once per
     # cap-exhaustion event by Scheduler.trigger_retry_cap_exhausted.
     retry_cap_exhausted = 'retry_cap_exhausted'
