@@ -29,8 +29,20 @@ def harness(tmp_path: Path, mock_orch_config):
     return h
 
 
-def _make_plan(steps_done: int, steps_total: int, task_id: str = 'test') -> dict:
-    """Build a plan dict with the given step completion counts."""
+def _make_plan(
+    steps_done: int,
+    steps_total: int,
+    task_id: str = 'test',
+    *,
+    session_id: str | None = None,
+) -> dict:
+    """Build a plan dict with the given step completion counts.
+
+    When ``session_id`` is provided, the plan is provenance-stamped (mirrors
+    artifacts.stamp_plan_provenance), which signals the recovery path that
+    the architect already produced this plan and the worktree should be
+    preserved for revalidation rather than wiped.
+    """
     steps = []
     for i in range(steps_total):
         steps.append({
@@ -39,11 +51,14 @@ def _make_plan(steps_done: int, steps_total: int, task_id: str = 'test') -> dict
             'status': 'done' if i < steps_done else 'pending',
             'commit': f'abc{i}' if i < steps_done else None,
         })
-    return {
+    plan: dict = {
         'task_id': task_id,
         'title': 'Test Task',
         'steps': steps,
     }
+    if session_id is not None:
+        plan['_session_id'] = session_id
+    return plan
 
 
 def _setup_worktree(base: Path, task_id: str, plan: dict | None = None):
@@ -83,14 +98,56 @@ class TestRecoverCrashedTasks:
         harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '36')  # type: ignore[attr-defined]
 
     async def test_recover_plan_no_progress_cleaned_up(self, harness: Harness):
-        """Plan with all steps pending -> cleaned up."""
+        """Unstamped plan with all steps pending -> cleaned up.
+
+        The predicate is ``_session_id`` presence rather than step-count alone:
+        an unstamped plan represents a half-written architect output (the
+        stamp is applied AFTER successful create_plan), so there is nothing
+        worth preserving.
+        """
         plan = _make_plan(steps_done=0, steps_total=4)
+        # Predicate-shape lock: this scenario must hit the "unstamped" branch.
+        assert '_session_id' not in plan, (
+            '_make_plan default must produce an unstamped plan'
+        )
         wt = _setup_worktree(harness.git_ops.worktree_base, '37', plan)
 
         await harness._recover_crashed_tasks()
 
         assert '37' not in harness._recovered_plans
+        assert '37' not in harness._preserved_worktrees
         harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '37')  # type: ignore[attr-defined]
+
+    async def test_recover_stamped_no_done_preserved(self, harness: Harness):
+        """Stamped plan with 0 done steps -> worktree kept, lock cleared,
+        added to _preserved_worktrees but NOT _recovered_plans.
+
+        Stamped pre-EXECUTE plans usually arrive here via the blast-radius
+        lock-conflict requeue: architect ran, plan was stamped, scheduler
+        rejected the expanded module set, task was re-pended.  Wiping the
+        worktree wastes the architect call; preserving it lets the next
+        acquisition take the revalidation branch in _plan().
+        """
+        plan = _make_plan(
+            steps_done=0, steps_total=4, task_id='38',
+            session_id='38-deadbeefcafe',
+        )
+        wt = _setup_worktree(harness.git_ops.worktree_base, '38', plan)
+        # Seed a stale plan.lock to verify it's unlinked on preservation.
+        lock_path = wt / '.task' / 'plan.lock'
+        lock_path.write_text(json.dumps({'session_id': 'old', 'owner_pid': 1}))
+
+        await harness._recover_crashed_tasks()
+
+        # Worktree dir survives — cleanup_worktree must NOT be called.
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert wt.exists()
+        # NOT pre-loaded into _recovered_plans (we want _plan() to revalidate).
+        assert '38' not in harness._recovered_plans
+        # Marked preserved so _reconcile_stranded_in_progress won't wipe it.
+        assert '38' in harness._preserved_worktrees
+        # Stale lock cleared.
+        assert not lock_path.exists()
 
     async def test_recover_corrupt_plan_cleaned_up(self, harness: Harness):
         """Invalid JSON in plan.json -> cleaned up with warning."""
@@ -190,6 +247,35 @@ class TestRecoverCrashedTasks:
 
             call_kwargs = MockWorkflow.call_args.kwargs
             assert call_kwargs['initial_plan'] is None
+
+    async def test_run_slot_clears_preserved_marker(self, harness: Harness):
+        """When the slot picks up a preserved-worktree task, the marker must
+        be discarded so a subsequent reconcile sweep doesn't see it as still
+        stranded."""
+        harness._preserved_worktrees.add('77')
+
+        assignment = MagicMock()
+        assignment.task_id = '77'
+        assignment.task = {'title': 'Preserved task'}
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = AsyncMock()
+            mock_wf.run.return_value = MagicMock(value='done')
+            mock_wf.metrics = MagicMock(
+                total_cost_usd=0.0,
+                total_duration_ms=0,
+                agent_invocations=0,
+            )
+            MockWorkflow.return_value = mock_wf
+
+            await harness._run_slot(assignment, sem)
+
+        # Marker cleared — _plan() will reuse the worktree on its own and
+        # the next reconcile sweep should not see the task as preserved.
+        assert '77' not in harness._preserved_worktrees
 
     async def test_recover_plan_task_id_mismatch_cleaned_up(self, harness: Harness):
         """Plan whose task_id doesn't match the worktree dir -> cleaned up."""
