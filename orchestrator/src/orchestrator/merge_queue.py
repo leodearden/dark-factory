@@ -661,6 +661,22 @@ class MergeWorker:
     def is_wip_halted(self) -> bool:
         return not self._wip_halt.is_set()
 
+    @property
+    def halt_owner_esc_id(self) -> str | None:
+        """Read-only public view of the current halt-owner escalation id."""
+        return self._halt_owner_esc_id
+
+    def _request_abandoned(self, req: MergeRequest) -> bool:
+        """True iff the requester cancelled the result future — drop the request."""
+        if req.result.cancelled():
+            logger.info(
+                'Task %s: merge request abandoned by waiter '
+                '(future cancelled) — dropping request without halting queue',
+                req.task_id,
+            )
+            return True
+        return False
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -725,6 +741,12 @@ class MergeWorker:
 
     async def _process(self, req: MergeRequest) -> MergeOutcome | None:
         """Process one merge request.  Returns None if re-enqueued."""
+        # Drop-on-detection: if the workflow that submitted this request has
+        # cancelled its result future (workflow soft-cancel), don't even
+        # start the merge.  Skipping here avoids the orphan-halt window
+        # entirely for the common case (workflow exited before dequeue).
+        if self._request_abandoned(req):
+            return None
         try:
             return await self._do_merge(req)
         except WorktreeMissing as exc:
@@ -914,6 +936,11 @@ class MergeWorker:
 
         if result in ('wip_overlap', 'pop_conflict'):
             # Halt the queue globally — no more merges until resolved
+            if self._request_abandoned(req):
+                # Workflow soft-cancelled mid-merge: dropping the request
+                # prevents the orphan-halt window where no escalation owner
+                # is registered (2026-05-04 incident).
+                return None
             self.halt_for_wip(f'advance_main: {result}')
             if result == 'pop_conflict':
                 # Main was advanced — push origin even though stash pop failed.
@@ -942,6 +969,8 @@ class MergeWorker:
         if result == 'unmerged_state':
             # Permanent block — pre-existing UU markers in project_root.
             # Halt the queue and route to human escalation (not steward).
+            if self._request_abandoned(req):
+                return None
             self.halt_for_wip(
                 'advance_main: unmerged_state — project_root has unresolved merge '
                 'conflicts. Manual investigation required before any retry.'
@@ -960,6 +989,8 @@ class MergeWorker:
         if result == 'pop_conflict_no_advance':
             # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
             # Halt queue and return distinct outcome for human-level escalation.
+            if self._request_abandoned(req):
+                return None
             self.halt_for_wip('advance_main: pop_conflict_no_advance')
             recovery = getattr(self._git_ops, '_last_recovery_branch', None)
             self._cas_retries.pop(req.task_id, None)
@@ -1128,6 +1159,22 @@ class SpeculativeMergeWorker:
     def is_wip_halted(self) -> bool:
         return not self._wip_halt.is_set()
 
+    @property
+    def halt_owner_esc_id(self) -> str | None:
+        """Read-only public view of the current halt-owner escalation id."""
+        return self._halt_owner_esc_id
+
+    def _request_abandoned(self, req: MergeRequest) -> bool:
+        """True iff the requester cancelled the result future — drop the request."""
+        if req.result.cancelled():
+            logger.info(
+                'Task %s: merge request abandoned by waiter '
+                '(future cancelled) — dropping request without halting queue',
+                req.task_id,
+            )
+            return True
+        return False
+
     async def run(self) -> None:
         """Start merger and verifier coroutines and wait for both to finish."""
         self._merger_task = asyncio.create_task(self._merger_loop())
@@ -1266,6 +1313,13 @@ class SpeculativeMergeWorker:
                     await self._wip_halt.wait()
 
                 self._inflight_req = req  # track for stop() race resolution
+                # Drop-on-detection: workflow soft-cancelled before worker
+                # dequeued.  Skipping merge work avoids the orphan-halt
+                # window where no escalation owner is registered.
+                if self._request_abandoned(req):
+                    spec_base = None
+                    self._inflight_req = None
+                    continue
                 if self._event_store is not None:
                     self._event_store.emit(
                         EventType.merge_dequeued,
@@ -1583,6 +1637,20 @@ class SpeculativeMergeWorker:
             # propagate the chain-invalidation flag to the next iteration.
             iteration_did_remerge = False
 
+            # Drop-on-detection: if the workflow that submitted this request
+            # cancelled its result future after the merger handed the item
+            # off, skip verify+CAS and any halt sites entirely.  Cleans up
+            # the merge worktree to avoid leaks.
+            if self._request_abandoned(req):
+                if item.merge_wt is not None:
+                    with contextlib.suppress(BaseException):
+                        await self._git_ops.cleanup_merge_worktree(item.merge_wt)
+                # Treat as failed for chain-invalidation: any speculative
+                # item built on this one's commit is now stale.
+                n_failed = True
+                self._speculation_slot.set()
+                continue
+
             try:
                 # ── Discard stale speculative merge when chain is invalidated ─
                 # Two cases: (1) N failed directly (n_failed=True); (2) a prior
@@ -1794,6 +1862,12 @@ class SpeculativeMergeWorker:
 
             if result in ('wip_overlap', 'pop_conflict'):
                 # Halt the queue globally — no more merges until resolved
+                if self._request_abandoned(req):
+                    # Workflow soft-cancelled mid-merge: dropping the request
+                    # prevents the orphan-halt window where no escalation
+                    # owner is registered (2026-05-04 incident).
+                    await self._git_ops.cleanup_merge_worktree(merge_wt)
+                    return False
                 self.halt_for_wip(f'advance_main: {result}')
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if result == 'pop_conflict':
@@ -1825,6 +1899,10 @@ class SpeculativeMergeWorker:
 
             if result == 'unmerged_state':
                 # Pre-existing UU markers — halt queue, human escalation.
+                if self._request_abandoned(req):
+                    await self._git_ops.cleanup_merge_worktree(merge_wt)
+                    self._cas_retries.pop(req.task_id, None)
+                    return False
                 self.halt_for_wip(
                     'advance_main: unmerged_state — project_root has unresolved '
                     'merge conflicts. Manual investigation required before any retry.'
@@ -1845,6 +1923,10 @@ class SpeculativeMergeWorker:
 
             if result == 'pop_conflict_no_advance':
                 # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
+                if self._request_abandoned(req):
+                    await self._git_ops.cleanup_merge_worktree(merge_wt)
+                    self._cas_retries.pop(req.task_id, None)
+                    return False
                 self.halt_for_wip('advance_main: pop_conflict_no_advance')
                 recovery = getattr(self._git_ops, '_last_recovery_branch', None)
                 self._cas_retries.pop(req.task_id, None)

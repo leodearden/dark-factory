@@ -182,3 +182,51 @@ async def test_empty_commit_string_blocks(tmp_path: Path):
     mark_blocked.assert_awaited_once()
     f.set_task_status.assert_not_called()
     f.is_ancestor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_short_circuits_on_architect_already_done(tmp_path: Path):
+    """``run()`` returns DONE without enqueuing a merge when ``_plan`` returns DONE.
+
+    Regression for the 2026-05-04 know-live incident: a deleted DONE
+    early-return at workflow.run() let the workflow proceed to
+    EXECUTE/VERIFY/MERGE after _handle_already_done_report set the task
+    done.  The orphaned merge then halted the queue with no escalation
+    owner.
+    """
+    import asyncio
+
+    f = _make(
+        worktree=tmp_path / 'wt',
+        project_root=tmp_path / 'proj',
+        commit_on_main=True,
+    )
+
+    # Stub _plan to return DONE — simulates _handle_already_done_report's
+    # success path running inside _plan().
+    f.wf._plan = AsyncMock(return_value=WorkflowOutcome.DONE)
+    # If EXECUTE were entered, this would raise loudly.
+    f.wf._execute_iterations = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError(
+            'EXECUTE must not run when _plan returns DONE',
+        ),
+    )
+    # Wire a merge queue and assert nothing gets enqueued.
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    f.wf.merge_queue = merge_queue
+    # _recover_if_already_merged returns None — let the run() proceed to PLAN.
+    f.wf._recover_if_already_merged = AsyncMock(  # type: ignore[method-assign]
+        return_value=None,
+    )
+    # _check_branch_on_main: bypass the post-PLAN ghost-loop guard.
+    f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+        return_value=None,
+    )
+
+    outcome = await f.wf.run()
+
+    assert outcome == WorkflowOutcome.DONE
+    f.wf._execute_iterations.assert_not_called()
+    assert merge_queue.empty(), (
+        'No merge request must be enqueued when _plan returns DONE'
+    )

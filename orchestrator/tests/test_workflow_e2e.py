@@ -3986,6 +3986,67 @@ class TestFileStructureInvariants:
 # not behavioural regressions.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tests: _plan → DONE propagates without entering EXECUTE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPlanDoneEarlyReturn:
+    """workflow.run returns DONE when _plan returns DONE, without entering EXECUTE.
+
+    Originally pinned the early-return at workflow.py:386-391 (deleted in
+    08bafa3683).  Restored 2026-05-04 because ``report_task_already_done``
+    (added 74a79dd9a6) now legitimately returns DONE through ``_plan`` —
+    falling through to EXECUTE / VERIFY / MERGE wastes effort and can
+    orphan a merge-queue halt if the workflow gets soft-cancelled
+    mid-merge (the 2026-05-04 know-live incident).
+    """
+
+    async def test_plan_done_returns_without_execute(
+        self, config, git_ops, task_assignment
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        # Stub _plan to return DONE (simulates _handle_already_done_report).
+        workflow._plan = AsyncMock(return_value=WorkflowOutcome.DONE)
+        # If EXECUTE were entered, this would raise.
+        workflow._execute_iterations = AsyncMock(
+            side_effect=AssertionError(
+                'EXECUTE must not be entered when _plan returns DONE',
+            ),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        workflow._execute_iterations.assert_not_called()
+
+    async def test_successful_plan_returns_PLANNED_and_continues_to_execute(
+        self, config, git_ops, task_assignment
+    ):
+        """Regression for b242030313: _plan success returns PLANNED, not DONE.
+
+        If _plan returns DONE on successful planning, the DONE early-return
+        at the _plan outcome handler short-circuits execute/verify/review/
+        merge entirely — every post-plan workflow exits with zero execute
+        iterations and no code merged.
+        """
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        workflow._plan = AsyncMock(return_value=WorkflowOutcome.PLANNED)
+        workflow._execute_verify_review_loop = AsyncMock(
+            return_value=WorkflowOutcome.BLOCKED,
+        )
+
+        outcome = await workflow.run()
+
+        workflow._execute_verify_review_loop.assert_called_once()
+        assert outcome == WorkflowOutcome.BLOCKED
+
+
 def _make_status_setting_steward(
     queue: EscalationQueue, scheduler, task_id: str, final_status: str,
 ) -> type:

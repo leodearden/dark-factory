@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, Any
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
@@ -1931,3 +1931,46 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.info(
                 'Merge queue un-halted: halt owner %s resolved', escalation.id,
             )
+
+    def get_merge_halt_status(self) -> dict[str, Any]:
+        """Inspect the merge queue's halt state for operator tooling."""
+        if self._merge_worker is None:
+            return {'wired': False}
+        return {
+            'wired': True,
+            'halted': self._merge_worker.is_wip_halted,
+            'owner_esc_id': self._merge_worker.halt_owner_esc_id,
+        }
+
+    def force_unhalt_merge_queue(self, reason: str) -> dict[str, Any]:
+        """Operator escape hatch for orphan halts (no escalation owns the halt).
+
+        Refuses to act if the halt has an active owning escalation — operators
+        must use ``resolve_issue(owner_esc_id)`` on those, since the legitimate
+        unhalt path (``Harness._on_escalation_resolved``) is intact.
+        """
+        if self._merge_worker is None:
+            return {'unhalted': False, 'error': 'merge worker not initialised'}
+        if not self._merge_worker.is_wip_halted:
+            return {'unhalted': False, 'reason': 'queue not halted'}
+        owner = self._merge_worker.halt_owner_esc_id
+        if owner is not None and self._escalation_queue is not None:
+            try:
+                esc = self._escalation_queue.get(owner)
+            except Exception:
+                esc = None
+            if esc is not None and esc.status not in ('resolved', 'dismissed'):
+                return {
+                    'unhalted': False,
+                    'error': (
+                        f'halt is owned by active escalation {owner!r} — '
+                        f'use resolve_issue({owner!r}, ...) instead'
+                    ),
+                    'owner_esc_id': owner,
+                }
+        self._merge_worker.unhalt_wip()
+        logger.warning(
+            'Force-unhalted merge queue (prior_owner=%s, reason=%r)',
+            owner, reason,
+        )
+        return {'unhalted': True, 'prior_owner': owner, 'reason': reason}

@@ -444,6 +444,13 @@ class TaskWorkflow:
                             data={'waste_type': 'replan_after_failure'},
                         )
                     return plan_outcome  # _plan() already called _mark_blocked
+                if plan_outcome == WorkflowOutcome.DONE:
+                    # _handle_already_done_report set status=done with provenance
+                    # and returned DONE.  Falling through to EXECUTE/VERIFY/MERGE
+                    # wastes effort and (per the 2026-05-04 incident) can orphan a
+                    # merge-queue halt if the workflow gets soft-cancelled
+                    # mid-merge.
+                    return plan_outcome
                 # WorkflowOutcome.PLANNED falls through to execute/verify/review.
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
@@ -3780,6 +3787,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 cancel_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await cancel_task
+            # If the cancel event won, propagate that cancellation to the
+            # underlying awaitable.  Without this, an enqueued merge request
+            # becomes "orphaned": the worker still processes it and may halt
+            # the queue with no workflow left to create the owning escalation.
+            # See merge_queue.py: workers check req.result.cancelled() at entry
+            # and before each halt_for_wip site.
+            if not fut.done():
+                fut.cancel()
 
     async def _handle_soft_cancel(self, phase: str) -> WorkflowOutcome:
         """Decide an outcome after ``_cancel_event`` interrupted a long wait.

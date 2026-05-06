@@ -5220,6 +5220,176 @@ class TestWipHaltSpeculativeMergeWorker:
         await worker_task
 
 
+@pytest.mark.asyncio
+class TestMergeWorkerCancelledRequest:
+    """Drop-on-detection: workflow soft-cancel must not orphan-halt the queue.
+
+    Regression for the 2026-05-04 know-live incident: a workflow that
+    soft-cancelled mid-merge left an enqueued request behind; when the
+    worker dequeued it and ``advance_main`` returned ``wip_overlap`` the
+    queue halted with no escalation owner — only an orchestrator restart
+    could clear it.  Workers now check ``req.result.cancelled()`` at
+    process entry and before each ``halt_for_wip`` call site.
+    """
+
+    async def test_cancelled_future_at_entry_drops_request(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Pre-cancelling the future short-circuits before any git work."""
+        wt = await _make_branch_with_file(
+            git_ops, 'cancel-entry', 'file_cancel_entry.py', 'cancel_entry = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        advance_calls = 0
+        original_advance = git_ops.advance_main
+
+        async def _spy_advance(*args, **kwargs):
+            nonlocal advance_calls
+            advance_calls += 1
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_spy_advance),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('cancel-entry', 'cancel-entry', wt, config)
+            req.result.cancel()  # workflow already gave up
+            await queue.put(req)
+            # No outcome will resolve the future — wait for worker to drop it.
+            await asyncio.sleep(0.3)
+
+        assert advance_calls == 0, 'advance_main must not run for a cancelled request'
+        assert not worker.is_wip_halted
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_cancelled_future_before_wip_overlap_skips_halt(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Cancellation just before halt_for_wip — queue must NOT halt."""
+        wt = await _make_branch_with_file(
+            git_ops, 'cancel-mid', 'file_cancel_mid.py', 'cancel_mid = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        captured_req: list[MergeRequest] = []
+
+        async def _wip_overlap_then_cancel(*args, **kwargs):
+            git_ops._last_overlap_files = ['file_cancel_mid.py']
+            # Cancel the request mid-advance to simulate workflow soft-cancel
+            # racing with merge execution.
+            if captured_req:
+                captured_req[0].result.cancel()
+            return 'wip_overlap'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_wip_overlap_then_cancel),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('cancel-mid', 'cancel-mid', wt, config)
+            captured_req.append(req)
+            await queue.put(req)
+            # Wait for worker to process (wip_overlap path will run).
+            await asyncio.sleep(0.5)
+
+        assert not worker.is_wip_halted, (
+            'Queue must not halt for a cancelled request — orphan-halt regression'
+        )
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+
+@pytest.mark.asyncio
+class TestSpeculativeWorkerCancelledRequest:
+    """Sister tests for SpeculativeMergeWorker — same drop-on-detection contract."""
+
+    async def test_cancelled_future_at_entry_drops_request(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-cancel-entry', 'file_spec_cancel_entry.py',
+            'spec_cancel_entry = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        advance_calls = 0
+        original_advance = git_ops.advance_main
+
+        async def _spy_advance(*args, **kwargs):
+            nonlocal advance_calls
+            advance_calls += 1
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_spy_advance),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request(
+                'spec-cancel-entry', 'spec-cancel-entry', wt, config,
+            )
+            req.result.cancel()
+            await queue.put(req)
+            await asyncio.sleep(0.3)
+
+        assert advance_calls == 0
+        assert not worker.is_wip_halted
+
+        await worker.stop()
+        await worker_task
+
+    async def test_cancelled_future_before_wip_overlap_skips_halt(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-cancel-mid', 'file_spec_cancel_mid.py',
+            'spec_cancel_mid = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        captured_req: list[MergeRequest] = []
+
+        async def _wip_overlap_then_cancel(*args, **kwargs):
+            git_ops._last_overlap_files = ['file_spec_cancel_mid.py']
+            if captured_req:
+                captured_req[0].result.cancel()
+            return 'wip_overlap'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_wip_overlap_then_cancel),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request(
+                'spec-cancel-mid', 'spec-cancel-mid', wt, config,
+            )
+            captured_req.append(req)
+            await queue.put(req)
+            await asyncio.sleep(0.5)
+
+        assert not worker.is_wip_halted
+
+        await worker.stop()
+        await worker_task
+
+
 @pytest.mark.parametrize(
     'worker_cls', [MergeWorker, SpeculativeMergeWorker],
 )

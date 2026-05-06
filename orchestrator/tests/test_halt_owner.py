@@ -68,6 +68,10 @@ class _FakeMergeWorker:
     def is_wip_halted(self) -> bool:
         return self._halted
 
+    @property
+    def halt_owner_esc_id(self) -> str | None:
+        return self._owner
+
     def halt_for_wip(self, reason: str) -> None:
         self._halted = True
         self._owner = None
@@ -168,3 +172,92 @@ class TestHaltOwnerUnhaltPredicate:
         queue.resolve(esc.id, 'any reason', resolved_by='test')
 
         assert not worker.is_wip_halted
+
+
+class TestForceUnhaltMergeQueue:
+    """Operator escape hatch for orphan halts (no escalation owns the halt).
+
+    Regression for the 2026-05-04 know-live incident: workflow soft-cancel
+    raced merge submission, so the queue halted on a request whose
+    workflow had already exited.  No escalation existed to resolve — the
+    only recovery was an orchestrator restart.  ``force_unhalt_merge_queue``
+    closes that gap while preserving the legitimate
+    ``resolve_issue → _on_escalation_resolved`` un-halt path.
+    """
+
+    def test_force_unhalt_when_no_owner_succeeds(self, harness: Harness):
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+
+        worker.halt_for_wip('orphan halt — no owner registered')
+        assert worker.is_wip_halted
+        assert worker.halt_owner_esc_id is None
+
+        result = harness.force_unhalt_merge_queue('orphan recovery')
+        assert result['unhalted'] is True
+        assert result['prior_owner'] is None
+        assert result['reason'] == 'orphan recovery'
+        assert not worker.is_wip_halted
+
+    def test_force_unhalt_when_owner_resolved_succeeds(
+        self, harness: Harness,
+    ):
+        """If the owner escalation is already resolved, force-unhalt may proceed.
+
+        Idempotent against the legitimate path: resolving the owner
+        normally fires ``_on_escalation_resolved`` which un-halts; if that
+        ran (worker not halted), force-unhalt reports ``queue not halted``.
+        If for some reason it didn't run, force-unhalt completes the job.
+        """
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        esc = _make_wip_esc(queue, '321')
+        worker.halt_for_wip('halt with owner')
+        worker.set_halt_owner(esc.id)
+        # Resolve the owning escalation directly via the queue — this
+        # fires the resolve callback which un-halts the worker.
+        queue.resolve(esc.id, 'cleanup done', resolved_by='test')
+        # Worker should have been unhalted by the callback path.
+        assert not worker.is_wip_halted
+
+        # Calling force-unhalt now is a no-op.
+        result = harness.force_unhalt_merge_queue('belt and braces')
+        assert result['unhalted'] is False
+        assert result.get('reason') == 'queue not halted'
+
+    def test_force_unhalt_when_active_owner_refused(self, harness: Harness):
+        """If the halt has an active owning escalation, refuse force-unhalt."""
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        esc = _make_wip_esc(queue, '4242')
+        worker.halt_for_wip('legit halt with active owner')
+        worker.set_halt_owner(esc.id)
+
+        result = harness.force_unhalt_merge_queue('try anyway')
+        assert result['unhalted'] is False
+        assert result.get('owner_esc_id') == esc.id
+        assert 'resolve_issue' in result.get('error', '')
+        # Worker still halted, owner still set.
+        assert worker.is_wip_halted
+        assert worker.is_halt_owner(esc.id)
+
+    def test_force_unhalt_when_not_halted_noop(self, harness: Harness):
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+
+        result = harness.force_unhalt_merge_queue('nothing to do')
+        assert result['unhalted'] is False
+        assert result.get('reason') == 'queue not halted'
+
+    def test_force_unhalt_when_no_merge_worker(self, harness: Harness):
+        """Bare harness (no merge worker wired) reports the wiring problem."""
+        harness._merge_worker = None
+        result = harness.force_unhalt_merge_queue('test')
+        assert result['unhalted'] is False
+        assert 'merge worker' in result.get('error', '').lower()

@@ -249,4 +249,30 @@ def create_server(
             'slot_cleared': slot_cleared,
         }
 
+    @mcp.tool()
+    async def unhalt_merge_queue(reason: str) -> dict[str, Any]:
+        """Force-unhalt the orchestrator merge queue when a halt was orphaned.
+
+        REFUSES to act if the halt has an active owning escalation — for those,
+        use resolve_issue(escalation_id, resolution).  Use this tool only when
+        get_merge_halt_status reports halted=True with owner_esc_id=None or a
+        stale owner_esc_id whose escalation no longer exists / is already
+        resolved.
+        """
+        if harness is None:
+            return {
+                'unhalted': False,
+                'error': 'escalation server running standalone — no harness wired',
+            }
+        if not reason or not reason.strip():
+            return {'unhalted': False, 'error': 'reason is required for audit'}
+        return harness.force_unhalt_merge_queue(reason.strip())
+
+    @mcp.tool()
+    def get_merge_halt_status() -> dict[str, Any]:
+        """Inspect the orchestrator merge queue's halt state."""
+        if harness is None:
+            return {'wired': False, 'error': 'escalation server running standalone'}
+        return harness.get_merge_halt_status()
+
     return mcp
