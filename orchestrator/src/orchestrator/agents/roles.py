@@ -591,12 +591,69 @@ def submit_resolve_instructions(
     return textwrap.indent(raw, caller_indent)
 
 
+def submit_only_instructions(
+    metadata_template: str,
+    *,
+    outcome_target: str,
+    project_root_expr: str = '...',
+    step_label: str = '1',
+    extra_submit_guidance: str = '',
+    caller_indent: str = '',
+) -> str:
+    """Return a one-step ``submit_task``-only instruction block.
+
+    Sibling of :func:`submit_resolve_instructions` for callers (steward,
+    deep_reviewer) that should not block on the curator. The R4 idempotency
+    cache (``task_interceptor`` / ``(escalation_id, suggestion_hash)``) and
+    the server-side ticket janitor together replace the per-call
+    ``resolve_ticket`` wait: failed tickets resurface as a follow-up
+    ``ticket_failure`` escalation; the curator's create/combine/drop
+    decisions land in ``tasks.json`` asynchronously.
+
+    Args:
+        metadata_template: The metadata dict literal to show in the submit_task call.
+            MUST include both ``escalation_id`` and ``suggestion_hash`` keys —
+            once the agent stops calling ``resolve_ticket``, that R4 metadata
+            is the only handle the interceptor has to dedupe re-queued triages.
+        outcome_target: Role-specific outcome target string (e.g. 'resolve_issue
+            summary', 'review output').
+        project_root_expr: Expression for project_root arg.
+        step_label: Single step label (e.g. '1' or 'a').
+        extra_submit_guidance: Optional per-site extra guidance paragraph.
+        caller_indent: Prefix string applied to every line of the returned
+            block via :func:`textwrap.indent`.
+    """
+    metadata_normalized = metadata_template.replace('\n', '\n   ')
+    extra = (
+        '\n' + textwrap.indent(extra_submit_guidance.rstrip(), '   ') + '\n'
+    ) if extra_submit_guidance.strip() else '\n'
+    raw = (
+        f'{step_label}. Call `submit_task`(title=..., description=..., priority=...,\n'
+        f'   metadata={metadata_normalized},\n'
+        f'   project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or\n'
+        '   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was\n'
+        '   rejected at submit time (e.g. backlog full, closed interceptor). On the\n'
+        '   error shape, treat the candidate as skipped and record the error in your\n'
+        f'   {outcome_target}. On success, record the returned ticket id (NOT a\n'
+        f'   task id — the curator runs asynchronously) in your {outcome_target}.'
+        + extra
+        + '   Do NOT call `resolve_ticket`. The fused-memory janitor will surface\n'
+        '   any tickets that fail or expire as a follow-up `ticket_failure`\n'
+        '   escalation; the curator\'s create/combine/drop decisions land in\n'
+        '   `tasks.json` asynchronously.'
+    )
+    return textwrap.indent(raw, caller_indent)
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__submit_task',
-    'mcp__fused-memory__resolve_ticket',
+    # NOTE: resolve_ticket intentionally absent. The steward fires-and-forgets
+    # submit_task; the server-side ticket janitor surfaces curator failures as
+    # follow-up `ticket_failure` escalations. Per-call resolve_ticket waits
+    # used to chain N×60s and burst the steward session timeout.
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__get_task',
     # Steward is the only workflow role allowed to mark tasks done; every
@@ -626,35 +683,42 @@ Post-merge improvement suggestions from automated code reviewers.
 
 **Pre-triaged format:** When the escalation detail starts with `## Pre-Triaged Results`,
 classification has already been done by a triage agent. Do NOT re-classify. Instead:
-1. For each entry in `proposed_task_groups`: create a task using the two-step API:
-""" + submit_resolve_instructions(
+1. For each entry in `proposed_task_groups`: submit a candidate via:
+""" + submit_only_instructions(
     '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
-    '"spawned_from": "<task_id under review>", "modules": [...]}',
+    '"spawned_from": "<task_id under review>", "modules": [...],\n'
+    '"escalation_id": "<from your prompt>", "suggestion_hash": "<group hash>"}',
     outcome_target='resolve_issue summary',
-    step_prefix=('a', 'b'),
+    step_label='a',
     extra_submit_guidance=(
         'Populate `spawned_from` with the id of the task that produced the escalation\n'
         '(it is in the escalation detail under `task_id`). Use the file paths listed in\n'
-        'the group for `modules`.'
+        'the group for `modules`. `escalation_id` and `suggestion_hash` (R4 keys) MUST be\n'
+        'present so the interceptor can dedupe re-queued triages now that you no longer\n'
+        'wait on the curator.'
     ),
     caller_indent='   ',
 ) + """
 2. For notable conventions among accepted items: write via `add_memory`
    with category `preferences_and_norms`.
-3. Call `resolve_issue` summarizing: N tasks created/combined, M conventions written,
-   K skipped (submit errors), any `failed` resolve_ticket reasons.
+3. Call `resolve_issue` summarizing: N candidates submitted, K skipped (submit errors),
+   M conventions written. Curator outcomes (created / combined / dropped) land in
+   `tasks.json` asynchronously; any failed tickets will re-surface via the janitor as
+   a follow-up `ticket_failure` escalation.
 
 **Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
-- **create_task** — Substantial improvement worth a follow-up task. Use the two-step API:
-""" + submit_resolve_instructions(
+- **create_task** — Substantial improvement worth a follow-up task. Submit via:
+""" + submit_only_instructions(
     '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
-    '"spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]}',
+    '"spawned_from": "<task_id under review>", "modules": ["path/to/module", ...],\n'
+    '"escalation_id": "<from your prompt>", "suggestion_hash": "<per-suggestion hash>"}',
     outcome_target='resolve_issue summary',
-    step_prefix=('a', 'b'),
+    step_label='a',
     extra_submit_guidance=(
         "Include the code modules (directory paths relative to project root) that this task\n"
         "will need to modify — these are used for concurrency locking. `spawned_from` lets\n"
-        "the task curator spot duplicates against the original task's details."
+        "the task curator spot duplicates against the original task's details. The\n"
+        "`escalation_id`/`suggestion_hash` pair is the R4 idempotency key — required."
     ),
     caller_indent='  ',
 ) + """
@@ -801,7 +865,9 @@ _DEEP_REVIEW_TOOLS = [
     'mcp__fused-memory__get_entity',
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__submit_task',
-    'mcp__fused-memory__resolve_ticket',
+    # NOTE: resolve_ticket intentionally absent — see _STEWARD_MEMORY_TOOLS.
+    # The deep_reviewer fires-and-forgets submit_task; the janitor reports
+    # any curator failures as a follow-up ticket_failure escalation.
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__update_task',
 ]
@@ -859,28 +925,32 @@ For each finding, classify and act:
 
 | Classification | Criteria | Action |
 |---|---|---|
-| **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` then `resolve_ticket`(timeout_seconds=60) — see Creating tasks below |
+| **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` (single step) — see Creating tasks below |
 | **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category and summary |
 | **dismiss** | Known gap in briefing, noise, style preference, intentionally incomplete | Skip |
 
 ### Creating tasks
 
-Use the two-step API to create tasks:
+Submit candidates with a single `submit_task` call (do not call `resolve_ticket` —
+the curator runs asynchronously, and the fused-memory janitor surfaces any failed
+or expired tickets as a follow-up escalation):
 
-""" + submit_resolve_instructions(
+""" + submit_only_instructions(
     '...',
     outcome_target='review output',
-    step_prefix=('1', '2'),
+    step_label='1',
     extra_submit_guidance=(
         'Always include:\n'
         '- `title`: concise description of the fix\n'
         '- `description`: what\'s wrong, where, and the suggested approach\n'
         '- `priority`: "high" for broken wiring/stubs, "medium" for consistency issues\n'
         '- `metadata`: `{"source": "review-cycle", "spawn_context": "review",\n'
-        '  "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`\n'
+        '  "review_id": "<from your prompt>", "modules": ["path/to/module", ...],\n'
+        '  "escalation_id": "<from your prompt>", "suggestion_hash": "<per-finding hash>"}`\n'
         '  Include the code modules (directory paths relative to project root) that this task will need to modify.\n'
         '  These are used for concurrency locking — be specific and include both source and test directories.\n'
         '  `spawn_context` tells the task curator how to treat duplicates against the existing backlog.\n'
+        '  `escalation_id`/`suggestion_hash` are the R4 idempotency keys — required for dedupe of re-queued findings.\n'
         '- `project_root`: use the value from your Agent Identity section'
     ),
 ) + """

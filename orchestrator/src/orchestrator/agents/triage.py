@@ -289,10 +289,10 @@ def format_pretriaged_detail(
             '',
             'Before the curator runs, the fused-memory interceptor will check '
             '`(escalation_id, suggestion_hash)` against existing '
-            'non-cancelled tasks. On a match, `resolve_ticket` returns '
-            "`status='combined'` with `task_id` pointing at the existing "
-            'task — record it the same way as `created`. '
-            'You do not need to search for duplicates yourself.',
+            'non-cancelled tasks. On a match, the curator marks the ticket '
+            '`combined` synchronously inside fused-memory; you do not need '
+            'to wait for or check the result — `tasks.json` will reflect '
+            'the outcome. You do not need to search for duplicates yourself.',
             '',
         ])
 

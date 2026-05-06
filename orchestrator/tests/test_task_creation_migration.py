@@ -1,8 +1,12 @@
-"""Tests for task-creation tool migration: add_task → submit_task + resolve_ticket.
+"""Tests for task-creation tool migration: add_task → submit_task (+/- resolve_ticket).
 
 Covers two scopes:
-  1. Tool allowlists in STEWARD and DEEP_REVIEWER roles
-  2. Shared submit_resolve_instructions helper fragment
+  1. Tool allowlists in STEWARD and DEEP_REVIEWER roles — neither role keeps
+     ``resolve_ticket`` in its allowlist; the server-side ticket janitor
+     surfaces curator failures asynchronously.
+  2. Shared instruction-helper fragments: ``submit_resolve_instructions``
+     (for callers that wait on the curator) and ``submit_only_instructions``
+     (for steward / deep_reviewer, which fire-and-forget).
 """
 
 from __future__ import annotations
@@ -10,7 +14,12 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from orchestrator.agents.roles import DEEP_REVIEWER, STEWARD, submit_resolve_instructions
+from orchestrator.agents.roles import (
+    DEEP_REVIEWER,
+    STEWARD,
+    submit_only_instructions,
+    submit_resolve_instructions,
+)
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
 
@@ -40,15 +49,36 @@ class TestSharedSubmitResolveFragment:
 
 
 class TestSiteWiringMinimal:
-    """Minimal wiring checks: prompts must direct the agent through the two-step API."""
+    """Wiring checks: steward + deep_reviewer prompts must use the one-step submit API."""
 
-    def test_steward_prompt_directs_two_step_api(self):
+    def test_steward_prompt_uses_submit_task(self):
         assert 'submit_task' in STEWARD.system_prompt
-        assert 'resolve_ticket' in STEWARD.system_prompt
 
-    def test_deep_reviewer_prompt_directs_two_step_api(self):
+    def test_steward_prompt_does_not_direct_resolve_ticket(self):
+        # Steward fires-and-forgets — the janitor surfaces curator failures.
+        # Per-call resolve_ticket waits used to chain N×60s and burst the
+        # outer steward-session timeout (e.g. know-live esc-70-201).
+        # The prompt may *mention* resolve_ticket negatively ("Do NOT call …"),
+        # but must not include any positive directive.
+        assert 'Call `resolve_ticket`' not in STEWARD.system_prompt, (
+            'Steward must not be told to call resolve_ticket; the ticket '
+            'janitor reports failures asynchronously.'
+        )
+        assert 'Do NOT call `resolve_ticket`' in STEWARD.system_prompt, (
+            'Steward prompt should explicitly tell the agent not to call '
+            'resolve_ticket so an agent that still has the tool for some '
+            'reason fires-and-forgets.'
+        )
+
+    def test_deep_reviewer_prompt_uses_submit_task(self):
         assert 'submit_task' in DEEP_REVIEWER.system_prompt
-        assert 'resolve_ticket' in DEEP_REVIEWER.system_prompt
+
+    def test_deep_reviewer_prompt_does_not_direct_resolve_ticket(self):
+        assert 'Call `resolve_ticket`' not in DEEP_REVIEWER.system_prompt, (
+            'Deep reviewer must not be told to call resolve_ticket; the '
+            'janitor reports failures asynchronously.'
+        )
+        assert 'Do NOT call `resolve_ticket`' in DEEP_REVIEWER.system_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -56,13 +86,20 @@ class TestSiteWiringMinimal:
 # ---------------------------------------------------------------------------
 
 class TestAllowlists:
-    """The tool allowlists in STEWARD and DEEP_REVIEWER must use the new two-step API."""
+    """The tool allowlists in STEWARD and DEEP_REVIEWER must use the one-step API.
+
+    ``resolve_ticket`` is intentionally excluded from both roles so the prompt
+    change (drop two-step → one-step) is enforceable at the harness level —
+    even a misbehaving agent that ignores its instructions cannot block on
+    the curator. Other callers (skills, humans) keep access to the underlying
+    MCP tool directly.
+    """
 
     def test_steward_has_submit_task(self):
         assert 'mcp__fused-memory__submit_task' in STEWARD.allowed_tools
 
-    def test_steward_has_resolve_ticket(self):
-        assert 'mcp__fused-memory__resolve_ticket' in STEWARD.allowed_tools
+    def test_steward_does_not_have_resolve_ticket(self):
+        assert 'mcp__fused-memory__resolve_ticket' not in STEWARD.allowed_tools
 
     def test_steward_does_not_have_add_task(self):
         assert 'mcp__fused-memory__add_task' not in STEWARD.allowed_tools
@@ -70,8 +107,8 @@ class TestAllowlists:
     def test_deep_reviewer_has_submit_task(self):
         assert 'mcp__fused-memory__submit_task' in DEEP_REVIEWER.allowed_tools
 
-    def test_deep_reviewer_has_resolve_ticket(self):
-        assert 'mcp__fused-memory__resolve_ticket' in DEEP_REVIEWER.allowed_tools
+    def test_deep_reviewer_does_not_have_resolve_ticket(self):
+        assert 'mcp__fused-memory__resolve_ticket' not in DEEP_REVIEWER.allowed_tools
 
     def test_deep_reviewer_does_not_have_add_task(self):
         assert 'mcp__fused-memory__add_task' not in DEEP_REVIEWER.allowed_tools
@@ -132,7 +169,7 @@ class TestHelperIndentationAlignment:
 
 
 class TestReviewCheckpointSite:
-    """ReviewCheckpoint._build_prompt must direct the agent through the two-step API for site 4."""
+    """ReviewCheckpoint._build_prompt must direct the agent through the one-step API."""
 
     def test_review_checkpoint_site_uses_helper(self):
         cp = _make_review_checkpoint()
@@ -143,9 +180,43 @@ class TestReviewCheckpointSite:
             briefing_content='',
             review_id='REV-TEST',
         )
-        # Verify the two-step API anchors are present in the rendered prompt.
+        # One-step submit anchor present.
         assert 'submit_task' in prompt
-        assert 'resolve_ticket' in prompt
+        # The deep_reviewer no longer waits on the curator.
+        assert 'Call `resolve_ticket`' not in prompt
         # Verify context-specific values are interpolated into the prompt.
         assert 'REV-TEST' in prompt
         assert '/tmp/pr' in prompt
+
+
+class TestSubmitOnlyHelper:
+    """Contract tests for submit_only_instructions (one-step submit_task fragment)."""
+
+    def test_helper_renders_single_step(self):
+        result = submit_only_instructions(
+            '{"source": "X", "escalation_id": "esc-1", "suggestion_hash": "h"}',
+            outcome_target='SENTINEL_OUTCOME_XYZ',
+            step_label='1',
+            project_root_expr='"/tmp"',
+        )
+        assert 'submit_task' in result
+        # outcome_target should appear at least twice (error-shape + success path).
+        assert result.count('SENTINEL_OUTCOME_XYZ') >= 2
+        # Single step only — no positive directive to call resolve_ticket.
+        assert 'Call `resolve_ticket`' not in result
+        # Must explicitly forbid resolve_ticket so an agent that still has the
+        # tool for other reasons fires-and-forgets.
+        assert 'Do NOT call `resolve_ticket`' in result
+
+    def test_helper_applies_caller_indent(self):
+        result = submit_only_instructions(
+            '{"source": "X"}',
+            outcome_target='t',
+            caller_indent='   ',
+        )
+        # Every non-empty line should start with the indent.
+        for line in result.splitlines():
+            if line:
+                assert line.startswith('   '), (
+                    f'Line missing caller_indent: {line!r}'
+                )

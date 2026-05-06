@@ -184,14 +184,16 @@ class TestFormatPretriagedDetail:
         # submit_task call must show the metadata= kwarg form
         assert 'submit_task' in detail
         assert 'metadata=' in detail
-        # Two-step resolution: resolve_ticket and combined status must be named
-        assert 'resolve_ticket' in detail, (
-            'Pre-triaged block must name resolve_ticket so the steward '
-            'knows to call it after submit_task'
+        # One-step submit: emitted detail must NOT name resolve_ticket — the
+        # steward fires-and-forgets submit_task; the curator's combine
+        # decision lands in tasks.json asynchronously.
+        assert 'resolve_ticket' not in detail, (
+            'Pre-triaged block must not direct the steward to call '
+            'resolve_ticket — the janitor surfaces failures asynchronously'
         )
         assert 'combined' in detail, (
-            "Pre-triaged block must name the 'combined' status returned by "
-            'resolve_ticket on an R4 idempotency hit'
+            "Pre-triaged block must still describe the 'combined' outcome "
+            'so the steward understands R4 idempotency-hit semantics'
         )
 
     def test_escalation_id_absent_keeps_legacy_format(self):

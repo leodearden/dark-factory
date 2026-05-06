@@ -44,7 +44,10 @@ def _new_ticket_id() -> str:
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_SQL = """
+# Table creation runs first; index creation runs after the in-place
+# ``escalated_at`` migration so legacy DBs (without the column) don't trip
+# the ``ix_tickets_status_escalated`` reference during schema bootstrap.
+TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS tickets (
     ticket_id   TEXT PRIMARY KEY,
     project_id  TEXT NOT NULL,
@@ -55,15 +58,25 @@ CREATE TABLE IF NOT EXISTS tickets (
     result_json TEXT,
     created_at  TEXT NOT NULL,
     resolved_at TEXT,
-    expires_at  TEXT NOT NULL
+    expires_at  TEXT NOT NULL,
+    escalated_at TEXT
 );
+"""
 
+INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS ix_tickets_project_status
     ON tickets (project_id, status);
 
 CREATE INDEX IF NOT EXISTS ix_tickets_status_created
     ON tickets (status, created_at);
+
+CREATE INDEX IF NOT EXISTS ix_tickets_status_escalated
+    ON tickets (status, escalated_at);
 """
+
+# Back-compat alias — third-party code (and old tests) imported SCHEMA_SQL
+# directly. Keep the symbol exporting the combined script.
+SCHEMA_SQL = TABLE_SQL + INDEX_SQL
 
 
 class TicketStore:
@@ -81,9 +94,28 @@ class TicketStore:
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.execute('PRAGMA busy_timeout=5000')
         await self._db.execute('PRAGMA synchronous=NORMAL')
-        await self._db.executescript(SCHEMA_SQL)
+        # Tables first, then in-place migrate, then indexes — the
+        # escalated_at index references the column added by the migration.
+        await self._db.executescript(TABLE_SQL)
+        await self._migrate_add_escalated_at()
+        await self._db.executescript(INDEX_SQL)
         await self._db.commit()
         logger.info('TicketStore initialized at %s', self._db_path)
+
+    async def _migrate_add_escalated_at(self) -> None:
+        """Add the ``escalated_at`` column to existing DBs that pre-date it.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op on existing tables, so the
+        column needs an explicit ALTER for legacy DBs. Idempotent: probes
+        ``PRAGMA table_info`` first.
+        """
+        db = self._require_db()
+        cursor = await db.execute('PRAGMA table_info(tickets)')
+        rows = await cursor.fetchall()
+        cols = {row[1] for row in rows}
+        if 'escalated_at' not in cols:
+            await db.execute('ALTER TABLE tickets ADD COLUMN escalated_at TEXT')
+            logger.info('TicketStore: migrated tickets table — added escalated_at column')
 
     def _require_db(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -216,6 +248,61 @@ class TicketStore:
         if row is None:
             return None
         return dict(row)
+
+    async def fetch_unescalated_failures(
+        self,
+        project_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return failed tickets that the janitor has not yet reported.
+
+        Selects ``status='failed'`` rows whose ``escalated_at`` is still NULL
+        and whose ``reason`` is not ``idempotency_hit`` (idempotency-hits land
+        as ``status='combined'`` so are already excluded by the status filter,
+        but the explicit guard belts-and-braces against future renames). Rows
+        are ordered by ``resolved_at`` so the oldest failure escalates first.
+
+        Args:
+            project_id: When set, restrict to a single project. Default None
+                returns all projects (the janitor groups across projects).
+            limit: Maximum rows per call (default 100). Aligns with
+                ``curator.janitor.batch_limit``.
+        """
+        db = self._require_db()
+        sql = (
+            "SELECT * FROM tickets "
+            "WHERE status = 'failed' "
+            "  AND escalated_at IS NULL "
+            "  AND (reason IS NULL OR reason != 'idempotency_hit')"
+        )
+        params: tuple = ()
+        if project_id is not None:
+            sql += " AND project_id = ?"
+            params = (project_id,)
+        sql += " ORDER BY resolved_at LIMIT ?"
+        params = (*params, limit)
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def mark_escalated(self, ticket_ids: 'list[str] | tuple[str, ...]') -> int:
+        """Bulk-stamp ``escalated_at`` on the given tickets.
+
+        Returns the number of rows updated. Caller is expected to pass an
+        already-deduped sequence of ticket ids; SQLite handles parameter
+        expansion via ``?, ?, ...`` placeholders.
+        """
+        if not ticket_ids:
+            return 0
+        now = datetime.now(UTC).isoformat()
+        placeholders = ','.join('?' * len(ticket_ids))
+        async with self._txn() as db:
+            cursor = await db.execute(
+                f"UPDATE tickets SET escalated_at = ? "
+                f"WHERE ticket_id IN ({placeholders})",
+                (now, *ticket_ids),
+            )
+        return cursor.rowcount
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection."""

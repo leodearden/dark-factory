@@ -44,6 +44,7 @@ async def test_initialize_creates_schema_and_is_idempotent(tmp_path):
         'created_at',
         'resolved_at',
         'expires_at',
+        'escalated_at',
     }
     assert expected_columns == col_names, (
         f"Missing columns: {expected_columns - col_names}; "
@@ -110,7 +111,8 @@ async def test_get_returns_row_or_none(store):
     assert isinstance(row, dict)
     expected_keys = {
         'ticket_id', 'project_id', 'candidate_json', 'status',
-        'task_id', 'reason', 'result_json', 'created_at', 'resolved_at', 'expires_at',
+        'task_id', 'reason', 'result_json', 'created_at', 'resolved_at',
+        'expires_at', 'escalated_at',
     }
     assert expected_keys == set(row.keys())
     assert row['ticket_id'] == ticket_id
@@ -225,3 +227,142 @@ async def test_sweep_expired_marks_only_expired_pending_failed(store):
 
     live_row = await store.get(live_id)
     assert live_row['status'] == 'pending'  # untouched
+
+
+# ---------------------------------------------------------------------------
+# Janitor-facing helpers: fetch_unescalated_failures + mark_escalated
+# ---------------------------------------------------------------------------
+
+
+async def _force_failed(store: TicketStore, ticket_id: str, *, reason: str) -> None:
+    """Test helper: terminalise a ticket as failed with the given reason."""
+    db = store._db
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        "UPDATE tickets SET status = 'failed', reason = ?, resolved_at = ? "
+        "WHERE ticket_id = ?",
+        (reason, now, ticket_id),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_fetch_unescalated_failures_returns_only_failed_null_escalated(store):
+    """fetch_unescalated_failures excludes pending, combined, idempotency_hit,
+    and rows already stamped via mark_escalated."""
+    pending_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    failed_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    await _force_failed(store, failed_id, reason='curator_failed')
+    idem_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    await _force_failed(store, idem_id, reason='idempotency_hit')
+
+    rows = await store.fetch_unescalated_failures()
+    ids = {r['ticket_id'] for r in rows}
+    assert failed_id in ids
+    assert pending_id not in ids
+    assert idem_id not in ids, (
+        'idempotency_hit must be excluded — happy-path even when status=failed'
+    )
+
+    # After mark_escalated, the row no longer surfaces.
+    n = await store.mark_escalated([failed_id])
+    assert n == 1
+    rows_after = await store.fetch_unescalated_failures()
+    assert all(r['ticket_id'] != failed_id for r in rows_after)
+
+
+@pytest.mark.asyncio
+async def test_fetch_unescalated_failures_filters_by_project(store):
+    a_id = await store.submit(project_id='proj-a', candidate_json='{}', ttl_seconds=600)
+    b_id = await store.submit(project_id='proj-b', candidate_json='{}', ttl_seconds=600)
+    await _force_failed(store, a_id, reason='curator_failed')
+    await _force_failed(store, b_id, reason='curator_failed')
+
+    a_only = await store.fetch_unescalated_failures(project_id='proj-a')
+    assert {r['ticket_id'] for r in a_only} == {a_id}
+
+    both = await store.fetch_unescalated_failures()
+    assert {r['ticket_id'] for r in both} == {a_id, b_id}
+
+
+@pytest.mark.asyncio
+async def test_fetch_unescalated_failures_orders_by_resolved_at(store):
+    older = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    newer = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    # Force resolved_at directly so ordering is deterministic in CI.
+    db = store._db
+    await db.execute(
+        "UPDATE tickets SET status='failed', reason='r', resolved_at=? WHERE ticket_id=?",
+        ('2026-01-01T00:00:00+00:00', older),
+    )
+    await db.execute(
+        "UPDATE tickets SET status='failed', reason='r', resolved_at=? WHERE ticket_id=?",
+        ('2026-02-01T00:00:00+00:00', newer),
+    )
+    await db.commit()
+
+    rows = await store.fetch_unescalated_failures()
+    assert [r['ticket_id'] for r in rows] == [older, newer]
+
+
+@pytest.mark.asyncio
+async def test_mark_escalated_bulk_updates(store):
+    a_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    b_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    c_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    await _force_failed(store, a_id, reason='r')
+    await _force_failed(store, b_id, reason='r')
+    await _force_failed(store, c_id, reason='r')
+
+    n = await store.mark_escalated([a_id, b_id])
+    assert n == 2
+    a = await store.get(a_id)
+    b = await store.get(b_id)
+    c = await store.get(c_id)
+    assert a['escalated_at'] is not None
+    assert b['escalated_at'] is not None
+    assert c['escalated_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_mark_escalated_empty_is_noop(store):
+    n = await store.mark_escalated([])
+    assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
+    """An existing DB without the escalated_at column gets the column added."""
+    import aiosqlite
+
+    db_path = tmp_path / 'tickets.db'
+    # Create a legacy schema (no escalated_at).
+    legacy_conn = await aiosqlite.connect(str(db_path))
+    try:
+        await legacy_conn.execute("""
+            CREATE TABLE tickets (
+                ticket_id   TEXT PRIMARY KEY,
+                project_id  TEXT NOT NULL,
+                candidate_json TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                task_id     TEXT,
+                reason      TEXT,
+                result_json TEXT,
+                created_at  TEXT NOT NULL,
+                resolved_at TEXT,
+                expires_at  TEXT NOT NULL
+            )
+        """)
+        await legacy_conn.commit()
+    finally:
+        await legacy_conn.close()
+
+    # Initialise — the migration must add escalated_at.
+    store = TicketStore(db_path)
+    await store.initialize()
+    cursor = await store._db.execute('PRAGMA table_info(tickets)')
+    cols = {r[1] for r in await cursor.fetchall()}
+    assert 'escalated_at' in cols
+    # And idempotent: re-initialising must not raise.
+    await store.initialize()
+    await store.close()

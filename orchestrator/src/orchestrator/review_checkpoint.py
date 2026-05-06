@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 
 from orchestrator.agents.invoke import invoke_agent
-from orchestrator.agents.roles import DEEP_REVIEWER, submit_resolve_instructions
+from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult, run_full_verification
 
@@ -328,11 +328,14 @@ class ReviewCheckpoint:
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
-        submit_resolve_block = submit_resolve_instructions(
-            f'{{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}}',
+        submit_resolve_block = submit_only_instructions(
+            f'{{"source": "review-cycle", "review_id": "{review_id}", '
+            f'"modules": ["path/to/module", ...], '
+            f'"escalation_id": "<review escalation id>", '
+            f'"suggestion_hash": "<per-finding hash>"}}',
             outcome_target='finding description',
             project_root_expr=f'"{project_root}"',
-            step_prefix=('1', '2'),
+            step_label='1',
             caller_indent='     ',
         )
 
@@ -417,7 +420,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
 2. **Read code** — trace critical paths, audit stubs, check cross-module consistency.
 
 3. **Triage each finding** and act:
-   - Clear-cut issues — use the two-step API:
+   - Clear-cut issues — submit a candidate (single step, no resolve_ticket):
 {submit_resolve_block}
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
