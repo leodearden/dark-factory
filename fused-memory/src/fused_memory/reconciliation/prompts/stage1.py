@@ -96,8 +96,12 @@ If you write a task-count snapshot, follow this discipline:
 
 1. First, search for existing task-count edges for this project \
    (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)`).
-2. Prefer `update_edge` to replace the fact text on the most recent prior snapshot edge \
-   when it is still the most canonical record, so you don't create a new edge for every cycle.
+2. To update the snapshot, use the **mandatory two-step workaround** (see \
+   `## update_edge Temporal Limitation` below): (a) call `update_edge(invalid_at=now)` \
+   on the old edge to mark it superseded, then (b) call \
+   `add_memory(category='temporal_facts')` with the new fact text. Do NOT use `update_edge` \
+   alone to overwrite snapshot fact text — the edge's `valid_at` stays pinned at its \
+   original creation date, creating misleading temporal provenance.
 3. When several stale edges exist from a single older snapshot episode, either:
    (a) `delete_memory` each stale edge UUID and call `refresh_entity_summary` on the \
        affected project entity, OR
@@ -107,6 +111,22 @@ If you write a task-count snapshot, follow this discipline:
 
 Do not write four sibling edges (one per count field) — that multiplies the stale-edge \
 surface you or a later cycle will have to clean up.
+
+## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
+`mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
+a temporal or snapshot edge's fact text via `update_edge`, the edge's `valid_at` timestamp \
+remains pinned at its original creation date — even if the content now describes current \
+state. This creates misleading temporal provenance.
+
+**Mandatory two-step workaround** for all temporal/snapshot edge updates (enforced until \
+Task 1145 Guard 3 is shipped):
+1. Call `update_edge(edge_uuid=..., invalid_at=now)` — marks the old edge superseded.
+2. Call `add_memory(category='temporal_facts', content=<new fact>)` — Graphiti assigns \
+   current time as `valid_at`, ensuring accurate temporal ordering in search results.
+
+When this applies: any time the fact text describes "current state as of today" (task \
+counts, system status, run summaries). For static entity relationships where the temporal \
+anchor is irrelevant, plain `update_edge` with new fact text remains acceptable.
 
 ## Cycle Fence
 When a cycle fence timestamp is provided in the payload, do NOT delete, merge, or modify \
