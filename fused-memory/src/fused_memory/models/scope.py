@@ -27,16 +27,16 @@ _MAIN_CHECKOUT_CACHE: dict[str, str] = {}
 def resolve_main_checkout(path: str | Path) -> str:
     """Return absolute string path of the main working tree that contains ``path``.
 
-    A project's main git checkout is the single source of truth for
-    ``tasks.json`` — worktrees must never read or write their own copy.
-    This helper maps any path inside a git working tree (main or worktree,
-    any subdirectory) to the absolute path of the *main* working tree.
+    Each project's tasks.db lives under the main git checkout; worktrees share
+    that database via path normalisation at the MCP boundary. This helper maps
+    any path inside a git working tree (main or worktree, any subdirectory) to
+    the absolute path of the *main* working tree.
 
     Uses ``git -C <path> worktree list --porcelain``. Git guarantees the
     first ``worktree <path>`` entry in the porcelain output is the main
-    working tree, regardless of which working tree the command was run
-    from. The input path is sanity-checked to confirm it is a descendant
-    of some listed worktree.
+    working tree, regardless of which working tree the command was run from.
+    The input path is sanity-checked to confirm it is a descendant of some
+    listed worktree.
 
     Results are cached by resolved absolute input path; clear
     ``_MAIN_CHECKOUT_CACHE`` directly in tests that mutate working trees.

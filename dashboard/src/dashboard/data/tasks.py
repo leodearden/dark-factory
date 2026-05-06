@@ -1,0 +1,137 @@
+"""Async fetchers for task state via fused-memory MCP HTTP endpoint.
+
+Replaces the legacy ``.taskmaster/tasks/tasks.json`` readers after the
+2026-05-02 SQLite cutover made fused-memory the sole owner of task state.
+
+The dashboard's per-task wire shape is preserved here so consumers
+(``active_tasks``, ``orchestrator``, ``burndown``, ``merge_queue``)
+do not need to be re-keyed.
+
+Network errors are caught and surfaced as ``{'offline': True, 'error': ...}``;
+the caller turns that into a per-project skip plus a Tasks-tab banner.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import httpx
+
+from dashboard.config import DashboardConfig
+from dashboard.data.memory import _sessions, mcp_tool_call
+
+logger = logging.getLogger(__name__)
+
+
+def _shape_task(task: dict) -> dict | None:
+    """Trim an MCP get_tasks row to the dashboard's persistent shape.
+
+    MCP returns top-level ids as strings and includes description/details/
+    testStrategy/subtasks/updatedAt that the dashboard does not render.
+    Cast id at the boundary; drop the rest.
+    """
+    raw_id = task.get('id')
+    try:
+        tid = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+
+    raw_deps = task.get('dependencies') or []
+    deps: list[int] = []
+    for d in raw_deps:
+        try:
+            deps.append(int(d))
+        except (TypeError, ValueError):
+            continue
+
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return {
+        'id': tid,
+        'title': task.get('title') or '',
+        'status': task.get('status'),
+        'priority': task.get('priority'),
+        'dependencies': deps,
+        'metadata': metadata,
+    }
+
+
+async def fetch_tasks(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | bytes,
+) -> list[dict] | dict:
+    """Fetch the dashboard-shaped task list for *project_root* via MCP.
+
+    Returns a ``list[dict]`` on success, or an offline marker
+    ``{'offline': True, 'error': str}`` if every configured server fails.
+    """
+    errors: list[str] = []
+    project_root_str = str(project_root)
+    for url in config.fused_memory_urls:
+        try:
+            result = await mcp_tool_call(
+                client, url, 'get_tasks', {'project_root': project_root_str},
+            )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
+                ValueError) as e:
+            logger.debug('fetch_tasks failed for %s: %s', url, e)
+            errors.append(f'{url}: {e}')
+            _sessions.pop(url.rstrip('/'), None)
+            continue
+
+        if 'error' in result and 'tasks' not in result:
+            errors.append(f'{url}: {result.get("error")}')
+            continue
+
+        raw_tasks = result.get('tasks') or []
+        shaped: list[dict] = []
+        for task in raw_tasks:
+            row = _shape_task(task)
+            if row is not None:
+                shaped.append(row)
+        return shaped
+
+    return {'offline': True, 'error': '; '.join(errors)}
+
+
+async def fetch_statuses(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | bytes,
+) -> dict[int, str] | dict:
+    """Fetch a compact ``{int(id): status}`` map for *project_root* via MCP.
+
+    Used by the burndown collector — ~95% smaller than ``fetch_tasks``.
+    Returns ``{'offline': True, 'error': str}`` if every server fails.
+    """
+    errors: list[str] = []
+    project_root_str = str(project_root)
+    for url in config.fused_memory_urls:
+        try:
+            result = await mcp_tool_call(
+                client, url, 'get_statuses', {'project_root': project_root_str},
+            )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
+                ValueError) as e:
+            logger.debug('fetch_statuses failed for %s: %s', url, e)
+            errors.append(f'{url}: {e}')
+            _sessions.pop(url.rstrip('/'), None)
+            continue
+
+        if 'error' in result and 'statuses' not in result:
+            errors.append(f'{url}: {result.get("error")}')
+            continue
+
+        raw = result.get('statuses') or {}
+        out: dict[int, str] = {}
+        for raw_id, status in raw.items():
+            try:
+                out[int(raw_id)] = status
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    return {'offline': True, 'error': '; '.join(errors)}

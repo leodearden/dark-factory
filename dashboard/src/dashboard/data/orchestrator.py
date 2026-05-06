@@ -1,13 +1,16 @@
-"""Synchronous functions for discovering orchestrator processes and reading task artifacts.
+"""Functions for discovering orchestrator processes and reading task artifacts.
 
-Scans running processes, parses the Taskmaster task tree, reads per-worktree
-.task/ artifacts, and combines them into a unified orchestrator status view.
-All functions are synchronous (subprocess.run, file I/O) — unlike the async
-memory.py and reconciliation.py modules.
+Scans running processes (via ``ps aux``), reads per-worktree ``.task/``
+artifacts from disk, and fetches task trees from the fused-memory MCP
+server (which is the source of truth post-2026-05-02 SQLite cutover).
+``discover_orchestrators`` is async because the MCP call is async; the
+process-scanning and worktree-artifact helpers remain sync and run via
+``asyncio.to_thread`` from the async caller.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -15,7 +18,10 @@ import re
 import subprocess
 from pathlib import Path
 
+import httpx
+
 from dashboard.config import DashboardConfig
+from dashboard.data.tasks import fetch_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -162,59 +168,6 @@ def find_running_orchestrators() -> list[dict]:
     return orchestrators
 
 
-def load_task_tree(tasks_json_path: Path) -> list[dict]:
-    """Parse a Taskmaster tasks.json file into a list of task dicts.
-
-    Supports both ``{'master': {'tasks': [...]}}`` and ``{'tasks': [...]}``
-    formats. Each returned dict has keys: id, title, status, priority,
-    dependencies, metadata.
-
-    Returns [] if the file is missing, contains invalid JSON, or lacks
-    the expected structure.
-    """
-    try:
-        raw = tasks_json_path.read_text()
-    except OSError:
-        return []
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning('Malformed JSON in %s', tasks_json_path)
-        return []
-
-    try:
-        raw_tasks = data['master']['tasks']
-    except (KeyError, TypeError):
-        try:
-            raw_tasks = data['tasks']
-        except (KeyError, TypeError):
-            logger.warning('No tasks found in %s', tasks_json_path)
-            return []
-
-    if not isinstance(raw_tasks, list):
-        logger.warning('tasks is not a list in %s', tasks_json_path)
-        return []
-
-    result: list[dict] = []
-    for task in raw_tasks:
-        try:
-            raw_deps = task.get('dependencies', [])
-            result.append({
-                'id': int(task.get('id', 0)),
-                'title': task.get('title'),
-                'status': task.get('status'),
-                'priority': task.get('priority'),
-                'dependencies': [int(d) for d in raw_deps if str(d).isdigit()],
-                'metadata': task.get('metadata', {}),
-            })
-        except (AttributeError, TypeError, ValueError):
-            logger.warning('Skipping malformed task entry in %s', tasks_json_path)
-            continue
-
-    return result
-
-
 def read_task_artifacts(worktree_path: Path) -> dict:
     """Read .task/ artifacts from a worktree directory.
 
@@ -261,7 +214,7 @@ def read_task_artifacts(worktree_path: Path) -> dict:
         pass
 
     # Review summary
-    review_summary = '\u2014'
+    review_summary = '—'
     reviews_dir = task_dir / 'reviews'
     if reviews_dir.is_dir():
         review_files = list(reviews_dir.glob('*.json'))
@@ -287,17 +240,21 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     }
 
 
-def discover_orchestrators(config: DashboardConfig) -> list[dict]:
+async def discover_orchestrators(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+) -> list[dict]:
     """Discover running orchestrators and enrich with task tree and worktree data.
 
     For each running orchestrator process, attaches:
-    - tasks: parsed task tree from tasks.json
+    - tasks: parsed task list fetched from fused-memory MCP
     - worktrees: dict mapping worktree name → artifact data
     - summary: status counts {total, done, in_progress, blocked, pending}
 
     Returns [] if no orchestrator processes are running.
+    Per-project task fetches that hit MCP errors degrade to an empty list.
     """
-    processes = find_running_orchestrators()
+    processes = await asyncio.to_thread(find_running_orchestrators)
     if not processes:
         return []
 
@@ -323,19 +280,17 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
         root = _resolve_root(proc)
         groups.setdefault(root, []).append(proc)
 
-    # Cache per-project data so we don't re-read the same tasks.json
+    # Cache per-project data so we don't re-fetch the same task list
     # when multiple processes share a project root.
     project_cache: dict[Path, tuple[list[dict], dict[int, dict]]] = {}
 
     result: list[dict] = []
     for project_root, group in groups.items():
         if project_root not in project_cache:
-            tasks_json = project_root / '.taskmaster' / 'tasks' / 'tasks.json'
-            worktrees_dir = project_root / '.worktrees'
-            project_cache[project_root] = (
-                load_task_tree(tasks_json),
-                _scan_worktrees(worktrees_dir),
-            )
+            fetched = await fetch_tasks(client, config, project_root)
+            tasks = fetched if isinstance(fetched, list) else []
+            worktrees = await asyncio.to_thread(_scan_worktrees, project_root / '.worktrees')
+            project_cache[project_root] = (tasks, worktrees)
 
         tasks, worktrees = project_cache[project_root]
         summary = {

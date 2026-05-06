@@ -52,7 +52,7 @@ Note the inconsistent filenames — each project chose its own. There is no conv
 
 3. **Add concurrency / model overrides if needed.** The package defaults at `dark-factory/orchestrator/defaults.yaml` cover most cases. Override anything project-specific (e.g. `max_concurrent_tasks`, `lock_depth`, per-role models). See the three existing configs as worked examples.
 
-4. **Create `.taskmaster/tasks/tasks.json` in the project root** if it doesn't exist — the orchestrator reads tasks from there.
+4. **Task state lives in fused-memory's SQLite** at `<project_root>/.taskmaster/tasks/tasks.db`, created on first write. There is no on-disk `tasks.json` to seed — submit the first task via the MCP `submit_task` tool.
 
 5. **Create an `.envrc` in the project root** for direnv ergonomics (see next section).
 
@@ -62,7 +62,7 @@ Note the inconsistent filenames — each project chose its own. There is no conv
    uv run --project orchestrator orchestrator status \
        --config /absolute/path/to/your/project/orchestrator.yaml
    ```
-   Expect to see the project's task tree (or "No tasks found." if `.taskmaster/tasks/tasks.json` is empty).
+   Expect to see the project's task tree (or "No tasks found." for a freshly-seeded project).
 
 ## Per-project `.envrc` for ergonomics
 

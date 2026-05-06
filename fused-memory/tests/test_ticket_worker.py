@@ -506,19 +506,13 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
 
 
 @pytest.mark.asyncio
-async def test_worker_created_path_emits_journal_event_and_schedules_commit(
+async def test_worker_created_path_emits_journal_event(
     interceptor_with_store, ticket_store, taskmaster, event_buffer,
 ):
     """Regression-pin: on create success, exactly one EventType.task_created
-    event is journalled with the task_id in its payload, and _schedule_commit
-    is called with operation='add_task' (i.e. task_committer.commit was called).
+    event is journalled with the task_id in its payload.
     """
     from fused_memory.models.reconciliation import EventType
-
-    # Wire a mock task_committer so _schedule_commit actually fires
-    mock_committer = MagicMock()
-    mock_committer.commit = AsyncMock(return_value=None)
-    interceptor_with_store.task_committer = mock_committer
 
     # Capture journal calls
     journal_calls = []
@@ -548,7 +542,7 @@ async def test_worker_created_path_emits_journal_event_and_schedules_commit(
         )
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
 
-        # Let the worker drain and commit task fire
+        # Let the worker drain
         await asyncio.sleep(0.2)
 
     # Exactly one task_created event must have been journalled
@@ -567,13 +561,6 @@ async def test_worker_created_path_emits_journal_event_and_schedules_commit(
     )
     assert payload.get('operation') == 'add_task', (
         f'task_created event payload must have operation=add_task: {payload}'
-    )
-
-    # _schedule_commit must have been called with operation='add_task'
-    mock_committer.commit.assert_called_once()
-    call_args = mock_committer.commit.call_args
-    assert 'add_task' in str(call_args), (
-        f'task_committer.commit should be called with add_task: {call_args}'
     )
 
 
@@ -890,11 +877,6 @@ async def test_worker_post_create_failure_still_resolves_as_created(
     """
     from fused_memory.models.reconciliation import EventType
 
-    # Wire a mock task_committer so _schedule_commit fires
-    mock_committer = MagicMock()
-    mock_committer.commit = AsyncMock(return_value=None)
-    interceptor_with_store.task_committer = mock_committer
-
     # Capture journal calls
     journal_calls = []
     original_journal = interceptor_with_store._journal
@@ -959,9 +941,6 @@ async def test_worker_post_create_failure_still_resolves_as_created(
         f'Expected 1 task_created event despite post-create failure: {task_created_events}'
     )
 
-    # (6) task_committer.commit was scheduled with operation='add_task'
-    mock_committer.commit.assert_called_once()
-
 
 @pytest.mark.asyncio
 async def test_worker_record_task_failure_still_resolves_as_created(
@@ -975,10 +954,6 @@ async def test_worker_record_task_failure_still_resolves_as_created(
     site (``curator.record_task``).
     """
     from fused_memory.models.reconciliation import EventType
-
-    mock_committer = MagicMock()
-    mock_committer.commit = AsyncMock(return_value=None)
-    interceptor_with_store.task_committer = mock_committer
 
     journal_calls = []
     original_journal = interceptor_with_store._journal
@@ -1039,9 +1014,6 @@ async def test_worker_record_task_failure_still_resolves_as_created(
     assert len(task_created_events) == 1, (
         f'Expected 1 task_created event despite record_task failure: {task_created_events}'
     )
-
-    # (6) task_committer.commit was scheduled
-    mock_committer.commit.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

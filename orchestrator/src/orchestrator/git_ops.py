@@ -514,11 +514,9 @@ class GitOps:
                 # needs the architect to see current file contents.
                 if await self.rebase_onto_main(worktree_path):
                     # Re-capture base from worktree's own merge-base after the
-                    # rebase completes.  The pre-positioning rev-parse at
-                    # line 478 races with fused-memory's tasks.json auto-commit
-                    # to main: if main advances between rev-parse and rebase,
-                    # base_sha lags HEAD's actual fork point.  merge-base from
-                    # inside the worktree is race-immune.
+                    # rebase completes.  merge-base from inside the worktree
+                    # is race-immune to concurrent main advances during
+                    # rev-parse / rebase.
                     _, mb_out, _ = await _run(
                         ['git', 'merge-base', self.config.main_branch, 'HEAD'],
                         cwd=worktree_path,
@@ -607,14 +605,9 @@ class GitOps:
             )
 
         # Re-capture base from the worktree's own merge-base after positioning
-        # AND the scrub_task_dir_from_tree call above.  The pre-positioning
-        # rev-parse at line 478 races with fused-memory's tasks.json auto-commit
-        # to main (TaskFileCommitter._schedule_commit fires-and-forgets a commit
-        # to main on every set_task_status): if main advances between rev-parse
-        # and `git worktree add`, base_sha lags worktree HEAD's actual fork
-        # point and downstream callers (notably _recover_if_already_merged)
-        # mis-detect "real work" via wt_head != base_commit.  merge-base from
-        # inside the freshly-created worktree is race-immune: it is the fork
+        # AND the scrub_task_dir_from_tree call above.  merge-base from inside
+        # the freshly-created worktree is race-immune to concurrent main
+        # advances between rev-parse and `git worktree add`: it is the fork
         # point of HEAD with the freshened start_ref regardless of when main
         # advanced.  We use start_ref (the ref the worktree was actually based
         # on — may be origin/main when local main lags) rather than
@@ -639,7 +632,7 @@ class GitOps:
         before this method runs.  The post-staging check catches that case.
         """
         # Stage all — :!.task excludes .task/ from staging
-        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude', ':!.taskmaster/tasks'], cwd=worktree)
+        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
 
         # ── Post-staging .task/ safety net ────────────────────────────
         # If .task/ files are staged (e.g. an agent ran "git add .task/"
@@ -658,29 +651,6 @@ class GitOps:
                 staged_task.strip()[:200],
             )
             await _run(['git', 'reset', 'HEAD', '--', '.task/'], cwd=worktree)
-
-        # ── Post-staging .taskmaster/tasks/ safety net ────────────────
-        # Same belt-and-braces check for tasks.json: the pathspec excludes
-        # it during the bulk add, but agents can bypass that with
-        # `git add .taskmaster/tasks/tasks.json` directly.  Main is
-        # canonical for tasks.json; landing a stale branch copy could
-        # silently overwrite other tasks' status updates at merge time.
-        rc, staged_taskmaster, _ = await _run(
-            ['git', 'diff', '--cached', '--name-only', '--', '.taskmaster/tasks/'],
-            cwd=worktree,
-        )
-        if rc == 0 and staged_taskmaster.strip():
-            logger.warning(
-                '.taskmaster/tasks/ CONTAMINATION caught in commit() — %d file(s) '
-                'were staged despite :!.taskmaster/tasks pathspec (an agent likely '
-                'ran "git add .taskmaster/tasks/" directly). Unstaging now: %s',
-                len(staged_taskmaster.strip().splitlines()),
-                staged_taskmaster.strip()[:200],
-            )
-            await _run(
-                ['git', 'reset', 'HEAD', '--', '.taskmaster/tasks/'],
-                cwd=worktree,
-            )
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -990,38 +960,6 @@ class GitOps:
         else:
             logger.info(f'Cleaned up merge worktree {merge_wt}')
 
-    async def commit_task_statuses(self) -> str | None:
-        """Commit task status changes in the project root. Returns sha or None.
-
-        Only stages ``.taskmaster/tasks/tasks.json`` — no other files are
-        touched.  Safe to call when nothing has changed (returns None).
-        """
-        tasks_file = '.taskmaster/tasks/tasks.json'
-        rc, _, _ = await _run(
-            ['git', 'diff', '--quiet', '--', tasks_file],
-            cwd=self.project_root,
-        )
-        if rc == 0:
-            return None  # no changes
-
-        await _run(
-            ['git', 'add', '--', tasks_file],
-            cwd=self.project_root,
-        )
-        rc, _, err = await _run(
-            ['git', 'commit', '-m',
-             'chore: sync task statuses with orchestrator run'],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            logger.warning(f'Failed to commit task statuses: {err}')
-            return None
-
-        _, sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=self.project_root,
-        )
-        return sha
-
     # ── PHASE 4: Speculative merge-verify pipeline ────────────────────
     #
     # Once the merge queue (task 292) is stable and we have metrics on
@@ -1248,22 +1186,14 @@ class GitOps:
                 # which eats the leading space from " M filename" status.
                 # Exclude .task/ (ephemeral) and the worktree dir (managed by git).
                 wt_dir = self.config.worktree_dir
-                # Also exclude .taskmaster/tasks/tasks.json: the fused-memory
-                # MCP commits this file out-of-band on a fire-and-forget
-                # schedule, racing with our overlap check.  Branches never
-                # legitimately introduce tasks.json deltas (commit() excludes
-                # it from staging), so a tasks.json-only overlap is always
-                # the MCP auto-commit race, never real WIP.
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
-                     '.', ':!.task', f':!{wt_dir}',
-                     ':!.taskmaster/tasks/tasks.json'],
+                     '.', ':!.task', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 _, staged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--cached', '--',
-                     '.', ':!.task', f':!{wt_dir}',
-                     ':!.taskmaster/tasks/tasks.json'],
+                     '.', ':!.task', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 dirty_tracked = {

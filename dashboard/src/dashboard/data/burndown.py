@@ -14,14 +14,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+import httpx
 
 from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
-    load_task_tree,
 )
+from dashboard.data.tasks import fetch_statuses
 
 logger = logging.getLogger(__name__)
 
@@ -59,17 +60,11 @@ _INSERT_SNAPSHOT_SQL = (
 )
 
 
-def _tasks_json_for(root: Path) -> Path:
-    """Return the canonical tasks.json path for *root*."""
-    return root / '.taskmaster' / 'tasks' / 'tasks.json'
-
-
-def _count_statuses(tasks: list[dict]) -> dict[str, int]:
-    """Count tasks by mapped display zone."""
+def _count_statuses(statuses: dict[int, str]) -> dict[str, int]:
+    """Count statuses (id → status) by mapped display zone."""
     counts: dict[str, int] = {k: 0 for k in _ZONE_KEYS}
-    for task in tasks:
-        raw = task.get('status', 'pending')
-        zone = _STATUS_MAP.get(raw, 'pending')
+    for raw in statuses.values():
+        zone = _STATUS_MAP.get(raw or 'pending', 'pending')
         counts[zone] += 1
     return counts
 
@@ -77,6 +72,7 @@ def _count_statuses(tasks: list[dict]) -> dict[str, int]:
 async def collect_snapshot(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
+    client: httpx.AsyncClient,
 ) -> None:
     """Discover projects and insert one snapshot row per project.
 
@@ -113,14 +109,14 @@ async def collect_snapshot(
         resolved_root = str(config.project_root)
 
         # Phase 1 — Discovery (sequential, in-memory):
-        # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
+        # Build the ordered list of project_root strings to snapshot.
         # Main project is always first; seen_roots dedup is preserved exactly.
         # project_root is already canonical (symlink-resolved) so a symlinked
         # project_root deduplicates correctly against orchestrator /
         # known_project_roots entries that surface the real path.
-        roots_to_snapshot: list[tuple[str, Path]] = []
+        roots_to_snapshot: list[str] = []
         seen_roots: set[str] = {resolved_root}
-        roots_to_snapshot.append((resolved_root, config.tasks_json))
+        roots_to_snapshot.append(resolved_root)
 
         try:
             orchestrators = await asyncio.to_thread(find_running_orchestrators)
@@ -146,7 +142,7 @@ async def collect_snapshot(
                     if root_str in seen_roots:
                         continue
                     seen_roots.add(root_str)
-                    roots_to_snapshot.append((root_str, _tasks_json_for(project_root)))
+                    roots_to_snapshot.append(root_str)
                 except OSError:
                     logger.warning(
                         'OSError while resolving orchestrator project root; skipping',
@@ -159,23 +155,19 @@ async def collect_snapshot(
                     )
 
         for known_root in config.known_project_roots:
-            # known_root is already resolved by DashboardConfig.__post_init__,
-            # so .resolve() is unnecessary here.  Per-root error isolation for
-            # load failures (PermissionError, etc.) is handled by Phase 2's
-            # return_exceptions=True and Phase 3's exception check below.
+            # known_root is already resolved by DashboardConfig.__post_init__.
             root_str = str(known_root)
             if root_str in seen_roots:
                 continue
             seen_roots.add(root_str)
-            roots_to_snapshot.append((root_str, _tasks_json_for(known_root)))
+            roots_to_snapshot.append(root_str)
 
         # Phase 2 — Parallel read:
-        # All load_task_tree calls are independent (separate files), so run them concurrently.
-        # load_task_tree catches OSError internally and returns [] for unreadable files,
-        # but we pass return_exceptions=True as defense-in-depth so a single failing read
-        # cannot sink the entire cycle and drop all snapshots before commit.
-        all_tasks = await asyncio.gather(
-            *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot),
+        # Each fetch_statuses call hits fused-memory MCP independently;
+        # return_exceptions=True isolates per-project network failures so a
+        # single offline server can't sink the whole cycle.
+        all_results = await asyncio.gather(
+            *(fetch_statuses(client, config, root) for root in roots_to_snapshot),
             return_exceptions=True,
         )
 
@@ -183,17 +175,21 @@ async def collect_snapshot(
         # aiosqlite serialises writes on a single connection; keep inserts sequential.
         # Each project gets its own INSERT + commit so a DB failure on one project
         # cannot roll back rows that were already committed for earlier projects.
-        # Main project is always roots_to_snapshot[0], so its commit fires first.
-        # Skip any roots whose load raised — log and continue so other snapshots commit.
-        # O(N) commits (one fsync per project) are acceptable at current scale
-        # (handful of projects every 10 minutes). If N grows significantly,
-        # consider SAVEPOINT-based isolation for a single trailing fsync.
-        for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
-            if isinstance(tasks, BaseException):
-                logger.warning('Failed to load tasks for %s', root_str, exc_info=tasks)
+        for root_str, result in zip(roots_to_snapshot, all_results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning('Failed to fetch statuses for %s', root_str, exc_info=result)
                 continue
+            if not isinstance(result, dict):
+                logger.warning('Unexpected fetch_statuses result for %s: %r', root_str, type(result))
+                continue
+            if result.get('offline'):
+                logger.debug('fetch_statuses offline for %s: %s', root_str, result.get('error'))
+                continue
+            statuses: dict[int, str] = {
+                k: v for k, v in result.items() if isinstance(k, int)
+            }
             try:
-                counts = _count_statuses(tasks)
+                counts = _count_statuses(statuses)
                 await conn.execute(
                     _INSERT_SNAPSHOT_SQL,
                     (

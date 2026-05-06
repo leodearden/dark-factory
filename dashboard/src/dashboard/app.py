@@ -133,17 +133,18 @@ async def _sleep_to_aligned_tick(interval: int) -> None:
 async def _burndown_loop(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
+    client: httpx.AsyncClient,
 ) -> None:
     """Periodically snapshot task status counts into the burndown DB."""
     try:
-        await collect_snapshot(conn, config)
+        await collect_snapshot(conn, config, client)
     except Exception:
         logger.warning('Initial burndown snapshot failed', exc_info=True)
     last_downsample = 0.0
     while True:
         await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
         try:
-            await collect_snapshot(conn, config)
+            await collect_snapshot(conn, config, client)
             now = time.monotonic()
             if now - last_downsample > _DOWNSAMPLE_INTERVAL_SECONDS:
                 await downsample(conn)
@@ -211,7 +212,9 @@ async def lifespan(app: FastAPI):
     await burndown_conn.execute('PRAGMA journal_mode=WAL')
     await burndown_conn.executescript(BURNDOWN_SCHEMA)
     await burndown_conn.commit()
-    collector_task = asyncio.create_task(_burndown_loop(burndown_conn, app.state.config))
+    collector_task = asyncio.create_task(_burndown_loop(
+        burndown_conn, app.state.config, app.state.http_client,
+    ))
 
     # Metrics snapshot collector (separate WAL writer for sparse-history signals).
     metrics_path = app.state.config.metrics_db
@@ -381,10 +384,10 @@ async def api_orchestrators(request: Request) -> JSONResponse:
     """ORCHESTRATORS + PROJECTS for the redux dashboard."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    orchestrators_task = asyncio.to_thread(discover_orchestrators, config)
+    http_client: httpx.AsyncClient = request.app.state.http_client
     metrics_db = await pool.get(config.metrics_db)
     orchestrators, running_spark = await asyncio.gather(
-        orchestrators_task,
+        discover_orchestrators(http_client, config),
         get_orchestrators_running_series(metrics_db, days=1),
     )
     known_roots = [config.project_root, *config.known_project_roots]
@@ -399,8 +402,14 @@ async def api_orchestrators(request: Request) -> JSONResponse:
 async def api_tasks(request: Request) -> JSONResponse:
     """ACTIVE_TASKS + derived FILE_LOCKS."""
     config: DashboardConfig = request.app.state.config
-    active, locks = await asyncio.to_thread(collect_active_tasks, config)
-    return JSONResponse({'ACTIVE_TASKS': active, 'FILE_LOCKS': locks})
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    active, locks, offline_projects = await collect_active_tasks(http_client, config)
+    return JSONResponse({
+        'ACTIVE_TASKS': active,
+        'FILE_LOCKS': locks,
+        'TASKS_OFFLINE': bool(offline_projects),
+        'TASKS_OFFLINE_PROJECTS': offline_projects,
+    })
 
 
 @app.get('/api/v2/dashboard/memory')
@@ -497,10 +506,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     )
     pids = list(projects_raw.keys())
     title_maps = await asyncio.gather(*(
-        asyncio.to_thread(
-            load_task_titles,
-            Path(pid) / '.taskmaster' / 'tasks' / 'tasks.json',
-        )
+        load_task_titles(http_client, config, pid)
         for pid in pids
     ))
     enriched: dict[str, dict] = {}

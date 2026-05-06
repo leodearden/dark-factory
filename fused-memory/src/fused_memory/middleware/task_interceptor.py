@@ -62,7 +62,6 @@ if TYPE_CHECKING:
 
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
-    from fused_memory.middleware.task_file_committer import TaskFileCommitter
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
@@ -194,7 +193,6 @@ class TaskInterceptor:
         taskmaster: TaskBackendProtocol | None,
         targeted_reconciler: 'TargetedReconciler | None',
         event_buffer: EventBuffer,
-        task_committer: 'TaskFileCommitter | None' = None,
         config: 'FusedMemoryConfig | None' = None,
         escalator: 'CuratorEscalator | None' = None,
         event_queue: 'EventQueue | None' = None,
@@ -213,7 +211,6 @@ class TaskInterceptor:
         # — preserves the legacy call pattern for tests that haven't yet been
         # updated to construct a queue.
         self.event_queue = event_queue
-        self.task_committer = task_committer
         # WP-D: bounded-backlog enforcement. Each mutating public method calls
         # ``_backlog_policy.check(project_id, project_root)`` before acquiring
         # the project lock; a rejection verdict short-circuits to a structured
@@ -444,33 +441,6 @@ class TaskInterceptor:
         exc = task.exception()
         if exc:
             logger.error(f'Background reconciliation failed: {exc}')
-
-    def _schedule_commit(self, project_root: str, operation: str) -> None:
-        """Fire-and-forget auto-commit of tasks.json."""
-        if self.task_committer is None:
-            return
-        task = asyncio.create_task(
-            self.task_committer.commit(project_root, operation),
-            name=f'auto-commit-{operation}',
-        )
-        self._background_tasks.add(task)
-        task.add_done_callback(lambda t: self._background_tasks.discard(t))
-        task.add_done_callback(self._on_commit_done)
-
-    @staticmethod
-    def _on_commit_done(task: asyncio.Task) -> None:
-        """Callback for fire-and-forget commit tasks."""
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc:
-            logger.error(f'Background auto-commit failed: {exc}')
-
-    async def _await_commit(self, project_root: str, operation: str) -> None:
-        """Await commit directly (used by bulk ops that must capture full batch)."""
-        if self.task_committer is None:
-            return
-        await self.task_committer.commit(project_root, operation)
 
     async def drain(self) -> None:
         """Await all pending background tasks (commits + reconciliation).
@@ -783,7 +753,6 @@ class TaskInterceptor:
             payload,
         )
         await self._journal(event)
-        self._schedule_commit(project_root, f'set_task_status({task_id}={status})')
 
         # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
         if status in self.STATUS_TRIGGERS and self.reconciler:
@@ -1539,7 +1508,6 @@ class TaskInterceptor:
                     {'operation': 'add_task', 'task_id': task_id_str, 'planning_mode': True},
                 )
                 await self._journal(event)
-                self._schedule_commit(project_root, 'add_task[planning_mode]')
                 return {
                     'task_id': task_id_str,
                     'status': 'pending',
@@ -1553,7 +1521,6 @@ class TaskInterceptor:
             {'operation': 'add_task', 'task_id': task_id_str, 'planning_mode': True},
         )
         await self._journal(event)
-        self._schedule_commit(project_root, 'add_task[planning_mode]')
 
         return {
             'task_id': task_id_str,
@@ -2316,7 +2283,6 @@ class TaskInterceptor:
                 {'operation': 'add_task', 'task_id': task_id},
             )
             await self._journal(event)
-            self._schedule_commit(project_root, 'add_task')
 
         self._signal_ticket_event(ticket_id)
 
@@ -2682,7 +2648,6 @@ class TaskInterceptor:
                             {'operation': 'add_task', 'task_id': task_id},
                         )
                         await self._journal(event)
-                        self._schedule_commit(t.project_root, 'add_task')
 
                     self._signal_ticket_event(t.ticket_id)
 
@@ -2755,7 +2720,6 @@ class TaskInterceptor:
             {'task_id': task_id, 'operation': 'update_task'},
         )
         await self._journal(event)
-        self._schedule_commit(project_root, f'update_task({task_id})')
 
         # Re-embed if any corpus-relevant field changed. Taskmaster's update_task
         # accepts a free-form ``prompt`` for AI-driven edits, so we can't know
@@ -2890,7 +2854,6 @@ class TaskInterceptor:
             {'parent_id': parent_id, 'operation': 'add_subtask'},
         )
         await self._journal(event)
-        self._schedule_commit(project_root, f'add_subtask({parent_id})')
 
         # Record the new subtask in the curator corpus (synchronous cache
         # update + awaited Qdrant upsert — see add_task for the rationale).
@@ -2941,8 +2904,6 @@ class TaskInterceptor:
                 {'task_id': task_id, 'operation': 'remove_task'},
             )
             await self._journal(event)
-        # One commit for the batch — file-committer coalesces anyway.
-        self._schedule_commit(project_root, f'remove_tasks({len(ids)})')
         return result
 
     async def add_dependency(
@@ -2972,7 +2933,6 @@ class TaskInterceptor:
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'add_dependency'},
         )
         await self._journal(event)
-        self._schedule_commit(project_root, f'add_dependency({task_id}<-{depends_on})')
         return result
 
     async def remove_dependency(
@@ -3002,7 +2962,6 @@ class TaskInterceptor:
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'remove_dependency'},
         )
         await self._journal(event)
-        self._schedule_commit(project_root, f'remove_dependency({task_id}<-{depends_on})')
         return result
 
     # ── Pure reads (direct pass-through) ───────────────────────────────

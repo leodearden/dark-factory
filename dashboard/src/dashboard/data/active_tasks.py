@@ -1,8 +1,8 @@
 """Aggregate active tasks across all known projects for the redux dashboard.
 
-Joins three on-disk sources (task tree, worktree artifacts, optional burst
-state from reconciliation) into the ``ACTIVE_TASKS`` shape consumed by the
-React dashboard's tasks tab.
+Joins three sources — task tree (via fused-memory MCP), worktree artifacts,
+and optional burst state from reconciliation — into the ``ACTIVE_TASKS``
+shape consumed by the React dashboard's tasks tab.
 
 Output shape (per task) matches ``data.js`` mock fixtures:
 
@@ -26,11 +26,15 @@ The companion ``FILE_LOCKS`` dict is derived by inverting ``ACTIVE_TASKS``:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
+
 from dashboard.config import DashboardConfig
-from dashboard.data.orchestrator import _scan_worktrees, load_task_tree
+from dashboard.data.orchestrator import _scan_worktrees
+from dashboard.data.tasks import fetch_tasks
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending'}
 _HOLDER_STATUSES = {'in-progress', 'blocked'}
@@ -83,14 +87,26 @@ def _attempts_from_review_summary(summary: str) -> int:
         return 0
 
 
-def _shape_one_project(project_root: Path) -> tuple[list[dict], dict[str, dict]]:
-    """Build (active_tasks, file_locks) for a single project root."""
-    project = _project_label(project_root)
-    tasks = load_task_tree(project_root / '.taskmaster' / 'tasks' / 'tasks.json')
-    if not tasks:
-        return [], {}
+async def _shape_one_project(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: Path,
+) -> tuple[list[dict], dict[str, dict], bool]:
+    """Build (active_tasks, file_locks, offline) for a single project root.
 
-    worktrees = _scan_worktrees(project_root / '.worktrees')
+    *offline* is True when the MCP fetch failed for this project; the
+    caller surfaces that in the API payload so the React Tasks tab can
+    show an offline banner.
+    """
+    project = _project_label(project_root)
+    fetched = await fetch_tasks(client, config, project_root)
+    if isinstance(fetched, dict) and fetched.get('offline'):
+        return [], {}, True
+    tasks = fetched if isinstance(fetched, list) else []
+    if not tasks:
+        return [], {}, False
+
+    worktrees = await asyncio.to_thread(_scan_worktrees, project_root / '.worktrees')
 
     # Lookup table for dep title/status resolution within the same project.
     by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
@@ -152,20 +168,28 @@ def _shape_one_project(project_root: Path) -> tuple[list[dict], dict[str, dict]]
         for path in entry['locks']:
             locks.setdefault(path, {'holder': None})
 
-    return active, locks
+    return active, locks, False
 
 
-def collect_active_tasks(config: DashboardConfig) -> tuple[list[dict], dict[str, dict[str, dict]]]:
+async def collect_active_tasks(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+) -> tuple[list[dict], dict[str, dict[str, dict]], list[str]]:
     """Collect active tasks and derived file locks across all known projects.
 
-    Returns ``(active_tasks, file_locks)`` where ``file_locks`` is keyed by
-    project label, then file path, value ``{'holder': task_uid_or_None}``.
+    Returns ``(active_tasks, file_locks, offline_projects)`` where
+    *offline_projects* is the list of project labels whose MCP fetch failed.
+    The handler turns a non-empty *offline_projects* into ``offline: True``
+    on the dashboard payload.
     """
     all_active: list[dict] = []
     all_locks: dict[str, dict[str, dict]] = {}
+    offline_projects: list[str] = []
     for root in _all_project_roots(config):
-        active, locks = _shape_one_project(root)
+        active, locks, offline = await _shape_one_project(client, config, root)
+        if offline:
+            offline_projects.append(_project_label(root))
         all_active.extend(active)
         if locks:
             all_locks[_project_label(root)] = locks
-    return all_active, all_locks
+    return all_active, all_locks, offline_projects
