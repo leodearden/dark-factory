@@ -3153,6 +3153,136 @@ async def test_run_loop_fast_restart_releases_recent_claims(
     )
 
 
+# ── Stale-run reaper: instance-scoped lock check ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_skips_when_same_instance_holds_lock(
+    journal, event_buffer, mock_memory_service
+):
+    """Reaper must NOT recover a run owned by the instance that still holds the lock.
+
+    This is the legitimate long-running cycle case: same EventBuffer.instance_id
+    on both the run row and the active reconciliation_locks row.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    # Run started long enough ago to be considered stale by age, owned by the
+    # currently-live EventBuffer instance.
+    run = ReconciliationRun(
+        id='run-same-instance',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+
+    # The same live instance currently holds the project lock.
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    await harness._recover_stale_runs()
+
+    after = await journal.get_run('run-same-instance')
+    assert after is not None
+    assert after.status == RunStatus.running, (
+        'Run owned by the same live instance must not be reaped'
+    )
+    assert '_error' not in after.stage_reports
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_recovers_when_different_instance_holds_lock(
+    journal, event_buffer, mock_memory_service
+):
+    """Reaper must recover an orphan even when another instance now holds the lock.
+
+    This is the 2026-05-06 incident scenario: the original instance died, a fresh
+    instance acquired the lock for its own cycle, and the project-scoped reaper
+    check used to shield the orphan forever.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    run = ReconciliationRun(
+        id='run-orphan-A',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id='dead-instance-A',
+    )
+    await journal.start_run(run)
+
+    # The live instance — different from 'dead-instance-A' — holds the lock now.
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+    assert event_buffer.instance_id != 'dead-instance-A'
+
+    # Defer one write so we can assert _replay_deferred_writes ran (the reaper
+    # invokes it after marking the run failed).
+    await event_buffer.defer_write(project_id, 'replayed-content', 'cat', {})
+    mock_memory_service.add_memory = AsyncMock()
+
+    await harness._recover_stale_runs()
+
+    after = await journal.get_run('run-orphan-A')
+    assert after is not None
+    assert after.status == RunStatus.failed
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+    # Deferred write was replayed.
+    mock_memory_service.add_memory.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_recovers_pre_migration_run_with_null_instance(
+    journal, event_buffer, mock_memory_service
+):
+    """Pre-migration runs (instance_id IS NULL) must be reaped even when locked.
+
+    The conservative choice: a NULL instance_id means we cannot prove the run is
+    owned by the current process, so we treat it as an orphan.  This is the
+    precise behaviour we need to clean up legacy rows that motivated the fix.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    project_id = 'test-project'
+    cutoff = harness.config.stale_run_recovery_seconds
+
+    run = ReconciliationRun(
+        id='run-pre-migration',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=None,
+    )
+    await journal.start_run(run)
+
+    # Lock is held — by the live instance, doesn't matter who.
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    await harness._recover_stale_runs()
+
+    after = await journal.get_run('run-pre-migration')
+    assert after is not None
+    assert after.status == RunStatus.failed
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'StaleRunRecovery'
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 

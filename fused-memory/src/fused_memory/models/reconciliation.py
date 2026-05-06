@@ -141,6 +141,7 @@ class ReconciliationRun(BaseModel):
     stage_reports: dict[str, StageReport | dict] = Field(default_factory=dict)
     status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
+    instance_id: str | None = None  # EventBuffer.instance_id of the harness that started the run
 
     @field_validator('project_id', mode='before')
     @classmethod
