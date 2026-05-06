@@ -416,14 +416,28 @@ class ReconciliationHarness:
         """Find runs stuck in 'running' state and mark them failed.
 
         Uses stale_run_recovery_seconds as the age cutoff (default 600s),
-        then double-checks that the project's reconciliation lock is actually
-        stale before recovering — protecting legitimately long-running cycles.
+        then double-checks that the *same* instance still holds the project's
+        reconciliation lock before skipping — protecting legitimately long-running
+        cycles owned by this process while still recovering orphans whose owning
+        instance is dead even when a fresh instance has since acquired the lock.
+
+        Pre-migration runs (instance_id IS NULL) are recovered unconditionally
+        — the bug this guards against was exactly stale rows being shielded
+        forever by a new instance's lock acquisition.
         """
         cutoff = self.config.stale_run_recovery_seconds
         stale_runs = await self.journal.get_stale_runs(cutoff)
         for run in stale_runs:
-            # Skip if lock is still actively held (legitimate long-running cycle)
-            if await self.buffer._is_run_locked(run.project_id):
+            # Only skip when the *same* instance that started the run still
+            # holds the lock — that's a legitimate long-running cycle.  A lock
+            # held by a different instance, or no lock at all, means the
+            # original owner is gone and the run is an orphan.
+            lock_holder = await self.buffer.get_lock_holder_instance_id(run.project_id)
+            if (
+                lock_holder is not None
+                and run.instance_id is not None
+                and lock_holder == run.instance_id
+            ):
                 continue
 
             logger.warning(
@@ -819,6 +833,7 @@ class ReconciliationHarness:
             started_at=datetime.now(UTC),
             events_processed=len(events),
             status=RunStatus.running,
+            instance_id=self.buffer.instance_id,
         )
         await self.journal.start_run(run)
 
@@ -1088,6 +1103,7 @@ class ReconciliationHarness:
             events_processed=0,
             status=RunStatus.running,
             triggered_by=parent_run_id,
+            instance_id=self.buffer.instance_id,
         )
         await self.journal.start_run(run)
 

@@ -339,6 +339,32 @@ class EventBuffer:
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    async def get_lock_holder_instance_id(self, project_id: str) -> str | None:
+        """Return the instance_id of the live lock holder for project_id, or None.
+
+        Mirrors the stale-lock cleanup in _is_run_locked so callers see a fresh
+        view: rows whose heartbeat_at is older than stale_lock_seconds are
+        deleted before the SELECT.  Used by the harness reaper to compare
+        against a stale run's owning instance — see _recover_stale_runs.
+        """
+        cutoff = datetime.fromtimestamp(
+            datetime.now(UTC).timestamp() - self.stale_lock_seconds,
+            tz=UTC,
+        ).isoformat()
+        async with self._txn() as db:
+            await db.execute(
+                'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
+                (cutoff,),
+            )
+
+        db = self._require_db()
+        async with db.execute(
+            'SELECT instance_id FROM reconciliation_locks WHERE project_id = ?',
+            (project_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row['instance_id'] if row is not None else None
+
     async def expire_stale_bursts(self) -> int:
         """Transition 'bursting' agents to 'idle' when cooldown has elapsed."""
         cooldown_cutoff = datetime.fromtimestamp(

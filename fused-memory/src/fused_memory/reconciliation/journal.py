@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS runs (
     events_processed INTEGER DEFAULT 0,
     stage_reports TEXT DEFAULT '{}',
     status TEXT DEFAULT 'running',
-    triggered_by TEXT
+    triggered_by TEXT,
+    instance_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
@@ -212,6 +213,16 @@ class ReconciliationJournal:
         except Exception:
             await self._safe_rollback()  # Column already exists
 
+        # Safe migration: add instance_id column to existing DBs.  Lets the
+        # stale-run reaper distinguish runs owned by the current process from
+        # runs orphaned by a prior process whose lock has since been re-acquired
+        # by a fresh instance — see _recover_stale_runs.
+        try:
+            await self._db.execute('ALTER TABLE runs ADD COLUMN instance_id TEXT')
+            await self._db.commit()
+        except Exception:
+            await self._safe_rollback()  # Column already exists
+
         logger.info(f'Reconciliation journal initialized at {db_path}')
 
     async def _safe_rollback(self) -> None:
@@ -297,8 +308,8 @@ class ReconciliationJournal:
             await db.execute(
                 """INSERT INTO runs
                    (id, project_id, run_type, trigger_reason, started_at,
-                    events_processed, stage_reports, status, triggered_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    events_processed, stage_reports, status, triggered_by, instance_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run.id,
                     run.project_id,
@@ -309,6 +320,7 @@ class ReconciliationJournal:
                     json.dumps({}),
                     run.status,
                     run.triggered_by,
+                    run.instance_id,
                 ),
             )
 
@@ -355,6 +367,7 @@ class ReconciliationJournal:
             stage_reports=stage_reports,
             status=row['status'],
             triggered_by=row['triggered_by'],
+            instance_id=row['instance_id'],
         )
 
     async def get_recent_runs(
@@ -387,6 +400,7 @@ class ReconciliationJournal:
                     stage_reports=stage_reports,
                     status=row['status'],
                     triggered_by=row['triggered_by'],
+                    instance_id=row['instance_id'],
                 )
             )
         return runs
@@ -636,6 +650,7 @@ class ReconciliationJournal:
                     stage_reports=stage_reports,
                     status=row['status'],
                     triggered_by=row['triggered_by'],
+                    instance_id=row['instance_id'],
                 )
             )
         return runs
