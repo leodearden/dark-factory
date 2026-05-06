@@ -280,7 +280,7 @@ def format_pretriaged_detail(
             '    metadata={',
             f'        "escalation_id": "{escalation_id}",',
             '        "suggestion_hash": "<hash from the group header>",',
-            '        "modules": ["<file-or-module paths>"],',
+            '        "files": ["<file-or-directory paths>"],',
             '        # plus your base role stamps: source, spawn_context, etc.',
             '    },',
             '    project_root=...,',

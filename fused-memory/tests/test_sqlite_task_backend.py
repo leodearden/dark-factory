@@ -183,13 +183,13 @@ async def test_update_task_appends_metadata(backend, project_root):
     )
     dto = await backend.update_task(
         '1', project_root=project_root,
-        metadata=json.dumps({'modules': ['src']}),
+        metadata=json.dumps({'files': ['src']}),
         append=True,
     )
     assert dto['updated'] is True
     one = await backend.get_task('1', project_root=project_root)
     assert one['metadata']['prd'] == 'old.md'
-    assert one['metadata']['modules'] == ['src']
+    assert one['metadata']['files'] == ['src']
 
 
 @pytest.mark.asyncio

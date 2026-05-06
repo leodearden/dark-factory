@@ -1692,14 +1692,17 @@ class TaskCurator:
 
 
 def _task_files(task: dict) -> list[str]:
-    """Extract files_to_modify from a raw taskmaster task dict."""
+    """Extract files_to_modify from a raw taskmaster task dict.
+
+    Priority: top-level ``files_to_modify`` (curator wire shape) →
+    ``metadata.files`` (canonical orchestrator field) →
+    ``metadata.files_to_modify`` (legacy curator-internal name).
+    """
     files = task.get('files_to_modify')
     if files is None:
-        # Fall back to metadata.modules, which is how reviewer/steward tasks
-        # currently carry locking hints (see roles.py prompts).
         meta = task.get('metadata') or {}
         if isinstance(meta, dict):
-            files = meta.get('modules') or meta.get('files_to_modify')
+            files = meta.get('files') or meta.get('files_to_modify')
     if not files:
         return []
     if isinstance(files, str):

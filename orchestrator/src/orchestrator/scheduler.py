@@ -1223,7 +1223,7 @@ class Scheduler:
         )
         # Cache expanded modules in memory so _get_modules uses them on retry
         self._module_cache[task_id] = sorted(needed_set)
-        updated = await self.update_task(task_id, {'modules': needed})
+        updated = await self.update_task(task_id, {'files': needed})
         if not updated:
             logger.warning(
                 f'Task {task_id}: metadata update failed (non-critical — '
@@ -1428,7 +1428,7 @@ class Scheduler:
     def _get_modules(self, task: dict) -> list[str]:
         """Extract module list from task metadata, normalized for locking.
 
-        Priority: in-memory cache > metadata.files > metadata.modules > fallback.
+        Priority: in-memory cache > metadata.files > fallback ``task-<id>``.
         """
         task_id = str(task.get('id', ''))
         depth = self.config.lock_depth
@@ -1437,16 +1437,11 @@ class Scheduler:
             return self._module_cache[task_id]
         metadata = task.get('metadata') or {}
         if isinstance(metadata, dict):
-            # Prefer file-derived modules (most accurate)
             files = metadata.get('files', [])
             if isinstance(files, list) and files:
                 derived = files_to_modules(files, depth)
                 if derived:
                     return derived
-            # Fall back to explicitly tagged modules
-            modules = metadata.get('modules', [])
-            if isinstance(modules, list) and modules:
-                return [normalize_lock(m, depth) for m in modules]
         # Fallback: use a generic module name based on task id
         if task_id not in self._fallback_warned:
             logger.warning(

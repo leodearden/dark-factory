@@ -59,7 +59,7 @@ class TestPlan:
         plan = {
             'task_id': 'task-1',
             'title': 'Test Task',
-            'modules': ['backend'],
+            'files': ['backend/app.py'],
             'steps': [
                 {'id': 'step-1', 'type': 'test', 'description': 'Write test', 'status': 'pending', 'commit': None},
                 {'id': 'step-2', 'type': 'impl', 'description': 'Implement', 'status': 'pending', 'commit': None},

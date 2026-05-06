@@ -42,7 +42,6 @@ class TestCreatePlan:
             task_id='test-1',
             title='Test task',
             analysis='Some analysis',
-            modules=['mod_a'],
             files=['mod_a/foo.py'],
         )
         assert result['status'] == 'ok'
@@ -51,23 +50,18 @@ class TestCreatePlan:
         assert plan['task_id'] == 'test-1'
         assert plan['title'] == 'Test task'
         assert plan['analysis'] == 'Some analysis'
-        assert plan['modules'] == ['mod_a']
         assert plan['files'] == ['mod_a/foo.py']
+        assert 'modules' not in plan
         assert plan['steps'] == []
         assert plan['prerequisites'] == []
         assert plan['design_decisions'] == []
         assert plan['reuse'] == []
         assert '_schema_version' in plan
 
-    def test_defaults_files_to_empty(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
-        plan = artifacts.read_plan()
-        assert plan['files'] == []
-
 
 class TestAddPlanStep:
     def test_appends_step(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         result = _add_plan_step(artifacts, 'step-1', 'test', 'Write test for X')
         assert result['status'] == 'ok'
         assert result['total_steps'] == 1
@@ -82,7 +76,7 @@ class TestAddPlanStep:
         assert step['commit'] is None
 
     def test_preserves_order(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         _add_plan_step(artifacts, 'step-1', 'test', 'First')
         _add_plan_step(artifacts, 'step-2', 'impl', 'Second')
         _add_plan_step(artifacts, 'step-3', 'test', 'Third')
@@ -92,14 +86,14 @@ class TestAddPlanStep:
         assert ids == ['step-1', 'step-2', 'step-3']
 
     def test_rejects_duplicate_id(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         _add_plan_step(artifacts, 'step-1', 'test', 'First')
         result = _add_plan_step(artifacts, 'step-1', 'impl', 'Duplicate')
         assert result['status'] == 'error'
         assert 'already exists' in result['message']
 
     def test_rejects_id_collision_with_prereq(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         _add_prerequisite(artifacts, 'pre-1', 'Setup')
         result = _add_plan_step(artifacts, 'pre-1', 'test', 'Collision')
         assert result['status'] == 'error'
@@ -113,7 +107,7 @@ class TestAddPlanStep:
 
 class TestAddPrerequisite:
     def test_appends_prerequisite(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         result = _add_prerequisite(artifacts, 'pre-1', 'Setup config')
         assert result['status'] == 'ok'
 
@@ -133,7 +127,7 @@ class TestAddPrerequisite:
 
 class TestAddDesignDecision:
     def test_appends_decision(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         result = _add_design_decision(artifacts, 'Use X over Y', 'X is simpler')
         assert result['status'] == 'ok'
         assert result['total_decisions'] == 1
@@ -146,7 +140,7 @@ class TestAddDesignDecision:
 
 class TestAddReuseItem:
     def test_appends_reuse(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         result = _add_reuse_item(artifacts, 'MergeResult', 'git_ops.py:14', 'Follow same pattern')
         assert result['status'] == 'ok'
         assert result['total_reuse'] == 1
@@ -165,7 +159,7 @@ class TestAddReuseItem:
 
 class TestMarkStepDone:
     def _setup_plan(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
         _add_plan_step(artifacts, 'step-2', 'impl', 'Implement')
 
@@ -191,7 +185,7 @@ class TestMarkStepDone:
         assert plan['_session_id'] == 'test-1-deadbeef'
 
     def test_marks_prerequisite_done(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         _add_prerequisite(artifacts, 'pre-1', 'Setup')
         _add_plan_step(artifacts, 'step-1', 'test', 'Test')
 
@@ -218,7 +212,7 @@ def _setup_full_plan(artifacts):
     """Create a plan with steps and prerequisites for revalidation tests."""
     _create_plan(
         artifacts, 'test-1', 'Test task', 'Analysis',
-        ['mod_a'], ['mod_a/foo.py', 'mod_a/bar.py'],
+        ['mod_a/foo.py', 'mod_a/bar.py'],
     )
     _add_prerequisite(artifacts, 'pre-1', 'Setup config')
     _add_plan_step(artifacts, 'step-1', 'test', 'Write test for foo')
@@ -227,7 +221,7 @@ def _setup_full_plan(artifacts):
 
 
 class TestUpdatePlanMetadata:
-    def test_updates_files_only(self, artifacts):
+    def test_updates_files(self, artifacts):
         _setup_full_plan(artifacts)
         result = _update_plan_metadata(
             artifacts, files=['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
@@ -237,19 +231,8 @@ class TestUpdatePlanMetadata:
 
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
-        # Modules and analysis unchanged
-        assert plan['modules'] == ['mod_a']
+        # Analysis unchanged
         assert plan['analysis'] == 'Analysis'
-
-    def test_updates_modules_only(self, artifacts):
-        _setup_full_plan(artifacts)
-        result = _update_plan_metadata(artifacts, modules=['mod_a', 'mod_b'])
-        assert result['status'] == 'ok'
-        assert result['modules'] == 2
-
-        plan = artifacts.read_plan()
-        assert plan['modules'] == ['mod_a', 'mod_b']
-        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
 
     def test_updates_analysis_only(self, artifacts):
         _setup_full_plan(artifacts)
@@ -258,18 +241,18 @@ class TestUpdatePlanMetadata:
 
         plan = artifacts.read_plan()
         assert plan['analysis'] == 'Updated analysis'
+        # Files unchanged
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
 
     def test_updates_all_fields(self, artifacts):
         _setup_full_plan(artifacts)
         result = _update_plan_metadata(
             artifacts,
-            modules=['mod_b'],
             files=['mod_b/x.py'],
             analysis='New approach',
         )
         assert result['status'] == 'ok'
         plan = artifacts.read_plan()
-        assert plan['modules'] == ['mod_b']
         assert plan['files'] == ['mod_b/x.py']
         assert plan['analysis'] == 'New approach'
 
@@ -388,7 +371,7 @@ class TestConfirmPlan:
         assert result['status'] == 'error'
 
     def test_empty_steps_returns_error(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
         result = _confirm_plan(artifacts)
         assert result['status'] == 'error'
         assert 'no steps' in result['message'].lower()
@@ -429,7 +412,7 @@ class TestReportBlockingDependency:
         assert data['main_sha_at_report'] == 'bbb'
 
     def test_does_not_mutate_plan_json(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'], files=['m/x.py'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m/x.py'])
         _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
         _report_blocking_dependency(artifacts, '5', 'r', main_sha='abc')
 
@@ -466,7 +449,7 @@ class TestReportTaskAlreadyDone:
         assert data['evidence'] == 'second'
 
     def test_does_not_mutate_plan_json(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'], files=['m/x.py'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m/x.py'])
         _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
         _report_task_already_done(artifacts, 'sha', 'e')
 
@@ -502,7 +485,7 @@ class TestReportUnactionableTask:
         assert data['evidence'] == 'e2'
 
     def test_does_not_mutate_plan_json(self, artifacts):
-        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'], files=['m/x.py'])
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m/x.py'])
         _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
         _report_unactionable_task(artifacts, 'r', 'e')
 

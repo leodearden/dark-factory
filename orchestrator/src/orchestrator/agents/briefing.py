@@ -83,13 +83,12 @@ class BriefingAssembler:
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
 2. Produce a TDD implementation plan using the plan-tools MCP tools:
-   a. Call `create_plan(task_id, title, analysis, modules, files)` with your analysis.
+   a. Call `create_plan(task_id, title, analysis, files)` with your analysis.
    b. Call `add_prerequisite(prereq_id, description)` for any setup work needed before TDD steps.
    c. Call `add_plan_step(step_id, step_type, description)` for each TDD step, in order. Alternate test/impl.
    d. Call `add_design_decision(decision, rationale)` for non-obvious choices.
    e. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
-3. List ALL files you expect to create or modify in the `files` parameter of `create_plan` — this drives concurrency locks, so be exhaustive and precise.
-4. Ensure the `modules` parameter accurately lists ALL code directories this task will touch.
+3. List ALL files (or directory paths) you expect to create or modify in the `files` parameter of `create_plan` — this drives concurrency locks and the phantom-done gate, so be exhaustive and precise.
 """
 
     async def build_revalidation_prompt(
@@ -175,7 +174,7 @@ and either confirm it, update it, or recreate it from scratch.
 2. Decide whether your plan is still valid.
 3. Take ONE of these actions:
    a. **Plan still valid**: call `confirm_plan()`.
-   b. **Plan needs updates**: use `update_plan_metadata(files=..., modules=...)`,
+   b. **Plan needs updates**: use `update_plan_metadata(files=...)`,
       `remove_plan_step(step_id)`, `replace_plan_step(step_id, step_type, description)`,
       and/or `add_plan_step(step_id, step_type, description)` to adjust the plan in place.
    c. **Plan is invalid**: call `create_plan(...)` to start fresh, then add steps as usual.
@@ -714,8 +713,8 @@ Handle this escalation, then call `resolve_issue` with a summary.
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
-        if task.get('metadata', {}).get('modules'):
-            lines.append(f'**Modules:** {", ".join(task["metadata"]["modules"])}')
+        if task.get('metadata', {}).get('files'):
+            lines.append(f'**Files:** {", ".join(task["metadata"]["files"])}')
         deps = task.get('dependencies', [])
         if deps:
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]

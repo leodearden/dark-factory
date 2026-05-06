@@ -37,8 +37,8 @@ class TestTaskFiles:
         task = {'id': '1', 'files_to_modify': ['src/a.py', 'src/b.py']}
         assert _task_files(task) == ['src/a.py', 'src/b.py']
 
-    def test_fallback_to_metadata_modules(self):
-        task = {'id': '1', 'metadata': {'modules': ['crates/reify-compiler/src']}}
+    def test_fallback_to_metadata_files(self):
+        task = {'id': '1', 'metadata': {'files': ['crates/reify-compiler/src']}}
         assert _task_files(task) == ['crates/reify-compiler/src']
 
     def test_metadata_files_to_modify_fallback(self):

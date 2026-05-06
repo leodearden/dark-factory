@@ -44,17 +44,17 @@ SAMPLE_TASKS = [
     {
         'id': '3',
         'title': 'Already tagged task',
-        'description': 'This one has modules already',
+        'description': 'This one has files already',
         'status': 'pending',
-        'metadata': {'modules': ['src/server']},
+        'metadata': {'files': ['src/server']},
         'dependencies': [],
     },
 ]
 
 AGENT_MODULE_RESPONSE = {
     'tasks': [
-        {'id': '1', 'modules': ['src/server', 'tests']},
-        {'id': '2', 'modules': ['src/config']},
+        {'id': '1', 'files': ['src/server/app.py', 'tests/test_app.py']},
+        {'id': '2', 'files': ['src/config/schema.py']},
     ],
 }
 
@@ -88,24 +88,24 @@ async def test_tag_task_modules_calls_update_for_untagged(harness, config):
     call_ids = {c.args[0] for c in calls}
     assert call_ids == {'1', '2'}
 
-    # Verify module metadata content
+    # Verify file metadata content
     for call in calls:
         task_id, metadata_json = call.args
         metadata = json.loads(metadata_json)
-        assert 'modules' in metadata
-        assert isinstance(metadata['modules'], list)
+        assert 'files' in metadata
+        assert isinstance(metadata['files'], list)
 
 
 @pytest.mark.asyncio
 async def test_tag_task_modules_skips_when_all_tagged(harness):
-    """Should skip agent invocation if all tasks already have modules."""
+    """Should skip agent invocation if all tasks already have files."""
     all_tagged = [
         {
             'id': '1',
             'title': 'Task',
             'description': '',
             'status': 'pending',
-            'metadata': {'modules': ['src/server']},
+            'metadata': {'files': ['src/server']},
             'dependencies': [],
         },
     ]

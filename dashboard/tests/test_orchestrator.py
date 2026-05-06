@@ -459,13 +459,13 @@ class TestReadTaskArtifacts:
         metadata = {'task_id': '7', 'title': 'Build widget', 'base_commit': 'abc123', 'created_at': '2026-03-18T10:00:00'}
         (task_dir / 'metadata.json').write_text(json.dumps(metadata))
 
-        # plan.json with 3 done, 2 pending out of 5 total + modules
+        # plan.json with 3 done, 2 pending out of 5 total + files
         steps = [
             {'id': f'step-{i}', 'status': 'done'} for i in range(1, 4)
         ] + [
             {'id': f'step-{i}', 'status': 'pending'} for i in range(4, 6)
         ]
-        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps, 'modules': ['dashboard']}))
+        (task_dir / 'plan.json').write_text(json.dumps({'steps': steps, 'files': ['dashboard']}))
 
         # iterations.jsonl with 3 lines
         with open(task_dir / 'iterations.jsonl', 'w') as f:
@@ -483,7 +483,7 @@ class TestReadTaskArtifacts:
         assert result['plan_progress'] == {'done': 3, 'total': 5}
         assert result['iteration_count'] == 3
         assert result['review_summary'] == '1/2 passed'
-        assert result['modules'] == ['dashboard']
+        assert result['files'] == ['dashboard']
 
     def test_empty_worktree(self, tmp_path):
         """Worktree with no .task/ subdir returns defaults."""
@@ -532,8 +532,8 @@ class TestReadTaskArtifacts:
         assert result['plan_progress'] == {'done': 0, 'total': 0}
         assert result['metadata'] == metadata
 
-    def test_modules_extracted_from_plan(self, tmp_path):
-        """Modules list is extracted from plan.json top-level 'modules' key."""
+    def test_files_extracted_from_plan(self, tmp_path):
+        """Files list is extracted from plan.json top-level 'files' key."""
         import json
 
         from dashboard.data.orchestrator import read_task_artifacts
@@ -542,17 +542,17 @@ class TestReadTaskArtifacts:
         task_dir.mkdir()
 
         plan_data = {
-            'modules': ['auth/', 'api/'],
+            'files': ['auth/', 'api/'],
             'steps': [{'id': 'step-1', 'status': 'pending'}],
         }
         (task_dir / 'plan.json').write_text(json.dumps(plan_data))
 
         result = read_task_artifacts(tmp_path)
 
-        assert result['modules'] == ['auth/', 'api/']
+        assert result['files'] == ['auth/', 'api/']
 
-    def test_modules_default_empty_when_missing(self, tmp_path):
-        """When plan.json has no 'modules' key, modules defaults to empty list."""
+    def test_files_default_empty_when_missing(self, tmp_path):
+        """When plan.json has no 'files' key, files defaults to empty list."""
         import json
 
         from dashboard.data.orchestrator import read_task_artifacts
@@ -565,15 +565,15 @@ class TestReadTaskArtifacts:
 
         result = read_task_artifacts(tmp_path)
 
-        assert result['modules'] == []
+        assert result['files'] == []
 
-    def test_modules_default_empty_no_plan(self, tmp_path):
-        """When plan.json doesn't exist, modules defaults to empty list."""
+    def test_files_default_empty_no_plan(self, tmp_path):
+        """When plan.json doesn't exist, files defaults to empty list."""
         from dashboard.data.orchestrator import read_task_artifacts
 
         result = read_task_artifacts(tmp_path)
 
-        assert result['modules'] == []
+        assert result['files'] == []
 
 
 class TestExtractTaskId:

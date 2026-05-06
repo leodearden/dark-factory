@@ -78,7 +78,7 @@ def task_assignment() -> TaskAssignment:
         task_id='42',
         task={
             'id': '42', 'title': 'X', 'description': '',
-            'status': 'pending', 'metadata': {'modules': ['lib']},
+            'status': 'pending', 'metadata': {'files': ['lib']},
             'dependencies': [],
         },
         modules=['lib'],
