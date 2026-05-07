@@ -249,6 +249,76 @@ class TicketStore:
             return None
         return dict(row)
 
+    async def extend_pending_expiry(self, project_id: str, seconds: float) -> int:
+        """Push expires_at forward by ``seconds`` for all pending tickets in this project.
+
+        Used by the curator worker to compensate for capacity-blocked time
+        (UsageGate closed) so the TTL janitor doesn't kill candidates the
+        worker was never permitted to attempt. Returns rows updated.
+
+        Computes new timestamps in Python (read-modify-write inside a single
+        transaction) rather than via SQLite's ``datetime(...)`` arithmetic
+        because the SQL function returns ``'YYYY-MM-DD HH:MM:SS'`` without a
+        timezone offset, which would corrupt the ISO-8601 + TZ format every
+        other write produces and break the lexical comparisons that
+        :meth:`sweep_expired` relies on.
+        """
+        if seconds <= 0:
+            return 0
+        delta = timedelta(seconds=seconds)
+        async with self._txn() as db:
+            cursor = await db.execute(
+                "SELECT ticket_id, expires_at FROM tickets "
+                "WHERE project_id = ? AND status = 'pending'",
+                (project_id,),
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return 0
+            updates = [
+                (
+                    (datetime.fromisoformat(row['expires_at']) + delta).isoformat(),
+                    row['ticket_id'],
+                )
+                for row in rows
+            ]
+            await db.executemany(
+                'UPDATE tickets SET expires_at = ? WHERE ticket_id = ?',
+                updates,
+            )
+        return len(updates)
+
+    async def list_tickets(
+        self,
+        project_id: str,
+        *,
+        status: str | None = None,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Return tickets for a project, newest-first, optionally filtered.
+
+        ``status`` matches against the status column literal ('pending',
+        'created', 'failed', 'combined'). ``since`` filters by ``created_at``.
+        Default window when ``since`` is None: last 7 days.
+        """
+        db = self._require_db()
+        if since is None:
+            since = datetime.now(UTC) - timedelta(days=7)
+        sql_parts = [
+            'SELECT * FROM tickets',
+            'WHERE project_id = ? AND created_at >= ?',
+        ]
+        params: list = [project_id, since.isoformat()]
+        if status is not None:
+            sql_parts.append('AND status = ?')
+            params.append(status)
+        sql_parts.append('ORDER BY created_at DESC LIMIT ?')
+        params.append(limit)
+        cursor = await db.execute(' '.join(sql_parts), tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     async def fetch_unescalated_failures(
         self,
         project_id: str | None = None,

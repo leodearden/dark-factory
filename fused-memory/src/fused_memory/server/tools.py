@@ -85,6 +85,39 @@ Conventions:
 """
 
 
+def _summarise_ticket_row(row: dict) -> dict:
+    """Project a ticket row into a triage-friendly summary.
+
+    Pulls a candidate title out of the stored ``candidate_json`` blob
+    (kwargs.title / kwargs.prompt fallback chain mirrors the path-guard
+    rejection helper in :mod:`task_interceptor`). Drops ``result_json`` —
+    the full payload is large and verbose; callers can use ``get_ticket``
+    when they want the raw row.
+    """
+    title = '<unknown>'
+    candidate_json = row.get('candidate_json')
+    if candidate_json:
+        try:
+            blob = json.loads(candidate_json)
+        except (TypeError, ValueError):
+            blob = {}
+        kwargs = blob.get('kwargs') if isinstance(blob, dict) else None
+        if isinstance(kwargs, dict):
+            raw = kwargs.get('title') or kwargs.get('prompt') or '<unknown>'
+            title = str(raw)[:200]
+    return {
+        'ticket_id': row['ticket_id'],
+        'status': row['status'],
+        'reason': row.get('reason'),
+        'task_id': row.get('task_id'),
+        'candidate_title': title,
+        'created_at': row['created_at'],
+        'expires_at': row['expires_at'],
+        'resolved_at': row.get('resolved_at'),
+        'escalated_at': row.get('escalated_at'),
+    }
+
+
 def _extract_causation(
     metadata: dict | None, agent_id: str | None
 ) -> tuple[str, str, dict | None]:
@@ -1660,6 +1693,58 @@ def create_mcp_server(
         except Exception as e:
             logger.error(f'resolve_ticket error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def list_tickets(
+        project_root: str,
+        status: str | None = None,
+        since: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """List recent submit_task tickets for a project. Default window: last 7 days.
+
+        Returns each ticket with extracted candidate_title for at-a-glance
+        triage. ``result_json`` is omitted (verbose; not useful here).
+
+        Args:
+            project_root: Absolute path to project root.
+            status: Optional status filter ('pending', 'created', 'failed',
+                'combined'). When None, all statuses are returned.
+            since: Optional ISO-8601 timestamp; only tickets with
+                ``created_at >= since`` are returned. Default: now − 7 days.
+            limit: Max rows to return. Clamped to [1, 2000].
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        since_dt: datetime | None = None
+        if since is not None:
+            try:
+                parsed = datetime.fromisoformat(since)
+            except ValueError:
+                return {
+                    'error': (
+                        f'list_tickets: invalid ISO-8601 timestamp for "since": {since!r}'
+                    ),
+                    'error_type': 'ValidationError',
+                }
+            since_dt = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        try:
+            result = await task_interceptor.list_tickets(
+                project_root=project_root,
+                status=status,
+                since=since_dt,
+                limit=limit,
+            )
+        except Exception as e:
+            logger.exception(f'list_tickets error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+        if 'error' in result:
+            return result
+        rows = result.pop('rows', [])
+        result['tickets'] = [_summarise_ticket_row(r) for r in rows]
+        return result
 
     @mcp.tool()
     async def commit_planning(

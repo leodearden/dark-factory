@@ -6,6 +6,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 import uuid as uuid_mod
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -1663,6 +1664,39 @@ class TaskInterceptor:
         result, _ = await self._resolve_ticket_raw(ticket, timeout_seconds)
         return result
 
+    async def list_tickets(
+        self,
+        *,
+        project_root: str,
+        status: str | None = None,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> dict:
+        """Return recent submit_task tickets for ``project_root``.
+
+        Thin wrapper around :meth:`TicketStore.list_tickets` that resolves
+        the project_id and shapes each row for at-a-glance triage. See
+        :func:`fused_memory.server.tools._summarise_ticket_row` for the
+        per-row shape.
+        """
+        if self._ticket_store is None:
+            return {
+                'error': 'ticket_store not configured; cannot use list_tickets',
+                'error_type': 'ConfigError',
+            }
+        project_id = resolve_project_id(project_root)
+        rows = await self._ticket_store.list_tickets(
+            project_id=project_id,
+            status=status,
+            since=since,
+            limit=max(1, min(limit, 2000)),
+        )
+        return {
+            'project_id': project_id,
+            'count': len(rows),
+            'rows': rows,
+        }
+
     def _start_worker_if_needed(self, project_id: str) -> None:
         """Lazily start the per-project curator worker asyncio.Task if not running.
 
@@ -1826,7 +1860,21 @@ class TaskInterceptor:
                     for tid in batch_ticket_ids:
                         queue.put_nowait(tid)
                     if self._usage_gate is not None:
-                        await self._usage_gate.wait_for_open(timeout=300)
+                        # Compensate every pending ticket in this project for
+                        # the capacity-blocked window so the TTL janitor does
+                        # not kill submissions the worker was never permitted
+                        # to attempt. ``finally`` so a CancelledError still
+                        # extends — partial credit beats none.
+                        t0 = time.monotonic()
+                        try:
+                            await self._usage_gate.wait_for_open(timeout=300)
+                        finally:
+                            elapsed = time.monotonic() - t0
+                            if elapsed > 0 and self._ticket_store is not None:
+                                with contextlib.suppress(Exception):
+                                    await self._ticket_store.extend_pending_expiry(
+                                        project_id, elapsed,
+                                    )
                 except Exception:
                     logger.exception(
                         '_curator_worker: unhandled error processing batch '
