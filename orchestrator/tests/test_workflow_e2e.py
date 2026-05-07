@@ -4369,6 +4369,227 @@ class TestEscalatePlanOverwriteMessage:
         assert 'duplicate workflow' in detail
 
 
+# ---------------------------------------------------------------------------
+# Tests: run-2 / run-3 gate fixes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAmendOverwriteHaltsLoop:
+    """Fix 2: When _amend detects a real plan-overwrite (validate_plan_owner
+    fails), it returns False and the execute/verify/review loop must halt
+    with ESCALATED — not continue as though the amendment succeeded.
+
+    Run 3 of reify-2911 hit this with a synthetic-overwrite signal (Lever B
+    preserved the original ``_session_id``); the spurious branch is closed
+    by Fix 1.  This test focuses on the genuine-overwrite path: a real
+    foreign ``_session_id`` lands in plan.json mid-amendment.
+    """
+
+    async def test_real_overwrite_triggers_escalated_outcome(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        # Set up artifacts with a fully-done plan so _execute_iterations
+        # short-circuits on the first while-loop check (no implementer
+        # invocation needed).
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init('42', 'T', 'd', base_commit='deadbeef')
+        plan = dict(PLAN)
+        plan['steps'] = [
+            dict(s, status='done') for s in plan['steps']
+        ]
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+
+        async def _verify_pass():
+            return WorkflowOutcome.DONE
+        workflow._verify_debugfix_loop = _verify_pass  # type: ignore[method-assign]
+
+        a_suggestion = {
+            'reviewer': 'analyst',
+            'severity': 'suggestion',
+            'category': 'naming',
+            'description': 'rename foo to bar',
+            'suggested_fix': 'foo -> bar',
+            'location': 'lib.py:1',
+        }
+        async def _review_one_suggestion():
+            return ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[a_suggestion],
+                reviews={'analyst': {}},
+            )
+        workflow._review = _review_one_suggestion  # type: ignore[method-assign]
+        # Bypass the module-lock filter — we want the suggestion to be
+        # applied in-scope so amend fires.
+        workflow._suggestions_in_scope = lambda s: list(s)  # type: ignore[method-assign]
+
+        # Stub _amend to actually overwrite plan.json with a foreign
+        # _session_id (real overwrite — validate_plan_owner now returns
+        # False), call _escalate_plan_overwrite, and return False.  This
+        # mirrors what the production _amend body does after validation
+        # fails.
+        amend_calls: list[int] = []
+        async def _amend_overwrites_plan(in_scope, amendment_round):
+            amend_calls.append(amendment_round)
+            assert workflow.artifacts is not None
+            plan_path = workflow.artifacts.root / 'plan.json'
+            data = json.loads(plan_path.read_text())
+            data['_session_id'] = 'foreign-session'
+            plan_path.write_text(json.dumps(data))
+            assert workflow.artifacts.validate_plan_owner(
+                workflow.session_id,
+            ) is False
+            workflow._escalate_plan_overwrite()
+            return False
+        workflow._amend = _amend_overwrites_plan  # type: ignore[method-assign]
+
+        outcome = await workflow._execute_verify_review_loop()
+
+        assert amend_calls == [1]
+        assert outcome == WorkflowOutcome.ESCALATED
+        # _amend's _escalate_plan_overwrite filed a blocking L0.
+        pending = queue.get_by_task('42', status='pending', level=0)
+        assert any(e.severity == 'blocking' for e in pending)
+
+
+@pytest.mark.asyncio
+class TestMergePhaseEscalationGate:
+    """Fix 3: Defense-in-depth gate at MERGE entry.  A blocking L0 escalation
+    queued during execute/verify/review (from any code path — including
+    future ones not currently checked) must gate the merge.
+    """
+
+    async def test_pending_l0_blocks_merge(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # Inject a blocking L0 escalation BEFORE workflow.run() reaches
+        # MERGE.  The simplest hook: stub _execute_verify_review_loop to
+        # submit the escalation as a side effect, then return DONE.
+        async def _exec_and_escalate():
+            queue.submit(Escalation(
+                id=queue.make_id(task_assignment.task_id),
+                task_id=task_assignment.task_id,
+                agent_role='implementer',
+                severity='blocking',
+                category='infra_issue',
+                summary='spurious escalation queued mid-run',
+                detail='simulates an L0 created outside the standard '
+                'implementer/debugger callsites that should still gate merge',
+                level=0,
+            ))
+            return WorkflowOutcome.DONE
+        workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
+
+        outcome = await workflow.run()
+
+        # MERGE-phase gate must intercept before submitting to the queue.
+        assert outcome == WorkflowOutcome.ESCALATED
+        # The escalation is still pending (not consumed by the gate).
+        pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=0,
+        )
+        assert len(pending) == 1
+
+
+@pytest.mark.asyncio
+class TestStaleL1DoesNotSinkRun:
+    """Fix 4: A pending L1 escalation from a prior run must NOT cause
+    ``_execute_iterations`` (or ``_verify_debugfix_loop``) to return
+    ESCALATED.  L1 escalations are by definition handed off to a human
+    or escalation-watcher; sinking the current run on them caused the
+    run-2 false-blocked outcome (esc-2911-22).
+    """
+
+    async def test_pending_l1_ignored_by_execute_iterations(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+        from orchestrator.artifacts import TaskArtifacts
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        # Pre-existing L1 from a prior run (already escalated to a
+        # human).  The current-run check at workflow.py:2193 must skip
+        # this and let execute return DONE.
+        queue.submit(Escalation(
+            id=queue.make_id(task_assignment.task_id),
+            task_id=task_assignment.task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='task_failure',
+            summary='Steward handed off to human (prior run)',
+            detail='Stale — not actionable by the current run',
+            level=1,
+        ))
+
+        # Wire up artifacts and worktree the way TaskWorkflow.run() does
+        # so we can call _execute_iterations directly.
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init('42', 'T', 'd', base_commit='deadbeef')
+        plan = dict(PLAN)
+        plan['steps'] = [
+            {**s, 'status': 'pending'} for s in plan['steps']
+        ]
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+
+        # Patch invoke + verify so a real implementer pass succeeds.
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        # Initialise a real git repo inside wt so the implementer's
+        # git commits work (AgentStub._implementer runs `git add`/commit).
+        await _init_repo(wt)
+
+        # Disable inter-iteration rebase to avoid main-branch lookups.
+        workflow.config.inter_iteration_rebase = False
+
+        outcome = await workflow._execute_iterations()
+
+        # Despite the pending L1, the run is allowed to complete.
+        assert outcome == WorkflowOutcome.DONE
+        # And the L1 stays pending (not auto-resolved).
+        still_pending = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=1,
+        )
+        assert len(still_pending) == 1
+
+
 @pytest.mark.asyncio
 class TestAllAccountsCappedExceptionBoundary:
     """Verify AllAccountsCappedException is caught at the workflow boundary.

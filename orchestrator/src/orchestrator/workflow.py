@@ -657,6 +657,24 @@ class TaskWorkflow:
                 if not self._worktree_external:
                     self._enter_phase(WorkflowState.MERGE)
 
+                    # Defense-in-depth: any blocking L0 escalation created
+                    # during execute/verify/review (e.g. plan-overwrite from
+                    # _amend, or any future code path that escalates outside
+                    # the implementer/debugger callsites) must gate the
+                    # merge.  Without this, an escalation queued mid-run
+                    # would sit invisible while a merge proceeded.
+                    pending_blocking_l0 = [
+                        e for e in self._check_escalations()
+                        if e.severity == 'blocking' and e.level == 0
+                    ]
+                    if pending_blocking_l0:
+                        logger.warning(
+                            'Task %s: %d pending L0 blocking escalation(s) '
+                            'at MERGE entry — bailing to ESCALATED',
+                            self.task_id, len(pending_blocking_l0),
+                        )
+                        return WorkflowOutcome.ESCALATED
+
                     # Ghost-loop early exit: if branch is already on main,
                     # skip the entire merge phase (prevents infinite retry
                     # when code was merged by an external actor).
@@ -2068,7 +2086,9 @@ class TaskWorkflow:
                                 'Task %s: archived reviews to %s',
                                 self.task_id, archive_dir.name,
                             )
-                    await self._amend(in_scope, amendment_round)
+                    amend_ok = await self._amend(in_scope, amendment_round)
+                    if not amend_ok:
+                        return WorkflowOutcome.ESCALATED
                     self.metrics.amendment_rounds += 1
                     continue  # re-loop: EXECUTE → VERIFY → REVIEW
 
@@ -2165,8 +2185,15 @@ class TaskWorkflow:
 
             self.metrics.execute_iterations += 1
 
-            # Check for escalations
-            blocking = [e for e in self._check_escalations() if e.severity == 'blocking']
+            # Check for escalations.  L1 (already-escalated-to-human) issues
+            # from prior runs of this same task stay in the queue until a
+            # human or escalation-watcher resolves them; we must not let them
+            # sink the current run.  Only fresh L0 blocking escalations
+            # gate progress here.
+            blocking = [
+                e for e in self._check_escalations()
+                if e.severity == 'blocking' and e.level == 0
+            ]
             if blocking:
                 return WorkflowOutcome.ESCALATED
 
@@ -2461,8 +2488,13 @@ class TaskWorkflow:
                 'source': 'orchestrator',
             })
 
-            # Check for escalations from debugger
-            blocking = [e for e in self._check_escalations() if e.severity == 'blocking']
+            # Check for escalations from debugger.  Same L0-only filter as
+            # the post-implementer check — a stale L1 from a prior run must
+            # not sink a successful debug pass.
+            blocking = [
+                e for e in self._check_escalations()
+                if e.severity == 'blocking' and e.level == 0
+            ]
             if blocking:
                 return WorkflowOutcome.ESCALATED
 
@@ -2640,13 +2672,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _amend(
         self, in_scope: list[dict], amendment_round: int,
-    ) -> None:
+    ) -> bool:
         """Invoke the implementer to apply in-scope review suggestions.
 
         Amendment passes skip the architect entirely — the plan is frozen,
         no new steps are added, the implementer patches the existing diff
         in place. Scope is enforced by the ``_suggestions_in_scope`` filter
         upstream (module-lock membership) and reinforced in the prompt.
+
+        Returns:
+            True on success. False if the amendment overwrote plan.json
+            (ownership mismatch) — in that case ``_escalate_plan_overwrite``
+            is called and the caller MUST halt the workflow rather than
+            continue as if the pass succeeded.
         """
         assert self.worktree is not None and self.artifacts is not None
 
@@ -2687,6 +2725,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, amendment_round,
             )
             self._escalate_plan_overwrite()
+            return False
+
+        return True
 
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,

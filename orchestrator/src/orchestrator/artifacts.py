@@ -565,7 +565,13 @@ class TaskArtifacts:
         self._write_json(self.root / 'plan.json', plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:
-        """Return True if plan.json's _session_id matches the given session_id.
+        """Return True if *session_id* owns plan.json.
+
+        Two acceptance criteria:
+        - ``_session_id == session_id`` — original planner / freshly stamped.
+        - ``_revalidated_by_session == session_id`` — Lever B revalidation_skip
+          preserves the original ``_session_id`` for audit but transfers
+          ownership to the revalidating session via ``_revalidated_by_session``.
 
         Returns False on any read or parse error (JSONDecodeError, OSError, etc.)
         so that a corrupt or unreadable plan.json triggers the ownership-mismatch
@@ -574,7 +580,9 @@ class TaskArtifacts:
         try:
             plan_path = self.root / 'plan.json'
             data = json.loads(plan_path.read_text())
-            return data.get('_session_id') == session_id
+            if data.get('_session_id') == session_id:
+                return True
+            return data.get('_revalidated_by_session') == session_id
         except Exception as exc:
             logger.warning(
                 'validate_plan_owner: failed to read/parse plan.json — treating as mismatch: %s',
