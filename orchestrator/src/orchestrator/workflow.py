@@ -499,6 +499,16 @@ class TaskWorkflow:
                     # merge-queue halt if the workflow gets soft-cancelled
                     # mid-merge.
                     return plan_outcome
+                if plan_outcome == WorkflowOutcome.ESCALATED:
+                    # _mark_blocked returned ESCALATED: status='blocked' was already
+                    # written, an L1 escalation is open, the steward handed off to
+                    # a human.  Falling through to the post-PLAN ghost-loop guard
+                    # would mistake any architect scratch in the worktree for
+                    # "prior merge survived" and try to flip status to 'done'
+                    # (the done_provenance gate currently blocks the DB write but
+                    # the workflow logs a fake DONE — don't lie).  See task 2911
+                    # incident 2026-05-06; mirrors 9760ba74bf for the DONE case.
+                    return plan_outcome
                 # WorkflowOutcome.PLANNED falls through to execute/verify/review.
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
@@ -536,12 +546,19 @@ class TaskWorkflow:
                 # the branch has real work and we should skip to DONE.  Passing
                 # wt_head would cause the SHA-primary check to return has_work=False
                 # on any rebased branch, silently discarding completed work.
+                #
+                # SINGLE SIGNAL — iteration log only.  We previously OR'd in
+                # has_uncommitted_work as a backstop for the "merged but iteration
+                # log empty" case, but that case is caught earlier by
+                # _recover_if_already_merged() with SHA-primary semantics.  The
+                # uncommitted backstop backfires whenever the architect leaves
+                # scratch behind on a budget-exhaustion escalation — the worktree
+                # has dirty files, the branch is on main, but no real work was
+                # done.  Task 2911 (2026-05-06) hit exactly this and the workflow
+                # tried to flip status to 'done' on an unimplemented task.
                 assert _branch_check is not None  # narrowing: already_on_main is True
                 wt_head, _ = _branch_check
-                has_work = (
-                    self._has_prior_implementation().has_work
-                    or await self.git_ops.has_uncommitted_work(self.worktree)
-                )
+                has_work = self._has_prior_implementation().has_work
                 if has_work:
                     logger.info(
                         f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
