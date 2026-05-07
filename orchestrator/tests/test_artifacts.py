@@ -228,6 +228,28 @@ class TestPlanProvenance:
         # Not stamped — no _session_id in plan
         assert artifacts.validate_plan_owner('session-abc123') is False
 
+    def test_validate_plan_owner_true_for_revalidating_session(
+        self, artifacts: TaskArtifacts,
+    ):
+        """Lever B's bump_revalidation_stamp preserves the original
+        ``_session_id`` for audit but transfers ownership to the
+        revalidating session via ``_revalidated_by_session``.  Both
+        sessions must be accepted as valid owners; a third party still
+        is not.
+        """
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('orig-planner')
+        artifacts.bump_revalidation_stamp('reval-runner')
+
+        plan = artifacts.read_plan()
+        # Sanity: original _session_id is intact, revalidation field set.
+        assert plan['_session_id'] == 'orig-planner'
+        assert plan['_revalidated_by_session'] == 'reval-runner'
+
+        assert artifacts.validate_plan_owner('orig-planner') is True
+        assert artifacts.validate_plan_owner('reval-runner') is True
+        assert artifacts.validate_plan_owner('foreign-session') is False
+
     def test_stamp_plan_provenance_raises_on_missing_plan(self, artifacts: TaskArtifacts):
         """stamp_plan_provenance() must raise ValueError if plan.json does not exist."""
         # Ensure plan.json does not exist

@@ -301,6 +301,32 @@ async def test_blast_radius_denied_falls_through(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_post_skip_revalidating_session_owns_plan(tmp_path: Path):
+    """After a Lever B skip, ``validate_plan_owner`` must accept the
+    revalidating session — otherwise the very next ``_amend`` call inside
+    the same run would fire a spurious ``_escalate_plan_overwrite``
+    (the run-3 bug, esc-2911-39).
+
+    The original planner remains a valid owner (audit trail), and a third
+    party is still rejected.
+    """
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+    outcome = await f.wf._plan()
+    assert outcome == WorkflowOutcome.PLANNED
+
+    # The session driving _plan() is the revalidating session — it must
+    # now own the plan even though _session_id was preserved.
+    assert f.artifacts.validate_plan_owner(f.wf.session_id) is True
+
+    # Original planner still recognised (the preserved _session_id).
+    assert f.artifacts.validate_plan_owner('prior-session-aaa') is True
+
+    # Foreign sessions still rejected.
+    assert f.artifacts.validate_plan_owner('foreign-session') is False
+
+
+@pytest.mark.asyncio
 async def test_blast_radius_granted_succeeds(tmp_path: Path):
     f = _make(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
