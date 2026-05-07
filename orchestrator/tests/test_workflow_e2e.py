@@ -2296,6 +2296,62 @@ class TestGhostLoopGuard:
         # The implementer must NOT have been called (ghost-loop skipped)
         assert 'implementer' not in stub.calls
 
+    async def test_uncommitted_scratch_alone_does_not_skip_to_done(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Worktree on main + uncommitted scratch but NO iteration log → must execute.
+
+        Regression for the 2026-05-06 task 2911 incident: the post-PLAN
+        ghost-loop guard used to OR ``has_uncommitted_work`` into the
+        ``has_work`` signal, causing architect leftovers (scratch files left
+        behind on a budget-exhaustion escalation) to masquerade as a prior
+        merge and trigger a phony skip-to-DONE.
+
+        After Fix 3, the iteration log is the sole authoritative signal at
+        this site — uncommitted edits without an implementer entry are not
+        evidence of a successful prior merge.
+        """
+        # 1. Pre-create the worktree (no implementer entries written).
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
+        # NOTE: deliberately NO iterations.jsonl entries — has_prior_implementation
+        # must return has_work=False on the iteration-log signal.
+
+        # 2. Plant uncommitted scratch in the worktree (architect leftovers).
+        # This used to trip the now-removed has_uncommitted_work backstop.
+        (wt / 'scratch_note.txt').write_text('architect scribbles\n')
+
+        # 3. Force the worktree HEAD to be an ancestor of main by advancing
+        # main with an unrelated commit (worktree branch HEAD remains on the
+        # base commit, which is now reachable from main).
+        (config.project_root / 'other.py').write_text('x = 1\n')
+        from orchestrator.git_ops import _run
+        await _run(['git', 'add', '-A'], cwd=config.project_root)
+        await _run(['git', 'commit', '-m', 'Advance main'], cwd=config.project_root)
+
+        # 4. Run workflow — must NOT skip to DONE on the basis of scratch alone.
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # The implementer MUST have been called — uncommitted scratch alone
+        # is not evidence of a prior merge, so the ghost-loop guard must
+        # fall through to EXECUTE.
+        assert 'implementer' in stub.calls
+
 
 # ---------------------------------------------------------------------------
 # Tests: WIP Recovery No Advance (pop_conflict on CAS-failure path)

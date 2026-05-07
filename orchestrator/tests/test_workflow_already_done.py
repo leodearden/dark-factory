@@ -230,3 +230,75 @@ async def test_run_short_circuits_on_architect_already_done(tmp_path: Path):
     assert merge_queue.empty(), (
         'No merge request must be enqueued when _plan returns DONE'
     )
+
+
+@pytest.mark.asyncio
+async def test_run_short_circuits_on_plan_escalated(tmp_path: Path):
+    """``run()`` returns ESCALATED without entering the post-PLAN ghost-loop guard.
+
+    Regression for the 2026-05-06 task 2911 incident: when ``_plan`` →
+    ``_mark_blocked`` returns ESCALATED (architect blew its budget, steward
+    timed out, L1 escalation filed), the post-_plan switch in run() didn't
+    match ESCALATED and let control fall through to the ghost-loop guard,
+    which mistook architect scratch in the worktree for "prior merge
+    survived" and tried to flip the task to done.
+
+    This test sets up the conditions that *would* cause the fall-through to
+    misfire — branch already on main + uncommitted scratch in worktree —
+    and proves the early-return in run() ignores both.
+
+    Mirrors fix 9760ba74bf for the DONE case (same shape, different outcome).
+    """
+    import asyncio
+
+    f = _make(
+        worktree=tmp_path / 'wt',
+        project_root=tmp_path / 'proj',
+        commit_on_main=True,
+    )
+
+    # Stub _plan to return ESCALATED — simulates _mark_blocked's L1-handoff path.
+    f.wf._plan = AsyncMock(return_value=WorkflowOutcome.ESCALATED)
+    # If EXECUTE were entered, this would raise loudly.
+    f.wf._execute_iterations = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError(
+            'EXECUTE must not run when _plan returns ESCALATED',
+        ),
+    )
+    # Wire a merge queue and assert nothing gets enqueued.
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    f.wf.merge_queue = merge_queue
+    # _recover_if_already_merged returns None — let run() proceed to PLAN.
+    f.wf._recover_if_already_merged = AsyncMock(  # type: ignore[method-assign]
+        return_value=None,
+    )
+    # Set up the ghost-loop guard's preconditions DELIBERATELY so it would
+    # misfire if we reached it: branch HEAD genuinely on main + scratch in
+    # the worktree.  Fix 1's job is to return ESCALATED before this code
+    # runs at all — so we assert these stubs were NOT consulted.
+    check_branch = AsyncMock(return_value=('wthead12', 'mainsha123'))
+    f.wf._check_branch_on_main = check_branch  # type: ignore[method-assign]
+    f.wf.git_ops.has_uncommitted_work = AsyncMock(return_value=True)
+
+    outcome = await f.wf.run()
+
+    assert outcome == WorkflowOutcome.ESCALATED
+    f.wf._execute_iterations.assert_not_called()
+    assert merge_queue.empty(), (
+        'No merge request must be enqueued when _plan returns ESCALATED'
+    )
+    # Critical: the post-PLAN ghost-loop guard MUST NOT have been reached.
+    # If it had, _check_branch_on_main would have been awaited (and the
+    # truthy return would have set already_on_main=True; combined with
+    # has_uncommitted_work=True, the buggy code would have logged "prior
+    # merge survived" and tried to flip status to done).
+    check_branch.assert_not_called()
+    f.wf.git_ops.has_uncommitted_work.assert_not_called()
+    # And status must NOT have been flipped to done.
+    set_done_calls = [
+        c for c in f.set_task_status.await_args_list
+        if len(c.args) >= 2 and c.args[1] == 'done'
+    ]
+    assert not set_done_calls, (
+        'Task status must not be flipped to done when _plan returns ESCALATED'
+    )
