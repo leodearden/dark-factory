@@ -365,4 +365,139 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     assert 'escalated_at' in cols
     # And idempotent: re-initialising must not raise.
     await store.initialize()
+
+
+# ---------------------------------------------------------------------------
+# extend_pending_expiry — capacity-blocked TTL compensation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_extend_pending_expiry_advances_only_pending_in_project(store):
+    """Only pending rows in the named project are pushed forward."""
+    p1_pending = await store.submit(project_id='p1', candidate_json='{}', ttl_seconds=600)
+    p2_pending = await store.submit(project_id='p2', candidate_json='{}', ttl_seconds=600)
+    p1_terminal = await store.submit(project_id='p1', candidate_json='{}', ttl_seconds=600)
+    await _force_failed(store, p1_terminal, reason='whatever')
+
+    before = {
+        p1_pending: (await store.get(p1_pending))['expires_at'],
+        p2_pending: (await store.get(p2_pending))['expires_at'],
+        p1_terminal: (await store.get(p1_terminal))['expires_at'],
+    }
+
+    n = await store.extend_pending_expiry('p1', seconds=100)
+    assert n == 1, 'only the single pending p1 row should have been updated'
+
+    after_p1 = (await store.get(p1_pending))['expires_at']
+    after_p2 = (await store.get(p2_pending))['expires_at']
+    after_p1_terminal = (await store.get(p1_terminal))['expires_at']
+
+    # p1 pending row moved forward by ~100s (sqlite datetime arithmetic
+    # rounds to whole seconds for integer additions, but our ".3f" format
+    # passes a fractional value through; either way, post > pre).
+    pre_dt = datetime.fromisoformat(before[p1_pending])
+    post_dt = datetime.fromisoformat(after_p1)
+    delta = (post_dt - pre_dt).total_seconds()
+    assert 99.0 <= delta <= 101.0, f'expected ~100s shift, got {delta}'
+
+    # The other rows are untouched.
+    assert after_p2 == before[p2_pending]
+    assert after_p1_terminal == before[p1_terminal]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('seconds', [0, -1, -100.5])
+async def test_extend_pending_expiry_zero_or_negative_is_noop(store, seconds):
+    """Non-positive values short-circuit without touching the DB."""
+    pid = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    before = (await store.get(pid))['expires_at']
+
+    n = await store.extend_pending_expiry('p', seconds=seconds)
+    assert n == 0
+
+    after = (await store.get(pid))['expires_at']
+    assert after == before
+
+
+# ---------------------------------------------------------------------------
+# list_tickets — caller-facing discovery
+# ---------------------------------------------------------------------------
+
+
+async def _force_created_at(store: TicketStore, ticket_id: str, when: datetime) -> None:
+    """Test helper: rewrite a ticket's created_at so window filters can be exercised."""
+    db = store._db
+    await db.execute(
+        'UPDATE tickets SET created_at = ? WHERE ticket_id = ?',
+        (when.isoformat(), ticket_id),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_list_tickets_default_window_7d(store):
+    """Default window (no since=) returns rows newer than now-7d only."""
+    now = datetime.now(UTC)
+    recent = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    old = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    await _force_created_at(store, recent, now - timedelta(days=1))
+    await _force_created_at(store, old, now - timedelta(days=8))
+
+    rows = await store.list_tickets('p')
+    ids = [r['ticket_id'] for r in rows]
+    assert recent in ids
+    assert old not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_tickets_status_filter_excludes_other_states(store):
+    """status='failed' returns only the failed row."""
+    pending = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    failed = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    combined = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    await _force_failed(store, failed, reason='curator_failed')
+    db = store._db
+    await db.execute(
+        "UPDATE tickets SET status='combined', resolved_at=? WHERE ticket_id=?",
+        (datetime.now(UTC).isoformat(), combined),
+    )
+    await db.commit()
+
+    rows = await store.list_tickets('p', status='failed')
+    ids = {r['ticket_id'] for r in rows}
+    assert ids == {failed}, f'expected only {failed}, got {ids}'
+
+    pending_rows = await store.list_tickets('p', status='pending')
+    assert {r['ticket_id'] for r in pending_rows} == {pending}
+
+
+@pytest.mark.asyncio
+async def test_list_tickets_orders_newest_first_and_caps_at_limit(store):
+    """Rows come back in DESC created_at order and the limit is honoured."""
+    now = datetime.now(UTC)
+    ids: list[str] = []
+    for i in range(5):
+        tid = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+        await _force_created_at(store, tid, now - timedelta(minutes=i))
+        ids.append(tid)
+    # ids[0] is newest (offset 0min), ids[4] is oldest (offset 4min).
+
+    rows = await store.list_tickets('p')
+    assert [r['ticket_id'] for r in rows] == ids, 'expected newest-first ordering'
+
+    capped = await store.list_tickets('p', limit=2)
+    assert [r['ticket_id'] for r in capped] == ids[:2]
+
+
+@pytest.mark.asyncio
+async def test_list_tickets_filters_by_project(store):
+    """Rows from another project never leak into the result."""
+    a_id = await store.submit(project_id='proj-a', candidate_json='{}', ttl_seconds=600)
+    b_id = await store.submit(project_id='proj-b', candidate_json='{}', ttl_seconds=600)
+
+    a_rows = await store.list_tickets('proj-a')
+    assert {r['ticket_id'] for r in a_rows} == {a_id}
+    b_rows = await store.list_tickets('proj-b')
+    assert {r['ticket_id'] for r in b_rows} == {b_id}
     await store.close()
