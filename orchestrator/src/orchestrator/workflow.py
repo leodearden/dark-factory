@@ -40,7 +40,12 @@ from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.scheduler import TaskAssignment, files_to_modules, normalize_lock
+from orchestrator.scheduler import (
+    TaskAssignment,
+    TerminalExitRejection,
+    files_to_modules,
+    normalize_lock,
+)
 from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import VerifyResult, run_scoped_verification
@@ -89,6 +94,7 @@ class _SchedulerLike(Protocol):
         self, task_id: str, current: list[str], needed: list[str], /
     ) -> bool: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
+    async def get_task(self, task_id: str, /) -> dict | None: ...
     async def update_task(
         self, task_id: str, metadata: str | dict,
     ) -> bool: ...
@@ -885,10 +891,10 @@ class TaskWorkflow:
             # Stop steward if running
             if self._steward:
                 await self._steward.stop()
-            # Cleanup worktree (only if done — keep for debugging if blocked)
-            # Skip cleanup for externally-managed worktrees (eval mode)
-            if self.state == WorkflowState.DONE and self.worktree and not self._worktree_external:
-                await self.git_ops.cleanup_worktree(self.worktree, branch_name)
+            # Cleanup worktree (only if done AND branch is on main — preserve
+            # otherwise so an agent's update_task(status='done') bypass doesn't
+            # GC unmerged work). Skips externally-managed worktrees (eval mode).
+            await self._maybe_cleanup_done_worktree()
             # Cleanup per-task config dir
             if self._config_dir:
                 self._config_dir.cleanup()
@@ -3816,6 +3822,166 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         self.escalation_queue.submit(esc)
 
+    async def _handle_terminal_exit_on_block(
+        self,
+        exc: TerminalExitRejection,
+        reason: str,
+        detail: str,
+    ) -> WorkflowOutcome | None:
+        """Detect ``update_task(status='done')`` bypass after a terminal-exit rejection.
+
+        When ``set_task_status('blocked')`` raises ``TerminalExitRejection``
+        the row is already terminal. Two sub-cases:
+
+        1. Legitimate done — ``metadata.done_provenance.commit`` is reachable
+           from main. Return ``None`` so the existing flow continues; the
+           post-steward branch at ``current == 'done'`` returns DONE.
+        2. Bypass — provenance missing or commit not on main. Reopen the row
+           via ``set_task_status('blocked', reopen_reason='bypass detected: …')``
+           (which the server accepts), file an L1 with
+           ``category='bypass_done'``, and return ``WorkflowOutcome.BLOCKED``.
+        """
+        task = await self.scheduler.get_task(self.task_id)
+        metadata: dict = {}
+        if isinstance(task, dict):
+            raw_meta = task.get('metadata')
+            if isinstance(raw_meta, dict):
+                metadata = raw_meta
+            elif isinstance(raw_meta, str) and raw_meta:
+                try:
+                    parsed = json.loads(raw_meta)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    metadata = parsed
+
+        provenance = metadata.get('done_provenance') if metadata else None
+        commit = ''
+        if isinstance(provenance, dict):
+            commit = str(provenance.get('commit') or '').strip()
+
+        if commit:
+            try:
+                main_sha = await self.git_ops.get_main_sha()
+                if await self.git_ops.is_ancestor(commit, main_sha):
+                    logger.info(
+                        'Task %s: terminal-exit on _mark_blocked but provenance '
+                        'commit %s is reachable from main — legitimate done',
+                        self.task_id, commit[:12],
+                    )
+                    return None
+            except Exception:
+                logger.warning(
+                    'Task %s: ancestor check failed during bypass detection',
+                    self.task_id, exc_info=True,
+                )
+
+        logger.warning(
+            'Task %s: terminal-exit on _mark_blocked with missing or off-main '
+            'done_provenance (commit=%s); reopening + filing L1 bypass_done',
+            self.task_id, commit[:12] if commit else '<none>',
+        )
+
+        bypass_summary = f'bypass detected: {reason[:160]}'
+        try:
+            await self.scheduler.set_task_status(
+                self.task_id, 'blocked', reopen_reason=bypass_summary,
+            )
+        except Exception:
+            logger.exception(
+                'Task %s: reopen with reopen_reason failed; continuing to L1',
+                self.task_id,
+            )
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+            l1 = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='bypass_done',
+                summary=(
+                    f'Mark-done bypass detected for task {self.task_id}: '
+                    f'row already done, provenance commit not on main'
+                ),
+                detail=(
+                    f'reason: {reason}\n'
+                    f'detail: {detail}\n'
+                    f'old_status: {exc.old_status}\n'
+                    f'evidence_commit: {commit or "<none>"}\n'
+                ),
+                suggested_action='investigate_bypass_done',
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+                level=1,
+            )
+            self.escalation_queue.submit(l1)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={
+                        'escalation_id': l1.id, 'category': 'bypass_done',
+                        'severity': 'blocking', 'level': 1,
+                        'summary': l1.summary[:200],
+                    },
+                )
+
+        return WorkflowOutcome.BLOCKED
+
+    async def _maybe_cleanup_done_worktree(self) -> None:
+        """Clean up worktree+branch only when the branch is reachable from main.
+
+        Forensics 2026-05-08: when an agent bypassed the merge via
+        ``update_task(status='done')``, the workflow returned DONE while the
+        branch HEAD was still off-main. Cleanup deleted the unmerged branch;
+        only the loose-object grace period kept the work recoverable.
+
+        Mirrors the predicate at ``run()``'s ghost-loop early exit.
+        """
+        if (
+            self.state != WorkflowState.DONE
+            or self.worktree is None
+            or self._worktree_external
+        ):
+            return
+        branch_name = self.task_id
+        try:
+            rc, branch_head_raw, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+            )
+        except Exception:
+            logger.warning(
+                'Task %s: rev-parse HEAD failed in cleanup gate; preserving worktree',
+                self.task_id, exc_info=True,
+            )
+            return
+        if rc != 0:
+            logger.warning(
+                'Task %s: rev-parse HEAD returned %d in cleanup gate; '
+                'preserving worktree+branch for inspection',
+                self.task_id, rc,
+            )
+            return
+        branch_head = branch_head_raw.strip()
+        try:
+            main_sha = await self.git_ops.get_main_sha()
+        except Exception:
+            logger.warning(
+                'Task %s: get_main_sha failed in cleanup gate; preserving worktree',
+                self.task_id, exc_info=True,
+            )
+            return
+        if await self.git_ops.is_ancestor(branch_head, main_sha):
+            await self.git_ops.cleanup_worktree(self.worktree, branch_name)
+            return
+        logger.warning(
+            'Task %s: state=DONE but branch HEAD %s not reachable from main %s '
+            '— preserving worktree+branch for inspection',
+            self.task_id, branch_head[:12], main_sha[:12],
+        )
+
     async def _mark_blocked(
         self, reason: str, *, detail: str = '',
         skip_escalation: bool = False,
@@ -3852,7 +4018,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self._last_block_detail = detail or reason
         if not merge_phase:
             self._enter_phase(WorkflowState.BLOCKED)
-            await self.scheduler.set_task_status(self.task_id, 'blocked')
+            try:
+                await self.scheduler.set_task_status(self.task_id, 'blocked')
+            except TerminalExitRejection as exc:
+                bypass_outcome = await self._handle_terminal_exit_on_block(
+                    exc, reason, detail or reason,
+                )
+                if bypass_outcome is not None:
+                    return bypass_outcome
+                # Legitimate done — fall through; the existing post-steward
+                # flow below handles current==done by returning DONE.
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:

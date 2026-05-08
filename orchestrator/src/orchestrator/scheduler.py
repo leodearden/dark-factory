@@ -51,9 +51,41 @@ __all__ = [
     'TaskAssignment',
     'ModuleLockTable',
     'Scheduler',
+    'TerminalExitRejection',
     'extract_rejection',
+    'extract_structured_rejection',
     'is_transient_rejection',
 ]
+
+
+# Server-side terminal statuses (mirrors fused-memory's TERMINAL_STATUSES).
+# Used to classify a ``terminal_exit_rejected`` response as a logical
+# contradiction (terminal -> non-terminal with no reopen_reason) versus a
+# benign side-effect of an idempotent terminal -> terminal write.
+_TERMINAL_STATUSES = frozenset({'done', 'cancelled'})
+
+
+class TerminalExitRejection(Exception):
+    """Server's terminal-exit gate refused a non-terminal write because the row is terminal.
+
+    Raised only when the rejection is a logical contradiction (caller asked
+    for a non-terminal status with no reopen_reason on a terminal row).
+    Callers that need to write 'pending' / 'blocked' / 'in-progress' must
+    catch this and decide whether to reopen explicitly or accept the
+    terminal state. The most important caller is
+    ``workflow._mark_blocked`` which uses the exception as the trip-wire
+    to detect an out-of-band ``update_task(status='done')`` bypass.
+    """
+
+    def __init__(self, task_id: str, old_status: str, target_status: str, raw: str):
+        self.task_id = task_id
+        self.old_status = old_status
+        self.target_status = target_status
+        self.raw = raw
+        super().__init__(
+            f'set_task_status({task_id!r}, {target_status!r}) refused: '
+            f'task is currently {old_status!r} (terminal-exit gate)'
+        )
 
 # Error-type names that indicate a transient backend failure (taskmaster
 # child reconnecting, fused-memory crashed mid-call, network blip).  Matches
@@ -103,6 +135,38 @@ def extract_rejection(response: Any) -> str | None:
         return f'{payload["error"]}{" — " + hint if hint else ""}'
     if payload.get('success') is False:
         return f'success=False payload={payload!r}'
+    return None
+
+
+def extract_structured_rejection(response: Any) -> dict | None:
+    """Return the structured rejection payload as a dict, or None on success.
+
+    Parallel to :func:`extract_rejection`, but returns the raw payload so
+    callers can inspect typed fields (``error``, ``from_status``, …) without
+    re-parsing the rendered string. Used by ``set_task_status`` to classify
+    ``terminal_exit_rejected`` responses as logical contradictions worthy of
+    raising ``TerminalExitRejection``.
+    """
+    if not isinstance(response, dict):
+        return None
+    result = response.get('result', response)
+    if not isinstance(result, dict):
+        return None
+    payload = result.get('structuredContent')
+    if not isinstance(payload, dict):
+        for block in result.get('content', []) or []:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                try:
+                    payload = json.loads(block.get('text') or '')
+                except (ValueError, TypeError):
+                    payload = None
+                break
+    if not isinstance(payload, dict):
+        return None
+    if payload.get('error'):
+        return payload
+    if payload.get('success') is False:
+        return payload
     return None
 
 
@@ -625,6 +689,24 @@ class Scheduler:
                 return  # success
             last_rejection = rejection
             if not is_transient_rejection(rejection):
+                # Distinguish logical-contradiction terminal_exit_rejected
+                # responses (caller asked for a non-terminal target with no
+                # reopen_reason on a terminal row) from benign rejections.
+                # Only the contradiction path raises — every other caller
+                # site already swallows the warning + returns.
+                structured = extract_structured_rejection(response)
+                if (
+                    isinstance(structured, dict)
+                    and structured.get('error') == 'terminal_exit_rejected'
+                    and status not in _TERMINAL_STATUSES
+                    and reopen_reason is None
+                ):
+                    raise TerminalExitRejection(
+                        task_id=task_id,
+                        old_status=str(structured.get('from_status', '')),
+                        target_status=status,
+                        raw=rejection,
+                    )
                 logger.warning(
                     'set_task_status(%s, %s) rejected by fused-memory: %s',
                     task_id, status, rejection,
@@ -666,6 +748,45 @@ class Scheduler:
         status = self._parse_tool_text_result(result, 'status')
         if isinstance(status, str):
             return status
+        return None
+
+    async def get_task(self, task_id: str) -> dict | None:
+        """Fetch the full task dict (including metadata) from fused-memory.
+
+        Used by the workflow's bypass-detection path to inspect
+        ``metadata.done_provenance`` after a ``terminal_exit_rejected``
+        rejection. Returns ``None`` on failure or absence.
+        """
+        try:
+            result = await self.dispatch_tool(
+                'get_task',
+                {'id': task_id, 'project_root': self._project_root},
+                timeout=15,
+            )
+        except Exception as e:
+            logger.exception(
+                'Failed to get task %s: %s: %s',
+                task_id, type(e).__name__, e,
+            )
+            return None
+        # The MCP tool returns the task wrapped in {data: {...}}; unwrap via
+        # the same text-block parser used by get_status.
+        if not isinstance(result, dict):
+            return None
+        for block in result.get('result', {}).get('content', []) or []:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                try:
+                    data = json.loads(block.get('text') or '')
+                except (ValueError, TypeError):
+                    return None
+                if isinstance(data, dict):
+                    inner = (
+                        data.get('data')
+                        if isinstance(data.get('data'), dict)
+                        else data
+                    )
+                    return inner if isinstance(inner, dict) else None
+                return None
         return None
 
     async def get_statuses(

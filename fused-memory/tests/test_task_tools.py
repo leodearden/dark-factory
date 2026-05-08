@@ -228,6 +228,44 @@ async def test_update_task_allows_unrelated_metadata(
 
 
 # ------------------------------------------------------------------
+# update_task rejects status= kwarg (2026-05-08 hardening)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked'])
+async def test_update_task_rejects_status_kwarg(
+    mcp_server_with_tasks, task_interceptor, bad_status,
+):
+    """update_task with status= is rejected — agents must use set_task_status.
+
+    Closes the bypass route used to mark reify tasks done without going through
+    the terminal-exit, phantom-done, and done-provenance gates.
+    """
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project', 'status': bad_status},
+    )
+    assert isinstance(result, dict)
+    assert result.get('error') == 'status_via_update_task'
+    assert result.get('status') == bad_status
+    assert 'set_task_status' in result.get('hint', '')
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_none_still_allowed(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """status=None (the default) is the metadata-only path and must still work."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': '/project', 'status': None},
+    )
+    task_interceptor.update_task.assert_called_once()
+
+
+# ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
 

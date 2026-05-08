@@ -1104,6 +1104,30 @@ class TestProactiveSampling:
             "STAGE2_SYSTEM_PROMPT must contain a guideline about reviewing the Proactive Task Sample"
         )
 
+    def test_stage2_directs_cancellation_via_set_task_status(self):
+        """Stage 2 prompt must direct agents to ``set_task_status('cancelled')``.
+
+        Forensics 2026-05-08: server now rejects ``update_task(status=…)``,
+        so any historical "delete via update_task(status='cancelled', …)"
+        guidance is broken. Redirect agents to set_task_status — the only
+        sanctioned writer for terminal status. The ``cancellation_reason``
+        metadata field has zero downstream consumers, so explicit
+        cancellation is enough; rationale belongs in
+        ``add_memory(category='observations_and_summaries')``.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert "set_task_status('cancelled')" in STAGE2_SYSTEM_PROMPT, (
+            "Stage 2 prompt must explicitly direct agents to "
+            "set_task_status('cancelled') for cancellation."
+        )
+        # Server rejects update_task(status=…) — calling out the path here
+        # prevents agents from rediscovering the broken bypass route.
+        assert 'update_task(status=' not in STAGE2_SYSTEM_PROMPT, (
+            'Stage 2 prompt must not reference update_task(status=…); the '
+            'server now rejects that call shape.'
+        )
+
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):

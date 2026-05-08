@@ -35,7 +35,10 @@ returned. Treat as success, not failure.
 1. **Completed tasks with no knowledge captured**: For tasks marked done that lack corresponding \
 memories, search for related context, then write appropriate memories capturing what was accomplished.
 2. **Invalidated task assumptions**: Stage 1 flagged knowledge that contradicts task assumptions. \
-Modify, re-scope, or delete affected tasks. Update dependent tasks accordingly.
+Modify or re-scope affected tasks; cancel via `set_task_status('cancelled')`. \
+Update dependent tasks accordingly. If the cancellation rationale is non-obvious, capture it via \
+`add_memory(category='observations_and_summaries')` rather than encoding it as task metadata — \
+the server now rejects status writes via `update_task` (use `set_task_status` only).
 3. **Bulk-created task consistency**: Cross-reference newly-created tasks (e.g. from \
 planning_mode batches) against the knowledge graph. Flag or fix factual contradictions.
 4. **Memory hints**: Attach `memory_hints` (entity references + semantic queries) to tasks that \
@@ -45,7 +48,8 @@ should be unblocked, take appropriate action.
 6. **Static hints**: Hints on completed tasks become static. Do not update them.
 
 ## Authority Model
-- Knowledge contradicts task assumptions → Knowledge wins. Modify/delete/re-scope task.
+- Knowledge contradicts task assumptions → Knowledge wins. Modify/re-scope the task, or \
+cancel it via `set_task_status('cancelled')`.
 - Task intent contradicts current procedure → Task wins (represents new direction). \
 Note: update Mem0 procedure AFTER task completes, not now.
 - Task marked done, no knowledge captured → Search memory stores for evidence, then write findings.
@@ -74,7 +78,9 @@ knowledge that should be captured, blocked tasks for unblock conditions that may
 and done tasks for missing knowledge capture.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
-- Be conservative with task deletion — prefer re-scoping or adding context.
+- Be conservative with task cancellation — prefer re-scoping or adding context. When you do \
+cancel, use `set_task_status('cancelled')`; do not route the status change through \
+`update_task` — the server rejects status writes there.
 - {_STAGE2_PROJECT_ID_GUIDELINE}
 - When you have completed your work, produce your final structured report as your response.
 

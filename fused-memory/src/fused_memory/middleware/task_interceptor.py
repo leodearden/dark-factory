@@ -679,13 +679,17 @@ class TaskInterceptor:
                     return _terminal_exit_error(task_id, old_status, status)
                 resolved_reopen_reason = reason
                 try:
+                    # Read-modify-write so the audit fields don't clobber the
+                    # row's pre-existing metadata (memory_hints, files, …).
+                    # `before` was fetched at the top of this method.
+                    merged_meta = _merged_audit_metadata(before, {
+                        'reopen_reason': reason,
+                        'reopen_from': old_status,
+                        'reopen_at': datetime.now(UTC).isoformat(),
+                    })
                     await tm.update_task(
                         task_id=task_id,
-                        metadata=json.dumps({
-                            'reopen_reason': reason,
-                            'reopen_from': old_status,
-                            'reopen_at': datetime.now(UTC).isoformat(),
-                        }),
+                        metadata=json.dumps(merged_meta),
                         project_root=project_root,
                         tag=tag,
                     )
@@ -718,9 +722,14 @@ class TaskInterceptor:
                     return validation_err
                 if resolved_provenance is not None:
                     try:
+                        # Read-modify-write: preserve memory_hints / files /
+                        # spawned_from instead of replacing the whole blob.
+                        merged_meta = _merged_audit_metadata(
+                            before, {'done_provenance': resolved_provenance},
+                        )
                         await tm.update_task(
                             task_id=task_id,
-                            metadata=json.dumps({'done_provenance': resolved_provenance}),
+                            metadata=json.dumps(merged_meta),
                             project_root=project_root,
                             tag=tag,
                         )
@@ -2765,6 +2774,8 @@ class TaskInterceptor:
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        if err := _reject_status_in_update_task(task_id, kwargs.get('status')):
+            return err
         if err := _reject_done_provenance_in_update_metadata(
             task_id, kwargs.get('metadata'),
         ):
@@ -3381,6 +3392,60 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
     if not sha or len(sha) < 7:
         return {'reason': 'empty rev-parse output'}
     return sha
+
+
+def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
+    """Merge ``audit_fields`` onto the task's pre-existing metadata.
+
+    ``set_task_status`` writes audit fields (``reopen_reason`` /
+    ``done_provenance``) via a separate ``tm.update_task(metadata=…)`` call.
+    The default Taskmaster path is ``append=False``, which would replace the
+    whole metadata blob — silently dropping ``memory_hints`` / ``files`` and
+    other sibling keys. Read-modify-write here so the audit write merges with
+    whatever was already on the row.
+
+    Audit fields win on collision (a fresh ``reopen_reason`` should never be
+    shadowed by a stale one from an earlier reopen).
+    """
+    existing: dict = {}
+    raw = before.get('metadata') if isinstance(before, dict) else None
+    if isinstance(raw, dict):
+        existing = dict(raw)
+    elif isinstance(raw, str) and raw:
+        try:
+            loaded = json.loads(raw)
+        except (ValueError, TypeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            existing = loaded
+    return {**existing, **audit_fields}
+
+
+def _reject_status_in_update_task(
+    task_id: str, status: object,
+) -> dict | None:
+    """Reject ``update_task(status=…)`` — defence-in-depth alongside ``server/tools.py``.
+
+    ``set_task_status`` is the only sanctioned writer for task status — it
+    enforces the terminal-exit, phantom-done, and done-provenance gates.
+    ``update_task(status=…)`` slipped through all three (2026-05-08 forensics:
+    9 historical ``done`` writes via this path in 36 h on dark-factory). Reject
+    the call before it reaches Taskmaster, regardless of which client called.
+    """
+    if status is None:
+        return None
+    return {
+        'success': False,
+        'error': 'status_via_update_task',
+        'task_id': task_id,
+        'status': status,
+        'hint': (
+            'update_task is metadata-only. Use '
+            'set_task_status(status=…, done_provenance={...} when '
+            'status="done") to change status — it enforces the '
+            'terminal-exit, phantom-done, and done-provenance gates.'
+        ),
+    }
 
 
 def _reject_done_provenance_in_update_metadata(
