@@ -493,6 +493,15 @@ class OrchestratorConfig(BaseSettings):
     # (15 escalations on the same port-1420 collision before
     # verify-budget exhaustion).
     max_consecutive_infra_resumes: int = Field(default=3, ge=1)
+    # Fix 3 — thrash threshold for repeated steward-resolved merge-phase
+    # failures with the same outcome signature.  Counter increments when
+    # the merge queue returns a blocked outcome whose signature matches
+    # the previous attempt; it resets to 1 on a different verdict.  At
+    # threshold the orchestrator escalates to L1 instead of resubmitting
+    # the same merge.  Default 2 — two identical verdicts is enough to
+    # call it a loop in the merge phase (the steward resolution between
+    # them is the mediation we already gave it a chance to perform).
+    max_consecutive_merge_thrash: int = Field(default=2, ge=1)
     requeue_cooldown_secs: float = Field(default=30.0)
     requeue_cap: int = Field(
         default=3,

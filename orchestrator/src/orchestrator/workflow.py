@@ -297,6 +297,11 @@ class TaskWorkflow:
         self._last_block_reason: str = ''
         self._last_block_detail: str = ''
         self._last_block_phase: str = ''
+        # Last blocked-from-merge-queue reason — captured by
+        # _submit_to_merge_queue and consumed by the merge-phase thrash
+        # check (Fix 3).  Cleared between merge attempts so a stale
+        # reason from an earlier task slot can't poison the signature.
+        self._last_merge_block_reason: str | None = None
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -753,6 +758,7 @@ class TaskWorkflow:
                                 )
 
                             # Phase 2: submit to merge queue (replaces _merge_lock)
+                            self._last_merge_block_reason = None
                             merge_outcome = await self._submit_to_merge_queue(
                                 branch_name, pre_rebased=pre_rebased,
                                 merge_phase=True,
@@ -762,6 +768,23 @@ class TaskWorkflow:
                             if merge_outcome != WorkflowOutcome.REQUEUED:
                                 # BLOCKED — steward gave up, terminal
                                 return merge_outcome
+
+                            # Fix 3 — anti-thrash guard for repeated
+                            # steward-resolved merge-phase loops on the same
+                            # outcome signature.  At threshold escalates to L1
+                            # rather than resubmitting the same merge.
+                            if self._last_merge_block_reason is not None:
+                                current_signature = hashlib.sha256(
+                                    self._last_merge_block_reason.encode('utf-8'),
+                                ).hexdigest()[:16]
+                                prev_signature = (
+                                    self.task.get('metadata') or {}
+                                ).get('last_merge_outcome_signature')
+                                thrash_outcome = await self._check_merge_outcome_thrash(
+                                    prev_signature, current_signature,
+                                )
+                                if thrash_outcome is not None:
+                                    return thrash_outcome
 
                             # Steward resolved — check if branch landed on main
                             _, bh, _ = await _run(
@@ -1817,6 +1840,70 @@ class TaskWorkflow:
 
         return None
 
+    async def _check_merge_outcome_thrash(
+        self,
+        prev_signature: str | None,
+        current_signature: str,
+    ) -> WorkflowOutcome | None:
+        """Fix 3 — detect & escalate repeated steward-resolved merge-phase loops.
+
+        Mirrors :meth:`_check_infra_resume_thrash` for the merge-retry loop.
+        Called from the merge-phase loop after ``_submit_to_merge_queue``
+        returns ``REQUEUED`` (steward resolved an L0 and the loop is about
+        to resubmit).  If the merge-outcome signature matches the previous
+        attempt, increment ``consecutive_merge_thrash`` in the task
+        metadata.  At ``max_consecutive_merge_thrash``, route to
+        ``_mark_blocked(escalate_to_human=True)`` instead of resubmitting.
+
+        ``current_signature`` is a sha256-short fingerprint of the blocked
+        ``MergeOutcome.reason``; full text would bloat metadata when verify
+        failure reports run multi-kilobyte.
+
+        Returns ``WorkflowOutcome.BLOCKED`` at threshold; ``None`` to fall
+        through to the resubmit.
+        """
+        metadata = self.task.get('metadata') or {}
+
+        try:
+            counter = int(metadata.get('consecutive_merge_thrash') or 0)
+        except (TypeError, ValueError):
+            counter = 0
+
+        if prev_signature is not None and prev_signature == current_signature:
+            counter += 1
+        else:
+            # Different verdict (or first observation) → steward made
+            # progress on something; reset to 1 because we just saw one.
+            counter = 1
+
+        new_metadata = dict(metadata)
+        new_metadata['consecutive_merge_thrash'] = counter
+        new_metadata['last_merge_outcome_signature'] = current_signature
+        self.task['metadata'] = new_metadata
+        try:
+            await self.scheduler.update_task(
+                self.task_id, metadata=new_metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+            logger.warning(
+                'Task %s: failed to persist merge-thrash counter: %s',
+                self.task_id, exc,
+            )
+
+        if counter >= self.config.max_consecutive_merge_thrash:
+            logger.warning(
+                'Task %s: consecutive_merge_thrash=%d at threshold %d — '
+                'merge-phase thrash confirmed; escalating to human',
+                self.task_id, counter,
+                self.config.max_consecutive_merge_thrash,
+            )
+            return await self._mark_blocked(
+                f'Repeated merge-phase thrash (counter={counter})',
+                detail=f'merge_outcome_signature={current_signature}',
+                escalate_to_human=True,
+            )
+        return None
+
     async def _handle_blocking_dep_report(
         self, *, rebase_retry_used: bool,
     ) -> WorkflowOutcome | None:
@@ -2823,6 +2910,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 merge_phase=merge_phase,
                 escalate_to_human=True,
             )
+        # Fix 3 — capture the merge-queue blocked reason so the merge-phase
+        # loop can fingerprint it for the thrash check before resubmitting.
+        self._last_merge_block_reason = result.reason
         # blocked — infer review category from reason
         if 'verification failed' in result.reason.lower():
             category = 'post_merge_verify'
