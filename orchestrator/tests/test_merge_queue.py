@@ -1911,6 +1911,188 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_drop_guard_no_op_for_gitignored_path(
+        self, git_ops: GitOps,
+    ):
+        """Gitignored paths in plan['files'] must NEVER fire the drop-guard.
+
+        Replicates reify task-3087: tree-sitter generated files
+        (parser.c, grammar.json, node-types.json) are listed in the
+        architect's plan for module-locking purposes but are explicitly
+        gitignored at the repo level.  They are never on task HEAD and
+        never on the merge commit, so the drop-guard must report no drops.
+
+        Under the post-fix contract, the gate compares task HEAD to the
+        merge commit directly — plan['files'] is no longer consulted —
+        so gitignored entries cannot reach the dropped list.
+        """
+        worktree = (await git_ops.create_worktree('drop-guard-gitignore')).path
+        # Add a real file plus a .gitignore that excludes the planned-but-generated path.
+        (worktree / '.gitignore').write_text('generated/\n')
+        (worktree / 'real.py').write_text('real = 1\n')
+        await git_ops.commit(worktree, 'Add real.py + .gitignore')
+
+        # Plan lists a gitignored path AND a structured step — under the OLD
+        # heuristic this would skip the narrow-against-task-HEAD filter and
+        # flag the gitignored file as dropped.
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('drop-gitignore', 'Drop gitignore', 'desc')
+        artifacts.write_plan({
+            'files': ['real.py', 'generated/parser.c'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'noop — anchors structured-steps branch',
+                    'status': 'pending',
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'drop-guard-gitignore')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='drop-gitignore',
+            )
+            assert result.dropped == [], (
+                f'Gitignored path must not be flagged as dropped; '
+                f'got {result.dropped!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_drop_guard_no_op_for_branch_deleted_path(
+        self, git_ops: GitOps,
+    ):
+        """File deleted by a commit not recorded in plan['steps'] is not flagged.
+
+        Replicates reify task-3093: ``tests/common/mod.rs`` was deleted by
+        a prereq commit (recorded in plan['prerequisites'], not in
+        plan['steps']).  Under the OLD heuristic the structured-steps
+        branch only iterates done plan-steps so the prereq deletion is
+        invisible and the file is mis-flagged as a merger drop.
+
+        Under the post-fix contract, the gate diffs task HEAD vs merge
+        commit — the branch's own deletion means the file isn't on task
+        HEAD, so it can't be in the diff-D output.
+        """
+        worktree = (await git_ops.create_worktree('drop-guard-branch-del')).path
+
+        # Step 1: add the file (would be a "prereq" in production wiring).
+        (worktree / 'tests_common.rs').write_text('// prereq\n')
+        await git_ops.commit(worktree, 'Prereq: add tests_common.rs')
+
+        # Step 2: delete the file as part of branch work.  This commit is NOT
+        # recorded in plan['steps'] — it represents a prereq landing on the
+        # branch outside the architect's tracked steps.
+        (worktree / 'tests_common.rs').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Prereq: delete tests_common.rs'], cwd=worktree)
+
+        # Step 3: real work commit.
+        (worktree / 'real.py').write_text('real = 1\n')
+        real_sha = await git_ops.commit(worktree, 'Add real.py')
+        assert real_sha
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('drop-branch-del', 'Drop branch del', 'desc')
+        artifacts.write_plan({
+            'files': ['tests_common.rs', 'real.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-real',
+                    'description': 'add real.py',
+                    'status': 'done',
+                    'commit': real_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'drop-guard-branch-del')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='drop-branch-del',
+            )
+            assert result.dropped == [], (
+                f'Prereq-deleted file must not be flagged as dropped; '
+                f'got {result.dropped!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_drop_guard_no_op_for_amend_deleted_path(
+        self, git_ops: GitOps,
+    ):
+        """File deleted by an amend commit not recorded in any plan-step is not flagged.
+
+        Replicates reify task-3004: ``crates/reify-compiler/stdlib/fea.ri``
+        was deleted by an ``amend(reviewer-suggestions)`` commit that
+        isn't recorded in any plan-step's ``commit`` field.  Under the OLD
+        heuristic this would flag the file because the structured-steps
+        branch can't see the amend deletion.
+
+        Under the post-fix contract, the gate diffs task HEAD vs merge
+        commit — the amend rewrote HEAD without the file, so the diff-D
+        output is empty.
+        """
+        worktree = (await git_ops.create_worktree('drop-guard-amend-del')).path
+
+        # Step 1: add a file the architect intends to keep.
+        (worktree / 'fea.ri').write_text('// stdlib\n')
+        await git_ops.commit(worktree, 'Add fea.ri (planned)')
+
+        # Step 2: a real work commit that the plan records.
+        (worktree / 'real.py').write_text('real = 1\n')
+        original_sha = await git_ops.commit(worktree, 'Add real.py')
+        assert original_sha
+
+        # Step 3: amend the *most recent* commit to also delete fea.ri —
+        # simulating ``amend(reviewer-suggestions)``.  The amended SHA replaces
+        # original_sha; the plan's recorded commit becomes orphaned/different.
+        (worktree / 'fea.ri').unlink()
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '--amend', '--no-edit'], cwd=worktree)
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('drop-amend-del', 'Drop amend del', 'desc')
+        artifacts.write_plan({
+            'files': ['fea.ri', 'real.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-real',
+                    'description': 'add real.py (pre-amend SHA)',
+                    'status': 'done',
+                    'commit': original_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'drop-guard-amend-del')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            result = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+                task_id='drop-amend-del',
+            )
+            assert result.dropped == [], (
+                f'Amend-deleted file must not be flagged as dropped; '
+                f'got {result.dropped!r}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
