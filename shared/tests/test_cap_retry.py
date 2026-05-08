@@ -1767,7 +1767,7 @@ class TestAuthFailure403Detection:
         assert gate._accounts[1].auth_failed is False
 
     async def test_401_also_treated_as_auth_failure(self):
-        """Any 4xx api_error_status is treated as auth failure."""
+        """401 api_error_status is treated as auth failure (alongside 403)."""
         gate = make_gate(['a', 'b'])
         results = iter([
             make_result(success=False, output='Unauthorized',
@@ -1785,6 +1785,91 @@ class TestAuthFailure403Detection:
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
         assert got.success is True
         assert gate._accounts[0].auth_failed is True
+
+    async def test_429_routes_to_cap_hit_not_auth_failed(self):
+        """HTTP 429 with a cap-message body must mark the account capped, not
+        auth_failed.  The 4xx-broadcast routing introduced before the fix sent
+        429 to ``_handle_auth_failure`` so ``AllAccountsCappedException`` never
+        fired and the curator worker's cap-defer / wait-for-open machinery
+        never engaged — yielding a real 2026-05-08 incident where 10 reify
+        tickets dropped during a cap storm.
+        """
+        gate = make_gate(['a', 'b'])
+
+        cap_body = (
+            "You're out of extra usage · resets May 13, 2pm "
+            "(Europe/London)"
+        )
+        results = iter([
+            make_result(
+                success=False, output=cap_body,
+                api_error_status=429, cost_usd=0.0,
+            ),
+            make_result(success=True, cost_usd=0.5),
+        ])
+
+        async def fake_invoke(**kwargs):
+            return next(results)
+
+        with (
+            patch(_INVOKE_PATCH, side_effect=fake_invoke),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch.object(
+                UsageGate, '_handle_auth_failure',
+                autospec=True, side_effect=AssertionError(
+                    '_handle_auth_failure must not be called for 429',
+                ),
+            ),
+            patch.object(
+                UsageGate, '_handle_cap_detected', autospec=True,
+                wraps=UsageGate._handle_cap_detected,
+            ) as mock_cap_detected,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        assert got.success is True
+        # The first invocation must have flagged account 'a' capped.
+        assert gate._accounts[0].capped is True, (
+            f'expected capped, got {gate._accounts[0]!r}'
+        )
+        assert gate._accounts[0].auth_failed is False
+        # _handle_cap_detected must have been called with a parsed resets_at.
+        assert mock_cap_detected.called
+        call_kwargs = mock_cap_detected.call_args.kwargs
+        call_args = mock_cap_detected.call_args.args
+        # autospec passes self as the first positional; resets_at is the
+        # third arg in the signature (reason, resets_at, oauth_token).
+        resets_at = call_kwargs.get('resets_at')
+        if resets_at is None and len(call_args) >= 3:
+            resets_at = call_args[2]
+        assert resets_at is not None, (
+            f'expected resets_at to be parsed; call_args={call_args!r} '
+            f'kwargs={call_kwargs!r}'
+        )
+
+    async def test_429_all_accounts_raises_all_accounts_capped(self):
+        """When every account answers HTTP 429 with a cap-message body, the
+        cap-retry budget exhausts and ``invoke_with_cap_retry`` must raise
+        ``AllAccountsCappedException`` — the signal the curator worker waits on
+        before deferring its batch via ``wait_for_open``.
+        """
+        gate = make_gate(['a', 'b'])
+        cap_body = "You're out of extra usage · resets in 30m"
+
+        async def fake_invoke(**_kw):
+            return make_result(
+                success=False, output=cap_body,
+                api_error_status=429, cost_usd=0.0,
+            )
+
+        with (
+            patch(_INVOKE_PATCH, side_effect=fake_invoke),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(AllAccountsCappedException),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', prompt='hi', max_cap_retries=4,
+            )
 
     async def test_500_not_treated_as_auth_failure(self):
         """5xx api_error_status is NOT treated as auth failure.
