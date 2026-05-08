@@ -315,6 +315,150 @@ async def test_idempotency_hit_rows_excluded(store, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_worker_dead_marks_pending_tickets_failed_worker_dead(store, tmp_path):
+    """When a project's curator worker is dead (no live asyncio.Task and no
+    ``_worker_intent`` placeholder), pending tickets for that project must be
+    terminalised as ``failed/worker_dead`` and surface as a single
+    ``ticket_failure`` escalation grouped by ``(project_id, 'task-curator', _no_escalation_)``.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        a = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='Aa'),
+        )
+        b = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='Bb'),
+        )
+
+        janitor = TicketJanitor(
+            store, primary_project_root=str(tmp_path),
+            liveness_probe=lambda pid: False,  # always dead
+        )
+        await janitor.tick()
+
+        # Both rows must now be terminal failed/worker_dead.
+        for tid in (a, b):
+            row = await store.get(tid)
+            assert row['status'] == 'failed', f'{tid}: {row}'
+            assert row['reason'] == 'worker_dead', f'{tid}: {row["reason"]!r}'
+
+        # And exactly one escalation file must have been emitted (grouped).
+        files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, [f.name for f in files]
+        body = json.loads(files[0].read_text())
+        assert body['category'] == 'ticket_failure'
+        assert body['task_id'] == 'task-curator'
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_alive_leaves_pending_alone(store, tmp_path):
+    """When the liveness probe reports the project's worker is alive, pending
+    tickets must remain pending — the reaper is liveness-gated, not
+    timer-gated.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        a = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='still going'),
+        )
+
+        janitor = TicketJanitor(
+            store, primary_project_root=str(tmp_path),
+            liveness_probe=lambda pid: True,  # always alive
+        )
+        await janitor.tick()
+
+        row = await store.get(a)
+        assert row['status'] == 'pending', f'expected pending, got {row}'
+        assert row['reason'] is None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_intent_present_treated_as_alive(store, tmp_path):
+    """The ``_worker_intent`` set carried by TaskInterceptor closes the
+    spawn-race window between submit_task setting up a queue entry and
+    ``_start_worker_if_needed`` actually creating an asyncio.Task: a project
+    in the intent set must count as alive even if no Task exists yet."""
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        a = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='spawning'),
+        )
+
+        intent = {project_id}
+
+        def _liveness(pid: str) -> bool:
+            # Simulate: no Task yet, but project has been added to the
+            # intent set by submit_task.
+            return pid in intent
+
+        janitor = TicketJanitor(
+            store, primary_project_root=str(tmp_path),
+            liveness_probe=_liveness,
+        )
+        await janitor.tick()
+
+        row = await store.get(a)
+        assert row['status'] == 'pending'
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_dead_escalations_respect_cooldown(store, tmp_path):
+    """Two ticks back-to-back with the same dead-worker project must not emit
+    duplicate escalations — the existing per-group cooldown still applies to
+    rows the reaper terminalises.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        a = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='first batch'),
+        )
+
+        janitor = TicketJanitor(
+            store,
+            cooldown_secs=3600.0,
+            primary_project_root=str(tmp_path),
+            liveness_probe=lambda pid: False,
+        )
+        await janitor.tick()
+        first = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(first) == 1
+
+        # Second batch lands while the cooldown window is still open.
+        b = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(title='second batch'),
+        )
+        await janitor.tick()
+
+        # Still one escalation, but b must be stamped so a third tick doesn't
+        # re-evaluate it.
+        second = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(second) == 1, 'cooldown must suppress the re-escalation'
+        row_b = await store.get(b)
+        assert row_b['status'] == 'failed'
+        assert row_b['reason'] == 'worker_dead'
+        assert row_b['escalated_at'] is not None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
 async def test_sweep_expired_runs_first(store, tmp_path):
     """Pending-but-expired rows graduate to failed/expired in the same tick."""
     handle = _make_orchestrator_layout(tmp_path, hold_lock=True)

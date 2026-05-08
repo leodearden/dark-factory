@@ -618,6 +618,10 @@ async def run_server():
             cooldown_secs=janitor_cfg.cooldown_seconds,
             batch_limit=janitor_cfg.batch_limit,
             primary_project_root=_janitor_primary_root,
+            liveness_probe=(
+                task_interceptor.is_worker_alive
+                if task_interceptor is not None else None
+            ),
         )
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),

@@ -288,6 +288,42 @@ class TicketStore:
             )
         return len(updates)
 
+    async def list_projects_with_pending(self) -> list[str]:
+        """Return distinct ``project_id``s that currently have pending tickets.
+
+        Used by :class:`TicketJanitor` to drive the worker-liveness reaper —
+        for each project with pending rows, the janitor asks an injected
+        liveness probe whether the per-project worker is still alive; dead
+        workers' rows get terminalised as ``failed/worker_dead``.
+        """
+        db = self._require_db()
+        cursor = await db.execute(
+            "SELECT DISTINCT project_id FROM tickets WHERE status = 'pending'",
+        )
+        rows = await cursor.fetchall()
+        return [row['project_id'] for row in rows]
+
+    async def mark_pending_failed_for_project(
+        self, project_id: str, *, reason: str,
+    ) -> int:
+        """Bulk-terminalise every pending ticket in a project.
+
+        Used by the worker-liveness reaper when the project's curator worker
+        is gone. ``resolved_at`` is stamped so downstream consumers can
+        attribute failure timing. Returns rows updated.
+        """
+        now = datetime.now(UTC).isoformat()
+        async with self._txn() as db:
+            cursor = await db.execute(
+                """
+                UPDATE tickets
+                SET status = 'failed', reason = ?, resolved_at = ?
+                WHERE project_id = ? AND status = 'pending'
+                """,
+                (reason, now, project_id),
+            )
+        return cursor.rowcount
+
     async def list_tickets(
         self,
         project_id: str,
