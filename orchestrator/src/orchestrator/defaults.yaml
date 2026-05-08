@@ -31,6 +31,12 @@ rebase_before_verify: true
 # implementer.  3 matches the empirical reify task-2289 thrash window.
 max_consecutive_infra_resumes: 3
 
+# Fix 3 — merge-phase thrash threshold. Counter increments when the merge
+# queue returns the same blocked outcome (signature-keyed) on consecutive
+# attempts; resets to 1 on a different verdict. At threshold the
+# orchestrator escalates to L1 instead of resubmitting.
+max_consecutive_merge_thrash: 2
+
 # Per-task retry cap — max WorkflowOutcome.REQUEUED iterations before L1
 # escalation.  Backstop against tight steward→REQUEUED loops (e.g. architect
 # returns empty output every time, steward classes it as transient).
