@@ -2168,3 +2168,105 @@ class TestReleaseProbeSlot:
 
         assert gate._open.is_set() is False  # still closed — NOT re-opened
         assert acct.capped is True  # capped flag untouched
+
+
+# =========================================================================
+# TestAuthReprobeDemoteOnCapMessage — when an auth_failed account's reprobe
+# returns a cap-message body, the gate must demote it to capped (not leave
+# it auth_failed) so the resume-probe loop kicks in instead of the periodic
+# auth-reprobe loop. This is the in-flight correction for the 429-as-auth
+# misclassification cap-retry now prevents on the entry path.
+# =========================================================================
+
+
+@pytest.mark.asyncio
+class TestAuthReprobeDemoteOnCapMessage:
+    """An ``auth_failed`` account whose ``_run_probe`` body contains a
+    cap-prefix must be demoted to ``capped`` so the resume-probe loop is the
+    one watching for reset, not the longer-cadence auth-reprobe loop.
+
+    This closes the recovery gap for any 429 that slipped through to
+    ``_handle_auth_failure`` before the cap-retry routing fix landed (and for
+    any future provider whose error body conflates auth + cap).
+    """
+
+    async def test_auth_reprobe_seeing_cap_message_demotes_to_capped(self):
+        from unittest.mock import MagicMock
+
+        env_var = 'TEST_AUTH_REPROBE_DEMOTE_A'
+        with patch.dict(os.environ, {env_var: 'fake-token-a'}):
+            config = UsageCapConfig(
+                accounts=[AccountConfig(name='a', oauth_token_env=env_var)],
+                # wait_for_reset=True is required for the
+                # account-resume-probe loop to be started by
+                # _handle_cap_detected — without it _start_account_resume_probe
+                # is a no-op (the production path with wait_for_reset=False
+                # depends on the operator-driven SIGHUP recovery).
+                wait_for_reset=True,
+                auth_reprobe_secs=0,
+            )
+            gate = UsageGate(config)
+        gate._probe_config_dir = MagicMock()
+        gate._probe_config_dir.path = '/tmp/probe-test'
+        gate._probe_config_dir.write_credentials = MagicMock()
+
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        # Pre-populate auth_reprobe_task with a real (cancellable) task so we
+        # can verify the demote path cancels it.
+        async def _idle_loop() -> None:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                return
+        acct.auth_reprobe_task = asyncio.get_running_loop().create_task(
+            _idle_loop(), name='test-auth-reprobe-task',
+        )
+
+        # Subprocess returns a 429-style cap-message body.
+        cap_stderr = (
+            b"You're out of extra usage \xc2\xb7 resets in 2h"
+        )
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(b'', cap_stderr))
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            ok = await gate._run_probe(acct)
+
+        # Probe still returns False — cap-prefix detection forces False.
+        assert ok is False
+
+        # auth_failed must be cleared and capped set.
+        assert acct.auth_failed is False, (
+            f'expected auth_failed cleared post-demote, got {acct!r}'
+        )
+        assert acct.capped is True, (
+            f'expected capped True post-demote, got {acct!r}'
+        )
+        # resets_at must have been parsed (~2h ahead).
+        assert acct.resets_at is not None, 'expected resets_at parsed from "resets in 2h"'
+        delta = acct.resets_at - datetime.now(UTC)
+        assert timedelta(minutes=90) < delta < timedelta(hours=3), (
+            f'resets_at {delta} not ~2h ahead'
+        )
+        # Old auth-reprobe task must be cancelled so two probe loops don't race.
+        assert acct.auth_reprobe_task is None or acct.auth_reprobe_task.cancelled() or acct.auth_reprobe_task.done(), (
+            'auth_reprobe_task must be cancelled / cleared after demote'
+        )
+        # Resume-probe loop should be running for the now-capped account.
+        assert acct.resume_task is not None, (
+            'expected account_resume_probe task started for capped acct'
+        )
+
+        # Cleanup: cancel any tasks we left running.
+        for t in (acct.resume_task, acct.auth_reprobe_task):
+            if t is not None and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass

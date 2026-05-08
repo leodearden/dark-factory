@@ -972,19 +972,59 @@ class UsageGate:
         # NOTE — intentional asymmetry with detect_cap_hit:
         # This loop does NOT apply the CAP_CONFIRM_KEYWORDS guard used by
         # detect_cap_hit.  The probe runs only while an account is already
-        # capped; any whiff of a cap prefix in the probe output means the
-        # account is still capped and we must NOT unpause it.  Being
-        # conservative here avoids the far worse outcome of unpausing a
-        # capped account and burning quota on a still-limited account.
-        # See CAP_CONFIRM_KEYWORDS (module top) for the current keyword list.
-        # Do not 'fix' this asymmetry without understanding the safety-margin
-        # implications — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
+        # blocked (capped or auth_failed); any whiff of a cap prefix in the
+        # probe output means the account is still capped and we must NOT
+        # unpause it.  Being conservative here avoids the far worse outcome
+        # of unpausing a capped account and burning quota on a still-limited
+        # account.  See CAP_CONFIRM_KEYWORDS (module top) for the current
+        # keyword list.  Do not 'fix' this asymmetry without understanding the
+        # safety-margin implications — see
+        # test_probe_prefix_only_without_confirm_keyword_still_returns_false.
+        #
+        # Demote auth_failed → capped on cap-prefix:
+        # An auth_failed account whose reprobe shows a cap-prefix is a 429
+        # misclassification we now correct in-flight (the cap-retry path
+        # already routes 429 to _handle_cap_detected on the entry side; this
+        # closes the recovery gap for accounts marked auth_failed before that
+        # routing landed, and for any provider whose error body conflates
+        # auth + cap).
         for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
             for prefix in prefixes:
                 if prefix.lower() in combined.lower():
                     logger.info(
                         f'Account {acct.name}: probe got cap message: {prefix}',
                     )
+                    if acct.auth_failed:
+                        resets_at = _parse_resets_at(combined)
+                        reason = (
+                            _extract_cap_message(combined, prefix)
+                            or f'Cap detected via auth-reprobe: {prefix}'
+                        )
+                        logger.warning(
+                            f'Account {acct.name}: auth-reprobe saw cap '
+                            f'message — demoting auth_failed → capped'
+                        )
+                        # Cancel the auth-reprobe task BEFORE _handle_cap_detected
+                        # so a stray reprobe iteration doesn't race the new
+                        # account-resume probe loop. The current call IS the
+                        # auth-reprobe loop; calling cancel() on its task will
+                        # take effect at the next suspension point.
+                        if (
+                            acct.auth_reprobe_task is not None
+                            and not acct.auth_reprobe_task.done()
+                        ):
+                            acct.auth_reprobe_task.cancel()
+                        acct.auth_reprobe_task = None
+                        # _handle_cap_detected sets capped=True, clears
+                        # auth_failed implicitly via the all-blocked invariant
+                        # check (still-pending), fires the cost event, and
+                        # starts the account-resume probe loop. We clear
+                        # auth_failed here explicitly so the all-blocked
+                        # invariant doesn't double-flip (capped + auth_failed
+                        # would mis-render in the dashboard).
+                        acct.auth_failed = False
+                        acct.auth_failed_at = None
+                        self._handle_cap_detected(reason, resets_at, acct.token)
                     return False
 
         if proc.returncode != 0:
