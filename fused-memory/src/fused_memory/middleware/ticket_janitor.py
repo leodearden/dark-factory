@@ -36,6 +36,7 @@ import json
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -135,11 +136,17 @@ class TicketJanitor:
         cooldown_secs: float = 3600.0,
         batch_limit: int = 100,
         primary_project_root: str = '',
+        liveness_probe: Callable[[str], bool] | None = None,
     ) -> None:
         self._store = store
         self._cooldown_secs = cooldown_secs
         self._batch_limit = batch_limit
         self._primary_root = primary_project_root
+        # Worker-liveness reaper: when set, ``tick()`` asks this probe whether
+        # each project with pending tickets has a live curator worker; rows
+        # for projects whose worker is dead are terminalised as
+        # ``failed/worker_dead``. None disables the reaper (legacy behaviour).
+        self._liveness_probe = liveness_probe
         # group_key → monotonic timestamps of recent escalations, used for
         # rolling-window cooldown. group_key is (project_id, task_id,
         # escalation_id). Reset on process restart by design.
@@ -197,12 +204,40 @@ class TicketJanitor:
         loop never crashes the server. Background work for an MCP server
         should be allergic to unhandled exceptions.
         """
-        # 1) terminalise expired pending tickets
-        try:
-            await self._store.sweep_expired()
-        except Exception:
-            logger.exception('ticket_janitor: sweep_expired failed')
-            # Continue — the unescalated-failures step is independent.
+        # 1) terminalise pending tickets whose project has no live curator
+        #    worker — replaces the old wall-clock TTL janitor with an honest
+        #    "is the worker actually processing?" signal.
+        if self._liveness_probe is not None:
+            try:
+                pending_projects = await self._store.list_projects_with_pending()
+            except Exception:
+                logger.exception('ticket_janitor: list_projects_with_pending failed')
+                pending_projects = []
+            for pid in pending_projects:
+                try:
+                    alive = self._liveness_probe(pid)
+                except Exception:
+                    logger.exception(
+                        'ticket_janitor: liveness_probe raised for %s; '
+                        'treating as alive (fail-open)', pid,
+                    )
+                    alive = True
+                if not alive:
+                    try:
+                        n = await self._store.mark_pending_failed_for_project(
+                            pid, reason='worker_dead',
+                        )
+                    except Exception:
+                        logger.exception(
+                            'ticket_janitor: mark_pending_failed_for_project '
+                            'failed for %s', pid,
+                        )
+                        continue
+                    if n:
+                        logger.warning(
+                            'ticket_janitor: reaped %d pending ticket(s) for '
+                            'dead worker on project %s', n, pid,
+                        )
 
         # 2) collect rows that haven't been escalated yet
         try:

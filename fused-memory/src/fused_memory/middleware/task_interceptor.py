@@ -6,7 +6,6 @@ import dataclasses
 import json
 import logging
 import os
-import time
 import uuid as uuid_mod
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -288,6 +287,13 @@ class TaskInterceptor:
         # Per-project asyncio.Task handles for the curator workers.  Keyed by
         # project_id, lazily started on first submit_task for that project.
         self._worker_tasks: dict[str, asyncio.Task] = {}
+        # Spawn-race shield: ``submit_task`` adds the project_id BEFORE
+        # ``queue.put`` so the worker-liveness reaper (TicketJanitor) does
+        # not mis-classify a freshly-submitted ticket as "dead worker" in
+        # the window between the SQLite insert and ``_start_worker_if_needed``
+        # actually creating the asyncio.Task.  Cleared inside
+        # ``_start_worker_if_needed`` once the Task entry is in place.
+        self._worker_intent: set[str] = set()
         # Per-ticket asyncio.Event lists: resolve_ticket appends one per caller
         # so multiple concurrent waiters (e.g. reconnect/retry patterns) each
         # get their own event.  _signal_ticket_event sets and removes all of them.
@@ -521,8 +527,6 @@ class TaskInterceptor:
         Performs:
         - ``flush_pending_on_startup``: marks any pending tickets left from a
           previous server run as ``failed/server_restart``.
-        - ``sweep_expired``: marks any expired pending tickets as
-          ``failed/expired``.
 
         If no ``ticket_store`` is wired in, this is a no-op.
         """
@@ -534,9 +538,6 @@ class TaskInterceptor:
         flushed = await self._ticket_store.flush_pending_on_startup()
         if flushed:
             logger.warning('start(): flushed %d orphaned pending ticket(s) from prior run', flushed)
-        swept = await self._ticket_store.sweep_expired()
-        if swept:
-            logger.info('start(): swept %d expired ticket(s)', swept)
 
     # ── Status transitions (with targeted reconciliation) ──────────────
 
@@ -1404,9 +1405,13 @@ class TaskInterceptor:
         ticket_id = await self._ticket_store.submit(
             project_id=project_id,
             candidate_json=blob,
-            ttl_seconds=600,
         )
         queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
+        # Mark intent BEFORE the queue.put so a janitor tick that lands
+        # between the row insert and _start_worker_if_needed sees the
+        # project as "alive" (worker about to spawn) rather than reaping
+        # the freshly-pending row as worker_dead.
+        self._worker_intent.add(project_id)
         await queue.put(ticket_id)
         self._start_worker_if_needed(project_id)
         return {'ticket': ticket_id}
@@ -1725,6 +1730,24 @@ class TaskInterceptor:
                 self._curator_worker(project_id),
                 name=f'task-interceptor-curator-worker-{project_id}',
             )
+        # Spawn-race shield released — a real Task now backs this project.
+        self._worker_intent.discard(project_id)
+
+    def is_worker_alive(self, project_id: str) -> bool:
+        """Return True iff the per-project curator worker is alive or about
+        to spawn.
+
+        Used by :class:`TicketJanitor` as the liveness probe for the
+        worker-dead reaper. Treats a project in ``_worker_intent`` as alive
+        to close the spawn-race window between ``submit_task`` enqueueing a
+        ticket and ``_start_worker_if_needed`` actually creating the Task.
+        """
+        if project_id in self._worker_intent:
+            return True
+        task = self._worker_tasks.get(project_id)
+        if task is None:
+            return False
+        return not task.done()
 
     async def _curator_worker(self, project_id: str) -> None:
         """Drain pending tickets for *project_id* from its per-project queue.
@@ -1860,27 +1883,26 @@ class TaskInterceptor:
                     for tid in batch_ticket_ids:
                         queue.put_nowait(tid)
                     if self._usage_gate is not None:
-                        # Compensate every pending ticket in this project for
-                        # the capacity-blocked window so the TTL janitor does
-                        # not kill submissions the worker was never permitted
-                        # to attempt. ``finally`` so a CancelledError still
-                        # extends — partial credit beats none.
-                        t0 = time.monotonic()
-                        try:
-                            await self._usage_gate.wait_for_open(timeout=300)
-                        finally:
-                            elapsed = time.monotonic() - t0
-                            if elapsed > 0 and self._ticket_store is not None:
-                                with contextlib.suppress(Exception):
-                                    await self._ticket_store.extend_pending_expiry(
-                                        project_id, elapsed,
-                                    )
+                        await self._usage_gate.wait_for_open(timeout=300)
                 except Exception:
                     logger.exception(
                         '_curator_worker: unhandled error processing batch '
                         'of %d tickets for project %s',
                         len(batch_ticket_ids), project_id,
                     )
+                    # Terminalise every ticket in the batch so they don't sit
+                    # ``pending`` waiting for a wall-clock janitor sweep —
+                    # ``mark_resolved`` is best-effort (suppress) so the
+                    # signal-waiters guarantee below holds even if the store
+                    # is closed mid-shutdown.
+                    if self._ticket_store is not None:
+                        for tid in batch_ticket_ids:
+                            with contextlib.suppress(Exception):
+                                await self._ticket_store.mark_resolved(
+                                    tid,
+                                    status='failed',
+                                    reason='curator_failed',
+                                )
                     # Signal so resolve_ticket callers are not blocked forever
                     # when _process_add_tickets_batch_prepared raised before
                     # mark_resolved + signal for each ticket.

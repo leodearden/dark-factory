@@ -2795,7 +2795,7 @@ async def test_start_flushes_prior_pending_tickets(
     # Manually insert a pending ticket directly via the store API.
     store = TicketStore(tmp_path / 'restart_tickets.db')
     await store.initialize()
-    orphan_id = await store.submit(project_id='project', candidate_json='{}', ttl_seconds=600)
+    orphan_id = await store.submit(project_id='project', candidate_json='{}')
     row_before = await store.get(orphan_id)
     assert row_before is not None and row_before['status'] == 'pending', (
         f'Setup: expected pending ticket, got {row_before}'
@@ -2956,7 +2956,6 @@ async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
     ticket_id = await ticket_store.submit(
         project_id='p',
         candidate_json='{}',
-        ttl_seconds=600,
     )
 
     original_get = ticket_store.get

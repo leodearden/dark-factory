@@ -393,13 +393,16 @@ async def invoke_with_cap_retry(
                 )
                 completed_at = datetime.now(UTC).isoformat()
 
-                # Auth-failure routing (403/401/other 4xx): distinct from cap
-                # hits. Mark the account auth_failed and fail over; don't count
+                # Auth-failure routing (401/403): distinct from cap hits.
+                # Mark the account auth_failed and fail over; don't count
                 # toward consecutive_cap_hits so the cooldown doesn't compound.
-                if (
-                    result.api_error_status is not None
-                    and 400 <= result.api_error_status < 500
-                ):
+                # The narrow {401, 403} is load-bearing: 429 carries a real
+                # cap-message body ("You're out of extra usage · resets ...")
+                # that the cap-hit detector below already recognises, but if
+                # we route 429 here the slot.detect_cap_hit() call never runs,
+                # AllAccountsCappedException never fires, and the curator
+                # worker's cap-defer machinery silently never engages.
+                if result.api_error_status in (401, 403):
                     auth_marked = usage_gate._handle_auth_failure(
                         f'HTTP {result.api_error_status}: {result.output[:120]}',
                         slot.token,
