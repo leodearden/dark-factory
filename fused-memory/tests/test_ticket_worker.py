@@ -649,7 +649,6 @@ async def test_resolve_ticket_returns_immediately_for_terminal_ticket(
     ticket_id = await ticket_store.submit(
         project_id='project',
         candidate_json='{}',
-        ttl_seconds=600,
     )
     await ticket_store.mark_resolved(
         ticket_id, status='created', task_id='42',
@@ -1167,7 +1166,6 @@ async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
     ticket_id = await ticket_store.submit(
         project_id='test_project_shutdown',
         candidate_json='{"title": "ShutdownRaceTask"}',
-        ttl_seconds=600,
     )
 
     # Monkeypatch get: call 1 → pending row, call 2 → RuntimeError
@@ -2331,9 +2329,9 @@ async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
         'kwargs': {'title': 'T', 'description': 'd'},
         'metadata': None,
     })
-    t1 = await ticket_store.submit(project_id, candidate, ttl_seconds=600)
-    t2 = await ticket_store.submit(project_id, candidate, ttl_seconds=600)
-    t3 = await ticket_store.submit(project_id, candidate, ttl_seconds=600)
+    t1 = await ticket_store.submit(project_id, candidate)
+    t2 = await ticket_store.submit(project_id, candidate)
+    t3 = await ticket_store.submit(project_id, candidate)
 
     queue = interceptor_with_store._ticket_queues.setdefault(
         project_id, asyncio.Queue(),
@@ -2380,171 +2378,3 @@ async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
         assert res.get('status') == 'failed', res
 
 
-# ---------------------------------------------------------------------------
-# extend_pending_expiry on gate-closed window
-# ---------------------------------------------------------------------------
-
-
-class TestCuratorWorkerExtendsExpiryOnGateWait:
-    """When the curator worker yields to ``UsageGate.wait_for_open`` because
-    all accounts are capped, the project's pending tickets must have their
-    ``expires_at`` rolled forward so the TTL janitor doesn't kill candidates
-    the worker was never permitted to attempt.
-    """
-
-    def _make_candidate_json(self, title: str) -> str:
-        return json.dumps({
-            'project_root': '/project',
-            'kwargs': {'title': title, 'description': 'test'},
-            'metadata': None,
-        })
-
-    @pytest.mark.asyncio
-    async def test_curator_worker_extends_expiry_after_gate_wait(
-        self, interceptor_with_store, ticket_store, taskmaster,
-    ):
-        """First batch raises AllAccountsCappedException → worker waits on
-        usage_gate → on return, every pending ticket in the project has
-        ``expires_at`` advanced by ≥ the simulated wait duration.  Then the
-        worker retries and the ticket resolves."""
-        from shared.cli_invoke import AllAccountsCappedException as RealCapExc
-
-        project_id = 'project'
-
-        # Stubbed UsageGate that simply sleeps a known duration before
-        # returning.  ``wait_for_open`` is an awaitable that returns bool.
-        wait_duration = 0.40
-        gate = MagicMock()
-
-        async def fake_wait_for_open(timeout: float | None = None) -> bool:
-            await asyncio.sleep(wait_duration)
-            return True
-
-        gate.wait_for_open = AsyncMock(side_effect=fake_wait_for_open)
-        interceptor_with_store._usage_gate = gate
-
-        # Curator: first call raises (cap exhaustion); second call succeeds.
-        mock_curator = MagicMock()
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
-        _stub_prepare_candidate(mock_curator)
-
-        cap_then_ok = [
-            RealCapExc(retries=3, elapsed_secs=12.5, label='Task X [impl]'),
-            [CuratorDecision(action='create', justification='ok')],
-        ]
-
-        async def curate_batch_side_effect(candidates, pid, project_root):
-            v = cap_then_ok.pop(0)
-            if isinstance(v, BaseException):
-                raise v
-            return v
-
-        mock_curator.curate_batch = AsyncMock(side_effect=curate_batch_side_effect)
-
-        taskmaster.add_task = AsyncMock(return_value={'id': '101', 'title': 'T'})
-
-        # Submit one ticket, capture its initial expires_at.
-        t1 = await ticket_store.submit(
-            project_id, self._make_candidate_json('T'), ttl_seconds=600,
-        )
-        before_row = await ticket_store.get(t1)
-        before_expires = before_row['expires_at']
-
-        queue = interceptor_with_store._ticket_queues.setdefault(
-            project_id, asyncio.Queue(),
-        )
-        queue.put_nowait(t1)
-
-        with patch.object(
-            type(interceptor_with_store), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ), patch.object(
-            type(interceptor_with_store), '_ensure_taskmaster',
-            new=AsyncMock(return_value=taskmaster),
-        ):
-            interceptor_with_store._start_worker_if_needed(project_id)
-
-            # Resolve the ticket — succeeds on the second batch attempt.
-            result = await interceptor_with_store.resolve_ticket(
-                t1, '/project', timeout_seconds=5.0,
-            )
-
-        assert result.get('status') == 'created', result
-        gate.wait_for_open.assert_awaited()  # the cap-defer path ran
-
-        after_row = await ticket_store.get(t1)
-        # Ticket is now terminal, so expires_at would only have changed
-        # while it was still pending — i.e. the extend ran during the wait.
-        before_dt = datetime.fromisoformat(before_expires)
-        after_dt = datetime.fromisoformat(after_row['expires_at'])
-        delta = (after_dt - before_dt).total_seconds()
-        assert delta >= wait_duration * 0.9, (
-            f'expected expires_at to advance ≥ {wait_duration}s during gate '
-            f'wait; got Δ={delta:.3f}s (before={before_expires}, '
-            f'after={after_row["expires_at"]})'
-        )
-
-    @pytest.mark.asyncio
-    async def test_extend_runs_in_finally_when_wait_for_open_raises(
-        self, interceptor_with_store, ticket_store, taskmaster,
-    ):
-        """If ``wait_for_open`` itself raises (e.g. CancelledError on
-        shutdown, or any other exception), the ``finally`` clause must
-        still extend pending expiry — partial credit beats none — and the
-        worker must not crash the process."""
-        from shared.cli_invoke import AllAccountsCappedException as RealCapExc
-
-        project_id = 'project'
-        wait_duration = 0.30
-        gate = MagicMock()
-
-        async def fake_wait_then_raise(timeout: float | None = None) -> bool:
-            await asyncio.sleep(wait_duration)
-            raise RuntimeError('simulated wait_for_open failure')
-
-        gate.wait_for_open = AsyncMock(side_effect=fake_wait_then_raise)
-        interceptor_with_store._usage_gate = gate
-
-        mock_curator = MagicMock()
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
-        _stub_prepare_candidate(mock_curator)
-        mock_curator.curate_batch = AsyncMock(
-            side_effect=RealCapExc(retries=3, elapsed_secs=10.0, label='X'),
-        )
-
-        t1 = await ticket_store.submit(
-            project_id, self._make_candidate_json('T'), ttl_seconds=600,
-        )
-        before_row = await ticket_store.get(t1)
-        before_expires = before_row['expires_at']
-
-        queue = interceptor_with_store._ticket_queues.setdefault(
-            project_id, asyncio.Queue(),
-        )
-        queue.put_nowait(t1)
-
-        with patch.object(
-            type(interceptor_with_store), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ), patch.object(
-            type(interceptor_with_store), '_ensure_taskmaster',
-            new=AsyncMock(return_value=taskmaster),
-        ):
-            interceptor_with_store._start_worker_if_needed(project_id)
-            # Give the worker time to enter the cap-defer branch + raise.
-            await asyncio.sleep(wait_duration + 0.30)
-
-        gate.wait_for_open.assert_awaited()
-        after_row = await ticket_store.get(t1)
-        # Ticket is still pending (worker died on the inner raise after
-        # the first cap-defer cycle), so the extend's effect is observable.
-        assert after_row['status'] == 'pending'
-        before_dt = datetime.fromisoformat(before_expires)
-        after_dt = datetime.fromisoformat(after_row['expires_at'])
-        delta = (after_dt - before_dt).total_seconds()
-        assert delta >= wait_duration * 0.9, (
-            f'finally-clause extend did not fire on wait_for_open exception; '
-            f'Δ={delta:.3f}s'
-        )

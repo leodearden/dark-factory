@@ -104,7 +104,6 @@ async def test_groups_failures_and_emits_one_escalation_per_group(store, tmp_pat
                 title='A', task_id='task-42', escalation_id='esc-42-1',
                 suggestion_hash='hash-A',
             ),
-            ttl_seconds=600,
         )
         b = await store.submit(
             project_id=project_id,
@@ -112,7 +111,6 @@ async def test_groups_failures_and_emits_one_escalation_per_group(store, tmp_pat
                 title='B', task_id='task-42', escalation_id='esc-42-1',
                 suggestion_hash='hash-B',
             ),
-            ttl_seconds=600,
         )
         await _force_failed(store, a, reason='curator_rejected')
         await _force_failed(store, b, reason='curator_rejected')
@@ -458,34 +456,3 @@ async def test_worker_dead_escalations_respect_cooldown(store, tmp_path):
         handle.close()
 
 
-@pytest.mark.asyncio
-async def test_sweep_expired_runs_first(store, tmp_path):
-    """Pending-but-expired rows graduate to failed/expired in the same tick."""
-    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
-    try:
-        project_id = _project_id_for(tmp_path)
-        a = await store.submit(
-            project_id=project_id,
-            candidate_json=_candidate_blob(task_id='t', escalation_id='e'),
-            ttl_seconds=600,
-        )
-        # Backdate expires_at so sweep_expired marks it failed.
-        db = store._db
-        await db.execute(
-            "UPDATE tickets SET expires_at='2020-01-01T00:00:00+00:00' "
-            "WHERE ticket_id=?",
-            (a,),
-        )
-        await db.commit()
-
-        janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
-        await janitor.tick()
-
-        # Expired row terminalised AND escalated in one pass.
-        row = await store.get(a)
-        assert row['status'] == 'failed'
-        assert row['reason'] == 'expired'
-        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
-        assert len(files) == 1
-    finally:
-        handle.close()

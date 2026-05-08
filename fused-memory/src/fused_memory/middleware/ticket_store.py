@@ -138,12 +138,18 @@ class TicketStore:
         self,
         project_id: str,
         candidate_json: str,
-        ttl_seconds: int = 600,
     ) -> str:
-        """Insert a new pending ticket and return its ticket_id."""
+        """Insert a new pending ticket and return its ticket_id.
+
+        ``expires_at`` is written as a far-future placeholder. The wall-clock
+        TTL janitor was retired in favour of a worker-liveness reaper (see
+        :class:`TicketJanitor.tick`); the column stays NOT NULL for schema
+        back-compat and the value is no longer load-bearing.
+        """
         ticket_id = _new_ticket_id()
         now = datetime.now(UTC)
-        expires_at = now + timedelta(seconds=ttl_seconds)
+        # Advisory placeholder; reaper is worker-liveness based, not TTL.
+        expires_at = now + timedelta(days=365)
         async with self._txn() as db:
             await db.execute(
                 """
@@ -207,37 +213,6 @@ class TicketStore:
         logger.info('flush_pending_on_startup: marked %d pending tickets as failed', count)
         return count
 
-    async def sweep_expired(self, now: datetime | None = None) -> int:
-        """Mark pending tickets past their ``expires_at`` as failed/expired.
-
-        Called once by :meth:`TaskInterceptor.start` at server startup so any
-        tickets whose TTL elapsed while the server was offline are immediately
-        cleaned up.  It is NOT called periodically during steady-state: tickets
-        submitted during a run that the worker never processes (e.g. worker
-        cancelled before picking them up) accumulate as ``pending`` until the
-        next restart.  Callers that need strict TTL enforcement during a
-        long-running process should call ``sweep_expired`` periodically from an
-        application-level background task.
-
-        Returns the number of rows updated.
-        """
-        if now is None:
-            now = datetime.now(UTC)
-        resolved_at = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
-            cursor = await db.execute(
-                """
-                UPDATE tickets
-                SET status = 'failed', reason = 'expired', resolved_at = ?
-                WHERE status = 'pending' AND expires_at < ?
-                """,
-                (resolved_at, now.isoformat()),
-            )
-        count = cursor.rowcount
-        if count:
-            logger.info('sweep_expired: expired %d tickets', count)
-        return count
-
     async def get(self, ticket_id: str) -> dict | None:
         """Return the ticket row as a plain dict, or None if not found."""
         db = self._require_db()
@@ -248,45 +223,6 @@ class TicketStore:
         if row is None:
             return None
         return dict(row)
-
-    async def extend_pending_expiry(self, project_id: str, seconds: float) -> int:
-        """Push expires_at forward by ``seconds`` for all pending tickets in this project.
-
-        Used by the curator worker to compensate for capacity-blocked time
-        (UsageGate closed) so the TTL janitor doesn't kill candidates the
-        worker was never permitted to attempt. Returns rows updated.
-
-        Computes new timestamps in Python (read-modify-write inside a single
-        transaction) rather than via SQLite's ``datetime(...)`` arithmetic
-        because the SQL function returns ``'YYYY-MM-DD HH:MM:SS'`` without a
-        timezone offset, which would corrupt the ISO-8601 + TZ format every
-        other write produces and break the lexical comparisons that
-        :meth:`sweep_expired` relies on.
-        """
-        if seconds <= 0:
-            return 0
-        delta = timedelta(seconds=seconds)
-        async with self._txn() as db:
-            cursor = await db.execute(
-                "SELECT ticket_id, expires_at FROM tickets "
-                "WHERE project_id = ? AND status = 'pending'",
-                (project_id,),
-            )
-            rows = await cursor.fetchall()
-            if not rows:
-                return 0
-            updates = [
-                (
-                    (datetime.fromisoformat(row['expires_at']) + delta).isoformat(),
-                    row['ticket_id'],
-                )
-                for row in rows
-            ]
-            await db.executemany(
-                'UPDATE tickets SET expires_at = ? WHERE ticket_id = ?',
-                updates,
-            )
-        return len(updates)
 
     async def list_projects_with_pending(self) -> list[str]:
         """Return distinct ``project_id``s that currently have pending tickets.

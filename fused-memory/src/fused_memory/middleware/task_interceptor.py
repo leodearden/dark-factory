@@ -6,7 +6,6 @@ import dataclasses
 import json
 import logging
 import os
-import time
 import uuid as uuid_mod
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -528,8 +527,6 @@ class TaskInterceptor:
         Performs:
         - ``flush_pending_on_startup``: marks any pending tickets left from a
           previous server run as ``failed/server_restart``.
-        - ``sweep_expired``: marks any expired pending tickets as
-          ``failed/expired``.
 
         If no ``ticket_store`` is wired in, this is a no-op.
         """
@@ -541,9 +538,6 @@ class TaskInterceptor:
         flushed = await self._ticket_store.flush_pending_on_startup()
         if flushed:
             logger.warning('start(): flushed %d orphaned pending ticket(s) from prior run', flushed)
-        swept = await self._ticket_store.sweep_expired()
-        if swept:
-            logger.info('start(): swept %d expired ticket(s)', swept)
 
     # ── Status transitions (with targeted reconciliation) ──────────────
 
@@ -1411,7 +1405,6 @@ class TaskInterceptor:
         ticket_id = await self._ticket_store.submit(
             project_id=project_id,
             candidate_json=blob,
-            ttl_seconds=600,
         )
         queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
         # Mark intent BEFORE the queue.put so a janitor tick that lands
@@ -1890,21 +1883,7 @@ class TaskInterceptor:
                     for tid in batch_ticket_ids:
                         queue.put_nowait(tid)
                     if self._usage_gate is not None:
-                        # Compensate every pending ticket in this project for
-                        # the capacity-blocked window so the TTL janitor does
-                        # not kill submissions the worker was never permitted
-                        # to attempt. ``finally`` so a CancelledError still
-                        # extends — partial credit beats none.
-                        t0 = time.monotonic()
-                        try:
-                            await self._usage_gate.wait_for_open(timeout=300)
-                        finally:
-                            elapsed = time.monotonic() - t0
-                            if elapsed > 0 and self._ticket_store is not None:
-                                with contextlib.suppress(Exception):
-                                    await self._ticket_store.extend_pending_expiry(
-                                        project_id, elapsed,
-                                    )
+                        await self._usage_gate.wait_for_open(timeout=300)
                 except Exception:
                     logger.exception(
                         '_curator_worker: unhandled error processing batch '

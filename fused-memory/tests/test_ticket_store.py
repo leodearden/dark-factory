@@ -76,7 +76,7 @@ async def test_new_ticket_id_has_tkt_prefix_and_sorts_by_time():
 async def test_submit_persists_pending_ticket_and_returns_id(store):
     """submit() inserts a pending row and returns a tkt_-prefixed id."""
     candidate = json.dumps({'title': 'Test Task', 'description': 'Do it'})
-    ticket_id = await store.submit(project_id='p', candidate_json=candidate, ttl_seconds=600)
+    ticket_id = await store.submit(project_id='p', candidate_json=candidate)
 
     assert ticket_id.startswith('tkt_')
 
@@ -87,11 +87,14 @@ async def test_submit_persists_pending_ticket_and_returns_id(store):
     assert row['project_id'] == 'p'
     assert row['candidate_json'] == candidate
 
-    # created_at and expires_at must be set
+    # created_at must be set; expires_at is now an advisory placeholder set
+    # far in the future (worker-liveness reaper supplanted wall-clock TTL).
     created_at = datetime.fromisoformat(row['created_at'])
     expires_at = datetime.fromisoformat(row['expires_at'])
     assert created_at.tzinfo is not None  # timezone-aware
-    assert expires_at == created_at + timedelta(seconds=600)
+    assert expires_at > created_at + timedelta(days=180), (
+        f'expires_at must be far-future placeholder, got {expires_at}'
+    )
 
     # Unresolved columns must be NULL
     assert row['task_id'] is None
@@ -198,37 +201,6 @@ async def test_flush_pending_on_startup_marks_all_pending_failed(store):
     assert row1['status'] == 'created'
 
 
-@pytest.mark.asyncio
-async def test_sweep_expired_marks_only_expired_pending_failed(store):
-    """sweep_expired() marks pending expired tickets failed; leaves non-expired alone."""
-    now = datetime.now(UTC)
-    past = now - timedelta(seconds=1)
-
-    # Insert an already-expired ticket (expires_at in the past)
-    expired_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    # Manually backdate the expires_at so it appears expired
-    db = store._db
-    await db.execute(
-        'UPDATE tickets SET expires_at = ? WHERE ticket_id = ?',
-        (past.isoformat(), expired_id),
-    )
-    await db.commit()
-
-    # Insert a ticket that won't expire yet
-    live_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-
-    count = await store.sweep_expired(now=now)
-    assert count == 1
-
-    expired_row = await store.get(expired_id)
-    assert expired_row['status'] == 'failed'
-    assert expired_row['reason'] == 'expired'
-    assert expired_row['resolved_at'] is not None
-
-    live_row = await store.get(live_id)
-    assert live_row['status'] == 'pending'  # untouched
-
-
 # ---------------------------------------------------------------------------
 # Janitor-facing helpers: fetch_unescalated_failures + mark_escalated
 # ---------------------------------------------------------------------------
@@ -250,10 +222,10 @@ async def _force_failed(store: TicketStore, ticket_id: str, *, reason: str) -> N
 async def test_fetch_unescalated_failures_returns_only_failed_null_escalated(store):
     """fetch_unescalated_failures excludes pending, combined, idempotency_hit,
     and rows already stamped via mark_escalated."""
-    pending_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    failed_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    pending_id = await store.submit(project_id='p', candidate_json='{}')
+    failed_id = await store.submit(project_id='p', candidate_json='{}')
     await _force_failed(store, failed_id, reason='curator_failed')
-    idem_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    idem_id = await store.submit(project_id='p', candidate_json='{}')
     await _force_failed(store, idem_id, reason='idempotency_hit')
 
     rows = await store.fetch_unescalated_failures()
@@ -273,8 +245,8 @@ async def test_fetch_unescalated_failures_returns_only_failed_null_escalated(sto
 
 @pytest.mark.asyncio
 async def test_fetch_unescalated_failures_filters_by_project(store):
-    a_id = await store.submit(project_id='proj-a', candidate_json='{}', ttl_seconds=600)
-    b_id = await store.submit(project_id='proj-b', candidate_json='{}', ttl_seconds=600)
+    a_id = await store.submit(project_id='proj-a', candidate_json='{}')
+    b_id = await store.submit(project_id='proj-b', candidate_json='{}')
     await _force_failed(store, a_id, reason='curator_failed')
     await _force_failed(store, b_id, reason='curator_failed')
 
@@ -287,8 +259,8 @@ async def test_fetch_unescalated_failures_filters_by_project(store):
 
 @pytest.mark.asyncio
 async def test_fetch_unescalated_failures_orders_by_resolved_at(store):
-    older = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    newer = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    older = await store.submit(project_id='p', candidate_json='{}')
+    newer = await store.submit(project_id='p', candidate_json='{}')
     # Force resolved_at directly so ordering is deterministic in CI.
     db = store._db
     await db.execute(
@@ -307,9 +279,9 @@ async def test_fetch_unescalated_failures_orders_by_resolved_at(store):
 
 @pytest.mark.asyncio
 async def test_mark_escalated_bulk_updates(store):
-    a_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    b_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    c_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    a_id = await store.submit(project_id='p', candidate_json='{}')
+    b_id = await store.submit(project_id='p', candidate_json='{}')
+    c_id = await store.submit(project_id='p', candidate_json='{}')
     await _force_failed(store, a_id, reason='r')
     await _force_failed(store, b_id, reason='r')
     await _force_failed(store, c_id, reason='r')
@@ -368,59 +340,6 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# extend_pending_expiry — capacity-blocked TTL compensation
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_extend_pending_expiry_advances_only_pending_in_project(store):
-    """Only pending rows in the named project are pushed forward."""
-    p1_pending = await store.submit(project_id='p1', candidate_json='{}', ttl_seconds=600)
-    p2_pending = await store.submit(project_id='p2', candidate_json='{}', ttl_seconds=600)
-    p1_terminal = await store.submit(project_id='p1', candidate_json='{}', ttl_seconds=600)
-    await _force_failed(store, p1_terminal, reason='whatever')
-
-    before = {
-        p1_pending: (await store.get(p1_pending))['expires_at'],
-        p2_pending: (await store.get(p2_pending))['expires_at'],
-        p1_terminal: (await store.get(p1_terminal))['expires_at'],
-    }
-
-    n = await store.extend_pending_expiry('p1', seconds=100)
-    assert n == 1, 'only the single pending p1 row should have been updated'
-
-    after_p1 = (await store.get(p1_pending))['expires_at']
-    after_p2 = (await store.get(p2_pending))['expires_at']
-    after_p1_terminal = (await store.get(p1_terminal))['expires_at']
-
-    # p1 pending row moved forward by ~100s (sqlite datetime arithmetic
-    # rounds to whole seconds for integer additions, but our ".3f" format
-    # passes a fractional value through; either way, post > pre).
-    pre_dt = datetime.fromisoformat(before[p1_pending])
-    post_dt = datetime.fromisoformat(after_p1)
-    delta = (post_dt - pre_dt).total_seconds()
-    assert 99.0 <= delta <= 101.0, f'expected ~100s shift, got {delta}'
-
-    # The other rows are untouched.
-    assert after_p2 == before[p2_pending]
-    assert after_p1_terminal == before[p1_terminal]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('seconds', [0, -1, -100.5])
-async def test_extend_pending_expiry_zero_or_negative_is_noop(store, seconds):
-    """Non-positive values short-circuit without touching the DB."""
-    pid = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    before = (await store.get(pid))['expires_at']
-
-    n = await store.extend_pending_expiry('p', seconds=seconds)
-    assert n == 0
-
-    after = (await store.get(pid))['expires_at']
-    assert after == before
-
-
-# ---------------------------------------------------------------------------
 # list_tickets — caller-facing discovery
 # ---------------------------------------------------------------------------
 
@@ -439,8 +358,8 @@ async def _force_created_at(store: TicketStore, ticket_id: str, when: datetime) 
 async def test_list_tickets_default_window_7d(store):
     """Default window (no since=) returns rows newer than now-7d only."""
     now = datetime.now(UTC)
-    recent = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    old = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    recent = await store.submit(project_id='p', candidate_json='{}')
+    old = await store.submit(project_id='p', candidate_json='{}')
     await _force_created_at(store, recent, now - timedelta(days=1))
     await _force_created_at(store, old, now - timedelta(days=8))
 
@@ -453,9 +372,9 @@ async def test_list_tickets_default_window_7d(store):
 @pytest.mark.asyncio
 async def test_list_tickets_status_filter_excludes_other_states(store):
     """status='failed' returns only the failed row."""
-    pending = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    failed = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
-    combined = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    pending = await store.submit(project_id='p', candidate_json='{}')
+    failed = await store.submit(project_id='p', candidate_json='{}')
+    combined = await store.submit(project_id='p', candidate_json='{}')
     await _force_failed(store, failed, reason='curator_failed')
     db = store._db
     await db.execute(
@@ -478,7 +397,7 @@ async def test_list_tickets_orders_newest_first_and_caps_at_limit(store):
     now = datetime.now(UTC)
     ids: list[str] = []
     for i in range(5):
-        tid = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+        tid = await store.submit(project_id='p', candidate_json='{}')
         await _force_created_at(store, tid, now - timedelta(minutes=i))
         ids.append(tid)
     # ids[0] is newest (offset 0min), ids[4] is oldest (offset 4min).
@@ -493,8 +412,8 @@ async def test_list_tickets_orders_newest_first_and_caps_at_limit(store):
 @pytest.mark.asyncio
 async def test_list_tickets_filters_by_project(store):
     """Rows from another project never leak into the result."""
-    a_id = await store.submit(project_id='proj-a', candidate_json='{}', ttl_seconds=600)
-    b_id = await store.submit(project_id='proj-b', candidate_json='{}', ttl_seconds=600)
+    a_id = await store.submit(project_id='proj-a', candidate_json='{}')
+    b_id = await store.submit(project_id='proj-b', candidate_json='{}')
 
     a_rows = await store.list_tickets('proj-a')
     assert {r['ticket_id'] for r in a_rows} == {a_id}
