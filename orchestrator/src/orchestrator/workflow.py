@@ -2811,6 +2811,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     f'escalation'
                 )
                 return WorkflowOutcome.DONE
+        # Drop-guard short-circuit: a real merger-drop is the human-judgement
+        # case the gate exists for.  Steward mediation (e.g. mutating plan.json
+        # to silence the gate) would undermine the safeguard, so skip the L0
+        # steward path entirely and submit an L1 immediately.
+        from orchestrator.merge_queue import DROPPED_PLAN_TARGETS_REASON_PREFIX
+        if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
+            self._write_merge_failure_review('dropped_plan_targets', result.reason)
+            return await self._mark_blocked(
+                result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+            )
         # blocked — infer review category from reason
         if 'verification failed' in result.reason.lower():
             category = 'post_merge_verify'
