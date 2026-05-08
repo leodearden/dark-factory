@@ -1881,6 +1881,19 @@ class TaskInterceptor:
                         'of %d tickets for project %s',
                         len(batch_ticket_ids), project_id,
                     )
+                    # Terminalise every ticket in the batch so they don't sit
+                    # ``pending`` waiting for a wall-clock janitor sweep —
+                    # ``mark_resolved`` is best-effort (suppress) so the
+                    # signal-waiters guarantee below holds even if the store
+                    # is closed mid-shutdown.
+                    if self._ticket_store is not None:
+                        for tid in batch_ticket_ids:
+                            with contextlib.suppress(Exception):
+                                await self._ticket_store.mark_resolved(
+                                    tid,
+                                    status='failed',
+                                    reason='curator_failed',
+                                )
                     # Signal so resolve_ticket callers are not blocked forever
                     # when _process_add_tickets_batch_prepared raised before
                     # mark_resolved + signal for each ticket.

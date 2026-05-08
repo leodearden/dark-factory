@@ -2295,6 +2295,92 @@ class TestAllAccountsCappedSentinel:
 
 
 # ---------------------------------------------------------------------------
+# generic curator-batch exception terminalises tickets (not pending → expired)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generic_curator_exception_marks_tickets_failed_curator_failed(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """A non-cap exception escaping into the worker's outer ``except Exception``
+    branch must terminalise every ticket in the batch as
+    ``status='failed', reason='curator_failed'`` and signal waiters — instead
+    of leaving them ``pending`` for a wall-clock janitor to sweep as expired.
+
+    The plan's symptom on 2026-05-08: tickets sat ``pending`` after
+    ``_curator_worker`` logged ``unhandled error`` because the only response
+    was ``_signal_ticket_event`` (no ``mark_resolved``).  Simulate that by
+    making ``_process_add_tickets_batch_prepared`` itself raise — which is
+    what the outer worker catches as the catch-all "something inside the
+    batch dispatch we didn't anticipate" branch."""
+    project_id = 'project'
+
+    mock_curator = MagicMock()
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+    _stub_prepare_candidate(mock_curator)
+    # If the inner degrade-to-create path is reached, fail loudly — we want
+    # the OUTER exception branch to be exercised.
+    mock_curator.curate_batch = AsyncMock(side_effect=AssertionError(
+        'inner degrade path should not be reached',
+    ))
+
+    candidate = json.dumps({
+        'project_root': '/project',
+        'kwargs': {'title': 'T', 'description': 'd'},
+        'metadata': None,
+    })
+    t1 = await ticket_store.submit(project_id, candidate, ttl_seconds=600)
+    t2 = await ticket_store.submit(project_id, candidate, ttl_seconds=600)
+    t3 = await ticket_store.submit(project_id, candidate, ttl_seconds=600)
+
+    queue = interceptor_with_store._ticket_queues.setdefault(
+        project_id, asyncio.Queue(),
+    )
+    queue.put_nowait(t1)
+    queue.put_nowait(t2)
+    queue.put_nowait(t3)
+
+    # Patch _process_add_tickets_batch_prepared to raise — this is the only
+    # call inside the worker's outer try-block whose failures aren't already
+    # absorbed at finer granularity, so it is the contract-shaped surface for
+    # "something raised; terminalise the batch".
+    async def _raise_synthetic(prepared_batch):
+        raise RuntimeError('synthetic')
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ), patch.object(
+        type(interceptor_with_store), '_ensure_taskmaster',
+        new=AsyncMock(return_value=taskmaster),
+    ), patch.object(
+        type(interceptor_with_store), '_process_add_tickets_batch_prepared',
+        new=AsyncMock(side_effect=_raise_synthetic),
+    ):
+        interceptor_with_store._start_worker_if_needed(project_id)
+        # resolve_ticket should return immediately (signalled) once worker
+        # marks the row terminal.
+        results = await asyncio.gather(
+            interceptor_with_store.resolve_ticket(t1, '/project', timeout_seconds=2.0),
+            interceptor_with_store.resolve_ticket(t2, '/project', timeout_seconds=2.0),
+            interceptor_with_store.resolve_ticket(t3, '/project', timeout_seconds=2.0),
+        )
+
+    for tid, res in zip([t1, t2, t3], results, strict=True):
+        row = await ticket_store.get(tid)
+        assert row['status'] == 'failed', (
+            f'expected failed for {tid}, got {row["status"]} (resolve_ticket={res})'
+        )
+        assert row['reason'] == 'curator_failed', (
+            f'expected curator_failed for {tid}, got reason={row["reason"]!r}'
+        )
+        assert row['resolved_at'] is not None
+        assert res.get('status') == 'failed', res
+
+
+# ---------------------------------------------------------------------------
 # extend_pending_expiry on gate-closed window
 # ---------------------------------------------------------------------------
 
