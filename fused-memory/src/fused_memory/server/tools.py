@@ -1377,6 +1377,33 @@ def create_mcp_server(
             }
         return None
 
+    def _reject_status_in_update_task(
+        task_id: str, status: str | None,
+    ) -> dict | None:
+        """Return a rejection dict if ``update_task`` was called with ``status``.
+
+        ``set_task_status`` is the only sanctioned writer for task status — it
+        enforces the terminal-exit gate, the phantom-done gate, and the
+        done-provenance gate. ``update_task(status=…)`` slipped through all
+        three and was used to mark reify tasks done with the implementing
+        commit only on the task branch (2026-05-08 forensics: 9 historical
+        ``done`` writes via this path in 36 h). Lock the door.
+        """
+        if status is None:
+            return None
+        return {
+            'success': False,
+            'error': 'status_via_update_task',
+            'task_id': task_id,
+            'status': status,
+            'hint': (
+                'update_task is metadata-only. Use '
+                'set_task_status(status=…, done_provenance={...} when '
+                'status="done") to change status — it enforces the '
+                'terminal-exit, phantom-done, and done-provenance gates.'
+            ),
+        }
+
     def _reject_done_provenance_in_metadata(
         metadata: str | dict | None,
     ) -> dict | None:
@@ -1871,6 +1898,8 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+        if err := _reject_status_in_update_task(id, status):
+            return err
         if err := _reject_done_provenance_in_metadata(metadata):
             return err
         try:

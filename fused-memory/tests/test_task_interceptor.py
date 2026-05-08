@@ -4714,3 +4714,113 @@ async def test_journaled_write_logs_failure_row(
         await journal.close()
 
 
+# ── Tests for update_task status-kwarg rejection (defence-in-depth) ─────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked'])
+async def test_update_task_rejects_status_kwarg(
+    interceptor, taskmaster, bad_status,
+):
+    """The interceptor's update_task path also rejects status=…
+
+    Defence-in-depth alongside the same gate at the MCP tool surface.
+    Closes the bypass route used to mark reify tasks done without going
+    through the terminal-exit, phantom-done, and done-provenance gates.
+    """
+    result = await interceptor.update_task(
+        task_id='1', project_root='/project', status=bad_status,
+    )
+    assert isinstance(result, dict)
+    assert result.get('error') == 'status_via_update_task'
+    assert result.get('status') == bad_status
+    assert 'set_task_status' in result.get('hint', '')
+    taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_none_passes_through(interceptor, taskmaster):
+    """status=None (the metadata-only path) is unchanged — the gate only blocks non-None."""
+    await interceptor.update_task(
+        task_id='1', project_root='/project', status=None, details='x',
+    )
+    taskmaster.update_task.assert_called_once()
+
+
+# ── Tests for set_task_status audit-metadata read-modify-write (2026-05-08) ─
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_with_reopen_reason_preserves_metadata(
+    taskmaster, reconciler, event_buffer,
+):
+    """Reopening a done task must NOT clobber existing metadata (files, memory_hints).
+
+    Bug: the audit-metadata write at task_interceptor.py:681-694 used
+    update_task(metadata=json.dumps({reopen_reason, …}), append=False) — that
+    overwrites the entire metadata blob, dropping memory_hints and files.
+    Fix: read-modify-write so audit fields merge with existing metadata.
+    """
+    taskmaster.get_task = AsyncMock(return_value={
+        'id': '7',
+        'status': 'done',
+        'title': 'T',
+        'metadata': {
+            'files': ['a.py', 'b.py'],
+            'memory_hints': {'queries': ['ctx']},
+            'spawned_from': '5',
+        },
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '7', 'pending', '/project', reopen_reason='manual reopen',
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    # Audit fields are written.
+    assert persisted['reopen_reason'] == 'manual reopen'
+    assert persisted['reopen_from'] == 'done'
+    assert 'reopen_at' in persisted
+    # Prior metadata is preserved.
+    assert persisted['files'] == ['a.py', 'b.py']
+    assert persisted['memory_hints'] == {'queries': ['ctx']}
+    assert persisted['spawned_from'] == '5'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_with_provenance_preserves_metadata(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """Marking done with done_provenance must NOT clobber existing metadata."""
+    sha = _init_git_repo(tmp_path)
+    # Create the declared file so the phantom-done gate doesn't trip on it.
+    (tmp_path / 'x.py').write_text('# shipped\n')
+    taskmaster.get_task = AsyncMock(return_value={
+        'id': '9',
+        'status': 'in-progress',
+        'title': 'T',
+        'metadata': {
+            'files': ['x.py'],
+            'memory_hints': {'queries': ['hint']},
+        },
+    })
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '9', 'done', str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': sha},
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance']['kind'] == 'merged'
+    assert persisted['done_provenance']['commit'] == sha
+    # Prior metadata is preserved.
+    assert persisted['files'] == ['x.py']
+    assert persisted['memory_hints'] == {'queries': ['hint']}
+
+

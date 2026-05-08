@@ -1864,6 +1864,108 @@ class TestSetTaskStatusForwarding:
             'rejected by fused-memory' in rec.message for rec in caplog.records
         )
 
+    @pytest.mark.asyncio
+    async def test_set_task_status_raises_on_terminal_exit_blocked(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Server-rejected ``done -> blocked`` (no reopen_reason) raises TerminalExitRejection.
+
+        The rejection is a logical contradiction — the row is already terminal
+        and the caller asked for a non-terminal target with no reopen_reason.
+        Callers (notably ``workflow._mark_blocked``) need to distinguish this
+        from a transient backend blip so they can run bypass-detection rather
+        than swallow the rejection.
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+        rejection_response = {
+            'result': {
+                'structuredContent': {
+                    'success': False,
+                    'error': 'terminal_exit_rejected',
+                    'task_id': '42',
+                    'from_status': 'done',
+                    'to_status': 'blocked',
+                    'hint': "Cannot transition from 'done' to 'blocked' …",
+                },
+                'isError': False,
+            },
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=rejection_response),
+        )
+        with pytest.raises(TerminalExitRejection) as excinfo:
+            await scheduler.set_task_status('42', 'blocked')
+        exc = excinfo.value
+        assert exc.task_id == '42'
+        assert exc.old_status == 'done'
+        assert exc.target_status == 'blocked'
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_silent_on_redundant_terminal_target(
+        self, scheduler: Scheduler, monkeypatch, caplog,
+    ):
+        """``done -> done`` should not raise — same-status writes are idempotent.
+
+        The exception is reserved for logical contradictions (terminal -> non-terminal
+        with no reopen_reason); a terminal -> terminal target is just a no-op
+        on the server side and we never want callers to see it as an error.
+        """
+        import logging as _logging
+        # Note: this is the unlikely shape where the server elects to return
+        # terminal_exit_rejected for a terminal target. Real fused-memory
+        # returns no_op for done->done; we simulate the corner case where the
+        # server were to ever return the structured error to confirm we don't
+        # raise.
+        rejection_response = {
+            'result': {
+                'structuredContent': {
+                    'success': False,
+                    'error': 'terminal_exit_rejected',
+                    'task_id': '42',
+                    'from_status': 'done',
+                    'to_status': 'done',
+                    'hint': '…',
+                },
+            },
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=rejection_response),
+        )
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+            # Must NOT raise — terminal target is not a logical contradiction.
+            await scheduler.set_task_status('42', 'done')
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_silent_when_reopen_reason_supplied(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """When the caller passed reopen_reason, even a terminal_exit_rejected
+        rejection from the server doesn't raise — the caller already
+        acknowledged the terminal state.
+        """
+        rejection_response = {
+            'result': {
+                'structuredContent': {
+                    'success': False,
+                    'error': 'terminal_exit_rejected',
+                    'task_id': '42',
+                    'from_status': 'done',
+                    'to_status': 'blocked',
+                },
+            },
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=rejection_response),
+        )
+        # Must NOT raise — caller passed reopen_reason; the rejection isn't a
+        # logical contradiction, just a server-side validation message.
+        await scheduler.set_task_status(
+            '42', 'blocked', reopen_reason='manual',
+        )
+
 
 class TestExtractRejection:
     """Direct tests of the response-shape parser used by set_task_status."""

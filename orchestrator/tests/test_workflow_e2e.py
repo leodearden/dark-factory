@@ -354,6 +354,9 @@ class FakeScheduler:
         self.statuses: dict[str, list[str]] = {}
         self.provenance: dict[str, dict] = {}
         self.reopen_reasons: dict[str, str] = {}
+        # Optional task data store for tests that exercise the bypass-detection
+        # path, which calls get_task to read metadata.done_provenance.
+        self.task_data: dict[str, dict] = {}
 
     async def set_task_status(
         self,
@@ -377,6 +380,9 @@ class FakeScheduler:
     async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
         return history[-1] if history else None
+
+    async def get_task(self, task_id: str) -> dict | None:
+        return self.task_data.get(task_id)
 
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         return True
@@ -4980,6 +4986,254 @@ class TestMarkBlockedPhantomDone:
         done_index = statuses.index('done')
         assert 'pending' not in statuses[done_index:], (
             f'Workflow must not requeue after steward marked done: {statuses}'
+        )
+
+
+@pytest.mark.asyncio
+class TestMarkBlockedBypassDetection:
+    """Detect ``update_task(status='done')`` bypass when set_task_status('blocked') is rejected.
+
+    Forensics 2026-05-08: workflow agents called update_task(status='done') and
+    bypassed the merge gate. Later in the same workflow, _mark_blocked tried to
+    write 'blocked' but the row was already 'done' — fused-memory's
+    terminal-exit gate refused, the rejection was swallowed, and the harness
+    cleaned up the (unmerged) worktree+branch. This trip-wire catches the
+    bypass and routes to L1.
+    """
+
+    async def test_mark_blocked_detects_bypass_done_and_reopens(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """When set_task_status('blocked') raises TerminalExitRejection AND the
+        row's done_provenance commit is not on main → reopen + L1.
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+
+        # Configure scheduler to return a 'done' row whose done_provenance
+        # cites a fabricated, off-main SHA.
+        bypass_sha = 'd' * 40
+        scheduler.task_data = {  # type: ignore[attr-defined]
+            task_assignment.task_id: {
+                'id': task_assignment.task_id,
+                'status': 'done',
+                'metadata': {
+                    'done_provenance': {
+                        'kind': 'merged', 'commit': bypass_sha,
+                    },
+                },
+            },
+        }
+
+        # Make the FIRST set_task_status('blocked') (no reopen_reason) raise
+        # the rejection, mirroring fused-memory's terminal-exit gate. Later
+        # calls (with reopen_reason) succeed.
+        original_set = scheduler.set_task_status
+
+        async def raising_set(task_id, status, *, done_provenance=None, reopen_reason=None):
+            if status == 'blocked' and reopen_reason is None:
+                raise TerminalExitRejection(
+                    task_id=task_id, old_status='done',
+                    target_status='blocked', raw='terminal_exit_rejected',
+                )
+            await original_set(
+                task_id, status,
+                done_provenance=done_provenance,
+                reopen_reason=reopen_reason,
+            )
+
+        scheduler.set_task_status = raising_set  # type: ignore[method-assign]
+
+        outcome = await workflow._mark_blocked(
+            'Architect reported task already done at deadbeef but commit is '
+            'not reachable from main',
+            detail='evidence: commit-not-on-main',
+        )
+
+        # Bypass detected → BLOCKED, not DONE.
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED on bypass detection, got {outcome!r}'
+        )
+
+        # An L1 with category='bypass_done' must be filed.
+        l1 = queue.get_by_task(task_assignment.task_id, level=1)
+        assert l1, 'expected an L1 escalation for bypass_done'
+        bypass_l1 = [e for e in l1 if e.category == 'bypass_done']
+        assert bypass_l1, (
+            f'expected category=bypass_done in L1 list, got '
+            f'{[(e.id, e.category) for e in l1]}'
+        )
+
+        # The reopen_reason must reference 'bypass detected'.
+        reasons = scheduler.reopen_reasons
+        assert task_assignment.task_id in reasons, (
+            'expected reopen_reason to be persisted'
+        )
+        assert 'bypass detected' in reasons[task_assignment.task_id]
+
+    async def test_mark_blocked_accepts_legitimate_done_with_valid_provenance(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """When done_provenance.commit IS on main, treat as legitimate done.
+
+        The first set_task_status('blocked') is rejected (because the row is
+        already done) but bypass-detection sees a valid provenance commit on
+        main and lets the existing flow continue (which falls through to the
+        steward / DONE path).
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+
+        # Use the actual main HEAD SHA so is_ancestor returns True.
+        main_sha = await git_ops.get_main_sha()
+        scheduler.task_data = {  # type: ignore[attr-defined]
+            task_assignment.task_id: {
+                'id': task_assignment.task_id,
+                'status': 'done',
+                'metadata': {
+                    'done_provenance': {'kind': 'merged', 'commit': main_sha},
+                },
+            },
+        }
+
+        # Make set_task_status('blocked') (no reopen_reason) raise.
+        async def raising_set(task_id, status, *, done_provenance=None, reopen_reason=None):
+            if status == 'blocked' and reopen_reason is None:
+                raise TerminalExitRejection(
+                    task_id=task_id, old_status='done',
+                    target_status='blocked', raw='terminal_exit_rejected',
+                )
+
+        scheduler.set_task_status = raising_set  # type: ignore[method-assign]
+
+        outcome = await workflow._mark_blocked('synthetic reason')
+
+        # Legitimate done — no bypass_done L1 and no reopen.
+        bypass_l1 = [
+            e for e in queue.get_by_task(task_assignment.task_id, level=1)
+            if e.category == 'bypass_done'
+        ]
+        assert not bypass_l1, (
+            f'expected no bypass_done L1 for legitimate done, got '
+            f'{[(e.id, e.category) for e in bypass_l1]}'
+        )
+
+        # The reopen_reason must NOT contain 'bypass detected'.
+        assert 'bypass detected' not in scheduler.reopen_reasons.get(
+            task_assignment.task_id, ''
+        )
+
+
+@pytest.mark.asyncio
+class TestCleanupVerificationGate:
+    """Cleanup must verify the branch is reachable from main before removing it.
+
+    Forensics 2026-05-08: when an agent bypassed the merge via
+    update_task(status='done'), the workflow returned DONE while the branch's
+    HEAD was still off-main. The cleanup_worktree call deleted the branch and
+    worktree; only the loose-object grace period kept the work recoverable.
+    """
+
+    async def test_cleanup_skipped_when_branch_not_on_main(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path, caplog,
+    ):
+        """state=DONE but branch HEAD off-main → preserve worktree+branch."""
+        import logging as _logging
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+        # Force the workflow to short-circuit to DONE with state=DONE but the
+        # branch HEAD still off-main.
+        workflow.state = WorkflowState.DONE
+
+        # Mark the worktree branch divergent from main: write+commit a file
+        # on the worktree branch only.
+        (wt_info.path / 'unmerged_marker.txt').write_text('off-main\n')
+        await _run(['git', 'add', '-A'], cwd=wt_info.path)
+        await _run(
+            ['git', 'commit', '-m', 'unmerged change'], cwd=wt_info.path,
+        )
+
+        cleanup_called = False
+        original_cleanup = git_ops.cleanup_worktree
+
+        async def tracking_cleanup(worktree, branch):
+            nonlocal cleanup_called
+            cleanup_called = True
+            await original_cleanup(worktree, branch)
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', tracking_cleanup)
+
+        # Drive the run() finally-block cleanup via a minimal helper that
+        # mimics the same predicate. Easiest: directly call the cleanup gate
+        # by invoking workflow.run() — but run() executes the full flow.
+        # Instead: invoke the finally-block cleanup logic by calling the
+        # private helper directly.
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.workflow'):
+            await workflow._maybe_cleanup_done_worktree()
+
+        assert not cleanup_called, (
+            'cleanup_worktree must NOT run when branch HEAD is not reachable '
+            'from main — preserves work for human inspection'
+        )
+        warned = [
+            rec for rec in caplog.records
+            if 'not reachable from main' in rec.message
+        ]
+        assert warned, (
+            'expected a warning that we preserved worktree+branch, '
+            f'got: {[r.message for r in caplog.records]}'
+        )
+
+    async def test_cleanup_runs_when_branch_on_main(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """state=DONE and branch HEAD reachable from main → normal cleanup."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+        workflow.state = WorkflowState.DONE
+
+        # Worktree HEAD == main HEAD (no divergent commits) → ancestor check
+        # succeeds and cleanup runs.
+
+        cleanup_called: list[Path] = []
+        original_cleanup = git_ops.cleanup_worktree
+
+        async def tracking_cleanup(worktree, branch):
+            cleanup_called.append(worktree)
+            await original_cleanup(worktree, branch)
+
+        monkeypatch.setattr(git_ops, 'cleanup_worktree', tracking_cleanup)
+
+        await workflow._maybe_cleanup_done_worktree()
+
+        assert cleanup_called, (
+            'cleanup_worktree MUST run when branch HEAD is on main — '
+            'no work to preserve'
         )
 
 
