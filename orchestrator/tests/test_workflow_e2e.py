@@ -2735,6 +2735,80 @@ class TestMarkBlockedFalseDoneGuard:
         assert len(l0) == 1
         assert queue.has_open_l1(task_assignment.task_id)
 
+    async def test_dropped_plan_targets_routes_to_l1_directly(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """A merge outcome with the dropped_plan_targets reason prefix must
+        skip the steward entirely and submit an L1 escalation directly.
+
+        Rationale: post-Fix-1 the drop-guard fires only on real merger
+        drops — the human-judgement case the gate was built for.  Asking
+        the steward to mediate (e.g. mutate plan.json to silence the
+        gate) would undermine the safeguard.  Pin this routing so future
+        refactors don't accidentally re-enable steward involvement.
+
+        Spies on ``_mark_blocked`` rather than driving through the full
+        steward grace period — the contract under test is that
+        ``_submit_to_merge_queue`` passes ``escalate_to_human=True`` for
+        this specific reason prefix.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from orchestrator.merge_queue import (
+            DROPPED_PLAN_TARGETS_REASON_PREFIX,
+            MergeOutcome,
+        )
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # Spy on _mark_blocked so we can inspect its kwargs.  Returning
+        # BLOCKED matches what the production helper returns on the
+        # escalate_to_human path.
+        spy_mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        workflow._mark_blocked = spy_mark_blocked  # type: ignore[method-assign]
+
+        # Stub enqueue so the merge worker isn't needed: deliver a blocked
+        # MergeOutcome whose reason matches the drop-guard prefix.
+        async def _fake_enqueue(_queue, request, _event_store):
+            request.result.set_result(MergeOutcome(
+                'blocked',
+                reason=(
+                    f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: foo.py. '
+                    f'Conflict resolution likely dropped planned work. '
+                    f'Review the merge commit and restore missing files.'
+                ),
+            ))
+
+        workflow.merge_queue = asyncio.Queue()
+        with patch(
+            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+        ):
+            outcome = await workflow._submit_to_merge_queue(
+                task_assignment.task_id, pre_rebased=False, merge_phase=True,
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED, got {outcome!r}'
+        )
+        spy_mark_blocked.assert_awaited_once()
+        _args, kwargs = spy_mark_blocked.await_args
+        assert kwargs.get('escalate_to_human') is True, (
+            'dropped_plan_targets must call _mark_blocked(escalate_to_human=True); '
+            f'got kwargs={kwargs!r}'
+        )
+        assert kwargs.get('merge_phase') is True, (
+            'merge_phase flag must be threaded through to _mark_blocked; '
+            f'got kwargs={kwargs!r}'
+        )
+
     async def test_l1_dedupe_when_already_open(
         self, config, git_ops, task_assignment, tmp_path
     ):
