@@ -258,7 +258,7 @@ Review the above data and perform memory consolidation:
 5. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
-"""
+{f'Use project_root="{self.project_root}" for tasks scoped to this project.' if self.project_root else ''}"""
 
     def _build_task_tree_section(self) -> str:
         """Return the Active Task Tree prompt section, or empty string if no tree set.
