@@ -131,9 +131,24 @@ Task 1145 Guard 3 is shipped):
 2. Call `add_memory(category='temporal_facts', content=<new fact>)` — Graphiti assigns \
    current time as `valid_at`, ensuring accurate temporal ordering in search results.
 
+**Encoding effective dates in fact text**: when writing a temporal-fact snapshot via \
+`add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \
+fact text itself so the temporal anchor is human-readable even if `valid_at` metadata \
+is not surfaced by the search caller. Example fact text: \
+`"As of 2026-05-09: project dark_factory has 42 total tasks, 18 done, 3 blocked."` \
+This is especially important for task-count, task-status, run summary, and system-stat \
+snapshots where the date of the reading is part of the fact's meaning.
+
+**Cycle summary acknowledgment**: note in your cycle summary that `update_edge` lacks a \
+`valid_at` parameter and that you used the two-step workaround (invalidate + add_memory) \
+for any temporal/snapshot edge updates. This keeps the `valid_at` gap visible to \
+downstream stages and the judge. Example: "Used invalidate+add_memory workaround for \
+N snapshot edges (update_edge valid_at limitation)."
+
 When this applies: any time the fact text describes "current state as of today" (task \
-counts, system status, run summaries). For static entity relationships where the temporal \
-anchor is irrelevant, plain `update_edge` with new fact text remains acceptable.
+counts, task status, system status, run summaries). For static entity relationships where \
+the temporal anchor is irrelevant, plain `update_edge` with new fact text remains \
+acceptable.
 
 ## Cycle Fence
 When a cycle fence timestamp is provided in the payload, do NOT delete, merge, or modify \
