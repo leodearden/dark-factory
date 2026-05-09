@@ -811,6 +811,110 @@ async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog)
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# task-1165 step-1 — HIT path: respects add_memory response memory_ids
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'add_memory_response,expect_delete,expect_noop_warning',
+    [
+        pytest.param(
+            'empty',  # AddMemoryResponse(memory_ids=[])
+            False,
+            True,
+            id='empty-memory_ids-skips-delete-and-warns',
+        ),
+        pytest.param(
+            'non_empty',  # AddMemoryResponse(memory_ids=['new-marker-id'])
+            True,
+            False,
+            id='non-empty-memory_ids-proceeds-to-delete',
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
+    add_memory_response, expect_delete, expect_noop_warning, caplog
+):
+    """HIT path: dedup_flags must inspect add_memory's return value.
+
+    When add_memory returns an empty memory_ids list:
+    - delete_memory must NOT be called (priors preserved for next cycle)
+    - a WARNING must be emitted containing task_id and flag_type
+
+    When add_memory returns a non-empty memory_ids list:
+    - delete_memory MUST be called once for the prior
+    - no no-op WARNING should be emitted
+    """
+    import logging
+
+    from fused_memory.models.memory import AddMemoryResponse
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'prior-hit-resp-test'
+
+    if add_memory_response == 'empty':
+        response = AddMemoryResponse(memory_ids=[])
+    else:
+        response = AddMemoryResponse(memory_ids=['new-marker-id'])
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.add_memory = AsyncMock(return_value=response)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # Flag is still annotated with persisted_from_run regardless of write outcome
+    assert len(result) == 1
+    assert result[0]['persisted_from_run'] == 'r0'
+    assert result[0]['last_seen_run_id'] == 'r1'
+
+    # add_memory always called once
+    memory_service.add_memory.assert_called_once()
+
+    if expect_delete:
+        # Non-empty memory_ids: delete should proceed
+        memory_service.delete_memory.assert_called_once()
+        del_kwargs = memory_service.delete_memory.call_args.kwargs
+        assert del_kwargs.get('memory_id') == 'prior-hit-resp-test'
+    else:
+        # Empty memory_ids: delete must be skipped
+        memory_service.delete_memory.assert_not_called()
+
+    # Check WARNING for no-op case
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    if expect_noop_warning:
+        assert any('42' in m for m in warning_messages), (
+            f'Expected WARNING mentioning task_id=42 but got: {warning_messages}'
+        )
+        assert any('missing_deliverable' in m for m in warning_messages), (
+            f'Expected WARNING mentioning flag_type but got: {warning_messages}'
+        )
+    else:
+        # No no-op warning expected when memory_ids is non-empty
+        noop_warnings = [m for m in warning_messages if 'no memory_ids' in m or 'returned no memory_ids' in m]
+        assert not noop_warnings, (
+            f'Unexpected no-op WARNING on non-empty memory_ids path: {noop_warnings}'
+        )
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
     """Regression: two successive dedup_flags calls for the same flag leave exactly 1 marker.
