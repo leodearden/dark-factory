@@ -75,7 +75,7 @@ class TestComputeFlagSignature:
 
 @pytest.mark.asyncio
 async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
-    """Flags without task_id/flag_type pass through unchanged with zero I/O calls."""
+    """Flags without task_id/flag_type pass through with exactly one I/O call (suppression filter); add_memory never called."""
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
@@ -96,8 +96,10 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 
     # All flags returned unchanged
     assert result == original_flags
-    # Zero I/O calls
-    memory_service.search.assert_not_called()
+    # filter_suppressed issues exactly one project-scoped suppression search;
+    # no per-flag searches because no flags have computable signatures.
+    assert memory_service.search.call_count == 1
+    # add_memory never called — no-signature flags never reach the marker write path
     memory_service.add_memory.assert_not_called()
 
 
@@ -173,8 +175,10 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     assert result[0]['persisted_from_run'] == 'r0'
     assert result[0]['last_seen_run_id'] == 'r1'
 
-    # (b) search was called once with project_id='p' and a query mentioning task_id and flag_type
-    memory_service.search.assert_called_once()
+    # (b) search was called twice: once for the suppression filter (filter_suppressed)
+    #     and once for the per-flag prior-marker lookup.  call_args refers to the last
+    #     call (per-flag), which must contain project_id='p' and mention task_id+flag_type.
+    assert memory_service.search.call_count == 2  # 1 suppression + 1 per-flag
     # project_id must be passed as a kwarg (production code uses kwargs throughout)
     assert memory_service.search.call_args.kwargs['project_id'] == 'p'
     # query must strictly mention both the task_id and the flag_type (no permissive 'or')
@@ -242,8 +246,8 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
         task_id='42', flag_type='missing_deliverable', run_id='r1',
     )
 
-    # Exactly one search per flag
-    memory_service.search.assert_called_once()
+    # Two search calls: 1 for the suppression filter (filter_suppressed) + 1 per-flag.
+    assert memory_service.search.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1091,261 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
         assert not noop_warnings, (
             f'Unexpected no-op WARNING on non-empty memory_ids path: {noop_warnings}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestFilterSuppressed (task-1186 step-1) — filter_suppressed behavior
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSuppressed:
+    """Tests for filter_suppressed(memory_service, project_id, flags).
+
+    All tests import filter_suppressed from flag_dedup; they will fail with
+    ImportError until the implementation is added in step-2.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_flags_returns_empty_no_io(self):
+        """(a) Empty flags input → empty result + zero I/O."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        memory_service = AsyncMock()
+        result = await filter_suppressed(memory_service, 'p', [])
+        assert result == []
+        memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_search_results_all_flags_pass_through(self):
+        """(b) Empty search results → all flags pass through unchanged."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[])
+        flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'stale_metadata'},
+        ]
+        result = await filter_suppressed(memory_service, 'p', flags)
+        assert result == flags
+
+    @pytest.mark.asyncio
+    async def test_search_called_with_canonical_kwargs(self):
+        """(c) search called with canonical kwargs (project_id, categories, stores, limit, query)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[])
+        flags = [{'task_id': 1, 'flag_type': 'missing_deliverable'}]
+        await filter_suppressed(memory_service, 'p', flags)
+
+        memory_service.search.assert_called_once()
+        kwargs = memory_service.search.call_args.kwargs
+        assert kwargs.get('project_id') == 'p'
+        assert kwargs.get('categories') == ['observations_and_summaries']
+        assert kwargs.get('stores') == ['mem0']
+        assert kwargs.get('limit') == 500
+        assert 'stage1_flag_suppression' in kwargs.get('query', '')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_task_id,record_task_id',
+        [
+            pytest.param(42, 42, id='int-int'),
+            pytest.param(42, '42', id='int-str'),
+            pytest.param('42', 42, id='str-int'),
+            pytest.param('42', '42', id='str-str'),
+        ],
+    )
+    async def test_suppressed_flag_dropped_and_unrelated_kept(
+        self, flag_task_id, record_task_id
+    ):
+        """(d) suppression record with matching task_id drops the flag; unrelated flags kept.
+
+        Parametrized: int-int, int-str, str-int, str-str coercion combinations
+        so that symmetric str() coercion is verified on both sides.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        suppression_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': record_task_id,
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[suppression_record])
+
+        suppressed_flag = {'task_id': flag_task_id, 'flag_type': 'missing_deliverable'}
+        unrelated_flag = {'task_id': 99, 'flag_type': 'stale_metadata'}
+        flags = [suppressed_flag, unrelated_flag]
+
+        result = await filter_suppressed(memory_service, 'p', flags)
+        assert len(result) == 1
+        assert result[0] == unrelated_flag
+
+    @pytest.mark.asyncio
+    async def test_wrong_kind_not_treated_as_suppression(self):
+        """(e) result with metadata.kind != 'stage1_flag_suppression' is NOT treated as suppression.
+
+        Canonical-schema enforcement: vector-search near-miss must be rejected.
+        The flag must pass through unchanged.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        near_miss_record = _make_memory_result({
+            'kind': 'some_other_kind',
+            'task_id': 42,
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[near_miss_record])
+
+        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
+        result = await filter_suppressed(memory_service, 'p', flags)
+        assert len(result) == 1
+        assert result[0] == flags[0]
+
+    @pytest.mark.asyncio
+    async def test_correct_kind_but_no_task_id_key_ignored(self):
+        """(f) result with metadata.kind correct but no task_id key → ignored, flag passes through."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        no_task_id_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            # 'task_id' key intentionally absent
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[no_task_id_record])
+
+        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
+        result = await filter_suppressed(memory_service, 'p', flags)
+        assert len(result) == 1
+        assert result[0] == flags[0]
+
+    @pytest.mark.asyncio
+    async def test_metadata_none_guard_does_not_crash(self):
+        """(g) result with metadata=None → defensive (r.metadata or {}) guard, doesn't crash, flag passes through."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        null_metadata_record = _make_memory_result(None)
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[null_metadata_record])
+
+        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
+        result = await filter_suppressed(memory_service, 'p', flags)
+        assert len(result) == 1
+        assert result[0] == flags[0]
+
+
+# ---------------------------------------------------------------------------
+# task-1186 step-3 — filter_suppressed: search exception → pass-through + WARNING
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_search_exception_returns_flags_unchanged_and_warns(caplog):
+    """Search exception in filter_suppressed → conservative pass-through + WARNING.
+
+    When memory_service.search raises, filter_suppressed must:
+    (a) NOT raise
+    (b) return both flags unchanged
+    (c) emit at least one WARNING log mentioning the failure and the function name
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+
+    flags = [
+        {'task_id': '55', 'flag_type': 'stale_metadata'},
+        {'task_id': '66', 'flag_type': 'missing_deliverable'},
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await filter_suppressed(memory_service, 'p', flags)
+
+    # (a) Does NOT raise
+    # (b) Returns both flags unchanged
+    assert result == flags
+    # (c) At least one WARNING log mentions failure and filter_suppressed
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'filter_suppressed' in m
+        for m in warning_messages
+    ), f'Expected WARNING mentioning filter_suppressed but got: {warning_messages}'
+
+
+# ---------------------------------------------------------------------------
+# task-1186 step-5 — integration: dedup_flags calls filter_suppressed FIRST
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
+    """Integration: dedup_flags calls filter_suppressed BEFORE the signature-dedup loop.
+
+    The mock search side_effect tracks call order:
+    - Call 1 (suppression query): returns a record suppressing task_id=42.
+    - Call 2+ (per-flag prior-marker queries): returns [].
+
+    Two flags: task_id=42 (suppressed) and task_id=99 (not suppressed), both
+    with flag_type='missing_deliverable'.
+
+    Expected outcomes:
+    (a) Result has exactly one item — the task_id=99 flag.
+    (b) task_id=42 flag was dropped.
+    (c) add_memory called exactly once (MISS path for task_id=99 only).
+    (d) search called exactly twice (1 suppression + 1 per-flag-marker for task_id=99).
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    suppression_record = _make_memory_result({
+        'kind': 'stage1_flag_suppression',
+        'task_id': 42,
+    })
+
+    call_count = [0]
+
+    async def _search_side_effect(**kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # First call is the filter_suppressed project-scoped query
+            return [suppression_record]
+        # Subsequent calls are per-flag prior-marker queries (MISS path)
+        return []
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_search_side_effect)
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+    flags = [
+        {'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'suppressed'},
+        {'task_id': 99, 'flag_type': 'missing_deliverable', 'description': 'survivor'},
+    ]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) Only one flag survived
+    assert len(result) == 1
+    # (b) task_id=42 was dropped
+    assert result[0].get('task_id') == 99, (
+        f"Expected surviving flag task_id=99 but got {result[0].get('task_id')!r}"
+    )
+    # (c) add_memory called exactly once — only for task_id=99 MISS path
+    assert memory_service.add_memory.call_count == 1, (
+        f'Expected exactly 1 add_memory call (task_id=99 MISS) but got '
+        f'{memory_service.add_memory.call_count}'
+    )
+    # (d) search called exactly twice: 1 suppression + 1 per-flag-marker
+    assert memory_service.search.call_count == 2, (
+        f'Expected 2 search calls (1 suppression + 1 per-flag-marker) but got '
+        f'{memory_service.search.call_count}'
+    )
 
 
 @pytest.mark.asyncio
