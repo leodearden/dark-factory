@@ -13,6 +13,7 @@ from fused_memory.reconciliation.stats_verifier import (
     _OP_TO_STAT,
     _bucket_ops_by_stage,
     _count_add_memory,
+    _count_graphiti_queued,
     verify_and_rewrite_stats,
 )
 from fused_memory.services.write_journal import WriteJournal
@@ -75,6 +76,42 @@ def test_count_add_memory_failure_is_false():
 def test_count_add_memory_handles_json_string_result_summary():
     op = {'success': 1, 'result_summary': '{"memory_ids": ["m1"], "stores": ["mem0"]}'}
     assert _count_add_memory(op) is True
+
+
+# ── _count_graphiti_queued ──────────────────────────────────────────────
+
+
+def test_count_graphiti_queued_true_when_empty_ids_and_graphiti_store():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
+    assert _count_graphiti_queued(op) is True
+
+
+def test_count_graphiti_queued_false_when_nonempty_memory_ids():
+    # Already counted as memories_added — not a graphiti-only enqueue.
+    op = {'success': 1, 'result_summary': {'memory_ids': ['m1'], 'stores': ['graphiti']}}
+    assert _count_graphiti_queued(op) is False
+
+
+def test_count_graphiti_queued_false_when_mem0_only():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['mem0']}}
+    assert _count_graphiti_queued(op) is False
+
+
+def test_count_graphiti_queued_false_when_failed():
+    op = {'success': 0, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
+    assert _count_graphiti_queued(op) is False
+
+
+def test_count_graphiti_queued_true_for_stores_written_alias():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores_written': ['graphiti']}}
+    assert _count_graphiti_queued(op) is True
+
+
+def test_count_graphiti_queued_true_for_json_string_result_summary():
+    import json
+    rs = json.dumps({'memory_ids': [], 'stores': ['graphiti']})
+    op = {'success': 1, 'result_summary': rs}
+    assert _count_graphiti_queued(op) is True
 
 
 # ── _bucket_ops_by_stage ────────────────────────────────────────────────
