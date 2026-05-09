@@ -3935,3 +3935,46 @@ class TestQueryStage2Flags:
         args = call_kwargs.args
         all_args = list(args) + list(kwargs.values())
         assert 'my_project' in all_args or kwargs.get('project_id') == 'my_project'
+
+
+class TestComputeStaleFlags:
+    """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
+
+    def _fn(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _compute_stale_flags
+        return _compute_stale_flags
+
+    def test_empty_dict_returns_empty(self):
+        assert self._fn()({}) == []
+
+    def test_all_below_threshold_returns_empty(self):
+        counts = {'flag-A': 1, 'flag-B': 2}
+        assert self._fn()(counts, threshold=3) == []
+
+    def test_counts_at_threshold_are_returned(self):
+        counts = {'flag-A': 3, 'flag-B': 2}
+        result = self._fn()(counts, threshold=3)
+        assert 'flag-A' in result
+        assert 'flag-B' not in result
+
+    def test_counts_above_threshold_are_returned(self):
+        counts = {'flag-A': 5, 'flag-B': 1}
+        result = self._fn()(counts, threshold=3)
+        assert 'flag-A' in result
+        assert 'flag-B' not in result
+
+    def test_result_is_sorted(self):
+        counts = {'flag-C': 4, 'flag-A': 5, 'flag-B': 3}
+        result = self._fn()(counts, threshold=3)
+        assert result == sorted(result)
+
+    def test_custom_threshold_value(self):
+        counts = {'flag-X': 7, 'flag-Y': 3}
+        result = self._fn()(counts, threshold=5)
+        assert result == ['flag-X']
+
+    def test_threshold_constant_equals_3(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            STAGE2_FLAG_PERSISTENCE_THRESHOLD,
+        )
+        assert STAGE2_FLAG_PERSISTENCE_THRESHOLD == 3
