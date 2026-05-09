@@ -1615,6 +1615,76 @@ async def test_suppression_record_round_trips_through_prompt_instructed_search(
 
 
 # ---------------------------------------------------------------------------
+# filter_suppressed end-to-end test (task-1185 step-6)
+#
+# Closes the producer→reader contract end-to-end for both int and str
+# task_id storage variants.  filter_suppressed is already on main from
+# sibling task-1186; this test pins that what the producer writes is exactly
+# what the reader correctly acts on.
+#
+# This test would have caught a producer that wrote metadata.kind under a
+# different key, or metadata.task_id under a non-str-coercible type, because
+# filter_suppressed requires BOTH fields to be present and correct before
+# adding task_id to the suppressed set.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'storage_shape,raw_task_id',
+    [
+        pytest.param('int_storage', 42, id='int_storage'),
+        pytest.param('str_storage', '42', id='str_storage'),
+    ],
+)
+async def test_filter_suppressed_drops_flags_written_by_producer(storage_shape, raw_task_id):
+    """Producer→reader contract: flags written by write_suppression_record are dropped by filter_suppressed.
+
+    Per task-1185 description: "once that function lands, extend the test to also assert
+    filter_suppressed correctly drops matching flags for both int and str task_id storage
+    variants."  filter_suppressed is now on main (task-1186).
+
+    Test body:
+      (1) build a FakeMemoryService;
+      (2) write the suppression record (int case: via write_suppression_record;
+          str case: directly via fake.add_memory with str task_id);
+      (3) call filter_suppressed with a matching flag and an unrelated flag;
+      (4) assert the suppressed flag is dropped;
+      (5) assert the unrelated flag is preserved.
+    """
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
+
+    fake = _FakeMemoryService()
+
+    if storage_shape == 'int_storage':
+        await write_suppression_record(fake, project_id='dark_factory', task_id=42)
+    else:
+        # model the str-task_id storage shape (alternative producer path)
+        await fake.add_memory(
+            content='STAGE 1 FLAG SUPPRESSION task_id=42',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': '42'},
+        )
+
+    flags = [
+        {'task_id': 42, 'flag_type': 'missing_deliverable'},   # should be dropped
+        {'task_id': 99, 'flag_type': 'stale_metadata'},         # should be kept
+    ]
+
+    result = await filter_suppressed(fake, 'dark_factory', flags)
+
+    # (4) Suppressed flag is dropped
+    assert len(result) == 1, (
+        f'Expected 1 surviving flag but got {len(result)}: {result}'
+    )
+    # (5) Unrelated flag is preserved
+    assert result[0]['task_id'] == 99, (
+        f"Expected surviving flag task_id=99 but got {result[0]['task_id']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # write_suppression_record tests (task-1185 step-3)
 # ---------------------------------------------------------------------------
 
