@@ -87,15 +87,22 @@ extracted edges instead of defaulting to ingestion time)
 An episode can use either parameter independently, but retrospective summaries \
 should always use both to fully prevent temporal contamination.
 
-## Task-count Snapshots
-Task-count snapshots (e.g. "project X has N total tasks, M done, K blocked") are a common \
-source of stale temporal facts in Graphiti. Every cycle the counts change, but prior \
-snapshot edges from older episodes stay valid and accumulate as contradictions.
+## Snapshot Discipline
+Recurring temporal-fact snapshots (task-count, task-status, run summaries, system stats) \
+are written every reconciliation cycle. Every cycle the values change, but prior snapshot \
+edges from older episodes stay valid and accumulate as contradictions.
 
-If you write a task-count snapshot, follow this discipline:
+**Never use `add_episode` for recurring temporal-fact snapshot writes.** `add_episode` \
+triggers Graphiti's extraction pipeline, which produces 4 identical edges per write that \
+dedup loops must clean up next cycle. Do not use `add_episode` for task-count, task-status, \
+run summary, or system-stat snapshots. Use the mandatory two-step workaround below instead.
 
-1. First, search for existing task-count edges for this project \
-   (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)`).
+If you write any recurring temporal-fact snapshot (task counts, task status, run summaries, \
+system stats), follow this discipline for each snapshot fact:
+
+1. First, search for existing snapshot edges for this project \
+   (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)` or \
+   `search(query="task status in_progress blocked", project_id=..., limit=5)`).
 2. To update the snapshot, use the **mandatory two-step workaround** (see \
    `## update_edge Temporal Limitation` below): (a) call `update_edge(invalid_at=now)` \
    on the old edge to mark it superseded, then (b) call \
