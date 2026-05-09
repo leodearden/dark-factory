@@ -5132,6 +5132,36 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 # ── Task-1137: Stage 2 post-flight guards ────────────────────────────────────
 
 
+def _make_stage2_guard_cli_result(flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
+    """Return a fake StageResult-like object for patching run_stage_via_cli."""
+    report = {'flagged_items': flagged_items, 'summary': 'ok'}
+    if stats:
+        report['stats'] = stats
+    return MagicMock(
+        success=True,
+        report=report,
+        llm_calls=1,
+        tokens_used=0,
+        cost_usd=0.0,
+        model='m',
+    )
+
+
+@pytest.fixture
+def stage2_guard_mock_deps():
+    config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+    write_journal_mock = MagicMock()
+    write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+    journal_mock = MagicMock()
+    journal_mock.write_journal = write_journal_mock
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': journal_mock,
+        'config': config,
+    }
+
+
 class TestTaskKnowledgeSyncStage2Guards:
     """Parent namespace for the four Stage 2 post-flight guard tests."""
 
@@ -5211,38 +5241,10 @@ class TestTaskKnowledgeSyncStage2Guards:
     class TestTerminalStatePreCheckIntegration:
         """Integration tests: TaskKnowledgeSync.run() applies terminal-state pre-check guard."""
 
-        @pytest.fixture
-        def mock_deps(self):
-            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-            write_journal_mock = MagicMock()
-            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
-            journal_mock = MagicMock()
-            journal_mock.write_journal = write_journal_mock
-            return {
-                'memory_service': AsyncMock(),
-                'taskmaster': AsyncMock(),
-                'journal': journal_mock,
-                'config': config,
-            }
-
-        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
-            """Return a fake StageResult-like object for patching run_stage_via_cli."""
-            report = {'flagged_items': flagged_items, 'summary': 'ok'}
-            if stats:
-                report['stats'] = stats
-            return MagicMock(
-                success=True,
-                report=report,
-                llm_calls=1,
-                tokens_used=0,
-                cost_usd=0.0,
-                model='m',
-            )
-
         @pytest.mark.asyncio
-        async def test_run_applies_terminal_state_guard(self, mock_deps, caplog):
+        async def test_run_applies_terminal_state_guard(self, stage2_guard_mock_deps, caplog):
             """run() decrements tasks_modified and adds not_applicable_count for terminal violations."""
-            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
             stage.project_id = 'dark_factory'
             stage.project_root = '/project'
 
@@ -5256,16 +5258,16 @@ class TestTaskKnowledgeSyncStage2Guards:
                 'causation_id': 'test-run-1137-a',
                 'created_at': '2026-01-01T00:00:00',
             }
-            mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [terminal_op]
+            stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [terminal_op]
 
             # taskmaster.get_task returns done status for task 42
-            mock_deps['taskmaster'].get_task.return_value = {'status': 'done'}
+            stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'done'}
 
             with (
                 patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
                 patch(
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    new=AsyncMock(return_value=self._make_cli_result(
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
                         [], stats={'tasks_modified': 3}
                     )),
                 ),
@@ -5355,37 +5357,10 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             assert mismatches == []
 
-        @pytest.fixture
-        def mock_deps_integration(self):
-            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-            write_journal_mock = MagicMock()
-            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
-            journal_mock = MagicMock()
-            journal_mock.write_journal = write_journal_mock
-            return {
-                'memory_service': AsyncMock(),
-                'taskmaster': AsyncMock(),
-                'journal': journal_mock,
-                'config': config,
-            }
-
-        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
-            report = {'flagged_items': flagged_items, 'summary': 'ok'}
-            if stats:
-                report['stats'] = stats
-            return MagicMock(
-                success=True,
-                report=report,
-                llm_calls=1,
-                tokens_used=0,
-                cost_usd=0.0,
-                model='m',
-            )
-
         @pytest.mark.asyncio
-        async def test_run_records_set_task_status_mismatch(self, mock_deps_integration, caplog):
+        async def test_run_records_set_task_status_mismatch(self, stage2_guard_mock_deps, caplog):
             """run() decrements tasks_modified and adds set_task_status_post_action_mismatches."""
-            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_integration)
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
             stage.project_id = 'dark_factory'
             stage.project_root = '/project'
 
@@ -5400,16 +5375,16 @@ class TestTaskKnowledgeSyncStage2Guards:
                 'causation_id': 'test-run-1137-b',
                 'created_at': '2026-01-01T00:00:00',
             }
-            mock_deps_integration['journal'].write_journal.get_ops_by_causation.return_value = [sts_op]
+            stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [sts_op]
 
             # live status is pending (transition did not stick)
-            mock_deps_integration['taskmaster'].get_task.return_value = {'status': 'pending'}
+            stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'pending'}
 
             with (
                 patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
                 patch(
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    new=AsyncMock(return_value=self._make_cli_result(
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
                         [], stats={'tasks_modified': 5}
                     )),
                 ),
@@ -5531,37 +5506,10 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             assert violations == []
 
-        @pytest.fixture
-        def mock_deps_integration(self):
-            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-            write_journal_mock = MagicMock()
-            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
-            journal_mock = MagicMock()
-            journal_mock.write_journal = write_journal_mock
-            return {
-                'memory_service': AsyncMock(),
-                'taskmaster': AsyncMock(),
-                'journal': journal_mock,
-                'config': config,
-            }
-
-        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
-            report = {'flagged_items': flagged_items, 'summary': 'ok'}
-            if stats:
-                report['stats'] = stats
-            return MagicMock(
-                success=True,
-                report=report,
-                llm_calls=1,
-                tokens_used=0,
-                cost_usd=0.0,
-                model='m',
-            )
-
         @pytest.mark.asyncio
-        async def test_run_records_stall_guard_freshness_violation(self, mock_deps_integration, caplog):
+        async def test_run_records_stall_guard_freshness_violation(self, stage2_guard_mock_deps, caplog):
             """run() adds stall_guard_freshness_violations when snapshot_status mismatches live."""
-            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_integration)
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
             stage.project_id = 'dark_factory'
             stage.project_root = '/project'
 
@@ -5576,14 +5524,14 @@ class TestTaskKnowledgeSyncStage2Guards:
                 'causation_id': 'test-run-1137-c',
                 'created_at': '2026-01-01T00:00:00',
             }
-            mock_deps_integration['journal'].write_journal.get_ops_by_causation.return_value = [stall_op]
-            mock_deps_integration['taskmaster'].get_task.return_value = {'status': 'done'}
+            stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [stall_op]
+            stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'done'}
 
             with (
                 patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
                 patch(
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    new=AsyncMock(return_value=self._make_cli_result([], stats={})),
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result([], stats={})),
                 ),
                 caplog.at_level(
                     logging.WARNING,
@@ -5675,37 +5623,10 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert result['expected'] == 0  # no baseline used
             assert result['reported'] == 3
 
-        @pytest.fixture
-        def mock_deps_integration(self):
-            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-            write_journal_mock = MagicMock()
-            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
-            journal_mock = MagicMock()
-            journal_mock.write_journal = write_journal_mock
-            return {
-                'memory_service': AsyncMock(),
-                'taskmaster': AsyncMock(),
-                'journal': journal_mock,
-                'config': config,
-            }
-
-        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
-            report = {'flagged_items': flagged_items, 'summary': 'ok'}
-            if stats:
-                report['stats'] = stats
-            return MagicMock(
-                success=True,
-                report=report,
-                llm_calls=1,
-                tokens_used=0,
-                cost_usd=0.0,
-                model='m',
-            )
-
         @pytest.mark.asyncio
-        async def test_run_clamps_stage1_flags_processed_on_mismatch(self, mock_deps_integration, caplog):
+        async def test_run_clamps_stage1_flags_processed_on_mismatch(self, stage2_guard_mock_deps, caplog):
             """run() clamps stage1_flags_processed to prior_reports[0] truth and warns."""
-            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_integration)
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
             stage.project_id = 'dark_factory'
             stage.project_root = '/project'
 
@@ -5721,7 +5642,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
                 patch(
                     'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                    new=AsyncMock(return_value=self._make_cli_result(
+                    new=AsyncMock(return_value=_make_stage2_guard_cli_result(
                         [], stats={'stage1_flags_processed': 3}
                     )),
                 ),
