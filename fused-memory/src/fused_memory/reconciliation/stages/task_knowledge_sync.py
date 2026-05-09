@@ -400,6 +400,43 @@ async def _check_stall_guard_freshness(
     return violations
 
 
+def _check_flag_counter_completeness(
+    report_stats: dict,
+    prior_reports: list[StageReport],
+) -> dict:
+    """Compare ``report.stats['stage1_flags_processed']`` against Stage 1's truth.
+
+    Stage 1 (memory_consolidator) emits ``StageReport.items_flagged`` — the
+    definitive list of flags it raised for Stage 2 to process.  This guard
+    compares that ground-truth count against whatever Stage 2 self-reported in
+    ``stats['stage1_flags_processed']``.
+
+    Pure stats-arithmetic — no taskmaster calls, no I/O.
+
+    Args:
+        report_stats: The ``StageReport.stats`` dict from Stage 2's run.
+        prior_reports: Reports from earlier stages in this cycle.  When
+            non-empty, ``prior_reports[0]`` is assumed to be the Stage 1
+            (memory_consolidator) report.  When empty, no baseline is available
+            and the function returns ``mismatch=False`` unconditionally.
+
+    Returns:
+        ``{'expected': int, 'reported': int, 'mismatch': bool}``
+        ``mismatch`` is ``True`` only when a Stage 1 baseline exists and
+        ``reported != expected``.
+    """
+    reported = report_stats.get('stage1_flags_processed', 0)
+    if not prior_reports:
+        return {'expected': 0, 'reported': reported, 'mismatch': False}
+
+    expected = len(prior_reports[0].items_flagged)
+    return {
+        'expected': expected,
+        'reported': reported,
+        'mismatch': expected != reported,
+    }
+
+
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     """Query Mem0 for active Stage-2-destined flags and return them as dicts.
 
@@ -858,6 +895,21 @@ class TaskKnowledgeSync(BaseStage):
                             'live_status': m['live_status'],
                         },
                     )
+
+        # Guard 4 — flag-counter completeness (pure stats arithmetic, no I/O)
+        flag_check = _check_flag_counter_completeness(report.stats, prior_reports)
+        if flag_check['mismatch']:
+            logger.warning(
+                'reconciliation.stage1_flags_processed_mismatch',
+                extra={
+                    'run_id': run_id,
+                    'project_id': self.project_id,
+                    'expected': flag_check['expected'],
+                    'reported': flag_check['reported'],
+                },
+            )
+            # Clamp to truth so downstream verifiers see the real picture.
+            report.stats['stage1_flags_processed'] = flag_check['expected']
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
