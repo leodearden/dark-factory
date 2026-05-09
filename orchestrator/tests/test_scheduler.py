@@ -1261,6 +1261,90 @@ class TestDispatchCooldownConfig:
             OrchestratorConfig(dispatch_cooldown_secs=120.0)
 
 
+class TestDispatchCooldownGate:
+    """Tests for the per-task dispatch cooldown gate that prevents immediate
+    re-grab after reconciliation reset or steward clear."""
+
+    import json as _json_module
+
+    def _make_task_response(self, task: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+
+    def _pending_task_with(self, metadata: dict) -> dict:
+        return {
+            'id': '99',
+            'title': 'Dispatch cooldown test task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': metadata,
+        }
+
+    @pytest.mark.asyncio
+    async def test_recon_reset_gt_1_blocks_immediate_redispatch(self, monkeypatch):
+        """recon_reset_count > 1 arms the dispatch cooldown gate.
+
+        First acquire succeeds (gate not yet armed).  After normal release,
+        second acquire must be blocked because the task has recon_reset_count=2.
+        """
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First acquire — gate not yet armed
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        # Normal release (not requeued)
+        scheduler.release('99')
+
+        # Second acquire immediately — gate must block (recon_reset_count=2)
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, (
+            'Task with recon_reset_count=2 must not be re-dispatched during cooldown'
+        )
+
+    @pytest.mark.asyncio
+    async def test_recon_reset_eq_1_does_not_block(self, monkeypatch):
+        """recon_reset_count=1 (first reset) must NOT trigger the cooldown gate.
+
+        Only counts > 1 indicate a repeated reset loop.
+        """
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 1})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+
+        scheduler.release('99')
+
+        # Second acquire must succeed — only the first reset, no loop yet
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99', (
+            'recon_reset_count=1 must not block re-dispatch'
+        )
+
+
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
 
