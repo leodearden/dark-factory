@@ -311,6 +311,95 @@ async def _verify_set_task_status_post_action(
     return mismatches
 
 
+# Metadata keys that mark an add_memory op for freshness checking.
+# The LLM may emit either ``snapshot_status`` (canonical) or ``observed_status``
+# (natural-language alias).  Both keys carry the same semantics: the task status
+# that was observed *before* the LLM started writing this memory.  The guard
+# fetches the *live* status and flags a mismatch if they differ.
+_STAGE2_STALL_SNAPSHOT_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_status')
+
+
+async def _check_stall_guard_freshness(
+    ops: list[dict],
+    taskmaster,
+    project_root: str,
+) -> list[dict]:
+    """Check that add_memory ops written against a snapshot status are still fresh.
+
+    For every ``add_memory`` op authored by the Stage 2 agent whose
+    ``params.metadata`` contains a ``snapshot_status`` (or ``observed_status``)
+    key AND a ``task_id``, this helper fetches the *live* task status and flags
+    a mismatch.
+
+    A mismatch indicates that the memory was written against a stale snapshot —
+    the LLM observed the task in one state, wrote a memory anchored to that
+    state, but the task has since transitioned.
+
+    Args:
+        ops: Write-journal op dicts (``layer=='write_op'``).
+        taskmaster: Taskmaster backend.
+        project_root: Absolute path to the Taskmaster project directory.
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'snapshot_status', 'live_status'}`` dicts.
+    """
+    violations: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != _STAGE2_AGENT_ID:
+            continue
+        if op.get('operation') != 'add_memory':
+            continue
+
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._check_stall_guard_freshness: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+
+        metadata = params.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            continue
+
+        task_id = str(metadata.get('task_id', '')).strip()
+        if not task_id:
+            continue
+
+        # Resolve snapshot_status or its alias
+        snapshot_status: str | None = None
+        for key in _STAGE2_STALL_SNAPSHOT_KEYS:
+            if key in metadata:
+                snapshot_status = str(metadata[key])
+                break
+        if snapshot_status is None:
+            continue  # Op not opted into freshness checking
+
+        try:
+            task_data = await taskmaster.get_task(task_id, project_root)
+        except Exception:
+            logger.warning(
+                'reconciliation._check_stall_guard_freshness: '
+                'get_task failed for task_id=%s; skipping op',
+                task_id,
+            )
+            continue
+
+        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        if live_status != snapshot_status:
+            violations.append({
+                'op_id': op.get('id'),
+                'task_id': task_id,
+                'snapshot_status': snapshot_status,
+                'live_status': live_status,
+            })
+
+    return violations
+
+
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     """Query Mem0 for active Stage-2-destined flags and return them as dicts.
 
@@ -719,6 +808,28 @@ class TaskKnowledgeSync(BaseStage):
                             'project_id': self.project_id,
                             'task_id': v['task_id'],
                             'reason': v['reason'],
+                        },
+                    )
+
+        # Guard 2 — stall-guard freshness gate
+        if self.taskmaster and self.project_root:
+            freshness_violations = await _check_stall_guard_freshness(
+                ops, self.taskmaster, self.project_root
+            )
+            if freshness_violations:
+                report.stats['stall_guard_freshness_violations'] = (
+                    report.stats.get('stall_guard_freshness_violations', 0)
+                    + len(freshness_violations)
+                )
+                for v in freshness_violations:
+                    logger.warning(
+                        'reconciliation.stall_guard_freshness_violation',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': v['task_id'],
+                            'snapshot_status': v['snapshot_status'],
+                            'live_status': v['live_status'],
                         },
                     )
 
