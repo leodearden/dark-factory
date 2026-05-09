@@ -950,6 +950,30 @@ class TestUpdateEdgeVerification:
 
         assert result['verified'] is False
 
+    @pytest.mark.asyncio
+    async def test_update_edge_returns_verified_false_when_readback_raises(self, service):
+        """When get_edge_text raises EdgeNotFoundError, verified must be False
+        and verification_error must be a non-empty string mentioning EdgeNotFoundError.
+        The save itself succeeded — do NOT re-raise the readback exception.
+        """
+        from graphiti_core.errors import EdgeNotFoundError
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(
+            side_effect=EdgeNotFoundError('e-1')
+        )
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='test'
+        )
+
+        assert result['verified'] is False
+        assert 'verification_error' in result
+        assert 'EdgeNotFoundError' in result['verification_error']
+        assert result['verification_error']  # non-empty string
+
 
 class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
