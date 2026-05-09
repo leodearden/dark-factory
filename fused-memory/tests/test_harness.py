@@ -155,6 +155,8 @@ async def test_run_full_cycle_restores_events_on_failure(
         config=config,
     )
     harness._make_stages = lambda: harness.stages
+    # task 1143: pre-populate _known_projects so pre-flight does not raise before the stage
+    harness._known_projects['test-project'] = '/tmp/test-project'
 
     # Make first stage raise
     harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage exploded'))
@@ -217,6 +219,11 @@ async def test_full_cycle_extracts_project_root_from_events(
         config=config,
     )
     harness._make_stages = lambda: harness.stages
+    # task 1143: pre-populate _known_projects so pre-flight does not raise.
+    # Events carry _project_root='/home/leo/src/dark-factory' which matches
+    # the registry value for dark_factory, so the assertion below still holds
+    # under the new contract (registry value, not event payload, is the source).
+    harness._known_projects['dark_factory'] = '/home/leo/src/dark-factory'
 
     # Mock each stage's run method and capture the stage state
     captured_stages = []
@@ -465,6 +472,10 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
     """Build a ReconciliationHarness wired to test fixtures with minimal config.
 
     Callers must mock individual stage.run methods as needed.
+
+    task 1143: pre-populates _known_projects so callers can invoke
+    run_full_cycle('dark_factory', ...) or run_full_cycle('test-project', ...)
+    without triggering the pre-flight ValueError from _known_project_root_for.
     """
     from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
     from fused_memory.reconciliation.harness import ReconciliationHarness
@@ -487,6 +498,12 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
     )
     # Patch _make_stages so tests that mock harness.stages[N].run still work
     harness._make_stages = lambda: harness.stages
+    # task 1143: inject known projects so run_full_cycle pre-flight does not raise
+    # for the project_ids used across the existing test suite.
+    harness._known_projects = {
+        'dark_factory': '/home/leo/src/dark-factory',
+        'test-project': '/tmp/test-project',
+    }
     return harness
 
 
@@ -2459,7 +2476,12 @@ class TestHarnessFilteredTaskTreeWiring:
         event_buffer,
         mock_memory_service,
     ):
-        """run_full_cycle calls _fetch_filtered_task_tree exactly once with the project_root."""
+        """run_full_cycle calls _fetch_filtered_task_tree exactly once with the registry-bound root.
+
+        task 1143: the project_root used by _fetch_filtered_task_tree comes from
+        _known_project_root_for(project_id), not from event payload _project_root.
+        Event payload _project_root is now informational-only.
+        """
         from unittest.mock import AsyncMock
 
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
@@ -2470,13 +2492,15 @@ class TestHarnessFilteredTaskTreeWiring:
         for stage in harness.stages:
             _mock_stage_run(stage)
 
-        # Embed _project_root in the event payload so run_full_cycle can extract it
+        # Event payload _project_root is now ignored; registry binding wins (task 1143).
         event = _make_event()
-        event.payload['_project_root'] = '/my/project'
+        event.payload['_project_root'] = '/my/project'  # intentionally wrong — must be ignored
 
         await harness.run_full_cycle('test-project', 'test-trigger', events=[event])
 
-        harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
+        # _fetch_filtered_task_tree must use the registry-bound root, not the event payload.
+        expected_root = harness._known_projects['test-project']  # '/tmp/test-project'
+        harness._fetch_filtered_task_tree.assert_called_once_with(expected_root)  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_run_full_cycle_invokes_get_tasks_exactly_once(
@@ -3597,6 +3621,11 @@ async def test_run_full_cycle_with_relative_config_and_memory_only_events_still_
     assert harness._project_root == expected_abs, (
         "Pre-condition: harness._project_root must be absolute after init"
     )
+    # task 1143: pre-populate _known_projects so _known_project_root_for('dark_factory')
+    # returns the same resolved-absolute path.  This preserves the test's original intent
+    # (init resolves '.' to absolute; that path is what reaches get_tasks) while satisfying
+    # the new KNOWN_PROJECT_ROOTS contract.
+    harness._known_projects['dark_factory'] = expected_abs
 
     # Push two memory-style events (no _project_root in payload)
     await event_buffer.push(_make_event('dark_factory'))

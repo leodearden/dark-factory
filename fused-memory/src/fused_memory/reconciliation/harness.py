@@ -856,6 +856,10 @@ class ReconciliationHarness:
                     When provided, Stage 1 uses this instead of generic
                     time-windowed episode/memory fetches.
         """
+        # task 1143: pre-flight guard — raises before any side effects (no journal row,
+        # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
+        project_root = self._known_project_root_for(project_id)
+
         tier = tier or TierConfig()
         run_id = str(uuid4())
         watermark = await self.journal.get_watermark(project_id)
@@ -886,9 +890,8 @@ class ReconciliationHarness:
             },
         )
 
-        # Resolve project_root: scan all events for the first _project_root payload
-        # key, fall back to the configured value via the shared helper (task 927).
-        project_root = self._resolve_project_root(events)
+        # project_root is already hard-bound via _known_project_root_for at the top
+        # of this function (task 1143); no _resolve_project_root call needed here.
 
         # Load prior S3 findings from last completed run (backstop for normal pass)
         prior_s3_findings = await self._get_prior_s3_findings(project_id)
