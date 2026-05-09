@@ -4305,3 +4305,148 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
 
         assert 'stage1 emitted this intentionally for 1139' in section, \
             'Stage 1 items_flagged are never scope-filtered; only Mem0 active-query flags are'
+
+
+class TestTaskKnowledgeSyncStaleFlagEscalation:
+    """assemble_payload renders a stale-flag section and logs a warning when count >= threshold."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='reify')
+
+    def _make_active_flag(self, flag_id, task_id='742'):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=flag_id,
+            content=f'active flag content for {flag_id}',
+            metadata={'flag_for_stage2': True, 'task_id': task_id},
+        )
+
+    def _make_persistence_marker(self, flag_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=f'marker-{flag_id}-1',
+            content=f'Stage 2 flag-persistence marker: flag_id={flag_id}',
+            metadata={'source': 'stage2_persistence_marker', 'flag_id': flag_id},
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_flag_section_rendered_when_count_at_threshold(
+        self, mock_deps, watermark, caplog,
+    ):
+        """When a flag has 2 prior markers (cycle=3 >= threshold 3), payload shows stale section."""
+        import logging
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+
+        # search side_effect: first call returns active flags; subsequent calls
+        # (for persistence-marker lookup) return 2 prior markers for flag-A.
+        call_count = {'n': 0}
+        def search_side_effect(**kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                # First call: active-flag query
+                return [self._make_active_flag('flag-A')]
+            else:
+                # Subsequent calls: persistence-marker search → 2 prior markers
+                return [self._make_persistence_marker('flag-A'), self._make_persistence_marker('flag-A')]
+        mock_deps['memory_service'].search.side_effect = search_side_effect
+
+        with caplog.at_level(logging.WARNING):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Stale Flags Requiring Escalation' in payload, \
+            'Payload must contain stale-flag section when cycle count >= threshold'
+        assert 'flag-A' in payload
+
+    @pytest.mark.asyncio
+    async def test_stale_flag_warning_logged(self, mock_deps, watermark, caplog):
+        """A WARNING is logged with reconciliation.stale_flag_escalated message."""
+        import logging
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+
+        call_count = {'n': 0}
+        def search_side_effect(**kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return [self._make_active_flag('flag-A')]
+            return [self._make_persistence_marker('flag-A'), self._make_persistence_marker('flag-A')]
+        mock_deps['memory_service'].search.side_effect = search_side_effect
+
+        with caplog.at_level(logging.WARNING):
+            await stage.assemble_payload([], watermark, [])
+
+        stale_records = [
+            r for r in caplog.records
+            if r.getMessage().startswith('reconciliation.stale_flag_escalated')
+        ]
+        assert len(stale_records) >= 1, 'Must log reconciliation.stale_flag_escalated warning'
+        assert getattr(stale_records[0], 'flag_id', None) == 'flag-A' or \
+            'flag-A' in str(stale_records[0].__dict__)
+
+    @pytest.mark.asyncio
+    async def test_no_stale_section_when_count_below_threshold(self, mock_deps, watermark, caplog):
+        """When persistence count is 1 (no prior markers), no stale-flag section, no warning."""
+        import logging
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+
+        call_count = {'n': 0}
+        def search_side_effect(**kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return [self._make_active_flag('flag-B')]
+            return []  # no prior markers → cycle count = 1
+        mock_deps['memory_service'].search.side_effect = search_side_effect
+
+        with caplog.at_level(logging.WARNING):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Stale Flags Requiring Escalation' not in payload
+        stale_records = [
+            r for r in caplog.records
+            if r.getMessage().startswith('reconciliation.stale_flag_escalated')
+        ]
+        assert len(stale_records) == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_flag_detection_runs_when_no_prior_reports(self, mock_deps, watermark):
+        """Stale flag detection runs even with no prior_reports (empty Stage 1)."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+
+        call_count = {'n': 0}
+        def search_side_effect(**kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return [self._make_active_flag('flag-C')]
+            return [self._make_persistence_marker('flag-C'), self._make_persistence_marker('flag-C')]
+        mock_deps['memory_service'].search.side_effect = search_side_effect
+
+        # No prior_reports → prior_reports=[] (no Stage 1 report)
+        payload = await stage.assemble_payload([], watermark, [])
+        assert '### Stale Flags Requiring Escalation' in payload
