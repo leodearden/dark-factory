@@ -2098,7 +2098,7 @@ async def test_done_provenance_merged_rejects_branch_only_sha(
 
     assert result['success'] is False
     assert result['error'] == 'done_provenance_invalid'
-    assert 'not on main' in result['reason'] or 'not an ancestor' in result['reason']
+    assert 'not on main' in result['reason']
     taskmaster.set_task_status.assert_not_called()
 
 
@@ -2144,7 +2144,7 @@ async def test_done_provenance_found_on_main_rejects_branch_only_sha(
 
     assert result['success'] is False
     assert result['error'] == 'done_provenance_invalid'
-    assert 'not on main' in result['reason'] or 'not an ancestor' in result['reason']
+    assert 'not on main' in result['reason']
     taskmaster.set_task_status.assert_not_called()
 
 
