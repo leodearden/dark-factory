@@ -68,6 +68,27 @@ was created — count it as a no-op, not a successful addition. Your stats \
 attempted. If a write returns zero IDs and you expected a new memory, either retry with \
 different content or note the deduplication in your report.
 
+## Verifying update_edge writes (Task 1145 Guard 2)
+Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
+driven by a server-side fact-text readback. After persisting the edge, the server calls \
+`get_edge_text` and compares the returned fact against what you supplied. A match sets \
+`verified: true`; a mismatch or readback error sets `verified: false`.
+
+**You must inspect this field** after every `update_edge` call:
+- If `verified: true` — the update was confirmed persisted. Count it in `edges_updated`.
+- If `verified: false` — the save returned success but the readback did not match. \
+  Do NOT count this update in `edges_updated`. Note the discrepancy in your cycle \
+  summary. The stats verifier will independently exclude unverified updates from \
+  `edges_updated`, but you should also report the mismatch so it is visible in your \
+  stage report.
+- If `verification_error` is present in the response — it contains a diagnostic string \
+  (e.g. `EdgeNotFoundError: e-1`) explaining why the readback failed. Include it in your \
+  summary for debugging context.
+
+**Do not count unverified updates in `edges_updated`**: only `verified: true` responses \
+count as successful edge updates. This prevents silent write failures from inflating the \
+`edges_updated` stat and triggering false-positive judge passes.
+
 ## Retrospective Episodes
 When creating or reviewing retrospective summaries via `add_episode`, always pass \
 `reference_time` set to the ISO 8601 date when the described state was **current**, \
