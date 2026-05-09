@@ -4450,3 +4450,33 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         # No prior_reports → prior_reports=[] (no Stage 1 report)
         payload = await stage.assemble_payload([], watermark, [])
         assert '### Stale Flags Requiring Escalation' in payload
+
+
+class TestStage1PromptFlagForStage2Enforcement:
+    """STAGE1_SYSTEM_PROMPT enforces the dual-write contract: flag_for_stage2 + flagged_items."""
+
+    def test_stage1_prompt_mentions_flag_for_stage2(self):
+        """STAGE1_SYSTEM_PROMPT contains the metadata field name 'flag_for_stage2'."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'flag_for_stage2' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must mention 'flag_for_stage2' so the LLM knows "
+            "the metadata field name for the dual-write contract (FIX B)"
+        )
+
+    def test_stage1_prompt_dual_write_contract_collocated(self):
+        """'flagged_items' appears within 400 chars of 'flag_for_stage2' in STAGE1_SYSTEM_PROMPT."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        idx = STAGE1_SYSTEM_PROMPT.find('flag_for_stage2')
+        assert idx != -1, "STAGE1_SYSTEM_PROMPT must contain 'flag_for_stage2'"
+
+        # Extract a 400-char window centred on the first occurrence
+        window_start = max(0, idx - 200)
+        window_end = min(len(STAGE1_SYSTEM_PROMPT), idx + 200)
+        window = STAGE1_SYSTEM_PROMPT[window_start:window_end]
+
+        assert 'flagged_items' in window, (
+            "STAGE1_SYSTEM_PROMPT must mention 'flagged_items' within 400 chars of "
+            "'flag_for_stage2' so the LLM sees the dual-write contract in one section"
+        )
