@@ -4522,3 +4522,79 @@ async def test_dark_factory_full_cycle_no_regression(
                     f'{state["stage_type"]}: known_projects[{pid!r}] must be '
                     f'{proot!r}, got {state["known_projects"][pid]!r}'
                 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('project_id,expected_root', [
+    ('reify', '/home/leo/src/reify'),
+    ('autopilot_video', '/home/leo/src/autopilot-video'),
+])
+async def test_stage3_payload_for_reify_emits_reify_root(
+    journal, event_buffer, mock_memory_service, project_id, expected_root
+):
+    """Integration-level pin: Stage 3 assembled payload contains Use project_root="<correct>".
+
+    Acceptance criterion (task 1143 step-17): Stage 3 integrity_check for
+    project_id='reify' uses project_root='/home/leo/src/reify' for all
+    Taskmaster calls.
+
+    Approach:
+    - Stages 0 and 1 are mocked normally (no CLI call).
+    - Stage 2 (IntegrityCheck) has a custom run that calls the real
+      assemble_payload() to capture the assembled string, then returns
+      a StageReport without invoking the CLI subprocess.
+    This means we test the actual payload logic end-to-end through run_full_cycle.
+    """
+    from fused_memory.models.reconciliation import StageReport
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+    )
+
+    # Push events for the target project
+    await event_buffer.push(_make_event(project_id))
+    await event_buffer.push(_make_event(project_id))
+
+    # Mock Stage 0 and 1 normally
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+
+    # Stage 2 (IntegrityCheck): custom run captures the payload from assemble_payload
+    captured_payload: list[str] = []
+    stage2 = harness.stages[2]
+
+    async def capture_and_return(
+        events, watermark, prior_reports, run_id, model=None, _s=stage2
+    ):
+        payload = await _s.assemble_payload(events, watermark, prior_reports)
+        captured_payload.append(payload)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=__import__('datetime').datetime.now(__import__('datetime').timezone.utc),
+            completed_at=__import__('datetime').datetime.now(__import__('datetime').timezone.utc),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    stage2.run = capture_and_return
+
+    await harness.run_full_cycle(project_id, 'buffer_size:2')
+
+    assert len(captured_payload) == 1, (
+        f'Expected stage 2 (IntegrityCheck) to be called exactly once; '
+        f'got {len(captured_payload)} calls'
+    )
+    payload = captured_payload[0]
+
+    expected_directive = f'Use project_root="{expected_root}"'
+    assert expected_directive in payload, (
+        f'Stage 3 payload for project_id={project_id!r} must contain '
+        f'{expected_directive!r} (task 1143 step-12). '
+        f'Payload (first 600 chars):\n{payload[:600]}'
+    )
+    assert '/home/leo/src/dark-factory' not in payload or project_id == 'dark_factory', (
+        f'Stage 3 payload for project_id={project_id!r} must not contain '
+        f'dark-factory path — cross-contamination guard (task 1143)'
+    )
