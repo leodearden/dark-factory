@@ -1428,3 +1428,62 @@ async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
     assert fake.latest_run_id() == 'r2', (
         f"Surviving marker must have run_id='r2' but got {fake.latest_run_id()!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# build_suppression_payload tests (task-1185 step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSuppressionPayload:
+    """Unit tests for build_suppression_payload(task_id) -> dict.
+
+    All tests import the function inside the test body so that collection does
+    not fail before step-2 lands.  These are pure dict assertions — no I/O,
+    no async.
+    """
+
+    def test_returns_canonical_content(self):
+        """(a) content field matches canonical schema: 'STAGE 1 FLAG SUPPRESSION task_id=<N>'."""
+        from fused_memory.reconciliation.flag_dedup import build_suppression_payload
+
+        payload = build_suppression_payload(42)
+        assert payload['content'] == 'STAGE 1 FLAG SUPPRESSION task_id=42'
+
+    def test_returns_observations_category(self):
+        """(b) category is 'observations_and_summaries'."""
+        from fused_memory.reconciliation.flag_dedup import build_suppression_payload
+
+        payload = build_suppression_payload(42)
+        assert payload['category'] == 'observations_and_summaries'
+
+    def test_metadata_kind_is_canonical(self):
+        """(c) metadata.kind is 'stage1_flag_suppression'."""
+        from fused_memory.reconciliation.flag_dedup import build_suppression_payload
+
+        payload = build_suppression_payload(42)
+        assert payload['metadata']['kind'] == 'stage1_flag_suppression'
+
+    def test_metadata_task_id_is_int(self):
+        """(d) metadata.task_id is an int when an int is passed."""
+        from fused_memory.reconciliation.flag_dedup import build_suppression_payload
+
+        payload = build_suppression_payload(42)
+        assert payload['metadata']['task_id'] == 42
+        assert isinstance(payload['metadata']['task_id'], int)
+
+    def test_coerces_str_task_id_to_int(self):
+        """(e) str task_id is coerced to int in metadata.task_id."""
+        from fused_memory.reconciliation.flag_dedup import build_suppression_payload
+
+        payload = build_suppression_payload('7')
+        assert payload['metadata']['task_id'] == 7
+        assert isinstance(payload['metadata']['task_id'], int)
+
+    def test_does_not_include_project_id(self):
+        """(f) project_id is NOT included — it is a write-time concern, not part of the schema payload."""
+        from fused_memory.reconciliation.flag_dedup import build_suppression_payload
+
+        payload = build_suppression_payload(42)
+        assert 'project_id' not in payload
+        assert 'project_id' not in payload.get('metadata', {})
