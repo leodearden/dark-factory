@@ -67,12 +67,30 @@ Public API
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
 
 logger = logging.getLogger(__name__)
+
+
+class _SuppressionMetadata(TypedDict):
+    kind: Literal['stage1_flag_suppression']
+    task_id: int
+
+
+class SuppressionPayload(TypedDict):
+    """Canonical Mem0 payload shape for a ``stage1_flag_suppression`` record.
+
+    Enforces the schema documented in the ``## Flag Suppression Check`` section
+    of ``STAGE1_SYSTEM_PROMPT`` at the type level so that mis-typed callers are
+    caught by mypy rather than silently accepted.
+    """
+
+    content: str
+    category: Literal['observations_and_summaries']
+    metadata: _SuppressionMetadata
 
 
 async def filter_suppressed(
@@ -305,13 +323,14 @@ async def dedup_flags(
     return result
 
 
-def build_suppression_payload(task_id: int | str) -> dict[str, Any]:
+def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
     """Build the canonical ``stage1_flag_suppression`` Mem0 payload for *task_id*.
 
-    Returns a dict with ``content``, ``category``, and ``metadata`` fields
-    matching the canonical schema documented in ``STAGE1_SYSTEM_PROMPT`` lines
-    244-248.  ``task_id`` is coerced to ``int`` so the producer always pins the
-    integer type regardless of how the caller obtained the id.
+    Returns a :class:`SuppressionPayload` with ``content``, ``category``, and
+    ``metadata`` fields matching the canonical schema documented in the
+    ``## Flag Suppression Check`` section of ``STAGE1_SYSTEM_PROMPT``.
+    ``task_id`` is coerced to ``int`` so the producer always pins the integer
+    type regardless of how the caller obtained the id.
 
     ``project_id`` is intentionally absent — it is a write-time concern that
     must be passed separately to ``memory_service.add_memory``, keeping this
