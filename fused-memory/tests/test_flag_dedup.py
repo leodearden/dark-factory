@@ -816,6 +816,89 @@ async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog)
 
 
 # ---------------------------------------------------------------------------
+# task-1165 step-3 — MISS path: respects add_memory response memory_ids
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'add_memory_response,expect_noop_warning',
+    [
+        pytest.param(
+            'empty',  # AddMemoryResponse(memory_ids=[])
+            True,
+            id='empty-memory_ids-warns',
+        ),
+        pytest.param(
+            'non_empty',  # AddMemoryResponse(memory_ids=['new-marker-id'])
+            False,
+            id='non-empty-memory_ids-no-warn',
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dedup_flags_miss_respects_add_memory_response_memory_ids(
+    add_memory_response, expect_noop_warning, caplog
+):
+    """MISS path: dedup_flags must inspect add_memory's return value.
+
+    When add_memory returns an empty memory_ids list on MISS:
+    - a WARNING must be emitted containing task_id and flag_type
+      (the flag won't be detectable next cycle)
+
+    When add_memory returns a non-empty memory_ids list on MISS:
+    - no no-op WARNING should be emitted
+
+    In both cases:
+    - flag returns unannotated (no persisted_from_run)
+    - add_memory is called exactly once
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    if add_memory_response == 'empty':
+        response = AddMemoryResponse(memory_ids=[])
+    else:
+        response = AddMemoryResponse(memory_ids=['new-marker-id'])
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])  # MISS
+    memory_service.add_memory = AsyncMock(return_value=response)
+
+    flags = [{'task_id': '77', 'flag_type': 'stale_metadata', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # Flag is NOT annotated on MISS path regardless of write outcome
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+
+    # add_memory called exactly once
+    memory_service.add_memory.assert_called_once()
+
+    # Check WARNING for no-op case
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    if expect_noop_warning:
+        assert any('77' in m for m in warning_messages), (
+            f'Expected WARNING mentioning task_id=77 but got: {warning_messages}'
+        )
+        assert any('stale_metadata' in m for m in warning_messages), (
+            f'Expected WARNING mentioning flag_type but got: {warning_messages}'
+        )
+    else:
+        noop_warnings = [m for m in warning_messages if 'no memory_ids' in m or 'returned no memory_ids' in m]
+        assert not noop_warnings, (
+            f'Unexpected no-op WARNING on non-empty memory_ids MISS path: {noop_warnings}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1165 step-1 — HIT path: respects add_memory response memory_ids
 # ---------------------------------------------------------------------------
 
