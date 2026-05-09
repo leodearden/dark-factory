@@ -1612,27 +1612,10 @@ class TestDispatchCooldownGate:
         )
 
     @pytest.mark.asyncio
-    async def test_signal_bearing_dispatch_arms_cooldown_gate(self, monkeypatch):
-        """A task dispatched WITH a cooldown signal must arm _last_dispatch_at.
-
-        Symmetric positive companion to test_signal_free_dispatch_does_not_arm_cooldown_gate.
-
-        The production arming logic lives at scheduler.py:1415-1416, gated by
-        ``_dispatch_cooldown_signal(task) is not None``.  The end-to-end suppression
-        tests (test_recon_reset_gt_1_blocks_immediate_redispatch,
-        test_steward_signals_block_immediate_redispatch) only verify that the second
-        acquire_next() returns None — they never inspect _last_dispatch_at directly.
-        A regression that flips the conditional to never-arm but coincidentally still
-        returns None via a different code path (dispatch guard, _dispatched set, lock
-        conflict, fairness park, deps gate) would slip through those tests.  This test
-        makes the gate-arming step an explicit, targeted assertion so such a regression
-        cannot hide.
-
-        Steps:
-          1. Dispatch a task carrying recon_reset_count=2 (a known gate-arming signal).
-          2. Assert _last_dispatch_at['99'] was set (direct gate-arming assertion).
-          3. Release and re-acquire within the 1800s cooldown window; assert None
-             (end-to-end suppression — confirms the armed gate is honoured).
+    async def test_signal_bearing_dispatch_arms_gate_and_suppresses_redispatch(self, monkeypatch):
+        """Signal-bearing dispatch (recon_reset_count≥2) arms _last_dispatch_at via
+        _dispatch_cooldown_signal, and the armed gate suppresses re-dispatch within
+        the cooldown window.
         """
         task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
         task_response = self._make_task_response(task)
