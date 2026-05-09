@@ -4079,3 +4079,118 @@ class TestTrackFlagPersistence:
         assert result == {}
         memory_service.search.assert_not_awaited()
         memory_service.add_memory.assert_not_awaited()
+
+
+class TestTaskKnowledgeSyncActiveQueryFlags:
+    """assemble_payload merges Mem0 active-query flags into the flagged section."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='reify')
+
+    def _make_mem0_flag(self, flag_id, content, task_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=flag_id,
+            content=content,
+            metadata={'flag_for_stage2': True, 'task_id': task_id},
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_contains_both_stage1_and_mem0_flags(self, mock_deps, watermark):
+        """Merged flagged section must contain Stage 1 items_flagged AND Mem0 active-query flags."""
+        from datetime import UTC, datetime
+        from fused_memory.models.reconciliation import StageId, StageReport
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # Mem0 active-query flags
+        mock_deps['memory_service'].search.return_value = [
+            self._make_mem0_flag('mem0-flag-1', 'mem0 flag content for task 742', '742'),
+            self._make_mem0_flag('mem0-flag-2', 'mem0 flag content for task 888', '888'),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        # Stage 1 items_flagged
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[{'task_id': '99', 'flag_type': 'assumption_invalid',
+                            'description': 'stage1 flagged content'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+        prior_reports = [stage1_report]
+
+        payload = await stage.assemble_payload([], watermark, prior_reports)
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+
+        assert 'stage1 flagged content' in section, \
+            'Stage 1 items_flagged must appear in the flagged section'
+        assert 'mem0 flag content for task 742' in section, \
+            'Mem0 active-query flag for task 742 must appear in the flagged section'
+        assert 'mem0 flag content for task 888' in section, \
+            'Mem0 active-query flag for task 888 must appear in the flagged section'
+
+    @pytest.mark.asyncio
+    async def test_search_exception_still_renders_stage1_flags(self, mock_deps, watermark):
+        """When memory_service.search raises, payload still contains Stage 1 flags."""
+        from datetime import UTC, datetime
+        from fused_memory.models.reconciliation import StageId, StageReport
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.side_effect = RuntimeError('Mem0 unavailable')
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[{'task_id': '77', 'description': 'stage1 only flag'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        # Should not raise
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+        assert 'stage1 only flag' in section
+
+    @pytest.mark.asyncio
+    async def test_search_called_with_project_id(self, mock_deps, watermark):
+        """memory_service.search must be called with project_id='reify'."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        await stage.assemble_payload([], watermark, [])
+
+        # At least one call to search should have used project_id='reify'
+        calls = mock_deps['memory_service'].search.call_args_list
+        assert len(calls) >= 1
+        first_call = calls[0]
+        project_id_used = (
+            first_call.kwargs.get('project_id') or
+            (first_call.args[1] if len(first_call.args) > 1 else None)
+        )
+        assert project_id_used == 'reify', \
+            f'search must be called with project_id="reify", got: {project_id_used}'
