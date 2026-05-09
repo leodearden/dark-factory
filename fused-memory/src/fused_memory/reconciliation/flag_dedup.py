@@ -184,7 +184,7 @@ async def dedup_flags(
             # on the HIT path ensures that once search recovers, the next cycle
             # collapses any accumulated duplicates back to a single row.
             try:
-                await memory_service.add_memory(
+                miss_response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -198,6 +198,12 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
+                if not getattr(miss_response, 'memory_ids', None):
+                    logger.warning(
+                        'flag_dedup: add_memory returned no memory_ids on MISS for task %s'
+                        ' flag_type %s — recurring flag will not be detected next cycle',
+                        tid, ftype,
+                    )
             except Exception as e:
                 logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
         result.append(flag)
