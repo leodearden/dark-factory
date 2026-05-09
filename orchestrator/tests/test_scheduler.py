@@ -1589,6 +1589,41 @@ class TestDispatchCooldownGate:
             f'Remaining time number missing from log: {log_text!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_acquire_next_tolerates_non_string_reopen_reason(self, monkeypatch):
+        """A non-string truthy reopen_reason (e.g. a dict) must not raise AttributeError.
+
+        Before the fix, a dict value bypasses the ``or ''`` short-circuit and
+        reaches ``.lower()`` on a non-string object, raising AttributeError.
+        After the fix (str() coercion), the dict is stringified and correctly
+        shows no 'steward' substring — so the task is dispatched normally on
+        the second acquire.
+        """
+        task = self._pending_task_with(
+            {'files': ['backend'], 'reopen_reason': {'malformed': 'producer'}}
+        )
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First acquire — arms _last_dispatch_at unconditionally
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        scheduler.release('99')
+
+        # Second acquire — before the fix this raises AttributeError on dict.lower().
+        # After the fix, the dict is str()-coerced and does not match 'steward',
+        # so the task is re-dispatched normally.
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99', (
+            'Non-string reopen_reason must not raise and must not falsely block dispatch'
+        )
+
 
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
