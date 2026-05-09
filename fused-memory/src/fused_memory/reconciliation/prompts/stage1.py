@@ -2,12 +2,6 @@
 
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 
-#: Pinned flag_type value for Stage 1's Terminal-State Pre-Check Discipline.
-#: Defined here alongside the prompt so both the f-string interpolation and any
-#: caller that imports this module reference exactly the same string — no silent
-#: drift between cycles.
-TERMINAL_STATE_PRE_CHECK_FLAG_TYPE: str = 'terminal_state_pre_check'
-
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
 consolidate memories across two stores:
@@ -91,7 +85,7 @@ terminal state (done / cancelled / deferred / blocked), follow this verification
    status from Taskmaster.
 2. Only persist the temporal_fact if the live status matches the claimed terminal state.
 3. If they disagree, SKIP the write and flag for Stage 2 review instead — set `task_id` \
-   and `flag_type='{TERMINAL_STATE_PRE_CHECK_FLAG_TYPE}'` on the flagged item per the existing \
+   and `flag_type='terminal_state_pre_check'` on the flagged item per the existing \
    Flag Deduplication and Stage 2 Flag Relay (FIX B) conventions.
 
 If `mcp__fused-memory__get_task` returns an `error` field \

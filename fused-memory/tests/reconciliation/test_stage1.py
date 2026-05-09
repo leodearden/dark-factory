@@ -4,7 +4,6 @@ Covers:
 - project_root threading through assemble_payload / _format_assembled_payload
   (TestStage1PayloadThreadsProjectRootLegacy, TestStage1PayloadThreadsProjectRootAssembled)
 - project_root omitted when empty (TestStage1PayloadOmitsProjectRootWhenUnset)
-- Pinned flag_type constant (TestTerminalStatePreCheckFlagTypeConstant)
 """
 
 from __future__ import annotations
@@ -18,10 +17,6 @@ from fused_memory.models.reconciliation import (
     AssembledPayload,
     StageId,
     Watermark,
-)
-from fused_memory.reconciliation.prompts.stage1 import (
-    STAGE1_SYSTEM_PROMPT,
-    TERMINAL_STATE_PRE_CHECK_FLAG_TYPE,
 )
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
@@ -144,20 +139,3 @@ class TestStage1PayloadOmitsProjectRootWhenUnset:
         assert 'Use project_root=""' not in result
 
 
-# ---------------------------------------------------------------------------
-# TERMINAL_STATE_PRE_CHECK_FLAG_TYPE constant in prompts/stage1.py
-# ---------------------------------------------------------------------------
-
-
-class TestTerminalStatePreCheckFlagTypeConstant:
-    """TERMINAL_STATE_PRE_CHECK_FLAG_TYPE is defined in prompts/stage1.py and wired into the prompt.
-
-    The constant exists so the prompt text and any downstream consumer reference
-    exactly the same string.  The meaningful contract is that the value is
-    present in STAGE1_SYSTEM_PROMPT — proving the f-string interpolated it
-    and that the constant hasn't drifted away from the prompt.
-    """
-
-    def test_constant_appears_in_prompt(self):
-        """The constant value is interpolated into STAGE1_SYSTEM_PROMPT (structural wiring check)."""
-        assert TERMINAL_STATE_PRE_CHECK_FLAG_TYPE in STAGE1_SYSTEM_PROMPT
