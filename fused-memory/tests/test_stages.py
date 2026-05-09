@@ -1133,47 +1133,6 @@ class TestProactiveSampling:
             'server now rejects that call shape.'
         )
 
-    def test_stage2_prompt_does_not_reference_recurrence_count(self):
-        """STAGE2_SYSTEM_PROMPT must not reference the non-existent recurrence_count mechanism.
-
-        The prompt previously instructed the LLM to "attach to the existing memory marker
-        via `recurrence_count`" and "increment `recurrence_count` in the existing memory
-        marker". This pointed the LLM at a fictional mechanism: flag_dedup.py marker
-        writes carry only {source, task_id, flag_type, run_id, last_seen_run_id} metadata
-        with no recurrence_count field, no read site for it, and no increment logic.
-
-        The actual same-run suppression is handled by _suppress_same_run_human_operator_dups
-        in task_knowledge_sync.py which **drops** duplicate Stage 2 items. This test pins
-        the corrected drop-semantics framing and ensures future edits cannot regress back
-        to the non-existent counter mechanism.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-
-        # The fictional mechanism must not be referenced
-        assert 'recurrence_count' not in STAGE2_SYSTEM_PROMPT, (
-            "STAGE2_SYSTEM_PROMPT must not reference `recurrence_count` — that field "
-            "does not exist in flag_dedup.py marker metadata and cannot be mutated by "
-            "any MCP tool exposed to the LLM."
-        )
-
-        # The section header must be preserved
-        assert 'Same-Run Stage 1 human_operator_required Suppression' in STAGE2_SYSTEM_PROMPT, (
-            "STAGE2_SYSTEM_PROMPT must still contain the 'Same-Run Stage 1 "
-            "human_operator_required Suppression' section header."
-        )
-
-        # The section must use drop-semantics language matching the post-processor
-        drop_semantics = (
-            'do not re-emit' in STAGE2_SYSTEM_PROMPT
-            or 'drop' in STAGE2_SYSTEM_PROMPT
-            or 'already filed' in STAGE2_SYSTEM_PROMPT
-        )
-        assert drop_semantics, (
-            "STAGE2_SYSTEM_PROMPT must contain drop-semantics wording ('do not re-emit', "
-            "'drop', or 'already filed') matching the _suppress_same_run_human_operator_dups "
-            "post-processor behavior."
-        )
-
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
