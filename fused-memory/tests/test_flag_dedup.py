@@ -629,6 +629,70 @@ async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
     assert result[0]['persisted_from_run'] == 'r0'
 
 
+# ---------------------------------------------------------------------------
+# Step 7 (task-1146) — write-failure skips delete (predecessor preserved)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_atomic_replace_skips_delete_if_write_fails(caplog):
+    """When add_memory raises on the HIT path, delete_memory is never called.
+
+    Pins the write-first ordering guarantee: if the replacement write fails,
+    all priors must remain intact so the next cycle still has dedup state.
+
+    (a) dedup_flags does NOT raise
+    (b) delete_memory was NEVER called
+    (c) flag IS annotated (annotation extracted BEFORE write attempt)
+    (d) WARNING log mentions task_id, flag_type, and the failure
+    """
+    import logging as _logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'prior-write-fail'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write failed'))
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) does not raise
+    # (b) delete_memory never called — prior preserved
+    memory_service.delete_memory.assert_not_called()
+
+    # (c) flag IS annotated (annotation extracted before write attempt)
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+    # (d) WARNING log mentions task_id and flag_type
+    warning_messages = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+    assert any('42' in m for m in warning_messages), (
+        f'Expected WARNING mentioning task 42 but got: {warning_messages}'
+    )
+    assert any('missing_deliverable' in m for m in warning_messages), (
+        f'Expected WARNING mentioning flag_type but got: {warning_messages}'
+    )
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog):
     """When memory_service.add_memory raises, dedup_flags does not raise, returns flag unchanged,
