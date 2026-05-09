@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+from fused_memory.reconciliation.mem0_dedup import find_prior_memories
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +80,10 @@ async def dedup_flags(
             result.append(flag)
             continue
         tid, ftype = sig
-        # Delegate search+filter to the shared helper.  find_prior_memory logs a
-        # WARNING under logger on search failure and returns None so the else
+        # Delegate search+filter to the shared helper.  find_prior_memories logs a
+        # WARNING under logger on search failure and returns [] so the else
         # branch below writes a fresh marker (best-effort on transient Mem0 outage).
-        prior = await find_prior_memory(
+        priors = await find_prior_memories(
             memory_service,
             project_id=project_id,
             task_id=tid,
@@ -93,10 +93,12 @@ async def dedup_flags(
             limit=50,
             log=logger,
         )
-        if prior is not None:
+        if priors:
             # --- HIT: atomic-replacement ---
-            # (1) Extract annotation from prior BEFORE deleting it.
-            prior_run_id = (prior.metadata or {}).get('run_id') or 'unknown'
+            # (1) Extract annotation from the FIRST prior BEFORE deleting any.
+            #     Annotation pinned to first-found prior (earliest known run_id).
+            first_prior = priors[0]
+            prior_run_id = (first_prior.metadata or {}).get('run_id') or 'unknown'
             if prior_run_id == 'unknown':
                 logger.debug(
                     'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
@@ -108,7 +110,7 @@ async def dedup_flags(
             flag['last_seen_run_id'] = run_id
 
             # (2) Write replacement marker first.  If this fails, skip the
-            #     delete so the prior remains intact for next cycle.
+            #     delete so all priors remain intact for next cycle.
             write_succeeded = False
             try:
                 await memory_service.add_memory(
@@ -132,23 +134,26 @@ async def dedup_flags(
                     tid, ftype, e,
                 )
 
-            # (3) Delete prior only if the new marker was successfully written.
+            # (3) Delete ALL priors only if the new marker was successfully written.
+            #     Each delete is wrapped individually so one bad delete does not
+            #     abort the batch (self-healing: leftovers are retried next cycle).
             if write_succeeded:
-                try:
-                    await memory_service.delete_memory(
-                        memory_id=prior.id,
-                        store='mem0',
-                        project_id=project_id,
-                        causation_id=run_id,
-                        _source='stage1_flag_dedup',
-                    )
-                except Exception as e:
-                    logger.warning(
-                        'flag_dedup: failed to delete prior marker %s for task %s flag_type %s: %s',
-                        prior.id, tid, ftype, e,
-                    )
+                for prior in priors:
+                    try:
+                        await memory_service.delete_memory(
+                            memory_id=prior.id,
+                            store='mem0',
+                            project_id=project_id,
+                            causation_id=run_id,
+                            _source='stage1_flag_dedup',
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            'flag_dedup: failed to delete prior marker %s for task %s flag_type %s: %s',
+                            prior.id, tid, ftype, e,
+                        )
         else:
-            # Novel flag (or search failed) — write a new marker for future
+            # MISS: novel flag (or search failed) — write a new marker for future
             # dedup cycles.  _source='stage1_flag_dedup' distinguishes these
             # from 'targeted_recon' writes in the audit journal.
             #
