@@ -101,10 +101,14 @@ async def dedup_flags(
             log=logger,
         )
         if priors:
-            # --- HIT: atomic-replacement ---
-            # (1) Extract annotation from the FIRST prior BEFORE deleting any.
-            #     Annotation pinned to the first-found prior (search-order —
-            #     typically highest-relevance, not necessarily earliest).
+            # --- HIT: best-effort replacement ---
+            # (1) Sort priors by id lex so annotation source and deletion order
+            #     are deterministic across concurrent cycles.  MemoryResult.id
+            #     is always present (str); temporal fields are optional and may
+            #     be absent for Mem0 results, so lex sort is the only total order.
+            priors = sorted(priors, key=lambda p: p.id)
+            # Extract annotation from the first prior (lowest id lex) BEFORE
+            # deleting any.
             first_prior = priors[0]
             prior_run_id = (first_prior.metadata or {}).get('run_id') or 'unknown'
             if prior_run_id == 'unknown':
