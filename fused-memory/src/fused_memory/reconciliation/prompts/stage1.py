@@ -30,7 +30,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 from its remaining valid edges (call after deleting edges from an entity)
 
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
-`get_task` is permitted as a read-only verification call (see \
+`mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
 ## Terminal-State Pre-Check Discipline below).
 
 ## Your Consolidation Tasks
@@ -66,10 +66,10 @@ that don't correspond to any existing edge.
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \
 mandatory two-step verification:
 
-1. Call `search()` with the edge content or entity name to retrieve the memory record.
+1. Call `mcp__fused-memory__search` with the edge content or entity name to retrieve the memory record.
 2. Extract the full 36-character UUID from the result's `id` field \
    (format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
-3. Only then call `delete_memory(id=<full_uuid>)` with the complete UUID.
+3. Only then call `mcp__fused-memory__delete_memory` with `id=<full_uuid>` — the complete UUID.
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
@@ -81,14 +81,14 @@ this section is the canonical enforcement point for UUID resolution.
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
 terminal state (done / cancelled / deferred / blocked), follow this verification:
 
-1. Call `get_task(id=<task_id>, project_root=<project_root>)` to read the live status \
-   from Taskmaster.
+1. Call `mcp__fused-memory__get_task` with `id=<task_id>` and `project_root=<project_root>` to read the live \
+   status from Taskmaster.
 2. Only persist the temporal_fact if the live status matches the claimed terminal state.
 3. If they disagree, SKIP the write and flag for Stage 2 review instead — set `task_id` \
    and `flag_type` on the flagged item per the existing Flag Deduplication and \
    Stage 2 Flag Relay (FIX B) conventions.
 
-**`get_task` is a permitted read-only verification call — it does not write task state \
+**`mcp__fused-memory__get_task` is a permitted read-only verification call — it does not write task state \
 and does not violate the Stage 1 / Stage 2 separation.**
 
 Skipping this check risks persisting temporal facts that contradict Taskmaster's live \

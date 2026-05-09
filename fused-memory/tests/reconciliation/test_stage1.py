@@ -35,11 +35,17 @@ from fused_memory.config.schema import ReconciliationConfig
 def _extract_section(payload: str, header: str) -> str:
     """Return the body of *header* up to the next '\\n#' boundary, or '' if absent.
 
-    Mirrors the helper at tests/test_stages.py:53-65.
+    Mirrors the helper at tests/test_stages.py:53-65, with one addition: we
+    search for '\\n' + header so we match only genuine section-level markdown
+    headers that start at a line boundary, not in-line cross-references (e.g.
+    'see ## Terminal-State Pre-Check Discipline below' in the helper note).
     """
-    start = payload.find(header)
+    needle = '\n' + header
+    start = payload.find(needle)
     if start == -1:
         return ''
+    # Skip the leading '\n' so the returned slice starts at the header itself.
+    start = start + 1
     end = payload.find('\n#', start + 1)
     if end == -1:
         end = len(payload)
