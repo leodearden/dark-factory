@@ -304,6 +304,34 @@ async def dedup_flags(
     return result
 
 
+def build_suppression_payload(task_id: int | str) -> dict[str, Any]:
+    """Build the canonical ``stage1_flag_suppression`` Mem0 payload for *task_id*.
+
+    Returns a dict with ``content``, ``category``, and ``metadata`` fields
+    matching the canonical schema documented in ``STAGE1_SYSTEM_PROMPT`` lines
+    244-248.  ``task_id`` is coerced to ``int`` so the producer always pins the
+    integer type regardless of how the caller obtained the id.
+
+    ``project_id`` is intentionally absent — it is a write-time concern that
+    must be passed separately to ``memory_service.add_memory``, keeping this
+    helper pure and reusable across projects.
+
+    Canonical schema (Mem0, observations_and_summaries category):
+      - ``metadata.kind = "stage1_flag_suppression"``
+      - ``metadata.task_id = <N>`` (int — coerced by this function)
+      - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
+    """
+    tid = int(task_id)
+    return {
+        'content': f'STAGE 1 FLAG SUPPRESSION task_id={tid}',
+        'category': 'observations_and_summaries',
+        'metadata': {
+            'kind': 'stage1_flag_suppression',
+            'task_id': tid,
+        },
+    }
+
+
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     """Return a (task_id_str, flag_type_str) signature for *flag*, or ``None``.
 
