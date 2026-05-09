@@ -243,6 +243,74 @@ async def _classify_terminal_state_violations(
     return violations
 
 
+async def _verify_set_task_status_post_action(
+    ops: list[dict],
+    taskmaster,
+    project_root: str,
+) -> list[dict]:
+    """Verify that each Stage 2 set_task_status op actually took effect.
+
+    For every ``set_task_status`` op authored by the Stage 2 agent, fetches the
+    *live* task status from Taskmaster and returns a mismatch record when the live
+    status differs from the op's target ``status`` param.
+
+    This catches cases where the task_interceptor's terminal-exit gate (or other
+    guards) silently rejected the status transition but the LLM still inflated its
+    self-reported ``tasks_modified`` count.
+
+    Args:
+        ops: Write-journal op dicts (``layer=='write_op'``).
+        taskmaster: Taskmaster backend.
+        project_root: Absolute path to the Taskmaster project directory.
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'target_status', 'live_status'}`` dicts.
+    """
+    mismatches: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != _STAGE2_AGENT_ID:
+            continue
+        if op.get('operation') != 'set_task_status':
+            continue
+
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._verify_set_task_status_post_action: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+
+        task_id = str(params.get('task_id', '')).strip()
+        target_status = str(params.get('status', '')).strip()
+        if not task_id or not target_status:
+            continue
+
+        try:
+            task_data = await taskmaster.get_task(task_id, project_root)
+        except Exception:
+            logger.warning(
+                'reconciliation._verify_set_task_status_post_action: '
+                'get_task failed for task_id=%s; skipping op',
+                task_id,
+            )
+            continue
+
+        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        if live_status != target_status:
+            mismatches.append({
+                'op_id': op.get('id'),
+                'task_id': task_id,
+                'target_status': target_status,
+                'live_status': live_status,
+            })
+
+    return mismatches
+
+
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     """Query Mem0 for active Stage-2-destined flags and return them as dicts.
 
@@ -651,6 +719,32 @@ class TaskKnowledgeSync(BaseStage):
                             'project_id': self.project_id,
                             'task_id': v['task_id'],
                             'reason': v['reason'],
+                        },
+                    )
+
+        # Guard 3 — post-action set_task_status verification
+        if self.taskmaster and self.project_root:
+            sts_mismatches = await _verify_set_task_status_post_action(
+                ops, self.taskmaster, self.project_root
+            )
+            if sts_mismatches:
+                report.stats['set_task_status_post_action_mismatches'] = (
+                    report.stats.get('set_task_status_post_action_mismatches', 0)
+                    + len(sts_mismatches)
+                )
+                report.stats['tasks_modified'] = max(
+                    0,
+                    report.stats.get('tasks_modified', 0) - len(sts_mismatches),
+                )
+                for m in sts_mismatches:
+                    logger.warning(
+                        'reconciliation.set_task_status_post_action_mismatch',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': m['task_id'],
+                            'target_status': m['target_status'],
+                            'live_status': m['live_status'],
                         },
                     )
 
