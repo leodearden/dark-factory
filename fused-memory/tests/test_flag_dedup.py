@@ -562,6 +562,73 @@ async def test_dedup_flags_prior_marker_atomic_replace_writes_new_and_deletes_pr
     )
 
 
+# ---------------------------------------------------------------------------
+# Step 5 (task-1146) — atomic-replace collapses multiple predecessors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
+    """On HIT with multiple prior markers (past leakage), all priors are deleted.
+
+    Simulates N=3 prior markers for the same (task_id, flag_type) that exist
+    due to prior search-failure or top-N rank-eviction leakage.  dedup_flags
+    must write exactly ONE replacement marker and delete all THREE priors.
+
+    (a) add_memory called exactly once
+    (b) delete_memory called exactly three times covering ids {p-1, p-2, p-3}
+    (c) flag annotation uses the FIRST prior's run_id
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    def _prior(id_: str, run_id: str) -> MagicMock:
+        r = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': run_id,
+            'last_seen_run_id': run_id,
+        })
+        r.id = id_
+        return r
+
+    prior1 = _prior('p-1', 'r0')  # first found — annotation should come from this one
+    prior2 = _prior('p-2', 'r-prev')
+    prior3 = _prior('p-3', 'r-earlier')
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior1, prior2, prior3])
+    memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) exactly one write
+    memory_service.add_memory.assert_called_once()
+
+    # (b) exactly three deletes covering all prior ids
+    assert memory_service.delete_memory.call_count == 3, (
+        f'Expected 3 delete_memory calls but got {memory_service.delete_memory.call_count}'
+    )
+    deleted_ids = {
+        call.kwargs.get('memory_id')
+        for call in memory_service.delete_memory.call_args_list
+    }
+    assert deleted_ids == {'p-1', 'p-2', 'p-3'}, (
+        f'Expected all three prior ids deleted but got {deleted_ids}'
+    )
+
+    # (c) annotation from first prior
+    assert result[0]['persisted_from_run'] == 'r0'
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog):
     """When memory_service.add_memory raises, dedup_flags does not raise, returns flag unchanged,
