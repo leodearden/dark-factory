@@ -3127,6 +3127,10 @@ async def test_run_loop_releases_stale_claims_on_startup(
     harness._recover_stale_runs = AsyncMock(return_value=None)
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
+    # judge.initialize() does a real SQLite query; mock it to avoid timing
+    # flakiness in slow environments (freethreaded Python, heavy parallel runs).
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
 
     # Spy on release_stale_claims: side_effect passes through to the real method,
     # so return_value is intentionally omitted (side_effect takes precedence).
@@ -4678,8 +4682,6 @@ class TestProjectLoopNarrowsExceptionHandling:
         import asyncio
         from unittest.mock import AsyncMock, patch
 
-        from fused_memory.reconciliation.harness import UnknownProjectError
-
         # Harness with NO entry for 'autopilot_video' — any attempt to run a
         # full cycle for this project_id should raise UnknownProjectError.
         harness = _make_harness_with_known_projects(
@@ -4758,10 +4760,10 @@ class TestProjectLoopNarrowsExceptionHandling:
         with (
             patch.object(harness, 'run_full_cycle', rfc_mock),
             patch('fused_memory.reconciliation.harness._sleep', sleep_mock),
+            suppress(asyncio.CancelledError),
         ):
             # CancelledError on the 2nd run_full_cycle call propagates out — suppress it.
-            with suppress(asyncio.CancelledError):
-                await harness._project_loop('autopilot_video')
+            await harness._project_loop('autopilot_video')
 
         # run_full_cycle must have been called at least twice — proof that the
         # plain ValueError was NOT loop-fatal (retry path was taken).
