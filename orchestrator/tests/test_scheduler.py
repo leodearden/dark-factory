@@ -1572,12 +1572,10 @@ class TestDispatchCooldownGate:
 
         log_text = cooldown_records[0].getMessage()
         assert '99' in log_text, f'Task id "99" missing from log: {log_text!r}'
-        # Assert the signal label appears anywhere in the rendered message,
-        # without pinning the exact "signal=" qualifier.  This still catches a
-        # regression that selects a different signal label, but does not couple
-        # the test to the format string at scheduler.py:1334.
-        assert 'recon_reset_count' in log_text, (
-            f'"recon_reset_count" missing from log: {log_text!r}'
+        # Check the field-qualified form "signal=recon_reset_count" so a
+        # regression that selected a different signal label would fail here.
+        assert 'signal=recon_reset_count' in log_text, (
+            f'"signal=recon_reset_count" missing from log: {log_text!r}'
         )
         # remaining time should be a number — check any digit appears in the message
         import re

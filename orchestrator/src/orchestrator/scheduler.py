@@ -287,6 +287,15 @@ class TaskAssignment:
     modules: list[str]
 
 
+def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
+    """Return *ts* if provided, else the stdlib ``time.monotonic`` callable.
+
+    Centralises the ``None``-fallback logic so ``ModuleLockTable`` and
+    ``Scheduler`` don't each inline a redundant lambda.
+    """
+    return ts if ts is not None else time.monotonic
+
+
 class ModuleLockTable:
     """Hierarchical module locking — two modules conflict if one is a prefix
     of the other (parent/child), but siblings are independent.
@@ -310,9 +319,7 @@ class ModuleLockTable:
         # normalized_module -> (owner_task_id, deadline_monotonic)
         self._parked: dict[str, tuple[str, float]] = {}
         self._config = config
-        self._time_source: Callable[[], float] = (
-            time_source if time_source is not None else (lambda: time.monotonic())
-        )
+        self._time_source: Callable[[], float] = _resolve_time_source(time_source)
 
     # --- Hierarchy helpers ---
 
@@ -500,9 +507,7 @@ class Scheduler:
         time_source: Callable[[], float] | None = None,
     ):
         self.config = config
-        self._time_source: Callable[[], float] = (
-            time_source if time_source is not None else (lambda: time.monotonic())
-        )
+        self._time_source: Callable[[], float] = _resolve_time_source(time_source)
         self.lock_table = ModuleLockTable(config, time_source=self._time_source)
         self.event_store = event_store
         self._mcp_session = mcp_session
