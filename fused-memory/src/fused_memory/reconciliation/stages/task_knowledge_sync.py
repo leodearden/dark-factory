@@ -912,9 +912,12 @@ class TaskKnowledgeSync(BaseStage):
                             tid,
                         )
                         continue  # omit entry; helpers detect missing key -> skip
-                    status_cache[tid] = (
-                        _extract_status(result) if isinstance(result, dict) else 'unknown'
-                    )
+                    if not isinstance(result, dict):
+                        continue  # non-dict result; omit entry so helpers skip
+                    extracted = _extract_status(result)
+                    if extracted == 'unknown':
+                        continue  # unresolvable status; omit entry so helpers skip
+                    status_cache[tid] = extracted
 
         # Guard 1 — terminal-state pre-check
         if self.taskmaster and self.project_root:

@@ -6014,11 +6014,13 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster.get_task raises unconditionally for '99'.
 
             Before the fix, the 'unknown' sentinel triggers 'unknown' != 'done' and
-            'unknown' != 'in-progress', so Guards 2 and 3 fire falsely and decrement
-            tasks_modified.  After the fix, the cache omits '99' and all helpers skip.
+            'unknown' != 'in-progress', so Guards 2 (freshness) and 3 (sts post-action)
+            fire falsely; Guard 3 also decrements tasks_modified.  After the fix, the
+            cache omits '99' and all helpers skip.
 
             Assertions (b) and (c) are the principal regressions; (d) catches the
-            false tasks_modified decrement; (e) verifies the failure was still logged.
+            false tasks_modified decrement from Guard 3; (e) verifies the failure was
+            still logged.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
             stage.project_id = 'dark_factory'
@@ -6091,10 +6093,10 @@ class TestTaskKnowledgeSyncStage2Guards:
             # (a) Guard 1 did not fire — 'unknown' is not in TERMINAL_STATUSES
             assert 'not_applicable_count' not in report.stats
 
-            # (b) Guard 2 (sts post-action) did NOT falsely fire — principal regression
+            # (b) Guard 3 (sts post-action) did NOT falsely fire — principal regression
             assert 'set_task_status_post_action_mismatches' not in report.stats
 
-            # (c) Guard 3 (freshness) did NOT falsely fire — principal regression
+            # (c) Guard 2 (freshness) did NOT falsely fire — principal regression
             assert 'stall_guard_freshness_violations' not in report.stats
 
             # (d) tasks_modified is unchanged — no false decrements
@@ -6110,3 +6112,92 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert len(cache_fail_logs) == 1, (
                 f'expected 1 cache-build WARNING for task_id=99, got {len(cache_fail_logs)}'
             )
+
+        @pytest.mark.asyncio
+        async def test_cache_build_nondict_result_no_false_positives(
+            self, mock_deps_composition
+        ):
+            """When get_task returns a non-dict, Guards 2 and 3 must NOT fire.
+
+            Scenario: same three Stage-2 ops as test_cache_build_failure_no_false_positives
+            (one per guard, task_id='99'), but get_task returns None (non-dict result)
+            instead of raising.
+
+            Before the fix, the non-dict result was stored as status_cache['99'] = 'unknown'
+            (via ``_extract_status(result) if isinstance(result, dict) else 'unknown'``),
+            so Guards 2 (freshness) and 3 (sts post-action) would fire falsely; Guard 3
+            also decrements tasks_modified.  After the fix, the cache omits '99' (non-dict
+            → continue) and all helpers skip uniformly.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            ops = [
+                {  # Guard 1: terminal-state update_task
+                    'id': 'op-term-99c',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'update_task',
+                    'params': json.dumps({'task_id': '99'}),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-1176-nondict',
+                    'created_at': '2026-01-01T00:00:00',
+                },
+                {  # Guard 3 (sts): set_task_status post-action target=done
+                    'id': 'op-sts-99c',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'set_task_status',
+                    'params': json.dumps({'task_id': '99', 'status': 'done'}),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-1176-nondict',
+                    'created_at': '2026-01-01T00:00:01',
+                },
+                {  # Guard 2 (freshness): add_memory snapshot_status=in-progress
+                    'id': 'op-mem-99c',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'add_memory',
+                    'params': json.dumps({
+                        'content': 'task 99 status unknown',
+                        'metadata': {'task_id': '99', 'snapshot_status': 'in-progress'},
+                    }),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-1176-nondict',
+                    'created_at': '2026-01-01T00:00:02',
+                },
+            ]
+            mock_deps_composition['journal'].write_journal.get_ops_by_causation.return_value = ops
+
+            # get_task returns None — simulates an unexpected non-dict API response
+            async def _get_task_returns_none(task_id, project_root):
+                return None
+
+            mock_deps_composition['taskmaster'].get_task.side_effect = _get_task_returns_none
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [],
+                        stats={'tasks_modified': 5, 'memories_written': 1},
+                    )),
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[],
+                    run_id='test-run-1176-nondict',
+                )
+
+            # (a) Guard 1 did not fire — 'unknown' is not in TERMINAL_STATUSES
+            assert 'not_applicable_count' not in report.stats
+
+            # (b) Guard 3 (sts post-action) did NOT falsely fire
+            assert 'set_task_status_post_action_mismatches' not in report.stats
+
+            # (c) Guard 2 (freshness) did NOT falsely fire
+            assert 'stall_guard_freshness_violations' not in report.stats
+
+            # (d) tasks_modified is unchanged — no false decrements from Guard 3
+            assert report.stats.get('tasks_modified') == 5
