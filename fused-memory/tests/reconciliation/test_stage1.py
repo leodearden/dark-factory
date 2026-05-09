@@ -65,6 +65,12 @@ class TestStage1PayloadThreadsProjectRootLegacy:
         assert 'Use project_root="/home/leo/src/test_proj"' in result, (
             'assemble_payload should emit project_root directive when project_root is set'
         )
+        assert result.rstrip().endswith(
+            'Use project_root="/home/leo/src/test_proj" for tasks scoped to this project.'
+        ), 'project_root directive should be the last line of the payload'
+        assert result.count('Use project_root=') == 1, (
+            'project_root directive should appear exactly once in the payload'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +99,12 @@ class TestStage1PayloadThreadsProjectRootAssembled:
 
         assert 'Use project_root="/home/leo/src/test_proj"' in result, (
             '_format_assembled_payload should emit project_root directive when project_root is set'
+        )
+        assert result.rstrip().endswith(
+            'Use project_root="/home/leo/src/test_proj" for tasks scoped to this project.'
+        ), 'project_root directive should be the last line of the payload'
+        assert result.count('Use project_root=') == 1, (
+            'project_root directive should appear exactly once in the payload'
         )
 
 

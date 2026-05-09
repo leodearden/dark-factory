@@ -262,10 +262,10 @@ Review the above data and perform memory consolidation:
         """Return the project_root directive line for payload footers, or empty string.
 
         When ``self.project_root`` is falsy (the BaseStage default ``''``), returns
-        ``''`` so no trailing blank line is produced.  When set, returns
-        ``'\\nUse project_root=...'`` (leading newline keeps it on its own line after
-        the preceding guideline).  Both payload methods call this helper so the
-        f-string fragment stays in a single place.
+        ``''`` so the payload ends immediately after the project_id guideline with no
+        trailing newline.  When set, returns ``'\\nUse project_root=...'`` (leading
+        newline keeps it on its own line after the preceding guideline).  Both payload
+        methods call this helper so the f-string fragment stays in a single place.
         """
         if not self.project_root:
             return ''
