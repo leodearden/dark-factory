@@ -553,10 +553,13 @@ async def test_dedup_flags_prior_marker_atomic_replace_writes_new_and_deletes_pr
     assert del_kwargs.get('store') == 'mem0'
     assert del_kwargs.get('project_id') == 'p'
 
-    # (d) ordering: add_memory before delete_memory in mock_calls
-    call_names = [str(c) for c in memory_service.mock_calls]
-    add_idx = next(i for i, c in enumerate(call_names) if 'add_memory' in c)
-    del_idx = next(i for i, c in enumerate(call_names) if 'delete_memory' in c)
+    # (d) ordering: add_memory before delete_memory.
+    # Use method_calls (records only actual method invocations, no attribute
+    # access) with exact name matching via call[0] so the check is immune to
+    # future child-mock interactions whose repr happens to contain 'add_memory'.
+    method_names = [c[0] for c in memory_service.method_calls]
+    add_idx = method_names.index('add_memory')
+    del_idx = method_names.index('delete_memory')
     assert add_idx < del_idx, (
         f'add_memory (idx {add_idx}) must precede delete_memory (idx {del_idx})'
     )
