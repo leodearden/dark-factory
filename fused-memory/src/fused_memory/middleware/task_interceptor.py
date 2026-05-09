@@ -3321,14 +3321,17 @@ async def _validate_done_provenance(
         resolved['commit'] = sha_or_err
         if sha_or_err != commit_input:
             resolved['commit_input'] = commit_input
-        if kind in ('merged', 'found_on_main'):
-            ancestor_err = await _verify_commit_on_main(project_root, sha_or_err)
-            if ancestor_err is not None:
-                return _done_provenance_error(
-                    task_id,
-                    f'kind={kind!r} but commit {sha_or_err} is not on main: '
-                    f'{ancestor_err}.',
-                ), None
+        # Ancestor backstop applies to every accepted kind ('merged' and
+        # 'found_on_main' are validated identically; they differ only in
+        # audit semantics).  Unknown kinds are rejected by the early-return
+        # above, so this check is always reached for any valid kind.
+        ancestor_err = await _verify_commit_on_main(project_root, sha_or_err)
+        if ancestor_err is not None:
+            return _done_provenance_error(
+                task_id,
+                f'kind={kind!r} but commit {sha_or_err} is not on main: '
+                f'{ancestor_err}.',
+            ), None
     if note is not None:
         resolved['note'] = note
 
