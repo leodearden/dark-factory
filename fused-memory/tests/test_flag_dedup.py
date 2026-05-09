@@ -693,6 +693,82 @@ async def test_dedup_flags_atomic_replace_skips_delete_if_write_fails(caplog):
     )
 
 
+# ---------------------------------------------------------------------------
+# Step 9 (task-1146) — per-prior delete failure logs warning and continues
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_atomic_replace_per_prior_delete_failure_logs_warning_and_continues(caplog):
+    """One failing delete does not abort the batch; both priors get a delete attempt.
+
+    Configures two priors ('p-1', 'p-2'); delete_memory raises for 'p-1' but
+    succeeds for 'p-2'.  Pins the contract that a per-prior delete error:
+    (a) does NOT cause dedup_flags to raise
+    (b) add_memory is called exactly once (write succeeded)
+    (c) delete_memory is called exactly twice — both priors attempted
+    (d) WARNING log mentions 'p-1' and the failure
+    (e) flag is annotated normally
+    """
+    import logging as _logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    def _prior(id_: str, run_id: str) -> MagicMock:
+        r = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': run_id,
+            'last_seen_run_id': run_id,
+        })
+        r.id = id_
+        return r
+
+    prior1 = _prior('p-1', 'r0')
+    prior2 = _prior('p-2', 'r-prev')
+
+    def _delete_side_effect(**kwargs):
+        if kwargs.get('memory_id') == 'p-1':
+            raise RuntimeError('delete p-1 failed')
+        # p-2 succeeds — return None (AsyncMock awaitable returns None by default)
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior1, prior2])
+    memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(side_effect=_delete_side_effect)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) does not raise
+    # (b) add_memory called once
+    memory_service.add_memory.assert_called_once()
+
+    # (c) delete_memory called twice — both priors attempted
+    assert memory_service.delete_memory.call_count == 2, (
+        f'Expected 2 delete calls but got {memory_service.delete_memory.call_count}'
+    )
+
+    # (d) WARNING log mentions 'p-1'
+    warning_messages = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+    assert any('p-1' in m for m in warning_messages), (
+        f'Expected WARNING mentioning p-1 but got: {warning_messages}'
+    )
+
+    # (e) flag annotated normally
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog):
     """When memory_service.add_memory raises, dedup_flags does not raise, returns flag unchanged,
