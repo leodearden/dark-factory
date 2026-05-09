@@ -4190,6 +4190,7 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
 
         # Mem0 active-query flags
         mock_deps['memory_service'].search.return_value = [
@@ -4305,6 +4306,7 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['memory_service'].search.return_value = [
             self._make_flag('mem-742', 'legitimate finding for task 742', '742'),
             self._make_flag('mem-1139', 'some flag for task 1139', '1139'),
@@ -4440,6 +4442,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
@@ -4461,6 +4464,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
@@ -4485,6 +4489,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
@@ -4507,6 +4512,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
@@ -4531,6 +4537,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 

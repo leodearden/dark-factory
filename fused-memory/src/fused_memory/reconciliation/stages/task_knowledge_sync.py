@@ -370,7 +370,9 @@ class TaskKnowledgeSync(BaseStage):
 
     # Current reconciliation run_id — set by run() so assemble_payload can use
     # it for stale-flag persistence markers (FIX D).
-    _current_run_id: str = ''
+    # Sentinel None means run() has not yet been called; assemble_payload raises
+    # loudly in that case so test authors are reminded to set this attribute.
+    _current_run_id: str | None = None
 
     def get_system_prompt(self) -> str:
         return STAGE2_SYSTEM_PROMPT
@@ -528,8 +530,24 @@ class TaskKnowledgeSync(BaseStage):
         # FIX D — stale-flag persistence tracking.
         # Track how many cycles each surviving flag has survived without being
         # deleted.  Best-effort: _track_flag_persistence degrades gracefully.
-        run_id_for_markers = self._current_run_id or 'unknown'
+        #
+        # run_id is only needed when there are surviving flags to persist; it
+        # is safe to skip the check when surviving is empty.  Raise before any
+        # marker writes so the failure is loud and attributable rather than
+        # tagging markers with an unattributable run_id.
+        # In tests: set `stage._current_run_id = 'test-run'` (or any non-empty
+        # string) before calling assemble_payload() with non-empty Mem0 search
+        # results.
         surviving_ids = [f['id'] for f in surviving]
+        if surviving_ids and not self._current_run_id:
+            raise RuntimeError(
+                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
+                '_current_run_id is not set.  In production this is set '
+                'automatically by run().  In tests that return active Mem0 '
+                'flags, assign stage._current_run_id = "test-run" before '
+                'calling assemble_payload() directly.'
+            )
+        run_id_for_markers = self._current_run_id or ''
         persistence_counts = await _track_flag_persistence(
             self.memory, self.project_id, run_id_for_markers, surviving_ids,
         )
