@@ -293,7 +293,7 @@ def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
     Centralises the ``None``-fallback logic so ``ModuleLockTable`` and
     ``Scheduler`` don't each inline a redundant lambda.
     """
-    return ts if ts is not None else time.monotonic
+    return ts if ts is not None else (lambda: time.monotonic())
 
 
 class ModuleLockTable:
