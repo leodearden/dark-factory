@@ -1199,6 +1199,17 @@ class MemoryService:
         ``invalid_at`` to a timestamp marks the edge as superseded as of that
         moment (used by reconciliation to retire contradicted facts without
         destroying their audit trail).
+
+        **Guard-2 verification (TOCTOU note):** when *fact* is supplied, a
+        ``get_edge_text`` readback is performed after the save to confirm
+        persistence.  There is a small TOCTOU window between the save and the
+        readback — if a concurrent writer updates the same edge in that window
+        (another reconciliation cycle, an interactive agent, or a retry) the
+        readback may return a different value and ``verified`` will be ``False``
+        even though *our* save did persist.  This is a known false-negative
+        mode; reconciliation is mostly single-writer per edge so it is rare in
+        practice.  Undercounting ``edges_updated`` (the conservative outcome) is
+        safer than overcounting, so the behaviour is intentional.
         """
         if fact is None and invalid_at is None:
             raise ValueError('update_edge requires fact or invalid_at to be set')
@@ -1206,6 +1217,11 @@ class MemoryService:
 
         params: dict[str, Any] = {'edge_uuid': edge_uuid}
         if fact is not None:
+            # Truncated copy for journal/payload logging only.  The full fact
+            # is passed to graphiti.update_edge and used for the Guard-2
+            # readback comparison.  A verified=False journal entry will show
+            # params['fact'] (truncated) as the 'expected' value — the actual
+            # equality check was against the un-truncated string.
             params['fact'] = fact[:200]
         if invalid_at is not None:
             params['invalid_at'] = invalid_at.isoformat()
@@ -1237,6 +1253,15 @@ class MemoryService:
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
+                # Log unexpected exceptions (e.g. AttributeError from a future
+                # signature change) so they remain observable in logs even
+                # though we don't re-raise — the save succeeded and must be
+                # reported; only the verification signal is lost.
+                logger.exception(
+                    'update_edge verification readback failed for edge %s',
+                    edge_uuid,
+                    exc_info=e,
+                )
                 result['verified'] = False
                 result['verification_error'] = f'{type(e).__name__}: {e}'
         else:
