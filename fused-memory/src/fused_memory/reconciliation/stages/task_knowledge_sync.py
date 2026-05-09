@@ -799,6 +799,7 @@ Stage 1 and Stage 2.
 5. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE3_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+Use project_root="{self.project_root}" for tasks scoped to this project.
 """
 
 
