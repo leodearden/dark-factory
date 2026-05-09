@@ -1452,6 +1452,92 @@ class TestDispatchCooldownGate:
             'Gate must be open at +601s (past 600s window)'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('terminal_status', ['done', 'cancelled'])
+    async def test_terminal_status_clears_last_dispatch_at(
+        self, monkeypatch, terminal_status
+    ):
+        """When acquire_next observes a task in done/cancelled, _last_dispatch_at
+        must be cleared for that task so a future re-dispatch starts clean."""
+        import json as _json
+
+        task = {
+            'id': '42',
+            'title': 'Terminal sweep test',
+            'status': terminal_status,
+            'dependencies': [],
+            'metadata': {},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        # Prime _last_dispatch_at as if task '42' was previously dispatched
+        scheduler._last_dispatch_at['42'] = time.monotonic()
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        # acquire_next returns None (task is terminal, not pending)
+        result = await scheduler.acquire_next()
+        assert result is None
+
+        # _last_dispatch_at must be cleared after observing the terminal status
+        assert '42' not in scheduler._last_dispatch_at, (
+            f'_last_dispatch_at must be cleared when task is {terminal_status!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_progress_status_preserves_last_dispatch_at(self, monkeypatch):
+        """In-progress status must NOT clear _last_dispatch_at (only terminal clears it)."""
+        import json as _json
+
+        task = {
+            'id': '42',
+            'title': 'In-progress sweep test',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        original_ts = time.monotonic()
+        scheduler._last_dispatch_at['42'] = original_ts
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        await scheduler.acquire_next()
+
+        # Entry must still be present for in-progress tasks
+        assert '42' in scheduler._last_dispatch_at, (
+            '_last_dispatch_at must NOT be cleared for in-progress tasks'
+        )
+
 
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
