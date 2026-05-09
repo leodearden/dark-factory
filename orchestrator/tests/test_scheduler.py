@@ -1415,41 +1415,35 @@ class TestDispatchCooldownGate:
         """Cooldown gate expires exactly at the configured window edge (strict <).
 
         After 601s with a 600s window the gate is open; after 599s it is still closed.
+        Uses an injected fake clock so only the Scheduler/ModuleLockTable see the
+        advanced time — asyncio internals are unaffected.
         """
-        import time as _time_module
+        t: list[float] = [1000.0]  # mutable clock cell; advance by assigning t[0]
+
+        def fake_clock() -> float:
+            return t[0]
 
         task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
         task_response = self._make_task_response(task)
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=600.0)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(config, time_source=fake_clock)
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
-        # First dispatch — arms the gate
+        # First dispatch — arms the gate at t=1000.0
         a1 = await scheduler.acquire_next()
         assert a1 is not None and a1.task_id == '99'
         scheduler.release('99')
 
-        original_monotonic = _time_module.monotonic
-
-        # Patch time.monotonic globally (all callers — asyncio internals, lock_table
-        # lease/park clocks — also see the shifted value).  This is intentional: the
-        # test carries no reservations, so the only effect of the large offset is that
-        # expired-park pruning finds nothing to evict, which does not affect the
-        # cooldown assertion.  The +599/+601 offsets straddle the 600s window boundary.
         # --- just inside window (+599s): gate still active ---
-        monkeypatch.setattr(
-            _time_module, 'monotonic', lambda: original_monotonic() + 599.0
-        )
+        t[0] = 1000.0 + 599.0
         a_inside = await scheduler.acquire_next()
         assert a_inside is None, 'Gate must still be active at +599s (inside 600s window)'
 
         # --- just past window (+601s): gate must be open ---
-        monkeypatch.setattr(
-            _time_module, 'monotonic', lambda: original_monotonic() + 601.0
-        )
+        t[0] = 1000.0 + 601.0
         a_outside = await scheduler.acquire_next()
         assert a_outside is not None and a_outside.task_id == '99', (
             'Gate must be open at +601s (past 600s window)'
