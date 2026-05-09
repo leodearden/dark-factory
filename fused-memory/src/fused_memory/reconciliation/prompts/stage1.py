@@ -231,6 +231,21 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - If a finding cannot be resolved (e.g., ambiguous data, missing context), flag it for Stage 2.
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 
+## Flag Suppression Check
+Before writing any `stage1_flag_marker`, you MUST search for an active suppression record \
+for the target `task_id`. Search Mem0 for memories whose content or metadata indicates \
+"STAGE 1 FLAG SUPPRESSION" for that task \
+(e.g. `search(query="STAGE 1 FLAG SUPPRESSION task_id=<N>", project_id=...)`). If such a \
+suppression record exists and the task remains in the suppressed status, skip flag emission \
+entirely for that task — do NOT write a `stage1_flag_marker` for it.
+
+Suppression is distinct from and authoritative over the post-processor dedup described in \
+the next section. Dedup collapses repeated emissions of the same (task_id, flag_type) pair \
+across runs; suppression authoritatively forbids ANY flag emission for a specific task. \
+The contamination cycle motivating this check: Stage 1 writes a violating flag → Stage 3 \
+detects it → remediation deletes it → next cycle Stage 1 writes it again. The suppression \
+record breaks this cycle at the source by preventing the Stage 1 write in the first place.
+
 ## Flag Deduplication
 Stage 1's flag emission is post-processed by an automatic deduplicator that searches Mem0 \
 for prior `stage1_flag_marker` memories with matching task_id+flag_type. You do NOT need \
