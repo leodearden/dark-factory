@@ -2032,9 +2032,8 @@ class TestSetTaskStatusForwarding:
         monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
         mock = AsyncMock(side_effect=OSError(2, 'No such file'))
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-        with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'):
-            with pytest.raises(RuntimeError, match='3 transient retries'):
-                await scheduler.set_task_status('1', 'in-progress')
+        with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'), pytest.raises(RuntimeError, match='3 transient retries'):
+            await scheduler.set_task_status('1', 'in-progress')
         # Three attempts before raising.
         assert mock.await_count == 3, (
             f'Expected 3 dispatch attempts, got {mock.await_count}'
@@ -2329,6 +2328,7 @@ class TestExtractRejection:
     def test_text_block_fallback(self):
         """When structuredContent is absent, parse the JSON text block."""
         import json as _json
+
         from orchestrator.scheduler import extract_rejection
         payload = {'success': False, 'error': 'terminal_exit_rejected'}
         msg = extract_rejection({
