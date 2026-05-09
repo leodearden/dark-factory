@@ -686,6 +686,71 @@ class TestPlannedEpisodePromotion:
         assert 'error' not in result
 
 
+# ── task-1136: route _on_task_blocked metadata write through TaskInterceptor ──
+
+
+@pytest.mark.asyncio
+async def test_blocked_routes_update_through_task_interceptor_when_wired(
+    reconciler, mock_memory_service, mock_taskmaster
+):
+    """When task_interceptor is wired, _on_task_blocked must route update_task
+    through the interceptor (which holds the per-project write_lock) instead of
+    calling self.taskmaster.update_task directly.
+
+    Asserts:
+    (a) mock_interceptor.update_task called exactly once with task_id, project_root,
+        and metadata= kwarg containing 'memory_hints'.
+    (b) mock_taskmaster.update_task NOT called — routing must be exclusive.
+    (c) Result still records a hints_attached action.
+    """
+    from unittest.mock import AsyncMock
+
+    mock_interceptor = AsyncMock()
+    mock_interceptor.update_task = AsyncMock(return_value={'success': True})
+    reconciler.task_interceptor = mock_interceptor
+
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(
+            id='1', content='blocker info', source_store=SourceStore.mem0,
+            entities=['EntityA'],
+        ),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='42',
+        transition='blocked',
+        project_id='test-project',
+        project_root='/tmp/test',
+        task_before={'id': '42', 'title': 'Blocked task', 'status': 'in-progress'},
+    )
+
+    # (a) interceptor.update_task called exactly once with correct kwargs
+    mock_interceptor.update_task.assert_called_once()
+    call_kwargs = mock_interceptor.update_task.call_args.kwargs
+    assert call_kwargs.get('task_id') == '42', (
+        f'Expected task_id="42", got {call_kwargs.get("task_id")!r}'
+    )
+    assert call_kwargs.get('project_root') == '/tmp/test', (
+        f'Expected project_root="/tmp/test", got {call_kwargs.get("project_root")!r}'
+    )
+    metadata_raw = call_kwargs.get('metadata')
+    assert metadata_raw is not None, 'update_task must be called with metadata= kwarg'
+    import json as _json
+    metadata = _json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+    assert 'memory_hints' in metadata, (
+        f'metadata must contain "memory_hints", got keys: {list(metadata.keys())}'
+    )
+
+    # (b) direct taskmaster bypass must NOT happen
+    mock_taskmaster.update_task.assert_not_called()
+
+    # (c) result records hints_attached
+    hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
+    assert len(hints_actions) == 1, (
+        f'Expected exactly one hints_attached action, got: {result.get("actions", [])}'
+    )
+
+
 class TestServerWiringContract:
     """step-34/35: TargetedReconciler.planned_episode_registry must be wired from
     MemoryService after MemoryService.initialize() creates it."""
