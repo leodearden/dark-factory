@@ -5025,3 +5025,66 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             if r.name == target_logger and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
         ]
         assert suppression_logs == []
+
+    @pytest.mark.asyncio
+    async def test_run_prior_reports_first_stage_not_memory_consolidator_no_op(self, mock_deps, caplog):
+        """prior_reports[0].stage != memory_consolidator → guard fires, no suppression even if items would match."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        _now = datetime.now(tz=UTC)
+        # Use StageId.task_knowledge_sync (a real-but-wrong stage) so the guard at
+        # task_knowledge_sync.py:477 fires before any dedup logic runs.
+        wrong_stage_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=_now,
+            completed_at=_now,
+            items_flagged=[
+                {
+                    'task_id': '99',
+                    'flag_type': 'assumption_invalid',
+                    'resolution_status': 'human_operator_required',
+                }
+            ],
+        )
+        # Shape the Stage 2 item to exactly match the prior-report entry so that
+        # suppression *would* fire if the guard were removed — this makes the test
+        # non-trivial: only the guard prevents suppression here.
+        stage2_flagged = [
+            {
+                'task_id': '99',
+                'flag_type': 'assumption_invalid',
+                'resolution_status': 'human_operator_required',
+                'description': 'should-not-suppress',
+            }
+        ]
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._make_cli_result(stage2_flagged)),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[wrong_stage_report],
+                run_id='test-run-1168-e',
+            )
+
+        # Item must be kept — the guard skips suppression for the wrong stage
+        assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
+
+        # No suppression log
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        suppression_logs = [
+            r for r in caplog.records
+            if r.name == target_logger and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
+        ]
+        assert suppression_logs == []
