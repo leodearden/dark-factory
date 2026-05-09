@@ -5169,3 +5169,97 @@ class TestTaskKnowledgeSyncStage2Guards:
             )
 
             assert violations == []
+
+    class TestTerminalStatePreCheckIntegration:
+        """Integration tests: TaskKnowledgeSync.run() applies terminal-state pre-check guard."""
+
+        @pytest.fixture
+        def mock_deps(self):
+            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+            write_journal_mock = MagicMock()
+            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+            journal_mock = MagicMock()
+            journal_mock.write_journal = write_journal_mock
+            return {
+                'memory_service': AsyncMock(),
+                'taskmaster': AsyncMock(),
+                'journal': journal_mock,
+                'config': config,
+            }
+
+        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
+            """Return a fake StageResult-like object for patching run_stage_via_cli."""
+            report = {'flagged_items': flagged_items, 'summary': 'ok'}
+            if stats:
+                report['stats'] = stats
+            return MagicMock(
+                success=True,
+                report=report,
+                llm_calls=1,
+                tokens_used=0,
+                cost_usd=0.0,
+                model='m',
+            )
+
+        @pytest.mark.asyncio
+        async def test_run_applies_terminal_state_guard(self, mock_deps, caplog):
+            """run() decrements tasks_modified and adds not_applicable_count for terminal violations."""
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            # Synthetic op: stage-2 agent updated task 42 which is now done
+            terminal_op = {
+                'id': 'op-term-1',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'operation': 'update_task',
+                'params': json.dumps({'task_id': '42'}),
+                'layer': 'write_op',
+                'causation_id': 'test-run-1137-a',
+                'created_at': '2026-01-01T00:00:00',
+            }
+            mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [terminal_op]
+
+            # taskmaster.get_task returns done status for task 42
+            mock_deps['taskmaster'].get_task.return_value = {'status': 'done'}
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [], stats={'tasks_modified': 3}
+                    )),
+                ),
+                caplog.at_level(
+                    logging.INFO,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[],
+                    run_id='test-run-1137-a',
+                )
+
+            # Guard 1: not_applicable_count incremented
+            assert report.stats.get('not_applicable_count') == 1
+
+            # Guard 1: tasks_modified decremented from 3 to 2
+            assert report.stats.get('tasks_modified') == 2
+
+            # Guard 1: one INFO log reconciliation.skipped_done_task
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            guard_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.INFO
+                and 'skipped_done_task' in r.getMessage()
+            ]
+            assert len(guard_logs) == 1, (
+                f'expected one skipped_done_task INFO log, got {len(guard_logs)}'
+            )
+            rec = guard_logs[0]
+            assert getattr(rec, 'task_id', None) == '42'
+            assert getattr(rec, 'reason', None) == 'not_applicable'
