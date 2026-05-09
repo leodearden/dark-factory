@@ -229,6 +229,10 @@ class TaskKnowledgeSync(BaseStage):
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
 
+    # Current reconciliation run_id — set by run() so assemble_payload can use
+    # it for stale-flag persistence markers (FIX D).
+    _current_run_id: str = ''
+
     def get_system_prompt(self) -> str:
         return STAGE2_SYSTEM_PROMPT
 
@@ -243,7 +247,8 @@ class TaskKnowledgeSync(BaseStage):
         run_id: str,
         model: str | None = None,
     ) -> StageReport:
-        """Run the briefing-refresh hook then delegate to BaseStage.run()."""
+        """Capture run_id, run briefing-refresh hook, then delegate to BaseStage.run()."""
+        self._current_run_id = run_id
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         return await super().run(events, watermark, prior_reports, run_id, model=model)
 
@@ -381,6 +386,16 @@ class TaskKnowledgeSync(BaseStage):
         # intentionally emitted by the LLM and must not be suppressed here.
         surviving = [f for f in active_flags if not _should_skip_known_bug_1139_flag(f)]
 
+        # FIX D — stale-flag persistence tracking.
+        # Track how many cycles each surviving flag has survived without being
+        # deleted.  Best-effort: _track_flag_persistence degrades gracefully.
+        run_id_for_markers = self._current_run_id or 'unknown'
+        surviving_ids = [f['id'] for f in surviving]
+        persistence_counts = await _track_flag_persistence(
+            self.memory, self.project_id, run_id_for_markers, surviving_ids,
+        )
+        stale_ids = _compute_stale_flags(persistence_counts)
+
         # Build the combined flags list: Stage 1 structured-output first, then
         # surviving Mem0 active-query results.
         combined_flags: list[dict] = list(stage1_report.items_flagged if stage1_report else [])
@@ -394,6 +409,38 @@ class TaskKnowledgeSync(BaseStage):
 
         flagged_text = _format_flagged(combined_flags, run_stage='stage2')
 
+        # Emit per-flag warnings and build the stale-flag section.
+        stale_section = ''
+        if stale_ids:
+            # Build a lookup map so we can surface content + task_id in the section.
+            surviving_map = {f['id']: f for f in surviving}
+            stale_entries = []
+            for fid in stale_ids:
+                cycle_count = persistence_counts[fid]
+                logger.warning(
+                    'reconciliation.stale_flag_escalated',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id_for_markers,
+                        'flag_id': fid,
+                        'cycle_count': cycle_count,
+                    },
+                )
+                flag_info = surviving_map.get(fid, {})
+                stale_entries.append(
+                    f'- flag_id={fid!r} task_id={flag_info.get("task_id", "")!r} '
+                    f'cycle_count={cycle_count} '
+                    f'content={flag_info.get("content", "")!r}'
+                )
+            stale_section = (
+                '\n### Stale Flags Requiring Escalation\n'
+                'These flags have persisted for ≥ 3 cycles without being deleted.\n'
+                'For each flag below, call `mcp__escalation__escalate_blocker` and '
+                'increment `stats.stale_flags_escalated`.\n\n'
+                + '\n'.join(stale_entries)
+                + '\n'
+            )
+
         known_projects_section = self._format_known_projects_section()
 
         return f"""## Stage 2: Task-Knowledge Sync
@@ -404,7 +451,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Stage 1 Flagged Items (Task-Relevant)
 {flagged_text}
-{known_projects_section}
+{stale_section}{known_projects_section}
 {format_filtered_task_tree(filtered)}
 
 ### Recently Completed Tasks
