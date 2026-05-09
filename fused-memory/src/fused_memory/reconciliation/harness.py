@@ -77,7 +77,7 @@ class ReconciliationHarness:
     def __init__(
         self,
         memory_service: MemoryService,
-        taskmaster: 'TaskBackendProtocol | None',
+        taskmaster: TaskBackendProtocol | None,
         journal: ReconciliationJournal,
         event_buffer: EventBuffer,
         config: FusedMemoryConfig,
