@@ -1027,7 +1027,42 @@ def create_mcp_server(
             project_id: Get stats for a specific project (optional)
         """
         try:
-            return await memory_service.get_status(project_id=project_id)
+            result = await memory_service.get_status(project_id=project_id)
+
+            # Enrich the queue section with a dead_letters sub-dict that
+            # mirrors the shape returned by get_dead_letters, so Stage 1
+            # reconciliation can compare both values without false positives.
+            #
+            # durable_dead: already project-scoped by MemoryService (step-4).
+            # event_dead: read from the JSONL dead-letter file via to_thread
+            #   (same offload pattern as get_dead_letters) to avoid blocking
+            #   the event loop on large files.
+            queue_section = result.get('queue') if isinstance(result, dict) else None
+            if queue_section is None:
+                # No durable_queue configured — attach a zero dead_letters anyway
+                if isinstance(result, dict):
+                    result.setdefault('queue', {})
+                    result['queue']['dead_letters'] = {
+                        'durable_queue': 0, 'event_queue': 0, 'total': 0,
+                    }
+            else:
+                durable_dead: int = queue_section.get('counts', {}).get('dead', 0)
+
+                event_dead: int = 0
+                if event_queue is not None:
+                    records = await asyncio.to_thread(
+                        event_queue.read_dead_letters,
+                        project_id=project_id,
+                    )
+                    event_dead = len(records)
+
+                queue_section['dead_letters'] = {
+                    'durable_queue': durable_dead,
+                    'event_queue': event_dead,
+                    'total': durable_dead + event_dead,
+                }
+
+            return result
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
