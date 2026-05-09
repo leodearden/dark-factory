@@ -61,6 +61,26 @@ logger = logging.getLogger(__name__)
 _sleep = asyncio.sleep
 
 
+class UnknownProjectError(ValueError):
+    """Raised when a project_id has no entry in the KNOWN_PROJECT_ROOTS registry.
+
+    Introduced by task 1143 as the pre-flight cross-contamination guard.
+
+    Design notes:
+    (a) Signals a KNOWN_PROJECT_ROOTS misconfiguration — the project_id is not
+        registered via ``taskmaster.project_root`` or ``DASHBOARD_KNOWN_PROJECT_ROOTS``.
+    (b) Subclasses ``ValueError`` for backward-compat: any existing or future
+        ``except ValueError`` callsite (test code, callers of
+        ``_known_project_root_for``) continues to match.
+    (c) Exists as a distinct type so ``_project_loop`` can narrowly catch ONLY
+        misconfiguration and let unrelated ``ValueError``s fall through to the
+        existing ``except Exception`` retry path:
+        - ``stages/base.py:108`` watermark↔stage project_id mismatch — transient
+          during instance handover; naturally recoverable on the next cycle.
+        - ``stages/memory_consolidator.py:96`` unset episode_limit/memory_limit —
+          programming bug; should surface and retry, not abort the project loop.
+    """
+
 
 @dataclass
 class TierConfig:
@@ -224,7 +244,7 @@ class ReconciliationHarness:
             return self._known_projects[project_id]
         except KeyError:
             known_sorted = sorted(self._known_projects)
-            raise ValueError(
+            raise UnknownProjectError(
                 f'reconciliation: project_id {project_id!r} has no entry in '
                 f'KNOWN_PROJECT_ROOTS (known: {known_sorted}). '
                 f'Set DASHBOARD_KNOWN_PROJECT_ROOTS env var or add a '
