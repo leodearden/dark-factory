@@ -234,6 +234,51 @@ class Mem0Backend:
         )
         return result.count
 
+    async def count_by_metadata(
+        self,
+        scope: Scope,
+        filters: dict[str, Any],
+    ) -> int:
+        """Deterministic count of memories whose payload matches all *filters*.
+
+        Goes straight to Qdrant's exact-count API with a payload ``Filter`` —
+        this is a key-equality lookup, NOT semantic search.  Use this when you
+        need a reliable count of memories tagged with specific metadata
+        (e.g. persistence markers, escalation markers) rather than a top-N
+        similarity ranking that can silently drop matches off the bottom.
+
+        Mem0 stores ``add_memory(metadata=...)`` fields as top-level keys on the
+        Qdrant payload, so ``filters={'source': 'X', 'flag_id': 'Y'}`` matches
+        against ``payload.source == 'X' AND payload.flag_id == 'Y'``.
+
+        Returns the exact match count.  Empty ``filters`` is rejected (would
+        otherwise count every memory in the collection — almost certainly a
+        bug at the caller).
+        """
+        if not filters:
+            raise ValueError(
+                'count_by_metadata requires at least one filter; '
+                'use count() to count all memories in the collection',
+            )
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        must = [
+            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+            for k, v in filters.items()
+        ]
+        qdrant_filter = qmodels.Filter(must=must)
+        result = await asyncio.wait_for(
+            client.count(
+                collection_name=collection_name,
+                count_filter=qdrant_filter,
+                exact=True,
+            ),
+            timeout=self._read_timeout,
+        )
+        return result.count
+
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""
         import contextlib

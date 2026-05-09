@@ -192,7 +192,9 @@ flag has been processed.
 If the payload contains a `### Stale Flags Requiring Escalation` section, the Python \
 layer has detected flags that have survived three or more reconciliation cycles without \
 being deleted (indicating that FIX C deletion or LLM action has repeatedly failed). \
-For each flag listed in that section, you MUST:
+The Python layer has already deduplicated this section against prior-cycle escalation \
+markers, so every entry that appears here is a NEW escalation. For each flag listed in \
+that section, you MUST:
 
 1. Submit one escalation via `mcp__escalation__escalate_blocker` with:
    - `category`: `'reconciliation_stale_flag'`
@@ -200,10 +202,21 @@ For each flag listed in that section, you MUST:
    - `detail`: include the flag's `content`, its `cycle_count`, and the likely cause \
 (repeated failure to process or delete)
 
-2. Set `stats.stale_flags_escalated` in your structured report to the number of \
+2. Immediately delete the underlying Mem0 flag — escalation IS the terminal action, \
+just like FIX C's processed-flag deletion:
+
+   `mcp__fused-memory__delete_memory(memory_id=<flag_id>, store='mem0')`
+
+   This prevents the same flag from being detected as stale again next cycle if the \
+operator's investigation outlives a few reconciliation runs. The Python layer also \
+writes an `stage2_escalation_marker` so duplicate escalations are suppressed even if \
+this delete fails — but the LLM-side delete is still the primary cleanup path.
+
+3. Set `stats.stale_flags_escalated` in your structured report to the number of \
 escalations you submitted. This counter is reviewed by operators to track escalation \
 volume and diagnose systemic failures in the flag-relay pipeline.
 
 Stale flags require human investigation. Do not attempt to silently resolve them by \
-re-acting on the same content — escalate so an operator can diagnose the root cause.
+re-acting on the same content — escalate (and delete) so an operator can diagnose the \
+root cause without being spammed by repeat alarms.
 """

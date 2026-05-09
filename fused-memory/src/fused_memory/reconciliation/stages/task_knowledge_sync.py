@@ -137,6 +137,13 @@ def _compute_stale_flags(
     return sorted(fid for fid, count in persistence_counts.items() if count >= threshold)
 
 
+# Persistence and escalation marker source tags — written into Mem0 metadata so
+# they can be retrieved deterministically via Qdrant payload filters (NOT via
+# semantic search, which can silently rank matches off the bottom of top-N).
+_STAGE2_PERSISTENCE_MARKER_SOURCE = 'stage2_persistence_marker'
+_STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
+
+
 async def _track_flag_persistence(
     memory_service,
     project_id: str,
@@ -147,13 +154,18 @@ async def _track_flag_persistence(
 
     For each *flag_id* in *flag_ids*:
 
-    1. Searches Mem0 for prior ``stage2_persistence_marker`` memories keyed on
-       the flag id.  The search hit-count is the number of prior cycles.
+    1. Counts prior ``stage2_persistence_marker`` memories via a metadata-filtered
+       Qdrant count (``MemoryService.count_memories_by_metadata``) — a deterministic
+       key-equality lookup, NOT semantic search.  The previous implementation used
+       ``memory_service.search`` with ``query='stage2_persistence_marker flag_id=...'``
+       and ``limit=100``, which silently dropped prior markers when unrelated
+       higher-similarity hits pushed them off the bottom of the top-N — see
+       reviewer note on FIX D, task 1139.
     2. Writes a fresh marker so the count accumulates across cycles.
     3. Returns ``{flag_id: prior_count + 1}`` where the "+1" accounts for the
        current cycle.
 
-    On search failure: prior_count defaults to 0 so the cycle count is 1.
+    On count failure: prior_count defaults to 0 so the cycle count is 1.
     On add_memory failure: the count is still returned (write is best-effort).
     Both failures log WARNING.
 
@@ -167,25 +179,19 @@ async def _track_flag_persistence(
 
     counts: dict[str, int] = {}
     for flag_id in flag_ids:
-        # ── count prior markers ──────────────────────────────────────────────
+        # ── count prior markers (deterministic metadata-filtered count) ──────
         prior_count = 0
         try:
-            prior_results = await memory_service.search(
-                query=f'stage2_persistence_marker flag_id={flag_id}',
+            prior_count = await memory_service.count_memories_by_metadata(
                 project_id=project_id,
-                categories=['observations_and_summaries'],
-                limit=100,
+                filters={
+                    'source': _STAGE2_PERSISTENCE_MARKER_SOURCE,
+                    'flag_id': flag_id,
+                },
             )
-            for r in prior_results:
-                meta = dict(r.metadata or {})
-                if (
-                    meta.get('source') == 'stage2_persistence_marker'
-                    and meta.get('flag_id') == flag_id
-                ):
-                    prior_count += 1
         except Exception:
             logger.warning(
-                'reconciliation._track_flag_persistence: search failed for flag_id=%s; '
+                'reconciliation._track_flag_persistence: count failed for flag_id=%s; '
                 'treating prior_count as 0',
                 flag_id,
                 extra={'project_id': project_id, 'flag_id': flag_id},
@@ -198,7 +204,7 @@ async def _track_flag_persistence(
                 category='observations_and_summaries',
                 project_id=project_id,
                 metadata={
-                    'source': 'stage2_persistence_marker',
+                    'source': _STAGE2_PERSISTENCE_MARKER_SOURCE,
                     'flag_id': flag_id,
                     'run_id': run_id,
                 },
@@ -215,6 +221,91 @@ async def _track_flag_persistence(
 
         counts[flag_id] = prior_count + 1
     return counts
+
+
+async def _filter_already_escalated_flags(
+    memory_service,
+    project_id: str,
+    flag_ids: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split *flag_ids* into (newly_escalating, already_escalated).
+
+    A flag is considered already-escalated iff a Mem0 memory exists with
+    metadata ``{'source': 'stage2_escalation_marker', 'flag_id': <flag_id>}``.
+    The check is a deterministic metadata-filtered count — same rationale as
+    :func:`_track_flag_persistence` — to avoid escalating the same flag every
+    cycle when FIX C deletion fails (reviewer note on FIX D, task 1139).
+
+    On count failure: the flag is treated as NOT already-escalated (i.e. it
+    surfaces in *newly_escalating*).  This is fail-loud-via-escalation: a
+    transient Qdrant glitch causes one extra escalation, not silent
+    suppression of a real one.
+    """
+    newly: list[str] = []
+    already: list[str] = []
+    for flag_id in flag_ids:
+        try:
+            count = await memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters={
+                    'source': _STAGE2_ESCALATION_MARKER_SOURCE,
+                    'flag_id': flag_id,
+                },
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation._filter_already_escalated_flags: count failed for '
+                'flag_id=%s; treating as newly-escalating',
+                flag_id,
+                extra={'project_id': project_id, 'flag_id': flag_id},
+            )
+            count = 0
+        if count > 0:
+            already.append(flag_id)
+        else:
+            newly.append(flag_id)
+    return newly, already
+
+
+async def _write_escalation_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    flag_ids: list[str],
+) -> None:
+    """Persist a ``stage2_escalation_marker`` for each newly-escalated flag.
+
+    Subsequent cycles use :func:`_filter_already_escalated_flags` to look up
+    these markers via a metadata-filtered Qdrant count, suppressing duplicate
+    escalations even when the LLM fails to delete the underlying flag.
+
+    Best-effort: write failures log WARNING but do not raise — at worst this
+    produces one duplicate escalation next cycle, never silent suppression.
+    """
+    for flag_id in flag_ids:
+        try:
+            await memory_service.add_memory(
+                content=(
+                    f'Stage 2 escalation marker: flag_id={flag_id} '
+                    f'escalated in run={run_id}'
+                ),
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata={
+                    'source': _STAGE2_ESCALATION_MARKER_SOURCE,
+                    'flag_id': flag_id,
+                    'run_id': run_id,
+                },
+                causation_id=run_id,
+                _source='stage2_flag_relay',
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation._write_escalation_markers: add_memory failed for '
+                'flag_id=%s; next cycle may re-escalate',
+                flag_id,
+                extra={'project_id': project_id, 'flag_id': flag_id},
+            )
 
 
 class TaskKnowledgeSync(BaseStage):
@@ -396,6 +487,25 @@ class TaskKnowledgeSync(BaseStage):
         )
         stale_ids = _compute_stale_flags(persistence_counts)
 
+        # Escalation dedup: skip flags we already escalated in a prior cycle so
+        # operators don't get the same alarm every run when FIX C deletion fails
+        # (reviewer note on FIX D, task 1139).  Only the *newly* stale flags
+        # render in the section and get a fresh escalation marker.
+        newly_stale_ids, already_escalated_ids = await _filter_already_escalated_flags(
+            self.memory, self.project_id, stale_ids,
+        )
+        if already_escalated_ids:
+            logger.info(
+                'reconciliation.stale_flag_escalation_suppressed',
+                extra={
+                    'project_id': self.project_id,
+                    'run_id': run_id_for_markers,
+                    'suppressed_flag_ids': already_escalated_ids,
+                    'reason': 'already escalated in a prior cycle',
+                },
+            )
+        stale_ids = newly_stale_ids
+
         # Build the combined flags list: Stage 1 structured-output first, then
         # surviving Mem0 active-query results.
         combined_flags: list[dict] = list(stage1_report.items_flagged if stage1_report else [])
@@ -435,10 +545,18 @@ class TaskKnowledgeSync(BaseStage):
             stale_section = (
                 '\n### Stale Flags Requiring Escalation\n'
                 'These flags have persisted for ≥ 3 cycles without being deleted.\n'
-                'For each flag below, call `mcp__escalation__escalate_blocker` and '
-                'increment `stats.stale_flags_escalated`.\n\n'
+                'For each flag below, call `mcp__escalation__escalate_blocker`, '
+                'then call `mcp__fused-memory__delete_memory` on the same flag_id '
+                '(store="mem0") so the escalation is terminal — see prompt for '
+                'details — and increment `stats.stale_flags_escalated`.\n\n'
                 + '\n'.join(stale_entries)
                 + '\n'
+            )
+            # Persist a per-flag escalation marker so the next cycle's
+            # _filter_already_escalated_flags suppresses re-escalation if FIX C
+            # deletion fails.  Best-effort: marker writes never raise.
+            await _write_escalation_markers(
+                self.memory, self.project_id, run_id_for_markers, stale_ids,
             )
 
         known_projects_section = self._format_known_projects_section()

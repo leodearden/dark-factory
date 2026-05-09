@@ -3982,23 +3982,19 @@ class TestComputeStaleFlags:
 
 
 class TestTrackFlagPersistence:
-    """_track_flag_persistence writes markers and returns cycle counts."""
+    """_track_flag_persistence writes markers and returns cycle counts.
 
-    def _make_prior(self, flag_id):
-        """Return a SimpleNamespace that looks like a Mem0 MemoryResult for a prior marker."""
-        from types import SimpleNamespace
-        return SimpleNamespace(
-            id=f'marker-{flag_id}',
-            content=f'Stage 2 flag-persistence marker: flag_id={flag_id}',
-            metadata={'source': 'stage2_persistence_marker', 'flag_id': flag_id},
-        )
+    Counts prior markers via ``count_memories_by_metadata`` (deterministic
+    Qdrant payload-filtered count) — NOT semantic search — so the count is
+    reliable under realistic Mem0 load.
+    """
 
     @pytest.mark.asyncio
     async def test_writes_marker_and_returns_prior_plus_one(self):
         from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
         memory_service = AsyncMock()
-        # 2 prior markers for flag-A
-        memory_service.search.return_value = [self._make_prior('flag-A'), self._make_prior('flag-A')]
+        # 2 prior markers for flag-A — returned directly by the metadata-filtered count
+        memory_service.count_memories_by_metadata.return_value = 2
         memory_service.add_memory.return_value = {'memory_ids': ['new-marker-1']}
 
         result = await _track_flag_persistence(memory_service, 'reify', 'run-1', ['flag-A'])
@@ -4007,28 +4003,31 @@ class TestTrackFlagPersistence:
         memory_service.add_memory.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_search_called_with_categories_and_flag_id(self):
+    async def test_count_called_with_metadata_filter_for_flag_id(self):
         from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
         memory_service = AsyncMock()
-        memory_service.search.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 0
         memory_service.add_memory.return_value = {'memory_ids': []}
 
         await _track_flag_persistence(memory_service, 'proj', 'run-2', ['flag-B'])
 
-        call = memory_service.search.call_args
+        call = memory_service.count_memories_by_metadata.call_args
         assert call is not None
         kwargs = call.kwargs
-        assert kwargs.get('categories') == ['observations_and_summaries'] or \
-            ['observations_and_summaries'] in call.args
-        # query must reference the flag id
-        query_arg = kwargs.get('query') or (call.args[0] if call.args else '')
-        assert 'flag-B' in str(query_arg) or 'flag-B' in str(call.args)
+        assert kwargs.get('project_id') == 'proj'
+        filters = kwargs.get('filters') or {}
+        # Filter must pin BOTH the marker source AND the flag id so the count
+        # is exact, not a similarity ranking that can drop matches.
+        assert filters.get('source') == 'stage2_persistence_marker'
+        assert filters.get('flag_id') == 'flag-B'
+        # Critically: must NOT use semantic search anymore.
+        memory_service.search.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_add_memory_called_with_persistence_marker_metadata(self):
         from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
         memory_service = AsyncMock()
-        memory_service.search.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 0
         memory_service.add_memory.return_value = {'memory_ids': ['m1']}
 
         await _track_flag_persistence(memory_service, 'proj', 'run-3', ['flag-C'])
@@ -4042,13 +4041,13 @@ class TestTrackFlagPersistence:
         assert meta.get('run_id') == 'run-3'
 
     @pytest.mark.asyncio
-    async def test_search_failure_degrades_to_count_1(self, caplog):
-        """On search failure, prior count is 0, so this cycle count = 1."""
+    async def test_count_failure_degrades_to_count_1(self, caplog):
+        """On count failure, prior count is 0, so this cycle count = 1."""
         import logging
 
         from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
         memory_service = AsyncMock()
-        memory_service.search.side_effect = RuntimeError('Mem0 down')
+        memory_service.count_memories_by_metadata.side_effect = RuntimeError('Mem0 down')
         memory_service.add_memory.return_value = {'memory_ids': []}
 
         with caplog.at_level(logging.WARNING):
@@ -4063,7 +4062,7 @@ class TestTrackFlagPersistence:
 
         from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
         memory_service = AsyncMock()
-        memory_service.search.return_value = [self._make_prior('flag-E')]
+        memory_service.count_memories_by_metadata.return_value = 1
         memory_service.add_memory.side_effect = RuntimeError('write failed')
 
         with caplog.at_level(logging.WARNING):
@@ -4080,8 +4079,86 @@ class TestTrackFlagPersistence:
         result = await _track_flag_persistence(memory_service, 'proj', 'run-6', [])
 
         assert result == {}
-        memory_service.search.assert_not_awaited()
+        memory_service.count_memories_by_metadata.assert_not_awaited()
         memory_service.add_memory.assert_not_awaited()
+
+
+class TestFilterAlreadyEscalatedFlags:
+    """_filter_already_escalated_flags suppresses flags that already carry an escalation marker."""
+
+    @pytest.mark.asyncio
+    async def test_partitions_by_marker_presence(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _filter_already_escalated_flags,
+        )
+        memory_service = AsyncMock()
+
+        async def count_side_effect(*, project_id, filters):
+            assert filters['source'] == 'stage2_escalation_marker'
+            return 1 if filters['flag_id'] == 'flag-old' else 0
+
+        memory_service.count_memories_by_metadata.side_effect = count_side_effect
+
+        newly, already = await _filter_already_escalated_flags(
+            memory_service, 'proj', ['flag-old', 'flag-new'],
+        )
+        assert newly == ['flag-new']
+        assert already == ['flag-old']
+
+    @pytest.mark.asyncio
+    async def test_count_failure_treats_flag_as_newly_escalating(self, caplog):
+        """A transient Qdrant glitch must not silently suppress a real escalation."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _filter_already_escalated_flags,
+        )
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.side_effect = RuntimeError('Mem0 down')
+
+        with caplog.at_level(logging.WARNING):
+            newly, already = await _filter_already_escalated_flags(
+                memory_service, 'proj', ['flag-X'],
+            )
+        assert newly == ['flag-X']
+        assert already == []
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+class TestWriteEscalationMarkers:
+    """_write_escalation_markers persists per-flag escalation markers."""
+
+    @pytest.mark.asyncio
+    async def test_marker_written_with_correct_metadata(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _write_escalation_markers,
+        )
+        memory_service = AsyncMock()
+        memory_service.add_memory.return_value = {'memory_ids': ['m1']}
+
+        await _write_escalation_markers(memory_service, 'proj', 'run-7', ['flag-Y'])
+
+        call = memory_service.add_memory.call_args
+        assert call is not None
+        meta = call.kwargs.get('metadata', {})
+        assert meta.get('source') == 'stage2_escalation_marker'
+        assert meta.get('flag_id') == 'flag-Y'
+        assert meta.get('run_id') == 'run-7'
+
+    @pytest.mark.asyncio
+    async def test_write_failure_logs_warning_does_not_raise(self, caplog):
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _write_escalation_markers,
+        )
+        memory_service = AsyncMock()
+        memory_service.add_memory.side_effect = RuntimeError('write down')
+
+        with caplog.at_level(logging.WARNING):
+            await _write_escalation_markers(memory_service, 'proj', 'run-8', ['flag-Z'])
+
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestTaskKnowledgeSyncActiveQueryFlags:
@@ -4091,8 +4168,13 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
     def mock_deps(self):
         from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        # Persistence/escalation counters default to 0 so _track_flag_persistence
+        # and _filter_already_escalated_flags produce arithmetic-safe ints when
+        # this fixture's tests don't care about stale-flag rendering.
+        memory_service.count_memories_by_metadata.return_value = 0
         return {
-            'memory_service': AsyncMock(),
+            'memory_service': memory_service,
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
@@ -4208,8 +4290,10 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
     def mock_deps(self):
         from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
         return {
-            'memory_service': AsyncMock(),
+            'memory_service': memory_service,
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
@@ -4320,8 +4404,12 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
     def mock_deps(self):
         from fused_memory.config.schema import ReconciliationConfig
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        # Per-test setup overrides this via _setup_persistence_count (which
+        # installs a side_effect routing on the filter['source'] key).
+        memory_service.count_memories_by_metadata.return_value = 0
         return {
-            'memory_service': AsyncMock(),
+            'memory_service': memory_service,
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
@@ -4339,13 +4427,20 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
             metadata={'flag_for_stage2': True, 'task_id': task_id},
         )
 
-    def _make_persistence_marker(self, flag_id):
-        from types import SimpleNamespace
-        return SimpleNamespace(
-            id=f'marker-{flag_id}-1',
-            content=f'Stage 2 flag-persistence marker: flag_id={flag_id}',
-            metadata={'source': 'stage2_persistence_marker', 'flag_id': flag_id},
-        )
+    def _setup_persistence_count(self, mock_deps, *, prior_count: int, escalated_count: int = 0):
+        """Configure ``count_memories_by_metadata`` to return *prior_count* for
+        persistence-marker queries and *escalated_count* for escalation-marker
+        queries.  Returns the side-effect function (not strictly needed by
+        callers — wired to the mock for you)."""
+        async def count_side_effect(*, project_id, filters):
+            source = filters.get('source')
+            if source == 'stage2_persistence_marker':
+                return prior_count
+            if source == 'stage2_escalation_marker':
+                return escalated_count
+            return 0
+        mock_deps['memory_service'].count_memories_by_metadata.side_effect = count_side_effect
+        return count_side_effect
 
     @pytest.mark.asyncio
     async def test_stale_flag_section_rendered_when_count_at_threshold(
@@ -4359,18 +4454,9 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        # search side_effect: first call returns active flags; subsequent calls
-        # (for persistence-marker lookup) return 2 prior markers for flag-A.
-        call_count = {'n': 0}
-        def search_side_effect(**kwargs):
-            call_count['n'] += 1
-            if call_count['n'] == 1:
-                # First call: active-flag query
-                return [self._make_active_flag('flag-A')]
-            else:
-                # Subsequent calls: persistence-marker search → 2 prior markers
-                return [self._make_persistence_marker('flag-A'), self._make_persistence_marker('flag-A')]
-        mock_deps['memory_service'].search.side_effect = search_side_effect
+        # search returns active flags; count returns 2 prior persistence markers.
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
             payload = await stage.assemble_payload([], watermark, [])
@@ -4389,13 +4475,8 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        call_count = {'n': 0}
-        def search_side_effect(**kwargs):
-            call_count['n'] += 1
-            if call_count['n'] == 1:
-                return [self._make_active_flag('flag-A')]
-            return [self._make_persistence_marker('flag-A'), self._make_persistence_marker('flag-A')]
-        mock_deps['memory_service'].search.side_effect = search_side_effect
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
             await stage.assemble_payload([], watermark, [])
@@ -4418,13 +4499,8 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        call_count = {'n': 0}
-        def search_side_effect(**kwargs):
-            call_count['n'] += 1
-            if call_count['n'] == 1:
-                return [self._make_active_flag('flag-B')]
-            return []  # no prior markers → cycle count = 1
-        mock_deps['memory_service'].search.side_effect = search_side_effect
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-B')]
+        self._setup_persistence_count(mock_deps, prior_count=0, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
             payload = await stage.assemble_payload([], watermark, [])
@@ -4445,14 +4521,70 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        call_count = {'n': 0}
-        def search_side_effect(**kwargs):
-            call_count['n'] += 1
-            if call_count['n'] == 1:
-                return [self._make_active_flag('flag-C')]
-            return [self._make_persistence_marker('flag-C'), self._make_persistence_marker('flag-C')]
-        mock_deps['memory_service'].search.side_effect = search_side_effect
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-C')]
+        self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         # No prior_reports → prior_reports=[] (no Stage 1 report)
         payload = await stage.assemble_payload([], watermark, [])
         assert '### Stale Flags Requiring Escalation' in payload
+
+    @pytest.mark.asyncio
+    async def test_already_escalated_flag_suppressed_from_section(
+        self, mock_deps, watermark, caplog,
+    ):
+        """When an escalation marker exists for the flag, do NOT re-render it.
+
+        This guards against the cycle-spam failure mode where FIX C deletion
+        fails: without dedup, every subsequent cycle re-emits the same flag in
+        the stale section and the LLM re-escalates it indefinitely.
+        """
+        import logging
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        # Persistence count >= threshold AND an escalation marker already exists.
+        self._setup_persistence_count(mock_deps, prior_count=5, escalated_count=1)
+
+        with caplog.at_level(logging.INFO):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Stale Flags Requiring Escalation' not in payload, \
+            'Already-escalated flag must NOT re-appear in the stale section'
+        suppressed = [
+            r for r in caplog.records
+            if r.getMessage().startswith('reconciliation.stale_flag_escalation_suppressed')
+        ]
+        assert len(suppressed) >= 1, 'Suppression must be logged for operator visibility'
+
+    @pytest.mark.asyncio
+    async def test_escalation_marker_written_when_section_renders(
+        self, mock_deps, watermark,
+    ):
+        """A newly-rendered stale section must persist an escalation marker."""
+        from unittest.mock import call as mock_call
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'run-marker-test'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': ['m1']}
+
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
+
+        await stage.assemble_payload([], watermark, [])
+
+        # Persistence marker (from _track_flag_persistence) AND escalation marker
+        # (from _write_escalation_markers) must both be written.
+        sources_written = [
+            (c.kwargs.get('metadata') or {}).get('source')
+            for c in mock_deps['memory_service'].add_memory.call_args_list
+        ]
+        assert 'stage2_persistence_marker' in sources_written
+        assert 'stage2_escalation_marker' in sources_written
+        # Sanity: avoid lint warning on unused import
+        assert mock_call

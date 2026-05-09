@@ -1098,6 +1098,26 @@ class MemoryService:
         ]
 
     # ------------------------------------------------------------------
+    # Read: deterministic metadata count
+    # ------------------------------------------------------------------
+
+    async def count_memories_by_metadata(
+        self,
+        project_id: str,
+        filters: dict,
+    ) -> int:
+        """Deterministic Mem0 count for the given metadata equality filters.
+
+        Use this when you need a reliable key-equality lookup instead of
+        semantic search — e.g. counting persistence markers or escalation
+        markers keyed by ``flag_id``.  Goes through ``Mem0Backend.count_by_metadata``
+        which talks to Qdrant's count API directly with a payload filter, so
+        the result is exact rather than top-N-bounded.
+        """
+        scope = Scope(project_id=project_id)
+        return await self.mem0.count_by_metadata(scope, filters)
+
+    # ------------------------------------------------------------------
     # Delete
     # ------------------------------------------------------------------
 
