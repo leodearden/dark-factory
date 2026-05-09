@@ -60,14 +60,26 @@ logger = logging.getLogger(__name__)
 # the global asyncio namespace.
 _sleep = asyncio.sleep
 
-# Peek window size for BacklogIterator's project_root resolution.
-# Large enough that an older event lacking `_project_root` doesn't force a
-# fallback when a later buffered event carries the key (see BacklogIterator.run).
-# See test_backlog_iterator_peek_window_finds_later_project_root_override — a
-# regression guard for the "later override past earlier eventless entries"
-# invariant; trips only if this is reduced below the small lower-bound setup
-# used by that test.
-_PROJECT_ROOT_PEEK_LIMIT = 10
+
+class UnknownProjectError(ValueError):
+    """Raised when a project_id has no entry in the KNOWN_PROJECT_ROOTS registry.
+
+    Introduced by task 1143 as the pre-flight cross-contamination guard.
+
+    Design notes:
+    (a) Signals a KNOWN_PROJECT_ROOTS misconfiguration — the project_id is not
+        registered via ``taskmaster.project_root`` or ``DASHBOARD_KNOWN_PROJECT_ROOTS``.
+    (b) Subclasses ``ValueError`` for backward-compat: any existing or future
+        ``except ValueError`` callsite (test code, callers of
+        ``_known_project_root_for``) continues to match.
+    (c) Exists as a distinct type so ``_project_loop`` can narrowly catch ONLY
+        misconfiguration and let unrelated ``ValueError``s fall through to the
+        existing ``except Exception`` retry path:
+        - ``stages/base.py:108`` watermark↔stage project_id mismatch — transient
+          during instance handover; naturally recoverable on the next cycle.
+        - ``stages/memory_consolidator.py:96`` unset episode_limit/memory_limit —
+          programming bug; should surface and retry, not abort the project loop.
+    """
 
 
 @dataclass
@@ -85,7 +97,7 @@ class ReconciliationHarness:
     def __init__(
         self,
         memory_service: MemoryService,
-        taskmaster: 'TaskBackendProtocol | None',
+        taskmaster: TaskBackendProtocol | None,
         journal: ReconciliationJournal,
         event_buffer: EventBuffer,
         config: FusedMemoryConfig,
@@ -196,34 +208,48 @@ class ReconciliationHarness:
     def project_root(self) -> str:
         """Configured project root (from taskmaster config).
 
-        BacklogIterator and other internal helpers read this to obtain the
-        fallback project root when no event payload carries ``_project_root``.
-        Returns ``''`` when no taskmaster config is present — which is safe
-        because ``_fetch_filtered_task_tree`` short-circuits on empty strings.
+        Returns ``''`` when no taskmaster config is present.  Callers that need
+        the canonical root for a *project_id* should use
+        ``_known_project_root_for(project_id)`` instead (task 1143).
         """
         return self._project_root
 
-    def _resolve_project_root(self, events: list[ReconciliationEvent]) -> str:
-        """Return the project root for a batch of events.
+    def _known_project_root_for(self, project_id: str) -> str:
+        """Return the canonical project_root for *project_id* from the registry.
 
-        Scans *all* events for the first ``_project_root`` payload key; falls
-        back to ``self._project_root`` (the configured value) when none carry
-        it.  Using a shared helper keeps the fallback semantics identical
-        between ``run_full_cycle`` (which iterates the full drained list) and
-        ``BacklogIterator`` (which peeks a limited window of events).
+        This is the pre-flight cross-contamination guard introduced by task 1143.
+        It looks up ``self._known_projects`` (populated at init from the configured
+        taskmaster root + ``DASHBOARD_KNOWN_PROJECT_ROOTS`` env var) and raises
+        ``ValueError`` if no entry exists.  The error message includes both the
+        unrecognised project_id *and* the sorted list of registered project_ids so
+        the operator can immediately attribute and fix a misconfiguration.
+
+        Raising here — before any journal or buffer side-effects — ensures that a
+        missing registry entry never causes a partial cycle (events drained, journal
+        row created, then a stage failure that leaves those events unrecoverable).
 
         Args:
-            events: Sequence of events to scan.  May be empty.
+            project_id: Canonical project identifier (e.g. ``'reify'``,
+                ``'autopilot_video'``).  Must match a key in
+                ``self._known_projects`` (derived from path basename,
+                lowercase, dashes to underscores).
 
         Returns:
-            A non-empty project root string if one was found in the payload or
-            configured at init time; otherwise ``''``.
+            The absolute project_root path for *project_id*.
+
+        Raises:
+            ValueError: If *project_id* is not in ``self._known_projects``.
         """
-        for ev in events:
-            pr = ev.payload.get('_project_root')
-            if pr:
-                return pr
-        return self._project_root
+        try:
+            return self._known_projects[project_id]
+        except KeyError:
+            known_sorted = sorted(self._known_projects)
+            raise UnknownProjectError(
+                f'reconciliation: project_id {project_id!r} has no entry in '
+                f'KNOWN_PROJECT_ROOTS (known: {known_sorted}). '
+                f'Set DASHBOARD_KNOWN_PROJECT_ROOTS env var or add a '
+                f'TaskmasterConfig.project_root that resolves to a known project.'
+            ) from None
 
     def drain(self) -> None:
         """Signal the harness to stop starting new reconciliation cycles.
@@ -774,6 +800,20 @@ class ReconciliationHarness:
 
             except asyncio.CancelledError:
                 raise  # Propagate shutdown
+            except UnknownProjectError as e:
+                # task 1143: KNOWN_PROJECT_ROOTS misconfiguration — fail fast, no retry.
+                # Catching the narrow UnknownProjectError (not bare ValueError) ensures
+                # generic ValueErrors from stages fall through to the except Exception
+                # retry path below:
+                #   - stages/base.py: watermark↔stage project_id mismatch (transient
+                #     during instance handover; naturally recoverable next cycle)
+                #   - stages/memory_consolidator.py: unset episode_limit/memory_limit
+                #     (programming bug; should surface and retry, not abort the loop)
+                logger.error(
+                    f'Project loop aborting for {project_id}: misconfiguration — {e}. '
+                    f'Set DASHBOARD_KNOWN_PROJECT_ROOTS to include this project (task 1143).'
+                )
+                return
             except Exception as e:
                 logger.error(f'Project loop error for {project_id}: {e}')
 
@@ -819,6 +859,10 @@ class ReconciliationHarness:
                     When provided, Stage 1 uses this instead of generic
                     time-windowed episode/memory fetches.
         """
+        # task 1143: pre-flight guard — raises before any side effects (no journal row,
+        # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
+        project_root = self._known_project_root_for(project_id)
+
         tier = tier or TierConfig()
         run_id = str(uuid4())
         watermark = await self.journal.get_watermark(project_id)
@@ -849,9 +893,8 @@ class ReconciliationHarness:
             },
         )
 
-        # Resolve project_root: scan all events for the first _project_root payload
-        # key, fall back to the configured value via the shared helper (task 927).
-        project_root = self._resolve_project_root(events)
+        # project_root is already hard-bound via _known_project_root_for at the top
+        # of this function (task 1143); no _resolve_project_root call needed here.
 
         # Load prior S3 findings from last completed run (backstop for normal pass)
         prior_s3_findings = await self._get_prior_s3_findings(project_id)
@@ -919,7 +962,7 @@ class ReconciliationHarness:
                 asyncio.create_task(self._run_judge(run_id))
 
             # Remediation pass: pass pre-fetched tree to avoid a redundant fetch (ref: task 478)
-            await self._maybe_remediate(project_id, project_root, run_id, run, tier,
+            await self._maybe_remediate(project_id, run_id, run, tier,
                                         filtered_task_tree=filtered_task_tree)
 
             logger.info(
@@ -1023,7 +1066,6 @@ class ReconciliationHarness:
     async def _maybe_remediate(
         self,
         project_id: str,
-        project_root: str,
         parent_run_id: str,
         parent_run: ReconciliationRun,
         tier: TierConfig,
@@ -1065,7 +1107,7 @@ class ReconciliationHarness:
                 f'triggering second pass'
             )
             await self._run_remediation_pass(
-                project_id, project_root, parent_run_id, actionable, tier,
+                project_id, parent_run_id, actionable, tier,
                 filtered_task_tree=filtered_task_tree,
             )
         except Exception as e:
@@ -1079,7 +1121,6 @@ class ReconciliationHarness:
     async def _run_remediation_pass(
         self,
         project_id: str,
-        project_root: str,
         parent_run_id: str,
         findings: list[dict],
         tier: TierConfig,
@@ -1093,6 +1134,10 @@ class ReconciliationHarness:
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
+        # task 1143: hard-bind from registry — the canonical source of truth so no
+        # caller can introduce cross-contamination via a stale or wrong argument.
+        project_root = self._known_project_root_for(project_id)
+
         run_id = str(uuid4())
         run = ReconciliationRun(
             id=run_id,
@@ -1271,8 +1316,8 @@ class BacklogIterator:
         # Snapshot: only process events that existed when we started.
         cutoff = datetime.now(UTC)
 
-        peeked_for_root = await self.buffer.peek_buffered(project_id, limit=_PROJECT_ROOT_PEEK_LIMIT, before=cutoff)
-        project_root = self.harness._resolve_project_root(peeked_for_root)
+        # task 1143: hard-bind project_root from registry — event payloads are informational only.
+        project_root = self.harness._known_project_root_for(project_id)
 
         assembler = ContextAssembler(
             memory_service=self.harness.memory,

@@ -155,6 +155,8 @@ async def test_run_full_cycle_restores_events_on_failure(
         config=config,
     )
     harness._make_stages = lambda: harness.stages
+    # task 1143: pre-populate _known_projects so pre-flight does not raise before the stage
+    harness._known_projects['test-project'] = '/tmp/test-project'
 
     # Make first stage raise
     harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage exploded'))
@@ -185,10 +187,17 @@ def _make_event_with_root(
 
 
 @pytest.mark.asyncio
-async def test_full_cycle_extracts_project_root_from_events(
+async def test_full_cycle_uses_registry_for_project_root(
     journal, event_buffer, mock_memory_service
 ):
-    """Harness should set both stage.project_id and stage.project_root from drained events."""
+    """Harness binds stage.project_root from _known_projects[project_id], not event payloads.
+
+    The events here carry _project_root='/home/leo/src/dark-factory' which happens to equal
+    the registry value for dark_factory — the assertion still holds under the task-1143
+    contract because the registry (not the payload) is the authoritative source.
+    See test_known_project_roots_wins_over_event_payload for the explicit payload-vs-registry
+    conflict case.
+    """
     from unittest.mock import AsyncMock
 
     from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
@@ -217,6 +226,11 @@ async def test_full_cycle_extracts_project_root_from_events(
         config=config,
     )
     harness._make_stages = lambda: harness.stages
+    # task 1143: pre-populate _known_projects so pre-flight does not raise.
+    # Events carry _project_root='/home/leo/src/dark-factory' which matches
+    # the registry value for dark_factory, so the assertion below still holds
+    # under the new contract (registry value, not event payload, is the source).
+    harness._known_projects['dark_factory'] = '/home/leo/src/dark-factory'
 
     # Mock each stage's run method and capture the stage state
     captured_stages = []
@@ -368,8 +382,16 @@ async def test_harness_init_resolves_relative_project_root_to_absolute(
 async def test_run_full_cycle_uses_configured_project_root_when_events_lack_override(
     journal, event_buffer, mock_memory_service
 ):
-    """run_full_cycle should fall back to self._project_root, not project_id, when events lack _project_root."""
-    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    """run_full_cycle uses the registry-derived root for the cycle's project_id,
+    even when events carry no _project_root payload.
+
+    task 1143: updated from '/abs/from/config' to '/abs/from/dark-factory' so that
+    resolve_project_id derives 'dark_factory' from the basename and _known_projects
+    contains the key.  The new contract is: registry wins (not event payload, not
+    self._project_root fallback).  This test pins: events-without-payload still gets
+    the correct root via registry.
+    """
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/abs/from/dark-factory')
 
     # Push events with NO _project_root key in payload
     await event_buffer.push(_make_event('dark_factory'))
@@ -388,23 +410,25 @@ async def test_run_full_cycle_uses_configured_project_root_when_events_lack_over
 
     assert len(captured_roots) == 3
     for root in captured_roots:
-        assert root == '/abs/from/config', (
-            f"Expected project_root='/abs/from/config' but got '{root}'"
-            " — fallback should use self._project_root, not project_id"
+        assert root == '/abs/from/dark-factory', (
+            f"Expected project_root='/abs/from/dark-factory' (registry-derived) but got '{root}'"
+            " — run_full_cycle must use the registry-bound root for the cycle's project_id"
         )
 
 
 @pytest.mark.asyncio
-async def test_run_full_cycle_event_project_root_wins_over_configured(
+async def test_known_project_roots_wins_over_event_payload(
     journal, event_buffer, mock_memory_service
 ):
-    """Event _project_root should override the configured project_root (precedence invariant).
+    """KNOWN_PROJECT_ROOTS registry wins over event payload _project_root (precedence invariant).
 
-    This pins the guarantee that a configured project_root is only a fallback:
-    events that carry _project_root in their payload always take priority,
-    regardless of what TaskmasterConfig.project_root says.
+    task 1143: replaces test_run_full_cycle_event_project_root_wins_over_configured.
+    Under the new contract, the registry is the single source of truth.  Events
+    carrying _project_root='/from/event' while the registry maps dark_factory to
+    '/abs/from/dark-factory' must yield '/abs/from/dark-factory' — the event payload
+    is informational only and must not override the registry.
     """
-    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/from/config')
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/abs/from/dark-factory')
 
     # Push events whose payload carries a DIFFERENT project root
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
@@ -422,9 +446,12 @@ async def test_run_full_cycle_event_project_root_wins_over_configured(
 
     assert len(captured_roots) == 3
     for root in captured_roots:
-        assert root == '/from/event', (
-            f"Expected project_root='/from/event' (from event payload) but got '{root}'"
-            " — event-provided root must win over the configured fallback"
+        assert root == '/abs/from/dark-factory', (
+            f"Expected project_root='/abs/from/dark-factory' (registry-bound) but got '{root}'"
+            " — KNOWN_PROJECT_ROOTS must win over event payload _project_root (task 1143)"
+        )
+        assert root != '/from/event', (
+            "Event payload _project_root='/from/event' must not override the registry"
         )
 
 
@@ -465,6 +492,10 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
     """Build a ReconciliationHarness wired to test fixtures with minimal config.
 
     Callers must mock individual stage.run methods as needed.
+
+    task 1143: pre-populates _known_projects so callers can invoke
+    run_full_cycle('dark_factory', ...) or run_full_cycle('test-project', ...)
+    without triggering the pre-flight ValueError from _known_project_root_for.
     """
     from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
     from fused_memory.reconciliation.harness import ReconciliationHarness
@@ -487,6 +518,12 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
     )
     # Patch _make_stages so tests that mock harness.stages[N].run still work
     harness._make_stages = lambda: harness.stages
+    # task 1143: inject known projects so run_full_cycle pre-flight does not raise
+    # for the project_ids used across the existing test suite.
+    harness._known_projects = {
+        'dark_factory': '/home/leo/src/dark-factory',
+        'test-project': '/tmp/test-project',
+    }
     return harness
 
 
@@ -1642,7 +1679,6 @@ async def test_remediation_propagates_tier_limits_to_consolidator(
 
     await harness._run_remediation_pass(
         'test-project',
-        '/tmp/test',
         'parent-run-id',
         findings,
         tier,
@@ -1669,6 +1705,8 @@ async def test_remediation_sets_project_id_and_root_on_all_stages(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     stages = harness._make_stages()
     harness._make_stages = lambda: stages
+    # task 1143: inject registry entry so _known_project_root_for('my-project') succeeds.
+    harness._known_projects['my-project'] = '/srv/my-project'
 
     stage_attrs: dict[str, dict] = {}
 
@@ -1688,7 +1726,6 @@ async def test_remediation_sets_project_id_and_root_on_all_stages(
 
     await harness._run_remediation_pass(
         'my-project',
-        '/srv/my-project',
         'parent-run-id',
         findings,
         tier,
@@ -1734,7 +1771,6 @@ async def test_remediation_sets_remediation_mode_on_task_knowledge_sync(
 
     await harness._run_remediation_pass(
         'test-project',
-        '/tmp/test',
         'parent-run-id',
         findings,
         tier,
@@ -1769,7 +1805,6 @@ async def test_remediation_forwards_tier_model_to_stage_run(
 
     await harness._run_remediation_pass(
         'test-project',
-        '/tmp/test',
         'parent-run-id',
         findings,
         tier,
@@ -2459,7 +2494,12 @@ class TestHarnessFilteredTaskTreeWiring:
         event_buffer,
         mock_memory_service,
     ):
-        """run_full_cycle calls _fetch_filtered_task_tree exactly once with the project_root."""
+        """run_full_cycle calls _fetch_filtered_task_tree exactly once with the registry-bound root.
+
+        task 1143: the project_root used by _fetch_filtered_task_tree comes from
+        _known_project_root_for(project_id), not from event payload _project_root.
+        Event payload _project_root is now informational-only.
+        """
         from unittest.mock import AsyncMock
 
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
@@ -2470,13 +2510,15 @@ class TestHarnessFilteredTaskTreeWiring:
         for stage in harness.stages:
             _mock_stage_run(stage)
 
-        # Embed _project_root in the event payload so run_full_cycle can extract it
+        # Event payload _project_root is now ignored; registry binding wins (task 1143).
         event = _make_event()
-        event.payload['_project_root'] = '/my/project'
+        event.payload['_project_root'] = '/my/project'  # intentionally wrong — must be ignored
 
         await harness.run_full_cycle('test-project', 'test-trigger', events=[event])
 
-        harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
+        # _fetch_filtered_task_tree must use the registry-bound root, not the event payload.
+        expected_root = harness._known_projects['test-project']  # '/tmp/test-project'
+        harness._fetch_filtered_task_tree.assert_called_once_with(expected_root)  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_run_full_cycle_invokes_get_tasks_exactly_once(
@@ -2629,7 +2671,6 @@ class TestHarnessFilteredTaskTreeWiring:
 
         await harness._run_remediation_pass(
             'test-project',
-            '/my/project',
             'parent-run-id',
             findings,
             tier,
@@ -2678,7 +2719,6 @@ class TestHarnessFilteredTaskTreeWiring:
 
         await harness._run_remediation_pass(
             'test-project',
-            '/my/project',
             'parent-run-id',
             findings,
             tier,
@@ -2789,7 +2829,6 @@ class TestHarnessFilteredTaskTreeWiring:
             tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
             await harness._run_remediation_pass(
                 'test-project',
-                '/my/project',
                 'parent-run-id',
                 findings,
                 tier,
@@ -2843,7 +2882,6 @@ class TestHarnessFilteredTaskTreeWiring:
         tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
         await harness._run_remediation_pass(
             'test-project',
-            '/my/project',
             'parent-run-id',
             findings,
             tier,
@@ -2898,6 +2936,8 @@ class TestHarnessFilteredTaskTreeWiring:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         stages = harness._make_stages()
         harness._make_stages = lambda: stages
+        # task 1143: inject registry entry so _known_project_root_for('test-project') succeeds.
+        harness._known_projects['test-project'] = '/my/project'
 
         expected_tree = self._make_tree()
         harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
@@ -2911,12 +2951,12 @@ class TestHarnessFilteredTaskTreeWiring:
         # No filtered_task_tree kwarg — method must fall back to _fetch_filtered_task_tree
         await harness._run_remediation_pass(
             'test-project',
-            '/my/project',
             'parent-run-id',
             findings,
             tier,
         )
 
+        # project_root comes from _known_projects['test-project'] = '/my/project' (injected above)
         harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
 
 
@@ -3087,6 +3127,10 @@ async def test_run_loop_releases_stale_claims_on_startup(
     harness._recover_stale_runs = AsyncMock(return_value=None)
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
+    # judge.initialize() does a real SQLite query; mock it to avoid timing
+    # flakiness in slow environments (freethreaded Python, heavy parallel runs).
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
 
     # Spy on release_stale_claims: side_effect passes through to the real method,
     # so return_value is intentionally omitted (side_effect takes precedence).
@@ -3364,6 +3408,68 @@ async def test_run_pipeline_defers_on_all_accounts_capped(
     )
 
 
+# ── Tests for Task 1143: BacklogIterator hard-bind via KNOWN_PROJECT_ROOTS ──
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_run_hard_binds_via_known_projects(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run must derive project_root from _known_project_root_for, not from event payload.
+
+    Build a harness with _known_projects containing autopilot_video and dark_factory.
+    Push events for autopilot_video with _project_root='/wrong/path' to prove the
+    event payload is ignored. Verify ContextAssembler receives the registry-bound root
+    '/home/leo/src/autopilot-video', NOT '/wrong/path' and NOT dark-factory's path.
+
+    This test fails before step-8 because BacklogIterator.run still calls
+    self.harness._resolve_project_root(peeked_for_root) which returns the event payload.
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {
+            'autopilot_video': '/home/leo/src/autopilot-video',
+            'dark_factory': '/home/leo/src/dark-factory',
+        },
+    )
+
+    wrong_path = '/wrong/path'
+    # Push events with deliberately wrong _project_root in payload.
+    for _ in range(3):
+        await event_buffer.push(_make_event_with_root('autopilot_video', wrong_path))
+
+    captured: dict = {}
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('autopilot_video')
+
+    assert 'project_root' in captured, (
+        'ContextAssembler was never constructed — BacklogIterator.run may not have run'
+    )
+    expected = '/home/leo/src/autopilot-video'
+    assert captured['project_root'] == expected, (
+        f"Expected project_root={expected!r} (registry-bound) "
+        f"but got {captured['project_root']!r} — "
+        "event payload _project_root must be ignored by BacklogIterator"
+    )
+    assert captured['project_root'] != '/home/leo/src/dark-factory', (
+        "BacklogIterator must not receive dark-factory's path for autopilot_video"
+    )
+    assert captured['project_root'] != wrong_path, (
+        "BacklogIterator must ignore event payload _project_root='/wrong/path'"
+    )
+
+
 # ── Tests for Task 927: BacklogIterator project_root fallback ─────────
 
 
@@ -3371,12 +3477,22 @@ async def test_run_pipeline_defers_on_all_accounts_capped(
 async def test_backlog_iterator_uses_harness_project_root_when_events_lack_override(
     journal, event_buffer, mock_memory_service
 ):
-    """BacklogIterator.run should pass harness.project_root to ContextAssembler
-    when peeked events carry no _project_root key in their payload."""
+    """BacklogIterator.run uses the registry-bound root for dark_factory even when
+    events carry no _project_root payload.
+
+    task 1143: project_root is now hard-bound via _known_project_root_for(project_id).
+    Event payload _project_root is informational only.  This test preserves the
+    'no payload → still gets a valid root' invariant, but the source is now
+    _known_projects, not harness.project_root.
+    """
     # Push one event with NO _project_root in payload
     await event_buffer.push(_make_event('dark_factory'))
 
     harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    # task 1143: inject dark_factory into _known_projects so _known_project_root_for
+    # succeeds.  The value matches the harness-configured root to preserve the
+    # original test's intent: when events lack the key, the configured root is used.
+    harness._known_projects['dark_factory'] = '/abs/from/config'
 
     captured: dict = {}
 
@@ -3396,39 +3512,26 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
 
     assert 'project_root' in captured, 'ContextAssembler was never constructed — iterator may not have run'
     assert captured['project_root'] == '/abs/from/config', (
-        f"Expected project_root='/abs/from/config' but got '{captured['project_root']}'"
-        " — BacklogIterator fallback should use harness.project_root, not project_id"
+        f"Expected project_root='/abs/from/config' (registry-bound) but got '{captured['project_root']}'"
     )
 
 
 @pytest.mark.asyncio
-async def test_backlog_iterator_peek_window_finds_later_project_root_override(
+async def test_backlog_iterator_registry_wins_regardless_of_mixed_event_payloads(
     journal, event_buffer, mock_memory_service
 ):
-    """Regression guard: a ``_project_root`` override on a later buffered event must be
-    found even when earlier events in the peek window lack the key.
+    """BacklogIterator uses the registry-bound root even when buffered events have
+    mixed payloads (some with _project_root, some without).
 
-    Uses a 2+1=3 event setup as a minimal lower bound: N=2 events without the key
-    before the override proves the resolver iterates past multiple eventless entries
-    (not just peeks-last), while staying far below any realistic peek-window size.
+    task 1143: replaced the old peek-window-based resolver with a direct lookup in
+    _known_project_root_for.  Event payload _project_root is now informational only —
+    the registry is always authoritative regardless of event content.
 
-    Scope note: this test does **not** guard against accidental narrowing of
-    ``_PROJECT_ROOT_PEEK_LIMIT``.  Detecting constant-narrowing is intentionally
-    out of scope so the test stays decoupled from the constant's specific value.
-    It will only fail for pathologically small windows (fewer than 3 events) — i.e.,
-    implementations that cannot scan past more than one eventless entry.
+    This replaces the former test_backlog_iterator_peek_window_finds_later_project_root_override
+    which guarded the dead-code peek-window width behavior.
     """
-    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 2 events that
-    # LACK _project_root with monotonically-increasing timestamps, then 1 event
-    # carrying _project_root='/from/event' with a strictly-later timestamp. With FIFO
-    # peek, the override event is returned LAST — so the resolver finds it only if the
-    # window is wide enough to include all 3 buffered events.
-    # N=2 earlier-without-key is the smallest number that proves the resolver
-    # iterates past multiple eventless entries, not just peeks-last.
-    # Anchor base_ts 60 seconds in the past so that peek_buffered's
-    # `WHERE timestamp < cutoff` clause (cutoff ≈ datetime.now(UTC) at run() time)
-    # includes all 3 events.  Explicit offsets avoid sub-microsecond tie flakiness.
     base_ts = datetime.now(UTC) - timedelta(seconds=60)
+    # Mix: 2 events without _project_root, 1 with a wrong value — registry must win.
     for i in range(2):
         await event_buffer.push(ReconciliationEvent(
             id=str(uuid.uuid4()),
@@ -3443,11 +3546,13 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
         type=EventType.task_status_changed,
         source=EventSource.agent,
         project_id='dark_factory',
-        timestamp=base_ts + timedelta(seconds=10),  # latest — FIFO peek returns last
+        timestamp=base_ts + timedelta(seconds=10),
         payload={'_project_root': '/from/event', 'task_id': '1'},
     ))
 
     harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    # task 1143: inject the registry entry for dark_factory.
+    harness._known_projects['dark_factory'] = '/abs/from/config'
 
     captured: dict = {}
 
@@ -3467,38 +3572,35 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     assert 'project_root' in captured, (
         'ContextAssembler was never constructed — iterator may not have run'
     )
-    assert captured['project_root'] == '/from/event', (
-        f"Expected project_root='/from/event' but got '{captured['project_root']}'. "
-        'The peek window must be wide enough to find a later-buffered _project_root '
-        'override past earlier events that lack the key.'
+    assert captured['project_root'] == '/abs/from/config', (
+        f"Expected registry-bound project_root='/abs/from/config' but got '{captured['project_root']}'. "
+        "Event payload _project_root must be ignored (task 1143 contract)."
+    )
+    assert captured['project_root'] != '/from/event', (
+        "BacklogIterator must not use event payload _project_root='/from/event' — registry wins"
     )
 
 
 @pytest.mark.asyncio
-async def test_backlog_iterator_event_project_root_wins_over_configured(
+async def test_known_project_roots_wins_over_event_payload_in_backlog_iterator(
     journal, event_buffer, mock_memory_service
 ):
-    """BacklogIterator.run should use the project_root from peeked events over
-    the harness-configured fallback (regression guard for task-927 invariant).
+    """BacklogIterator.run uses the registry-bound root, ignoring event payload _project_root.
 
-    Parallel to test_backlog_iterator_uses_harness_project_root_when_events_lack_override
-    but exercises the event-override path: events carry _project_root='/from/event'
-    while the harness is configured with '/from/config'.  The event value must win.
+    task 1143: replaces test_backlog_iterator_event_project_root_wins_over_configured.
+    Under the new KNOWN_PROJECT_ROOTS contract, the registry is the single source of truth.
+    Events carrying _project_root='/from/event' while the registry maps dark_factory to
+    '/from/registry' must yield '/from/registry' — the event payload is informational only.
 
-    Pure-precedence case: ALL buffered events carry _project_root — pins that event value
-    beats the configured fallback.  Contrast with
-    test_backlog_iterator_peek_window_finds_later_project_root_override, which uses
-    a mixed setup (events without the key + a later event with it) to probe peek-window width.
-
-    Peek-window semantics differ from run_full_cycle's full-drain coverage at
-    test_harness.py:341, making this a distinct regression guard.
+    Parallel to test_known_project_roots_wins_over_event_payload for run_full_cycle.
     """
-    # Push two events WITH _project_root key — both within the peek window
+    # Push two events WITH _project_root key — event payload must be IGNORED
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
 
-    # Build harness with a different configured root
+    # Build harness with a different configured root and inject registry with a third path
     harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/from/config')
+    harness._known_projects['dark_factory'] = '/from/registry'
 
     captured: dict = {}
 
@@ -3518,53 +3620,43 @@ async def test_backlog_iterator_event_project_root_wins_over_configured(
     assert 'project_root' in captured, (
         'ContextAssembler was never constructed — iterator may not have run'
     )
-    assert captured['project_root'] == '/from/event', (
-        f"Expected project_root='/from/event' but got '{captured['project_root']}'"
-        " — event-provided root must win over the configured fallback in BacklogIterator"
+    assert captured['project_root'] == '/from/registry', (
+        f"Expected registry-bound project_root='/from/registry' but got '{captured['project_root']}'. "
+        "KNOWN_PROJECT_ROOTS must win over both event payload and harness config (task 1143)."
+    )
+    assert captured['project_root'] != '/from/event', (
+        "BacklogIterator must not use event payload _project_root='/from/event'"
+    )
+    assert captured['project_root'] != '/from/config', (
+        "BacklogIterator must not use harness-configured project_root='/from/config'"
     )
 
 
 @pytest.mark.asyncio
-async def test_empty_fallback_resolves_and_short_circuits_filtered_task_tree(
+async def test_fetch_filtered_task_tree_short_circuits_on_empty_project_root(
     journal, event_buffer, mock_memory_service
 ):
-    """_resolve_project_root with no-override events returns '' and
-    _fetch_filtered_task_tree('') short-circuits without a taskmaster call.
+    """_fetch_filtered_task_tree('') short-circuits without a taskmaster call.
 
-    This chained assertion guards the full resolver → fetcher pipeline introduced
-    by task-927.  task-927 replaced project_id (e.g. 'dark_factory') with '' as
-    the fallback in _resolve_project_root.  That change is only 'strictly better'
-    because downstream _fetch_filtered_task_tree short-circuits on empty strings.
-    Splitting the assertion would leave a gap: a future refactor could reintroduce
-    project_id as fallback and _fetch_filtered_task_tree would silently start
-    hitting taskmaster again.
+    task 1143: _resolve_project_root was deleted; this test retains the fetcher
+    short-circuit guard (parts (b)+(c) of the former
+    test_empty_fallback_resolves_and_short_circuits_filtered_task_tree) which
+    is still meaningful — if project_root is '' for any reason, the fetcher must
+    not call taskmaster.get_tasks.
 
     test_harness.py:1827 (test_returns_empty_when_empty_project_root) covers the
-    fetch-level short-circuit in isolation; this test pins the resolver ↔ fetcher
-    contract so the full pipeline is protected.
+    same in isolation; keeping both guards different entry paths.
     """
     from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
-    # project_root=None → config.taskmaster=None → harness._project_root == ''
-    # harness.taskmaster = AsyncMock() (injected mock) so we can assert it was NOT called
     harness = _make_harness_927(journal, event_buffer, mock_memory_service, project_root=None)
 
-    # Events with NO _project_root key — triggers the fallback path
-    events = [_make_event('dark_factory'), _make_event('dark_factory')]
-
-    # (a) resolver returns '' — pins post-927 invariant (NOT 'dark_factory')
-    resolved = harness._resolve_project_root(events)
-    assert resolved == '', (
-        f"_resolve_project_root returned '{resolved}' but expected '' — "
-        "regression to old project_id fallback detected (task-927 invariant violated)"
-    )
-
-    # (b) fetcher returns empty tree when project_root is ''
+    # fetcher returns empty tree when project_root is ''
     result = await harness._fetch_filtered_task_tree('')
     assert isinstance(result, FilteredTaskTree)
     assert result.active_tasks == []
 
-    # (c) taskmaster.get_tasks was never called (short-circuit on empty project_root)
+    # taskmaster.get_tasks was never called (short-circuit on empty project_root)
     harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
 
@@ -3597,6 +3689,11 @@ async def test_run_full_cycle_with_relative_config_and_memory_only_events_still_
     assert harness._project_root == expected_abs, (
         "Pre-condition: harness._project_root must be absolute after init"
     )
+    # task 1143: pre-populate _known_projects so _known_project_root_for('dark_factory')
+    # returns the same resolved-absolute path.  This preserves the test's original intent
+    # (init resolves '.' to absolute; that path is what reaches get_tasks) while satisfying
+    # the new KNOWN_PROJECT_ROOTS contract.
+    harness._known_projects['dark_factory'] = expected_abs
 
     # Push two memory-style events (no _project_root in payload)
     await event_buffer.push(_make_event('dark_factory'))
@@ -4123,4 +4220,567 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
         assert warn_records, (
             f'Expected a WARNING log mentioning task 777 but got: '
             f'{[r.message for r in caplog.records]}'
+        )
+
+
+# ── Tests for Task 1143: KNOWN_PROJECT_ROOTS hard-bind ───────────────────────
+
+_FIVE_PROJECT_MAP = {
+    'autopilot_video': '/home/leo/src/autopilot-video',
+    'reify': '/home/leo/src/reify',
+    'dark_factory': '/home/leo/src/dark-factory',
+    'autotrade': '/home/leo/src/autotrade',
+    'know_live': '/home/leo/src/know-live',
+}
+
+
+def _make_harness_with_known_projects(
+    journal, event_buffer, mock_memory_service, known_projects: dict
+):
+    """Build a harness and monkeypatch _known_projects for task-1143 tests."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._known_projects = dict(known_projects)
+    return harness
+
+
+class TestKnownProjectRootFor:
+    """Tests for ReconciliationHarness._known_project_root_for (task 1143)."""
+
+    @pytest.mark.asyncio
+    async def test_known_project_root_for_returns_mapped_root(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_known_project_root_for returns the correct project_root for each project_id."""
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+        )
+
+        assert harness._known_project_root_for('autopilot_video') == '/home/leo/src/autopilot-video'
+        assert harness._known_project_root_for('reify') == '/home/leo/src/reify'
+        assert harness._known_project_root_for('dark_factory') == '/home/leo/src/dark-factory'
+        assert harness._known_project_root_for('autotrade') == '/home/leo/src/autotrade'
+        assert harness._known_project_root_for('know_live') == '/home/leo/src/know-live'
+
+    @pytest.mark.asyncio
+    async def test_known_project_root_for_raises_for_unknown_project_id(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_known_project_root_for raises ValueError for an unknown project_id.
+
+        The error message must include both the unknown project_id and the sorted list
+        of known project_ids so the operator can immediately diagnose the misconfiguration.
+        """
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            harness._known_project_root_for('not_a_real_project')
+
+        err_msg = str(exc_info.value)
+        assert 'not_a_real_project' in err_msg, (
+            f"Error message must include the unknown project_id; got: {err_msg!r}"
+        )
+        # At least one known project_id must appear so the operator can see what's registered.
+        # We intentionally avoid pinning the exact message format (repr vs bullet list, etc.)
+        # — only the *presence* of diagnostic context is the contract.
+        assert any(pid in err_msg for pid in sorted(_FIVE_PROJECT_MAP)), (
+            f"Error message must include at least one known project_id; got: {err_msg!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_pre_flight_raises_before_side_effects(
+    journal, event_buffer, mock_memory_service
+):
+    """Pre-flight _known_project_root_for raises before any drain or journal mutation.
+
+    Pins that a misconfigured project_id never causes a partial cycle:
+    (a) ValueError is raised,
+    (b) events remain in the buffer (drain was NOT called),
+    (c) no journal run row was created (start_run was NOT called).
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'dark_factory': '/home/leo/src/dark-factory'},  # no autopilot_video entry
+    )
+
+    # Push 2 events for autopilot_video (which is NOT in _known_projects).
+    await event_buffer.push(_make_event('autopilot_video'))
+    await event_buffer.push(_make_event('autopilot_video'))
+
+    # (a) ValueError with the unknown project_id in the message
+    with pytest.raises(ValueError, match='autopilot_video'):
+        await harness.run_full_cycle('autopilot_video', 'buffer_size:2')
+
+    # (b) Events NOT drained — buffer still shows size==2
+    stats = await event_buffer.get_buffer_stats('autopilot_video')
+    assert stats['size'] == 2, (
+        f"Expected buffer size==2 (events not drained) but got {stats['size']}"
+        " — pre-flight must run before drain"
+    )
+
+    # (c) No journal start_run side effect — get_recent_runs returns no row
+    recent_runs = await journal.get_recent_runs('autopilot_video', limit=1)
+    assert len(recent_runs) == 0, (
+        f"Expected no journal row but got {len(recent_runs)} row(s)"
+        " — pre-flight must run before journal.start_run"
+    )
+
+
+@pytest.mark.parametrize(
+    'project_id,expected_root',
+    [
+        ('autopilot_video', '/home/leo/src/autopilot-video'),
+        ('reify', '/home/leo/src/reify'),
+        ('autotrade', '/home/leo/src/autotrade'),
+        ('know_live', '/home/leo/src/know-live'),
+        ('dark_factory', '/home/leo/src/dark-factory'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_full_cycle_hard_binds_project_root_via_known_projects(
+    project_id, expected_root, journal, event_buffer, mock_memory_service
+):
+    """run_full_cycle must use the registry-derived root regardless of event payload.
+
+    The harness's _known_projects dict is the single source of truth (task 1143).
+    Even when events carry _project_root='/some/other/path', the stage must receive
+    the registry-bound root. Also verifies non-dark-factory projects never receive
+    dark-factory's path.
+
+    This test fails before step-4 because _resolve_project_root honours the event payload.
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+    )
+    # The harness's configured _project_root is dark-factory (typical multi-project deployment).
+    harness._project_root = '/home/leo/src/dark-factory'
+
+    wrong_path = '/some/other/wrong/path'
+
+    # Push events with deliberately wrong _project_root to verify it is ignored.
+    await event_buffer.push(_make_event_with_root(project_id, wrong_path))
+    await event_buffer.push(_make_event_with_root(project_id, wrong_path))
+
+    captured_roots: list[str] = []
+
+    async def capture_root(stage):
+        captured_roots.append(stage.project_root)
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_root)
+
+    await harness.run_full_cycle(project_id, 'buffer_size:2')
+
+    assert len(captured_roots) == 3, f"Expected 3 captured roots, got {len(captured_roots)}"
+    for root in captured_roots:
+        assert root == expected_root, (
+            f"project_id={project_id!r}: expected root {expected_root!r} but got {root!r} "
+            f"— registry binding must win over event payload"
+        )
+        # Non-dark-factory projects must not receive dark-factory's path
+        if project_id != 'dark_factory':
+            assert root != '/home/leo/src/dark-factory', (
+                f"project_id={project_id!r} must not receive dark-factory's path; got {root!r}"
+            )
+        # Wrong event payload must not leak through
+        assert root != wrong_path, (
+            f"Event payload _project_root must be ignored; stage got {root!r}"
+        )
+
+
+# ── Tests for Task 1143 step-9: _run_remediation_pass defense-in-depth ───
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_hard_binds_via_known_projects(
+    journal, event_buffer, mock_memory_service
+):
+    """_run_remediation_pass derives project_root from the registry, not from a caller argument.
+
+    Defense-in-depth guard (task 1143 step-9/amendment): the function computes project_root
+    via self._known_project_root_for(project_id) — it accepts no project_root argument at
+    the API level, making the registry the unambiguous source of truth.
+
+    The harness has _known_projects = {'reify': '/home/leo/src/reify', 'dark_factory': ...}.
+    All three stage.project_root captures must equal '/home/leo/src/reify'.
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {
+            'reify': '/home/leo/src/reify',
+            'dark_factory': '/home/leo/src/dark-factory',
+        },
+    )
+
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    captured_roots: dict[str, str] = {}
+    for stage in stages:
+        stage_name = type(stage).__name__
+
+        async def capture(s, _name=stage_name):
+            captured_roots[_name] = s.project_root
+
+        _mock_stage_run(stage, before_return=capture)
+
+    findings = [_make_s3_findings()[0]]  # one actionable finding
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    await harness._run_remediation_pass(
+        project_id='reify',
+        parent_run_id='test-parent-run',
+        findings=findings,
+        tier=tier,
+    )
+
+    assert len(captured_roots) == 3, (
+        f"Expected 3 stage captures, got {len(captured_roots)}: {list(captured_roots)}"
+    )
+    expected = '/home/leo/src/reify'
+    for stage_name, root in captured_roots.items():
+        assert root == expected, (
+            f"{stage_name}: expected registry-bound project_root={expected!r} "
+            f"but got {root!r} — _run_remediation_pass must use _known_project_root_for('reify') "
+            f"(task 1143 defense-in-depth)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_dark_factory_full_cycle_no_regression(
+    journal, event_buffer, mock_memory_service
+):
+    """End-to-end smoke: dark_factory cycle uses correct project_root across all 3 stages.
+
+    Acceptance criterion (task 1143 step-15): "No regression for dark_factory Stage 1, 2, or 3."
+
+    Build a harness with all five projects in _known_projects (realistic deployment).
+    Push events for 'dark_factory' — some with _project_root payload (matching registry),
+    some without — to verify neither variant causes contamination.
+    Mock stage.run and capture project_id, project_root, known_projects at call time.
+    Assert all three stages see:
+      - project_id='dark_factory'
+      - project_root='/home/leo/src/dark-factory'
+      - known_projects containing all five entries
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+    )
+
+    # Push a mix: some events with correct _project_root, some without
+    await event_buffer.push(_make_event_with_root('dark_factory', '/home/leo/src/dark-factory'))
+    await event_buffer.push(_make_event('dark_factory'))  # no _project_root payload
+
+    captured_states: list[dict] = []
+
+    async def capture_stage_state(stage):
+        captured_states.append({
+            'stage_type': type(stage).__name__,
+            'project_id': stage.project_id,
+            'project_root': stage.project_root,
+            'known_projects': dict(getattr(stage, 'known_projects', {})),
+        })
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_stage_state)
+
+    run = await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    assert run.status == 'completed', f'Expected completed run, got status={run.status!r}'
+    assert len(captured_states) == 3, (
+        f'Expected 3 stage captures (one per stage), got {len(captured_states)}: '
+        f'{[s["stage_type"] for s in captured_states]}'
+    )
+
+    expected_root = '/home/leo/src/dark-factory'
+    for state in captured_states:
+        assert state['project_id'] == 'dark_factory', (
+            f'{state["stage_type"]}: project_id must be dark_factory, '
+            f'got {state["project_id"]!r}'
+        )
+        assert state['project_root'] == expected_root, (
+            f'{state["stage_type"]}: project_root must be {expected_root!r}, '
+            f'got {state["project_root"]!r} — registry-bind regression check'
+        )
+        # Stage 2 (TaskKnowledgeSync) receives known_projects; verify map is intact
+        if state['known_projects']:
+            for pid, proot in _FIVE_PROJECT_MAP.items():
+                assert pid in state['known_projects'], (
+                    f'{state["stage_type"]}: known_projects must contain {pid!r}'
+                )
+                assert state['known_projects'][pid] == proot, (
+                    f'{state["stage_type"]}: known_projects[{pid!r}] must be '
+                    f'{proot!r}, got {state["known_projects"][pid]!r}'
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('project_id,expected_root', [
+    ('reify', '/home/leo/src/reify'),
+    ('autopilot_video', '/home/leo/src/autopilot-video'),
+])
+async def test_stage3_payload_for_reify_emits_reify_root(
+    journal, event_buffer, mock_memory_service, project_id, expected_root
+):
+    """Integration-level pin: Stage 3 assembled payload contains Use project_root="<correct>".
+
+    Acceptance criterion (task 1143 step-17): Stage 3 integrity_check for
+    project_id='reify' uses project_root='/home/leo/src/reify' for all
+    Taskmaster calls.
+
+    Approach:
+    - Stages 0 and 1 are mocked normally (no CLI call).
+    - Stage 2 (IntegrityCheck) has a custom run that calls the real
+      assemble_payload() to capture the assembled string, then returns
+      a StageReport without invoking the CLI subprocess.
+    This means we test the actual payload logic end-to-end through run_full_cycle.
+    """
+    from fused_memory.models.reconciliation import StageReport
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+    )
+
+    # Push events for the target project
+    await event_buffer.push(_make_event(project_id))
+    await event_buffer.push(_make_event(project_id))
+
+    # Mock Stage 0 and 1 normally
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+
+    # Stage 2 (IntegrityCheck): custom run captures the payload from assemble_payload
+    captured_payload: list[str] = []
+    stage2 = harness.stages[2]
+
+    async def capture_and_return(
+        events, watermark, prior_reports, run_id, model=None, _s=stage2
+    ):
+        payload = await _s.assemble_payload(events, watermark, prior_reports)
+        captured_payload.append(payload)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=__import__('datetime').datetime.now(__import__('datetime').timezone.utc),
+            completed_at=__import__('datetime').datetime.now(__import__('datetime').timezone.utc),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    stage2.run = capture_and_return
+
+    await harness.run_full_cycle(project_id, 'buffer_size:2')
+
+    assert len(captured_payload) == 1, (
+        f'Expected stage 2 (IntegrityCheck) to be called exactly once; '
+        f'got {len(captured_payload)} calls'
+    )
+    payload = captured_payload[0]
+
+    expected_directive = f'Use project_root="{expected_root}"'
+    assert expected_directive in payload, (
+        f'Stage 3 payload for project_id={project_id!r} must contain '
+        f'{expected_directive!r} (task 1143 step-12). '
+        f'Payload (first 600 chars):\n{payload[:600]}'
+    )
+    assert '/home/leo/src/dark-factory' not in payload or project_id == 'dark_factory', (
+        f'Stage 3 payload for project_id={project_id!r} must not contain '
+        f'dark-factory path — cross-contamination guard (task 1143)'
+    )
+
+
+# ── step-19: UnknownProjectError tests ────────────────────────────────────────
+
+class TestUnknownProjectError:
+    """Tests for the UnknownProjectError exception class (task 1143 step-19/20).
+
+    These tests fail before step-20 with ImportError because UnknownProjectError
+    does not yet exist in fused_memory.reconciliation.harness.
+    """
+
+    def test_unknown_project_error_is_value_error_subclass(self):
+        """UnknownProjectError must subclass ValueError for backward-compat.
+
+        Any existing or future ``except ValueError`` callsite (test code, callers
+        of ``_known_project_root_for``) must continue to match after step-20.
+        """
+        from fused_memory.reconciliation.harness import UnknownProjectError  # noqa: F401
+
+        assert issubclass(UnknownProjectError, ValueError) is True, (
+            'UnknownProjectError must subclass ValueError for backward-compat '
+            '(task 1143 step-20)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_known_project_root_for_raises_unknown_project_error_specifically(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_known_project_root_for raises UnknownProjectError (not bare ValueError).
+
+        After step-20, the narrow exception type lets _project_loop distinguish
+        a KNOWN_PROJECT_ROOTS misconfiguration from generic ValueErrors raised by
+        stages (e.g. watermark/stage project_id mismatch, unset limits).
+        """
+        from fused_memory.reconciliation.harness import UnknownProjectError
+
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service,
+            {'dark_factory': '/home/leo/src/dark-factory'},
+        )
+
+        with pytest.raises(UnknownProjectError) as exc_info:
+            harness._known_project_root_for('not_a_real_project')
+
+        # Subclass relationship — must also satisfy bare ValueError catches
+        assert isinstance(exc_info.value, ValueError) is True, (
+            'UnknownProjectError must be an instance of ValueError '
+            '(task 1143 step-20 backward-compat)'
+        )
+
+        err_msg = str(exc_info.value)
+        assert 'not_a_real_project' in err_msg, (
+            f'Error message must include the unknown project_id; got: {err_msg!r}'
+        )
+        assert 'dark_factory' in err_msg, (
+            f'Error message must include known project_ids; got: {err_msg!r}'
+        )
+
+
+# ── step-21: _project_loop narrow exception handling tests ────────────────────
+
+class TestProjectLoopNarrowsExceptionHandling:
+    """Tests that _project_loop handles UnknownProjectError and plain ValueError differently.
+
+    Before step-22, the bare ``except ValueError`` swallows ALL ValueErrors as
+    misconfiguration and aborts the loop — including the transient ``ValueError``s
+    raised by stages (watermark/stage project_id mismatch, unset limits).
+
+    After step-22, the narrow ``except UnknownProjectError`` only catches registry
+    misconfiguration; plain ``ValueError``s fall through to ``except Exception``
+    and trigger the normal 5-second cooldown retry.
+
+    Subcase (a) passes both before and after step-22 (same behavior — UnknownProjectError
+    aborts loop cleanly in both cases).
+    Subcase (b) fails BEFORE step-22 (bare ValueError catches and aborts rather than
+    retrying) and passes AFTER step-22 (falls through to retry path).
+    """
+
+    @pytest.mark.asyncio
+    async def test_project_loop_aborts_on_unknown_project_error_no_retry(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_project_loop must abort cleanly on UnknownProjectError — no 5-second retry.
+
+        Pins that a KNOWN_PROJECT_ROOTS misconfiguration causes the loop to exit
+        immediately (logs once, returns), rather than spam-retrying every 5 seconds.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        # Harness with NO entry for 'autopilot_video' — any attempt to run a
+        # full cycle for this project_id should raise UnknownProjectError.
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service,
+            {'dark_factory': '/home/leo/src/dark-factory'},
+        )
+
+        # Push enough events to trigger the cycle (buffer_size_threshold=2 in fixture)
+        for _ in range(5):
+            await event_buffer.push(_make_event('autopilot_video'))
+
+        sleep_mock = AsyncMock()
+
+        with patch('fused_memory.reconciliation.harness._sleep', sleep_mock):
+            # Should return cleanly — no exception escapes (loop catches and returns)
+            await asyncio.wait_for(
+                harness._project_loop('autopilot_video'),
+                timeout=10.0,
+            )
+
+        # The 5-second cooldown sleep must NOT have been called — the narrow catch
+        # should abort the loop without ever reaching the bottom `await _sleep(5)`.
+        cooldown_calls = [
+            c for c in sleep_mock.await_args_list if c.args and c.args[0] == 5
+        ]
+        assert len(cooldown_calls) == 0, (
+            f'_sleep(5) was called {len(cooldown_calls)} time(s) — '
+            f'UnknownProjectError should abort the loop without any retry cooldown '
+            f'(task 1143 step-22). Calls: {sleep_mock.await_args_list}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_project_loop_retries_on_generic_value_error_from_stage(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A plain ValueError from a stage must NOT abort the loop — it must retry.
+
+        Before step-22, the bare ``except ValueError`` silently swallows stage
+        ValueErrors (e.g. watermark↔stage project_id mismatch) and returns,
+        causing the loop to never recover. After step-22, the narrow
+        ``except UnknownProjectError`` lets the plain ValueError fall through to
+        ``except Exception``, which logs it and continues with the 5-second cooldown.
+
+        This test FAILS before step-22 (run_full_cycle called once, no _sleep(5))
+        and PASSES after step-22 (run_full_cycle called twice, _sleep(5) called).
+        """
+        import asyncio
+        from contextlib import suppress
+        from unittest.mock import AsyncMock, patch
+
+        # Harness WITH 'autopilot_video' so _known_project_root_for succeeds
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service,
+            {
+                'autopilot_video': '/home/leo/src/autopilot-video',
+                'dark_factory': '/home/leo/src/dark-factory',
+            },
+        )
+
+        # Push enough events to trigger should_trigger → True
+        for _ in range(5):
+            await event_buffer.push(_make_event('autopilot_video'))
+
+        # First call raises a plain ValueError (simulates transient stage error,
+        # e.g. base.py:108 watermark↔stage project_id mismatch).
+        # Second call raises CancelledError to terminate the loop in the test.
+        rfc_mock = AsyncMock(
+            side_effect=[
+                ValueError('simulated watermark mismatch — not a misconfig'),
+                asyncio.CancelledError(),
+            ]
+        )
+
+        sleep_mock = AsyncMock()
+
+        with (
+            patch.object(harness, 'run_full_cycle', rfc_mock),
+            patch('fused_memory.reconciliation.harness._sleep', sleep_mock),
+            suppress(asyncio.CancelledError),
+        ):
+            # CancelledError on the 2nd run_full_cycle call propagates out — suppress it.
+            await harness._project_loop('autopilot_video')
+
+        # run_full_cycle must have been called at least twice — proof that the
+        # plain ValueError was NOT loop-fatal (retry path was taken).
+        assert rfc_mock.await_count >= 2, (
+            f'run_full_cycle must be retried after a plain ValueError; '
+            f'got {rfc_mock.await_count} call(s). '
+            f'If the count is 1, the bare except ValueError is still swallowing '
+            f'stage errors as misconfiguration (task 1143 step-22).'
+        )
+
+        # The 5-second cooldown must have been called between the two cycles.
+        cooldown_calls = [
+            c for c in sleep_mock.await_args_list if c.args and c.args[0] == 5
+        ]
+        assert len(cooldown_calls) >= 1, (
+            f'_sleep(5) (retry cooldown) must be called after the plain ValueError; '
+            f'got calls: {sleep_mock.await_args_list}. '
+            f'If 0 calls, the except ValueError is aborting instead of falling '
+            f'through to except Exception (task 1143 step-22).'
         )

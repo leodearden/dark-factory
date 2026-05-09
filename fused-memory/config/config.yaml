@@ -62,6 +62,23 @@ queue:
   search_timeout_seconds: ${SEARCH_TIMEOUT:30}
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
 
+# ── Project isolation (task 1143) ────────────────────────────────────────────
+# The reconciliation harness hard-binds project_root per project_id via a
+# registry built from two sources:
+#
+#   1. taskmaster.project_root below (this server's primary project).
+#   2. DASHBOARD_KNOWN_PROJECT_ROOTS env var — a comma-separated list of
+#      absolute paths for *all* additional projects reconciled by this server.
+#      Defined in scripts/fused-memory.service.template (see ExecStart env).
+#      Example: DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live
+#
+# Basename derivation: /home/leo/src/know-live  →  know_live  (lowercase,
+# dashes replaced by underscores).  The canonical project_ids are therefore:
+#   dark_factory, reify, autopilot_video, autotrade, know_live
+#
+# If a project_id passed to run_full_cycle() has no entry in this registry,
+# the harness raises UnknownProjectError pre-flight (no silent fallback to any path).
+# ─────────────────────────────────────────────────────────────────────────────
 taskmaster:
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "all"
