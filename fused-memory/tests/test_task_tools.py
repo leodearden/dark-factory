@@ -563,15 +563,17 @@ async def test_remove_task_empty_after_strip_is_noop(
 
 
 @pytest.mark.asyncio
-async def test_remove_task_nested_subtask_id_returns_structured_error(
+async def test_remove_task_taskmaster_error_returns_structured_dict(
     mcp_server_with_tasks, task_interceptor,
 ):
-    """Nested-subtask-id input surfaces as a structured TaskmasterError dict.
+    """TaskmasterError from the backend is converted to a structured error dict.
 
-    Wire-contract regression: when the backend raises
+    Wire-contract regression: when the interceptor raises
     ``TaskmasterError('INVALID_TASK_ID', ...)`` the MCP exception handler must
     return ``{'error': '...INVALID_TASK_ID...', 'error_type': 'TaskmasterError'}``
-    — the shape that programmatic callers parse.  Also asserts that the CSV
+    — the shape that programmatic callers parse.  A nested-subtask-id value is
+    used as a realistic driver but the test's actual coverage is the generic
+    exception-to-dict adapter in the MCP handler.  Also asserts that the CSV
     split forwarded the malformed id as ``ids=['1.2.3']`` (i.e. the MCP
     boundary doesn't pre-validate grammar; it delegates to the backend).
     """

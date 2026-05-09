@@ -352,7 +352,9 @@ async def test_remove_tasks_rejects_nested_subtask_id_atomically(backend, projec
         )
 
     assert exc_info.value.code == 'INVALID_TASK_ID'
-    assert 'nested subtask ids not supported' in exc_info.value.message
+    # Key off the offending id repr rather than pinning the prose — proves the
+    # right path fired without coupling to exact wording in _parse_task_id.
+    assert "'1.2.3'" in exc_info.value.message
 
     # State must be unchanged — both tasks still present.
     listing = await backend.get_tasks(project_root=project_root)
