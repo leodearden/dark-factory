@@ -46,6 +46,41 @@ logger = logging.getLogger(__name__)
 # that happen to have the same file layout.  Extend when needed.
 _BRIEFING_REFRESH_PROJECT_ALLOWLIST: frozenset[str] = frozenset({'reify'})
 
+# ── Task-1139 scope filter ────────────────────────────────────────────────────
+# These substrings uniquely identify Mem0 flags that were written as part of the
+# FIX-A bug-mechanics description itself.  They must not be re-surfaced as live
+# flags for other tasks.  The list is intentionally narrow so legitimate flags
+# that merely mention "Stage 1" or "flagged_items" in passing are not suppressed.
+_KNOWN_BUG_1139_CONTENT_MARKERS: tuple[str, ...] = (
+    'flag_for_stage2=true but does NOT include them in flagged_items',
+    'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2',
+)
+
+# Persistence-threshold constant for FIX D (stale-flag escalation guard).
+# A flag that has survived this many Stage 2 cycles without being deleted is
+# considered stale and is surfaced in the payload for operator escalation.
+STAGE2_FLAG_PERSISTENCE_THRESHOLD: int = 3
+
+
+def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
+    """Return True iff *flag* describes the task-1139 flag-relay bug mechanics.
+
+    The active-Mem0-query path (FIX A) must not re-inject into the payload any
+    flags that were written specifically to describe *this* bug.  Two narrow
+    signals identify such a flag:
+
+    1. ``flag['task_id'] == '1139'`` (string-coerced, so int 1139 also matches).
+    2. ``flag['content']`` contains one of the ``_KNOWN_BUG_1139_CONTENT_MARKERS``
+       substrings — e.g. the sentence "Stage 1 LLM writes flags to Mem0 with
+       metadata.flag_for_stage2 but does NOT include them in flagged_items".
+
+    All other flags pass through unchanged.
+    """
+    if str(flag.get('task_id', '')) == '1139':
+        return True
+    content = flag.get('content', '')
+    return any(marker in content for marker in _KNOWN_BUG_1139_CONTENT_MARKERS)
+
 
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
