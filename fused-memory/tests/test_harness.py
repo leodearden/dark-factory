@@ -4380,3 +4380,73 @@ async def test_run_full_cycle_hard_binds_project_root_via_known_projects(
         assert root != wrong_path, (
             f"Event payload _project_root must be ignored; stage got {root!r}"
         )
+
+
+# ── Tests for Task 1143 step-9: _run_remediation_pass defense-in-depth ───
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_hard_binds_via_known_projects(
+    journal, event_buffer, mock_memory_service
+):
+    """_run_remediation_pass re-derives project_root from registry, ignoring the caller argument.
+
+    Defense-in-depth guard (task 1143 step-9): even when the caller passes a wrong
+    project_root (e.g. a stale or contaminated value), the function must shadow it
+    with self._known_project_root_for(project_id).
+
+    The harness has _known_projects = {'reify': '/home/leo/src/reify', 'dark_factory': ...}.
+    The caller passes project_root='/wrong/path/from/buggy/caller'.
+    All three stage.project_root captures must equal '/home/leo/src/reify'.
+
+    This test FAILS before step-10 because _run_remediation_pass currently assigns
+    stage.project_root = project_root (the caller-supplied wrong path).
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {
+            'reify': '/home/leo/src/reify',
+            'dark_factory': '/home/leo/src/dark-factory',
+        },
+    )
+
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    captured_roots: dict[str, str] = {}
+    for stage in stages:
+        stage_name = type(stage).__name__
+
+        async def capture(s, _name=stage_name):
+            captured_roots[_name] = s.project_root
+
+        _mock_stage_run(stage, before_return=capture)
+
+    findings = [_make_s3_findings()[0]]  # one actionable finding
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+    wrong_path = '/wrong/path/from/buggy/caller'
+
+    await harness._run_remediation_pass(
+        project_id='reify',
+        project_root=wrong_path,  # deliberately wrong — defense-in-depth must override
+        parent_run_id='test-parent-run',
+        findings=findings,
+        tier=tier,
+    )
+
+    assert len(captured_roots) == 3, (
+        f"Expected 3 stage captures, got {len(captured_roots)}: {list(captured_roots)}"
+    )
+    expected = '/home/leo/src/reify'
+    for stage_name, root in captured_roots.items():
+        assert root == expected, (
+            f"{stage_name}: expected registry-bound project_root={expected!r} "
+            f"but got {root!r} — _run_remediation_pass must ignore caller-supplied "
+            f"project_root and re-derive from _known_project_root_for('reify') "
+            f"(task 1143 defense-in-depth)"
+        )
+        assert root != wrong_path, (
+            f"{stage_name}: caller-supplied wrong_path={wrong_path!r} must not reach stages"
+        )
