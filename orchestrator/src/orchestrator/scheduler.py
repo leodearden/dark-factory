@@ -893,6 +893,50 @@ class Scheduler:
                 return False
         return True
 
+    def _dispatch_cooldown_signal(self, task: dict) -> str | None:
+        """Return the signal label if *task* carries a dispatch-cooldown signal.
+
+        Signals (OR semantics — any one arms the gate):
+        - ``recon_reset_count > 1``: task has been reset by reconciliation
+          more than once (first reset is still allowed to dispatch).
+        - ``steward_clear_at``: truthy value → steward stash-pop resolution.
+        - ``recon_stage2_blocked_at``: truthy value → stage-2 block.
+        - ``reopen_reason`` containing the substring ``'steward'`` (case-insensitive).
+
+        Returns the matched signal label (for log messages), or ``None`` if no
+        signal is present.  Used both by :meth:`_dispatch_cooldown_active` and
+        at the dispatch site to guard ``_last_dispatch_at`` arming.
+        """
+        metadata = task.get('metadata') or {}
+
+        # recon_reset_count > 1 (strict — first reset is allowed).
+        # float() is used for type flexibility; bool values collapse to 1.0/0.0
+        # (True → gate NOT armed, False → 0.0 → gate NOT armed), which is the
+        # safe default. Non-finite floats compare > 1 as False, also safe.
+        recon_count = metadata.get('recon_reset_count', 0)
+        try:
+            recon_count = float(recon_count)
+        except (TypeError, ValueError):
+            recon_count = 0
+        if recon_count > 1:
+            return 'recon_reset_count'
+
+        # steward_clear_at: any truthy value
+        if metadata.get('steward_clear_at'):
+            return 'steward_clear_at'
+
+        # recon_stage2_blocked_at: any truthy value
+        if metadata.get('recon_stage2_blocked_at'):
+            return 'recon_stage2_blocked_at'
+
+        # reopen_reason containing 'steward' (case-insensitive — field is
+        # human-authored prose and future producers may use different casing).
+        reopen_reason = str(metadata.get('reopen_reason') or '')
+        if 'steward' in reopen_reason.lower():
+            return 'reopen_reason'
+
+        return None
+
     def _dispatch_cooldown_active(
         self, task: dict, tid: str
     ) -> tuple[bool, str | None]:
@@ -905,13 +949,7 @@ class Scheduler:
         3. The task's metadata carries a reset/steward signal indicating
            it was just touched by reconciliation or the steward.
 
-        Signals (OR semantics — any one arms the gate):
-        - ``recon_reset_count > 1``: task has been reset by reconciliation
-          more than once (first reset is still allowed to dispatch).
-        - ``steward_clear_at``: truthy value → steward stash-pop resolution.
-        - ``recon_stage2_blocked_at``: truthy value → stage-2 block.
-        - ``reopen_reason`` containing the substring ``'steward'`` (case-insensitive).
-
+        Signal detection is delegated to :meth:`_dispatch_cooldown_signal`.
         Returns the signal label for use in operator-visible log messages.
         """
         last_dispatch = self._last_dispatch_at.get(tid)
@@ -925,34 +963,9 @@ class Scheduler:
             self._last_dispatch_at.pop(tid, None)
             return False, None
 
-        metadata = task.get('metadata') or {}
-
-        # recon_reset_count > 1 (strict — first reset is allowed).
-        # float() is used for type flexibility; bool values collapse to 1.0/0.0
-        # (True → gate NOT armed, False → 0.0 → gate NOT armed), which is the
-        # safe default. Non-finite floats compare > 1 as False, also safe.
-        recon_count = metadata.get('recon_reset_count', 0)
-        try:
-            recon_count = float(recon_count)
-        except (TypeError, ValueError):
-            recon_count = 0
-        if recon_count > 1:
-            return True, 'recon_reset_count'
-
-        # steward_clear_at: any truthy value
-        if metadata.get('steward_clear_at'):
-            return True, 'steward_clear_at'
-
-        # recon_stage2_blocked_at: any truthy value
-        if metadata.get('recon_stage2_blocked_at'):
-            return True, 'recon_stage2_blocked_at'
-
-        # reopen_reason containing 'steward' (case-insensitive — field is
-        # human-authored prose and future producers may use different casing).
-        reopen_reason = str(metadata.get('reopen_reason') or '')
-        if 'steward' in reopen_reason.lower():
-            return True, 'reopen_reason'
-
+        signal = self._dispatch_cooldown_signal(task)
+        if signal is not None:
+            return True, signal
         return False, None
 
     def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
@@ -1363,7 +1376,8 @@ class Scheduler:
                 continue
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
-                self._last_dispatch_at[task_id] = time.monotonic()  # arm cooldown gate
+                if self._dispatch_cooldown_signal(task) is not None:  # arm cooldown gate
+                    self._last_dispatch_at[task_id] = time.monotonic()
                 self._dispatched_priority[task_id] = pri
                 self._task_start_times[task_id] = time.monotonic()
                 if task_id == top_id:
