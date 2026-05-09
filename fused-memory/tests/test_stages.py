@@ -6115,7 +6115,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
         @pytest.mark.asyncio
         async def test_cache_build_nondict_result_no_false_positives(
-            self, mock_deps_composition
+            self, mock_deps_composition, caplog
         ):
             """When get_task returns a non-dict, Guards 2 and 3 must NOT fire.
 
@@ -6182,6 +6182,10 @@ class TestTaskKnowledgeSyncStage2Guards:
                         stats={'tasks_modified': 5, 'memories_written': 1},
                     )),
                 ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
             ):
                 report = await stage.run(
                     events=[],
@@ -6201,3 +6205,14 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             # (d) tasks_modified is unchanged — no false decrements from Guard 3
             assert report.stats.get('tasks_modified') == 5
+
+            # (e) Pin the silent-skip contract: non-dict cache-build results must NOT
+            # emit a 'cache build' WARNING for task_id=99. The raised-exception branch
+            # DOES warn (see test_cache_build_failure_no_false_positives) — that
+            # differentiator is what this assertion guards. A future regression that
+            # either re-introduces a noisy warning for non-dict, or swallows a real
+            # exception while pretending it was non-dict, would be caught here.
+            assert not any(
+                'cache build' in r.getMessage() and 'task_id=99' in r.getMessage()
+                for r in caplog.records
+            )
