@@ -2,8 +2,6 @@
 
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 
-# Regression pin for the "truncated 8-char hex prefix silent no-op" claim
-# at lines ~74-78 below: fused-memory/tests/test_delete_memory_truncated_uuid.py
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
 consolidate memories across two stores:
