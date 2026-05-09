@@ -69,6 +69,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
 
 logger = logging.getLogger(__name__)
@@ -330,6 +331,41 @@ def build_suppression_payload(task_id: int | str) -> dict[str, Any]:
             'task_id': tid,
         },
     }
+
+
+async def write_suppression_record(
+    memory_service: Any,
+    *,
+    project_id: str,
+    task_id: int | str,
+    causation_id: str | None = None,
+) -> AddMemoryResponse:
+    """Write a ``stage1_flag_suppression`` record to Mem0 for *task_id*.
+
+    Builds the canonical payload via :func:`build_suppression_payload` (which
+    coerces *task_id* to ``int`` and pins ``metadata.kind``/``content``) then
+    calls ``memory_service.add_memory`` with *project_id* and *causation_id*
+    as separate write-time kwargs.
+
+    The ``_source='stage1_flag_suppression'`` sentinel distinguishes these
+    writes from ``'stage1_flag_dedup'`` and ``'targeted_recon'`` writes in the
+    audit journal, enabling per-class retention and query filtering.
+
+    Canonical schema (Mem0, observations_and_summaries category):
+      - ``metadata.kind = "stage1_flag_suppression"``
+      - ``metadata.task_id = <N>`` (int — coerced by build_suppression_payload)
+      - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
+
+    Returns the :class:`AddMemoryResponse` from the memory service so callers
+    can inspect ``memory_ids`` for empty-list deduplication / no-op detection.
+    """
+    payload = build_suppression_payload(task_id)
+    return await memory_service.add_memory(
+        **payload,
+        project_id=project_id,
+        causation_id=causation_id,
+        _source='stage1_flag_suppression',
+    )
 
 
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
