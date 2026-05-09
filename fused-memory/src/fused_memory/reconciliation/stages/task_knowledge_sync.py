@@ -169,15 +169,13 @@ def _suppress_same_run_human_operator_dups(
 
 # ── Stage 2 post-flight guard helpers (task 1137) ────────────────────────────
 
-# Agent-id written by BaseStage.run() into every LLM-emitted write op for
-# Stage 2.  This matches the recon_context block in base.py:125-126.
-_STAGE2_AGENT_ID = 'recon-stage-task_knowledge_sync'
-
 
 async def _classify_terminal_state_violations(
     ops: list[dict],
     taskmaster,
     project_root: str,
+    agent_id: str,
+    status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
     """Classify write_journal ops that mutated tasks already in a terminal state.
 
@@ -209,7 +207,7 @@ async def _classify_terminal_state_violations(
     """
     violations: list[dict] = []
     for op in ops:
-        if op.get('agent_id') != _STAGE2_AGENT_ID:
+        if op.get('agent_id') != agent_id:
             continue
         if op.get('operation') != 'update_task':
             continue
@@ -230,18 +228,21 @@ async def _classify_terminal_state_violations(
         if not task_id:
             continue
 
-        # Fetch live status — best-effort; skip op on exception
-        try:
-            task_data = await taskmaster.get_task(task_id, project_root)
-        except Exception:
-            logger.warning(
-                'reconciliation._classify_terminal_state_violations: '
-                'get_task failed for task_id=%s; skipping op',
-                task_id,
-            )
-            continue
+        if status_cache is not None:
+            live_status = status_cache.get(task_id, 'unknown')
+        else:
+            # Fallback: fetch live status individually (used in unit tests)
+            try:
+                task_data = await taskmaster.get_task(task_id, project_root)
+            except Exception:
+                logger.warning(
+                    'reconciliation._classify_terminal_state_violations: '
+                    'get_task failed for task_id=%s; skipping op',
+                    task_id,
+                )
+                continue
+            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
 
-        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
         if live_status in TERMINAL_STATUSES:
             violations.append({
                 'op_id': op.get('id'),
@@ -257,6 +258,8 @@ async def _verify_set_task_status_post_action(
     ops: list[dict],
     taskmaster,
     project_root: str,
+    agent_id: str,
+    status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
     """Verify that each Stage 2 set_task_status op actually took effect.
 
@@ -272,13 +275,17 @@ async def _verify_set_task_status_post_action(
         ops: Write-journal op dicts (``layer=='write_op'``).
         taskmaster: Taskmaster backend.
         project_root: Absolute path to the Taskmaster project directory.
+        agent_id: The agent_id string to filter ops on (derived from stage_id).
+        status_cache: Pre-fetched ``{task_id: live_status}`` dict built by
+            ``_apply_post_flight_guards``.  When provided, skips individual
+            ``taskmaster.get_task`` calls.
 
     Returns:
         List of ``{'op_id', 'task_id', 'target_status', 'live_status'}`` dicts.
     """
     mismatches: list[dict] = []
     for op in ops:
-        if op.get('agent_id') != _STAGE2_AGENT_ID:
+        if op.get('agent_id') != agent_id:
             continue
         if op.get('operation') != 'set_task_status':
             continue
@@ -299,17 +306,20 @@ async def _verify_set_task_status_post_action(
         if not task_id or not target_status:
             continue
 
-        try:
-            task_data = await taskmaster.get_task(task_id, project_root)
-        except Exception:
-            logger.warning(
-                'reconciliation._verify_set_task_status_post_action: '
-                'get_task failed for task_id=%s; skipping op',
-                task_id,
-            )
-            continue
+        if status_cache is not None:
+            live_status = status_cache.get(task_id, 'unknown')
+        else:
+            try:
+                task_data = await taskmaster.get_task(task_id, project_root)
+            except Exception:
+                logger.warning(
+                    'reconciliation._verify_set_task_status_post_action: '
+                    'get_task failed for task_id=%s; skipping op',
+                    task_id,
+                )
+                continue
+            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
 
-        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
         if live_status != target_status:
             mismatches.append({
                 'op_id': op.get('id'),
@@ -333,6 +343,8 @@ async def _check_stall_guard_freshness(
     ops: list[dict],
     taskmaster,
     project_root: str,
+    agent_id: str,
+    status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
     """Check that add_memory ops written against a snapshot status are still fresh.
 
@@ -349,13 +361,17 @@ async def _check_stall_guard_freshness(
         ops: Write-journal op dicts (``layer=='write_op'``).
         taskmaster: Taskmaster backend.
         project_root: Absolute path to the Taskmaster project directory.
+        agent_id: The agent_id string to filter ops on (derived from stage_id).
+        status_cache: Pre-fetched ``{task_id: live_status}`` dict built by
+            ``_apply_post_flight_guards``.  When provided, skips individual
+            ``taskmaster.get_task`` calls.
 
     Returns:
         List of ``{'op_id', 'task_id', 'snapshot_status', 'live_status'}`` dicts.
     """
     violations: list[dict] = []
     for op in ops:
-        if op.get('agent_id') != _STAGE2_AGENT_ID:
+        if op.get('agent_id') != agent_id:
             continue
         if op.get('operation') != 'add_memory':
             continue
@@ -388,17 +404,20 @@ async def _check_stall_guard_freshness(
         if snapshot_status is None:
             continue  # Op not opted into freshness checking
 
-        try:
-            task_data = await taskmaster.get_task(task_id, project_root)
-        except Exception:
-            logger.warning(
-                'reconciliation._check_stall_guard_freshness: '
-                'get_task failed for task_id=%s; skipping op',
-                task_id,
-            )
-            continue
+        if status_cache is not None:
+            live_status = status_cache.get(task_id, 'unknown')
+        else:
+            try:
+                task_data = await taskmaster.get_task(task_id, project_root)
+            except Exception:
+                logger.warning(
+                    'reconciliation._check_stall_guard_freshness: '
+                    'get_task failed for task_id=%s; skipping op',
+                    task_id,
+                )
+                continue
+            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
 
-        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
         if live_status != snapshot_status:
             violations.append({
                 'op_id': op.get('id'),
@@ -829,6 +848,9 @@ class TaskKnowledgeSync(BaseStage):
                 Guard 4 reads ``prior_reports[0].items_flagged``.
             run_id: Current reconciliation run identifier.
         """
+        # Derive agent_id from stage_id so it stays in sync with base.py:125.
+        _stage_agent_id = f'recon-stage-{self.stage_id.value}'
+
         # Fetch write_journal ops once; share across Guards 1-3.
         ops: list[dict] = []
         if self.journal is not None and self.journal.write_journal is not None:
@@ -843,10 +865,55 @@ class TaskKnowledgeSync(BaseStage):
                 )
                 ops = []
 
+        # Pre-fetch all unique task_ids referenced by stage-2 ops concurrently,
+        # building a shared status_cache so Guards 1-3 avoid N+1 get_task calls.
+        status_cache: dict[str, str] | None = None
+        if ops and self.taskmaster and self.project_root:
+            task_ids: set[str] = set()
+            for op in ops:
+                if op.get('agent_id') != _stage_agent_id:
+                    continue
+                params_raw = op.get('params') or '{}'
+                try:
+                    params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                operation = op.get('operation')
+                if operation in ('update_task', 'set_task_status'):
+                    tid = str(params.get('task_id', '')).strip()
+                    if tid:
+                        task_ids.add(tid)
+                elif operation == 'add_memory':
+                    meta = params.get('metadata') or {}
+                    if isinstance(meta, dict):
+                        tid = str(meta.get('task_id', '')).strip()
+                        if tid:
+                            task_ids.add(tid)
+
+            if task_ids:
+                fetch_results = await asyncio.gather(
+                    *(self.taskmaster.get_task(tid, self.project_root) for tid in task_ids),
+                    return_exceptions=True,
+                )
+                status_cache = {}
+                for tid, result in zip(task_ids, fetch_results, strict=True):
+                    if isinstance(result, BaseException):
+                        logger.warning(
+                            'reconciliation._apply_post_flight_guards: '
+                            'get_task failed for task_id=%s during cache build; '
+                            'guards will report unknown for this task',
+                            tid,
+                        )
+                        status_cache[tid] = 'unknown'
+                    else:
+                        status_cache[tid] = (
+                            _extract_status(result) if isinstance(result, dict) else 'unknown'
+                        )
+
         # Guard 1 — terminal-state pre-check
         if self.taskmaster and self.project_root:
             terminal_violations = await _classify_terminal_state_violations(
-                ops, self.taskmaster, self.project_root
+                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
             )
             if terminal_violations:
                 report.stats['not_applicable_count'] = (
@@ -871,7 +938,7 @@ class TaskKnowledgeSync(BaseStage):
         # Guard 2 — stall-guard freshness gate
         if self.taskmaster and self.project_root:
             freshness_violations = await _check_stall_guard_freshness(
-                ops, self.taskmaster, self.project_root
+                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
             )
             if freshness_violations:
                 report.stats['stall_guard_freshness_violations'] = (
@@ -893,7 +960,7 @@ class TaskKnowledgeSync(BaseStage):
         # Guard 3 — post-action set_task_status verification
         if self.taskmaster and self.project_root:
             sts_mismatches = await _verify_set_task_status_post_action(
-                ops, self.taskmaster, self.project_root
+                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
             )
             if sts_mismatches:
                 report.stats['set_task_status_post_action_mismatches'] = (

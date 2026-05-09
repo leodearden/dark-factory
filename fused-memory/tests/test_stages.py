@@ -5130,7 +5130,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(op_id='op-42', params={'task_id': '42'})]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project'
+                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
             )
 
             assert len(violations) == 1
@@ -5154,7 +5154,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 )
             ]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project'
+                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
             )
 
             assert violations == []
@@ -5168,7 +5168,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(params={'task_id': '7'})]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project'
+                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
             )
 
             assert violations == []
@@ -5297,7 +5297,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(op_id='op-sts-mismatch', params={'task_id': '7', 'status': 'done'})]
             mismatches = await _verify_set_task_status_post_action(
-                ops, taskmaster, '/project'
+                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
             )
 
             assert len(mismatches) == 1
@@ -5315,7 +5315,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(params={'task_id': '7', 'status': 'done'})]
             mismatches = await _verify_set_task_status_post_action(
-                ops, taskmaster, '/project'
+                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
             )
 
             assert mismatches == []
@@ -5445,7 +5445,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 op_id='op-stall-1',
                 metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
 
             assert len(violations) == 1
             v = violations[0]
@@ -5464,7 +5464,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 op_id='op-stall-alias',
                 metadata={'task_id': '11', 'observed_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
 
             assert len(violations) == 1
             assert violations[0]['snapshot_status'] == 'in-progress'
@@ -5478,7 +5478,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             ops = [self._make_add_memory_op(
                 metadata={'task_id': '11'},  # no snapshot_status key
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
 
             assert violations == []
             taskmaster.get_task.assert_not_called()
@@ -5492,7 +5492,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             ops = [self._make_add_memory_op(
                 metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
 
             assert violations == []
 
