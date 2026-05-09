@@ -1878,10 +1878,10 @@ async def test_done_provenance_resolves_short_sha_and_persists(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_note_only_accepted_and_persisted(
+async def test_done_provenance_note_only_rejected_for_found_on_main(
     taskmaster, reconciler, event_buffer
 ):
-    """A found_on_main note-only payload is accepted without git validation and persisted."""
+    """kind='found_on_main' without a commit is rejected (post-3092 hardening)."""
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
@@ -1892,13 +1892,10 @@ async def test_done_provenance_note_only_accepted_and_persisted(
         },
     )
 
-    assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    assert persisted['done_provenance'] == {
-        'kind': 'found_on_main',
-        'note': 'covered by parent task 1745',
-    }
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'commit' in result['reason'].lower()
+    taskmaster.set_task_status.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2058,6 +2055,27 @@ async def test_done_provenance_found_on_main_requires_note(
     assert result['success'] is False
     assert result['error'] == 'done_provenance_invalid'
     assert 'note' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_requires_commit(
+    taskmaster, reconciler, event_buffer
+):
+    """kind='found_on_main' without a commit is rejected (post-3092 hardening)."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project',
+        done_provenance={
+            'kind': 'found_on_main',
+            'note': 'covered by parent task 1745',
+        },
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'commit' in result['reason'].lower()
     taskmaster.set_task_status.assert_not_called()
 
 
