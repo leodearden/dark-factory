@@ -60,14 +60,6 @@ logger = logging.getLogger(__name__)
 # the global asyncio namespace.
 _sleep = asyncio.sleep
 
-# Peek window size for BacklogIterator's project_root resolution.
-# Large enough that an older event lacking `_project_root` doesn't force a
-# fallback when a later buffered event carries the key (see BacklogIterator.run).
-# See test_backlog_iterator_peek_window_finds_later_project_root_override — a
-# regression guard for the "later override past earlier eventless entries"
-# invariant; trips only if this is reduced below the small lower-bound setup
-# used by that test.
-_PROJECT_ROOT_PEEK_LIMIT = 10
 
 
 @dataclass
@@ -196,10 +188,9 @@ class ReconciliationHarness:
     def project_root(self) -> str:
         """Configured project root (from taskmaster config).
 
-        BacklogIterator and other internal helpers read this to obtain the
-        fallback project root when no event payload carries ``_project_root``.
-        Returns ``''`` when no taskmaster config is present — which is safe
-        because ``_fetch_filtered_task_tree`` short-circuits on empty strings.
+        Returns ``''`` when no taskmaster config is present.  Callers that need
+        the canonical root for a *project_id* should use
+        ``_known_project_root_for(project_id)`` instead (task 1143).
         """
         return self._project_root
 
@@ -239,34 +230,6 @@ class ReconciliationHarness:
                 f'Set DASHBOARD_KNOWN_PROJECT_ROOTS env var or add a '
                 f'TaskmasterConfig.project_root that resolves to a known project.'
             ) from None
-
-    def _resolve_project_root(self, events: list[ReconciliationEvent]) -> str:
-        """[DEPRECATED — task 1143] Return the project root for a batch of events.
-
-        .. deprecated:: task 1143
-            ``run_full_cycle`` now uses ``_known_project_root_for(project_id)``
-            exclusively.  This method is still called by ``BacklogIterator.run``
-            and will be deleted once step-8 (task 1143) migrates BacklogIterator
-            to ``_known_project_root_for``.  Do NOT add new callers.
-
-        Scans *all* events for the first ``_project_root`` payload key; falls
-        back to ``self._project_root`` (the configured value) when none carry
-        it.  Using a shared helper keeps the fallback semantics identical
-        between ``run_full_cycle`` (which iterates the full drained list) and
-        ``BacklogIterator`` (which peeks a limited window of events).
-
-        Args:
-            events: Sequence of events to scan.  May be empty.
-
-        Returns:
-            A non-empty project root string if one was found in the payload or
-            configured at init time; otherwise ``''``.
-        """
-        for ev in events:
-            pr = ev.payload.get('_project_root')
-            if pr:
-                return pr
-        return self._project_root
 
     def drain(self) -> None:
         """Signal the harness to stop starting new reconciliation cycles.
@@ -1317,8 +1280,8 @@ class BacklogIterator:
         # Snapshot: only process events that existed when we started.
         cutoff = datetime.now(UTC)
 
-        peeked_for_root = await self.buffer.peek_buffered(project_id, limit=_PROJECT_ROOT_PEEK_LIMIT, before=cutoff)
-        project_root = self.harness._resolve_project_root(peeked_for_root)
+        # task 1143: hard-bind project_root from registry — event payloads are informational only.
+        project_root = self.harness._known_project_root_for(project_id)
 
         assembler = ContextAssembler(
             memory_service=self.harness.memory,

@@ -375,8 +375,16 @@ async def test_harness_init_resolves_relative_project_root_to_absolute(
 async def test_run_full_cycle_uses_configured_project_root_when_events_lack_override(
     journal, event_buffer, mock_memory_service
 ):
-    """run_full_cycle should fall back to self._project_root, not project_id, when events lack _project_root."""
-    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    """run_full_cycle uses the registry-derived root for the cycle's project_id,
+    even when events carry no _project_root payload.
+
+    task 1143: updated from '/abs/from/config' to '/abs/from/dark-factory' so that
+    resolve_project_id derives 'dark_factory' from the basename and _known_projects
+    contains the key.  The new contract is: registry wins (not event payload, not
+    self._project_root fallback).  This test pins: events-without-payload still gets
+    the correct root via registry.
+    """
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/abs/from/dark-factory')
 
     # Push events with NO _project_root key in payload
     await event_buffer.push(_make_event('dark_factory'))
@@ -395,23 +403,25 @@ async def test_run_full_cycle_uses_configured_project_root_when_events_lack_over
 
     assert len(captured_roots) == 3
     for root in captured_roots:
-        assert root == '/abs/from/config', (
-            f"Expected project_root='/abs/from/config' but got '{root}'"
-            " — fallback should use self._project_root, not project_id"
+        assert root == '/abs/from/dark-factory', (
+            f"Expected project_root='/abs/from/dark-factory' (registry-derived) but got '{root}'"
+            " — run_full_cycle must use the registry-bound root for the cycle's project_id"
         )
 
 
 @pytest.mark.asyncio
-async def test_run_full_cycle_event_project_root_wins_over_configured(
+async def test_known_project_roots_wins_over_event_payload(
     journal, event_buffer, mock_memory_service
 ):
-    """Event _project_root should override the configured project_root (precedence invariant).
+    """KNOWN_PROJECT_ROOTS registry wins over event payload _project_root (precedence invariant).
 
-    This pins the guarantee that a configured project_root is only a fallback:
-    events that carry _project_root in their payload always take priority,
-    regardless of what TaskmasterConfig.project_root says.
+    task 1143: replaces test_run_full_cycle_event_project_root_wins_over_configured.
+    Under the new contract, the registry is the single source of truth.  Events
+    carrying _project_root='/from/event' while the registry maps dark_factory to
+    '/abs/from/dark-factory' must yield '/abs/from/dark-factory' — the event payload
+    is informational only and must not override the registry.
     """
-    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/from/config')
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/abs/from/dark-factory')
 
     # Push events whose payload carries a DIFFERENT project root
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
@@ -429,9 +439,12 @@ async def test_run_full_cycle_event_project_root_wins_over_configured(
 
     assert len(captured_roots) == 3
     for root in captured_roots:
-        assert root == '/from/event', (
-            f"Expected project_root='/from/event' (from event payload) but got '{root}'"
-            " — event-provided root must win over the configured fallback"
+        assert root == '/abs/from/dark-factory', (
+            f"Expected project_root='/abs/from/dark-factory' (registry-bound) but got '{root}'"
+            " — KNOWN_PROJECT_ROOTS must win over event payload _project_root (task 1143)"
+        )
+        assert root != '/from/event', (
+            "Event payload _project_root='/from/event' must not override the registry"
         )
 
 
@@ -3457,12 +3470,22 @@ async def test_backlog_iterator_run_hard_binds_via_known_projects(
 async def test_backlog_iterator_uses_harness_project_root_when_events_lack_override(
     journal, event_buffer, mock_memory_service
 ):
-    """BacklogIterator.run should pass harness.project_root to ContextAssembler
-    when peeked events carry no _project_root key in their payload."""
+    """BacklogIterator.run uses the registry-bound root for dark_factory even when
+    events carry no _project_root payload.
+
+    task 1143: project_root is now hard-bound via _known_project_root_for(project_id).
+    Event payload _project_root is informational only.  This test preserves the
+    'no payload → still gets a valid root' invariant, but the source is now
+    _known_projects, not harness.project_root.
+    """
     # Push one event with NO _project_root in payload
     await event_buffer.push(_make_event('dark_factory'))
 
     harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    # task 1143: inject dark_factory into _known_projects so _known_project_root_for
+    # succeeds.  The value matches the harness-configured root to preserve the
+    # original test's intent: when events lack the key, the configured root is used.
+    harness._known_projects['dark_factory'] = '/abs/from/config'
 
     captured: dict = {}
 
@@ -3482,39 +3505,26 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
 
     assert 'project_root' in captured, 'ContextAssembler was never constructed — iterator may not have run'
     assert captured['project_root'] == '/abs/from/config', (
-        f"Expected project_root='/abs/from/config' but got '{captured['project_root']}'"
-        " — BacklogIterator fallback should use harness.project_root, not project_id"
+        f"Expected project_root='/abs/from/config' (registry-bound) but got '{captured['project_root']}'"
     )
 
 
 @pytest.mark.asyncio
-async def test_backlog_iterator_peek_window_finds_later_project_root_override(
+async def test_backlog_iterator_registry_wins_regardless_of_mixed_event_payloads(
     journal, event_buffer, mock_memory_service
 ):
-    """Regression guard: a ``_project_root`` override on a later buffered event must be
-    found even when earlier events in the peek window lack the key.
+    """BacklogIterator uses the registry-bound root even when buffered events have
+    mixed payloads (some with _project_root, some without).
 
-    Uses a 2+1=3 event setup as a minimal lower bound: N=2 events without the key
-    before the override proves the resolver iterates past multiple eventless entries
-    (not just peeks-last), while staying far below any realistic peek-window size.
+    task 1143: replaced the old peek-window-based resolver with a direct lookup in
+    _known_project_root_for.  Event payload _project_root is now informational only —
+    the registry is always authoritative regardless of event content.
 
-    Scope note: this test does **not** guard against accidental narrowing of
-    ``_PROJECT_ROOT_PEEK_LIMIT``.  Detecting constant-narrowing is intentionally
-    out of scope so the test stays decoupled from the constant's specific value.
-    It will only fail for pathologically small windows (fewer than 3 events) — i.e.,
-    implementations that cannot scan past more than one eventless entry.
+    This replaces the former test_backlog_iterator_peek_window_finds_later_project_root_override
+    which guarded the dead-code peek-window width behavior.
     """
-    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 2 events that
-    # LACK _project_root with monotonically-increasing timestamps, then 1 event
-    # carrying _project_root='/from/event' with a strictly-later timestamp. With FIFO
-    # peek, the override event is returned LAST — so the resolver finds it only if the
-    # window is wide enough to include all 3 buffered events.
-    # N=2 earlier-without-key is the smallest number that proves the resolver
-    # iterates past multiple eventless entries, not just peeks-last.
-    # Anchor base_ts 60 seconds in the past so that peek_buffered's
-    # `WHERE timestamp < cutoff` clause (cutoff ≈ datetime.now(UTC) at run() time)
-    # includes all 3 events.  Explicit offsets avoid sub-microsecond tie flakiness.
     base_ts = datetime.now(UTC) - timedelta(seconds=60)
+    # Mix: 2 events without _project_root, 1 with a wrong value — registry must win.
     for i in range(2):
         await event_buffer.push(ReconciliationEvent(
             id=str(uuid.uuid4()),
@@ -3529,11 +3539,13 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
         type=EventType.task_status_changed,
         source=EventSource.agent,
         project_id='dark_factory',
-        timestamp=base_ts + timedelta(seconds=10),  # latest — FIFO peek returns last
+        timestamp=base_ts + timedelta(seconds=10),
         payload={'_project_root': '/from/event', 'task_id': '1'},
     ))
 
     harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    # task 1143: inject the registry entry for dark_factory.
+    harness._known_projects['dark_factory'] = '/abs/from/config'
 
     captured: dict = {}
 
@@ -3553,38 +3565,35 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     assert 'project_root' in captured, (
         'ContextAssembler was never constructed — iterator may not have run'
     )
-    assert captured['project_root'] == '/from/event', (
-        f"Expected project_root='/from/event' but got '{captured['project_root']}'. "
-        'The peek window must be wide enough to find a later-buffered _project_root '
-        'override past earlier events that lack the key.'
+    assert captured['project_root'] == '/abs/from/config', (
+        f"Expected registry-bound project_root='/abs/from/config' but got '{captured['project_root']}'. "
+        "Event payload _project_root must be ignored (task 1143 contract)."
+    )
+    assert captured['project_root'] != '/from/event', (
+        "BacklogIterator must not use event payload _project_root='/from/event' — registry wins"
     )
 
 
 @pytest.mark.asyncio
-async def test_backlog_iterator_event_project_root_wins_over_configured(
+async def test_known_project_roots_wins_over_event_payload_in_backlog_iterator(
     journal, event_buffer, mock_memory_service
 ):
-    """BacklogIterator.run should use the project_root from peeked events over
-    the harness-configured fallback (regression guard for task-927 invariant).
+    """BacklogIterator.run uses the registry-bound root, ignoring event payload _project_root.
 
-    Parallel to test_backlog_iterator_uses_harness_project_root_when_events_lack_override
-    but exercises the event-override path: events carry _project_root='/from/event'
-    while the harness is configured with '/from/config'.  The event value must win.
+    task 1143: replaces test_backlog_iterator_event_project_root_wins_over_configured.
+    Under the new KNOWN_PROJECT_ROOTS contract, the registry is the single source of truth.
+    Events carrying _project_root='/from/event' while the registry maps dark_factory to
+    '/from/registry' must yield '/from/registry' — the event payload is informational only.
 
-    Pure-precedence case: ALL buffered events carry _project_root — pins that event value
-    beats the configured fallback.  Contrast with
-    test_backlog_iterator_peek_window_finds_later_project_root_override, which uses
-    a mixed setup (events without the key + a later event with it) to probe peek-window width.
-
-    Peek-window semantics differ from run_full_cycle's full-drain coverage at
-    test_harness.py:341, making this a distinct regression guard.
+    Parallel to test_known_project_roots_wins_over_event_payload for run_full_cycle.
     """
-    # Push two events WITH _project_root key — both within the peek window
+    # Push two events WITH _project_root key — event payload must be IGNORED
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
 
-    # Build harness with a different configured root
+    # Build harness with a different configured root and inject registry with a third path
     harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/from/config')
+    harness._known_projects['dark_factory'] = '/from/registry'
 
     captured: dict = {}
 
@@ -3604,53 +3613,43 @@ async def test_backlog_iterator_event_project_root_wins_over_configured(
     assert 'project_root' in captured, (
         'ContextAssembler was never constructed — iterator may not have run'
     )
-    assert captured['project_root'] == '/from/event', (
-        f"Expected project_root='/from/event' but got '{captured['project_root']}'"
-        " — event-provided root must win over the configured fallback in BacklogIterator"
+    assert captured['project_root'] == '/from/registry', (
+        f"Expected registry-bound project_root='/from/registry' but got '{captured['project_root']}'. "
+        "KNOWN_PROJECT_ROOTS must win over both event payload and harness config (task 1143)."
+    )
+    assert captured['project_root'] != '/from/event', (
+        "BacklogIterator must not use event payload _project_root='/from/event'"
+    )
+    assert captured['project_root'] != '/from/config', (
+        "BacklogIterator must not use harness-configured project_root='/from/config'"
     )
 
 
 @pytest.mark.asyncio
-async def test_empty_fallback_resolves_and_short_circuits_filtered_task_tree(
+async def test_fetch_filtered_task_tree_short_circuits_on_empty_project_root(
     journal, event_buffer, mock_memory_service
 ):
-    """_resolve_project_root with no-override events returns '' and
-    _fetch_filtered_task_tree('') short-circuits without a taskmaster call.
+    """_fetch_filtered_task_tree('') short-circuits without a taskmaster call.
 
-    This chained assertion guards the full resolver → fetcher pipeline introduced
-    by task-927.  task-927 replaced project_id (e.g. 'dark_factory') with '' as
-    the fallback in _resolve_project_root.  That change is only 'strictly better'
-    because downstream _fetch_filtered_task_tree short-circuits on empty strings.
-    Splitting the assertion would leave a gap: a future refactor could reintroduce
-    project_id as fallback and _fetch_filtered_task_tree would silently start
-    hitting taskmaster again.
+    task 1143: _resolve_project_root was deleted; this test retains the fetcher
+    short-circuit guard (parts (b)+(c) of the former
+    test_empty_fallback_resolves_and_short_circuits_filtered_task_tree) which
+    is still meaningful — if project_root is '' for any reason, the fetcher must
+    not call taskmaster.get_tasks.
 
     test_harness.py:1827 (test_returns_empty_when_empty_project_root) covers the
-    fetch-level short-circuit in isolation; this test pins the resolver ↔ fetcher
-    contract so the full pipeline is protected.
+    same in isolation; keeping both guards different entry paths.
     """
     from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
-    # project_root=None → config.taskmaster=None → harness._project_root == ''
-    # harness.taskmaster = AsyncMock() (injected mock) so we can assert it was NOT called
     harness = _make_harness_927(journal, event_buffer, mock_memory_service, project_root=None)
 
-    # Events with NO _project_root key — triggers the fallback path
-    events = [_make_event('dark_factory'), _make_event('dark_factory')]
-
-    # (a) resolver returns '' — pins post-927 invariant (NOT 'dark_factory')
-    resolved = harness._resolve_project_root(events)
-    assert resolved == '', (
-        f"_resolve_project_root returned '{resolved}' but expected '' — "
-        "regression to old project_id fallback detected (task-927 invariant violated)"
-    )
-
-    # (b) fetcher returns empty tree when project_root is ''
+    # fetcher returns empty tree when project_root is ''
     result = await harness._fetch_filtered_task_tree('')
     assert isinstance(result, FilteredTaskTree)
     assert result.active_tasks == []
 
-    # (c) taskmaster.get_tasks was never called (short-circuit on empty project_root)
+    # taskmaster.get_tasks was never called (short-circuit on empty project_root)
     harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
 
