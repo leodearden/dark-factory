@@ -4,6 +4,7 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
+import uuid as _uuid_mod
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1498,9 +1499,6 @@ class TestBuildSuppressionPayload:
 # writers (flag-marker writes AND suppression-record writes).
 # Kept module-private — promoting to conftest is a future refactor.
 # ---------------------------------------------------------------------------
-
-import uuid as _uuid_mod
-
 
 class _MemoryResultStub:
     """Minimal stand-in for a Mem0 MemoryResult, accepts explicit content."""
