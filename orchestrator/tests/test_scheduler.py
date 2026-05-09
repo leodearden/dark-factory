@@ -1265,8 +1265,6 @@ class TestDispatchCooldownGate:
     """Tests for the per-task dispatch cooldown gate that prevents immediate
     re-grab after reconciliation reset or steward clear."""
 
-    import json as _json_module
-
     def _make_task_response(self, task: dict) -> dict:
         import json as _json
         return {
@@ -1436,6 +1434,11 @@ class TestDispatchCooldownGate:
 
         original_monotonic = _time_module.monotonic
 
+        # Patch time.monotonic globally (all callers — asyncio internals, lock_table
+        # lease/park clocks — also see the shifted value).  This is intentional: the
+        # test carries no reservations, so the only effect of the large offset is that
+        # expired-park pruning finds nothing to evict, which does not affect the
+        # cooldown assertion.  The +599/+601 offsets straddle the 600s window boundary.
         # --- just inside window (+599s): gate still active ---
         monkeypatch.setattr(
             _time_module, 'monotonic', lambda: original_monotonic() + 599.0
@@ -1575,8 +1578,10 @@ class TestDispatchCooldownGate:
 
         log_text = cooldown_records[0].getMessage()
         assert '99' in log_text, f'Task id "99" missing from log: {log_text!r}'
-        assert 'recon_reset_count' in log_text, (
-            f'Signal label "recon_reset_count" missing from log: {log_text!r}'
+        # Check the field-qualified form "signal=recon_reset_count" so a
+        # regression that selected a different signal label would fail here.
+        assert 'signal=recon_reset_count' in log_text, (
+            f'"signal=recon_reset_count" missing from log: {log_text!r}'
         )
         # remaining time should be a number — check any digit appears in the message
         import re

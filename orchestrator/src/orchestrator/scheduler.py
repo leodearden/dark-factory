@@ -910,7 +910,7 @@ class Scheduler:
           more than once (first reset is still allowed to dispatch).
         - ``steward_clear_at``: truthy value → steward stash-pop resolution.
         - ``recon_stage2_blocked_at``: truthy value → stage-2 block.
-        - ``reopen_reason`` containing the literal substring ``'steward'``.
+        - ``reopen_reason`` containing the substring ``'steward'`` (case-insensitive).
 
         Returns the signal label for use in operator-visible log messages.
         """
@@ -919,11 +919,18 @@ class Scheduler:
             return False, None
         elapsed = time.monotonic() - last_dispatch
         if elapsed >= self.config.dispatch_cooldown_secs:
+            # Entry is past the window and no longer affects behaviour — drop it
+            # to keep the dict bounded over long-running processes (e.g. tasks
+            # removed via remove_task without ever reaching a terminal status).
+            self._last_dispatch_at.pop(tid, None)
             return False, None
 
         metadata = task.get('metadata') or {}
 
-        # recon_reset_count > 1 (strict — first reset is allowed)
+        # recon_reset_count > 1 (strict — first reset is allowed).
+        # float() is used for type flexibility; bool values collapse to 1.0/0.0
+        # (True → gate NOT armed, False → 0.0 → gate NOT armed), which is the
+        # safe default. Non-finite floats compare > 1 as False, also safe.
         recon_count = metadata.get('recon_reset_count', 0)
         try:
             recon_count = float(recon_count)
@@ -940,9 +947,10 @@ class Scheduler:
         if metadata.get('recon_stage2_blocked_at'):
             return True, 'recon_stage2_blocked_at'
 
-        # reopen_reason containing literal substring 'steward' (case-sensitive)
+        # reopen_reason containing 'steward' (case-insensitive — field is
+        # human-authored prose and future producers may use different casing).
         reopen_reason = metadata.get('reopen_reason', '') or ''
-        if 'steward' in reopen_reason:
+        if 'steward' in reopen_reason.lower():
             return True, 'reopen_reason'
 
         return False, None
@@ -1282,6 +1290,11 @@ class Scheduler:
             # Dispatch cooldown gate: if the task was recently dispatched and
             # carries a reconciliation/steward signal, suppress re-dispatch
             # until the settle window elapses.  Both gates must pass.
+            # Note: cooldown-suppressed tasks intentionally bypass the fairness
+            # skip-bookkeeping machinery for the duration of the settle window.
+            # They are invisible to skip counters and parking logic until the
+            # window elapses, at which point they re-enter the normal candidate
+            # pool and can accumulate skips like any other task.
             cooldown_active, signal_label = self._dispatch_cooldown_active(t, tid_str)
             if cooldown_active:
                 remaining_secs = (
@@ -1289,13 +1302,11 @@ class Scheduler:
                     - (time.monotonic() - self._last_dispatch_at.get(tid_str, 0.0))
                 )
                 metadata = t.get('metadata') or {}
-                recon_reset_value = metadata.get('recon_reset_count', 0)
                 logger.info(
-                    'Task %s dispatch suppressed by cooldown: signal=%s,'
-                    ' recon_reset_count=%s, remaining=%.1fs',
+                    'Task %s dispatch suppressed by cooldown: signal=%s=%r, remaining=%.1fs',
                     tid_str,
                     signal_label,
-                    recon_reset_value,
+                    metadata.get(signal_label),
                     remaining_secs,
                 )
                 continue
