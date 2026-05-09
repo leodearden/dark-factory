@@ -119,9 +119,12 @@ async def dedup_flags(
 
             # (2) Write replacement marker first.  If this fails, skip the
             #     delete so all priors remain intact for next cycle.
+            #     Also check that Mem0 actually persisted the write (non-empty
+            #     memory_ids); a silent no-op (empty memory_ids) skips deletion
+            #     so priors are preserved for the next cycle.
             write_succeeded = False
             try:
-                await memory_service.add_memory(
+                response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -135,7 +138,14 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                write_succeeded = True
+                if getattr(response, 'memory_ids', None):
+                    write_succeeded = True
+                else:
+                    logger.warning(
+                        'flag_dedup: add_memory returned no memory_ids on HIT for task %s'
+                        ' flag_type %s — skipping prior deletion',
+                        tid, ftype,
+                    )
             except Exception as e:
                 logger.warning(
                     'flag_dedup: failed to write replacement marker for task %s flag_type %s: %s',
