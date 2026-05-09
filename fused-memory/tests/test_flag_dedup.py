@@ -133,8 +133,11 @@ def _assert_valid_stage1_marker(
 
 @pytest.mark.asyncio
 async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
-    """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id
-    and NO additional marker write is made (avoids monotonic marker accumulation).
+    """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id,
+    a replacement marker is written, and the prior is deleted (atomic-replacement contract).
+
+    Updated for task-1146: the old \"no write on HIT\" contract is replaced by
+    atomic-replacement (write new marker → delete prior).
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
@@ -145,10 +148,12 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
         'run_id': 'r0',
         'last_seen_run_id': 'r0',
     })
+    prior_marker.id = 'prior-42'
 
     memory_service = AsyncMock()
     memory_service.search = AsyncMock(return_value=[prior_marker])
     memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(return_value=None)
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
 
@@ -172,8 +177,9 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     query = memory_service.search.call_args.kwargs.get('query', '')
     assert '42' in query and 'missing_deliverable' in query
 
-    # (c) No refresh write — the prior marker is sufficient; skipping avoids N*M accumulation
-    memory_service.add_memory.assert_not_called()
+    # (c) Replacement marker written and prior deleted (atomic-replacement)
+    memory_service.add_memory.assert_called_once()
+    memory_service.delete_memory.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -399,10 +405,12 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     prior_marker = _make_memory_result(prior_metadata)
+    prior_marker.id = 'prior-malformed'
 
     memory_service = AsyncMock()
     memory_service.search = AsyncMock(return_value=[prior_marker])
     memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(return_value=None)
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
 
@@ -420,8 +428,10 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
         f"in prior marker metadata, but got {result[0].get('persisted_from_run')!r}."
     )
     assert result[0]['last_seen_run_id'] == 'r1'
-    # No new marker write — prior was found, no accumulation
-    memory_service.add_memory.assert_not_called()
+    # Atomic-replacement: replacement marker is written and prior is deleted even
+    # when run_id was malformed (annotation sentinel does not suppress the write).
+    memory_service.add_memory.assert_called_once()
+    memory_service.delete_memory.assert_called_once()
 
     # Sentinel-collapse path emits a DEBUG log — covers all three malformed shapes.
     # Loose enough to tolerate minor wording changes; strict enough to lock in the
@@ -484,6 +494,284 @@ async def test_dedup_flags_prior_marker_None_metadata_writes_new_marker():
     )
 
 
+# ---------------------------------------------------------------------------
+# Step 3 (task-1146) — atomic-replace: HIT writes new marker then deletes prior
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_prior_marker_atomic_replace_writes_new_and_deletes_prior():
+    """On HIT, dedup_flags writes a new marker and deletes the prior, in that order.
+
+    Pins the atomic-replacement contract introduced by task-1146:
+    (a) flag is annotated with persisted_from_run='r0' and last_seen_run_id='r1'
+    (b) add_memory called exactly once with a well-formed stage1_flag_marker for run_id='r1'
+    (c) delete_memory called exactly once with memory_id='prior-123', store='mem0'
+    (d) ordering invariant: add_memory call precedes delete_memory call in mock_calls
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'prior-123'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) annotation
+    assert len(result) == 1
+    assert result[0]['persisted_from_run'] == 'r0'
+    assert result[0]['last_seen_run_id'] == 'r1'
+
+    # (b) add_memory called once with valid marker for run_id='r1'
+    memory_service.add_memory.assert_called_once()
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args.kwargs,
+        task_id='42', flag_type='missing_deliverable', run_id='r1',
+    )
+
+    # (c) delete_memory called once for the prior
+    memory_service.delete_memory.assert_called_once()
+    del_kwargs = memory_service.delete_memory.call_args.kwargs
+    assert del_kwargs.get('memory_id') == 'prior-123'
+    assert del_kwargs.get('store') == 'mem0'
+    assert del_kwargs.get('project_id') == 'p'
+
+    # (d) ordering: add_memory before delete_memory.
+    # Use method_calls (records only actual method invocations, no attribute
+    # access) with exact name matching via call[0] so the check is immune to
+    # future child-mock interactions whose repr happens to contain 'add_memory'.
+    method_names = [c[0] for c in memory_service.method_calls]
+    add_idx = method_names.index('add_memory')
+    del_idx = method_names.index('delete_memory')
+    assert add_idx < del_idx, (
+        f'add_memory (idx {add_idx}) must precede delete_memory (idx {del_idx})'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 5 (task-1146) — atomic-replace collapses multiple predecessors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
+    """On HIT with multiple prior markers (past leakage), all priors are deleted.
+
+    Simulates N=3 prior markers for the same (task_id, flag_type) that exist
+    due to prior search-failure or top-N rank-eviction leakage.  dedup_flags
+    must write exactly ONE replacement marker and delete all THREE priors.
+
+    (a) add_memory called exactly once
+    (b) delete_memory called exactly three times covering ids {p-1, p-2, p-3}
+    (c) flag annotation uses the FIRST prior's run_id
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    def _prior(id_: str, run_id: str) -> MagicMock:
+        r = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': run_id,
+            'last_seen_run_id': run_id,
+        })
+        r.id = id_
+        return r
+
+    prior1 = _prior('p-1', 'r0')  # first found — annotation should come from this one
+    prior2 = _prior('p-2', 'r-prev')
+    prior3 = _prior('p-3', 'r-earlier')
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior1, prior2, prior3])
+    memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) exactly one write
+    memory_service.add_memory.assert_called_once()
+
+    # (b) exactly three deletes covering all prior ids
+    assert memory_service.delete_memory.call_count == 3, (
+        f'Expected 3 delete_memory calls but got {memory_service.delete_memory.call_count}'
+    )
+    deleted_ids = {
+        call.kwargs.get('memory_id')
+        for call in memory_service.delete_memory.call_args_list
+    }
+    assert deleted_ids == {'p-1', 'p-2', 'p-3'}, (
+        f'Expected all three prior ids deleted but got {deleted_ids}'
+    )
+
+    # (c) annotation from first prior
+    assert result[0]['persisted_from_run'] == 'r0'
+
+
+# ---------------------------------------------------------------------------
+# Step 7 (task-1146) — write-failure skips delete (predecessor preserved)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_atomic_replace_skips_delete_if_write_fails(caplog):
+    """When add_memory raises on the HIT path, delete_memory is never called.
+
+    Pins the write-first ordering guarantee: if the replacement write fails,
+    all priors must remain intact so the next cycle still has dedup state.
+
+    (a) dedup_flags does NOT raise
+    (b) delete_memory was NEVER called
+    (c) flag IS annotated (annotation extracted BEFORE write attempt)
+    (d) WARNING log mentions task_id, flag_type, and the failure
+    """
+    import logging as _logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'prior-write-fail'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write failed'))
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) does not raise
+    # (b) delete_memory never called — prior preserved
+    memory_service.delete_memory.assert_not_called()
+
+    # (c) flag IS annotated (annotation extracted before write attempt)
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+    # (d) WARNING log mentions task_id and flag_type
+    warning_messages = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+    assert any('42' in m for m in warning_messages), (
+        f'Expected WARNING mentioning task 42 but got: {warning_messages}'
+    )
+    assert any('missing_deliverable' in m for m in warning_messages), (
+        f'Expected WARNING mentioning flag_type but got: {warning_messages}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 9 (task-1146) — per-prior delete failure logs warning and continues
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_atomic_replace_per_prior_delete_failure_logs_warning_and_continues(caplog):
+    """One failing delete does not abort the batch; both priors get a delete attempt.
+
+    Configures two priors ('p-1', 'p-2'); delete_memory raises for 'p-1' but
+    succeeds for 'p-2'.  Pins the contract that a per-prior delete error:
+    (a) does NOT cause dedup_flags to raise
+    (b) add_memory is called exactly once (write succeeded)
+    (c) delete_memory is called exactly twice — both priors attempted
+    (d) WARNING log mentions 'p-1' and the failure
+    (e) flag is annotated normally
+    """
+    import logging as _logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    def _prior(id_: str, run_id: str) -> MagicMock:
+        r = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': run_id,
+            'last_seen_run_id': run_id,
+        })
+        r.id = id_
+        return r
+
+    prior1 = _prior('p-1', 'r0')
+    prior2 = _prior('p-2', 'r-prev')
+
+    def _delete_side_effect(**kwargs):
+        if kwargs.get('memory_id') == 'p-1':
+            raise RuntimeError('delete p-1 failed')
+        # p-2 succeeds — return None (AsyncMock awaitable returns None by default)
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[prior1, prior2])
+    memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(side_effect=_delete_side_effect)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(_logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) does not raise
+    # (b) add_memory called once
+    memory_service.add_memory.assert_called_once()
+
+    # (c) delete_memory called twice — both priors attempted
+    assert memory_service.delete_memory.call_count == 2, (
+        f'Expected 2 delete calls but got {memory_service.delete_memory.call_count}'
+    )
+
+    # (d) WARNING log mentions 'p-1'
+    warning_messages = [r.message for r in caplog.records if r.levelno >= _logging.WARNING]
+    assert any('p-1' in m for m in warning_messages), (
+        f'Expected WARNING mentioning p-1 but got: {warning_messages}'
+    )
+
+    # (e) flag annotated normally
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog):
     """When memory_service.add_memory raises, dedup_flags does not raise, returns flag unchanged,
@@ -515,4 +803,91 @@ async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog)
     assert any(
         '66' in record.message and record.levelno >= logging.WARNING
         for record in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 11 (task-1146) — two-consecutive-runs no-accumulation regression test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
+    """Regression: two successive dedup_flags calls for the same flag leave exactly 1 marker.
+
+    Uses a FakeMem0 in-memory store (self-contained, no external mocks) to
+    exercise the full add/search/delete cycle deterministically.
+
+    Run 1 (run_id='r1'): no prior exists → MISS branch → 1 marker stored.
+    Run 2 (run_id='r2'): prior found → HIT branch → write replacement, delete prior
+                         → still exactly 1 marker stored, with run_id='r2'.
+    """
+    import uuid as _uuid
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    class _MemoryRecord:
+        """Minimal stand-in for a Mem0 MemoryResult."""
+        def __init__(self, id_: str, metadata: dict) -> None:
+            self.id = id_
+            self.metadata = metadata
+            self.content = (
+                f"Stage 1 flag marker: task={metadata.get('task_id')} "
+                f"type={metadata.get('flag_type')} from run={metadata.get('run_id')}"
+            )
+
+    class FakeMem0:
+        """In-memory Mem0 stub with add_memory, search, and delete_memory."""
+
+        def __init__(self) -> None:
+            self._store: dict[str, _MemoryRecord] = {}
+
+        async def add_memory(self, *, metadata: dict, **_kwargs) -> dict:
+            id_ = str(_uuid.uuid4())
+            self._store[id_] = _MemoryRecord(id_, metadata)
+            return {'memory_ids': [id_]}
+
+        async def search(self, *, query: str = '', **_kwargs) -> list[_MemoryRecord]:
+            # Return all stored records (deterministic; query not used for filtering)
+            return list(self._store.values())
+
+        async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
+            self._store.pop(memory_id, None)
+
+        def count(self) -> int:
+            return len(self._store)
+
+        def latest_run_id(self) -> str | None:
+            """Return the run_id of the single stored marker (for assertion)."""
+            records = list(self._store.values())
+            if not records:
+                return None
+            return records[0].metadata.get('run_id')
+
+    fake = FakeMem0()
+    flag = {'task_id': '42', 'flag_type': 'missing_deliverable', 'description': 'foo'}
+
+    # Run 1 — MISS branch: no prior, writes one marker
+    await dedup_flags(
+        memory_service=fake,
+        project_id='p',
+        run_id='r1',
+        flags=[flag],
+    )
+    assert fake.count() == 1, (
+        f'After run 1: expected 1 marker but got {fake.count()}'
+    )
+
+    # Run 2 — HIT branch: prior found, replacement written, prior deleted
+    await dedup_flags(
+        memory_service=fake,
+        project_id='p',
+        run_id='r2',
+        flags=[flag],
+    )
+    assert fake.count() == 1, (
+        f'After run 2: expected 1 marker (no accumulation) but got {fake.count()}'
+    )
+    assert fake.latest_run_id() == 'r2', (
+        f"Surviving marker must have run_id='r2' but got {fake.latest_run_id()!r}"
     )
