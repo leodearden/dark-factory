@@ -185,6 +185,11 @@ async def _track_flag_persistence(
     3. Returns ``{flag_id: prior_count + 1}`` where the "+1" accounts for the
        current cycle.
 
+    Count reads are issued in parallel via ``asyncio.gather`` (no ordering
+    constraint); marker writes are also parallelised.  Both phases use
+    ``return_exceptions=True`` so a single Qdrant failure degrades gracefully
+    rather than aborting the whole batch.
+
     On count failure: prior_count defaults to 0 so the cycle count is 1.
     On add_memory failure: the count is still returned (write is best-effort).
     Both failures log WARNING.
@@ -197,50 +202,59 @@ async def _track_flag_persistence(
     if not flag_ids:
         return {}
 
-    counts: dict[str, int] = {}
-    for flag_id in flag_ids:
-        # ── count prior markers (deterministic metadata-filtered count) ──────
-        prior_count = 0
-        try:
-            prior_count = await memory_service.count_memories_by_metadata(
+    # ── count phase (parallel) ───────────────────────────────────────────────
+    count_results = await asyncio.gather(
+        *(
+            memory_service.count_memories_by_metadata(
                 project_id=project_id,
-                filters={
-                    'source': _STAGE2_PERSISTENCE_MARKER_SOURCE,
-                    'flag_id': flag_id,
-                },
+                filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE, 'flag_id': fid},
             )
-        except Exception:
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
+    prior_counts: dict[str, int] = {}
+    for fid, result in zip(flag_ids, count_results):
+        if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._track_flag_persistence: count failed for flag_id=%s; '
                 'treating prior_count as 0',
-                flag_id,
-                extra={'project_id': project_id, 'flag_id': flag_id},
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
             )
+            prior_counts[fid] = 0
+        else:
+            prior_counts[fid] = result
 
-        # ── write this-cycle marker ──────────────────────────────────────────
-        try:
-            await memory_service.add_memory(
-                content=f'Stage 2 flag-persistence marker: flag_id={flag_id} run={run_id}',
+    # ── write phase (parallel) ───────────────────────────────────────────────
+    write_results = await asyncio.gather(
+        *(
+            memory_service.add_memory(
+                content=f'Stage 2 flag-persistence marker: flag_id={fid} run={run_id}',
                 category='observations_and_summaries',
                 project_id=project_id,
                 metadata={
                     'source': _STAGE2_PERSISTENCE_MARKER_SOURCE,
-                    'flag_id': flag_id,
+                    'flag_id': fid,
                     'run_id': run_id,
                 },
                 causation_id=run_id,
                 _source='stage2_flag_relay',
             )
-        except Exception:
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
+    for fid, result in zip(flag_ids, write_results):
+        if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._track_flag_persistence: add_memory failed for flag_id=%s; '
                 'count still returned',
-                flag_id,
-                extra={'project_id': project_id, 'flag_id': flag_id},
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
             )
 
-        counts[flag_id] = prior_count + 1
-    return counts
+    return {fid: prior_counts[fid] + 1 for fid in flag_ids}
 
 
 async def _filter_already_escalated_flags(
@@ -256,34 +270,39 @@ async def _filter_already_escalated_flags(
     :func:`_track_flag_persistence` — to avoid escalating the same flag every
     cycle when FIX C deletion fails (reviewer note on FIX D, task 1139).
 
-    On count failure: the flag is treated as NOT already-escalated (i.e. it
-    surfaces in *newly_escalating*).  This is fail-loud-via-escalation: a
-    transient Qdrant glitch causes one extra escalation, not silent
-    suppression of a real one.
+    Counts are issued in parallel via ``asyncio.gather``.  On count failure:
+    the flag is treated as NOT already-escalated (i.e. it surfaces in
+    *newly_escalating*).  This is fail-loud-via-escalation: a transient Qdrant
+    glitch causes one extra escalation, not silent suppression of a real one.
     """
+    if not flag_ids:
+        return [], []
+
+    count_results = await asyncio.gather(
+        *(
+            memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters={'source': _STAGE2_ESCALATION_MARKER_SOURCE, 'flag_id': fid},
+            )
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
     newly: list[str] = []
     already: list[str] = []
-    for flag_id in flag_ids:
-        try:
-            count = await memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters={
-                    'source': _STAGE2_ESCALATION_MARKER_SOURCE,
-                    'flag_id': flag_id,
-                },
-            )
-        except Exception:
+    for fid, result in zip(flag_ids, count_results):
+        if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._filter_already_escalated_flags: count failed for '
                 'flag_id=%s; treating as newly-escalating',
-                flag_id,
-                extra={'project_id': project_id, 'flag_id': flag_id},
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
             )
-            count = 0
-        if count > 0:
-            already.append(flag_id)
+            newly.append(fid)
+        elif result > 0:
+            already.append(fid)
         else:
-            newly.append(flag_id)
+            newly.append(fid)
     return newly, already
 
 
@@ -299,32 +318,41 @@ async def _write_escalation_markers(
     these markers via a metadata-filtered Qdrant count, suppressing duplicate
     escalations even when the LLM fails to delete the underlying flag.
 
-    Best-effort: write failures log WARNING but do not raise — at worst this
-    produces one duplicate escalation next cycle, never silent suppression.
+    Writes are issued in parallel via ``asyncio.gather``.  Best-effort: write
+    failures log WARNING but do not raise — at worst this produces one duplicate
+    escalation next cycle, never silent suppression.
     """
-    for flag_id in flag_ids:
-        try:
-            await memory_service.add_memory(
+    if not flag_ids:
+        return
+
+    write_results = await asyncio.gather(
+        *(
+            memory_service.add_memory(
                 content=(
-                    f'Stage 2 escalation marker: flag_id={flag_id} '
+                    f'Stage 2 escalation marker: flag_id={fid} '
                     f'escalated in run={run_id}'
                 ),
                 category='observations_and_summaries',
                 project_id=project_id,
                 metadata={
                     'source': _STAGE2_ESCALATION_MARKER_SOURCE,
-                    'flag_id': flag_id,
+                    'flag_id': fid,
                     'run_id': run_id,
                 },
                 causation_id=run_id,
                 _source='stage2_flag_relay',
             )
-        except Exception:
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
+    for fid, result in zip(flag_ids, write_results):
+        if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._write_escalation_markers: add_memory failed for '
                 'flag_id=%s; next cycle may re-escalate',
-                flag_id,
-                extra={'project_id': project_id, 'flag_id': flag_id},
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
             )
 
 
