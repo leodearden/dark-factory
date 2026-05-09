@@ -241,7 +241,13 @@ class ReconciliationHarness:
             ) from None
 
     def _resolve_project_root(self, events: list[ReconciliationEvent]) -> str:
-        """Return the project root for a batch of events.
+        """[DEPRECATED — task 1143] Return the project root for a batch of events.
+
+        .. deprecated:: task 1143
+            ``run_full_cycle`` now uses ``_known_project_root_for(project_id)``
+            exclusively.  This method is still called by ``BacklogIterator.run``
+            and will be deleted once step-8 (task 1143) migrates BacklogIterator
+            to ``_known_project_root_for``.  Do NOT add new callers.
 
         Scans *all* events for the first ``_project_root`` payload key; falls
         back to ``self._project_root`` (the configured value) when none carry
