@@ -823,17 +823,20 @@ it). Required shape:
         id=<task>, status="done", project_root=<root>,
         done_provenance={
             "kind": "found_on_main",
+            "commit": "<landing sha>",
             "note": "<why this task is already covered>",
-            "commit": "<optional landing commit>",
         },
     )
 
-Before calling, identify the impl-providing commit(s):
+Both `commit` and `note` are required. Before calling, identify the
+impl-providing commit and verify it is on main:
 
     git -C <project_root> log main --oneline -- <relevant_paths>
+    git -C <project_root> merge-base --is-ancestor <sha> main && echo on-main
 
-Cite the commit(s) and the providing-task id (when known) in `note`. The
-server does NOT ancestor-check this kind — your `note` is the audit trail.
+Cite the commit and the providing-task id (when known) in `note`. The
+server runs the same `git merge-base --is-ancestor` check as a backstop
+for this kind too (post-3092 phantom-done hardening, 2026-05-09).
 
 ### Forbidden
 
