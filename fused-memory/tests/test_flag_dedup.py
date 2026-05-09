@@ -1231,6 +1231,46 @@ class TestFilterSuppressed:
         assert result[0] == flags[0]
 
 
+# ---------------------------------------------------------------------------
+# task-1186 step-3 — filter_suppressed: search exception → pass-through + WARNING
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_search_exception_returns_flags_unchanged_and_warns(caplog):
+    """Search exception in filter_suppressed → conservative pass-through + WARNING.
+
+    When memory_service.search raises, filter_suppressed must:
+    (a) NOT raise
+    (b) return both flags unchanged
+    (c) emit at least one WARNING log mentioning the failure and the function name
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+
+    flags = [
+        {'task_id': '55', 'flag_type': 'stale_metadata'},
+        {'task_id': '66', 'flag_type': 'missing_deliverable'},
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await filter_suppressed(memory_service, 'p', flags)
+
+    # (a) Does NOT raise
+    # (b) Returns both flags unchanged
+    assert result == flags
+    # (c) At least one WARNING log mentions failure and filter_suppressed
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'filter_suppressed' in m
+        for m in warning_messages
+    ), f'Expected WARNING mentioning filter_suppressed but got: {warning_messages}'
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
     """Regression: two successive dedup_flags calls for the same flag leave exactly 1 marker.
