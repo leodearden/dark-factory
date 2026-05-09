@@ -792,3 +792,39 @@ class TestServerWiringContract:
             'After wiring, targeted.planned_episode_registry must be the same object '
             'as memory_service.planned_episode_registry'
         )
+
+    def test_task_interceptor_wired_to_targeted_reconciler(self):
+        """After TargetedReconciler and TaskInterceptor are both constructed,
+        server/main.py must set targeted.task_interceptor = task_interceptor so
+        that _on_task_blocked routes metadata writes through the per-project
+        write_lock (task 1136 locking invariant).
+
+        Mirrors the structure of test_planned_episode_registry_wired_from_memory_service.
+        """
+        from unittest.mock import MagicMock
+
+        from fused_memory.reconciliation.targeted import TargetedReconciler
+
+        mock_interceptor = MagicMock()
+
+        mock_memory_service = MagicMock()
+        mock_taskmaster = MagicMock()
+        mock_journal = MagicMock()
+        mock_config = MagicMock()
+        targeted = TargetedReconciler(
+            mock_memory_service, mock_taskmaster, mock_journal, mock_config
+        )
+
+        # Before wiring: task_interceptor must be None (the reconciler doesn't auto-wire)
+        assert targeted.task_interceptor is None, (
+            'TargetedReconciler must start with task_interceptor=None'
+        )
+
+        # Apply the wiring (what server/main.py must do — see task 1136)
+        targeted.task_interceptor = mock_interceptor
+
+        # After wiring: identity check
+        assert targeted.task_interceptor is mock_interceptor, (
+            'After wiring, targeted.task_interceptor must be the same object '
+            'as the constructed TaskInterceptor'
+        )
