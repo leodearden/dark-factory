@@ -3388,6 +3388,68 @@ async def test_run_pipeline_defers_on_all_accounts_capped(
     )
 
 
+# ── Tests for Task 1143: BacklogIterator hard-bind via KNOWN_PROJECT_ROOTS ──
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_run_hard_binds_via_known_projects(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run must derive project_root from _known_project_root_for, not from event payload.
+
+    Build a harness with _known_projects containing autopilot_video and dark_factory.
+    Push events for autopilot_video with _project_root='/wrong/path' to prove the
+    event payload is ignored. Verify ContextAssembler receives the registry-bound root
+    '/home/leo/src/autopilot-video', NOT '/wrong/path' and NOT dark-factory's path.
+
+    This test fails before step-8 because BacklogIterator.run still calls
+    self.harness._resolve_project_root(peeked_for_root) which returns the event payload.
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {
+            'autopilot_video': '/home/leo/src/autopilot-video',
+            'dark_factory': '/home/leo/src/dark-factory',
+        },
+    )
+
+    wrong_path = '/wrong/path'
+    # Push events with deliberately wrong _project_root in payload.
+    for _ in range(3):
+        await event_buffer.push(_make_event_with_root('autopilot_video', wrong_path))
+
+    captured: dict = {}
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('autopilot_video')
+
+    assert 'project_root' in captured, (
+        'ContextAssembler was never constructed — BacklogIterator.run may not have run'
+    )
+    expected = '/home/leo/src/autopilot-video'
+    assert captured['project_root'] == expected, (
+        f"Expected project_root={expected!r} (registry-bound) "
+        f"but got {captured['project_root']!r} — "
+        "event payload _project_root must be ignored by BacklogIterator"
+    )
+    assert captured['project_root'] != '/home/leo/src/dark-factory', (
+        "BacklogIterator must not receive dark-factory's path for autopilot_video"
+    )
+    assert captured['project_root'] != wrong_path, (
+        "BacklogIterator must ignore event payload _project_root='/wrong/path'"
+    )
+
+
 # ── Tests for Task 927: BacklogIterator project_root fallback ─────────
 
 
