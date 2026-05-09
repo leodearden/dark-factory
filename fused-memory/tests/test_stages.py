@@ -26,6 +26,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -4640,4 +4641,37 @@ class TestStage3PayloadIncludesProjectRoot:
         assert 'Use project_root="/home/leo/src/dark-factory"' in payload, (
             f'Stage 3 payload for dark_factory must contain Use project_root="..." directive. '
             f'Got payload:\n{payload[:500]}'
+        )
+
+
+class TestStage1PromptForbidsAddEpisodeForTemporalFacts:
+    """Pin the contract that STAGE1_SYSTEM_PROMPT explicitly forbids add_episode
+    for recurring temporal-fact / status-snapshot writes (Part A, step-1).
+    """
+
+    def test_add_episode_prohibition_in_temporal_snapshot_section(self):
+        """The prompt must contain 'add_episode' AND a prohibition ('do not'/'never')
+        within the same section that covers recurring temporal-fact / snapshot writes.
+        The Task-count Snapshots section or Snapshot Discipline section must carry
+        this explicit prohibition so Stage 1 cannot fall back to add_episode for
+        snapshot writes.
+        """
+        section = _extract_section(STAGE1_SYSTEM_PROMPT, '## Snapshot Discipline')
+        # If the dedicated section exists, check it; otherwise look for adjacent content.
+        if not section:
+            section = _extract_section(
+                STAGE1_SYSTEM_PROMPT, '## Task-count Snapshots'
+            )
+        assert section, (
+            'STAGE1_SYSTEM_PROMPT must have a ## Snapshot Discipline or '
+            '## Task-count Snapshots section'
+        )
+        assert 'add_episode' in section, (
+            "The snapshot section must mention 'add_episode' (to prohibit it)"
+        )
+        section_lower = section.lower()
+        has_prohibition = 'do not' in section_lower or 'never' in section_lower
+        assert has_prohibition, (
+            "The snapshot section must explicitly say 'do not' or 'never' near "
+            "'add_episode' to forbid its use for recurring temporal-fact writes"
         )
