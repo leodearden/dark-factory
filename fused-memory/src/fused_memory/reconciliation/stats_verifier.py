@@ -41,6 +41,23 @@ _OP_TO_STAT: dict[str, str] = {
     'replay_to_graphiti': 'episodes_replayed',
 }
 
+# Alias map: alternative stat-key names that the LLM may emit, mapped to their
+# canonical key. The verifier writes the observed value to BOTH the canonical
+# key and each of its aliases so Stage 3's comparison sees a consistent picture.
+_STAT_ALIASES: dict[str, str] = {
+    'memories_written': 'memories_added',
+}
+
+# Stat keys the verifier writes back to stage stats. Includes virtual keys
+# derived from ops rather than mapped 1:1 in _OP_TO_STAT (e.g.
+# graphiti_writes_queued, which is the residual of add_memory ops where
+# memory_ids is empty but stores includes graphiti), plus all alias keys.
+_TRACKED_STAT_KEYS: frozenset[str] = (
+    frozenset(_OP_TO_STAT.values())
+    | {'graphiti_writes_queued'}
+    | frozenset(_STAT_ALIASES)
+)
+
 
 def _parse_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
@@ -86,19 +103,38 @@ def _count_update_edge(op: dict) -> bool:
 def _count_add_memory(op: dict) -> bool:
     """Return True if the add_memory op actually produced a stored memory.
 
-    Mem0 may dedup a write and return an empty ``memory_ids`` list. Graphiti
-    writes are enqueued asynchronously and don't produce IDs inline — we fall
-    back to ``stores_written`` to know whether at least one backend accepted the
-    write. An op that reached neither store is a no-op and must not count.
+    Mem0 may dedup a write and return an empty ``memory_ids`` list. Only ops
+    where ``memory_ids`` is a non-empty list count toward ``memories_added``.
+    Graphiti-only async-enqueued writes (``memory_ids=[]``, ``stores=['graphiti']``)
+    are tracked separately under ``graphiti_writes_queued`` via ``_count_graphiti_queued``.
+    An op that reached neither store with a returned ID is a no-op here.
+    """
+    if not op.get('success', 1):
+        return False
+    rs = _parse_result_summary(op.get('result_summary'))
+    memory_ids = rs.get('memory_ids')
+    return bool(isinstance(memory_ids, list) and memory_ids)
+
+
+def _count_graphiti_queued(op: dict) -> bool:
+    """Return True if the add_memory op was a graphiti-only async enqueue.
+
+    Graphiti writes are enqueued asynchronously and return no ``memory_ids``
+    inline. An op counts as a graphiti-only enqueue iff it succeeded,
+    ``memory_ids`` is empty (so it was not counted toward ``memories_added``),
+    and ``stores``/``stores_written`` contains ``'graphiti'``. These are
+    tallied separately under ``graphiti_writes_queued`` rather than
+    ``memories_added`` to avoid inflating the memories count.
     """
     if not op.get('success', 1):
         return False
     rs = _parse_result_summary(op.get('result_summary'))
     memory_ids = rs.get('memory_ids')
     if isinstance(memory_ids, list) and memory_ids:
-        return True
+        # Non-empty IDs: this op is a memories_added, not a graphiti enqueue.
+        return False
     stores = rs.get('stores') or rs.get('stores_written')
-    return bool(isinstance(stores, list) and stores)
+    return bool(isinstance(stores, list) and 'graphiti' in stores)
 
 
 def _stage_window(report: StageReport | dict) -> tuple[datetime | None, datetime | None]:
@@ -160,8 +196,16 @@ def _observed_counts(ops: list[dict]) -> dict[str, int]:
         if stat_key is None:
             continue
         if operation == 'add_memory':
-            if not _count_add_memory(op):
-                continue
+            if _count_add_memory(op):
+                counts[stat_key] = counts.get(stat_key, 0) + 1
+            elif _count_graphiti_queued(op):
+                # Graphiti-only async enqueue: no inline ID, but store accepted
+                # the write. Track separately so it doesn't inflate memories_added.
+                counts['graphiti_writes_queued'] = (
+                    counts.get('graphiti_writes_queued', 0) + 1
+                )
+            # Either path accounts for the op — skip the generic counter.
+            continue
         elif operation == 'update_edge':
             if not _count_update_edge(op):
                 continue
@@ -190,13 +234,23 @@ def _apply_observed(
             report['stats'] = stats
 
     reported_snapshot: dict[str, Any] = {}
-    for stat_key in set(_OP_TO_STAT.values()):
+
+    # Write canonical keys first so the alias pass can read the canonical
+    # observed value without needing to compute it twice.
+    canonical_keys = _TRACKED_STAT_KEYS - frozenset(_STAT_ALIASES)
+    for stat_key in canonical_keys:
         # Always record the observed value — zero is meaningful (means "no
         # writes happened for this op"). Only snapshot the original when it
         # actually existed, to avoid polluting with spurious None entries.
         if stat_key in stats:
             reported_snapshot[stat_key] = stats[stat_key]
         stats[stat_key] = observed.get(stat_key, 0)
+
+    # Write alias keys to the same observed value as their canonical counterpart.
+    for alias_key, canonical_key in _STAT_ALIASES.items():
+        if alias_key in stats:
+            reported_snapshot[alias_key] = stats[alias_key]
+        stats[alias_key] = stats[canonical_key]
 
     if reported_snapshot:
         stats['_reported'] = reported_snapshot

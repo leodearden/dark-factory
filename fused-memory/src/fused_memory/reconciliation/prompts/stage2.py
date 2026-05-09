@@ -118,6 +118,13 @@ response. An empty list means Mem0 deduplicated or filtered the write and no new
 was created — count it as a no-op, not a successful addition. Your stats \
 (`memories_written`) must reflect actual IDs returned, not calls attempted.
 
+Graphiti-only async-enqueued writes show `stores: ['graphiti']` in the response but \
+return `memory_ids: []` because the write is queued rather than persisted inline. These \
+must NOT be counted under `memories_written`. Report them instead under a separate \
+`graphiti_writes_queued` stat. The stats verifier enforces this split independently and \
+will override any inflated `memories_written` count, but you should report it correctly \
+from the start to avoid divergence.
+
 **Per-Cycle Summary Uniqueness**: when writing your final per-cycle summary via \
 `add_memory`, the content string MUST include all three of: (1) the reconciliation \
 `run_id` (provided in the payload context), (2) the full list of `flag_id` UUIDs \
