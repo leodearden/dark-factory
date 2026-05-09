@@ -5033,8 +5033,8 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
         stage.project_id = 'dark_factory'
 
         _now = datetime.now(tz=UTC)
-        # Use StageId.task_knowledge_sync (a real-but-wrong stage) so the guard at
-        # task_knowledge_sync.py:477 fires before any dedup logic runs.
+        # Use StageId.task_knowledge_sync (a real-but-wrong stage) so the
+        # prior_reports[0].stage guard fires before any dedup logic runs.
         wrong_stage_report = StageReport(
             stage=StageId.task_knowledge_sync,
             started_at=_now,
