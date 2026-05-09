@@ -233,9 +233,10 @@ root cause without being spammed by repeat alarms.
 
 ## Same-Run Stage 1 human_operator_required Suppression
 Do not re-emit a finding already marked `human_operator_required` by Stage 1 in the \
-same run unless Stage 2 has new evidence not present in Stage 1's description. If the \
-flag recurs across runs, increment a `recurrence_count` in the existing memory marker \
-instead of writing a new finding.
+same run. If you have new evidence about an existing finding, attach it to the existing \
+memory marker via `recurrence_count` rather than writing a new finding. If the flag \
+recurs across runs, increment `recurrence_count` in the existing memory marker instead \
+of writing a new finding.
 
 The Python harness enforces this dedup as defence-in-depth: after the LLM returns, \
 the post-processor drops any Stage 2 item whose `(task_id, flag_type, \

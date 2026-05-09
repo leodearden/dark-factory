@@ -4868,6 +4868,17 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
         assert len(report.items_flagged) == 1
         assert report.items_flagged[0]['description'] == 's2 unique'
 
+        # Key-based assertion: the suppressed (task_id, flag_type) must be absent
+        # (suggestion 4 — description-only assertion would miss a wrong-item drop)
+        assert not any(
+            (it['task_id'], it['flag_type']) == ('99', 'assumption_invalid')
+            and it.get('resolution_status') == 'human_operator_required'
+            for it in report.items_flagged
+        )
+
+        # suppressed_count recorded in stats (suggestion 2)
+        assert report.stats.get('stage2_stage1_dups_suppressed') == 1
+
         # INFO log with suppressed_count should have fired
         target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
         suppression_logs = [
