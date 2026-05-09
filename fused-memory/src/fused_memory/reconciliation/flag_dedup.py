@@ -16,6 +16,16 @@ Note: this module does **not** suppress persistent flags before Stage 2 sees
 them; suppression logic lives in Stage 2's prompt instructions which direct
 the LLM to soft-handle annotated flags.
 
+Authoritative suppression gate (task-1186)
+------------------------------------------
+``dedup_flags`` now calls ``filter_suppressed`` as its **first step**, before
+the existing signature-dedup loop.  ``filter_suppressed`` performs one
+project-scoped Mem0 search per ``dedup_flags`` call to retrieve all active
+``stage1_flag_suppression`` records.  Flags whose ``task_id`` matches a
+suppression record are dropped entirely; the remaining flags proceed through
+the signature-dedup loop unchanged.  This enforces the suppression contract
+in code, making it authoritative over the LLM-side prompt directive.
+
 Best-effort replacement contract (task-1146, hardened in task-1165)
 --------------------------------------------------------------------
 On every HIT the dedup flow is:
@@ -48,8 +58,11 @@ cycles.
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
-- ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, does
-  Mem0 search + write + delete; best-effort (exceptions are logged, not raised).
+- ``filter_suppressed(memory_service, project_id, flags)`` — async, one
+  project-scoped Mem0 search; drops suppressed flags before signature dedup.
+- ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
+  ``filter_suppressed`` first then does Mem0 search + write + delete per flag;
+  best-effort (exceptions are logged, not raised).
 """
 from __future__ import annotations
 
@@ -59,6 +72,59 @@ from typing import Any
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
 
 logger = logging.getLogger(__name__)
+
+
+async def filter_suppressed(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop flags whose ``task_id`` has an active ``stage1_flag_suppression`` record.
+
+    Performs one project-scoped Mem0 search per call to retrieve all active
+    suppression records.  Suppressed task_ids are extracted into a set; flags
+    whose ``task_id`` is in that set are dropped.  The remaining flags are
+    returned unchanged so they can proceed through the signature-dedup loop.
+
+    Canonical suppression record schema (owned by the producer task):
+    - ``metadata.kind == "stage1_flag_suppression"``
+    - ``metadata.task_id == <N>`` (int or str; coerced to str on both sides)
+
+    Both fields must be present and correct for a record to be treated as a
+    suppression — this rejects vector-search near-misses that only match on
+    semantic proximity.
+
+    On search exception: logs a WARNING and returns *flags* unchanged
+    (conservative pass-through — treats as "no suppression in effect").
+    """
+    if not flags:
+        return []
+
+    try:
+        results = await memory_service.search(
+            query='stage1_flag_suppression',
+            project_id=project_id,
+            categories=['observations_and_summaries'],
+            stores=['mem0'],
+            limit=50,
+        )
+    except Exception as e:
+        logger.warning(
+            'filter_suppressed search failed for project %s: %s', project_id, e
+        )
+        return flags
+
+    suppressed_task_ids: set[str] = set()
+    for r in results:
+        meta = r.metadata or {}
+        if meta.get('kind') != 'stage1_flag_suppression':
+            continue
+        task_id = meta.get('task_id')
+        if task_id is None:
+            continue
+        suppressed_task_ids.add(str(task_id))
+
+    return [f for f in flags if str(f.get('task_id', '')) not in suppressed_task_ids]
 
 
 async def dedup_flags(
