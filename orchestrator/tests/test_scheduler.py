@@ -1685,13 +1685,17 @@ class TestDispatchCooldownGate:
 
     @pytest.mark.asyncio
     async def test_acquire_next_tolerates_non_string_reopen_reason(self, monkeypatch):
-        """A non-string truthy reopen_reason (e.g. a dict) must not raise AttributeError.
+        """A non-string truthy reopen_reason (e.g. a dict) must not raise and must not arm the gate.
 
-        Before the fix, a dict value bypasses the ``or ''`` short-circuit and
-        reaches ``.lower()`` on a non-string object, raising AttributeError.
-        After the fix (str() coercion), the dict is stringified and correctly
-        shows no 'steward' substring — so the task is dispatched normally on
-        the second acquire.
+        The ``isinstance`` guard in ``_dispatch_cooldown_signal`` rejects non-string
+        ``reopen_reason`` values as no-signal rather than str()-coercing them
+        (which could produce false positives for dicts like
+        ``{'steward_unblock_failure': True}`` whose repr contains 'steward').
+
+        This test explicitly exercises the gate code path: ``_last_dispatch_at``
+        is primed manually before the second acquire so that ``_dispatch_cooldown_active``
+        is reached.  The gate must return inactive (non-string → no signal), so the
+        second dispatch must succeed rather than raise or be suppressed.
         """
         task = self._pending_task_with(
             {'files': ['backend'], 'reopen_reason': {'malformed': 'producer'}}
@@ -1704,18 +1708,57 @@ class TestDispatchCooldownGate:
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
-        # First acquire — arms _last_dispatch_at unconditionally
+        # First acquire — non-string reopen_reason → no signal → gate NOT armed
         a1 = await scheduler.acquire_next()
         assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+        assert '99' not in scheduler._last_dispatch_at, (
+            'Non-string reopen_reason must not arm the cooldown gate on first dispatch'
+        )
 
         scheduler.release('99')
 
-        # Second acquire — before the fix this raises AttributeError on dict.lower().
-        # After the fix, the dict is str()-coerced and does not match 'steward',
-        # so the task is re-dispatched normally.
+        # Prime _last_dispatch_at manually so the gate code path is reached on
+        # the second acquire (simulates a hypothetical prior signal-bearing dispatch).
+        scheduler._last_dispatch_at['99'] = time.monotonic()
+
+        # Second acquire — gate path is now reachable.  The isinstance guard
+        # sees a dict (not a str) and returns no signal → gate inactive → dispatch
+        # must succeed without raising AttributeError.
         a2 = await scheduler.acquire_next()
         assert a2 is not None and a2.task_id == '99', (
-            'Non-string reopen_reason must not raise and must not falsely block dispatch'
+            'Non-string reopen_reason must not raise and must not falsely suppress dispatch'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dict_reopen_reason_with_steward_key_does_not_arm_gate(self, monkeypatch):
+        """A dict reopen_reason whose str() repr contains 'steward' must NOT arm the gate.
+
+        Under the old str()-coerce approach, ``{'steward_unblock_failure': True}``
+        would stringify to a repr containing ``'steward'`` and falsely arm the
+        cooldown gate.  The isinstance guard fixes this by treating all non-string
+        values as no-signal, regardless of their repr content.
+        """
+        task = self._pending_task_with(
+            {'files': ['backend'], 'reopen_reason': {'steward_unblock_failure': True}}
+        )
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        # Confirm directly: signal helper must return None for non-string reopen_reason
+        assert scheduler._dispatch_cooldown_signal(task) is None, (
+            'Dict reopen_reason must not trigger cooldown signal even if its '
+            'str() repr contains the "steward" substring'
+        )
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a = await scheduler.acquire_next()
+        assert a is not None and a.task_id == '99', 'Dispatch must succeed'
+        assert '99' not in scheduler._last_dispatch_at, (
+            'Dict reopen_reason with "steward" key must not arm the cooldown gate'
         )
 
 

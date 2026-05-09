@@ -931,8 +931,12 @@ class Scheduler:
 
         # reopen_reason containing 'steward' (case-insensitive — field is
         # human-authored prose and future producers may use different casing).
-        reopen_reason = str(metadata.get('reopen_reason') or '')
-        if 'steward' in reopen_reason.lower():
+        # Non-string values (e.g. a dict from a malformed producer) are treated
+        # as no-signal rather than str()-coerced: a repr containing the substring
+        # 'steward' (e.g. {'steward_unblock_failure': True}) would be an
+        # accidental false positive under str() coercion.
+        reopen_reason = metadata.get('reopen_reason') or ''
+        if isinstance(reopen_reason, str) and 'steward' in reopen_reason.lower():
             return 'reopen_reason'
 
         return None
@@ -951,6 +955,13 @@ class Scheduler:
 
         Signal detection is delegated to :meth:`_dispatch_cooldown_signal`.
         Returns the signal label for use in operator-visible log messages.
+
+        **Timing note**: ``_last_dispatch_at`` is only armed when the *dispatch
+        itself* is signal-bearing (see :meth:`acquire_next`).  A steward signal
+        that arrives *after* a signal-free dispatch will not retroactively
+        suppress re-dispatch within the prior dispatch window — the gate only
+        guards against rapid re-dispatch of tasks that were *already* flagged
+        at the moment they were first picked up.
         """
         last_dispatch = self._last_dispatch_at.get(tid)
         if last_dispatch is None:
@@ -958,8 +969,10 @@ class Scheduler:
         elapsed = time.monotonic() - last_dispatch
         if elapsed >= self.config.dispatch_cooldown_secs:
             # Entry is past the window and no longer affects behaviour — drop it
-            # to keep the dict bounded over long-running processes (e.g. tasks
-            # removed via remove_task without ever reaching a terminal status).
+            # to keep the dict bounded for tasks that remain visible past the
+            # window.  Tasks deleted via remove_task before their window elapses
+            # leave an orphan entry until the window expires naturally; this is
+            # an acceptable trade-off (bounded by dispatch_cooldown_secs).
             self._last_dispatch_at.pop(tid, None)
             return False, None
 
@@ -1376,7 +1389,12 @@ class Scheduler:
                 continue
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
-                if self._dispatch_cooldown_signal(task) is not None:  # arm cooldown gate
+                # arm cooldown gate — only for signal-bearing dispatches.
+                # Steward signals that arrive *after* a signal-free dispatch
+                # will not retroactively suppress re-dispatch; the gate is
+                # intentionally scoped to tasks that were already flagged
+                # when first picked up (bounded _last_dispatch_at size).
+                if self._dispatch_cooldown_signal(task) is not None:
                     self._last_dispatch_at[task_id] = time.monotonic()
                 self._dispatched_priority[task_id] = pri
                 self._task_start_times[task_id] = time.monotonic()
