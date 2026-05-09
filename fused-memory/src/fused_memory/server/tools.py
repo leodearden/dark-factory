@@ -1973,8 +1973,35 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Remove a task or subtask.
 
+        Supported ID grammar
+        --------------------
+        Each id must be one of:
+        - Top-level integer id, e.g. ``"292"``
+        - 2-level dotted subtask id, e.g. ``"292.1"``
+
+        3+-level nested ids (e.g. ``"1.2.3"``) are **not** supported and
+        raise ``TaskmasterError(code='INVALID_TASK_ID')``.
+
+        Multiple ids may be supplied as a comma-separated string
+        (e.g. ``"292, 293.1"``); the wire boundary splits and strips them
+        before forwarding a structured ``list[str]`` to the backend.
+
+        Atomicity
+        ---------
+        All ids in the batch are parsed upfront.  A single malformed id
+        causes the **entire** batch to fail with
+        ``TaskmasterError(code='INVALID_TASK_ID')`` and **no** removals
+        occur.  The error surfaces at the wire boundary as
+        ``{'error': 'INVALID_TASK_ID: <reason>', 'error_type': 'TaskmasterError'}``.
+
+        Success response shape
+        ----------------------
+        ``{'successful': int, 'failed': int, 'removed_ids': list[str], 'message': str}``
+
         Args:
-            id: Task/subtask ID to remove (comma-separated for multiple)
+            id: Task/subtask ID to remove (comma-separated for multiple).
+                Each id must be a top-level integer (e.g. "292") or a
+                2-level dotted subtask id (e.g. "292.1").
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
