@@ -1699,6 +1699,8 @@ async def test_remediation_sets_project_id_and_root_on_all_stages(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     stages = harness._make_stages()
     harness._make_stages = lambda: stages
+    # task 1143: inject registry entry so _known_project_root_for('my-project') succeeds.
+    harness._known_projects['my-project'] = '/srv/my-project'
 
     stage_attrs: dict[str, dict] = {}
 
@@ -2935,6 +2937,8 @@ class TestHarnessFilteredTaskTreeWiring:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         stages = harness._make_stages()
         harness._make_stages = lambda: stages
+        # task 1143: inject registry entry so _known_project_root_for('test-project') succeeds.
+        harness._known_projects['test-project'] = '/my/project'
 
         expected_tree = self._make_tree()
         harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)

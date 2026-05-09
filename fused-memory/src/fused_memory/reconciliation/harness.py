@@ -1102,6 +1102,11 @@ class ReconciliationHarness:
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
+        # task 1143: defense-in-depth — re-derive from registry so a wrong caller-supplied
+        # root cannot re-introduce cross-contamination even if run_full_cycle or a future
+        # caller passes a stale or incorrect project_root value.
+        project_root = self._known_project_root_for(project_id)  # noqa: F841 (shadows param intentionally)
+
         run_id = str(uuid4())
         run = ReconciliationRun(
             id=run_id,
