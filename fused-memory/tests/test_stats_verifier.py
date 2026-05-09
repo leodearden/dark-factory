@@ -62,9 +62,9 @@ def test_count_add_memory_nonempty_memory_ids_is_true():
     assert _count_add_memory(op) is True
 
 
-def test_count_add_memory_graphiti_enqueued_counts_even_if_mem0_deduped():
+def test_count_add_memory_graphiti_enqueued_without_memory_ids_is_false():
     op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
-    assert _count_add_memory(op) is True
+    assert _count_add_memory(op) is False
 
 
 def test_count_add_memory_failure_is_false():
