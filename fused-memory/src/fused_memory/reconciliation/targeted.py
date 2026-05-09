@@ -5,7 +5,7 @@ import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
@@ -333,38 +333,50 @@ class TargetedReconciler:
                 # Fall back to direct taskmaster call when interceptor is not set
                 # (keeps existing unit-test fixtures working; the wiring-contract test
                 # in TestServerWiringContract ensures production always wires correctly).
-                #
-                # Backlog-gate note: when routed through the interceptor,
-                # TaskInterceptor._backlog_gate() may return a rejection dict
-                # (not an exception) under sustained write pressure. This causes
-                # update_task() to return early without writing — the hints are
-                # silently skipped and the except clause below does NOT fire.
-                # This is intentional graceful degradation: reconciliation-generated
-                # hint metadata is low-priority bookkeeping and should not add
-                # pressure during backlog conditions. Operators can detect hint loss
-                # by correlating missing 'hints_attached' actions in reconciliation
-                # run logs against periods of elevated backlog-gate rejection metrics.
+                resp: Any
                 if self.task_interceptor is not None:
-                    await self.task_interceptor.update_task(
+                    resp = await self.task_interceptor.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
                         project_root=project_root,
                     )
                 else:
-                    await self.taskmaster.update_task(
+                    resp = await self.taskmaster.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
                         project_root=project_root,
                     )
-                result['actions'].append({
-                    'type': 'hints_attached',
-                    'hints': hints.model_dump(),
-                })
-                await self.journal.add_run_action(
-                    run_id, 'write', 'taskmaster', 'update_task',
-                    {'task_id': task_id, 'type': 'hints_attached'},
-                    causation_id=run_id,
-                )
+
+                # TaskInterceptor gates (_backlog_gate, _reject_status_in_update_task,
+                # _reject_done_provenance_in_update_metadata) return early with a dict
+                # shaped {'success': False, 'error': '<code>', ...} — they do NOT raise.
+                # The audit trail must not lie: only emit 'hints_attached' when the
+                # write actually succeeded; emit 'hints_skipped' with diagnostics on
+                # rejection so operators have a positive, queryable signal (task 1136).
+                write_succeeded = not (isinstance(resp, dict) and resp.get('error'))
+
+                if write_succeeded:
+                    result['actions'].append({
+                        'type': 'hints_attached',
+                        'hints': hints.model_dump(),
+                    })
+                    await self.journal.add_run_action(
+                        run_id, 'write', 'taskmaster', 'update_task',
+                        {'task_id': task_id, 'type': 'hints_attached'},
+                        causation_id=run_id,
+                    )
+                else:
+                    error_code = resp.get('error') if isinstance(resp, dict) else 'unknown'
+                    reason = resp.get('reason') if isinstance(resp, dict) else None
+                    result['actions'].append({
+                        'type': 'hints_skipped',
+                        'error': error_code,
+                        'reason': reason,
+                    })
+                    logger.info(
+                        f'Hints skipped for task {task_id}: '
+                        f'update_task rejected with error={error_code!r} reason={reason!r}'
+                    )
             except Exception as e:
                 logger.warning(f'Failed to attach hints to task {task_id}: {e}')
 
