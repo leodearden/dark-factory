@@ -333,6 +333,17 @@ class TargetedReconciler:
                 # Fall back to direct taskmaster call when interceptor is not set
                 # (keeps existing unit-test fixtures working; the wiring-contract test
                 # in TestServerWiringContract ensures production always wires correctly).
+                #
+                # Backlog-gate note: when routed through the interceptor,
+                # TaskInterceptor._backlog_gate() may return a rejection dict
+                # (not an exception) under sustained write pressure. This causes
+                # update_task() to return early without writing — the hints are
+                # silently skipped and the except clause below does NOT fire.
+                # This is intentional graceful degradation: reconciliation-generated
+                # hint metadata is low-priority bookkeeping and should not add
+                # pressure during backlog conditions. Operators can detect hint loss
+                # by correlating missing 'hints_attached' actions in reconciliation
+                # run logs against periods of elevated backlog-gate rejection metrics.
                 if self.task_interceptor is not None:
                     await self.task_interceptor.update_task(
                         task_id=task_id,

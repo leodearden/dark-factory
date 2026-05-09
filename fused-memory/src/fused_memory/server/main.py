@@ -686,7 +686,7 @@ async def run_server():
             # install its own handlers. We need to differentiate operator-stop
             # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
             # restart) — uvicorn's default handlers don't expose that distinction.
-            server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+            server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # uvicorn stubs don't declare this as writable
             _install_operator_stop_handler(
                 lambda: setattr(server, 'should_exit', True),
             )

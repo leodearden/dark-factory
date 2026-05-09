@@ -794,37 +794,45 @@ class TestServerWiringContract:
         )
 
     def test_task_interceptor_wired_to_targeted_reconciler(self):
-        """After TargetedReconciler and TaskInterceptor are both constructed,
-        server/main.py must set targeted.task_interceptor = task_interceptor so
-        that _on_task_blocked routes metadata writes through the per-project
-        write_lock (task 1136 locking invariant).
+        """server/main.py must assign targeted.task_interceptor = task_interceptor
+        after both TargetedReconciler and TaskInterceptor are constructed, so that
+        _on_task_blocked routes metadata writes through the per-project write_lock
+        (task 1136 locking invariant).
 
-        Mirrors the structure of test_planned_episode_registry_wired_from_memory_service.
+        Uses AST analysis of server/main.py to verify the wiring assignment is present.
+        This catches the regression where the wiring line is accidentally removed from
+        server/main.py — something the unit test above cannot detect because it only
+        exercises the wired code path, not the wiring step itself.
         """
-        from unittest.mock import MagicMock
+        import ast
+        import pathlib
 
-        from fused_memory.reconciliation.targeted import TargetedReconciler
+        main_py = (
+            pathlib.Path(__file__).parents[1]
+            / 'src' / 'fused_memory' / 'server' / 'main.py'
+        )
+        assert main_py.exists(), f'server/main.py not found at {main_py}'
 
-        mock_interceptor = MagicMock()
+        tree = ast.parse(main_py.read_text())
 
-        mock_memory_service = MagicMock()
-        mock_taskmaster = MagicMock()
-        mock_journal = MagicMock()
-        mock_config = MagicMock()
-        targeted = TargetedReconciler(
-            mock_memory_service, mock_taskmaster, mock_journal, mock_config
+        # Walk every node looking for:  targeted.task_interceptor = <anything>
+        # The assignment may appear inside an `if targeted is not None:` guard —
+        # ast.walk descends into all children so it finds it regardless of nesting.
+        found = any(
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Attribute)
+                and isinstance(t.value, ast.Name)
+                and t.value.id == 'targeted'
+                and t.attr == 'task_interceptor'
+                for t in node.targets
+            )
+            for node in ast.walk(tree)
         )
 
-        # Before wiring: task_interceptor must be None (the reconciler doesn't auto-wire)
-        assert targeted.task_interceptor is None, (
-            'TargetedReconciler must start with task_interceptor=None'
-        )
-
-        # Apply the wiring (what server/main.py must do — see task 1136)
-        targeted.task_interceptor = mock_interceptor
-
-        # After wiring: identity check
-        assert targeted.task_interceptor is mock_interceptor, (
-            'After wiring, targeted.task_interceptor must be the same object '
-            'as the constructed TaskInterceptor'
+        assert found, (
+            'server/main.py must assign targeted.task_interceptor after TaskInterceptor '
+            'is constructed. This wiring ensures _on_task_blocked routes metadata writes '
+            'through the per-project write_lock (task 1136). '
+            'Restore the assignment in server/main.py if this assertion fails.'
         )
