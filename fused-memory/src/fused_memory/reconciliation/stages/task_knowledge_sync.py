@@ -584,7 +584,75 @@ class TaskKnowledgeSync(BaseStage):
                 # length against the LLM's own flagged_count (suggestion 2).
                 report.stats['stage2_stage1_dups_suppressed'] = len(suppressed)
 
+        # --- post-flight guards (task 1137) ---
+        await self._apply_post_flight_guards(report, prior_reports, run_id)
+
         return report
+
+    async def _apply_post_flight_guards(
+        self,
+        report: StageReport,
+        prior_reports: list[StageReport],
+        run_id: str,
+    ) -> None:
+        """Apply four orthogonal post-flight integrity guards to *report*.
+
+        Each guard reads the write-journal op stream and/or calls
+        ``taskmaster.get_task()`` to verify what the Stage 2 LLM actually did,
+        then mutates ``report.stats`` in place to reflect the true picture.
+
+        Guards are applied even when the stage run was not fully successful so
+        that partial-run artefacts are still classified correctly.
+
+        Degrades gracefully when ``self.journal`` or
+        ``self.journal.write_journal`` is ``None`` — Guards 1-3 skip (no ops
+        available), Guard 4 still fires (pure stats arithmetic).
+
+        Args:
+            report: The ``StageReport`` returned by ``super().run()``.
+                Mutated in place.
+            prior_reports: Stage reports for all earlier stages in this cycle.
+                Guard 4 reads ``prior_reports[0].items_flagged``.
+            run_id: Current reconciliation run identifier.
+        """
+        # Fetch write_journal ops once; share across Guards 1-3.
+        ops: list[dict] = []
+        if self.journal is not None and self.journal.write_journal is not None:
+            try:
+                ops = await self.journal.write_journal.get_ops_by_causation(run_id)
+            except Exception:
+                logger.warning(
+                    'reconciliation._apply_post_flight_guards: '
+                    'get_ops_by_causation failed for run_id=%s; '
+                    'skipping Guards 1-3',
+                    run_id,
+                )
+                ops = []
+
+        # Guard 1 — terminal-state pre-check
+        if self.taskmaster and self.project_root:
+            terminal_violations = await _classify_terminal_state_violations(
+                ops, self.taskmaster, self.project_root
+            )
+            if terminal_violations:
+                report.stats['not_applicable_count'] = (
+                    report.stats.get('not_applicable_count', 0) + len(terminal_violations)
+                )
+                # Decrement inflated success counters (clamped at 0)
+                report.stats['tasks_modified'] = max(
+                    0,
+                    report.stats.get('tasks_modified', 0) - len(terminal_violations),
+                )
+                for v in terminal_violations:
+                    logger.info(
+                        'reconciliation.skipped_done_task',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': v['task_id'],
+                            'reason': v['reason'],
+                        },
+                    )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
