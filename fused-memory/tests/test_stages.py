@@ -6115,7 +6115,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
         @pytest.mark.asyncio
         async def test_cache_build_nondict_result_no_false_positives(
-            self, mock_deps_composition
+            self, mock_deps_composition, caplog
         ):
             """When get_task returns a non-dict, Guards 2 and 3 must NOT fire.
 
@@ -6182,6 +6182,10 @@ class TestTaskKnowledgeSyncStage2Guards:
                         stats={'tasks_modified': 5, 'memories_written': 1},
                     )),
                 ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
             ):
                 report = await stage.run(
                     events=[],
@@ -6201,3 +6205,15 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             # (d) tasks_modified is unchanged — no false decrements from Guard 3
             assert report.stats.get('tasks_modified') == 5
+
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+            # (e) Silent-skip contract: non-dict result must NOT emit the cache-build
+            # warning that the raised-exception branch emits (see sibling test).
+            assert not any(
+                r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'cache build' in r.getMessage()
+                and 'task_id=99' in r.getMessage()
+                for r in caplog.records
+            )
