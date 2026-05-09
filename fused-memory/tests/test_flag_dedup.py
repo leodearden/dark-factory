@@ -96,9 +96,10 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 
     # All flags returned unchanged
     assert result == original_flags
-    # Zero I/O calls
-    memory_service.search.assert_not_called()
+    # add_memory never called — no-signature flags never reach the marker write path
     memory_service.add_memory.assert_not_called()
+    # Note: filter_suppressed calls search once (project-scoped suppression query),
+    # but since no flags have computable signatures the per-flag search is never called.
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +174,10 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     assert result[0]['persisted_from_run'] == 'r0'
     assert result[0]['last_seen_run_id'] == 'r1'
 
-    # (b) search was called once with project_id='p' and a query mentioning task_id and flag_type
-    memory_service.search.assert_called_once()
+    # (b) search was called twice: once for the suppression filter (filter_suppressed)
+    #     and once for the per-flag prior-marker lookup.  call_args refers to the last
+    #     call (per-flag), which must contain project_id='p' and mention task_id+flag_type.
+    assert memory_service.search.call_count == 2  # 1 suppression + 1 per-flag
     # project_id must be passed as a kwarg (production code uses kwargs throughout)
     assert memory_service.search.call_args.kwargs['project_id'] == 'p'
     # query must strictly mention both the task_id and the flag_type (no permissive 'or')
@@ -242,8 +245,8 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
         task_id='42', flag_type='missing_deliverable', run_id='r1',
     )
 
-    # Exactly one search per flag
-    memory_service.search.assert_called_once()
+    # Two search calls: 1 for the suppression filter (filter_suppressed) + 1 per-flag.
+    assert memory_service.search.call_count == 2
 
 
 # ---------------------------------------------------------------------------

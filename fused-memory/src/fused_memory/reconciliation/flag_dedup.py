@@ -157,6 +157,12 @@ async def dedup_flags(
 
     Returns the (possibly annotated) flag list.
     """
+    # --- Authoritative suppression gate (task-1186) ---
+    # Drop flags for tasks with active stage1_flag_suppression records BEFORE
+    # the signature-dedup loop so suppressed flags never reach the per-flag
+    # prior-marker write path.
+    flags = await filter_suppressed(memory_service, project_id, flags)
+
     result: list[dict[str, Any]] = []
     for flag in flags:
         sig = compute_flag_signature(flag)
