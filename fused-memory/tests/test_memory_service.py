@@ -28,6 +28,7 @@ def service(mock_config):
     svc.graphiti.update_edge = AsyncMock(
         return_value={'uuid': 'test-uuid', 'fact': 'updated', 'refreshed_nodes': []}
     )
+    svc.graphiti.get_edge_text = AsyncMock(return_value=('edge-name', 'updated'))
     svc.graphiti._require_client = MagicMock()
 
     svc.mem0 = MagicMock()
