@@ -503,6 +503,22 @@ class OrchestratorConfig(BaseSettings):
     # them is the mediation we already gave it a chance to perform).
     max_consecutive_merge_thrash: int = Field(default=2, ge=1)
     requeue_cooldown_secs: float = Field(default=30.0)
+    # Per-task settle window applied after a dispatch when reconciliation or
+    # steward signals are present (recon_reset_count > 1, steward_clear_at,
+    # recon_stage2_blocked_at, or reopen_reason containing 'steward').  The
+    # gate prevents the orchestrator from immediately re-grabbing a task that
+    # was just reset/cleared, giving reconciliation time to settle.  The 5-min
+    # floor (ge=300.0) prevents setting a value so small it reproduces the
+    # original tight-loop pathology.
+    dispatch_cooldown_secs: float = Field(
+        default=1800.0,
+        ge=300.0,
+        description=(
+            'Per-task settle window (seconds) applied after dispatch when '
+            'reconciliation/steward signals are present.  Default 1800s (30 min); '
+            'minimum 300s (5 min floor).'
+        ),
+    )
     requeue_cap: int = Field(
         default=3,
         ge=1,
