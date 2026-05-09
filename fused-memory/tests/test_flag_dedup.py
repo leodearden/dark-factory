@@ -801,3 +801,90 @@ async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog)
         '66' in record.message and record.levelno >= logging.WARNING
         for record in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 11 (task-1146) — two-consecutive-runs no-accumulation regression test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
+    """Regression: two successive dedup_flags calls for the same flag leave exactly 1 marker.
+
+    Uses a FakeMem0 in-memory store (self-contained, no external mocks) to
+    exercise the full add/search/delete cycle deterministically.
+
+    Run 1 (run_id='r1'): no prior exists → MISS branch → 1 marker stored.
+    Run 2 (run_id='r2'): prior found → HIT branch → write replacement, delete prior
+                         → still exactly 1 marker stored, with run_id='r2'.
+    """
+    import uuid as _uuid
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    class _MemoryRecord:
+        """Minimal stand-in for a Mem0 MemoryResult."""
+        def __init__(self, id_: str, metadata: dict) -> None:
+            self.id = id_
+            self.metadata = metadata
+            self.content = (
+                f"Stage 1 flag marker: task={metadata.get('task_id')} "
+                f"type={metadata.get('flag_type')} from run={metadata.get('run_id')}"
+            )
+
+    class FakeMem0:
+        """In-memory Mem0 stub with add_memory, search, and delete_memory."""
+
+        def __init__(self) -> None:
+            self._store: dict[str, _MemoryRecord] = {}
+
+        async def add_memory(self, *, metadata: dict, **_kwargs) -> dict:
+            id_ = str(_uuid.uuid4())
+            self._store[id_] = _MemoryRecord(id_, metadata)
+            return {'memory_ids': [id_]}
+
+        async def search(self, *, query: str = '', **_kwargs) -> list[_MemoryRecord]:
+            # Return all stored records (deterministic; query not used for filtering)
+            return list(self._store.values())
+
+        async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
+            self._store.pop(memory_id, None)
+
+        def count(self) -> int:
+            return len(self._store)
+
+        def latest_run_id(self) -> str | None:
+            """Return the run_id of the single stored marker (for assertion)."""
+            records = list(self._store.values())
+            if not records:
+                return None
+            return records[0].metadata.get('run_id')
+
+    fake = FakeMem0()
+    flag = {'task_id': '42', 'flag_type': 'missing_deliverable', 'description': 'foo'}
+
+    # Run 1 — MISS branch: no prior, writes one marker
+    await dedup_flags(
+        memory_service=fake,
+        project_id='p',
+        run_id='r1',
+        flags=[flag],
+    )
+    assert fake.count() == 1, (
+        f'After run 1: expected 1 marker but got {fake.count()}'
+    )
+
+    # Run 2 — HIT branch: prior found, replacement written, prior deleted
+    await dedup_flags(
+        memory_service=fake,
+        project_id='p',
+        run_id='r2',
+        flags=[flag],
+    )
+    assert fake.count() == 1, (
+        f'After run 2: expected 1 marker (no accumulation) but got {fake.count()}'
+    )
+    assert fake.latest_run_id() == 'r2', (
+        f"Surviving marker must have run_id='r2' but got {fake.latest_run_id()!r}"
+    )
