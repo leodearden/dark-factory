@@ -133,8 +133,11 @@ def _assert_valid_stage1_marker(
 
 @pytest.mark.asyncio
 async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
-    """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id
-    and NO additional marker write is made (avoids monotonic marker accumulation).
+    """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id,
+    a replacement marker is written, and the prior is deleted (atomic-replacement contract).
+
+    Updated for task-1146: the old \"no write on HIT\" contract is replaced by
+    atomic-replacement (write new marker → delete prior).
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
@@ -145,10 +148,12 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
         'run_id': 'r0',
         'last_seen_run_id': 'r0',
     })
+    prior_marker.id = 'prior-42'
 
     memory_service = AsyncMock()
     memory_service.search = AsyncMock(return_value=[prior_marker])
     memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(return_value=None)
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
 
@@ -172,8 +177,9 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     query = memory_service.search.call_args.kwargs.get('query', '')
     assert '42' in query and 'missing_deliverable' in query
 
-    # (c) No refresh write — the prior marker is sufficient; skipping avoids N*M accumulation
-    memory_service.add_memory.assert_not_called()
+    # (c) Replacement marker written and prior deleted (atomic-replacement)
+    memory_service.add_memory.assert_called_once()
+    memory_service.delete_memory.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -399,10 +405,12 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     prior_marker = _make_memory_result(prior_metadata)
+    prior_marker.id = 'prior-malformed'
 
     memory_service = AsyncMock()
     memory_service.search = AsyncMock(return_value=[prior_marker])
     memory_service.add_memory = AsyncMock(return_value=None)
+    memory_service.delete_memory = AsyncMock(return_value=None)
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
 
@@ -420,8 +428,10 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
         f"in prior marker metadata, but got {result[0].get('persisted_from_run')!r}."
     )
     assert result[0]['last_seen_run_id'] == 'r1'
-    # No new marker write — prior was found, no accumulation
-    memory_service.add_memory.assert_not_called()
+    # Atomic-replacement: replacement marker is written and prior is deleted even
+    # when run_id was malformed (annotation sentinel does not suppress the write).
+    memory_service.add_memory.assert_called_once()
+    memory_service.delete_memory.assert_called_once()
 
     # Sentinel-collapse path emits a DEBUG log — covers all three malformed shapes.
     # Loose enough to tolerate minor wording changes; strict enough to lock in the
