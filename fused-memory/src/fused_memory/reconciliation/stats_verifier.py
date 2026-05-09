@@ -41,13 +41,22 @@ _OP_TO_STAT: dict[str, str] = {
     'replay_to_graphiti': 'episodes_replayed',
 }
 
+# Alias map: alternative stat-key names that the LLM may emit, mapped to their
+# canonical key. The verifier writes the observed value to BOTH the canonical
+# key and each of its aliases so Stage 3's comparison sees a consistent picture.
+_STAT_ALIASES: dict[str, str] = {
+    'memories_written': 'memories_added',
+}
+
 # Stat keys the verifier writes back to stage stats. Includes virtual keys
 # derived from ops rather than mapped 1:1 in _OP_TO_STAT (e.g.
 # graphiti_writes_queued, which is the residual of add_memory ops where
-# memory_ids is empty but stores includes graphiti).
-_TRACKED_STAT_KEYS: frozenset[str] = frozenset(_OP_TO_STAT.values()) | {
-    'graphiti_writes_queued',
-}
+# memory_ids is empty but stores includes graphiti), plus all alias keys.
+_TRACKED_STAT_KEYS: frozenset[str] = (
+    frozenset(_OP_TO_STAT.values())
+    | {'graphiti_writes_queued'}
+    | frozenset(_STAT_ALIASES)
+)
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -225,13 +234,23 @@ def _apply_observed(
             report['stats'] = stats
 
     reported_snapshot: dict[str, Any] = {}
-    for stat_key in _TRACKED_STAT_KEYS:
+
+    # Write canonical keys first so the alias pass can read the canonical
+    # observed value without needing to compute it twice.
+    canonical_keys = frozenset(_OP_TO_STAT.values()) | {'graphiti_writes_queued'}
+    for stat_key in canonical_keys:
         # Always record the observed value — zero is meaningful (means "no
         # writes happened for this op"). Only snapshot the original when it
         # actually existed, to avoid polluting with spurious None entries.
         if stat_key in stats:
             reported_snapshot[stat_key] = stats[stat_key]
         stats[stat_key] = observed.get(stat_key, 0)
+
+    # Write alias keys to the same observed value as their canonical counterpart.
+    for alias_key, canonical_key in _STAT_ALIASES.items():
+        if alias_key in stats:
+            reported_snapshot[alias_key] = stats[alias_key]
+        stats[alias_key] = stats[canonical_key]
 
     if reported_snapshot:
         stats['_reported'] = reported_snapshot
