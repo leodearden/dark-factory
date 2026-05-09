@@ -45,11 +45,11 @@ class TargetedReconciler:
         self.config = config.reconciliation
         self.verifier = CodebaseVerifier(config.reconciliation)
         self.buffer = event_buffer
-        self.planned_episode_registry: 'PlannedEpisodeRegistry | None' = None
+        self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         # Wire post-construction (mirroring the planned_episode_registry pattern) so that
         # _on_task_blocked routes metadata writes through the interceptor's write_lock.
         # Set by server/main.py after TaskInterceptor is constructed — see task 1136.
-        self.task_interceptor: 'TaskInterceptor | None' = None
+        self.task_interceptor: TaskInterceptor | None = None
 
     async def _fenced_add_memory(
         self,
