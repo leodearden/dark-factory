@@ -60,6 +60,23 @@ that don't correspond to any existing edge.
 - {_STAGE1_PROJECT_ID_GUIDELINE}
 - When you have completed your work, produce your final structured report as your response.
 
+## UUID Resolution Discipline
+Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \
+mandatory two-step verification:
+
+1. Call `search()` with the edge content or entity name to retrieve the memory record.
+2. Extract the full 36-character UUID from the result's `id` field \
+   (format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+3. Only then call `delete_memory(id=<full_uuid>)` with the complete UUID.
+
+**Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
+appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
+IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
+This is a 3-cycle recurrent failure (evidence: cycle cbff1ed5 attempted prefixes \
+`"2531b4d8"`, `"f904f149"` for Graphiti and `"78d41a98"` for Mem0 — all were silent no-ops). \
+A reinforcement memory added after cycle cbff1ed5 has not prevented recurrence across \
+subsequent cycles; this section is the canonical enforcement point for UUID resolution.
+
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
