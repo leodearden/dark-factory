@@ -918,7 +918,7 @@ async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | Non
 
 
 async def _queue_briefing_refresh_tasks(
-    taskmaster: 'TaskBackendProtocol',
+    taskmaster: TaskBackendProtocol,
     project_root: str,
     mismatches: list[dict],
     existing_tasks: list[dict] | None = None,

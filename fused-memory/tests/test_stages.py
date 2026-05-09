@@ -3913,8 +3913,9 @@ class TestQueryStage2Flags:
 
     @pytest.mark.asyncio
     async def test_returns_empty_list_on_search_exception(self, caplog):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
         with caplog.at_level(logging.WARNING):
@@ -4044,6 +4045,7 @@ class TestTrackFlagPersistence:
     async def test_search_failure_degrades_to_count_1(self, caplog):
         """On search failure, prior count is 0, so this cycle count = 1."""
         import logging
+
         from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 down')
@@ -4058,6 +4060,7 @@ class TestTrackFlagPersistence:
     @pytest.mark.asyncio
     async def test_add_memory_failure_still_returns_count(self, caplog):
         import logging
+
         from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
         memory_service = AsyncMock()
         memory_service.search.return_value = [self._make_prior('flag-E')]
@@ -4111,6 +4114,7 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
     async def test_payload_contains_both_stage1_and_mem0_flags(self, mock_deps, watermark):
         """Merged flagged section must contain Stage 1 items_flagged AND Mem0 active-query flags."""
         from datetime import UTC, datetime
+
         from fused_memory.models.reconciliation import StageId, StageReport
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
@@ -4150,6 +4154,7 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
     async def test_search_exception_still_renders_stage1_flags(self, mock_deps, watermark):
         """When memory_service.search raises, payload still contains Stage 1 flags."""
         from datetime import UTC, datetime
+
         from fused_memory.models.reconciliation import StageId, StageReport
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
@@ -4280,6 +4285,7 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         """Stage 1 structured-output flags for task 1139 are NOT filtered.
         The scope filter only applies to the Mem0 active-query path."""
         from datetime import UTC, datetime
+
         from fused_memory.models.reconciliation import StageReport
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
