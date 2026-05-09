@@ -426,9 +426,11 @@ def _check_flag_counter_completeness(
     Args:
         report_stats: The ``StageReport.stats`` dict from Stage 2's run.
         prior_reports: Reports from earlier stages in this cycle.  When
-            non-empty, ``prior_reports[0]`` is assumed to be the Stage 1
-            (memory_consolidator) report.  When empty, no baseline is available
-            and the function returns ``mismatch=False`` unconditionally.
+            non-empty, ``prior_reports[0]`` must be the Stage 1
+            (``memory_consolidator``) report — guarded by a stage-identity
+            check to avoid a silent wrong-baseline comparison if the pipeline
+            is ever reordered.  When empty, no baseline is available and the
+            function returns ``mismatch=False`` unconditionally.
 
     Returns:
         ``{'expected': int, 'reported': int, 'mismatch': bool}``
@@ -437,6 +439,13 @@ def _check_flag_counter_completeness(
     """
     reported = report_stats.get('stage1_flags_processed', 0)
     if not prior_reports:
+        return {'expected': 0, 'reported': reported, 'mismatch': False}
+
+    # Mirror the stage-identity guard used by the same-run dedup block above
+    # (lines ~757-761) — only treat prior_reports[0] as a Stage 1 baseline
+    # when it actually is Stage 1.  A wrong stage would produce a meaningless
+    # expected count and silently clamp stats to garbage.
+    if prior_reports[0].stage != StageId.memory_consolidator:
         return {'expected': 0, 'reported': reported, 'mismatch': False}
 
     expected = len(prior_reports[0].items_flagged)

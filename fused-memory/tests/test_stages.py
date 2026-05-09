@@ -5626,6 +5626,20 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert result['reported'] == 0
             assert result['mismatch'] is False
 
+        def test_unit_wrong_stage_skips_baseline(self):
+            """prior_reports[0] is not memory_consolidator -> mismatch=False, no clamp."""
+            # Simulate a pipeline reorder: prior_reports[0] is Stage 3
+            prior_report = StageReport(
+                stage=StageId.task_knowledge_sync,
+                started_at=datetime.now(tz=UTC),
+                completed_at=datetime.now(tz=UTC),
+                items_flagged=[{'id': str(i)} for i in range(5)],
+            )
+            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [prior_report])
+            assert result['mismatch'] is False
+            assert result['expected'] == 0  # no baseline used
+            assert result['reported'] == 3
+
         @pytest.fixture
         def mock_deps_integration(self):
             config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
@@ -5958,3 +5972,112 @@ class TestTaskKnowledgeSyncStage2Guards:
                 f'expected 1 stage1_flags_processed_mismatch WARNING even with null journal, '
                 f'got {len(flag_logs)}'
             )
+
+        @pytest.mark.asyncio
+        async def test_null_journal_object_degrades_gracefully(self, mock_deps_composition, caplog):
+            """When self.journal is None entirely, Guards 1-3 skip; Guard 4 still fires."""
+            deps = {**mock_deps_composition, 'journal': None}
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **deps)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[{'id': str(i)} for i in range(3)],
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [],
+                        stats={'tasks_modified': 2, 'stage1_flags_processed': 0},
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-null-journal-obj',
+                )
+
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            assert 'not_applicable_count' not in report.stats
+            assert 'set_task_status_post_action_mismatches' not in report.stats
+            assert 'stall_guard_freshness_violations' not in report.stats
+            # Guard 4 fires: stage1_flags_processed clamped from 0 to 3
+            assert report.stats.get('stage1_flags_processed') == 3
+            flag_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and 'stage1_flags_processed_mismatch' in r.getMessage()
+            ]
+            assert len(flag_logs) == 1
+
+        @pytest.mark.asyncio
+        async def test_get_ops_by_causation_raises_degrades_gracefully(
+            self, mock_deps_composition, caplog
+        ):
+            """When get_ops_by_causation raises, a WARNING is emitted, ops default to [],
+            Guards 1-3 skip, Guard 4 still fires, and run completes without exception."""
+            mock_deps_composition['journal'].write_journal.get_ops_by_causation = AsyncMock(
+                side_effect=RuntimeError('db connection lost')
+            )
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[{'id': str(i)} for i in range(2)],
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [],
+                        stats={'tasks_modified': 1, 'stage1_flags_processed': 0},
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-ops-raise',
+                )
+
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            # WARNING about get_ops_by_causation failure
+            ops_fail_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and 'get_ops_by_causation failed' in r.getMessage()
+            ]
+            assert len(ops_fail_logs) == 1, (
+                f'expected 1 get_ops_by_causation failure WARNING, got {len(ops_fail_logs)}'
+            )
+            # Guards 1-3 skipped (no ops)
+            assert 'not_applicable_count' not in report.stats
+            assert 'set_task_status_post_action_mismatches' not in report.stats
+            assert 'stall_guard_freshness_violations' not in report.stats
+            # Guard 4 still fires
+            assert report.stats.get('stage1_flags_processed') == 2
