@@ -17,8 +17,8 @@ Atomic-replacement contract (task-1146)
 ---------------------------------------
 On every HIT the dedup flow is:
 
-1. Find ALL prior markers for (task_id, flag_type) via ``find_prior_memory``
-   (singular, returns first prior for annotation) — annotation extracted first.
+1. Find ALL prior markers for (task_id, flag_type) via ``find_prior_memories``
+   (plural); annotation extracted from the first result before any deletes.
 2. Write a new replacement marker with the current ``run_id``.
 3. Only if the write succeeds: delete every prior marker (per-prior try/except
    WARNING so one bad delete does not abort the batch).
