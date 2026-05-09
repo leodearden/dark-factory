@@ -33,6 +33,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
     TaskKnowledgeSync,
+    _classify_terminal_state_violations,
     _format_flagged,
     _queue_briefing_refresh_tasks,
     _run_briefing_known_gaps_script,
@@ -5088,3 +5089,83 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             if r.name == target_logger and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
         ]
         assert suppression_logs == []
+
+
+# ── Task-1137: Stage 2 post-flight guards ────────────────────────────────────
+
+
+class TestTaskKnowledgeSyncStage2Guards:
+    """Parent namespace for the four Stage 2 post-flight guard tests."""
+
+    class TestTerminalStatePreCheck:
+        """Unit tests for _classify_terminal_state_violations helper."""
+
+        def _make_op(
+            self,
+            *,
+            op_id: str = 'op-1',
+            agent_id: str = 'recon-stage-task_knowledge_sync',
+            operation: str = 'update_task',
+            params: dict | None = None,
+        ) -> dict:
+            """Return a minimal write_journal op dict for testing."""
+            return {
+                'id': op_id,
+                'agent_id': agent_id,
+                'operation': operation,
+                'params': json.dumps(params or {'task_id': '42'}),
+                'layer': 'write_op',
+                'causation_id': 'run-test',
+                'created_at': '2026-01-01T00:00:00',
+            }
+
+        @pytest.mark.asyncio
+        async def test_unit_terminal_done_status_detected(self):
+            """update_task op for stage-2 agent on a done task -> one violation."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'done'}
+
+            ops = [self._make_op(op_id='op-42', params={'task_id': '42'})]
+            violations = await _classify_terminal_state_violations(
+                ops, taskmaster, '/project'
+            )
+
+            assert len(violations) == 1
+            v = violations[0]
+            assert v['op_id'] == 'op-42'
+            assert v['task_id'] == '42'
+            assert v['live_status'] == 'done'
+            assert v['reason'] == 'not_applicable'
+
+        @pytest.mark.asyncio
+        async def test_unit_task_interceptor_op_excluded(self):
+            """update_task op from task-interceptor agent is NOT classified as a violation."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'done'}
+
+            ops = [
+                self._make_op(
+                    op_id='op-interceptor',
+                    agent_id='task-interceptor',
+                    params={'task_id': '42'},
+                )
+            ]
+            violations = await _classify_terminal_state_violations(
+                ops, taskmaster, '/project'
+            )
+
+            assert violations == []
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_unit_non_terminal_status_no_violation(self):
+            """update_task op for stage-2 agent on an in-progress task -> no violation."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'in-progress'}
+
+            ops = [self._make_op(params={'task_id': '7'})]
+            violations = await _classify_terminal_state_violations(
+                ops, taskmaster, '/project'
+            )
+
+            assert violations == []
