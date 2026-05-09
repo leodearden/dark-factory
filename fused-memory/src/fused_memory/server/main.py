@@ -531,6 +531,10 @@ async def run_server():
             scope_violation_escalator=scope_violation_escalator,
         )
         await task_interceptor.start()
+        # Wire interceptor back into targeted so reconciler-initiated metadata writes
+        # acquire the per-project write_lock — see task 1136.
+        if targeted is not None:
+            targeted.task_interceptor = task_interceptor
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
 
@@ -682,7 +686,7 @@ async def run_server():
             # install its own handlers. We need to differentiate operator-stop
             # (clean exit 0, do not restart) from cascade-shutdown (exit 1, do
             # restart) — uvicorn's default handlers don't expose that distinction.
-            server.install_signal_handlers = lambda: None
+            server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # uvicorn stubs don't declare this as writable
             _install_operator_stop_handler(
                 lambda: setattr(server, 'should_exit', True),
             )

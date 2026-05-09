@@ -5,7 +5,7 @@ import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.reconciliation import (
@@ -22,6 +22,7 @@ from fused_memory.utils.validation import InputValidationError, require_project_
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,10 @@ class TargetedReconciler:
         self.verifier = CodebaseVerifier(config.reconciliation)
         self.buffer = event_buffer
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
+        # Wire post-construction (mirroring the planned_episode_registry pattern) so that
+        # _on_task_blocked routes metadata writes through the interceptor's write_lock.
+        # Set by server/main.py after TaskInterceptor is constructed — see task 1136.
+        self.task_interceptor: TaskInterceptor | None = None
 
     async def _fenced_add_memory(
         self,
@@ -322,20 +327,56 @@ class TargetedReconciler:
                 queries=[f'resolution for: {title}'],
             )
             try:
-                await self.taskmaster.update_task(
-                    task_id=task_id,
-                    metadata=json.dumps({'memory_hints': hints.model_dump()}),
-                    project_root=project_root,
-                )
-                result['actions'].append({
-                    'type': 'hints_attached',
-                    'hints': hints.model_dump(),
-                })
-                await self.journal.add_run_action(
-                    run_id, 'write', 'taskmaster', 'update_task',
-                    {'task_id': task_id, 'type': 'hints_attached'},
-                    causation_id=run_id,
-                )
+                metadata_payload = json.dumps({'memory_hints': hints.model_dump()})
+                # Route through TaskInterceptor when wired so the per-project
+                # _write_lock is acquired around this metadata-only update — see task 1136.
+                # Fall back to direct taskmaster call when interceptor is not set
+                # (keeps existing unit-test fixtures working; the wiring-contract test
+                # in TestServerWiringContract ensures production always wires correctly).
+                resp: Any
+                if self.task_interceptor is not None:
+                    resp = await self.task_interceptor.update_task(
+                        task_id=task_id,
+                        metadata=metadata_payload,
+                        project_root=project_root,
+                    )
+                else:
+                    resp = await self.taskmaster.update_task(
+                        task_id=task_id,
+                        metadata=metadata_payload,
+                        project_root=project_root,
+                    )
+
+                # TaskInterceptor gates (_backlog_gate, _reject_status_in_update_task,
+                # _reject_done_provenance_in_update_metadata) return early with a dict
+                # shaped {'success': False, 'error': '<code>', ...} — they do NOT raise.
+                # The audit trail must not lie: only emit 'hints_attached' when the
+                # write actually succeeded; emit 'hints_skipped' with diagnostics on
+                # rejection so operators have a positive, queryable signal (task 1136).
+                write_succeeded = not (isinstance(resp, dict) and resp.get('error'))
+
+                if write_succeeded:
+                    result['actions'].append({
+                        'type': 'hints_attached',
+                        'hints': hints.model_dump(),
+                    })
+                    await self.journal.add_run_action(
+                        run_id, 'write', 'taskmaster', 'update_task',
+                        {'task_id': task_id, 'type': 'hints_attached'},
+                        causation_id=run_id,
+                    )
+                else:
+                    error_code = resp.get('error') if isinstance(resp, dict) else 'unknown'
+                    reason = resp.get('reason') if isinstance(resp, dict) else None
+                    result['actions'].append({
+                        'type': 'hints_skipped',
+                        'error': error_code,
+                        'reason': reason,
+                    })
+                    logger.info(
+                        f'Hints skipped for task {task_id}: '
+                        f'update_task rejected with error={error_code!r} reason={reason!r}'
+                    )
             except Exception as e:
                 logger.warning(f'Failed to attach hints to task {task_id}: {e}')
 
