@@ -3204,7 +3204,7 @@ async def _validate_done_provenance(
     Schema:
         {
             "kind": "merged" | "found_on_main",  # required
-            "commit": <sha-or-ref>,              # required if kind="merged"
+            "commit": <sha-or-ref>,              # required for both kinds
             "note":   <free text>,               # required if kind="found_on_main"
         }
 
@@ -3213,9 +3213,10 @@ async def _validate_done_provenance(
       additionally checked with ``git merge-base --is-ancestor <sha> main`` so
       a steward cannot record a SHA that is only on a feature branch.
     - ``kind="found_on_main"``: the implementation is already on main from a
-      sibling task / prior orchestrator run. ``note`` is required (free text,
-      typically citing the landing commit or providing-task id). ``commit`` is
-      optional and is resolved (but NOT ancestor-checked) when supplied.
+      sibling task / prior orchestrator run. Both ``commit`` and ``note`` are
+      required. ``commit`` is resolved + ancestor-checked identical to
+      ``kind="merged"``; the kinds differ only in audit semantics (``note``
+      is required for ``found_on_main`` to cite the providing task/commit).
 
     Returns ``(error_payload, resolved_provenance)``. Error payload is a
     structured dict suitable for returning to the MCP caller; when it is
@@ -3290,6 +3291,16 @@ async def _validate_done_provenance(
             'done_provenance with kind="merged" requires commit=<sha-or-ref> '
             '(the merge commit on main). Use kind="found_on_main" instead '
             'when no single commit applies.',
+        ), None
+    if kind == 'found_on_main' and commit_input is None:
+        return _done_provenance_error(
+            task_id,
+            'done_provenance with kind="found_on_main" requires '
+            'commit=<sha-or-ref> (the impl-providing commit on main, '
+            'ancestor-checked) — note alone is no longer accepted '
+            '(post-3092 phantom-done hardening; cite the landing commit so '
+            'the server can verify it). Use kind="merged" instead when this '
+            'branch supplied the merge.',
         ), None
     if kind == 'found_on_main' and note is None:
         return _done_provenance_error(
@@ -3494,8 +3505,9 @@ def _done_provenance_missing_error(task_id: str) -> dict:
             'reconciliation.require_done_provenance is enabled. Pass '
             'done_provenance={"kind": "merged", "commit": "<merge-sha>"} when '
             'the merge_request landed a commit on main, or '
-            'done_provenance={"kind": "found_on_main", "note": "<text>"} when '
-            'the implementation is already on main from a sibling task.'
+            'done_provenance={"kind": "found_on_main", "commit": "<sha>", '
+            '"note": "<text>"} when the implementation is already on main '
+            'from a sibling task (commit is ancestor-checked).'
         ),
     }
 
