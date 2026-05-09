@@ -1612,6 +1612,39 @@ class TestDispatchCooldownGate:
         )
 
     @pytest.mark.asyncio
+    async def test_signal_bearing_dispatch_arms_gate_and_suppresses_redispatch(self, monkeypatch):
+        """Signal-bearing dispatch (recon_reset_count≥2) arms _last_dispatch_at via
+        _dispatch_cooldown_signal, and the armed gate suppresses re-dispatch within
+        the cooldown window.
+        """
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Dispatch the task — recon_reset_count=2 is a gate-arming signal
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        # Gate MUST be armed for signal-bearing tasks (direct positive assertion)
+        assert '99' in scheduler._last_dispatch_at, (
+            '_last_dispatch_at must be set for signal-bearing dispatches '
+            '(recon_reset_count=2)'
+        )
+
+        # End-to-end suppression: follow-up acquire within cooldown window must return None
+        scheduler.release('99')
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, (
+            'Follow-up acquire_next within cooldown window must be suppressed '
+            'end-to-end for signal-bearing tasks'
+        )
+
+    @pytest.mark.asyncio
     async def test_cooldown_log_suppressed_when_deps_unsatisfied(self, monkeypatch, caplog):
         """Cooldown-suppression INFO log must NOT fire for deps-blocked tasks.
 
