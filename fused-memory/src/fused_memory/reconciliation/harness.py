@@ -780,6 +780,16 @@ class ReconciliationHarness:
 
             except asyncio.CancelledError:
                 raise  # Propagate shutdown
+            except ValueError as e:
+                # task 1143: KNOWN_PROJECT_ROOTS misconfiguration — fail fast, no retry.
+                # A ValueError from _known_project_root_for indicates the project_id has
+                # no registry entry.  Retrying every 5 s would spam logs; return instead
+                # so run_loop can log the task failure once rather than on every cycle.
+                logger.error(
+                    f'Project loop aborting for {project_id}: misconfiguration — {e}. '
+                    f'Set DASHBOARD_KNOWN_PROJECT_ROOTS to include this project (task 1143).'
+                )
+                return
             except Exception as e:
                 logger.error(f'Project loop error for {project_id}: {e}')
 
@@ -928,7 +938,7 @@ class ReconciliationHarness:
                 asyncio.create_task(self._run_judge(run_id))
 
             # Remediation pass: pass pre-fetched tree to avoid a redundant fetch (ref: task 478)
-            await self._maybe_remediate(project_id, project_root, run_id, run, tier,
+            await self._maybe_remediate(project_id, run_id, run, tier,
                                         filtered_task_tree=filtered_task_tree)
 
             logger.info(
@@ -1032,7 +1042,6 @@ class ReconciliationHarness:
     async def _maybe_remediate(
         self,
         project_id: str,
-        project_root: str,
         parent_run_id: str,
         parent_run: ReconciliationRun,
         tier: TierConfig,
@@ -1074,7 +1083,7 @@ class ReconciliationHarness:
                 f'triggering second pass'
             )
             await self._run_remediation_pass(
-                project_id, project_root, parent_run_id, actionable, tier,
+                project_id, parent_run_id, actionable, tier,
                 filtered_task_tree=filtered_task_tree,
             )
         except Exception as e:
@@ -1088,7 +1097,6 @@ class ReconciliationHarness:
     async def _run_remediation_pass(
         self,
         project_id: str,
-        project_root: str,
         parent_run_id: str,
         findings: list[dict],
         tier: TierConfig,
@@ -1102,10 +1110,9 @@ class ReconciliationHarness:
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
-        # task 1143: defense-in-depth — re-derive from registry so a wrong caller-supplied
-        # root cannot re-introduce cross-contamination even if run_full_cycle or a future
-        # caller passes a stale or incorrect project_root value.
-        project_root = self._known_project_root_for(project_id)  # noqa: F841 (shadows param intentionally)
+        # task 1143: hard-bind from registry — the canonical source of truth so no
+        # caller can introduce cross-contamination via a stale or wrong argument.
+        project_root = self._known_project_root_for(project_id)
 
         run_id = str(uuid4())
         run = ReconciliationRun(
