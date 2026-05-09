@@ -138,21 +138,33 @@ class MemoryService:
 
     async def close(self) -> None:
         if self.durable_queue:
-            with contextlib.suppress(Exception):
+            try:
                 await self.durable_queue.close()
-        with contextlib.suppress(Exception):
+            except Exception:
+                logger.exception('MemoryService.close: durable_queue.close failed')
+        try:
             await self.graphiti.close()
-        with contextlib.suppress(Exception):
+        except Exception:
+            logger.exception('MemoryService.close: graphiti.close failed')
+        try:
             await self.mem0.close()
+        except Exception:
+            logger.exception('MemoryService.close: mem0.close failed')
         if self._write_journal:
-            with contextlib.suppress(Exception):
+            try:
                 await self._write_journal.close()
+            except Exception:
+                logger.exception('MemoryService.close: write_journal.close failed')
         if self._event_buffer:
-            with contextlib.suppress(Exception):
+            try:
                 await self._event_buffer.close()
+            except Exception:
+                logger.exception('MemoryService.close: event_buffer.close failed')
         if self.planned_episode_registry:
-            with contextlib.suppress(Exception):
+            try:
                 await self.planned_episode_registry.close()
+            except Exception:
+                logger.exception('MemoryService.close: planned_episode_registry.close failed')
 
     # ------------------------------------------------------------------
     # Journal helper
