@@ -4,11 +4,13 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
+import uuid as _uuid_mod
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.flag_dedup import build_suppression_payload
 
 _STUB_ADD_MEMORY_RESPONSE = AddMemoryResponse(memory_ids=['stub-id'])
 
@@ -1428,3 +1430,336 @@ async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
     assert fake.latest_run_id() == 'r2', (
         f"Surviving marker must have run_id='r2' but got {fake.latest_run_id()!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# build_suppression_payload tests (task-1185 step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSuppressionPayload:
+    """Unit tests for build_suppression_payload(task_id) -> SuppressionPayload.
+
+    Pure dict assertions — no I/O, no async.
+    """
+
+    _CANONICAL = {
+        'content': 'STAGE 1 FLAG SUPPRESSION task_id=42',
+        'category': 'observations_and_summaries',
+        'metadata': {'kind': 'stage1_flag_suppression', 'task_id': 42},
+    }
+
+    def test_full_payload_for_int_task_id(self):
+        """Full payload dict equals the canonical schema literal for int input.
+
+        Implicitly asserts: content, category, metadata.kind, metadata.task_id
+        (int), and absence of project_id (not in canonical schema).
+        """
+        assert build_suppression_payload(42) == self._CANONICAL
+
+    def test_coerces_str_task_id_to_int(self):
+        """str task_id is coerced to int; resulting payload equals canonical schema."""
+        assert build_suppression_payload('42') == self._CANONICAL
+
+
+# ---------------------------------------------------------------------------
+# Round-trip schema validation tests (task-1185 step-5)
+#
+# FakeMemoryService: in-test stub generalising the FakeMem0 pattern already
+# used in test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation.
+# Accepts writer-supplied content and metadata so it works for arbitrary
+# writers (flag-marker writes AND suppression-record writes).
+# Kept module-private — promoting to conftest is a future refactor.
+# ---------------------------------------------------------------------------
+
+class _MemoryResultStub:
+    """Minimal stand-in for a Mem0 MemoryResult, accepts explicit content."""
+
+    def __init__(self, id_: str, content: str, metadata: dict) -> None:
+        self.id = id_
+        self.content = content
+        self.metadata = metadata
+
+
+class _FakeMemoryService:
+    """In-memory memory service stub: add_memory, search, delete_memory.
+
+    Stores records keyed by UUID.  search() applies minimal filtering:
+
+    * When ``query`` is provided it is matched against ``metadata['kind']``
+      exactly — records whose kind does not equal query are excluded.  This
+      catches drift between the producer's ``metadata.kind`` and the reader's
+      search query (e.g. filter_suppressed passes ``query='stage1_flag_suppression'``
+      which must match the kind the producer wrote).
+    * ``limit`` truncates the result list when provided.
+    * All other kwargs (``categories``, ``stores``, ``project_id``) are
+      accepted and ignored for simplicity; they are not needed for the
+      schema-contract tests here.
+
+    This mirrors the existing FakeMem0 in the regression test but accepts
+    writer-supplied content and metadata.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, _MemoryResultStub] = {}
+
+    async def add_memory(
+        self, *, content: str, metadata: dict, **_kwargs
+    ) -> AddMemoryResponse:
+        id_ = str(_uuid_mod.uuid4())
+        self._store[id_] = _MemoryResultStub(id_, content, metadata)
+        return AddMemoryResponse(memory_ids=[id_])
+
+    async def search(
+        self, *, query: str = '', limit: int | None = None, **_kwargs
+    ) -> list[_MemoryResultStub]:
+        results = list(self._store.values())
+        if query:
+            results = [r for r in results if r.metadata.get('kind') == query]
+        if limit is not None:
+            results = results[:limit]
+        return results
+
+    async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
+        self._store.pop(memory_id, None)
+
+    def count(self) -> int:
+        return len(self._store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'raw_task_id',
+    [
+        pytest.param(42, id='int_storage'),
+        pytest.param('42', id='str_storage'),
+    ],
+)
+async def test_suppression_record_round_trips_through_prompt_instructed_search(raw_task_id):
+    """Round-trip schema contract: what write_suppression_record writes is exactly
+    what filter_suppressed's search finds.
+
+    Canonical schema (four-line contract):
+      1. metadata.kind == 'stage1_flag_suppression'
+      2. metadata.task_id == <N>  (int or str; compared via str-coercion)
+      3. content == 'STAGE 1 FLAG SUPPRESSION task_id=<N>'
+      4. category == 'observations_and_summaries'
+
+    Parametrized over raw_task_id: int (42) exercises write_suppression_record
+    directly; str ('42') models a hand-authored or legacy record stored with
+    task_id as str.  Changing the parametrize value changes test behavior —
+    raw_task_id is consumed to construct both the payload and the expected values.
+
+    The str-coercion convention on assertion (6) mirrors filter_suppressed's
+    comparison at flag_dedup.py (`str(task_id)`) so the test passes for both
+    int and str storage shapes without false failures.
+
+    The search kwargs match filter_suppressed's actual call shape exactly so
+    that any future drift between the producer and the search-call contract is
+    caught here first.
+    """
+    from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+    tid_int = int(raw_task_id)
+    expected_content = f'STAGE 1 FLAG SUPPRESSION task_id={tid_int}'
+    fake = _FakeMemoryService()
+
+    if isinstance(raw_task_id, int):
+        # write via the canonical producer (coerces to int)
+        await write_suppression_record(fake, project_id='dark_factory', task_id=raw_task_id)
+    else:
+        # model the alternative shape: task_id stored as str (e.g. from a
+        # hand-authored record or an old producer without int coercion)
+        await fake.add_memory(
+            content=expected_content,
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': raw_task_id},
+        )
+
+    # Search with the kwargs filter_suppressed actually uses (task-1186)
+    results = await fake.search(
+        query='stage1_flag_suppression',
+        project_id='dark_factory',
+        categories=['observations_and_summaries'],
+        stores=['mem0'],
+        limit=500,
+    )
+
+    # (4) Exactly one result
+    assert len(results) == 1, f'Expected 1 result but got {len(results)}: {results}'
+
+    # (5) Canonical kind key
+    assert results[0].metadata['kind'] == 'stage1_flag_suppression', (
+        f'metadata.kind mismatch: {results[0].metadata}'
+    )
+
+    # (6) task_id round-trips (str-coercion handles int vs str storage)
+    assert str(results[0].metadata['task_id']) == str(tid_int), (
+        f'metadata.task_id mismatch: {results[0].metadata["task_id"]!r}'
+    )
+
+    # (7) Canonical content
+    assert results[0].content == expected_content, (
+        f'content mismatch: {results[0].content!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# filter_suppressed end-to-end test (task-1185 step-6)
+#
+# Closes the producer→reader contract end-to-end for both int and str
+# task_id storage variants.  filter_suppressed is already on main from
+# sibling task-1186; this test pins that what the producer writes is exactly
+# what the reader correctly acts on.
+#
+# This test would have caught a producer that wrote metadata.kind under a
+# different key, or metadata.task_id under a non-str-coercible type, because
+# filter_suppressed requires BOTH fields to be present and correct before
+# adding task_id to the suppressed set.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'raw_task_id',
+    [
+        pytest.param(42, id='int_storage'),
+        pytest.param('42', id='str_storage'),
+    ],
+)
+async def test_filter_suppressed_drops_flags_written_by_producer(raw_task_id):
+    """Producer→reader contract: flags written by write_suppression_record are dropped by filter_suppressed.
+
+    Per task-1185 description: "once that function lands, extend the test to also assert
+    filter_suppressed correctly drops matching flags for both int and str task_id storage
+    variants."  filter_suppressed is now on main (task-1186).
+
+    Parametrized over raw_task_id: int (42) exercises write_suppression_record
+    directly; str ('42') models the alternative storage shape.  Changing the
+    parametrize value changes which task_id is suppressed and which flag is
+    kept — raw_task_id is consumed in both the write step and the flag construction.
+
+    This test would have caught a producer that wrote metadata.kind under a
+    different key, or task_id under a non-coercible type, because filter_suppressed
+    requires BOTH fields to be present and correct before adding task_id to the
+    suppressed set.
+
+    Test body:
+      (1) build a FakeMemoryService;
+      (2) write the suppression record (int: via write_suppression_record;
+          str: directly via fake.add_memory with str task_id);
+      (3) call filter_suppressed with a matching flag and an unrelated flag;
+      (4) assert the suppressed flag is dropped;
+      (5) assert the unrelated flag is preserved.
+    """
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
+
+    tid_int = int(raw_task_id)
+    fake = _FakeMemoryService()
+
+    if isinstance(raw_task_id, int):
+        await write_suppression_record(fake, project_id='dark_factory', task_id=raw_task_id)
+    else:
+        # model the str-task_id storage shape (alternative producer path)
+        await fake.add_memory(
+            content=f'STAGE 1 FLAG SUPPRESSION task_id={tid_int}',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': raw_task_id},
+        )
+
+    flags = [
+        {'task_id': tid_int, 'flag_type': 'missing_deliverable'},   # should be dropped
+        {'task_id': 99, 'flag_type': 'stale_metadata'},              # should be kept
+    ]
+
+    result = await filter_suppressed(fake, 'dark_factory', flags)
+
+    # (4) Suppressed flag is dropped
+    assert len(result) == 1, (
+        f'Expected 1 surviving flag but got {len(result)}: {result}'
+    )
+    # (5) Unrelated flag is preserved
+    assert result[0]['task_id'] == 99, (
+        f"Expected surviving flag task_id=99 but got {result[0]['task_id']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# write_suppression_record tests (task-1185 step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_memory_service():
+    """AsyncMock memory_service with add_memory returning a stub AddMemoryResponse."""
+    svc = AsyncMock()
+    svc.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['supp-1']))
+    return svc
+
+
+class TestWriteSuppressionRecord:
+    """Async tests for write_suppression_record(memory_service, *, project_id, task_id, causation_id).
+
+    Uses the ``mock_memory_service`` fixture to avoid per-test boilerplate.
+    The canonical-payload, project_id, _source, and default-causation_id
+    assertions are consolidated into one test that inspects the full kwargs
+    dict; separate small tests cover the causation_id and str-coercion variants.
+    """
+
+    @pytest.mark.asyncio
+    async def test_canonical_call_kwargs(self, mock_memory_service):
+        """add_memory called once with the full canonical kwargs dict.
+
+        Asserts content, category, metadata (kind + int task_id), project_id,
+        _source sentinel, and causation_id=None (default) in a single call.
+        """
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        result = await write_suppression_record(
+            mock_memory_service, project_id='autopilot_video', task_id=42
+        )
+
+        mock_memory_service.add_memory.assert_called_once_with(
+            content='STAGE 1 FLAG SUPPRESSION task_id=42',
+            category='observations_and_summaries',
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': 42},
+            project_id='autopilot_video',
+            causation_id=None,
+            _source='stage1_flag_suppression',
+        )
+        assert result.memory_ids == ['supp-1']
+
+    @pytest.mark.asyncio
+    async def test_passes_causation_id_when_provided(self, mock_memory_service):
+        """causation_id is forwarded to add_memory when explicitly provided."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            mock_memory_service, project_id='p', task_id=42, causation_id='recon-run-99'
+        )
+
+        kwargs = mock_memory_service.add_memory.call_args.kwargs
+        assert kwargs['causation_id'] == 'recon-run-99'
+
+    @pytest.mark.asyncio
+    async def test_coerces_str_task_id(self, mock_memory_service):
+        """passing task_id='42' produces metadata.task_id == 42 (int)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(mock_memory_service, project_id='p', task_id='42')
+
+        kwargs = mock_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['task_id'] == 42
+        assert isinstance(kwargs['metadata']['task_id'], int)
+
+
+def test_write_suppression_record_importable_from_canonical_path():
+    """Smoke test: write_suppression_record is importable from the path stage1.py advertises.
+
+    If the helper is ever moved or renamed, this test fails CI rather than
+    silently drifting the prompt's operator instructions
+    (see STAGE1_SYSTEM_PROMPT ## Flag Suppression Check section).
+    """
+    from fused_memory.reconciliation.flag_dedup import write_suppression_record  # noqa: F401

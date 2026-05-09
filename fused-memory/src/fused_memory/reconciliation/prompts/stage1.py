@@ -247,6 +247,12 @@ this is the producer's contract source-of-truth read by the post-processor:
   - `metadata.task_id = <N>` (integer matching the target task)
   - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
 
+Producing a suppression record: operators and remediation hooks should call \
+`fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
+project_id=..., task_id=N)` rather than constructing the canonical schema by hand. \
+The helper coerces `task_id` to int and pins the metadata.kind/content shape so \
+future schema changes touch one location.
+
 If you do choose to check: call `search(query="stage1_flag_suppression", \
 project_id=...)`, then inspect each result's metadata. A result is a valid \
 suppression record ONLY when BOTH `metadata.kind == "stage1_flag_suppression"` AND \
