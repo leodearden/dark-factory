@@ -183,6 +183,8 @@ async def test_verify_rewrites_inflated_stats(journal):
     assert stats['memories_added'] == 1
     # Original inflated value preserved for divergence visibility.
     assert stats['_reported']['memories_added'] == 3
+    # 'graphiti_writes_queued' was not in original stats — must not appear in _reported.
+    assert 'graphiti_writes_queued' not in stats['_reported']
     # Unrelated stats untouched.
     assert stats['llm_calls_extra'] == 42
 
