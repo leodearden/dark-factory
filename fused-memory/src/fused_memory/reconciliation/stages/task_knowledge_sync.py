@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
-from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES, _extract_status
+from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -43,6 +43,17 @@ from fused_memory.reconciliation.task_filter import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_status(task_data: dict) -> str:
+    """Extract status from a Taskmaster get_task response dict."""
+    if 'status' in task_data:
+        return task_data['status']
+    data = task_data.get('data', {})
+    if isinstance(data, dict):
+        return data.get('status', 'unknown')
+    return 'unknown'
+
 
 # Projects allowed to use the briefing-refresh hook.  This is a reify-specific
 # feature; gating on project_id prevents accidental triggering by other projects
@@ -179,8 +190,7 @@ async def _classify_terminal_state_violations(
     helper *reclassifies* the op instead.  Callers are expected to:
 
     - increment ``stats['not_applicable_count']`` by ``len(violations)``
-    - decrement ``stats['tasks_modified']`` / ``stats['memories_written']``
-      accordingly (clamped at 0)
+    - decrement ``stats['tasks_modified']`` by ``len(violations)`` (clamped at 0)
 
     ops from ``agent_id='task-interceptor'`` are intentionally excluded; the
     interceptor performs legitimate ``update_task(metadata=...)`` calls during
@@ -795,8 +805,9 @@ class TaskKnowledgeSync(BaseStage):
         ``taskmaster.get_task()`` to verify what the Stage 2 LLM actually did,
         then mutates ``report.stats`` in place to reflect the true picture.
 
-        Guards are applied even when the stage run was not fully successful so
-        that partial-run artefacts are still classified correctly.
+        Guards run whenever ``super().run()`` returns (success or failure
+        report), so partial-run artefacts are still classified correctly.
+        If ``super().run()`` raises rather than returning, guards do not fire.
 
         Degrades gracefully when ``self.journal`` or
         ``self.journal.write_journal`` is ``None`` — Guards 1-3 skip (no ops
