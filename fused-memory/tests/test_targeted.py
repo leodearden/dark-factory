@@ -751,6 +751,83 @@ async def test_blocked_routes_update_through_task_interceptor_when_wired(
     )
 
 
+@pytest.mark.asyncio
+async def test_blocked_skips_hints_attached_on_interceptor_rejection(
+    reconciler, mock_memory_service, mock_taskmaster
+):
+    """When task_interceptor.update_task() returns a rejection dict, the audit signals
+    must honestly reflect the failed write:
+
+    (1) mock_interceptor.update_task called once  — the write was attempted.
+    (2) mock_taskmaster.update_task NOT called     — no fallback bypass when interceptor set.
+    (3) No 'hints_attached' action in result       — must not lie about a write that failed.
+    (4) No 'hints_attached' journal entry          — ditto in the journal.
+    (5) Exactly one 'hints_skipped' action with error/reason matching the rejection.
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    # Wire interceptor that simulates a backlog-gate rejection (not an exception — a dict)
+    mock_interceptor = _AsyncMock()
+    mock_interceptor.update_task = _AsyncMock(
+        return_value={'success': False, 'error': 'backlog_gate_rejected', 'reason': 'queue_lag'}
+    )
+    reconciler.task_interceptor = mock_interceptor
+
+    # Spy on journal.add_run_action so we can inspect every emitted action row
+    journal_spy = _AsyncMock()
+    reconciler.journal.add_run_action = journal_spy
+
+    # Seed search so the hints-attach branch fires
+    mock_memory_service.search = _AsyncMock(return_value=[
+        MemoryResult(id='1', content='blocker info', source_store=SourceStore.mem0, entities=['EntityA']),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='42',
+        transition='blocked',
+        project_id='test-project',
+        project_root='/tmp/test',
+        task_before={'id': '42', 'title': 'Blocked task', 'status': 'in-progress'},
+    )
+
+    # (1) the write was attempted through the interceptor
+    mock_interceptor.update_task.assert_called_once()
+
+    # (2) no fallback to direct taskmaster
+    mock_taskmaster.update_task.assert_not_called()
+
+    # (3) 'hints_attached' must NOT appear in result (write didn't succeed)
+    hints_attached = [a for a in result.get('actions', []) if a.get('type') == 'hints_attached']
+    assert hints_attached == [], (
+        f'hints_attached must not appear in actions on rejection; '
+        f'got full actions list: {result.get("actions", [])}'
+    )
+
+    # (4) journal must NOT contain a hints_attached row
+    journal_hints_rows = [
+        c for c in journal_spy.call_args_list
+        if len(c.args) >= 5
+        and isinstance(c.args[4], dict)
+        and c.args[4].get('type') == 'hints_attached'
+    ]
+    assert journal_hints_rows == [], (
+        f'journal must not record hints_attached on rejection; got: {journal_hints_rows}'
+    )
+
+    # (5) exactly one 'hints_skipped' action carrying the rejection error/reason
+    hints_skipped = [a for a in result.get('actions', []) if a.get('type') == 'hints_skipped']
+    assert len(hints_skipped) == 1, (
+        f'Expected exactly one hints_skipped action, got: {result.get("actions", [])}'
+    )
+    skip = hints_skipped[0]
+    assert skip.get('error') == 'backlog_gate_rejected', (
+        f'hints_skipped must carry the rejection error code, got: {skip}'
+    )
+    assert skip.get('reason') == 'queue_lag', (
+        f'hints_skipped must carry the rejection reason, got: {skip}'
+    )
+
+
 class TestServerWiringContract:
     """step-34/35: TargetedReconciler.planned_episode_registry must be wired from
     MemoryService after MemoryService.initialize() creates it."""
