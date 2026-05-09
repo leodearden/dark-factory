@@ -4815,8 +4815,11 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'
 
+        _now = datetime.now(tz=UTC)
         stage1_report = StageReport(
-            stage=StageId.memory_consolidation,
+            stage=StageId.memory_consolidator,
+            started_at=_now,
+            completed_at=_now,
             items_flagged=[
                 {
                     'task_id': '99',
@@ -4925,8 +4928,11 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'
 
+        _now = datetime.now(tz=UTC)
         stage1_report = StageReport(
-            stage=StageId.memory_consolidation,
+            stage=StageId.memory_consolidator,
+            started_at=_now,
+            completed_at=_now,
             items_flagged=[],
         )
         stage2_flagged = [
@@ -4968,8 +4974,11 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'
 
+        _now = datetime.now(tz=UTC)
         stage1_report = StageReport(
-            stage=StageId.memory_consolidation,
+            stage=StageId.memory_consolidator,
+            started_at=_now,
+            completed_at=_now,
             items_flagged=[
                 {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
             ],

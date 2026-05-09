@@ -92,6 +92,73 @@ def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
     return any(marker in content for marker in _KNOWN_BUG_1139_CONTENT_MARKERS)
 
 
+def _suppress_same_run_human_operator_dups(
+    stage2_flagged: list[dict],
+    stage1_flagged: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Partition *stage2_flagged* into (kept, suppressed) by comparing against Stage 1.
+
+    A Stage 2 item is **suppressed** iff ALL of the following hold:
+
+    1. The Stage 2 item has ``resolution_status == 'human_operator_required'``.
+    2. Stage 1 has an item with the **same** ``(task_id, flag_type)`` pair whose
+       ``resolution_status`` is also ``'human_operator_required'``.
+
+    In other words, this filter enforces the 3-tuple
+    ``(task_id, flag_type, resolution_status='human_operator_required')``
+    deduplication described in task 1154, but expresses the ``resolution_status``
+    constraint as a predicate on both sides rather than as a key dimension.
+    This mirrors the established ``compute_flag_signature`` convention in
+    ``flag_dedup.py``, which uses a 2-tuple ``(task_id, flag_type)`` key
+    and treats ``None`` values as a "skip this entry" sentinel.
+
+    **str() coercion**: ``task_id`` and ``flag_type`` are coerced via ``str()``
+    when building or looking up keys.  LLM output frequently emits ``task_id``
+    as an integer in some cycles and as a string in others; without coercion,
+    ``42 != '42'`` would silently miss duplicates.
+
+    **None-skip rule**: Stage 1 entries where ``task_id`` or ``flag_type`` is
+    ``None`` (absent from the dict) form no key and therefore can never suppress
+    any Stage 2 item.  Falsy-but-valid values like ``task_id=0`` or
+    ``flag_type=''`` *do* form valid keys (matching ``compute_flag_signature``).
+
+    Args:
+        stage2_flagged: The ``items_flagged`` list from Stage 2's ``StageReport``.
+        stage1_flagged: The ``items_flagged`` list from Stage 1's ``StageReport``.
+
+    Returns:
+        ``(kept, suppressed)`` — two lists that together partition *stage2_flagged*.
+    """
+    # Build the set of (task_id, flag_type) keys from Stage 1 entries that are
+    # human_operator_required AND have both fields present.
+    stage1_hor_keys: set[tuple[str, str]] = set()
+    for item in stage1_flagged:
+        if item.get('resolution_status') != 'human_operator_required':
+            continue
+        task_id = item.get('task_id')
+        flag_type = item.get('flag_type')
+        if task_id is None or flag_type is None:
+            continue
+        stage1_hor_keys.add((str(task_id), str(flag_type)))
+
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for item in stage2_flagged:
+        if item.get('resolution_status') == 'human_operator_required':
+            task_id = item.get('task_id')
+            flag_type = item.get('flag_type')
+            if (
+                task_id is not None
+                and flag_type is not None
+                and (str(task_id), str(flag_type)) in stage1_hor_keys
+            ):
+                suppressed.append(item)
+                continue
+        kept.append(item)
+
+    return kept, suppressed
+
+
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     """Query Mem0 for active Stage-2-destined flags and return them as dicts.
 
