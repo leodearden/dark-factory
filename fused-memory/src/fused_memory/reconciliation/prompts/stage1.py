@@ -77,6 +77,24 @@ This is a 3-cycle recurrent failure (evidence: cycle cbff1ed5 attempted prefixes
 A reinforcement memory added after cycle cbff1ed5 has not prevented recurrence across \
 subsequent cycles; this section is the canonical enforcement point for UUID resolution.
 
+## Terminal-State Pre-Check Discipline
+Before writing a `temporal_fact` whose content states or implies that a task reached a \
+terminal state (done / cancelled / deferred / blocked), follow this verification:
+
+1. Call `get_task(id=<task_id>)` to read the live status from Taskmaster.
+2. Only persist the temporal_fact if the live status matches the claimed terminal state.
+3. If they disagree, SKIP the write and flag for Stage 2 review instead — set `task_id` \
+   and `flag_type` on the flagged item per the existing Flag Deduplication and \
+   Stage 2 Flag Relay (FIX B) conventions.
+
+**Although Stage 1's general guideline says you do not perform task reconciliation, \
+`get_task` is a read-only tool that is permitted for this verification — it does not \
+write task state and does not violate the Stage 1 / Stage 2 separation.**
+
+Evidence: Stage 1 run `e5340e1a` wrote a temporal_fact claiming task 605 was "done" \
+without verifying live status (flagged by run `c37dffcf`, severity=moderate). See also \
+Task 1137, which implements the mirror pre-check at Stage 2's temporal_fact write site.
+
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
 response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
