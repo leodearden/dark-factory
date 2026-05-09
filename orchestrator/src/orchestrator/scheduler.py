@@ -960,19 +960,21 @@ class Scheduler:
         return None
 
     def _dispatch_cooldown_active(
-        self, task: dict, tid: str
-    ) -> tuple[bool, str | None]:
-        """Return (is_active, signal_label) for the per-task dispatch cooldown gate.
+        self, tid: str, signal: str | None
+    ) -> bool:
+        """Return ``True`` when the per-task dispatch cooldown gate is active.
 
         The gate is active when ALL of:
         1. The task has a prior dispatch recorded in ``_last_dispatch_at``.
         2. The elapsed time since that dispatch is less than
            ``config.dispatch_cooldown_secs`` (strict less-than).
-        3. The task's metadata carries a reset/steward signal indicating
-           it was just touched by reconciliation or the steward.
+        3. ``signal`` is non-``None`` — the task carries a reset/steward signal
+           indicating it was just touched by reconciliation or the steward.
 
-        Signal detection is delegated to :meth:`_dispatch_cooldown_signal`.
-        Returns the signal label for use in operator-visible log messages.
+        ``signal`` must be precomputed by the caller via
+        :meth:`_dispatch_cooldown_signal` before calling this method.  The
+        caller owns signal evaluation; this method owns only the time-window
+        check and the ``_last_dispatch_at`` expiry sweep.
 
         **Timing note**: ``_last_dispatch_at`` is only armed when the *dispatch
         itself* is signal-bearing (see :meth:`acquire_next`).  A steward signal
@@ -983,7 +985,7 @@ class Scheduler:
         """
         last_dispatch = self._last_dispatch_at.get(tid)
         if last_dispatch is None:
-            return False, None
+            return False
         elapsed = self._time_source() - last_dispatch
         if elapsed >= self.config.dispatch_cooldown_secs:
             # Entry is past the window and no longer affects behaviour — drop it
@@ -992,12 +994,9 @@ class Scheduler:
             # leave an orphan entry until the window expires naturally; this is
             # an acceptable trade-off (bounded by dispatch_cooldown_secs).
             self._last_dispatch_at.pop(tid, None)
-            return False, None
+            return False
 
-        signal = self._dispatch_cooldown_signal(task)
-        if signal is not None:
-            return True, signal
-        return False, None
+        return signal is not None
 
     def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
         """Compute a reservation lease from the rolling duration window.
@@ -1320,6 +1319,7 @@ class Scheduler:
         # Filter to pending tasks whose deps are all done and that aren't
         # dispatched or in their post-requeue cooldown window.
         candidates: list[dict] = []
+        candidate_signals: dict[str, str | None] = {}
         for t in tasks:
             if t.get('status') != 'pending':
                 continue
@@ -1333,6 +1333,10 @@ class Scheduler:
                 del self._requeue_until[tid_str]
             if not self._deps_satisfied(t, status_map):
                 continue
+            # Evaluate the cooldown signal once here; the result is stashed in
+            # candidate_signals and reused at the arm site (avoiding a second
+            # call to _dispatch_cooldown_signal for the dispatched task).
+            signal_label = self._dispatch_cooldown_signal(t)
             # Dispatch cooldown gate: if the task was recently dispatched and
             # carries a reconciliation/steward signal, suppress re-dispatch
             # until the settle window elapses.  Both gates must pass.
@@ -1341,8 +1345,7 @@ class Scheduler:
             # They are invisible to skip counters and parking logic until the
             # window elapses, at which point they re-enter the normal candidate
             # pool and can accumulate skips like any other task.
-            cooldown_active, signal_label = self._dispatch_cooldown_active(t, tid_str)
-            if cooldown_active:
+            if self._dispatch_cooldown_active(tid_str, signal_label):
                 remaining_secs = (
                     self.config.dispatch_cooldown_secs
                     - (self._time_source() - self._last_dispatch_at.get(tid_str, 0.0))
@@ -1357,6 +1360,7 @@ class Scheduler:
                 )
                 continue
             candidates.append(t)
+            candidate_signals[tid_str] = signal_label
 
         if not candidates:
             return None
@@ -1412,7 +1416,7 @@ class Scheduler:
                 # will not retroactively suppress re-dispatch; the gate is
                 # intentionally scoped to tasks that were already flagged
                 # when first picked up (bounded _last_dispatch_at size).
-                if self._dispatch_cooldown_signal(task) is not None:
+                if candidate_signals.get(task_id) is not None:
                     self._last_dispatch_at[task_id] = self._time_source()
                 self._dispatched_priority[task_id] = pri
                 self._task_start_times[task_id] = self._time_source()
