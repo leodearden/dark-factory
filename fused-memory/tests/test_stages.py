@@ -37,6 +37,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _queue_briefing_refresh_tasks,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
+    _suppress_same_run_human_operator_dups,
 )
 from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
@@ -4650,15 +4651,9 @@ class TestStage3PayloadIncludesProjectRoot:
 class TestSuppressSameRunHumanOperatorDups:
     """Unit tests for _suppress_same_run_human_operator_dups(stage2_flagged, stage1_flagged)."""
 
-    def _fn(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _suppress_same_run_human_operator_dups,
-        )
-        return _suppress_same_run_human_operator_dups
-
     def test_both_empty_returns_empty_tuples(self):
         """Both empty inputs → ([], [])."""
-        kept, suppressed = self._fn()([], [])
+        kept, suppressed = _suppress_same_run_human_operator_dups([], [])
         assert kept == []
         assert suppressed == []
 
@@ -4670,7 +4665,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 's2 dup'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert kept == []
         assert len(suppressed) == 1
         assert suppressed[0]['description'] == 's2 dup'
@@ -4683,7 +4678,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'stage2 unique'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4695,7 +4690,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'in_progress', 'description': 'different status'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert kept[0]['resolution_status'] == 'in_progress'
         assert suppressed == []
@@ -4708,7 +4703,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '99', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4720,7 +4715,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'stale_dependency', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4732,7 +4727,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4744,7 +4739,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4756,7 +4751,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert kept == []
         assert len(suppressed) == 1
 
@@ -4776,7 +4771,7 @@ class TestSuppressSameRunHumanOperatorDups:
             # exact dup for task 77 — should be suppressed
             {'task_id': '77', 'flag_type': 'stale_dependency', 'resolution_status': 'human_operator_required', 'description': 'dup2'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 2
         assert len(suppressed) == 2
         kept_descs = {item['description'] for item in kept}
@@ -4924,6 +4919,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
         # All items kept unchanged
         assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
 
         # No suppression log
         target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -4970,6 +4966,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
         # All items kept unchanged
         assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
 
         # No suppression log
         target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -5019,8 +5016,72 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
         # All items kept
         assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
 
         # No suppression log because nothing was suppressed
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        suppression_logs = [
+            r for r in caplog.records
+            if r.name == target_logger and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
+        ]
+        assert suppression_logs == []
+
+    @pytest.mark.asyncio
+    async def test_run_prior_reports_first_stage_not_memory_consolidator_no_op(self, mock_deps, caplog):
+        """prior_reports[0].stage != memory_consolidator → guard fires, no suppression even if items would match."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        _now = datetime.now(tz=UTC)
+        # Use StageId.task_knowledge_sync (a real-but-wrong stage) so the
+        # prior_reports[0].stage guard fires before any dedup logic runs.
+        wrong_stage_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=_now,
+            completed_at=_now,
+            items_flagged=[
+                {
+                    'task_id': '99',
+                    'flag_type': 'assumption_invalid',
+                    'resolution_status': 'human_operator_required',
+                }
+            ],
+        )
+        # Shape the Stage 2 item to exactly match the prior-report entry so that
+        # suppression *would* fire if the guard were removed — this makes the test
+        # non-trivial: only the guard prevents suppression here.
+        stage2_flagged = [
+            {
+                'task_id': '99',
+                'flag_type': 'assumption_invalid',
+                'resolution_status': 'human_operator_required',
+                'description': 'should-not-suppress',
+            }
+        ]
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._make_cli_result(stage2_flagged)),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[wrong_stage_report],
+                run_id='test-run-1168-e',
+            )
+
+        # Item must be kept — the guard skips suppression for the wrong stage
+        assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
+
+        # No suppression log
         target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
         suppression_logs = [
             r for r in caplog.records
