@@ -194,6 +194,12 @@ async def dedup_flags(
     return result
 
 
+#: Pinned ``flag_type`` value for Stage 1's Terminal-State Pre-Check Discipline.
+#: Importing this constant into prompts/stage1.py ensures the prompt text and the
+#: dedup keyspace always reference the same string — no silent drift between cycles.
+TERMINAL_STATE_PRE_CHECK_FLAG_TYPE: str = 'terminal_state_pre_check'
+
+
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     """Return a (task_id_str, flag_type_str) signature for *flag*, or ``None``.
 
