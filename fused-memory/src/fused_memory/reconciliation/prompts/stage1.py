@@ -88,6 +88,10 @@ terminal state (done / cancelled / deferred / blocked), follow this verification
    and `flag_type` on the flagged item per the existing Flag Deduplication and \
    Stage 2 Flag Relay (FIX B) conventions.
 
+If `mcp__fused-memory__get_task` returns an `error` field \
+(e.g. `{{'error': ..., 'error_type': ...}}`), treat verification as inconclusive — \
+skip the terminal-state write without flagging.
+
 **`mcp__fused-memory__get_task` is a permitted read-only verification call — it does not write task state \
 and does not violate the Stage 1 / Stage 2 separation.**
 
