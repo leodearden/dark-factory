@@ -4641,3 +4641,369 @@ class TestStage3PayloadIncludesProjectRoot:
             f'Stage 3 payload for dark_factory must contain Use project_root="..." directive. '
             f'Got payload:\n{payload[:500]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1154 — Stage 2 same-run Stage 1 human_operator_required suppression
+# ---------------------------------------------------------------------------
+
+class TestSuppressSameRunHumanOperatorDups:
+    """Unit tests for _suppress_same_run_human_operator_dups(stage2_flagged, stage1_flagged)."""
+
+    def _fn(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _suppress_same_run_human_operator_dups,
+        )
+        return _suppress_same_run_human_operator_dups
+
+    def test_both_empty_returns_empty_tuples(self):
+        """Both empty inputs → ([], [])."""
+        kept, suppressed = self._fn()([], [])
+        assert kept == []
+        assert suppressed == []
+
+    def test_exact_match_suppressed(self):
+        """Stage 1 human_operator_required + Stage 2 same (task_id, flag_type, resolution_status) → suppressed."""
+        stage1 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 's1 finding'},
+        ]
+        stage2 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 's2 dup'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert kept == []
+        assert len(suppressed) == 1
+        assert suppressed[0]['description'] == 's2 dup'
+
+    def test_stage1_not_human_operator_required_keeps_stage2(self):
+        """Stage 1 has same (task_id, flag_type) but resolution_status='resolved' → Stage 2 item kept."""
+        stage1 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'resolved'},
+        ]
+        stage2 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'stage2 unique'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert len(kept) == 1
+        assert suppressed == []
+
+    def test_stage2_different_resolution_status_kept(self):
+        """Stage 1 is human_operator_required but Stage 2 item has different resolution_status → Stage 2 kept."""
+        stage1 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        stage2 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'in_progress', 'description': 'different status'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert len(kept) == 1
+        assert kept[0]['resolution_status'] == 'in_progress'
+        assert suppressed == []
+
+    def test_different_task_id_kept(self):
+        """Stage 1 human_operator_required for task 42; Stage 2 item has different task_id → kept."""
+        stage1 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        stage2 = [
+            {'task_id': '99', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert len(kept) == 1
+        assert suppressed == []
+
+    def test_different_flag_type_kept(self):
+        """Stage 1 human_operator_required for flag_type X; Stage 2 item has different flag_type → kept."""
+        stage1 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        stage2 = [
+            {'task_id': '42', 'flag_type': 'stale_dependency', 'resolution_status': 'human_operator_required'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert len(kept) == 1
+        assert suppressed == []
+
+    def test_stage1_missing_task_id_forms_no_key_all_stage2_kept(self):
+        """Stage 1 entry missing task_id → no key formed → all Stage 2 items kept."""
+        stage1 = [
+            {'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        stage2 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert len(kept) == 1
+        assert suppressed == []
+
+    def test_stage1_missing_flag_type_forms_no_key_all_stage2_kept(self):
+        """Stage 1 entry missing flag_type → no key formed → all Stage 2 items kept."""
+        stage1 = [
+            {'task_id': '42', 'resolution_status': 'human_operator_required'},
+        ]
+        stage2 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert len(kept) == 1
+        assert suppressed == []
+
+    def test_integer_vs_string_task_id_coercion_suppresses(self):
+        """Stage 1 emits int task_id=42; Stage 2 emits string '42' → suppressed via str() coercion."""
+        stage1 = [
+            {'task_id': 42, 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        stage2 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert kept == []
+        assert len(suppressed) == 1
+
+    def test_mixed_stage2_items_exact_split(self):
+        """Multiple Stage 2 items: duplicate + non-duplicate → exact split in (kept, suppressed)."""
+        stage1 = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+            {'task_id': '77', 'flag_type': 'stale_dependency', 'resolution_status': 'human_operator_required'},
+        ]
+        stage2 = [
+            # duplicate — should be suppressed
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'dup'},
+            # different task_id — should be kept
+            {'task_id': '55', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'unique task'},
+            # different flag_type for stage1 task 77 — should be kept
+            {'task_id': '77', 'flag_type': 'other_flag', 'resolution_status': 'human_operator_required', 'description': 'unique flag_type'},
+            # exact dup for task 77 — should be suppressed
+            {'task_id': '77', 'flag_type': 'stale_dependency', 'resolution_status': 'human_operator_required', 'description': 'dup2'},
+        ]
+        kept, suppressed = self._fn()(stage2, stage1)
+        assert len(kept) == 2
+        assert len(suppressed) == 2
+        kept_descs = {item['description'] for item in kept}
+        suppressed_descs = {item['description'] for item in suppressed}
+        assert kept_descs == {'unique task', 'unique flag_type'}
+        assert suppressed_descs == {'dup', 'dup2'}
+
+
+class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
+    """Integration tests: TaskKnowledgeSync.run() applies the Stage 1 dup suppression post-processor."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _make_cli_result(self, flagged_items: list[dict]) -> MagicMock:
+        """Return a fake StageResult-like object for patching run_stage_via_cli."""
+        return MagicMock(
+            success=True,
+            report={'flagged_items': flagged_items, 'summary': 'ok'},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='m',
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_suppresses_stage1_dup_and_keeps_unique(self, mock_deps, caplog):
+        """run() drops Stage 2 items that duplicate Stage 1 human_operator_required flags."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidation,
+            items_flagged=[
+                {
+                    'task_id': '99',
+                    'flag_type': 'assumption_invalid',
+                    'resolution_status': 'human_operator_required',
+                    'description': 's1 finding',
+                }
+            ],
+        )
+        stage2_flagged = [
+            # duplicate — same (task_id, flag_type, resolution_status)
+            {
+                'task_id': '99',
+                'flag_type': 'assumption_invalid',
+                'resolution_status': 'human_operator_required',
+                'description': 's2 dup',
+            },
+            # unique — different task_id
+            {
+                'task_id': '888',
+                'flag_type': 'assumption_invalid',
+                'resolution_status': 'human_operator_required',
+                'description': 's2 unique',
+            },
+        ]
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._make_cli_result(stage2_flagged)),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[stage1_report],
+                run_id='test-run-1154-a',
+            )
+
+        # Only the unique item should survive
+        assert len(report.items_flagged) == 1
+        assert report.items_flagged[0]['description'] == 's2 unique'
+
+        # INFO log with suppressed_count should have fired
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        suppression_logs = [
+            r for r in caplog.records
+            if r.name == target_logger
+            and r.levelno == logging.INFO
+            and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
+        ]
+        assert len(suppression_logs) == 1, (
+            f'expected one stage2_suppressed_stage1_dup_flags INFO log, got {len(suppression_logs)}'
+        )
+        rec = suppression_logs[0]
+        assert getattr(rec, 'suppressed_count', None) == 1
+        assert getattr(rec, 'run_id', None) == 'test-run-1154-a'
+
+    @pytest.mark.asyncio
+    async def test_run_empty_prior_reports_no_op(self, mock_deps, caplog):
+        """Empty prior_reports → no suppression, no log, items_flagged unchanged."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        stage2_flagged = [
+            {'task_id': '99', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'item'},
+        ]
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._make_cli_result(stage2_flagged)),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-1154-b',
+            )
+
+        # All items kept unchanged
+        assert len(report.items_flagged) == 1
+
+        # No suppression log
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        suppression_logs = [
+            r for r in caplog.records
+            if r.name == target_logger and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
+        ]
+        assert suppression_logs == []
+
+    @pytest.mark.asyncio
+    async def test_run_empty_stage1_flags_no_op(self, mock_deps, caplog):
+        """prior_reports[0].items_flagged empty → no suppression, no log."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidation,
+            items_flagged=[],
+        )
+        stage2_flagged = [
+            {'task_id': '99', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'item'},
+        ]
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._make_cli_result(stage2_flagged)),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[stage1_report],
+                run_id='test-run-1154-c',
+            )
+
+        # All items kept unchanged
+        assert len(report.items_flagged) == 1
+
+        # No suppression log
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        suppression_logs = [
+            r for r in caplog.records
+            if r.name == target_logger and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
+        ]
+        assert suppression_logs == []
+
+    @pytest.mark.asyncio
+    async def test_run_no_duplicates_no_suppression_log(self, mock_deps, caplog):
+        """Stage 2 emits non-duplicate items only → all kept, no suppression log fired."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidation,
+            items_flagged=[
+                {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+            ],
+        )
+        stage2_flagged = [
+            # different task_id — not a dup
+            {'task_id': '99', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'unique'},
+        ]
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._make_cli_result(stage2_flagged)),
+            ),
+            caplog.at_level(
+                logging.INFO,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[stage1_report],
+                run_id='test-run-1154-d',
+            )
+
+        # All items kept
+        assert len(report.items_flagged) == 1
+
+        # No suppression log because nothing was suppressed
+        target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        suppression_logs = [
+            r for r in caplog.records
+            if r.name == target_logger and 'stage2_suppressed_stage1_dup_flags' in r.getMessage()
+        ]
+        assert suppression_logs == []
