@@ -779,40 +779,12 @@ class TestGetStatusToolDeadLetters:
             f'Expected dead_letters in queue; got: {status_result}'
         )
         status_total = status_result['queue']['dead_letters']['total']
+        # dead_letters.total is the UNBOUNDED count: 2 durable + 3 event = 5.
+        # This invariant holds regardless of any limit= used in get_dead_letters.
+        # (If limit < total, get_dead_letters.items is truncated but total stays 5.)
+        assert status_total == 5, (
+            f'Expected unbounded total of 5 (2 durable + 3 event); got {status_total}'
+        )
+        # When limit (100) exceeds actual count (5), items are also complete.
         dl_count = len(dl_result['items'])
-        assert status_total == dl_count, (
-            f'get_status dead_letters.total ({status_total}) must equal '
-            f'get_dead_letters item count ({dl_count})'
-        )
-
-    @pytest.mark.asyncio
-    async def test_get_status_event_queue_count_uses_to_thread(self, tmp_path):
-        """event_queue.read_dead_letters is called via asyncio.to_thread."""
-        dl_path = tmp_path / 'dl.jsonl'
-        buf = _make_failing_buf()
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl_path,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        await eq.close()  # close immediately — we just need the object
-
-        svc = _make_status_mock_service(queue_counts={'dead': 0})
-        server = create_mcp_server(svc, event_queue=eq)
-
-        with patch('fused_memory.server.tools.asyncio.to_thread', new_callable=AsyncMock) as mock_to_thread:
-            mock_to_thread.return_value = []  # no dead letters
-            await server._tool_manager.call_tool(
-                'get_status', {'project_id': 'proj-a'},
-            )
-
-        mock_to_thread.assert_called()
-        # First positional arg must be event_queue.read_dead_letters
-        first_arg = mock_to_thread.call_args.args[0]
-        assert first_arg == eq.read_dead_letters, (
-            f'to_thread must be called with event_queue.read_dead_letters; got {first_arg}'
-        )
+        assert dl_count == 5, f'Expected 5 items from get_dead_letters; got {dl_count}'

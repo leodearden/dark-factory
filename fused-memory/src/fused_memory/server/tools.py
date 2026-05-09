@@ -1045,7 +1045,10 @@ def create_mcp_server(
                     result['queue']['dead_letters'] = {
                         'durable_queue': 0, 'event_queue': 0, 'total': 0,
                     }
-            else:
+            elif 'error' not in queue_section:
+                # Skip enrichment for error queue sections (e.g. {'error': '...'}).
+                # Mutating an error dict with dead_letters stats would create a
+                # confusing mixed error/stats shape for consumers.
                 durable_dead: int = queue_section.get('counts', {}).get('dead', 0)
 
                 event_dead: int = 0

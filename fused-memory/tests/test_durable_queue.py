@@ -1105,6 +1105,33 @@ class TestStats:
         await q.close()
 
 
+async def _poll_until_dead(
+    q: DurableWriteQueue,
+    *,
+    group_id: str | None = None,
+    expected_dead: int,
+    timeout: float = 5.0,
+) -> None:
+    """Poll queue stats until at least *expected_dead* items have status='dead'.
+
+    Replaces fixed ``asyncio.sleep`` calls in tests that wait for items to
+    dead-letter: avoids the 1.5 s floor on fast machines while still handling
+    slow CI runners via the *timeout* guard.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        stats = await q.get_stats(group_id=group_id)
+        if stats['counts'].get('dead', 0) >= expected_dead:
+            return
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            raise AssertionError(
+                f'Timed out waiting for {expected_dead} dead item(s) '
+                f'(group_id={group_id!r}); last counts={stats["counts"]}'
+            )
+        await asyncio.sleep(0.05)
+
+
 class TestGetStatsScopedByGroup:
     """get_stats(group_id=…) should filter counts and oldest-pending age by group."""
 
@@ -1137,8 +1164,9 @@ class TestGetStatsScopedByGroup:
                     group_id='proj_b', operation='add_episode',
                     payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
                 )
-            # Wait for all items to be processed (dead-lettered)
-            await asyncio.sleep(1.5)
+            # Wait for all 5 items to dead-letter (2 proj_a + 3 proj_b).
+            # Polling is faster than a fixed sleep and reliable on slow CI.
+            await _poll_until_dead(q, expected_dead=5)
 
             stats_a = await q.get_stats(group_id='proj_a')
             stats_b = await q.get_stats(group_id='proj_b')
@@ -1183,7 +1211,8 @@ class TestGetStatsScopedByGroup:
                     group_id='proj_b', operation='add_episode',
                     payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
                 )
-            await asyncio.sleep(1.5)
+            # Wait for all 5 items to dead-letter; polling avoids fixed-sleep flakiness.
+            await _poll_until_dead(q, expected_dead=5)
 
             stats = await q.get_stats()  # no group_id → unscoped
             # Should see the total across both groups
