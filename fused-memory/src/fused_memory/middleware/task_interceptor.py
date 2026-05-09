@@ -1883,7 +1883,7 @@ class TaskInterceptor:
                         '_curator_worker: AllAccountsCappedException for '
                         'project %s (retries=%d, elapsed=%.1fs); deferring '
                         '%d batch tickets%s and waiting for cap reset',
-                        project_id, getattr(exc, 'retries', 0), getattr(exc, 'elapsed_secs', 0.0),
+                        project_id, exc.retries, exc.elapsed_secs,
                         len(batch_ticket_ids),
                         ' (+1 lookahead held in worker)'
                         if lookahead_ticket_id is not None else '',

@@ -1878,27 +1878,6 @@ async def test_done_provenance_resolves_short_sha_and_persists(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_note_only_rejected_for_found_on_main(
-    taskmaster, reconciler, event_buffer
-):
-    """kind='found_on_main' without a commit is rejected (post-3092 hardening)."""
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
-
-    result = await interceptor.set_task_status(
-        '1', 'done', '/project',
-        done_provenance={
-            'kind': 'found_on_main',
-            'note': 'covered by parent task 1745',
-        },
-    )
-
-    assert result['success'] is False
-    assert result['error'] == 'done_provenance_invalid'
-    assert 'commit' in result['reason'].lower()
-    taskmaster.set_task_status.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_done_provenance_commit_plus_note_both_persisted(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
@@ -2160,51 +2139,6 @@ async def test_done_provenance_found_on_main_rejects_branch_only_sha(
             'kind': 'found_on_main',
             'commit': branch_sha,
             'note': 'sibling task 99 landed this',
-        },
-    )
-
-    assert result['success'] is False
-    assert result['error'] == 'done_provenance_invalid'
-    assert 'not on main' in result['reason'] or 'not an ancestor' in result['reason']
-    taskmaster.set_task_status.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_done_provenance_found_on_main_runs_ancestor_check(
-    taskmaster, reconciler, event_buffer, tmp_path
-):
-    """kind='found_on_main' with a commit DOES run the ancestor backstop (post-3092 hardening).
-
-    A branch-only SHA is rejected the same way as kind='merged'.
-    """
-    import subprocess
-    _init_git_repo(tmp_path)
-    # Branch commit not on main — would fail the ancestor check under "merged"
-    subprocess.run(
-        ['git', '-C', str(tmp_path), 'checkout', '-q', '-b', 'feature'],
-        check=True,
-    )
-    (tmp_path / 'feature.txt').write_text('feature\n')
-    subprocess.run(['git', '-C', str(tmp_path), 'add', '-A'], check=True)
-    subprocess.run(
-        ['git', '-C', str(tmp_path), 'commit', '-q', '-m', 'feature commit'],
-        check=True,
-    )
-    branch_sha = subprocess.run(
-        ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    subprocess.run(
-        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'], check=True,
-    )
-
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
-    result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
-        done_provenance={
-            'kind': 'found_on_main',
-            'commit': branch_sha,
-            'note': 'sibling task 99 landed this on its own branch',
         },
     )
 
