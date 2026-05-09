@@ -296,6 +296,93 @@ async def test_verify_tracks_graphiti_writes_queued_separately(journal):
 
 
 @pytest.mark.asyncio
+async def test_verify_overrides_inflated_graphiti_writes_queued(journal):
+    """LLM inflates graphiti_writes_queued (7); only 1 graphiti-only enqueue actually occurred.
+
+    Verifier must override the LLM value with the observed count (1) and snapshot
+    the original LLM-emitted value (7) under _reported['graphiti_writes_queued'].
+    No mem0 noise: the only op is the graphiti-only enqueue.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    # One graphiti-only enqueue — must count as graphiti_writes_queued only.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator, stage_start, stage_end,
+            stats={'graphiti_writes_queued': 7},
+        ),
+    }
+
+    observed = await verify_and_rewrite_stats(run_id, reports, journal)
+
+    assert observed['memory_consolidator']['graphiti_writes_queued'] == 1
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    # LLM's inflated 7 overridden by observed 1.
+    assert stats['graphiti_writes_queued'] == 1
+    # Original LLM value preserved for divergence visibility.
+    assert stats['_reported']['graphiti_writes_queued'] == 7
+    # memories_added was not originally reported — must NOT appear in _reported.
+    assert 'memories_added' not in stats['_reported']
+
+
+@pytest.mark.asyncio
+async def test_verify_overrides_all_three_with_divergent_originals(journal):
+    """LLM reports inflated memories_added=9, memories_written=9, graphiti_writes_queued=7.
+
+    Observed: 1 mem0-id op + 1 graphiti-only enqueue.
+    Verifier must overwrite all three to 1 and snapshot all three originals under
+    _reported, exercising both the alias mechanism and the queued-counter override
+    in a single pass.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    # (a) One mem0-id success — counts as memories_added.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    # (b) One graphiti-only enqueue — counts as graphiti_writes_queued.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator, stage_start, stage_end,
+            stats={'memories_added': 9, 'memories_written': 9, 'graphiti_writes_queued': 7},
+        ),
+    }
+
+    observed = await verify_and_rewrite_stats(run_id, reports, journal)
+
+    assert observed['memory_consolidator']['memories_added'] == 1
+    assert observed['memory_consolidator']['graphiti_writes_queued'] == 1
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    # All three keys overwritten with observed values.
+    assert stats['memories_added'] == 1
+    assert stats['memories_written'] == 1  # alias mirrors canonical's observed value
+    assert stats['graphiti_writes_queued'] == 1
+    # All three originals snapshotted under _reported.
+    assert stats['_reported']['memories_added'] == 9
+    assert stats['_reported']['memories_written'] == 9
+    assert stats['_reported']['graphiti_writes_queued'] == 7
+
+
+@pytest.mark.asyncio
 async def test_verify_returns_empty_when_no_write_journal():
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC)
