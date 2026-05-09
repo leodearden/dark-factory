@@ -263,3 +263,76 @@ async def test_empty_string_kind_value_matches_explicit_empty_string():
     assert result is row, (
         f'Expected the row when flag_type is explicitly empty string but got {result!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (task-1146) — find_prior_memories (plural) returns ALL matching rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_prior_memories_returns_all_matching():
+    """find_prior_memories returns ALL rows matching task_id+kind, in order.
+
+    Given 4 search results where 3 match (task_id='42', flag_type='foo') and 1
+    does not (wrong task_id), the function returns a list of exactly those 3
+    matching rows, in the order they appeared in the search result.
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memories
+
+    match1 = _make_memory_result({'task_id': '42', 'flag_type': 'foo'})
+    match2 = _make_memory_result({'task_id': 42, 'flag_type': 'foo'})   # int task_id → str-coerced
+    match3 = _make_memory_result({'task_id': '42', 'flag_type': 'foo'})
+    no_match = _make_memory_result({'task_id': '99', 'flag_type': 'foo'})  # wrong task_id
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[match1, no_match, match2, match3])
+
+    results = await find_prior_memories(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': 'foo'},
+        query='q',
+    )
+
+    assert results == [match1, match2, match3], (
+        f'Expected the 3 matching rows in order but got {results!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_prior_memories_search_failure_returns_empty_list_and_warns(caplog):
+    """When memory_service.search raises, find_prior_memories returns [] (not None) and logs WARNING.
+
+    The returned value must be a list so callers can safely iterate without
+    checking for None.  The WARNING is logged under the caller's logger when one
+    is provided (mirrors find_prior_memory behaviour).
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memories
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+
+    caller_logger = logging.getLogger('test.caller_logger')
+    with caplog.at_level(logging.WARNING, logger='test.caller_logger'):
+        results = await find_prior_memories(
+            memory_service,
+            project_id='p',
+            task_id='77',
+            kind={'flag_type': 'foo'},
+            query='q',
+            log=caller_logger,
+        )
+
+    # Returns empty list, not None
+    assert results == [], f'Expected [] on search failure but got {results!r}'
+
+    # At least one WARNING record under the caller's logger mentions task_id
+    assert any(
+        '77' in record.message and record.levelno >= logging.WARNING
+        for record in caplog.records
+    ), (
+        f'Expected a WARNING mentioning task 77 but got: '
+        f'{[r.message for r in caplog.records]}'
+    )
