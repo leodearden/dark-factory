@@ -29,7 +29,9 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 
-You do NOT have access to task tools — task reconciliation is Stage 2's job.
+You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
+`get_task` is permitted as a read-only verification call (see \
+## Terminal-State Pre-Check Discipline below).
 
 ## Your Consolidation Tasks
 1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. Merge or delete.
@@ -72,28 +74,25 @@ mandatory two-step verification:
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
 IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
-This is a 3-cycle recurrent failure (evidence: cycle cbff1ed5 attempted prefixes \
-`"2531b4d8"`, `"f904f149"` for Graphiti and `"78d41a98"` for Mem0 — all were silent no-ops). \
-A reinforcement memory added after cycle cbff1ed5 has not prevented recurrence across \
-subsequent cycles; this section is the canonical enforcement point for UUID resolution.
+This is a recurrent failure that reinforcement memories alone have not prevented; \
+this section is the canonical enforcement point for UUID resolution.
 
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
 terminal state (done / cancelled / deferred / blocked), follow this verification:
 
-1. Call `get_task(id=<task_id>)` to read the live status from Taskmaster.
+1. Call `get_task(id=<task_id>, project_root=<project_root>)` to read the live status \
+   from Taskmaster.
 2. Only persist the temporal_fact if the live status matches the claimed terminal state.
 3. If they disagree, SKIP the write and flag for Stage 2 review instead — set `task_id` \
    and `flag_type` on the flagged item per the existing Flag Deduplication and \
    Stage 2 Flag Relay (FIX B) conventions.
 
-**Although Stage 1's general guideline says you do not perform task reconciliation, \
-`get_task` is a read-only tool that is permitted for this verification — it does not \
-write task state and does not violate the Stage 1 / Stage 2 separation.**
+**`get_task` is a permitted read-only verification call — it does not write task state \
+and does not violate the Stage 1 / Stage 2 separation.**
 
-Evidence: Stage 1 run `e5340e1a` wrote a temporal_fact claiming task 605 was "done" \
-without verifying live status (flagged by run `c37dffcf`, severity=moderate). See also \
-Task 1137, which implements the mirror pre-check at Stage 2's temporal_fact write site.
+Skipping this check risks persisting temporal facts that contradict Taskmaster's live \
+state, which misleads Stage 2 task reconciliation.
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
