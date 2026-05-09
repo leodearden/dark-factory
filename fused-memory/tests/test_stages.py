@@ -4919,6 +4919,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
         # All items kept unchanged
         assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
 
         # No suppression log
         target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -4965,6 +4966,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
         # All items kept unchanged
         assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
 
         # No suppression log
         target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -5014,6 +5016,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
         # All items kept
         assert len(report.items_flagged) == 1
+        assert 'stage2_stage1_dups_suppressed' not in report.stats
 
         # No suppression log because nothing was suppressed
         target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
