@@ -1102,6 +1102,7 @@ class TestStats:
         stats = await q.get_stats()
         assert stats['counts'].get('completed', 0) == 2
         assert stats['counts'].get('dead', 0) == 1
+        await q.close()
 
 
 class TestGetStatsScopedByGroup:
@@ -1257,4 +1258,3 @@ class TestGetStatsScopedByGroup:
             )
         finally:
             await q.close()
-        await q.close()
