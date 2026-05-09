@@ -3321,15 +3321,13 @@ async def _validate_done_provenance(
         resolved['commit'] = sha_or_err
         if sha_or_err != commit_input:
             resolved['commit_input'] = commit_input
-        if kind == 'merged':
+        if kind in ('merged', 'found_on_main'):
             ancestor_err = await _verify_commit_on_main(project_root, sha_or_err)
             if ancestor_err is not None:
                 return _done_provenance_error(
                     task_id,
-                    f'kind="merged" but commit {sha_or_err} is not on main: '
-                    f'{ancestor_err}. If the implementation lives on a sibling '
-                    f'task that landed separately, use kind="found_on_main" '
-                    f'with a note instead.',
+                    f'kind={kind!r} but commit {sha_or_err} is not on main: '
+                    f'{ancestor_err}.',
                 ), None
     if note is not None:
         resolved['note'] = note
