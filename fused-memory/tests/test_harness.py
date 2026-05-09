@@ -4645,3 +4645,140 @@ class TestUnknownProjectError:
         assert 'dark_factory' in err_msg, (
             f'Error message must include known project_ids; got: {err_msg!r}'
         )
+
+
+# ── step-21: _project_loop narrow exception handling tests ────────────────────
+
+class TestProjectLoopNarrowsExceptionHandling:
+    """Tests that _project_loop handles UnknownProjectError and plain ValueError differently.
+
+    Before step-22, the bare ``except ValueError`` swallows ALL ValueErrors as
+    misconfiguration and aborts the loop — including the transient ``ValueError``s
+    raised by stages (watermark/stage project_id mismatch, unset limits).
+
+    After step-22, the narrow ``except UnknownProjectError`` only catches registry
+    misconfiguration; plain ``ValueError``s fall through to ``except Exception``
+    and trigger the normal 5-second cooldown retry.
+
+    Subcase (a) passes both before and after step-22 (same behavior — UnknownProjectError
+    aborts loop cleanly in both cases).
+    Subcase (b) fails BEFORE step-22 (bare ValueError catches and aborts rather than
+    retrying) and passes AFTER step-22 (falls through to retry path).
+    """
+
+    @pytest.mark.asyncio
+    async def test_project_loop_aborts_on_unknown_project_error_no_retry(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_project_loop must abort cleanly on UnknownProjectError — no 5-second retry.
+
+        Pins that a KNOWN_PROJECT_ROOTS misconfiguration causes the loop to exit
+        immediately (logs once, returns), rather than spam-retrying every 5 seconds.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        from fused_memory.reconciliation.harness import UnknownProjectError
+
+        # Harness with NO entry for 'autopilot_video' — any attempt to run a
+        # full cycle for this project_id should raise UnknownProjectError.
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service,
+            {'dark_factory': '/home/leo/src/dark-factory'},
+        )
+
+        # Push enough events to trigger the cycle (buffer_size_threshold=2 in fixture)
+        for _ in range(5):
+            await event_buffer.push(_make_event('autopilot_video'))
+
+        sleep_mock = AsyncMock()
+
+        with patch('fused_memory.reconciliation.harness._sleep', sleep_mock):
+            # Should return cleanly — no exception escapes (loop catches and returns)
+            await asyncio.wait_for(
+                harness._project_loop('autopilot_video'),
+                timeout=10.0,
+            )
+
+        # The 5-second cooldown sleep must NOT have been called — the narrow catch
+        # should abort the loop without ever reaching the bottom `await _sleep(5)`.
+        cooldown_calls = [
+            c for c in sleep_mock.await_args_list if c.args and c.args[0] == 5
+        ]
+        assert len(cooldown_calls) == 0, (
+            f'_sleep(5) was called {len(cooldown_calls)} time(s) — '
+            f'UnknownProjectError should abort the loop without any retry cooldown '
+            f'(task 1143 step-22). Calls: {sleep_mock.await_args_list}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_project_loop_retries_on_generic_value_error_from_stage(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A plain ValueError from a stage must NOT abort the loop — it must retry.
+
+        Before step-22, the bare ``except ValueError`` silently swallows stage
+        ValueErrors (e.g. watermark↔stage project_id mismatch) and returns,
+        causing the loop to never recover. After step-22, the narrow
+        ``except UnknownProjectError`` lets the plain ValueError fall through to
+        ``except Exception``, which logs it and continues with the 5-second cooldown.
+
+        This test FAILS before step-22 (run_full_cycle called once, no _sleep(5))
+        and PASSES after step-22 (run_full_cycle called twice, _sleep(5) called).
+        """
+        import asyncio
+        from contextlib import suppress
+        from unittest.mock import AsyncMock, patch
+
+        # Harness WITH 'autopilot_video' so _known_project_root_for succeeds
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service,
+            {
+                'autopilot_video': '/home/leo/src/autopilot-video',
+                'dark_factory': '/home/leo/src/dark-factory',
+            },
+        )
+
+        # Push enough events to trigger should_trigger → True
+        for _ in range(5):
+            await event_buffer.push(_make_event('autopilot_video'))
+
+        # First call raises a plain ValueError (simulates transient stage error,
+        # e.g. base.py:108 watermark↔stage project_id mismatch).
+        # Second call raises CancelledError to terminate the loop in the test.
+        rfc_mock = AsyncMock(
+            side_effect=[
+                ValueError('simulated watermark mismatch — not a misconfig'),
+                asyncio.CancelledError(),
+            ]
+        )
+
+        sleep_mock = AsyncMock()
+
+        with (
+            patch.object(harness, 'run_full_cycle', rfc_mock),
+            patch('fused_memory.reconciliation.harness._sleep', sleep_mock),
+        ):
+            # CancelledError on the 2nd run_full_cycle call propagates out — suppress it.
+            with suppress(asyncio.CancelledError):
+                await harness._project_loop('autopilot_video')
+
+        # run_full_cycle must have been called at least twice — proof that the
+        # plain ValueError was NOT loop-fatal (retry path was taken).
+        assert rfc_mock.await_count >= 2, (
+            f'run_full_cycle must be retried after a plain ValueError; '
+            f'got {rfc_mock.await_count} call(s). '
+            f'If the count is 1, the bare except ValueError is still swallowing '
+            f'stage errors as misconfiguration (task 1143 step-22).'
+        )
+
+        # The 5-second cooldown must have been called between the two cycles.
+        cooldown_calls = [
+            c for c in sleep_mock.await_args_list if c.args and c.args[0] == 5
+        ]
+        assert len(cooldown_calls) >= 1, (
+            f'_sleep(5) (retry cooldown) must be called after the plain ValueError; '
+            f'got calls: {sleep_mock.await_args_list}. '
+            f'If 0 calls, the except ValueError is aborting instead of falling '
+            f'through to except Exception (task 1143 step-22).'
+        )
