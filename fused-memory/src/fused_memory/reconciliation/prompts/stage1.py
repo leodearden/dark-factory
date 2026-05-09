@@ -68,6 +68,16 @@ was created — count it as a no-op, not a successful addition. Your stats \
 attempted. If a write returns zero IDs and you expected a new memory, either retry with \
 different content or note the deduplication in your report.
 
+Invariant: `len(memory_ids_returned) == memories_written == memories_added`. Both keys \
+must carry the same count and both count only writes where `memory_ids` was non-empty.
+
+Graphiti-only async-enqueued writes show `stores: ['graphiti']` in the response but \
+return `memory_ids: []` because the write is queued rather than persisted inline. These \
+must NOT be counted under `memories_added` / `memories_written`. Report them instead under \
+a separate `graphiti_writes_queued` stat. The stats verifier enforces this split \
+independently and will override any inflated `memories_added` count, but you should report \
+it correctly from the start to avoid divergence.
+
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
 driven by a server-side fact-text readback. After persisting the edge, the server calls \
