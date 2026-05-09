@@ -82,6 +82,43 @@ def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
     return any(marker in content for marker in _KNOWN_BUG_1139_CONTENT_MARKERS)
 
 
+async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
+    """Query Mem0 for active Stage-2-destined flags and return them as dicts.
+
+    Searches for memories with ``metadata.flag_for_stage2=true`` (current
+    convention) *or* ``metadata.stage1_flag_marker=true`` (historical alias).
+    Any other memories are discarded.
+
+    Returns an empty list on search failure (best-effort; logs WARNING).
+    """
+    try:
+        results = await memory_service.search(
+            query='stage 1 flag for stage 2',
+            project_id=project_id,
+            categories=['observations_and_summaries'],
+            limit=100,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._query_stage2_flags: Mem0 search failed; '
+            'skipping active-query path this cycle',
+            extra={'project_id': project_id},
+        )
+        return []
+
+    flags: list[dict] = []
+    for r in results:
+        meta = dict(r.metadata or {})
+        if meta.get('flag_for_stage2') or meta.get('stage1_flag_marker'):
+            flags.append({
+                'id': r.id,
+                'content': r.content,
+                'metadata': meta,
+                'task_id': str(meta.get('task_id', '')),
+            })
+    return flags
+
+
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
