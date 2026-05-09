@@ -372,10 +372,23 @@ class TaskKnowledgeSync(BaseStage):
                 f'{format_task_list(sample)}\n'
             )
 
-        flagged_text = _format_flagged(
-            stage1_report.items_flagged if stage1_report else [],
-            run_stage='stage2',
-        )
+        # FIX A — merge Mem0 active-query flags into the flagged section.
+        # _query_stage2_flags is best-effort: search failures yield [] internally.
+        active_flags = await _query_stage2_flags(self.memory, self.project_id)
+
+        # Build the combined flags list: Stage 1 structured-output first, then
+        # Mem0 active-query results.  The Stage 1 path is left untouched — the
+        # scope filter below only applies to the Mem0-active-query path.
+        combined_flags: list[dict] = list(stage1_report.items_flagged if stage1_report else [])
+        for f in active_flags:
+            combined_flags.append({
+                '_source': 'mem0_active_query',
+                'flag_id': f['id'],
+                'task_id': f['task_id'],
+                'content': f['content'],
+            })
+
+        flagged_text = _format_flagged(combined_flags, run_stage='stage2')
 
         known_projects_section = self._format_known_projects_section()
 
