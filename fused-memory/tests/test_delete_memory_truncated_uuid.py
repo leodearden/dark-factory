@@ -18,7 +18,6 @@ from graphiti_core.errors import EdgeNotFoundError
 
 from fused_memory.services.memory_service import MemoryService
 
-
 # ---------------------------------------------------------------------------
 # Local service fixture — mirrors test_memory_service.py:16-47
 # ---------------------------------------------------------------------------
