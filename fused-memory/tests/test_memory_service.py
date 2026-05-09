@@ -2683,3 +2683,50 @@ class TestSearchGraphitiInvalidatedFiltering:
         )
 
 
+class TestGetStatusScoping:
+    """get_status forwards project_id as group_id to durable_queue.get_stats."""
+
+    @pytest.mark.asyncio
+    async def test_get_status_with_project_id_passes_group_id_to_queue(self, service):
+        """get_status(project_id='dark_factory') passes group_id='dark_factory'."""
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        await service.get_status(project_id='dark_factory')
+
+        service.durable_queue.get_stats.assert_called_once()
+        call_kwargs = service.durable_queue.get_stats.call_args.kwargs
+        assert call_kwargs.get('group_id') == 'dark_factory', (
+            f'Expected group_id="dark_factory", got call_kwargs={call_kwargs}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_status_without_project_id_passes_no_group_filter(self, service):
+        """get_status() with no project_id passes group_id=None (unscoped)."""
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        await service.get_status()
+
+        service.durable_queue.get_stats.assert_called_once()
+        call_kwargs = service.durable_queue.get_stats.call_args.kwargs
+        assert call_kwargs.get('group_id') is None, (
+            f'Expected group_id=None, got call_kwargs={call_kwargs}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_status_returns_queue_section_unchanged_shape(self, service):
+        """The queue section returned by get_status equals get_stats mock output."""
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        fixed_stats = {'counts': {'pending': 2, 'dead': 1}, 'oldest_pending_age_seconds': 5.0}
+        service.durable_queue.get_stats = AsyncMock(return_value=fixed_stats)
+
+        result = await service.get_status(project_id='proj1')
+
+        assert 'queue' in result, f'Expected "queue" key in result; got {list(result)}'
+        assert result['queue'] == fixed_stats, (
+            f'queue section should equal get_stats output; got {result["queue"]}'
+        )
+

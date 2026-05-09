@@ -635,3 +635,156 @@ class TestDeleteDeadLettersIdGuard:
             f"expected offending value in error message, got: {error_msg!r}"
         )
         svc.durable_queue.delete_dead.assert_not_called()
+
+
+# ── step-5 tests: get_status dead_letters enrichment ─────────────────────────
+
+
+def _make_status_mock_service(queue_counts: dict | None = None):
+    """Build a minimal mock service whose get_status returns a fixed queue section."""
+    svc = AsyncMock()
+    counts = queue_counts if queue_counts is not None else {}
+    svc.get_status = AsyncMock(return_value={
+        'graphiti': {'connected': True},
+        'mem0': {'connected': True},
+        'projects': {},
+        'queue': {
+            'counts': counts,
+            'oldest_pending_age_seconds': None,
+        },
+    })
+    svc.durable_queue = MagicMock()
+    svc.durable_queue.get_dead_items = AsyncMock(return_value=[])
+    return svc
+
+
+_FAKE_DEAD_ITEMS_PROJ_A = [
+    {
+        'id': 21,
+        'group_id': 'proj-a',
+        'operation': 'add_episode',
+        'payload': {'content': 'alpha', 'group_id': 'proj-a'},
+        'attempts': 3,
+        'error': 'RuntimeError: timeout',
+        'created_at': 1_700_000_021.0,
+    },
+    {
+        'id': 20,
+        'group_id': 'proj-a',
+        'operation': 'add_episode',
+        'payload': {'content': 'beta', 'group_id': 'proj-a'},
+        'attempts': 3,
+        'error': 'RuntimeError: timeout',
+        'created_at': 1_700_000_020.0,
+    },
+]
+
+
+class TestGetStatusToolDeadLetters:
+    """get_status MCP tool enriches the queue section with a dead_letters sub-dict."""
+
+    @pytest.mark.asyncio
+    async def test_get_status_includes_dead_letters_section_with_durable_only(self):
+        """With no event_queue, dead_letters reflects only the durable dead count."""
+        svc = _make_status_mock_service(queue_counts={'dead': 2, 'pending': 1})
+        server = create_mcp_server(svc, event_queue=None)
+
+        result = await server._tool_manager.call_tool(
+            'get_status', {'project_id': 'proj1'},
+        )
+
+        assert 'queue' in result, f'Expected queue key; got: {list(result)}'
+        assert 'dead_letters' in result['queue'], (
+            f'Expected dead_letters in queue; got: {list(result["queue"])}'
+        )
+        dl = result['queue']['dead_letters']
+        assert dl == {'durable_queue': 2, 'event_queue': 0, 'total': 2}, (
+            f'Wrong dead_letters shape: {dl}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_status_includes_event_queue_dead_letter_count(self, tmp_path):
+        """event_queue dead-letters for a project are counted in dead_letters."""
+        dl_path = tmp_path / 'dl.jsonl'
+        buf = _make_failing_buf()
+        eq = EventQueue(
+            buf,
+            dead_letter_path=dl_path,
+            maxsize=100,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.05,
+            shutdown_flush_seconds=1.0,
+        )
+        await eq.start()
+        try:
+            for _ in range(3):
+                eq.enqueue(_make_recon_event('proj-a'))
+            for _ in range(2):
+                eq.enqueue(_make_recon_event('proj-b'))
+            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
+            assert eq.stats()['dead_letters'] == 5
+        finally:
+            await eq.close()
+
+        svc = _make_status_mock_service(queue_counts={'dead': 0})
+        server = create_mcp_server(svc, event_queue=eq)
+
+        result = await server._tool_manager.call_tool(
+            'get_status', {'project_id': 'proj-a'},
+        )
+
+        assert 'queue' in result
+        assert 'dead_letters' in result['queue'], (
+            f'Expected dead_letters in queue; got: {list(result["queue"])}'
+        )
+        dl = result['queue']['dead_letters']
+        assert dl == {'durable_queue': 0, 'event_queue': 3, 'total': 3}, (
+            f'Expected only proj-a event_queue count; got: {dl}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_status_dead_letters_total_matches_get_dead_letters(self, tmp_path):
+        """get_status dead_letters.total equals len(get_dead_letters.items) for same project."""
+        dl_path = tmp_path / 'dl.jsonl'
+        buf = _make_failing_buf()
+        eq = EventQueue(
+            buf,
+            dead_letter_path=dl_path,
+            maxsize=100,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.05,
+            shutdown_flush_seconds=1.0,
+        )
+        await eq.start()
+        try:
+            for _ in range(3):
+                eq.enqueue(_make_recon_event('proj-a'))
+            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
+        finally:
+            await eq.close()
+
+        # Service reports 2 durable dead for proj-a; get_dead_letters returns 2 items
+        svc = _make_status_mock_service(queue_counts={'dead': 2})
+        svc.durable_queue.get_dead_items = AsyncMock(return_value=_FAKE_DEAD_ITEMS_PROJ_A)
+        server = create_mcp_server(svc, event_queue=eq)
+
+        status_result = await server._tool_manager.call_tool(
+            'get_status', {'project_id': 'proj-a'},
+        )
+        dl_result = await server._tool_manager.call_tool(
+            'get_dead_letters', {'project_id': 'proj-a', 'limit': 100},
+        )
+
+        assert 'dead_letters' in status_result.get('queue', {}), (
+            f'Expected dead_letters in queue; got: {status_result}'
+        )
+        status_total = status_result['queue']['dead_letters']['total']
+        # dead_letters.total is the UNBOUNDED count: 2 durable + 3 event = 5.
+        # This invariant holds regardless of any limit= used in get_dead_letters.
+        # (If limit < total, get_dead_letters.items is truncated but total stays 5.)
+        assert status_total == 5, (
+            f'Expected unbounded total of 5 (2 durable + 3 event); got {status_total}'
+        )
+        # When limit (100) exceeds actual count (5), items are also complete.
+        dl_count = len(dl_result['items'])
+        assert dl_count == 5, f'Expected 5 items from get_dead_letters; got {dl_count}'

@@ -387,12 +387,27 @@ class DurableWriteQueue:
                 await self._start_workers_for_pending_groups()
         return count
 
-    async def get_stats(self) -> dict[str, Any]:
-        """Return counts by status and oldest pending age."""
+    async def get_stats(self, group_id: str | None = None) -> dict[str, Any]:
+        """Return counts by status and oldest pending age.
+
+        Args:
+            group_id: When given, restrict counts and oldest-pending age to
+                rows whose ``group_id`` matches.  Default ``None`` returns
+                unscoped (global) statistics — preserving the behaviour
+                required by :mcp-tool:`get_queue_stats` and the dashboard.
+        """
         assert self._db is not None
-        cursor = await self._db.execute(
-            'SELECT status, COUNT(*) as cnt FROM write_queue GROUP BY status'
-        )
+
+        if group_id is not None:
+            cursor = await self._db.execute(
+                'SELECT status, COUNT(*) as cnt FROM write_queue '
+                'WHERE group_id = ? GROUP BY status',
+                (group_id,),
+            )
+        else:
+            cursor = await self._db.execute(
+                'SELECT status, COUNT(*) as cnt FROM write_queue GROUP BY status'
+            )
         rows = await cursor.fetchall()
         counts = {
             row[0] if isinstance(row, tuple) else row['status']:
@@ -401,10 +416,17 @@ class DurableWriteQueue:
         }
 
         oldest_pending_age = None
-        cursor = await self._db.execute(
-            "SELECT MIN(created_at) FROM write_queue "
-            "WHERE status IN ('pending', 'retry')"
-        )
+        if group_id is not None:
+            cursor = await self._db.execute(
+                "SELECT MIN(created_at) FROM write_queue "
+                "WHERE status IN ('pending', 'retry') AND group_id = ?",
+                (group_id,),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT MIN(created_at) FROM write_queue "
+                "WHERE status IN ('pending', 'retry')"
+            )
         row = await cursor.fetchone()
         if row:
             min_created = row[0] if isinstance(row, tuple) else row[0]
