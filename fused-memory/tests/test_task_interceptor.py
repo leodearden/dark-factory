@@ -1878,30 +1878,6 @@ async def test_done_provenance_resolves_short_sha_and_persists(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_note_only_accepted_and_persisted(
-    taskmaster, reconciler, event_buffer
-):
-    """A found_on_main note-only payload is accepted without git validation and persisted."""
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
-
-    result = await interceptor.set_task_status(
-        '1', 'done', '/project',
-        done_provenance={
-            'kind': 'found_on_main',
-            'note': 'covered by parent task 1745',
-        },
-    )
-
-    assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    assert persisted['done_provenance'] == {
-        'kind': 'found_on_main',
-        'note': 'covered by parent task 1745',
-    }
-
-
-@pytest.mark.asyncio
 async def test_done_provenance_commit_plus_note_both_persisted(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
@@ -2062,6 +2038,27 @@ async def test_done_provenance_found_on_main_requires_note(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_found_on_main_requires_commit(
+    taskmaster, reconciler, event_buffer
+):
+    """kind='found_on_main' without a commit is rejected (post-3092 hardening)."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project',
+        done_provenance={
+            'kind': 'found_on_main',
+            'note': 'covered by parent task 1745',
+        },
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'commit' in result['reason'].lower()
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_done_provenance_merged_rejects_branch_only_sha(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
@@ -2106,17 +2103,16 @@ async def test_done_provenance_merged_rejects_branch_only_sha(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_found_on_main_skips_ancestor_check(
+async def test_done_provenance_found_on_main_rejects_branch_only_sha(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
-    """kind="found_on_main" with an optional commit does NOT run the ancestor backstop.
+    """kind='found_on_main' with a commit not on main is rejected (post-3092 hardening).
 
-    The steward justifies the call via ``note``; the commit field is purely
-    advisory ("most relevant landing commit").
+    A branch-only SHA is rejected the same way as kind='merged'.
     """
     import subprocess
     _init_git_repo(tmp_path)
-    # Branch commit not on main — would fail the ancestor check under "merged"
+    # Create a branch commit that is NOT on main
     subprocess.run(
         ['git', '-C', str(tmp_path), 'checkout', '-q', '-b', 'feature'],
         check=True,
@@ -2131,6 +2127,7 @@ async def test_done_provenance_found_on_main_skips_ancestor_check(
         ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
+    # Switch back to main so HEAD on the worktree is on main
     subprocess.run(
         ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'], check=True,
     )
@@ -2141,14 +2138,66 @@ async def test_done_provenance_found_on_main_skips_ancestor_check(
         done_provenance={
             'kind': 'found_on_main',
             'commit': branch_sha,
-            'note': 'sibling task 99 landed this on its own branch',
+            'note': 'sibling task 99 landed this',
         },
     )
 
-    assert 'error' not in result, result
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'not on main' in result['reason'] or 'not an ancestor' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_with_on_main_commit_passes(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='found_on_main' with commit+note where commit is on main is accepted."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': sha,
+            'note': 'sibling task 99 landed this on main',
+        },
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
     persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    assert persisted['done_provenance']['kind'] == 'found_on_main'
-    assert persisted['done_provenance']['commit'] == branch_sha
+    dp = persisted['done_provenance']
+    assert dp['kind'] == 'found_on_main'
+    assert dp['commit'] == sha
+    assert dp['note'] == 'sibling task 99 landed this on main'
+    # No commit_input when the full SHA was supplied
+    assert 'commit_input' not in dp
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_short_sha_resolved(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='found_on_main' with a short-SHA prefix resolves to the full 40-char SHA."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': sha[:7],
+            'note': 'sibling task 99 landed this on main',
+        },
+    )
+
+    assert 'error' not in result
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    dp = persisted['done_provenance']
+    assert dp['commit'] == sha           # resolved to full SHA
+    assert dp['commit_input'] == sha[:7]  # original short ref preserved
 
 
 @pytest.mark.asyncio
@@ -4653,6 +4702,7 @@ async def test_journaled_write_emits_write_op_and_backend_op(
         await interceptor.update_task('1', '/project', prompt='tweak')
 
         # Verify the rows.
+        assert journal._db is not None
         async with journal._db.execute(
             "SELECT id, operation FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
@@ -4698,10 +4748,13 @@ async def test_journaled_write_logs_failure_row(
         with pytest.raises(TaskmasterError):
             await interceptor.update_task('1', '/project', prompt='x')
 
+        assert journal._db is not None
         async with journal._db.execute(
             "SELECT COUNT(*) FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
-            wo_count = (await cur.fetchone())[0]
+            row = await cur.fetchone()
+            assert row is not None
+            wo_count = row[0]
         assert wo_count == 1
         async with journal._db.execute(
             "SELECT success, error FROM backend_ops WHERE operation = 'update_task'",
