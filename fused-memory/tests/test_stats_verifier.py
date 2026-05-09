@@ -314,6 +314,79 @@ async def test_verify_returns_empty_when_no_write_journal():
     assert reports['memory_consolidator'].stats == {'memories_added': 2}  # type: ignore[union-attr]
 
 
+@pytest.mark.asyncio
+async def test_verify_aliases_memories_written_to_memories_added(journal):
+    """memories_written must mirror memories_added after verification.
+
+    The LLM uses both 'memories_added' and 'memories_written' interchangeably.
+    The verifier must write both keys to the same observed count and snapshot
+    both original LLM-emitted values under _reported.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    # One successful add_memory with non-empty memory_ids.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+
+    # Stage reports both keys with the same (inflated) value.
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator, stage_start, stage_end,
+            stats={'memories_added': 4, 'memories_written': 4},
+        ),
+    }
+
+    await verify_and_rewrite_stats(run_id, reports, journal)
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    # Both keys overwritten with the observed value (1).
+    assert stats['memories_added'] == 1
+    assert stats['memories_written'] == 1
+    # Both originals preserved under _reported.
+    assert stats['_reported']['memories_added'] == 4
+    assert stats['_reported']['memories_written'] == 4
+
+
+@pytest.mark.asyncio
+async def test_verify_aliases_memories_written_when_only_written_key_present(journal):
+    """When stage only reports memories_written (no memories_added), verifier
+    writes both keys and snapshots only memories_written in _reported.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator, stage_start, stage_end,
+            stats={'memories_written': 3},
+        ),
+    }
+
+    await verify_and_rewrite_stats(run_id, reports, journal)
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    # Both keys written with observed value.
+    assert stats['memories_added'] == 1
+    assert stats['memories_written'] == 1
+    # Only memories_written was originally present — memories_added was absent.
+    assert 'memories_written' in stats['_reported']
+    assert stats['_reported']['memories_written'] == 3
+    # memories_added was not in the original stats, so NOT in _reported.
+    assert 'memories_added' not in stats['_reported']
+
+
 def test_op_to_stat_mapping_covers_core_memory_operations():
     """Guard against accidental deletions of key op-to-stat mappings."""
     for key in ('add_memory', 'delete_memory', 'update_edge', 'add_episode'):
