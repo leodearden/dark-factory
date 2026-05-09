@@ -3874,17 +3874,6 @@ class TestQueryStage2Flags:
         assert result[0]['id'] == 'id-1'
 
     @pytest.mark.asyncio
-    async def test_returns_flags_with_stage1_flag_marker_legacy(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
-        memory_service = AsyncMock()
-        memory_service.search.return_value = [
-            self._make_result('id-3', 'legacy flag', {'stage1_flag_marker': True, 'task_id': '888'}),
-        ]
-        result = await _query_stage2_flags(memory_service, 'reify')
-        assert len(result) == 1
-        assert result[0]['id'] == 'id-3'
-
-    @pytest.mark.asyncio
     async def test_excludes_memories_without_either_marker(self):
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()

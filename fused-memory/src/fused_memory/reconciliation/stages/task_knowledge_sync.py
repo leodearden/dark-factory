@@ -51,6 +51,11 @@ _BRIEFING_REFRESH_PROJECT_ALLOWLIST: frozenset[str] = frozenset({'reify'})
 # FIX-A bug-mechanics description itself.  They must not be re-surfaced as live
 # flags for other tasks.  The list is intentionally narrow so legitimate flags
 # that merely mention "Stage 1" or "flagged_items" in passing are not suppressed.
+#
+# TODO(task-1139-gc): Remove this constant and _should_skip_known_bug_1139_flag
+# once the Mem0 collection no longer contains task_id=1139 flag_for_stage2
+# memories.  Trigger: verify via count_memories_by_metadata(filters={'task_id':
+# '1139', 'flag_for_stage2': True}) == 0, then delete both symbols.
 _KNOWN_BUG_1139_CONTENT_MARKERS: tuple[str, ...] = (
     'flag_for_stage2=true but does NOT include them in flagged_items',
     'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2',
@@ -75,6 +80,11 @@ def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
        metadata.flag_for_stage2 but does NOT include them in flagged_items".
 
     All other flags pass through unchanged.
+
+    .. note::
+        This filter becomes dead code once task 1139 closes and its Mem0 flags
+        are GC'd.  See the TODO on ``_KNOWN_BUG_1139_CONTENT_MARKERS`` for the
+        removal trigger.
     """
     if str(flag.get('task_id', '')) == '1139':
         return True
@@ -85,9 +95,19 @@ def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     """Query Mem0 for active Stage-2-destined flags and return them as dicts.
 
-    Searches for memories with ``metadata.flag_for_stage2=true`` (current
-    convention) *or* ``metadata.stage1_flag_marker=true`` (historical alias).
+    Searches for memories with ``metadata.flag_for_stage2=true`` (the only
+    supported convention — the ``stage1_flag_marker`` key was a never-shipped
+    alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
+
+    .. warning::
+        This function uses semantic search with a ``limit=100`` top-N cutoff.
+        In a busy Mem0 collection, flags with low embedding similarity to the
+        query can be pushed off the bottom and silently dropped.  FIX D's
+        persistence tracking (``_track_flag_persistence``) uses a deterministic
+        ``count_memories_by_metadata`` call to avoid this problem for staleness
+        detection.  The active-query path here still carries the top-N risk —
+        see follow-up task for a proper ``scroll_by_metadata`` API on Mem0Backend.
 
     Returns an empty list on search failure (best-effort; logs WARNING).
     """
@@ -109,7 +129,7 @@ async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     flags: list[dict] = []
     for r in results:
         meta = dict(r.metadata or {})
-        if meta.get('flag_for_stage2') or meta.get('stage1_flag_marker'):
+        if meta.get('flag_for_stage2'):
             flags.append({
                 'id': r.id,
                 'content': r.content,
