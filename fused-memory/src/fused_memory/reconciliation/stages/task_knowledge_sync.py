@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
+from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES, _extract_status
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -27,7 +28,6 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
-from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES, _extract_status
 from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
