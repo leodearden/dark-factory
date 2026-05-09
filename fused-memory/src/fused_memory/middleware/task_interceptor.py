@@ -24,6 +24,10 @@ except ImportError:
     class _UnavailableAllAccountsCapped(Exception):
         """Placeholder used only when shared.cli_invoke is not importable."""
 
+        retries: int
+        elapsed_secs: float
+        label: str
+
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
