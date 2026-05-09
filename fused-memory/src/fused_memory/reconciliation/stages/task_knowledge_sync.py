@@ -27,12 +27,12 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
