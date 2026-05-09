@@ -6002,3 +6002,111 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert 'stall_guard_freshness_violations' not in report.stats
             # Guard 4 still fires
             assert report.stats.get('stage1_flags_processed') == 2
+
+        @pytest.mark.asyncio
+        async def test_cache_build_failure_no_false_positives(
+            self, mock_deps_composition, caplog
+        ):
+            """When get_task raises during cache build, Guards 2 and 3 must NOT fire.
+
+            Scenario: three Stage-2 ops on task_id='99' (one per guard: update_task,
+            set_task_status target=done, add_memory snapshot_status=in-progress).
+            taskmaster.get_task raises unconditionally for '99'.
+
+            Before the fix, the 'unknown' sentinel triggers 'unknown' != 'done' and
+            'unknown' != 'in-progress', so Guards 2 and 3 fire falsely and decrement
+            tasks_modified.  After the fix, the cache omits '99' and all helpers skip.
+
+            Assertions (b) and (c) are the principal regressions; (d) catches the
+            false tasks_modified decrement; (e) verifies the failure was still logged.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            # Three ops on the same task_id='99' — one per guard
+            ops = [
+                {  # Guard 1: terminal-state update_task
+                    'id': 'op-term-99',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'update_task',
+                    'params': json.dumps({'task_id': '99'}),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-1176-cache-fail',
+                    'created_at': '2026-01-01T00:00:00',
+                },
+                {  # Guard 3 (sts): set_task_status post-action target=done
+                    'id': 'op-sts-99',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'set_task_status',
+                    'params': json.dumps({'task_id': '99', 'status': 'done'}),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-1176-cache-fail',
+                    'created_at': '2026-01-01T00:00:01',
+                },
+                {  # Guard 2 (freshness): add_memory snapshot_status=in-progress
+                    'id': 'op-mem-99',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'add_memory',
+                    'params': json.dumps({
+                        'content': 'task 99 is stalled',
+                        'metadata': {'task_id': '99', 'snapshot_status': 'in-progress'},
+                    }),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-1176-cache-fail',
+                    'created_at': '2026-01-01T00:00:02',
+                },
+            ]
+            mock_deps_composition['journal'].write_journal.get_ops_by_causation.return_value = ops
+
+            # get_task always raises — '99' cannot be fetched from Taskmaster
+            async def _get_task_raises(task_id, project_root):
+                raise RuntimeError('boom')
+
+            mock_deps_composition['taskmaster'].get_task.side_effect = _get_task_raises
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [],
+                        stats={'tasks_modified': 5, 'memories_written': 1},
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[],
+                    run_id='test-run-1176-cache-fail',
+                )
+
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+            # (a) Guard 1 did not fire — 'unknown' is not in TERMINAL_STATUSES
+            assert 'not_applicable_count' not in report.stats
+
+            # (b) Guard 2 (sts post-action) did NOT falsely fire — principal regression
+            assert 'set_task_status_post_action_mismatches' not in report.stats
+
+            # (c) Guard 3 (freshness) did NOT falsely fire — principal regression
+            assert 'stall_guard_freshness_violations' not in report.stats
+
+            # (d) tasks_modified is unchanged — no false decrements
+            assert report.stats.get('tasks_modified') == 5
+
+            # (e) Exactly one cache-build WARNING was emitted naming task_id=99
+            cache_fail_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'get_task failed for task_id=99 during cache build' in r.getMessage()
+            ]
+            assert len(cache_fail_logs) == 1, (
+                f'expected 1 cache-build WARNING for task_id=99, got {len(cache_fail_logs)}'
+            )
