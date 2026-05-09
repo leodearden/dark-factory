@@ -1412,6 +1412,46 @@ class TestDispatchCooldownGate:
             "reopen_reason='un-defer script' must not block re-dispatch"
         )
 
+    @pytest.mark.asyncio
+    async def test_dispatch_cooldown_expires_after_window(self, monkeypatch):
+        """Cooldown gate expires exactly at the configured window edge (strict <).
+
+        After 601s with a 600s window the gate is open; after 599s it is still closed.
+        """
+        import time as _time_module
+
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=600.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First dispatch — arms the gate
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+        scheduler.release('99')
+
+        original_monotonic = _time_module.monotonic
+
+        # --- just inside window (+599s): gate still active ---
+        monkeypatch.setattr(
+            _time_module, 'monotonic', lambda: original_monotonic() + 599.0
+        )
+        a_inside = await scheduler.acquire_next()
+        assert a_inside is None, 'Gate must still be active at +599s (inside 600s window)'
+
+        # --- just past window (+601s): gate must be open ---
+        monkeypatch.setattr(
+            _time_module, 'monotonic', lambda: original_monotonic() + 601.0
+        )
+        a_outside = await scheduler.acquire_next()
+        assert a_outside is not None and a_outside.task_id == '99', (
+            'Gate must be open at +601s (past 600s window)'
+        )
+
 
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
