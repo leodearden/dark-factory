@@ -1128,6 +1128,29 @@ class TestProactiveSampling:
             'server now rejects that call shape.'
         )
 
+    def test_stage2_per_cycle_summary_requires_cycle_unique_fields(self):
+        """STAGE2_SYSTEM_PROMPT must require cycle-unique content in per-cycle summaries.
+
+        Three confirmed cycles (ddbeca36, b5c39ab7, 07a747ca) had their Stage 2
+        per-cycle summary silently dropped by Mem0 cosine-similarity deduplication
+        (memory_ids=[]). The fix is to require three cycle-unique fields in the
+        final add_memory content: run_id, flag UUIDs processed, and task IDs modified.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert 'run_id' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must mention 'run_id' in per-cycle-summary guidance "
+            "so Mem0 cannot collapse it with prior cycles via cosine similarity."
+        )
+        assert 'flag_id' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must mention 'flag_id' (flag marker UUIDs) in "
+            "per-cycle-summary guidance to ensure uniqueness across cycles."
+        )
+        assert 'task IDs modified' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must mention 'task IDs modified' in "
+            "per-cycle-summary guidance so the exact changed tasks are recorded."
+        )
+
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
