@@ -1271,6 +1271,79 @@ async def test_filter_suppressed_search_exception_returns_flags_unchanged_and_wa
     ), f'Expected WARNING mentioning filter_suppressed but got: {warning_messages}'
 
 
+# ---------------------------------------------------------------------------
+# task-1186 step-5 — integration: dedup_flags calls filter_suppressed FIRST
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
+    """Integration: dedup_flags calls filter_suppressed BEFORE the signature-dedup loop.
+
+    The mock search side_effect tracks call order:
+    - Call 1 (suppression query): returns a record suppressing task_id=42.
+    - Call 2+ (per-flag prior-marker queries): returns [].
+
+    Two flags: task_id=42 (suppressed) and task_id=99 (not suppressed), both
+    with flag_type='missing_deliverable'.
+
+    Expected outcomes:
+    (a) Result has exactly one item — the task_id=99 flag.
+    (b) task_id=42 flag was dropped.
+    (c) add_memory called exactly once (MISS path for task_id=99 only).
+    (d) search called exactly twice (1 suppression + 1 per-flag-marker for task_id=99).
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    suppression_record = _make_memory_result({
+        'kind': 'stage1_flag_suppression',
+        'task_id': 42,
+    })
+
+    call_count = [0]
+
+    async def _search_side_effect(**kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # First call is the filter_suppressed project-scoped query
+            return [suppression_record]
+        # Subsequent calls are per-flag prior-marker queries (MISS path)
+        return []
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_search_side_effect)
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+    flags = [
+        {'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'suppressed'},
+        {'task_id': 99, 'flag_type': 'missing_deliverable', 'description': 'survivor'},
+    ]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) Only one flag survived
+    assert len(result) == 1
+    # (b) task_id=42 was dropped
+    assert result[0].get('task_id') == 99, (
+        f"Expected surviving flag task_id=99 but got {result[0].get('task_id')!r}"
+    )
+    # (c) add_memory called exactly once — only for task_id=99 MISS path
+    assert memory_service.add_memory.call_count == 1, (
+        f'Expected exactly 1 add_memory call (task_id=99 MISS) but got '
+        f'{memory_service.add_memory.call_count}'
+    )
+    # (d) search called exactly twice: 1 suppression + 1 per-flag-marker
+    assert memory_service.search.call_count == 2, (
+        f'Expected 2 search calls (1 suppression + 1 per-flag-marker) but got '
+        f'{memory_service.search.call_count}'
+    )
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
     """Regression: two successive dedup_flags calls for the same flag leave exactly 1 marker.
