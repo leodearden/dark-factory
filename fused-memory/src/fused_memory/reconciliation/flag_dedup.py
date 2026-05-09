@@ -5,28 +5,38 @@ output.  The LLM has no memory of prior cycles, so the same (task_id,
 flag_type) pair can be emitted cycle after cycle.  For flags with a
 computable *signature* we check Mem0 for a prior ``stage1_flag_marker``
 memory.  On a hit, the flag is annotated with ``persisted_from_run`` and a
-replacement marker is written, then all prior markers are deleted (atomic
-replacement).  On a miss, a new marker memory is written so future cycles
-can detect the repeat.
+replacement marker is written, then all prior markers are deleted (best-effort
+replacement).  Two concurrent dedup_flags calls for the same (task_id,
+flag_type) may both write replacements and both delete the shared prior,
+leaving up to N transient duplicate markers; the next cycle's HIT branch
+collapses them back to one.  On a miss, a new marker memory is written so
+future cycles can detect the repeat.
 
 Note: this module does **not** suppress persistent flags before Stage 2 sees
 them; suppression logic lives in Stage 2's prompt instructions which direct
 the LLM to soft-handle annotated flags.
 
-Atomic-replacement contract (task-1146)
----------------------------------------
+Best-effort replacement contract (task-1146, hardened in task-1165)
+--------------------------------------------------------------------
 On every HIT the dedup flow is:
 
 1. Find ALL prior markers for (task_id, flag_type) via ``find_prior_memories``
-   (plural); annotation extracted from the first result before any deletes.
+   (plural); sort by id lex; annotation extracted from the lowest-id-lex
+   prior before any deletes.
 2. Write a new replacement marker with the current ``run_id``.
-3. Only if the write succeeds: delete every prior marker (per-prior try/except
-   WARNING so one bad delete does not abort the batch).
+3. Only if the write succeeds **and** Mem0 confirmed it (non-empty
+   ``memory_ids`` in the response): delete every prior marker (per-prior
+   try/except WARNING so one bad delete does not abort the batch).  The
+   empty-memory_ids guard prevents a silent Mem0 no-op from wiping priors
+   and leaving no dedup state for the next cycle.
 
 This is self-healing: even if past leakage produced N prior markers, the next
-dedup_flags call collapses them to a single row.  Write-first ordering
-guarantees at-least-one-marker: either the new marker exists (proceed to
-delete priors) or write failed (priors intact for next cycle).
+dedup_flags call collapses them to a single row.  Write-first ordering with
+the empty-memory_ids guard provides best-effort at-least-one-marker: either
+the new marker exists (proceed to delete priors) or write failed/was a no-op
+(priors intact for next cycle).  Note that write+delete are two separate
+non-atomic steps; a crash between them leaves a transient duplicate, which
+the next cycle's HIT branch reclaims.
 
 Reclamation bound: ``find_prior_memories`` is called with ``limit=50``, so if
 past leakage produced more than 50 markers for one (task_id, flag_type) pair,
@@ -67,7 +77,8 @@ async def dedup_flags(
       with matching ``task_id`` and ``flag_type``.
       - On a HIT: annotate the flag with ``persisted_from_run`` and
         ``last_seen_run_id``; write a new replacement marker; if the write
-        succeeds, delete the prior marker (atomic-replacement pattern).
+        succeeds and Mem0 confirms it, delete the prior marker
+        (best-effort replacement pattern).
       - On a MISS: write a new marker so future cycles detect the repeat.
     - All search/write/delete exceptions are caught and logged at WARNING so
       that a transient Mem0 outage does not abort the stage run.
@@ -101,10 +112,14 @@ async def dedup_flags(
             log=logger,
         )
         if priors:
-            # --- HIT: atomic-replacement ---
-            # (1) Extract annotation from the FIRST prior BEFORE deleting any.
-            #     Annotation pinned to the first-found prior (search-order —
-            #     typically highest-relevance, not necessarily earliest).
+            # --- HIT: best-effort replacement ---
+            # (1) Sort priors by id lex so annotation source and deletion order
+            #     are deterministic across concurrent cycles.  MemoryResult.id
+            #     is always present (str); temporal fields are optional and may
+            #     be absent for Mem0 results, so lex sort is the only total order.
+            priors = sorted(priors, key=lambda p: p.id)
+            # Extract annotation from the first prior (lowest id lex) BEFORE
+            # deleting any.
             first_prior = priors[0]
             prior_run_id = (first_prior.metadata or {}).get('run_id') or 'unknown'
             if prior_run_id == 'unknown':
@@ -119,9 +134,12 @@ async def dedup_flags(
 
             # (2) Write replacement marker first.  If this fails, skip the
             #     delete so all priors remain intact for next cycle.
+            #     Also check that Mem0 actually persisted the write (non-empty
+            #     memory_ids); a silent no-op (empty memory_ids) skips deletion
+            #     so priors are preserved for the next cycle.
             write_succeeded = False
             try:
-                await memory_service.add_memory(
+                response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -135,7 +153,14 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                write_succeeded = True
+                if getattr(response, 'memory_ids', None):
+                    write_succeeded = True
+                else:
+                    logger.warning(
+                        'flag_dedup: add_memory returned no memory_ids on HIT for task %s'
+                        ' flag_type %s — skipping prior deletion',
+                        tid, ftype,
+                    )
             except Exception as e:
                 logger.warning(
                     'flag_dedup: failed to write replacement marker for task %s flag_type %s: %s',
@@ -170,11 +195,11 @@ async def dedup_flags(
             # miss, this branch still writes a new marker.  During a sustained
             # outage every cycle will write a marker for recurring flags,
             # causing monotonic marker-table growth beyond the normal one-row-
-            # per-(task_id, flag_type) bound.  The atomic-replacement pattern
-            # on the HIT path ensures that once search recovers, the next cycle
-            # collapses any accumulated duplicates back to a single row.
+            # per-(task_id, flag_type) bound.  The best-effort replacement
+            # pattern on the HIT path ensures that once search recovers, the
+            # next cycle collapses any accumulated duplicates back to a single row.
             try:
-                await memory_service.add_memory(
+                miss_response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -188,6 +213,12 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
+                if not getattr(miss_response, 'memory_ids', None):
+                    logger.warning(
+                        'flag_dedup: add_memory returned no memory_ids on MISS for task %s'
+                        ' flag_type %s — recurring flag will not be detected next cycle',
+                        tid, ftype,
+                    )
             except Exception as e:
                 logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
         result.append(flag)
