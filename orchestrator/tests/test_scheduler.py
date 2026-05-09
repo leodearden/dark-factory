@@ -1827,9 +1827,9 @@ class TestDispatchCooldownGate:
         counts = [0]
         real_signal = scheduler._dispatch_cooldown_signal  # bound method
 
-        def counting_signal(task_arg):
+        def counting_signal(task):
             counts[0] += 1
-            return real_signal(task_arg)
+            return real_signal(task)
 
         scheduler._dispatch_cooldown_signal = counting_signal
 
