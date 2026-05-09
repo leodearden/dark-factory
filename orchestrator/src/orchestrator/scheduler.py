@@ -499,6 +499,12 @@ class Scheduler:
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
+        # Per-task dispatch timestamps (monotonic) for the dispatch-cooldown
+        # gate.  Set immediately after a successful dispatch; cleared when the
+        # task transitions to a terminal status.  Process-local — an
+        # orchestrator restart is an acceptable implicit reset (reconciliation
+        # re-marks tasks needing the gate).
+        self._last_dispatch_at: dict[str, float] = {}  # task_id -> monotonic ts
         # Per-task retry-cap tracking.  Count of REQUEUED outcomes since the
         # last DONE (or cap-exhaust); history is the per-attempt record used
         # by the cap-exhaust escalation report.  Both are process-local — an
@@ -887,6 +893,60 @@ class Scheduler:
                 return False
         return True
 
+    def _dispatch_cooldown_active(
+        self, task: dict, tid: str
+    ) -> tuple[bool, str | None]:
+        """Return (is_active, signal_label) for the per-task dispatch cooldown gate.
+
+        The gate is active when ALL of:
+        1. The task has a prior dispatch recorded in ``_last_dispatch_at``.
+        2. The elapsed time since that dispatch is less than
+           ``config.dispatch_cooldown_secs`` (strict less-than).
+        3. The task's metadata carries a reset/steward signal indicating
+           it was just touched by reconciliation or the steward.
+
+        Signals (OR semantics — any one arms the gate):
+        - ``recon_reset_count > 1``: task has been reset by reconciliation
+          more than once (first reset is still allowed to dispatch).
+        - ``steward_clear_at``: truthy value → steward stash-pop resolution.
+        - ``recon_stage2_blocked_at``: truthy value → stage-2 block.
+        - ``reopen_reason`` containing the literal substring ``'steward'``.
+
+        Returns the signal label for use in operator-visible log messages.
+        """
+        last_dispatch = self._last_dispatch_at.get(tid)
+        if last_dispatch is None:
+            return False, None
+        elapsed = time.monotonic() - last_dispatch
+        if elapsed >= self.config.dispatch_cooldown_secs:
+            return False, None
+
+        metadata = task.get('metadata') or {}
+
+        # recon_reset_count > 1 (strict — first reset is allowed)
+        recon_count = metadata.get('recon_reset_count', 0)
+        try:
+            recon_count = float(recon_count)
+        except (TypeError, ValueError):
+            recon_count = 0
+        if recon_count > 1:
+            return True, 'recon_reset_count'
+
+        # steward_clear_at: any truthy value
+        if metadata.get('steward_clear_at'):
+            return True, 'steward_clear_at'
+
+        # recon_stage2_blocked_at: any truthy value
+        if metadata.get('recon_stage2_blocked_at'):
+            return True, 'recon_stage2_blocked_at'
+
+        # reopen_reason containing literal substring 'steward' (case-sensitive)
+        reopen_reason = metadata.get('reopen_reason', '') or ''
+        if 'steward' in reopen_reason:
+            return True, 'reopen_reason'
+
+        return False, None
+
     def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
         """Compute a reservation lease from the rolling duration window.
 
@@ -1211,6 +1271,12 @@ class Scheduler:
                 if time.monotonic() < cooldown_deadline:
                     continue
                 del self._requeue_until[tid_str]
+            # Dispatch cooldown gate: if the task was recently dispatched and
+            # carries a reconciliation/steward signal, suppress re-dispatch
+            # until the settle window elapses.  Both gates must pass.
+            cooldown_active, _signal = self._dispatch_cooldown_active(t, tid_str)
+            if cooldown_active:
+                continue
             if not self._deps_satisfied(t, status_map):
                 continue
             candidates.append(t)
@@ -1264,6 +1330,7 @@ class Scheduler:
                 continue
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
+                self._last_dispatch_at[task_id] = time.monotonic()  # arm cooldown gate
                 self._dispatched_priority[task_id] = pri
                 self._task_start_times[task_id] = time.monotonic()
                 if task_id == top_id:
