@@ -203,6 +203,43 @@ class ReconciliationHarness:
         """
         return self._project_root
 
+    def _known_project_root_for(self, project_id: str) -> str:
+        """Return the canonical project_root for *project_id* from the registry.
+
+        This is the pre-flight cross-contamination guard introduced by task 1143.
+        It looks up ``self._known_projects`` (populated at init from the configured
+        taskmaster root + ``DASHBOARD_KNOWN_PROJECT_ROOTS`` env var) and raises
+        ``ValueError`` if no entry exists.  The error message includes both the
+        unrecognised project_id *and* the sorted list of registered project_ids so
+        the operator can immediately attribute and fix a misconfiguration.
+
+        Raising here — before any journal or buffer side-effects — ensures that a
+        missing registry entry never causes a partial cycle (events drained, journal
+        row created, then a stage failure that leaves those events unrecoverable).
+
+        Args:
+            project_id: Canonical project identifier (e.g. ``'reify'``,
+                ``'autopilot_video'``).  Must match a key in
+                ``self._known_projects`` (derived from path basename,
+                lowercase, dashes to underscores).
+
+        Returns:
+            The absolute project_root path for *project_id*.
+
+        Raises:
+            ValueError: If *project_id* is not in ``self._known_projects``.
+        """
+        try:
+            return self._known_projects[project_id]
+        except KeyError:
+            known_sorted = sorted(self._known_projects)
+            raise ValueError(
+                f'reconciliation: project_id {project_id!r} has no entry in '
+                f'KNOWN_PROJECT_ROOTS (known: {known_sorted}). '
+                f'Set DASHBOARD_KNOWN_PROJECT_ROOTS env var or add a '
+                f'TaskmasterConfig.project_root that resolves to a known project.'
+            ) from None
+
     def _resolve_project_root(self, events: list[ReconciliationEvent]) -> str:
         """Return the project root for a batch of events.
 
