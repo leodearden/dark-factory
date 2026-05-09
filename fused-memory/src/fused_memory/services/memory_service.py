@@ -136,23 +136,27 @@ class MemoryService:
 
         logger.info('MemoryService initialized')
 
+    async def _safe_close(self, label: str, resource: Any) -> None:
+        """Close one resource, logging any failure without re-raising.
+
+        Lets close() continue through every resource even when one fails.
+        """
+        try:
+            await resource.close()
+        except Exception:
+            logger.exception('MemoryService.close: %s.close failed', label)
+
     async def close(self) -> None:
         if self.durable_queue:
-            with contextlib.suppress(Exception):
-                await self.durable_queue.close()
-        with contextlib.suppress(Exception):
-            await self.graphiti.close()
-        with contextlib.suppress(Exception):
-            await self.mem0.close()
+            await self._safe_close('durable_queue', self.durable_queue)
+        await self._safe_close('graphiti', self.graphiti)
+        await self._safe_close('mem0', self.mem0)
         if self._write_journal:
-            with contextlib.suppress(Exception):
-                await self._write_journal.close()
+            await self._safe_close('write_journal', self._write_journal)
         if self._event_buffer:
-            with contextlib.suppress(Exception):
-                await self._event_buffer.close()
+            await self._safe_close('event_buffer', self._event_buffer)
         if self.planned_episode_registry:
-            with contextlib.suppress(Exception):
-                await self.planned_episode_registry.close()
+            await self._safe_close('planned_episode_registry', self.planned_episode_registry)
 
     # ------------------------------------------------------------------
     # Journal helper
