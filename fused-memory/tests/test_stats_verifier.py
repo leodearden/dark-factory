@@ -243,6 +243,58 @@ async def test_verify_tallies_delete_and_update_edge(journal):
 
 
 @pytest.mark.asyncio
+async def test_verify_tracks_graphiti_writes_queued_separately(journal):
+    """Three add_memory ops: 2 with memory_ids, 1 graphiti-only enqueue.
+
+    The verifier must attribute:
+    - memories_added = 2  (ops a and c which returned non-empty memory_ids)
+    - graphiti_writes_queued = 1  (op b: memory_ids=[], stores=['graphiti'])
+
+    The LLM-emitted originals (5, 5, 0) must be preserved under _reported.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    # (a) mem0-only successful write — counts as memories_added.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    # (b) graphiti-only enqueue — must NOT count as memories_added,
+    #     must count as graphiti_writes_queued.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    # (c) mixed write: both stores, IDs returned — counts as memories_added.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m2'], 'stores': ['mem0', 'graphiti']},
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator, stage_start, stage_end,
+            stats={'memories_added': 5, 'memories_written': 5, 'graphiti_writes_queued': 0},
+        ),
+    }
+
+    observed = await verify_and_rewrite_stats(run_id, reports, journal)
+
+    assert observed['memory_consolidator']['memories_added'] == 2
+    assert observed['memory_consolidator']['graphiti_writes_queued'] == 1
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    assert stats['memories_added'] == 2
+    assert stats['graphiti_writes_queued'] == 1
+    # LLM-emitted originals preserved for divergence visibility.
+    assert stats['_reported']['memories_added'] == 5
+    assert stats['_reported']['graphiti_writes_queued'] == 0
+
+
+@pytest.mark.asyncio
 async def test_verify_returns_empty_when_no_write_journal():
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC)
