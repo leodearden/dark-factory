@@ -4189,3 +4189,65 @@ class TestKnownProjectRootFor:
             assert pid in err_msg, (
                 f"Error message must include known project_id {pid!r}; got: {err_msg!r}"
             )
+
+
+@pytest.mark.parametrize(
+    'project_id,expected_root',
+    [
+        ('autopilot_video', '/home/leo/src/autopilot-video'),
+        ('reify', '/home/leo/src/reify'),
+        ('autotrade', '/home/leo/src/autotrade'),
+        ('know_live', '/home/leo/src/know-live'),
+        ('dark_factory', '/home/leo/src/dark-factory'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_full_cycle_hard_binds_project_root_via_known_projects(
+    project_id, expected_root, journal, event_buffer, mock_memory_service
+):
+    """run_full_cycle must use the registry-derived root regardless of event payload.
+
+    The harness's _known_projects dict is the single source of truth (task 1143).
+    Even when events carry _project_root='/some/other/path', the stage must receive
+    the registry-bound root. Also verifies non-dark-factory projects never receive
+    dark-factory's path.
+
+    This test fails before step-4 because _resolve_project_root honours the event payload.
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+    )
+    # The harness's configured _project_root is dark-factory (typical multi-project deployment).
+    harness._project_root = '/home/leo/src/dark-factory'
+
+    wrong_path = '/some/other/wrong/path'
+
+    # Push events with deliberately wrong _project_root to verify it is ignored.
+    await event_buffer.push(_make_event_with_root(project_id, wrong_path))
+    await event_buffer.push(_make_event_with_root(project_id, wrong_path))
+
+    captured_roots: list[str] = []
+
+    async def capture_root(stage):
+        captured_roots.append(stage.project_root)
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_root)
+
+    await harness.run_full_cycle(project_id, 'buffer_size:2')
+
+    assert len(captured_roots) == 3, f"Expected 3 captured roots, got {len(captured_roots)}"
+    for root in captured_roots:
+        assert root == expected_root, (
+            f"project_id={project_id!r}: expected root {expected_root!r} but got {root!r} "
+            f"— registry binding must win over event payload"
+        )
+        # Non-dark-factory projects must not receive dark-factory's path
+        if project_id != 'dark_factory':
+            assert root != '/home/leo/src/dark-factory', (
+                f"project_id={project_id!r} must not receive dark-factory's path; got {root!r}"
+            )
+        # Wrong event payload must not leak through
+        assert root != wrong_path, (
+            f"Event payload _project_root must be ignored; stage got {root!r}"
+        )
