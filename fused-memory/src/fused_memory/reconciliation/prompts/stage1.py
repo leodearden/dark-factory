@@ -147,4 +147,11 @@ to manually search for or skip duplicate flags — emit findings naturally and t
 post-processor will attach `persisted_from_run` for repeats. Do, however, set `task_id` \
 and `flag_type` fields on each flagged item where applicable so the deduplicator can \
 compute a signature.
+
+## Stage 2 Flag Relay (FIX B)
+When you write a flag to Mem0 with `metadata.flag_for_stage2=true`, you MUST ALSO include \
+the same flag content in the `flagged_items` field of your structured-output report. Do not \
+write one without the other — Stage 2's payload assembly merges both sources, but the \
+duplication closes the loop in case Mem0 is briefly unavailable. The `flagged_items` entry \
+should carry the same `task_id`, `flag_type`, and `description` as the Mem0 memory.
 """

@@ -170,4 +170,53 @@ status changes). If you find evidence that you already acted on this flag in a p
 cycle, do NOT re-act — instead note in your summary that the flag was carried over from \
 run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
 the flag as a normal finding and act on it.
+
+## Mem0 Active-Query Flag Deletion (FIX C)
+Some flagged items in the "Stage 1 Flagged Items" section originate from a Mem0 \
+active-query path (identified by a `_source: mem0_active_query` marker or a `flag_id` \
+UUID field). These flags are live Mem0 memories written by Stage 1 with \
+`metadata.flag_for_stage2=true`. After you record your action for such a flag \
+(memory_hint write, task update, or a no-action note explaining why no action is \
+needed), you MUST immediately delete that flag from Mem0 to prevent it from being \
+re-surfaced in future reconciliation cycles:
+
+  `mcp__fused-memory__delete_memory(memory_id=<flag_id>, store='mem0')`
+
+Within the same iteration, emit an action record in your structured report:
+  `{{"action": "flag_deleted", "flag_id": "<mem0_uuid>", "reason": "processed"}}`
+
+Do NOT delete the flag before acting — deletion is the acknowledgement that the \
+flag has been processed.
+
+## Stale Flag Escalation (FIX D)
+If the payload contains a `### Stale Flags Requiring Escalation` section, the Python \
+layer has detected flags that have survived three or more reconciliation cycles without \
+being deleted (indicating that FIX C deletion or LLM action has repeatedly failed). \
+The Python layer has already deduplicated this section against prior-cycle escalation \
+markers, so every entry that appears here is a NEW escalation. For each flag listed in \
+that section, you MUST:
+
+1. Submit one escalation via `mcp__escalation__escalate_blocker` with:
+   - `category`: `'reconciliation_stale_flag'`
+   - `summary`: a short description identifying the flag by its `flag_id` and `task_id`
+   - `detail`: include the flag's `content`, its `cycle_count`, and the likely cause \
+(repeated failure to process or delete)
+
+2. Immediately delete the underlying Mem0 flag — escalation IS the terminal action, \
+just like FIX C's processed-flag deletion:
+
+   `mcp__fused-memory__delete_memory(memory_id=<flag_id>, store='mem0')`
+
+   This prevents the same flag from being detected as stale again next cycle if the \
+operator's investigation outlives a few reconciliation runs. The Python layer also \
+writes an `stage2_escalation_marker` so duplicate escalations are suppressed even if \
+this delete fails — but the LLM-side delete is still the primary cleanup path.
+
+3. Set `stats.stale_flags_escalated` in your structured report to the number of \
+escalations you submitted. This counter is reviewed by operators to track escalation \
+volume and diagnose systemic failures in the flag-relay pipeline.
+
+Stale flags require human investigation. Do not attempt to silently resolve them by \
+re-acting on the same content — escalate (and delete) so an operator can diagnose the \
+root cause without being spammed by repeat alarms.
 """

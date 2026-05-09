@@ -46,6 +46,315 @@ logger = logging.getLogger(__name__)
 # that happen to have the same file layout.  Extend when needed.
 _BRIEFING_REFRESH_PROJECT_ALLOWLIST: frozenset[str] = frozenset({'reify'})
 
+# ── Task-1139 scope filter ────────────────────────────────────────────────────
+# These substrings uniquely identify Mem0 flags that were written as part of the
+# FIX-A bug-mechanics description itself.  They must not be re-surfaced as live
+# flags for other tasks.  The list is intentionally narrow so legitimate flags
+# that merely mention "Stage 1" or "flagged_items" in passing are not suppressed.
+#
+# TODO(task-1139-gc): Remove this constant and _should_skip_known_bug_1139_flag
+# once the Mem0 collection no longer contains task_id=1139 flag_for_stage2
+# memories.  Trigger: verify via count_memories_by_metadata(filters={'task_id':
+# '1139', 'flag_for_stage2': True}) == 0, then delete both symbols.
+_KNOWN_BUG_1139_CONTENT_MARKERS: tuple[str, ...] = (
+    'flag_for_stage2=true but does NOT include them in flagged_items',
+    'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2',
+)
+
+# Persistence-threshold constant for FIX D (stale-flag escalation guard).
+# A flag that has survived this many Stage 2 cycles without being deleted is
+# considered stale and is surfaced in the payload for operator escalation.
+STAGE2_FLAG_PERSISTENCE_THRESHOLD: int = 3
+
+
+def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
+    """Return True iff *flag* describes the task-1139 flag-relay bug mechanics.
+
+    The active-Mem0-query path (FIX A) must not re-inject into the payload any
+    flags that were written specifically to describe *this* bug.  Two narrow
+    signals identify such a flag:
+
+    1. ``flag['task_id'] == '1139'`` (string-coerced, so int 1139 also matches).
+    2. ``flag['content']`` contains one of the ``_KNOWN_BUG_1139_CONTENT_MARKERS``
+       substrings — e.g. the sentence "Stage 1 LLM writes flags to Mem0 with
+       metadata.flag_for_stage2 but does NOT include them in flagged_items".
+
+    All other flags pass through unchanged.
+
+    .. note::
+        This filter becomes dead code once task 1139 closes and its Mem0 flags
+        are GC'd.  See the TODO on ``_KNOWN_BUG_1139_CONTENT_MARKERS`` for the
+        removal trigger.
+    """
+    if str(flag.get('task_id', '')) == '1139':
+        return True
+    content = flag.get('content', '')
+    return any(marker in content for marker in _KNOWN_BUG_1139_CONTENT_MARKERS)
+
+
+async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
+    """Query Mem0 for active Stage-2-destined flags and return them as dicts.
+
+    Searches for memories with ``metadata.flag_for_stage2=true`` (the only
+    supported convention — the ``stage1_flag_marker`` key was a never-shipped
+    alias and is not checked here; see task-1139 reviewer note on dead code).
+    Any other memories are discarded.
+
+    .. warning::
+        This function uses semantic search with a ``limit=100`` top-N cutoff.
+        In a busy Mem0 collection, flags with low embedding similarity to the
+        query can be pushed off the bottom and silently dropped.  FIX D's
+        persistence tracking (``_track_flag_persistence``) uses a deterministic
+        ``count_memories_by_metadata`` call to avoid this problem for staleness
+        detection.  The active-query path here still carries the top-N risk —
+        see follow-up task for a proper ``scroll_by_metadata`` API on Mem0Backend.
+
+    Returns an empty list on search failure (best-effort; logs WARNING).
+    """
+    try:
+        results = await memory_service.search(
+            query='stage 1 flag for stage 2',
+            project_id=project_id,
+            categories=['observations_and_summaries'],
+            limit=100,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._query_stage2_flags: Mem0 search failed; '
+            'skipping active-query path this cycle',
+            extra={'project_id': project_id},
+        )
+        return []
+
+    flags: list[dict] = []
+    for r in results:
+        meta = dict(r.metadata or {})
+        if meta.get('flag_for_stage2'):
+            flags.append({
+                'id': r.id,
+                'content': r.content,
+                'metadata': meta,
+                'task_id': str(meta.get('task_id', '')),
+            })
+    return flags
+
+
+def _compute_stale_flags(
+    persistence_counts: dict[str, int],
+    threshold: int = STAGE2_FLAG_PERSISTENCE_THRESHOLD,
+) -> list[str]:
+    """Return sorted list of flag_ids whose persistence count is >= *threshold*.
+
+    Args:
+        persistence_counts: Mapping of flag_id → cycle count (from
+            ``_track_flag_persistence``).
+        threshold: Minimum count to be considered stale.  Defaults to
+            ``STAGE2_FLAG_PERSISTENCE_THRESHOLD`` (3).
+
+    Returns:
+        Sorted list of flag_id strings that meet or exceed the threshold.
+    """
+    return sorted(fid for fid, count in persistence_counts.items() if count >= threshold)
+
+
+# Persistence and escalation marker source tags — written into Mem0 metadata so
+# they can be retrieved deterministically via Qdrant payload filters (NOT via
+# semantic search, which can silently rank matches off the bottom of top-N).
+_STAGE2_PERSISTENCE_MARKER_SOURCE = 'stage2_persistence_marker'
+_STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
+
+
+async def _track_flag_persistence(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    flag_ids: list[str],
+) -> dict[str, int]:
+    """Track how many Stage 2 cycles each flag has survived.
+
+    For each *flag_id* in *flag_ids*:
+
+    1. Counts prior ``stage2_persistence_marker`` memories via a metadata-filtered
+       Qdrant count (``MemoryService.count_memories_by_metadata``) — a deterministic
+       key-equality lookup, NOT semantic search.  The previous implementation used
+       ``memory_service.search`` with ``query='stage2_persistence_marker flag_id=...'``
+       and ``limit=100``, which silently dropped prior markers when unrelated
+       higher-similarity hits pushed them off the bottom of the top-N — see
+       reviewer note on FIX D, task 1139.
+    2. Writes a fresh marker so the count accumulates across cycles.
+    3. Returns ``{flag_id: prior_count + 1}`` where the "+1" accounts for the
+       current cycle.
+
+    Count reads are issued in parallel via ``asyncio.gather`` (no ordering
+    constraint); marker writes are also parallelised.  Both phases use
+    ``return_exceptions=True`` so a single Qdrant failure degrades gracefully
+    rather than aborting the whole batch.
+
+    On count failure: prior_count defaults to 0 so the cycle count is 1.
+    On add_memory failure: the count is still returned (write is best-effort).
+    Both failures log WARNING.
+
+    Note: markers accumulate monotonically (same pattern as ``stage1_flag_marker``
+    in ``flag_dedup.py``).  FIX C's prompt-driven deletion ensures healthy flags
+    never reach threshold; the monotonic growth is bounded to failure cases.
+    Manual GC is acceptable — see design decision in plan.json.
+    """
+    if not flag_ids:
+        return {}
+
+    # ── count phase (parallel) ───────────────────────────────────────────────
+    count_results = await asyncio.gather(
+        *(
+            memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE, 'flag_id': fid},
+            )
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
+    prior_counts: dict[str, int] = {}
+    for fid, result in zip(flag_ids, count_results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._track_flag_persistence: count failed for flag_id=%s; '
+                'treating prior_count as 0',
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
+            )
+            prior_counts[fid] = 0
+        else:
+            prior_counts[fid] = result
+
+    # ── write phase (parallel) ───────────────────────────────────────────────
+    write_results = await asyncio.gather(
+        *(
+            memory_service.add_memory(
+                content=f'Stage 2 flag-persistence marker: flag_id={fid} run={run_id}',
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata={
+                    'source': _STAGE2_PERSISTENCE_MARKER_SOURCE,
+                    'flag_id': fid,
+                    'run_id': run_id,
+                },
+                causation_id=run_id,
+                _source='stage2_flag_relay',
+            )
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
+    for fid, result in zip(flag_ids, write_results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._track_flag_persistence: add_memory failed for flag_id=%s; '
+                'count still returned',
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
+            )
+
+    return {fid: prior_counts[fid] + 1 for fid in flag_ids}
+
+
+async def _filter_already_escalated_flags(
+    memory_service,
+    project_id: str,
+    flag_ids: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split *flag_ids* into (newly_escalating, already_escalated).
+
+    A flag is considered already-escalated iff a Mem0 memory exists with
+    metadata ``{'source': 'stage2_escalation_marker', 'flag_id': <flag_id>}``.
+    The check is a deterministic metadata-filtered count — same rationale as
+    :func:`_track_flag_persistence` — to avoid escalating the same flag every
+    cycle when FIX C deletion fails (reviewer note on FIX D, task 1139).
+
+    Counts are issued in parallel via ``asyncio.gather``.  On count failure:
+    the flag is treated as NOT already-escalated (i.e. it surfaces in
+    *newly_escalating*).  This is fail-loud-via-escalation: a transient Qdrant
+    glitch causes one extra escalation, not silent suppression of a real one.
+    """
+    if not flag_ids:
+        return [], []
+
+    count_results = await asyncio.gather(
+        *(
+            memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters={'source': _STAGE2_ESCALATION_MARKER_SOURCE, 'flag_id': fid},
+            )
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
+    newly: list[str] = []
+    already: list[str] = []
+    for fid, result in zip(flag_ids, count_results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._filter_already_escalated_flags: count failed for '
+                'flag_id=%s; treating as newly-escalating',
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
+            )
+            newly.append(fid)
+        elif result > 0:
+            already.append(fid)
+        else:
+            newly.append(fid)
+    return newly, already
+
+
+async def _write_escalation_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    flag_ids: list[str],
+) -> None:
+    """Persist a ``stage2_escalation_marker`` for each newly-escalated flag.
+
+    Subsequent cycles use :func:`_filter_already_escalated_flags` to look up
+    these markers via a metadata-filtered Qdrant count, suppressing duplicate
+    escalations even when the LLM fails to delete the underlying flag.
+
+    Writes are issued in parallel via ``asyncio.gather``.  Best-effort: write
+    failures log WARNING but do not raise — at worst this produces one duplicate
+    escalation next cycle, never silent suppression.
+    """
+    if not flag_ids:
+        return
+
+    write_results = await asyncio.gather(
+        *(
+            memory_service.add_memory(
+                content=(
+                    f'Stage 2 escalation marker: flag_id={fid} '
+                    f'escalated in run={run_id}'
+                ),
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata={
+                    'source': _STAGE2_ESCALATION_MARKER_SOURCE,
+                    'flag_id': fid,
+                    'run_id': run_id,
+                },
+                causation_id=run_id,
+                _source='stage2_flag_relay',
+            )
+            for fid in flag_ids
+        ),
+        return_exceptions=True,
+    )
+    for fid, result in zip(flag_ids, write_results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._write_escalation_markers: add_memory failed for '
+                'flag_id=%s; next cycle may re-escalate',
+                fid,
+                extra={'project_id': project_id, 'flag_id': fid},
+            )
+
 
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
@@ -58,6 +367,12 @@ class TaskKnowledgeSync(BaseStage):
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
+
+    # Current reconciliation run_id — set by run() so assemble_payload can use
+    # it for stale-flag persistence markers (FIX D).
+    # Sentinel None means run() has not yet been called; assemble_payload raises
+    # loudly in that case so test authors are reminded to set this attribute.
+    _current_run_id: str | None = None
 
     def get_system_prompt(self) -> str:
         return STAGE2_SYSTEM_PROMPT
@@ -73,7 +388,8 @@ class TaskKnowledgeSync(BaseStage):
         run_id: str,
         model: str | None = None,
     ) -> StageReport:
-        """Run the briefing-refresh hook then delegate to BaseStage.run()."""
+        """Capture run_id, run briefing-refresh hook, then delegate to BaseStage.run()."""
+        self._current_run_id = run_id
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         return await super().run(events, watermark, prior_reports, run_id, model=model)
 
@@ -202,10 +518,112 @@ class TaskKnowledgeSync(BaseStage):
                 f'{format_task_list(sample)}\n'
             )
 
-        flagged_text = _format_flagged(
-            stage1_report.items_flagged if stage1_report else [],
-            run_stage='stage2',
+        # FIX A — merge Mem0 active-query flags into the flagged section.
+        # _query_stage2_flags is best-effort: search failures yield [] internally.
+        active_flags = await _query_stage2_flags(self.memory, self.project_id)
+
+        # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
+        # the active-query path ONLY.  Stage 1's structured-output flags are
+        # intentionally emitted by the LLM and must not be suppressed here.
+        surviving = [f for f in active_flags if not _should_skip_known_bug_1139_flag(f)]
+
+        # FIX D — stale-flag persistence tracking.
+        # Track how many cycles each surviving flag has survived without being
+        # deleted.  Best-effort: _track_flag_persistence degrades gracefully.
+        #
+        # run_id is only needed when there are surviving flags to persist; it
+        # is safe to skip the check when surviving is empty.  Raise before any
+        # marker writes so the failure is loud and attributable rather than
+        # tagging markers with an unattributable run_id.
+        # In tests: set `stage._current_run_id = 'test-run'` (or any non-empty
+        # string) before calling assemble_payload() with non-empty Mem0 search
+        # results.
+        surviving_ids = [f['id'] for f in surviving]
+        if surviving_ids and not self._current_run_id:
+            raise RuntimeError(
+                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
+                '_current_run_id is not set.  In production this is set '
+                'automatically by run().  In tests that return active Mem0 '
+                'flags, assign stage._current_run_id = "test-run" before '
+                'calling assemble_payload() directly.'
+            )
+        run_id_for_markers = self._current_run_id or ''
+        persistence_counts = await _track_flag_persistence(
+            self.memory, self.project_id, run_id_for_markers, surviving_ids,
         )
+        stale_ids = _compute_stale_flags(persistence_counts)
+
+        # Escalation dedup: skip flags we already escalated in a prior cycle so
+        # operators don't get the same alarm every run when FIX C deletion fails
+        # (reviewer note on FIX D, task 1139).  Only the *newly* stale flags
+        # render in the section and get a fresh escalation marker.
+        newly_stale_ids, already_escalated_ids = await _filter_already_escalated_flags(
+            self.memory, self.project_id, stale_ids,
+        )
+        if already_escalated_ids:
+            logger.info(
+                'reconciliation.stale_flag_escalation_suppressed',
+                extra={
+                    'project_id': self.project_id,
+                    'run_id': run_id_for_markers,
+                    'suppressed_flag_ids': already_escalated_ids,
+                    'reason': 'already escalated in a prior cycle',
+                },
+            )
+        stale_ids = newly_stale_ids
+
+        # Build the combined flags list: Stage 1 structured-output first, then
+        # surviving Mem0 active-query results.
+        combined_flags: list[dict] = list(stage1_report.items_flagged if stage1_report else [])
+        for f in surviving:
+            combined_flags.append({
+                '_source': 'mem0_active_query',
+                'flag_id': f['id'],
+                'task_id': f['task_id'],
+                'content': f['content'],
+            })
+
+        flagged_text = _format_flagged(combined_flags, run_stage='stage2')
+
+        # Emit per-flag warnings and build the stale-flag section.
+        stale_section = ''
+        if stale_ids:
+            # Build a lookup map so we can surface content + task_id in the section.
+            surviving_map = {f['id']: f for f in surviving}
+            stale_entries = []
+            for fid in stale_ids:
+                cycle_count = persistence_counts[fid]
+                logger.warning(
+                    'reconciliation.stale_flag_escalated',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id_for_markers,
+                        'flag_id': fid,
+                        'cycle_count': cycle_count,
+                    },
+                )
+                flag_info = surviving_map.get(fid, {})
+                stale_entries.append(
+                    f'- flag_id={fid!r} task_id={flag_info.get("task_id", "")!r} '
+                    f'cycle_count={cycle_count} '
+                    f'content={flag_info.get("content", "")!r}'
+                )
+            stale_section = (
+                '\n### Stale Flags Requiring Escalation\n'
+                'These flags have persisted for ≥ 3 cycles without being deleted.\n'
+                'For each flag below, call `mcp__escalation__escalate_blocker`, '
+                'then call `mcp__fused-memory__delete_memory` on the same flag_id '
+                '(store="mem0") so the escalation is terminal — see prompt for '
+                'details — and increment `stats.stale_flags_escalated`.\n\n'
+                + '\n'.join(stale_entries)
+                + '\n'
+            )
+            # Persist a per-flag escalation marker so the next cycle's
+            # _filter_already_escalated_flags suppresses re-escalation if FIX C
+            # deletion fails.  Best-effort: marker writes never raise.
+            await _write_escalation_markers(
+                self.memory, self.project_id, run_id_for_markers, stale_ids,
+            )
 
         known_projects_section = self._format_known_projects_section()
 
@@ -217,7 +635,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Stage 1 Flagged Items (Task-Relevant)
 {flagged_text}
-{known_projects_section}
+{stale_section}{known_projects_section}
 {format_filtered_task_tree(filtered)}
 
 ### Recently Completed Tasks
@@ -684,7 +1102,7 @@ async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | Non
 
 
 async def _queue_briefing_refresh_tasks(
-    taskmaster: 'TaskBackendProtocol',
+    taskmaster: TaskBackendProtocol,
     project_root: str,
     mismatches: list[dict],
     existing_tasks: list[dict] | None = None,
