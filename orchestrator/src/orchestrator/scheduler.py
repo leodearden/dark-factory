@@ -949,7 +949,7 @@ class Scheduler:
 
         # reopen_reason containing 'steward' (case-insensitive — field is
         # human-authored prose and future producers may use different casing).
-        reopen_reason = metadata.get('reopen_reason', '') or ''
+        reopen_reason = str(metadata.get('reopen_reason') or '')
         if 'steward' in reopen_reason.lower():
             return True, 'reopen_reason'
 
