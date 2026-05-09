@@ -1222,6 +1222,27 @@ class MemoryService:
         )
         result = {'status': 'updated', 'store': 'graphiti', **result_data}
 
+        # Guard 2: post-write persistence verification.
+        # Only when fact text was supplied — invalid_at-only updates have nothing to compare.
+        if fact is not None:
+            try:
+                _name, readback_fact = await self.graphiti.get_edge_text(
+                    edge_uuid, group_id=project_id
+                )
+                result['verified'] = readback_fact == fact
+                if not result['verified']:
+                    result['verification_error'] = (
+                        f'Readback fact mismatch: expected {fact!r}, got {readback_fact!r}'
+                    )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                result['verified'] = False
+                result['verification_error'] = f'{type(e).__name__}: {e}'
+        else:
+            # invalid_at-only update — skip readback, trivially verified.
+            result['verified'] = True
+
         if self._write_journal:
             await self._write_journal.log_write_op(
                 write_op_id=write_op_id,
