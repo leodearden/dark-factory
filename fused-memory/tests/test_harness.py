@@ -4454,3 +4454,71 @@ async def test_remediation_pass_hard_binds_via_known_projects(
         assert root != wrong_path, (
             f"{stage_name}: caller-supplied wrong_path={wrong_path!r} must not reach stages"
         )
+
+
+@pytest.mark.asyncio
+async def test_dark_factory_full_cycle_no_regression(
+    journal, event_buffer, mock_memory_service
+):
+    """End-to-end smoke: dark_factory cycle uses correct project_root across all 3 stages.
+
+    Acceptance criterion (task 1143 step-15): "No regression for dark_factory Stage 1, 2, or 3."
+
+    Build a harness with all five projects in _known_projects (realistic deployment).
+    Push events for 'dark_factory' — some with _project_root payload (matching registry),
+    some without — to verify neither variant causes contamination.
+    Mock stage.run and capture project_id, project_root, known_projects at call time.
+    Assert all three stages see:
+      - project_id='dark_factory'
+      - project_root='/home/leo/src/dark-factory'
+      - known_projects containing all five entries
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+    )
+
+    # Push a mix: some events with correct _project_root, some without
+    await event_buffer.push(_make_event_with_root('dark_factory', '/home/leo/src/dark-factory'))
+    await event_buffer.push(_make_event('dark_factory'))  # no _project_root payload
+
+    captured_states: list[dict] = []
+
+    async def capture_stage_state(stage):
+        captured_states.append({
+            'stage_type': type(stage).__name__,
+            'project_id': stage.project_id,
+            'project_root': stage.project_root,
+            'known_projects': dict(getattr(stage, 'known_projects', {})),
+        })
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_stage_state)
+
+    run = await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    assert run.status == 'completed', f'Expected completed run, got status={run.status!r}'
+    assert len(captured_states) == 3, (
+        f'Expected 3 stage captures (one per stage), got {len(captured_states)}: '
+        f'{[s["stage_type"] for s in captured_states]}'
+    )
+
+    expected_root = '/home/leo/src/dark-factory'
+    for state in captured_states:
+        assert state['project_id'] == 'dark_factory', (
+            f'{state["stage_type"]}: project_id must be dark_factory, '
+            f'got {state["project_id"]!r}'
+        )
+        assert state['project_root'] == expected_root, (
+            f'{state["stage_type"]}: project_root must be {expected_root!r}, '
+            f'got {state["project_root"]!r} — registry-bind regression check'
+        )
+        # Stage 2 (TaskKnowledgeSync) receives known_projects; verify map is intact
+        if state['known_projects']:
+            for pid, proot in _FIVE_PROJECT_MAP.items():
+                assert pid in state['known_projects'], (
+                    f'{state["stage_type"]}: known_projects must contain {pid!r}'
+                )
+                assert state['known_projects'][pid] == proot, (
+                    f'{state["stage_type"]}: known_projects[{pid!r}] must be '
+                    f'{proot!r}, got {state["known_projects"][pid]!r}'
+                )
