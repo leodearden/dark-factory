@@ -45,7 +45,6 @@ from fused_memory.middleware.task_curator import (
     CuratorFailureError,
     PreparedCandidate,
     TaskCurator,
-    _to_pool_entry,
     flatten_task_tree,
     normalize_title,
 )
@@ -1884,7 +1883,7 @@ class TaskInterceptor:
                         '_curator_worker: AllAccountsCappedException for '
                         'project %s (retries=%d, elapsed=%.1fs); deferring '
                         '%d batch tickets%s and waiting for cap reset',
-                        project_id, exc.retries, exc.elapsed_secs,
+                        project_id, getattr(exc, 'retries', 0), getattr(exc, 'elapsed_secs', 0.0),
                         len(batch_ticket_ids),
                         ' (+1 lookahead held in worker)'
                         if lookahead_ticket_id is not None else '',
@@ -2464,9 +2463,6 @@ class TaskInterceptor:
             if not ticket_data:
                 return  # All tickets short-circuited by idempotency
 
-            candidates: list[CandidateTask | None] = [
-                t.candidate for t in ticket_data
-            ]
             # non_none-space slice that goes to the curator.  We pass the
             # already-prepared bundles so the curator skips the second
             # corpus build it would otherwise do inside curate_batch.
@@ -2507,7 +2503,7 @@ class TaskInterceptor:
                     # resolved_task_ids by ticket_data-space indices.
                     batch_idx = 0
                     decisions = []
-                    for i, t in enumerate(ticket_data):
+                    for _i, t in enumerate(ticket_data):
                         if t.candidate is None or t.prepared is None:
                             decisions.append(None)
                             continue

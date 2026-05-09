@@ -4768,6 +4768,7 @@ async def test_journaled_write_emits_write_op_and_backend_op(
         await interceptor.update_task('1', '/project', prompt='tweak')
 
         # Verify the rows.
+        assert journal._db is not None
         async with journal._db.execute(
             "SELECT id, operation FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
@@ -4813,10 +4814,13 @@ async def test_journaled_write_logs_failure_row(
         with pytest.raises(TaskmasterError):
             await interceptor.update_task('1', '/project', prompt='x')
 
+        assert journal._db is not None
         async with journal._db.execute(
             "SELECT COUNT(*) FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
-            wo_count = (await cur.fetchone())[0]
+            row = await cur.fetchone()
+            assert row is not None
+            wo_count = row[0]
         assert wo_count == 1
         async with journal._db.execute(
             "SELECT success, error FROM backend_ops WHERE operation = 'update_task'",
