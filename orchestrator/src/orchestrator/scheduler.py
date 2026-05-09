@@ -12,6 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from shared.locking import files_to_modules, normalize_lock
@@ -298,12 +299,20 @@ class ModuleLockTable:
         autopilot/analyze/asr  <->  autopilot/analyze/speech  (siblings)
     """
 
-    def __init__(self, config: OrchestratorConfig):
+    def __init__(
+        self,
+        config: OrchestratorConfig,
+        *,
+        time_source: Callable[[], float] | None = None,
+    ):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
         # normalized_module -> (owner_task_id, deadline_monotonic)
         self._parked: dict[str, tuple[str, float]] = {}
         self._config = config
+        self._time_source: Callable[[], float] = (
+            time_source if time_source is not None else (lambda: time.monotonic())
+        )
 
     # --- Hierarchy helpers ---
 
@@ -415,7 +424,7 @@ class ModuleLockTable:
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
-        now = time.monotonic()
+        now = self._time_source()
 
         # Check every requested module against all other tasks' held locks and
         # active reservations owned by other tasks.
@@ -467,7 +476,7 @@ class ModuleLockTable:
         if not new_modules:
             return True
 
-        now = time.monotonic()
+        now = self._time_source()
         for module in new_modules:
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
@@ -488,9 +497,13 @@ class Scheduler:
         event_store: EventStore | None = None,
         *,
         mcp_session: McpSessionLike | None = None,
+        time_source: Callable[[], float] | None = None,
     ):
         self.config = config
-        self.lock_table = ModuleLockTable(config)
+        self._time_source: Callable[[], float] = (
+            time_source if time_source is not None else (lambda: time.monotonic())
+        )
+        self.lock_table = ModuleLockTable(config, time_source=self._time_source)
         self.event_store = event_store
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
@@ -966,7 +979,7 @@ class Scheduler:
         last_dispatch = self._last_dispatch_at.get(tid)
         if last_dispatch is None:
             return False, None
-        elapsed = time.monotonic() - last_dispatch
+        elapsed = self._time_source() - last_dispatch
         if elapsed >= self.config.dispatch_cooldown_secs:
             # Entry is past the window and no longer affects behaviour — drop it
             # to keep the dict bounded for tasks that remain visible past the
@@ -1037,7 +1050,7 @@ class Scheduler:
             )
         if count >= threshold and not self.lock_table.has_parks(task_id):
             lease = self._compute_lease(tier)
-            deadline = time.monotonic() + lease
+            deadline = self._time_source() + lease
             installed = self.lock_table.install_parks(task_id, modules, deadline)
             logger.info(
                 'Task %s reserved modules %s (skip_count=%d, lease=%.1fs, tier=%s)',
@@ -1249,7 +1262,7 @@ class Scheduler:
         """
         # Fairness: evict expired reservations and reset their owners' skip
         # counts so they can re-accumulate instead of immediately re-parking.
-        now = time.monotonic()
+        now = self._time_source()
         evicted = self.lock_table.prune_expired_parks(now)
         for owner in evicted:
             self._skip_count.pop(owner, None)
@@ -1310,7 +1323,7 @@ class Scheduler:
                 continue
             cooldown_deadline = self._requeue_until.get(tid_str)
             if cooldown_deadline is not None:
-                if time.monotonic() < cooldown_deadline:
+                if self._time_source() < cooldown_deadline:
                     continue
                 del self._requeue_until[tid_str]
             if not self._deps_satisfied(t, status_map):
@@ -1327,7 +1340,7 @@ class Scheduler:
             if cooldown_active:
                 remaining_secs = (
                     self.config.dispatch_cooldown_secs
-                    - (time.monotonic() - self._last_dispatch_at.get(tid_str, 0.0))
+                    - (self._time_source() - self._last_dispatch_at.get(tid_str, 0.0))
                 )
                 metadata = t.get('metadata') or {}
                 logger.info(
@@ -1395,9 +1408,9 @@ class Scheduler:
                 # intentionally scoped to tasks that were already flagged
                 # when first picked up (bounded _last_dispatch_at size).
                 if self._dispatch_cooldown_signal(task) is not None:
-                    self._last_dispatch_at[task_id] = time.monotonic()
+                    self._last_dispatch_at[task_id] = self._time_source()
                 self._dispatched_priority[task_id] = pri
-                self._task_start_times[task_id] = time.monotonic()
+                self._task_start_times[task_id] = self._time_source()
                 if task_id == top_id:
                     self._skip_count.pop(task_id, None)
                     if top_had_parks:
@@ -1505,12 +1518,12 @@ class Scheduler:
         self._dispatched_priority.pop(task_id, None)
         if requeued:
             self._requeue_until[task_id] = (
-                time.monotonic() + self.config.requeue_cooldown_secs
+                self._time_source() + self.config.requeue_cooldown_secs
             )
         # Fairness: record duration for the rolling median used by _compute_lease.
         start = self._task_start_times.pop(task_id, None)
         if start is not None:
-            self._recent_durations.append(time.monotonic() - start)
+            self._recent_durations.append(self._time_source() - start)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
