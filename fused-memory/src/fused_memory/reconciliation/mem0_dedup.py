@@ -4,12 +4,15 @@ Both ``harness._replay_deferred_writes`` and ``flag_dedup.dedup_flags``
 implement the same search→metadata-equality-filter→log-on-failure→return-match
 pattern.  This module extracts that pattern into a single function so both
 callers get consistent behaviour: symmetric str coercion, defensive metadata
-guard, category-constrained search, and search-failure degrades to None.
+guard, category-constrained search, and search-failure degrades to None/[].
 
 Public API
 ----------
+- ``find_prior_memories(memory_service, *, project_id, task_id, kind, query, ...)``
+  — returns all matching MemoryResults as a list (empty list on failure/no match).
 - ``find_prior_memory(memory_service, *, project_id, task_id, kind, query, ...)``
-  — returns the first matching MemoryResult or None.
+  — returns the first matching MemoryResult or None; thin wrapper around
+  ``find_prior_memories``.
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ from typing import Any
 _module_logger = logging.getLogger(__name__)
 
 
-async def find_prior_memory(
+async def find_prior_memories(
     memory_service: Any,
     *,
     project_id: str,
@@ -29,8 +32,8 @@ async def find_prior_memory(
     categories: list[str] | None = None,
     limit: int = 50,
     log: logging.Logger | None = None,
-) -> Any | None:
-    """Search Mem0 for a prior memory matching *task_id* and all *kind* key/values.
+) -> list[Any]:
+    """Search Mem0 for ALL prior memories matching *task_id* and all *kind* key/values.
 
     All equality comparisons coerce both sides to ``str`` so that a prior
     written with ``task_id`` as an ``int`` matches a caller passing ``task_id``
@@ -56,8 +59,9 @@ async def find_prior_memory(
              under the caller's logger namespace (preserving caplog-based tests).
 
     Returns:
-        The first ``MemoryResult`` whose metadata satisfies ``task_id`` AND all
-        ``kind`` key/value pairs, or ``None`` if no match or search fails.
+        A list of all ``MemoryResult`` objects whose metadata satisfies
+        ``task_id`` AND all ``kind`` key/value pairs, in search-result order.
+        Returns an empty list if no match is found or if the search fails.
     """
     _log = log or _module_logger
     try:
@@ -69,14 +73,60 @@ async def find_prior_memory(
         )
     except Exception as e:
         _log.warning('find_prior_memory search failed for task %s: %s', task_id, e)
-        return None
+        return []
 
     task_id_str = str(task_id)
+    matches = []
     for r in results:
         meta = r.metadata or {}
         if str(meta.get('task_id', '')) != task_id_str:
             continue
         if all(k in meta and str(meta[k]) == str(v) for k, v in kind.items()):
-            return r
+            matches.append(r)
 
-    return None
+    return matches
+
+
+async def find_prior_memory(
+    memory_service: Any,
+    *,
+    project_id: str,
+    task_id: str | int,
+    kind: dict[str, Any],
+    query: str,
+    categories: list[str] | None = None,
+    limit: int = 50,
+    log: logging.Logger | None = None,
+) -> Any | None:
+    """Search Mem0 for a prior memory matching *task_id* and all *kind* key/values.
+
+    Thin wrapper around :func:`find_prior_memories` that returns the first match
+    or ``None``.  Preserves the existing first-match-or-None contract so callers
+    that only need one result (e.g. ``harness._replay_deferred_writes``) are
+    unaffected.
+
+    Args:
+        memory_service: Mem0 service with an async ``search`` method.
+        project_id: Project scope passed to ``memory_service.search``.
+        task_id: Task identifier; compared symmetrically as ``str`` on both sides.
+        kind: Extra metadata-equality filters.  See :func:`find_prior_memories`.
+        query: Embedding query string forwarded to ``memory_service.search``.
+        categories: Optional category list forwarded to ``memory_service.search``.
+        limit: Result cap forwarded to ``memory_service.search``.
+        log: Logger to use for WARNING messages on search failure.
+
+    Returns:
+        The first ``MemoryResult`` whose metadata satisfies ``task_id`` AND all
+        ``kind`` key/value pairs, or ``None`` if no match or search fails.
+    """
+    matches = await find_prior_memories(
+        memory_service,
+        project_id=project_id,
+        task_id=task_id,
+        kind=kind,
+        query=query,
+        categories=categories,
+        limit=limit,
+        log=log,
+    )
+    return matches[0] if matches else None
