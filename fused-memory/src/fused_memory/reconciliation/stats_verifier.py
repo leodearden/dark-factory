@@ -41,6 +41,14 @@ _OP_TO_STAT: dict[str, str] = {
     'replay_to_graphiti': 'episodes_replayed',
 }
 
+# Stat keys the verifier writes back to stage stats. Includes virtual keys
+# derived from ops rather than mapped 1:1 in _OP_TO_STAT (e.g.
+# graphiti_writes_queued, which is the residual of add_memory ops where
+# memory_ids is empty but stores includes graphiti).
+_TRACKED_STAT_KEYS: frozenset[str] = frozenset(_OP_TO_STAT.values()) | {
+    'graphiti_writes_queued',
+}
+
 
 def _parse_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
@@ -179,8 +187,16 @@ def _observed_counts(ops: list[dict]) -> dict[str, int]:
         if stat_key is None:
             continue
         if operation == 'add_memory':
-            if not _count_add_memory(op):
-                continue
+            if _count_add_memory(op):
+                counts[stat_key] = counts.get(stat_key, 0) + 1
+            elif _count_graphiti_queued(op):
+                # Graphiti-only async enqueue: no inline ID, but store accepted
+                # the write. Track separately so it doesn't inflate memories_added.
+                counts['graphiti_writes_queued'] = (
+                    counts.get('graphiti_writes_queued', 0) + 1
+                )
+            # Either path accounts for the op — skip the generic counter.
+            continue
         elif operation == 'update_edge':
             if not _count_update_edge(op):
                 continue
@@ -209,7 +225,7 @@ def _apply_observed(
             report['stats'] = stats
 
     reported_snapshot: dict[str, Any] = {}
-    for stat_key in set(_OP_TO_STAT.values()):
+    for stat_key in _TRACKED_STAT_KEYS:
         # Always record the observed value — zero is meaningful (means "no
         # writes happened for this op"). Only snapshot the original when it
         # actually existed, to avoid polluting with spurious None entries.
