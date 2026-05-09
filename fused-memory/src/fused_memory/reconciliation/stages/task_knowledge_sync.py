@@ -27,6 +27,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES, _extract_status
 from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
@@ -153,6 +154,93 @@ def _suppress_same_run_human_operator_dups(
         kept.append(item)
 
     return kept, suppressed
+
+
+# ── Stage 2 post-flight guard helpers (task 1137) ────────────────────────────
+
+# Agent-id written by BaseStage.run() into every LLM-emitted write op for
+# Stage 2.  This matches the recon_context block in base.py:125-126.
+_STAGE2_AGENT_ID = 'recon-stage-task_knowledge_sync'
+
+
+async def _classify_terminal_state_violations(
+    ops: list[dict],
+    taskmaster,
+    project_root: str,
+) -> list[dict]:
+    """Classify write_journal ops that mutated tasks already in a terminal state.
+
+    For every ``update_task`` op authored by the Stage 2 agent, fetches the
+    *live* task status from Taskmaster and returns a violation record when the
+    status is in ``TERMINAL_STATUSES`` (done, cancelled).
+
+    The "skip the write entirely" semantics described in the task specification
+    cannot be enforced post-hoc (the LLM's write already landed), so this
+    helper *reclassifies* the op instead.  Callers are expected to:
+
+    - increment ``stats['not_applicable_count']`` by ``len(violations)``
+    - decrement ``stats['tasks_modified']`` / ``stats['memories_written']``
+      accordingly (clamped at 0)
+
+    ops from ``agent_id='task-interceptor'`` are intentionally excluded; the
+    interceptor performs legitimate ``update_task(metadata=...)`` calls during
+    set_task_status (e.g. ``done_provenance`` audit-field merge).
+
+    Args:
+        ops: Write-journal op dicts returned by
+            ``WriteJournal.get_ops_by_causation(run_id)`` (layer=='write_op').
+        taskmaster: Taskmaster backend (must have an async ``get_task`` method).
+        project_root: Absolute path to the Taskmaster project directory.
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'live_status', 'reason': 'not_applicable'}``
+        dicts, one per qualifying violation.  Empty list when no violations are
+        found.
+    """
+    violations: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != _STAGE2_AGENT_ID:
+            continue
+        if op.get('operation') != 'update_task':
+            continue
+
+        # Parse params JSON to extract task_id
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._classify_terminal_state_violations: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+
+        task_id = str(params.get('task_id', '')).strip()
+        if not task_id:
+            continue
+
+        # Fetch live status — best-effort; skip op on exception
+        try:
+            task_data = await taskmaster.get_task(task_id, project_root)
+        except Exception:
+            logger.warning(
+                'reconciliation._classify_terminal_state_violations: '
+                'get_task failed for task_id=%s; skipping op',
+                task_id,
+            )
+            continue
+
+        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        if live_status in TERMINAL_STATUSES:
+            violations.append({
+                'op_id': op.get('id'),
+                'task_id': task_id,
+                'live_status': live_status,
+                'reason': 'not_applicable',
+            })
+
+    return violations
 
 
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
