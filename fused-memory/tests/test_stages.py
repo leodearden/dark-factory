@@ -4736,3 +4736,64 @@ class TestStage1PromptGuard3IsoDateAndCycleSummary:
             "The ## update_edge Temporal Limitation section must instruct the agent "
             "to note the valid_at limitation in the cycle summary"
         )
+
+
+class TestStage1PromptInstructsVerifiedCheck:
+    """Pin Guard 2 prompt contracts: Stage 1 must inspect the 'verified' field on
+    update_edge responses and exclude unverified updates from edges_updated (step-21).
+    """
+
+    def _get_update_edge_verify_section(self) -> str:
+        """Return the dedicated 'Verifying update_edge' section, or fall back
+        to the general 'Verifying Writes' section if the former doesn't exist yet.
+        """
+        section = _extract_section(
+            STAGE1_SYSTEM_PROMPT, '## Verifying update_edge'
+        )
+        if not section:
+            section = _extract_section(STAGE1_SYSTEM_PROMPT, '## Verifying Writes')
+        return section
+
+    def test_prompt_mentions_verified_field_on_update_edge(self):
+        """STAGE1_SYSTEM_PROMPT must mention the literal 'verified' token within
+        a section that discusses update_edge writes — pinning the contract that
+        Stage 1 knows the MCP response now carries a verified: bool field.
+        """
+        section = self._get_update_edge_verify_section()
+        assert section, (
+            'STAGE1_SYSTEM_PROMPT must have a ## Verifying update_edge (or ## Verifying '
+            'Writes) section'
+        )
+        assert 'verified' in section, (
+            "The Verifying update_edge section must mention the literal 'verified' token "
+            "(the new MCP response field added by Guard 2) so Stage 1 knows to inspect it"
+        )
+
+    def test_prompt_instructs_skip_unverified_in_edges_updated(self):
+        """STAGE1_SYSTEM_PROMPT must instruct Stage 1 not to count unverified
+        update_edge responses in its self-reported edges_updated stat.
+
+        The section must co-locate both 'unverified' (or 'not count' / 'exclude') and
+        'edges_updated' so the instruction is unambiguous.
+        """
+        section = self._get_update_edge_verify_section()
+        assert section, (
+            'STAGE1_SYSTEM_PROMPT must have a ## Verifying update_edge (or ## Verifying '
+            'Writes) section'
+        )
+        section_lower = section.lower()
+        has_unverified_concept = (
+            'unverified' in section_lower
+            or 'not count' in section_lower
+            or 'do not count' in section_lower
+            or 'exclude' in section_lower
+        )
+        assert has_unverified_concept, (
+            "The Verifying update_edge section must instruct the agent not to count "
+            "unverified update_edge responses (expected 'unverified', 'not count', "
+            "'do not count', or 'exclude' in the section)"
+        )
+        assert 'edges_updated' in section, (
+            "The Verifying update_edge section must explicitly reference 'edges_updated' "
+            "so Stage 1 knows which stat key must not include unverified updates"
+        )
