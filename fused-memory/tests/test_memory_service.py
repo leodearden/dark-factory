@@ -1,6 +1,7 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
 import asyncio
+import logging
 import types
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -990,6 +991,114 @@ class TestClose:
         service.mem0.close.assert_called_once()
         mock_journal.close.assert_called_once()
         mock_buffer.close.assert_called_once()
+
+
+class TestCloseLogsExceptions:
+    """Tests that MemoryService.close() logs exceptions via logger.exception
+    and continues closing remaining resources (failure isolation)."""
+
+    def _make_resource_mocks(self, service):
+        """Wire all six resources with AsyncMock close() methods and return a
+        name-to-mock mapping for assertion convenience."""
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+
+        mock_journal = MagicMock()
+        mock_journal.close = AsyncMock()
+        service._write_journal = mock_journal
+
+        mock_buffer = MagicMock()
+        mock_buffer.close = AsyncMock()
+        service._event_buffer = mock_buffer
+
+        mock_registry = MagicMock()
+        mock_registry.close = AsyncMock()
+        service.planned_episode_registry = mock_registry
+
+        return {
+            'durable_queue': service.durable_queue,
+            'graphiti': service.graphiti,
+            'mem0': service.mem0,
+            '_write_journal': service._write_journal,
+            '_event_buffer': service._event_buffer,
+            'planned_episode_registry': service.planned_episode_registry,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'failing_resource,log_fragment',
+        [
+            ('durable_queue', 'durable_queue'),
+            ('graphiti', 'graphiti'),
+            ('mem0', 'mem0'),
+            ('_write_journal', 'write_journal'),
+            ('_event_buffer', 'event_buffer'),
+            ('planned_episode_registry', 'planned_episode_registry'),
+        ],
+    )
+    async def test_close_logs_exception_per_resource(
+        self, service, caplog, failing_resource, log_fragment
+    ):
+        """Each resource failure is logged at ERROR (logger.exception) and
+        does NOT prevent the remaining resources from being closed."""
+        resources = self._make_resource_mocks(service)
+
+        # Make ONLY the failing resource raise
+        resources[failing_resource].close.side_effect = RuntimeError('boom')
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+            # Must NOT raise
+            await service.close()
+
+        # All six resources must have been awaited (failure isolation)
+        for _name, resource in resources.items():
+            resource.close.assert_awaited_once()
+
+        # Exactly one ERROR record
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1, (
+            f'Expected 1 ERROR record, got {len(error_records)}: '
+            f'{[r.message for r in error_records]}'
+        )
+        record = error_records[0]
+        assert 'MemoryService.close' in record.message
+        assert log_fragment in record.message
+        # logger.exception sets exc_info — verify traceback is captured
+        assert record.exc_info is not None, (
+            'Expected exc_info to be populated (use logger.exception, not logger.error)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_close_does_not_raise_when_every_resource_fails(self, service, caplog):
+        """When all six resources raise, close() logs six ERROR records and never re-raises."""
+        resources = self._make_resource_mocks(service)
+
+        # Wire ALL resources to fail with distinct exceptions
+        resources['durable_queue'].close.side_effect = RuntimeError('dq-fail')
+        resources['graphiti'].close.side_effect = ValueError('graphiti-fail')
+        resources['mem0'].close.side_effect = OSError('mem0-fail')
+        resources['_write_journal'].close.side_effect = RuntimeError('journal-fail')
+        resources['_event_buffer'].close.side_effect = TimeoutError('buffer-fail')
+        resources['planned_episode_registry'].close.side_effect = RuntimeError('registry-fail')
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+            # Must NOT raise even when every resource fails
+            await service.close()
+
+        # All six must have been attempted
+        for _name, resource in resources.items():
+            resource.close.assert_awaited_once()
+
+        # Exactly six ERROR records
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 6, (
+            f'Expected 6 ERROR records, got {len(error_records)}'
+        )
+        # Every record has exc_info (logger.exception, not logger.error)
+        for record in error_records:
+            assert record.exc_info is not None, (
+                f'Expected exc_info on record: {record.message}'
+            )
 
 
 class TestGraphitiBackendRemoveEdge:
