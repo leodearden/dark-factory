@@ -4675,3 +4675,17 @@ class TestStage1PromptForbidsAddEpisodeForTemporalFacts:
             "The snapshot section must explicitly say 'do not' or 'never' near "
             "'add_episode' to forbid its use for recurring temporal-fact writes"
         )
+
+    def test_snapshot_discipline_covers_task_status_not_only_task_counts(self):
+        """The snapshot discipline section must explicitly reference task-status
+        snapshots (not only task-counts), confirming Guard 1 is generalised.
+        """
+        section = _extract_section(STAGE1_SYSTEM_PROMPT, '## Snapshot Discipline')
+        assert section, (
+            'STAGE1_SYSTEM_PROMPT must have a ## Snapshot Discipline section'
+        )
+        section_lower = section.lower()
+        assert 'task status' in section_lower or 'task-status' in section_lower, (
+            "The ## Snapshot Discipline section must explicitly mention 'task status' "
+            "(or 'task-status') to confirm Guard 1 is generalised beyond task-counts"
+        )
