@@ -4124,3 +4124,68 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             f'Expected a WARNING log mentioning task 777 but got: '
             f'{[r.message for r in caplog.records]}'
         )
+
+
+# ── Tests for Task 1143: KNOWN_PROJECT_ROOTS hard-bind ───────────────────────
+
+_FIVE_PROJECT_MAP = {
+    'autopilot_video': '/home/leo/src/autopilot-video',
+    'reify': '/home/leo/src/reify',
+    'dark_factory': '/home/leo/src/dark-factory',
+    'autotrade': '/home/leo/src/autotrade',
+    'know_live': '/home/leo/src/know-live',
+}
+
+
+def _make_harness_with_known_projects(
+    journal, event_buffer, mock_memory_service, known_projects: dict
+):
+    """Build a harness and monkeypatch _known_projects for task-1143 tests."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._known_projects = dict(known_projects)
+    return harness
+
+
+class TestKnownProjectRootFor:
+    """Tests for ReconciliationHarness._known_project_root_for (task 1143)."""
+
+    @pytest.mark.asyncio
+    async def test_known_project_root_for_returns_mapped_root(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_known_project_root_for returns the correct project_root for each project_id."""
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+        )
+
+        assert harness._known_project_root_for('autopilot_video') == '/home/leo/src/autopilot-video'
+        assert harness._known_project_root_for('reify') == '/home/leo/src/reify'
+        assert harness._known_project_root_for('dark_factory') == '/home/leo/src/dark-factory'
+        assert harness._known_project_root_for('autotrade') == '/home/leo/src/autotrade'
+        assert harness._known_project_root_for('know_live') == '/home/leo/src/know-live'
+
+    @pytest.mark.asyncio
+    async def test_known_project_root_for_raises_for_unknown_project_id(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_known_project_root_for raises ValueError for an unknown project_id.
+
+        The error message must include both the unknown project_id and the sorted list
+        of known project_ids so the operator can immediately diagnose the misconfiguration.
+        """
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            harness._known_project_root_for('not_a_real_project')
+
+        err_msg = str(exc_info.value)
+        assert 'not_a_real_project' in err_msg, (
+            f"Error message must include the unknown project_id; got: {err_msg!r}"
+        )
+        # The sorted list of known ids must appear so the operator can see what's registered
+        for pid in sorted(_FIVE_PROJECT_MAP):
+            assert pid in err_msg, (
+                f"Error message must include known project_id {pid!r}; got: {err_msg!r}"
+            )
