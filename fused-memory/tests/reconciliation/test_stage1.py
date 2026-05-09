@@ -17,15 +17,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     StageId,
     Watermark,
 )
+from fused_memory.reconciliation.flag_dedup import TERMINAL_STATE_PRE_CHECK_FLAG_TYPE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-from fused_memory.config.schema import ReconciliationConfig
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -278,16 +278,15 @@ class TestTerminalStatePreCheckFlagTypeConstant:
 
     def test_constant_importable(self):
         """TERMINAL_STATE_PRE_CHECK_FLAG_TYPE can be imported from flag_dedup."""
-        from fused_memory.reconciliation.flag_dedup import TERMINAL_STATE_PRE_CHECK_FLAG_TYPE  # noqa: F401
+        # Import succeeds at module level; if the symbol is missing the file won't load.
+        assert TERMINAL_STATE_PRE_CHECK_FLAG_TYPE is not None
 
     def test_constant_value(self):
         """TERMINAL_STATE_PRE_CHECK_FLAG_TYPE equals 'terminal_state_pre_check'."""
-        from fused_memory.reconciliation.flag_dedup import TERMINAL_STATE_PRE_CHECK_FLAG_TYPE
         assert TERMINAL_STATE_PRE_CHECK_FLAG_TYPE == 'terminal_state_pre_check'
 
     def test_constant_is_str(self):
         """TERMINAL_STATE_PRE_CHECK_FLAG_TYPE is a str instance."""
-        from fused_memory.reconciliation.flag_dedup import TERMINAL_STATE_PRE_CHECK_FLAG_TYPE
         assert isinstance(TERMINAL_STATE_PRE_CHECK_FLAG_TYPE, str)
 
 
@@ -301,8 +300,6 @@ class TestStage1PromptReferencesPinnedFlagType:
 
     def test_terminal_state_section_contains_flag_type_value(self):
         """Terminal-State Pre-Check Discipline contains the literal flag_type string."""
-        from fused_memory.reconciliation.flag_dedup import TERMINAL_STATE_PRE_CHECK_FLAG_TYPE
-
         section = _extract_section(STAGE1_SYSTEM_PROMPT, '## Terminal-State Pre-Check Discipline')
         assert section, 'Terminal-State Pre-Check Discipline section not found'
         assert TERMINAL_STATE_PRE_CHECK_FLAG_TYPE in section, (
