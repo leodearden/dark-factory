@@ -1590,6 +1590,34 @@ class TestDispatchCooldownGate:
         )
 
     @pytest.mark.asyncio
+    async def test_signal_free_dispatch_does_not_arm_cooldown_gate(self, monkeypatch):
+        """A task dispatched with no cooldown signal must NOT arm _last_dispatch_at.
+
+        Only tasks carrying a steward/reconciliation signal (recon_reset_count>1,
+        steward_clear_at, recon_stage2_blocked_at, or steward reopen_reason) should
+        arm the gate.  Signal-free dispatches must leave _last_dispatch_at empty so
+        the dict doesn't accumulate stale entries for tasks removed without ever
+        reaching a terminal status.
+        """
+        task = self._pending_task_with({'files': ['backend']})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Dispatch the task — no steward/recon signal in metadata
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        # Gate must NOT be armed for signal-free tasks
+        assert '99' not in scheduler._last_dispatch_at, (
+            '_last_dispatch_at must not be set for signal-free dispatches'
+        )
+
+    @pytest.mark.asyncio
     async def test_cooldown_log_suppressed_when_deps_unsatisfied(self, monkeypatch, caplog):
         """Cooldown-suppression INFO log must NOT fire for deps-blocked tasks.
 
