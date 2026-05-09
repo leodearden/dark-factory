@@ -974,6 +974,28 @@ class TestUpdateEdgeVerification:
         assert 'EdgeNotFoundError' in result['verification_error']
         assert result['verification_error']  # non-empty string
 
+    @pytest.mark.asyncio
+    async def test_update_edge_invalid_at_only_returns_verified_true_without_readback(
+        self, service
+    ):
+        """When only invalid_at is supplied (no fact), verified must be True
+        and get_edge_text must NOT be called.
+        """
+        from datetime import UTC, datetime
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock()
+
+        ts = datetime(2026, 5, 4, tzinfo=UTC)
+        result = await service.update_edge(
+            edge_uuid='e-1', project_id='test', invalid_at=ts
+        )
+
+        assert result['verified'] is True
+        service.graphiti.get_edge_text.assert_not_called()
+
 
 class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
