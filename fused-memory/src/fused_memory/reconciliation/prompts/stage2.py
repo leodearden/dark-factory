@@ -118,6 +118,17 @@ response. An empty list means Mem0 deduplicated or filtered the write and no new
 was created — count it as a no-op, not a successful addition. Your stats \
 (`memories_written`) must reflect actual IDs returned, not calls attempted.
 
+**Per-Cycle Summary Uniqueness**: when writing your final per-cycle summary via \
+`add_memory`, the content string MUST include all three of: (1) the reconciliation \
+`run_id` (provided in the payload context), (2) the full list of `flag_id` UUIDs \
+processed this cycle (from active-query flags, FIX C deletions, and FIX D \
+escalations — or "none" if zero), and (3) the task IDs created or modified this cycle \
+(via `set_task_status`, `update_task`, `submit_task`, or `resolve_ticket` — including \
+newly-created task_ids returned from `submit_task`/`resolve_ticket`). Rationale: \
+Mem0 deduplicates near-duplicate writes by cosine similarity — multiple confirmed cycles \
+had their summaries silently dropped (`memory_ids=[]`) because the content was too \
+uniform across cycles.
+
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
