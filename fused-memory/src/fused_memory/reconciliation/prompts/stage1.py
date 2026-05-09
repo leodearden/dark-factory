@@ -1,7 +1,12 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
-from fused_memory.reconciliation.flag_dedup import TERMINAL_STATE_PRE_CHECK_FLAG_TYPE
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+
+#: Pinned flag_type value for Stage 1's Terminal-State Pre-Check Discipline.
+#: Defined here alongside the prompt so both the f-string interpolation and any
+#: caller that imports this module reference exactly the same string — no silent
+#: drift between cycles.
+TERMINAL_STATE_PRE_CHECK_FLAG_TYPE: str = 'terminal_state_pre_check'
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \

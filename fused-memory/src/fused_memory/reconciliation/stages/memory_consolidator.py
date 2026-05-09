@@ -194,8 +194,7 @@ Review the above data and perform memory consolidation:
 4. Flag any items that are relevant to task planning for Stage 2.
 5. When you have completed your work, produce your final structured report as your response.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
-{f'Use project_root="{self.project_root}" for tasks scoped to this project.' if self.project_root else ''}"""
+{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     async def _format_assembled_payload(self, watermark: Watermark) -> str:
         """Format a payload from ContextAssembler output — event-driven context."""
@@ -257,8 +256,20 @@ Review the above data and perform memory consolidation:
 4. Flag any items that are relevant to task planning for Stage 2.
 5. When you have completed your work, produce your final structured report as your response.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
-{f'Use project_root="{self.project_root}" for tasks scoped to this project.' if self.project_root else ''}"""
+{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+
+    def _build_project_root_directive(self) -> str:
+        """Return the project_root directive line for payload footers, or empty string.
+
+        When ``self.project_root`` is falsy (the BaseStage default ``''``), returns
+        ``''`` so no trailing blank line is produced.  When set, returns
+        ``'\\nUse project_root=...'`` (leading newline keeps it on its own line after
+        the preceding guideline).  Both payload methods call this helper so the
+        f-string fragment stays in a single place.
+        """
+        if not self.project_root:
+            return ''
+        return f'\nUse project_root="{self.project_root}" for tasks scoped to this project.'
 
     def _build_task_tree_section(self) -> str:
         """Return the Active Task Tree prompt section, or empty string if no tree set.
