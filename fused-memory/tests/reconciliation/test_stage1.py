@@ -184,7 +184,6 @@ class TestStage1PayloadThreadsProjectRootAssembled:
         stage.assembled_payload = AssembledPayload(
             events=[],
             context_items={},
-            project_id='test_project',
         )
 
         watermark = Watermark(project_id='test_project')
@@ -227,7 +226,6 @@ class TestStage1PayloadOmitsProjectRootWhenUnset:
         stage.assembled_payload = AssembledPayload(
             events=[],
             context_items={},
-            project_id='test_project',
         )
 
         watermark = Watermark(project_id='test_project')
