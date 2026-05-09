@@ -934,6 +934,22 @@ class TestUpdateEdgeVerification:
         assert result['verified'] is True
         service.graphiti.get_edge_text.assert_called_once_with('e-1', group_id='test')
 
+    @pytest.mark.asyncio
+    async def test_update_edge_returns_verified_false_when_readback_differs(self, service):
+        """When get_edge_text returns a different fact text, verified must be False."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(
+            return_value=('Edge', 'old stale fact')
+        )
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='test'
+        )
+
+        assert result['verified'] is False
+
 
 class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
