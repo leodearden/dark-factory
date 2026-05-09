@@ -69,6 +69,41 @@ def _extract_section(payload: str, header: str) -> str:
     return payload[start:end]
 
 
+class TestStage2GuardScaffolding:
+    """Direct tests for the module-level stage-2 guard helpers added in task 1178."""
+
+    def test_make_stage2_guard_cli_result_returns_stageresult_like_mock(self):
+        result = _make_stage2_guard_cli_result([{'id': 'flag-x'}], stats={'tasks_modified': 4})
+        assert result.success is True
+        assert result.report == {
+            'flagged_items': [{'id': 'flag-x'}],
+            'summary': 'ok',
+            'stats': {'tasks_modified': 4},
+        }
+        assert result.llm_calls == 1
+        assert result.tokens_used == 0
+        assert result.cost_usd == 0.0
+        assert result.model == 'm'
+
+        # stats omitted -> 'stats' key absent from report
+        result_no_stats = _make_stage2_guard_cli_result([])
+        assert 'stats' not in result_no_stats.report
+
+    @pytest.mark.asyncio
+    async def test_stage2_guard_mock_deps_provides_journal_and_config(self, stage2_guard_mock_deps):
+        assert set(stage2_guard_mock_deps.keys()) == {'memory_service', 'taskmaster', 'journal', 'config'}
+        assert isinstance(stage2_guard_mock_deps['memory_service'], AsyncMock)
+        assert isinstance(stage2_guard_mock_deps['taskmaster'], AsyncMock)
+        assert isinstance(
+            stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation, AsyncMock
+        )
+        assert await stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation() == []
+        config = stage2_guard_mock_deps['config']
+        assert isinstance(config, ReconciliationConfig)
+        assert config.enabled is True
+        assert config.explore_codebase_root == '/tmp/test'
+
+
 class TestMockTypesConstant:
     """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
 
