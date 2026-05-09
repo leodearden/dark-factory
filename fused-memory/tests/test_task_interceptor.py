@@ -2124,13 +2124,58 @@ async def test_done_provenance_merged_rejects_branch_only_sha(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_found_on_main_skips_ancestor_check(
+async def test_done_provenance_found_on_main_rejects_branch_only_sha(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
-    """kind="found_on_main" with an optional commit does NOT run the ancestor backstop.
+    """kind='found_on_main' with a commit not on main is rejected (post-3092 hardening).
 
-    The steward justifies the call via ``note``; the commit field is purely
-    advisory ("most relevant landing commit").
+    A branch-only SHA is rejected the same way as kind='merged'.
+    """
+    import subprocess
+    _init_git_repo(tmp_path)
+    # Create a branch commit that is NOT on main
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'checkout', '-q', '-b', 'feature'],
+        check=True,
+    )
+    (tmp_path / 'feature.txt').write_text('feature\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', '-A'], check=True)
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'commit', '-q', '-m', 'feature commit'],
+        check=True,
+    )
+    branch_sha = subprocess.run(
+        ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    # Switch back to main so HEAD on the worktree is on main
+    subprocess.run(
+        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'], check=True,
+    )
+
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': branch_sha,
+            'note': 'sibling task 99 landed this',
+        },
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'not on main' in result['reason'] or 'not an ancestor' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_runs_ancestor_check(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='found_on_main' with a commit DOES run the ancestor backstop (post-3092 hardening).
+
+    A branch-only SHA is rejected the same way as kind='merged'.
     """
     import subprocess
     _init_git_repo(tmp_path)
@@ -2163,10 +2208,10 @@ async def test_done_provenance_found_on_main_skips_ancestor_check(
         },
     )
 
-    assert 'error' not in result, result
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    assert persisted['done_provenance']['kind'] == 'found_on_main'
-    assert persisted['done_provenance']['commit'] == branch_sha
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    assert 'not on main' in result['reason'] or 'not an ancestor' in result['reason']
+    taskmaster.set_task_status.assert_not_called()
 
 
 @pytest.mark.asyncio
