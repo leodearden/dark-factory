@@ -3852,3 +3852,86 @@ class TestShouldSkipKnownBug1139Flag:
     def test_pass_content_mentions_stage1_but_not_bug(self):
         fn = self._import()
         assert fn({'content': 'mentions Stage 1 but not the bug'}) is False
+
+
+class TestQueryStage2Flags:
+    """_query_stage2_flags retrieves and filters Mem0 active-query flags."""
+
+    def _make_result(self, id, content, metadata):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=id, content=content, metadata=metadata)
+
+    @pytest.mark.asyncio
+    async def test_returns_flags_with_flag_for_stage2(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742'}),
+            self._make_result('id-2', 'no flag', {}),
+        ]
+        result = await _query_stage2_flags(memory_service, 'reify')
+        assert len(result) == 1
+        assert result[0]['id'] == 'id-1'
+
+    @pytest.mark.asyncio
+    async def test_returns_flags_with_stage1_flag_marker_legacy(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result('id-3', 'legacy flag', {'stage1_flag_marker': True, 'task_id': '888'}),
+        ]
+        result = await _query_stage2_flags(memory_service, 'reify')
+        assert len(result) == 1
+        assert result[0]['id'] == 'id-3'
+
+    @pytest.mark.asyncio
+    async def test_excludes_memories_without_either_marker(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result('id-4', 'irrelevant', {'some_other_key': True}),
+            self._make_result('id-5', 'also irrelevant', {}),
+        ]
+        result = await _query_stage2_flags(memory_service, 'reify')
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_preserves_fields_and_extracts_task_id(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        meta = {'flag_for_stage2': True, 'task_id': '742', 'extra': 'x'}
+        memory_service.search.return_value = [
+            self._make_result('id-6', 'content here', meta),
+        ]
+        result = await _query_stage2_flags(memory_service, 'reify')
+        assert len(result) == 1
+        flag = result[0]
+        assert flag['id'] == 'id-6'
+        assert flag['content'] == 'content here'
+        assert flag['metadata'] == meta
+        assert flag['task_id'] == '742'
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_search_exception(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        import logging
+        memory_service = AsyncMock()
+        memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
+        with caplog.at_level(logging.WARNING):
+            result = await _query_stage2_flags(memory_service, 'reify')
+        assert result == []
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_calls_search_with_project_id(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = []
+        await _query_stage2_flags(memory_service, 'my_project')
+        call_kwargs = memory_service.search.call_args
+        assert call_kwargs is not None
+        # project_id must be passed as kwarg or positional
+        kwargs = call_kwargs.kwargs
+        args = call_kwargs.args
+        all_args = list(args) + list(kwargs.values())
+        assert 'my_project' in all_args or kwargs.get('project_id') == 'my_project'
