@@ -1344,6 +1344,74 @@ class TestDispatchCooldownGate:
             'recon_reset_count=1 must not block re-dispatch'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('metadata,signal', [
+        (
+            {'files': ['backend'], 'steward_clear_at': '2026-04-27T13:04:06Z'},
+            'steward_clear_at',
+        ),
+        (
+            {'files': ['backend'], 'recon_stage2_blocked_at': '2026-04-27T13:04:06Z'},
+            'recon_stage2_blocked_at',
+        ),
+        (
+            {'files': ['backend'], 'reopen_reason': 'steward stash-pop resolution'},
+            'reopen_reason',
+        ),
+    ])
+    async def test_steward_signals_block_immediate_redispatch(
+        self, monkeypatch, metadata, signal
+    ):
+        """Steward signals (steward_clear_at, recon_stage2_blocked_at,
+        reopen_reason containing 'steward') arm the dispatch cooldown gate."""
+        task = self._pending_task_with(metadata)
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        scheduler.release('99')
+
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, (
+            f'Task with signal {signal!r} must not be re-dispatched during cooldown'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_steward_reopen_reason_does_not_block(self, monkeypatch):
+        """reopen_reason without 'steward' substring must NOT trigger the gate.
+
+        Only the literal substring 'steward' arms the gate; other reopen reasons
+        such as 'un-defer script' are orchestrator-internal and must dispatch normally.
+        """
+        task = self._pending_task_with(
+            {'files': ['backend'], 'reopen_reason': 'un-defer script'}
+        )
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+
+        scheduler.release('99')
+
+        # Must succeed — 'un-defer script' does not contain 'steward'
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99', (
+            "reopen_reason='un-defer script' must not block re-dispatch"
+        )
+
 
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
