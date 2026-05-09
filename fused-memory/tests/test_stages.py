@@ -33,6 +33,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
     TaskKnowledgeSync,
+    _check_stall_guard_freshness,
     _classify_terminal_state_violations,
     _format_flagged,
     _queue_briefing_refresh_tasks,
@@ -5409,3 +5410,168 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert getattr(rec, 'task_id', None) == '7'
             assert getattr(rec, 'target_status', None) == 'done'
             assert getattr(rec, 'live_status', None) == 'pending'
+
+    class TestStallGuardFreshnessGate:
+        """Unit + integration tests for _check_stall_guard_freshness helper."""
+
+        def _make_add_memory_op(
+            self,
+            *,
+            op_id: str = 'op-mem-1',
+            agent_id: str = 'recon-stage-task_knowledge_sync',
+            metadata: dict | None = None,
+        ) -> dict:
+            """Return a minimal write_journal add_memory op dict."""
+            if metadata is None:
+                metadata = {'task_id': '11', 'snapshot_status': 'in-progress'}
+            return {
+                'id': op_id,
+                'agent_id': agent_id,
+                'operation': 'add_memory',
+                'params': json.dumps({'metadata': metadata}),
+                'layer': 'write_op',
+                'causation_id': 'run-test',
+                'created_at': '2026-01-01T00:00:00',
+            }
+
+        @pytest.mark.asyncio
+        async def test_unit_freshness_violation_snapshot_status(self):
+            """add_memory op with snapshot_status='in-progress', live='done' -> one violation."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'done'}
+
+            ops = [self._make_add_memory_op(
+                op_id='op-stall-1',
+                metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
+            )]
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+
+            assert len(violations) == 1
+            v = violations[0]
+            assert v['op_id'] == 'op-stall-1'
+            assert v['task_id'] == '11'
+            assert v['snapshot_status'] == 'in-progress'
+            assert v['live_status'] == 'done'
+
+        @pytest.mark.asyncio
+        async def test_unit_freshness_violation_observed_status_alias(self):
+            """observed_status alias is accepted in addition to snapshot_status."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'done'}
+
+            ops = [self._make_add_memory_op(
+                op_id='op-stall-alias',
+                metadata={'task_id': '11', 'observed_status': 'in-progress'},
+            )]
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+
+            assert len(violations) == 1
+            assert violations[0]['snapshot_status'] == 'in-progress'
+
+        @pytest.mark.asyncio
+        async def test_unit_no_snapshot_status_key_skipped(self):
+            """add_memory op without snapshot_status/observed_status -> no violation."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'done'}
+
+            ops = [self._make_add_memory_op(
+                metadata={'task_id': '11'},  # no snapshot_status key
+            )]
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+
+            assert violations == []
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_unit_snapshot_matches_live_no_violation(self):
+            """add_memory op where snapshot_status matches live status -> no violation."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'in-progress'}
+
+            ops = [self._make_add_memory_op(
+                metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
+            )]
+            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project')
+
+            assert violations == []
+
+        @pytest.fixture
+        def mock_deps_integration(self):
+            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+            write_journal_mock = MagicMock()
+            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+            journal_mock = MagicMock()
+            journal_mock.write_journal = write_journal_mock
+            return {
+                'memory_service': AsyncMock(),
+                'taskmaster': AsyncMock(),
+                'journal': journal_mock,
+                'config': config,
+            }
+
+        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
+            report = {'flagged_items': flagged_items, 'summary': 'ok'}
+            if stats:
+                report['stats'] = stats
+            return MagicMock(
+                success=True,
+                report=report,
+                llm_calls=1,
+                tokens_used=0,
+                cost_usd=0.0,
+                model='m',
+            )
+
+        @pytest.mark.asyncio
+        async def test_run_records_stall_guard_freshness_violation(self, mock_deps_integration, caplog):
+            """run() adds stall_guard_freshness_violations when snapshot_status mismatches live."""
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_integration)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            stall_op = {
+                'id': 'op-stall-integration-1',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'operation': 'add_memory',
+                'params': json.dumps({
+                    'metadata': {'task_id': '11', 'snapshot_status': 'in-progress'},
+                }),
+                'layer': 'write_op',
+                'causation_id': 'test-run-1137-c',
+                'created_at': '2026-01-01T00:00:00',
+            }
+            mock_deps_integration['journal'].write_journal.get_ops_by_causation.return_value = [stall_op]
+            mock_deps_integration['taskmaster'].get_task.return_value = {'status': 'done'}
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result([], stats={})),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[],
+                    run_id='test-run-1137-c',
+                )
+
+            # Guard 2: freshness violations counter incremented
+            assert report.stats.get('stall_guard_freshness_violations') == 1
+
+            # Guard 2: WARNING log
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            guard_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stall_guard_freshness_violation' in r.getMessage()
+            ]
+            assert len(guard_logs) == 1, (
+                f'expected one stall_guard_freshness_violation WARNING, got {len(guard_logs)}'
+            )
