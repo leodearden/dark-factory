@@ -229,7 +229,9 @@ async def _classify_terminal_state_violations(
             continue
 
         if status_cache is not None:
-            live_status = status_cache.get(task_id, 'unknown')
+            if task_id not in status_cache:
+                continue  # cache build failed for this task; skip per fallback semantics
+            live_status = status_cache[task_id]
         else:
             # Fallback: fetch live status individually (used in unit tests)
             try:
@@ -307,7 +309,9 @@ async def _verify_set_task_status_post_action(
             continue
 
         if status_cache is not None:
-            live_status = status_cache.get(task_id, 'unknown')
+            if task_id not in status_cache:
+                continue  # cache build failed for this task; skip per fallback semantics
+            live_status = status_cache[task_id]
         else:
             try:
                 task_data = await taskmaster.get_task(task_id, project_root)
@@ -405,7 +409,9 @@ async def _check_stall_guard_freshness(
             continue  # Op not opted into freshness checking
 
         if status_cache is not None:
-            live_status = status_cache.get(task_id, 'unknown')
+            if task_id not in status_cache:
+                continue  # cache build failed for this task; skip per fallback semantics
+            live_status = status_cache[task_id]
         else:
             try:
                 task_data = await taskmaster.get_task(task_id, project_root)
@@ -891,24 +897,27 @@ class TaskKnowledgeSync(BaseStage):
                             task_ids.add(tid)
 
             if task_ids:
+                task_id_list = list(task_ids)
                 fetch_results = await asyncio.gather(
-                    *(self.taskmaster.get_task(tid, self.project_root) for tid in task_ids),
+                    *(self.taskmaster.get_task(tid, self.project_root) for tid in task_id_list),
                     return_exceptions=True,
                 )
                 status_cache = {}
-                for tid, result in zip(task_ids, fetch_results, strict=True):
+                for tid, result in zip(task_id_list, fetch_results, strict=True):
                     if isinstance(result, BaseException):
                         logger.warning(
                             'reconciliation._apply_post_flight_guards: '
                             'get_task failed for task_id=%s during cache build; '
-                            'guards will report unknown for this task',
+                            'guards will skip ops on this task',
                             tid,
                         )
-                        status_cache[tid] = 'unknown'
-                    else:
-                        status_cache[tid] = (
-                            _extract_status(result) if isinstance(result, dict) else 'unknown'
-                        )
+                        continue  # omit entry; helpers detect missing key -> skip
+                    if not isinstance(result, dict):
+                        continue  # non-dict result; omit entry so helpers skip
+                    extracted = _extract_status(result)
+                    if extracted == 'unknown':
+                        continue  # unresolvable status; omit entry so helpers skip
+                    status_cache[tid] = extracted
 
         # Guard 1 — terminal-state pre-check
         if self.taskmaster and self.project_root:
