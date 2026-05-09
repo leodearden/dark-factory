@@ -214,7 +214,7 @@ async def _track_flag_persistence(
         return_exceptions=True,
     )
     prior_counts: dict[str, int] = {}
-    for fid, result in zip(flag_ids, count_results):
+    for fid, result in zip(flag_ids, count_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._track_flag_persistence: count failed for flag_id=%s; '
@@ -245,7 +245,7 @@ async def _track_flag_persistence(
         ),
         return_exceptions=True,
     )
-    for fid, result in zip(flag_ids, write_results):
+    for fid, result in zip(flag_ids, write_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._track_flag_persistence: add_memory failed for flag_id=%s; '
@@ -290,7 +290,7 @@ async def _filter_already_escalated_flags(
     )
     newly: list[str] = []
     already: list[str] = []
-    for fid, result in zip(flag_ids, count_results):
+    for fid, result in zip(flag_ids, count_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._filter_already_escalated_flags: count failed for '
@@ -346,7 +346,7 @@ async def _write_escalation_markers(
         ),
         return_exceptions=True,
     )
-    for fid, result in zip(flag_ids, write_results):
+    for fid, result in zip(flag_ids, write_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._write_escalation_markers: add_memory failed for '
