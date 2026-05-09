@@ -28,6 +28,7 @@ def service(mock_config):
     svc.graphiti.update_edge = AsyncMock(
         return_value={'uuid': 'test-uuid', 'fact': 'updated', 'refreshed_nodes': []}
     )
+    svc.graphiti.get_edge_text = AsyncMock(return_value=('edge-name', 'updated'))
     svc.graphiti._require_client = MagicMock()
 
     svc.mem0 = MagicMock()
@@ -914,6 +915,137 @@ class TestUpdateEdge:
             edge_uuid='e-1', fact='new', project_id='test'
         )
         assert result['refreshed_nodes'] == ['n-src', 'n-tgt']
+
+
+class TestUpdateEdgeVerification:
+    """Tests for the post-write persistence verification in update_edge (Guard 2)."""
+
+    @pytest.mark.asyncio
+    async def test_update_edge_returns_verified_true_when_readback_matches(self, service):
+        """When get_edge_text returns the same fact text, verified must be True."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='test'
+        )
+
+        assert result['verified'] is True
+        service.graphiti.get_edge_text.assert_called_once_with('e-1', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_update_edge_returns_verified_false_when_readback_differs(self, service):
+        """When get_edge_text returns a different fact text, verified must be False."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(
+            return_value=('Edge', 'old stale fact')
+        )
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='test'
+        )
+
+        assert result['verified'] is False
+
+    @pytest.mark.asyncio
+    async def test_update_edge_returns_verified_false_when_readback_raises(self, service):
+        """When get_edge_text raises EdgeNotFoundError, verified must be False
+        and verification_error must be a non-empty string mentioning EdgeNotFoundError.
+        The save itself succeeded — do NOT re-raise the readback exception.
+        """
+        from graphiti_core.errors import EdgeNotFoundError
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(
+            side_effect=EdgeNotFoundError('e-1')
+        )
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='test'
+        )
+
+        assert result['verified'] is False
+        assert 'verification_error' in result
+        assert 'EdgeNotFoundError' in result['verification_error']
+        assert result['verification_error']  # non-empty string
+
+    @pytest.mark.asyncio
+    async def test_update_edge_invalid_at_only_returns_verified_true_without_readback(
+        self, service
+    ):
+        """When only invalid_at is supplied (no fact), verified must be True
+        and get_edge_text must NOT be called.
+        """
+        from datetime import UTC, datetime
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock()
+
+        ts = datetime(2026, 5, 4, tzinfo=UTC)
+        result = await service.update_edge(
+            edge_uuid='e-1', project_id='test', invalid_at=ts
+        )
+
+        assert result['verified'] is True
+        service.graphiti.get_edge_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_edge_with_empty_string_fact_runs_verification(self, service):
+        """fact='' is not None so get_edge_text must still be called and verified computed.
+
+        Guards against an accidental future change from ``if fact is not None:``
+        to ``if fact:`` which would silently skip verification for empty-string
+        facts and regress the invalid_at-only bypass.
+        """
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': '', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', ''))
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='', project_id='test'
+        )
+
+        service.graphiti.get_edge_text.assert_called_once_with('e-1', group_id='test')
+        assert result['verified'] is True
+
+    @pytest.mark.asyncio
+    async def test_update_edge_logs_verified_in_journal(self, service):
+        """The verified field must appear in the result_summary logged to the write journal."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
+        journal_mock = MagicMock()
+        journal_mock.log_write_op = AsyncMock()
+        journal_mock.log_backend_op = AsyncMock()
+        service._write_journal = journal_mock
+
+        # --- matching readback: verified=True ---
+        await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='test')
+
+        call_args = journal_mock.log_write_op.call_args
+        result_summary = call_args.kwargs.get('result_summary', {})
+        assert result_summary.get('verified') is True
+        assert result_summary.get('status') == 'updated'
+
+        # --- mismatched readback: verified=False ---
+        journal_mock.log_write_op.reset_mock()
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'stale'))
+
+        await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='test')
+
+        call_args = journal_mock.log_write_op.call_args
+        result_summary = call_args.kwargs.get('result_summary', {})
+        assert result_summary.get('verified') is False
 
 
 class TestSearchDeleteRoundtrip:

@@ -185,7 +185,7 @@ async def test_verify_tallies_delete_and_update_edge(journal):
     await _log_write(journal, causation_id=run_id, operation='delete_memory',
                      result_summary={'status': 'deleted'})
     await _log_write(journal, causation_id=run_id, operation='update_edge',
-                     result_summary={'status': 'updated'})
+                     result_summary={'status': 'updated', 'verified': True})
 
     reports: dict[str, StageReport | dict] = {
         'memory_consolidator': _stage_report(
@@ -229,3 +229,102 @@ def test_op_to_stat_mapping_covers_core_memory_operations():
     """Guard against accidental deletions of key op-to-stat mappings."""
     for key in ('add_memory', 'delete_memory', 'update_edge', 'add_episode'):
         assert key in _OP_TO_STAT
+
+
+class TestUpdateEdgeVerifiedFilter:
+    """Only verified update_edge ops should count toward edges_updated (step-17 / step-19)."""
+
+    @pytest.mark.asyncio
+    async def test_unverified_update_edge_op_excluded_from_edges_updated(self, journal):
+        """Two update_edge ops with same causation_id: one verified=True, one verified=False.
+        Only the verified op must count.
+        """
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+
+        await _log_write(
+            journal, causation_id=run_id, operation='update_edge',
+            result_summary={'verified': True, 'status': 'updated', 'store': 'graphiti'},
+        )
+        await _log_write(
+            journal, causation_id=run_id, operation='update_edge',
+            result_summary={'verified': False, 'status': 'updated', 'store': 'graphiti'},
+        )
+
+        reports: dict[str, StageReport | dict] = {
+            'memory_consolidator': _stage_report(
+                StageId.memory_consolidator,
+                now - timedelta(minutes=1),
+                now + timedelta(minutes=1),
+                stats={'edges_updated': 2},
+            ),
+        }
+
+        await verify_and_rewrite_stats(run_id, reports, journal)
+
+        stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+        assert stats['edges_updated'] == 1, (
+            'Only the verified=True update_edge op should count; verified=False must be excluded'
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_update_edge_op_without_verified_field_is_not_counted(self, journal):
+        """A legacy update_edge op with no 'verified' key in result_summary must NOT count.
+
+        Strict interpretation: missing verified field is treated as 'not verified',
+        not 'trust the legacy entry'. Post-rollout cycles cannot accidentally count
+        un-readback ops.
+        """
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+
+        await _log_write(
+            journal, causation_id=run_id, operation='update_edge',
+            result_summary={'status': 'updated', 'store': 'graphiti'},  # no 'verified' key
+        )
+
+        reports: dict[str, StageReport | dict] = {
+            'memory_consolidator': _stage_report(
+                StageId.memory_consolidator,
+                now - timedelta(minutes=1),
+                now + timedelta(minutes=1),
+            ),
+        }
+
+        await verify_and_rewrite_stats(run_id, reports, journal)
+
+        stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+        assert stats['edges_updated'] == 0, (
+            'Legacy update_edge op without verified key must not count toward edges_updated'
+        )
+
+    @pytest.mark.asyncio
+    async def test_truthy_non_true_verified_value_does_not_count(self, journal):
+        """Truthy-but-not-True values like 'true' (string) or 1 (int) must NOT count.
+
+        The strict ``is True`` identity check in ``_count_update_edge`` prevents
+        coerced / loosely-typed values from slipping through.  This test pins
+        the string-'true' case explicitly.
+        """
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+
+        await _log_write(
+            journal, causation_id=run_id, operation='update_edge',
+            result_summary={'verified': 'true', 'status': 'updated', 'store': 'graphiti'},
+        )
+
+        reports: dict[str, StageReport | dict] = {
+            'memory_consolidator': _stage_report(
+                StageId.memory_consolidator,
+                now - timedelta(minutes=1),
+                now + timedelta(minutes=1),
+            ),
+        }
+
+        await verify_and_rewrite_stats(run_id, reports, journal)
+
+        stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+        assert stats['edges_updated'] == 0, (
+            "Truthy-but-not-True 'verified' (e.g. string 'true') must not count as verified"
+        )

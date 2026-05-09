@@ -65,6 +65,24 @@ def _parse_result_summary(raw: Any) -> dict:
     return {}
 
 
+def _count_update_edge(op: dict) -> bool:
+    """Return True only if the update_edge op was verified by a server-side readback.
+
+    MemoryService.update_edge performs a ``get_edge_text`` round-trip after the
+    save and sets ``verified=True`` in ``result_summary`` only when the returned
+    fact matches. A missing ``verified`` key (legacy ops written before Guard 2
+    was deployed) or ``verified=False`` (readback failed or returned a different
+    fact) are both treated as unverified and excluded from ``edges_updated``.
+
+    The strict ``is True`` identity check (not truthy) prevents strings like
+    ``'true'`` or ``1`` from accidentally counting.
+    """
+    if not op.get('success', 1):
+        return False
+    rs = _parse_result_summary(op.get('result_summary'))
+    return rs.get('verified') is True
+
+
 def _count_add_memory(op: dict) -> bool:
     """Return True if the add_memory op actually produced a stored memory.
 
@@ -143,6 +161,9 @@ def _observed_counts(ops: list[dict]) -> dict[str, int]:
             continue
         if operation == 'add_memory':
             if not _count_add_memory(op):
+                continue
+        elif operation == 'update_edge':
+            if not _count_update_edge(op):
                 continue
         elif not op.get('success', 1):
             continue

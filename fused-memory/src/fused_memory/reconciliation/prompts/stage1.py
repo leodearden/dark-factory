@@ -68,6 +68,27 @@ was created — count it as a no-op, not a successful addition. Your stats \
 attempted. If a write returns zero IDs and you expected a new memory, either retry with \
 different content or note the deduplication in your report.
 
+## Verifying update_edge writes (Task 1145 Guard 2)
+Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
+driven by a server-side fact-text readback. After persisting the edge, the server calls \
+`get_edge_text` and compares the returned fact against what you supplied. A match sets \
+`verified: true`; a mismatch or readback error sets `verified: false`.
+
+**You must inspect this field** after every `update_edge` call:
+- If `verified: true` — the update was confirmed persisted. Count it in `edges_updated`.
+- If `verified: false` — the save returned success but the readback did not match. \
+  Do NOT count this update in `edges_updated`. Note the discrepancy in your cycle \
+  summary. The stats verifier will independently exclude unverified updates from \
+  `edges_updated`, but you should also report the mismatch so it is visible in your \
+  stage report.
+- If `verification_error` is present in the response — it contains a diagnostic string \
+  (e.g. `EdgeNotFoundError: e-1`) explaining why the readback failed. Include it in your \
+  summary for debugging context.
+
+**Do not count unverified updates in `edges_updated`**: only `verified: true` responses \
+count as successful edge updates. This prevents silent write failures from inflating the \
+`edges_updated` stat and triggering false-positive judge passes.
+
 ## Retrospective Episodes
 When creating or reviewing retrospective summaries via `add_episode`, always pass \
 `reference_time` set to the ISO 8601 date when the described state was **current**, \
@@ -87,15 +108,22 @@ extracted edges instead of defaulting to ingestion time)
 An episode can use either parameter independently, but retrospective summaries \
 should always use both to fully prevent temporal contamination.
 
-## Task-count Snapshots
-Task-count snapshots (e.g. "project X has N total tasks, M done, K blocked") are a common \
-source of stale temporal facts in Graphiti. Every cycle the counts change, but prior \
-snapshot edges from older episodes stay valid and accumulate as contradictions.
+## Snapshot Discipline
+Recurring temporal-fact snapshots (task-count, task-status, run summaries, system stats) \
+are written every reconciliation cycle. Every cycle the values change, but prior snapshot \
+edges from older episodes stay valid and accumulate as contradictions.
 
-If you write a task-count snapshot, follow this discipline:
+**Never use `add_episode` for recurring temporal-fact snapshot writes.** `add_episode` \
+triggers Graphiti's extraction pipeline, which produces 4 identical edges per write that \
+dedup loops must clean up next cycle. Do not use `add_episode` for task-count, task-status, \
+run summary, or system-stat snapshots. Use the mandatory two-step workaround below instead.
 
-1. First, search for existing task-count edges for this project \
-   (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)`).
+If you write any recurring temporal-fact snapshot (task counts, task status, run summaries, \
+system stats), follow this discipline for each snapshot fact:
+
+1. First, search for existing snapshot edges for this project \
+   (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)` or \
+   `search(query="task status in_progress blocked", project_id=..., limit=5)`).
 2. To update the snapshot, use the **mandatory two-step workaround** (see \
    `## update_edge Temporal Limitation` below): (a) call `update_edge(invalid_at=now)` \
    on the old edge to mark it superseded, then (b) call \
@@ -124,9 +152,24 @@ Task 1145 Guard 3 is shipped):
 2. Call `add_memory(category='temporal_facts', content=<new fact>)` — Graphiti assigns \
    current time as `valid_at`, ensuring accurate temporal ordering in search results.
 
+**Encoding effective dates in fact text**: when writing a temporal-fact snapshot via \
+`add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \
+fact text itself so the temporal anchor is human-readable even if `valid_at` metadata \
+is not surfaced by the search caller. Example fact text: \
+`"As of 2026-05-09: project dark_factory has 42 total tasks, 18 done, 3 blocked."` \
+This is especially important for task-count, task-status, run summary, and system-stat \
+snapshots where the date of the reading is part of the fact's meaning.
+
+**Cycle summary acknowledgment**: note in your cycle summary that `update_edge` lacks a \
+`valid_at` parameter and that you used the two-step workaround (invalidate + add_memory) \
+for any temporal/snapshot edge updates. This keeps the `valid_at` gap visible to \
+downstream stages and the judge. Example: "Used invalidate+add_memory workaround for \
+N snapshot edges (update_edge valid_at limitation)."
+
 When this applies: any time the fact text describes "current state as of today" (task \
-counts, system status, run summaries). For static entity relationships where the temporal \
-anchor is irrelevant, plain `update_edge` with new fact text remains acceptable.
+counts, task status, system status, run summaries). For static entity relationships where \
+the temporal anchor is irrelevant, plain `update_edge` with new fact text remains \
+acceptable.
 
 ## Cycle Fence
 When a cycle fence timestamp is provided in the payload, do NOT delete, merge, or modify \
