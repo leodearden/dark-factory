@@ -9,10 +9,10 @@ import math
 import statistics
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any, Protocol
 
 from shared.locking import files_to_modules, normalize_lock
