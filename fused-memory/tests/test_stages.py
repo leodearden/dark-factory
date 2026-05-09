@@ -4584,3 +4584,60 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         assert 'stage2_escalation_marker' in sources_written
         # Sanity: avoid lint warning on unused import
         assert mock_call
+
+
+class TestStage3PayloadIncludesProjectRoot:
+    """IntegrityCheck.assemble_payload() must emit a Use project_root="..." directive.
+
+    Mirrors Stage 2's pattern (task_knowledge_sync.py:662) so the Stage 3 CLI
+    agent receives an explicit project_root binding rather than guessing.
+
+    These tests FAIL before step-12 because Stage 3's assemble_payload currently
+    never emits the directive (task 1143 step-11).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_integrity_check_payload_emits_use_project_root_directive(self, mock_deps):
+        """assemble_payload() for reify must contain Use project_root="/home/leo/src/reify"."""
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        watermark = Watermark(project_id='reify')
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert 'Use project_root="/home/leo/src/reify"' in payload, (
+            f'Stage 3 payload must contain Use project_root="..." directive '
+            f'mirroring Stage 2 (task 1143 step-12). Got payload:\n{payload[:500]}'
+        )
+        # Must not silently bleed dark-factory's path into another project's payload
+        assert '/home/leo/src/dark-factory' not in payload, (
+            'Stage 3 payload for reify must not contain dark-factory path'
+        )
+
+    @pytest.mark.asyncio
+    async def test_integrity_check_payload_for_dark_factory_uses_dark_factory_root(
+        self, mock_deps
+    ):
+        """assemble_payload() for dark_factory must use dark-factory root in directive."""
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/home/leo/src/dark-factory'
+
+        watermark = Watermark(project_id='dark_factory')
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert 'Use project_root="/home/leo/src/dark-factory"' in payload, (
+            f'Stage 3 payload for dark_factory must contain Use project_root="..." directive. '
+            f'Got payload:\n{payload[:500]}'
+        )
