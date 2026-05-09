@@ -499,7 +499,9 @@ async def test_dedup_flags_prior_marker_None_metadata_writes_new_marker():
 
 
 # ---------------------------------------------------------------------------
-# Step 3 (task-1146) — atomic-replace: HIT writes new marker then deletes prior
+# Step 3 (task-1146) — best-effort replace: HIT writes new marker then deletes prior
+# NOTE: test names below use the historical 'atomic_replace' prefix; the contract
+# was renamed 'best-effort replacement' in task-1165 (concurrent duplicates self-heal).
 # ---------------------------------------------------------------------------
 
 
@@ -584,7 +586,7 @@ async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
 
     (a) add_memory called exactly once
     (b) delete_memory called exactly three times covering ids {p-1, p-2, p-3}
-    (c) flag annotation uses the FIRST prior's run_id
+    (c) flag annotation uses the lowest-id-lex prior's run_id
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
@@ -599,12 +601,13 @@ async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
         r.id = id_
         return r
 
-    prior1 = _prior('p-1', 'r0')  # first found — annotation should come from this one
+    prior1 = _prior('p-1', 'r0')   # lex-lowest id — annotation comes from this one
     prior2 = _prior('p-2', 'r-prev')
     prior3 = _prior('p-3', 'r-earlier')
 
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior1, prior2, prior3])
+    # Return [prior2, prior3, prior1] to exercise lex-sort — p-1 is NOT first in this order
+    memory_service.search = AsyncMock(return_value=[prior2, prior3, prior1])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -632,7 +635,7 @@ async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
         f'Expected all three prior ids deleted but got {deleted_ids}'
     )
 
-    # (c) annotation from first prior
+    # (c) annotation from lowest-id-lex prior (p-1 → run_id 'r0')
     assert result[0]['persisted_from_run'] == 'r0'
 
 
@@ -851,6 +854,8 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
     prior_mmm = _prior('mmm', 'r-mmm')
     prior_zzz = _prior('zzz', 'r-zzz')
 
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
     flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'test'}]
 
     # Run 1: search returns [zzz, aaa, mmm] — aaa is NOT first
@@ -859,7 +864,7 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
     memory_service_1.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_1.delete_memory = AsyncMock(return_value=None)
 
-    result_1 = await __import__('fused_memory.reconciliation.flag_dedup', fromlist=['dedup_flags']).dedup_flags(
+    result_1 = await dedup_flags(
         memory_service=memory_service_1,
         project_id='p',
         run_id='r1',
@@ -872,7 +877,7 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
     memory_service_2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_2.delete_memory = AsyncMock(return_value=None)
 
-    result_2 = await __import__('fused_memory.reconciliation.flag_dedup', fromlist=['dedup_flags']).dedup_flags(
+    result_2 = await dedup_flags(
         memory_service=memory_service_2,
         project_id='p',
         run_id='r2',
@@ -1019,7 +1024,6 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
     """
     import logging
 
-    from fused_memory.models.memory import AddMemoryResponse
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     prior_marker = _make_memory_result({
