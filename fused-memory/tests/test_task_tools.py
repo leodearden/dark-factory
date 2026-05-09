@@ -562,6 +562,41 @@ async def test_remove_task_empty_after_strip_is_noop(
     task_interceptor.remove_tasks.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_remove_task_nested_subtask_id_returns_structured_error(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Nested-subtask-id input surfaces as a structured TaskmasterError dict.
+
+    Wire-contract regression: when the backend raises
+    ``TaskmasterError('INVALID_TASK_ID', ...)`` the MCP exception handler must
+    return ``{'error': '...INVALID_TASK_ID...', 'error_type': 'TaskmasterError'}``
+    — the shape that programmatic callers parse.  Also asserts that the CSV
+    split forwarded the malformed id as ``ids=['1.2.3']`` (i.e. the MCP
+    boundary doesn't pre-validate grammar; it delegates to the backend).
+    """
+    from fused_memory.backends.task_backend_errors import TaskmasterError
+
+    task_interceptor.remove_tasks = AsyncMock(
+        side_effect=TaskmasterError(
+            'INVALID_TASK_ID', "nested subtask ids not supported: '1.2.3'"
+        )
+    )
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'remove_task', {'id': '1.2.3', 'project_root': '/project'},
+    )
+
+    assert result['error_type'] == 'TaskmasterError'
+    assert 'INVALID_TASK_ID' in result['error']
+    assert 'nested subtask ids not supported' in result['error']
+
+    # Confirm the CSV split forwarded the id without pre-validation.
+    task_interceptor.remove_tasks.assert_called_once()
+    _, kwargs = task_interceptor.remove_tasks.call_args
+    assert kwargs['ids'] == ['1.2.3']
+
+
 # ---------------------------------------------------------------------------
 # get_statuses MCP tool tests (step-7)
 # ---------------------------------------------------------------------------
