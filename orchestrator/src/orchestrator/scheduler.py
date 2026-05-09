@@ -1287,6 +1287,8 @@ class Scheduler:
                 if time.monotonic() < cooldown_deadline:
                     continue
                 del self._requeue_until[tid_str]
+            if not self._deps_satisfied(t, status_map):
+                continue
             # Dispatch cooldown gate: if the task was recently dispatched and
             # carries a reconciliation/steward signal, suppress re-dispatch
             # until the settle window elapses.  Both gates must pass.
@@ -1309,8 +1311,6 @@ class Scheduler:
                     metadata.get(signal_label),
                     remaining_secs,
                 )
-                continue
-            if not self._deps_satisfied(t, status_map):
                 continue
             candidates.append(t)
 
