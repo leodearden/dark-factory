@@ -1102,4 +1102,159 @@ class TestStats:
         stats = await q.get_stats()
         assert stats['counts'].get('completed', 0) == 2
         assert stats['counts'].get('dead', 0) == 1
+
+
+class TestGetStatsScopedByGroup:
+    """get_stats(group_id=…) should filter counts and oldest-pending age by group."""
+
+    @pytest.mark.asyncio
+    async def test_get_stats_filters_counts_by_group_id(self, tmp_path):
+        """Dead-letter counts are scoped to the requested group_id."""
+        async def always_fail(op, payload):
+            raise RuntimeError('forced fail')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        try:
+            # 2 items for proj_a, 3 items for proj_b → all dead-lettered
+            for i in range(2):
+                await q.enqueue(
+                    group_id='proj_a', operation='add_episode',
+                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
+                )
+            for i in range(3):
+                await q.enqueue(
+                    group_id='proj_b', operation='add_episode',
+                    payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
+                )
+            # Wait for all items to be processed (dead-lettered)
+            await asyncio.sleep(1.5)
+
+            stats_a = await q.get_stats(group_id='proj_a')
+            stats_b = await q.get_stats(group_id='proj_b')
+
+            assert stats_a['counts'].get('dead', 0) == 2, (
+                f"proj_a dead count should be 2, got {stats_a['counts']}"
+            )
+            assert stats_a['counts'].get('completed', 0) == 0
+            assert stats_b['counts'].get('dead', 0) == 3, (
+                f"proj_b dead count should be 3, got {stats_b['counts']}"
+            )
+            assert stats_b['counts'].get('completed', 0) == 0
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_no_group_id_returns_unscoped(self, tmp_path):
+        """get_stats() with no group_id returns combined counts — backward compat."""
+        async def always_fail(op, payload):
+            raise RuntimeError('forced fail')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        try:
+            # 2 items for proj_a, 3 items for proj_b → all dead-lettered
+            for i in range(2):
+                await q.enqueue(
+                    group_id='proj_a', operation='add_episode',
+                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
+                )
+            for i in range(3):
+                await q.enqueue(
+                    group_id='proj_b', operation='add_episode',
+                    payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
+                )
+            await asyncio.sleep(1.5)
+
+            stats = await q.get_stats()  # no group_id → unscoped
+            # Should see the total across both groups
+            assert stats['counts'].get('dead', 0) == 5, (
+                f"unscoped dead count should be 5 (2+3), got {stats['counts']}"
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_oldest_pending_age_filtered_by_group_id(self, tmp_path):
+        """oldest_pending_age_seconds reflects only the requested group's items."""
+        # Use a no-op execute that succeeds so we can control pending state
+        # by inserting rows directly into the DB after initialization.
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=0,  # no workers — items stay pending
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        try:
+            now = time.time()
+            old_ts = now - 100.0  # proj_a item created 100 seconds ago
+            recent_ts = now - 10.0  # proj_b item created 10 seconds ago
+
+            assert q._db is not None
+            # Insert directly so workers aren't triggered (they'd change status)
+            await q._db.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, status, attempts, max_attempts, '
+                ' next_retry_at, created_at) '
+                "VALUES (?, ?, ?, 'pending', 0, 3, 0, ?)",
+                ('proj_a', 'add_episode',
+                 '{"content":"old","group_id":"proj_a","name":"old"}',
+                 old_ts),
+            )
+            await q._db.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, status, attempts, max_attempts, '
+                ' next_retry_at, created_at) '
+                "VALUES (?, ?, ?, 'pending', 0, 3, 0, ?)",
+                ('proj_b', 'add_episode',
+                 '{"content":"recent","group_id":"proj_b","name":"recent"}',
+                 recent_ts),
+            )
+            await q._db.commit()
+
+            stats_b = await q.get_stats(group_id='proj_b')
+            age_b = stats_b['oldest_pending_age_seconds']
+
+            assert age_b is not None, 'proj_b should have a pending item'
+            # proj_b item is ~10s old; should be well under 50s
+            assert age_b < 50.0, (
+                f'proj_b oldest_pending_age should reflect ~10s, got {age_b}'
+            )
+            # If group_id filter was missing, MIN(created_at) would pick proj_a's
+            # 100s-old item instead — so assert we're NOT near 100s.
+            assert age_b < 80.0, (
+                f'proj_b oldest_pending_age must not include proj_a rows; got {age_b}'
+            )
+
+            stats_a = await q.get_stats(group_id='proj_a')
+            age_a = stats_a['oldest_pending_age_seconds']
+            assert age_a is not None
+            assert age_a > 80.0, (
+                f'proj_a oldest_pending_age should reflect ~100s, got {age_a}'
+            )
+        finally:
+            await q.close()
         await q.close()
