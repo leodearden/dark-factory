@@ -4220,6 +4220,45 @@ class TestKnownProjectRootFor:
             )
 
 
+@pytest.mark.asyncio
+async def test_run_full_cycle_pre_flight_raises_before_side_effects(
+    journal, event_buffer, mock_memory_service
+):
+    """Pre-flight _known_project_root_for raises before any drain or journal mutation.
+
+    Pins that a misconfigured project_id never causes a partial cycle:
+    (a) ValueError is raised,
+    (b) events remain in the buffer (drain was NOT called),
+    (c) no journal run row was created (start_run was NOT called).
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'dark_factory': '/home/leo/src/dark-factory'},  # no autopilot_video entry
+    )
+
+    # Push 2 events for autopilot_video (which is NOT in _known_projects).
+    await event_buffer.push(_make_event('autopilot_video'))
+    await event_buffer.push(_make_event('autopilot_video'))
+
+    # (a) ValueError with the unknown project_id in the message
+    with pytest.raises(ValueError, match='autopilot_video'):
+        await harness.run_full_cycle('autopilot_video', 'buffer_size:2')
+
+    # (b) Events NOT drained — buffer still shows size==2
+    stats = await event_buffer.get_buffer_stats('autopilot_video')
+    assert stats['size'] == 2, (
+        f"Expected buffer size==2 (events not drained) but got {stats['size']}"
+        " — pre-flight must run before drain"
+    )
+
+    # (c) No journal start_run side effect — get_recent_runs returns no row
+    recent_runs = await journal.get_recent_runs('autopilot_video', limit=1)
+    assert len(recent_runs) == 0, (
+        f"Expected no journal row but got {len(recent_runs)} row(s)"
+        " — pre-flight must run before journal.start_run"
+    )
+
+
 @pytest.mark.parametrize(
     'project_id,expected_root',
     [
