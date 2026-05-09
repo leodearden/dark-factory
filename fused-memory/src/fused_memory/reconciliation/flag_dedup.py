@@ -92,7 +92,14 @@ async def filter_suppressed(
 
     Both fields must be present and correct for a record to be treated as a
     suppression — this rejects vector-search near-misses that only match on
-    semantic proximity.
+    semantic proximity.  ``task_id`` values that are ``None`` or ``''`` in a
+    suppression record are skipped (invalid; not added to the suppressed set),
+    preventing a malformed record from accidentally suppressing flags that have
+    no task_id.
+
+    The search uses ``limit=500``.  Projects with more than 500 active
+    suppression records would see the excess truncated; in practice suppression
+    records are a small operator-managed set and 500 provides ample headroom.
 
     On search exception: logs a WARNING and returns *flags* unchanged
     (conservative pass-through — treats as "no suppression in effect").
@@ -106,7 +113,7 @@ async def filter_suppressed(
             project_id=project_id,
             categories=['observations_and_summaries'],
             stores=['mem0'],
-            limit=50,
+            limit=500,
         )
     except Exception as e:
         logger.warning(
@@ -120,7 +127,7 @@ async def filter_suppressed(
         if meta.get('kind') != 'stage1_flag_suppression':
             continue
         task_id = meta.get('task_id')
-        if task_id is None:
+        if task_id is None or task_id == '':
             continue
         suppressed_task_ids.add(str(task_id))
 

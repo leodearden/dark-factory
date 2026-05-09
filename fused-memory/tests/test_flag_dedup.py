@@ -75,7 +75,7 @@ class TestComputeFlagSignature:
 
 @pytest.mark.asyncio
 async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
-    """Flags without task_id/flag_type pass through unchanged with zero I/O calls."""
+    """Flags without task_id/flag_type pass through with exactly one I/O call (suppression filter); add_memory never called."""
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
@@ -96,10 +96,11 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 
     # All flags returned unchanged
     assert result == original_flags
+    # filter_suppressed issues exactly one project-scoped suppression search;
+    # no per-flag searches because no flags have computable signatures.
+    assert memory_service.search.call_count == 1
     # add_memory never called — no-signature flags never reach the marker write path
     memory_service.add_memory.assert_not_called()
-    # Note: filter_suppressed calls search once (project-scoped suppression query),
-    # but since no flags have computable signatures the per-flag search is never called.
 
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +1144,7 @@ class TestFilterSuppressed:
         assert kwargs.get('project_id') == 'p'
         assert kwargs.get('categories') == ['observations_and_summaries']
         assert kwargs.get('stores') == ['mem0']
-        assert kwargs.get('limit') == 50
+        assert kwargs.get('limit') == 500
         assert 'stage1_flag_suppression' in kwargs.get('query', '')
 
     @pytest.mark.asyncio
