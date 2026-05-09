@@ -185,7 +185,7 @@ async def test_verify_tallies_delete_and_update_edge(journal):
     await _log_write(journal, causation_id=run_id, operation='delete_memory',
                      result_summary={'status': 'deleted'})
     await _log_write(journal, causation_id=run_id, operation='update_edge',
-                     result_summary={'status': 'updated'})
+                     result_summary={'status': 'updated', 'verified': True})
 
     reports: dict[str, StageReport | dict] = {
         'memory_consolidator': _stage_report(
