@@ -33,6 +33,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
     TaskKnowledgeSync,
+    _check_flag_counter_completeness,
     _check_stall_guard_freshness,
     _classify_terminal_state_violations,
     _format_flagged,
@@ -5575,3 +5576,132 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert len(guard_logs) == 1, (
                 f'expected one stall_guard_freshness_violation WARNING, got {len(guard_logs)}'
             )
+
+    class TestFlagCounterCompleteness:
+        """Unit + integration tests for _check_flag_counter_completeness helper."""
+
+        def test_unit_mismatch_low_reported(self):
+            """prior_reports[0] has 5 items_flagged, stats reports 3 -> mismatch True."""
+            prior_report = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=datetime.now(tz=UTC),
+                completed_at=datetime.now(tz=UTC),
+                items_flagged=[{'id': str(i)} for i in range(5)],
+            )
+            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [prior_report])
+            assert result['expected'] == 5
+            assert result['reported'] == 3
+            assert result['mismatch'] is True
+
+        def test_unit_counts_match_no_mismatch(self):
+            """prior_reports[0] has 5 items_flagged, stats reports 5 -> mismatch False."""
+            prior_report = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=datetime.now(tz=UTC),
+                completed_at=datetime.now(tz=UTC),
+                items_flagged=[{'id': str(i)} for i in range(5)],
+            )
+            result = _check_flag_counter_completeness({'stage1_flags_processed': 5}, [prior_report])
+            assert result['expected'] == 5
+            assert result['reported'] == 5
+            assert result['mismatch'] is False
+
+        def test_unit_empty_prior_reports_no_mismatch(self):
+            """No prior reports -> expected=0, mismatch=False."""
+            result = _check_flag_counter_completeness({'stage1_flags_processed': 3}, [])
+            assert result['expected'] == 0
+            assert result['reported'] == 3
+            assert result['mismatch'] is False
+
+        def test_unit_zero_stats_value_matches_empty_flagged(self):
+            """prior_reports[0].items_flagged=[], stats reports 0 -> no mismatch."""
+            prior_report = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=datetime.now(tz=UTC),
+                completed_at=datetime.now(tz=UTC),
+                items_flagged=[],
+            )
+            result = _check_flag_counter_completeness({}, [prior_report])
+            assert result['expected'] == 0
+            assert result['reported'] == 0
+            assert result['mismatch'] is False
+
+        @pytest.fixture
+        def mock_deps_integration(self):
+            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+            write_journal_mock = MagicMock()
+            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+            journal_mock = MagicMock()
+            journal_mock.write_journal = write_journal_mock
+            return {
+                'memory_service': AsyncMock(),
+                'taskmaster': AsyncMock(),
+                'journal': journal_mock,
+                'config': config,
+            }
+
+        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
+            report = {'flagged_items': flagged_items, 'summary': 'ok'}
+            if stats:
+                report['stats'] = stats
+            return MagicMock(
+                success=True,
+                report=report,
+                llm_calls=1,
+                tokens_used=0,
+                cost_usd=0.0,
+                model='m',
+            )
+
+        @pytest.mark.asyncio
+        async def test_run_clamps_stage1_flags_processed_on_mismatch(self, mock_deps_integration, caplog):
+            """run() clamps stage1_flags_processed to prior_reports[0] truth and warns."""
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_integration)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[{'id': str(i)} for i in range(5)],
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [], stats={'stage1_flags_processed': 3}
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-1137-d',
+                )
+
+            # Guard 4: stage1_flags_processed clamped to 5 (truth from prior_reports)
+            assert report.stats.get('stage1_flags_processed') == 5
+
+            # Guard 4: WARNING log
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            guard_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stage1_flags_processed_mismatch' in r.getMessage()
+            ]
+            assert len(guard_logs) == 1, (
+                f'expected one stage1_flags_processed_mismatch WARNING, got {len(guard_logs)}'
+            )
+            rec = guard_logs[0]
+            assert getattr(rec, 'expected', None) == 5
+            assert getattr(rec, 'reported', None) == 3
