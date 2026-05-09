@@ -1,5 +1,6 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+from fused_memory.reconciliation.flag_dedup import TERMINAL_STATE_PRE_CHECK_FLAG_TYPE
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 
 STAGE1_SYSTEM_PROMPT = f"""\
@@ -85,8 +86,8 @@ terminal state (done / cancelled / deferred / blocked), follow this verification
    status from Taskmaster.
 2. Only persist the temporal_fact if the live status matches the claimed terminal state.
 3. If they disagree, SKIP the write and flag for Stage 2 review instead — set `task_id` \
-   and `flag_type` on the flagged item per the existing Flag Deduplication and \
-   Stage 2 Flag Relay (FIX B) conventions.
+   and `flag_type='{TERMINAL_STATE_PRE_CHECK_FLAG_TYPE}'` on the flagged item per the existing \
+   Flag Deduplication and Stage 2 Flag Relay (FIX B) conventions.
 
 If `mcp__fused-memory__get_task` returns an `error` field \
 (e.g. `{{'error': ..., 'error_type': ...}}`), treat verification as inconclusive — \
