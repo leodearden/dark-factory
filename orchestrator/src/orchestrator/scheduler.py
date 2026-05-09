@@ -1247,6 +1247,14 @@ class Scheduler:
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._update_age_anchors(tasks, max_id)
 
+        # Drop _last_dispatch_at entries for tasks now in a terminal status so
+        # a future legitimate re-dispatch (e.g. cancelled -> pending re-architect,
+        # or a freshly-created task reusing the id) starts from a clean slate.
+        # Mirrors the _pending_anchor clearing in _update_age_anchors.
+        for tid_str, status in status_map.items():
+            if status in TERMINAL_STATUSES:
+                self._last_dispatch_at.pop(tid_str, None)
+
         # Build reverse index + compute effective priorities + CPM counts
         # once per tick (O(N+E)).
         reverse_index = self._build_reverse_index(tasks)
