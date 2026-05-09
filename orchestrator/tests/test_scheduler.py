@@ -1241,6 +1241,26 @@ class TestRequeueCooldown:
         assert a2 is not None and a2.task_id == '99'
 
 
+class TestDispatchCooldownConfig:
+    """Validate the dispatch_cooldown_secs config field defaults and constraints."""
+
+    def test_default_dispatch_cooldown_secs(self):
+        """OrchestratorConfig() defaults dispatch_cooldown_secs to 1800.0."""
+        config = OrchestratorConfig()
+        assert config.dispatch_cooldown_secs == 1800.0
+
+    def test_accepts_value_above_floor(self):
+        """OrchestratorConfig(dispatch_cooldown_secs=600.0) is valid (above 300.0 floor)."""
+        config = OrchestratorConfig(dispatch_cooldown_secs=600.0)
+        assert config.dispatch_cooldown_secs == 600.0
+
+    def test_rejects_value_below_floor(self):
+        """OrchestratorConfig(dispatch_cooldown_secs=120.0) raises ValidationError."""
+        import pydantic
+        with pytest.raises(pydantic.ValidationError):
+            OrchestratorConfig(dispatch_cooldown_secs=120.0)
+
+
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
 
