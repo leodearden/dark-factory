@@ -4641,4 +4641,3 @@ class TestStage3PayloadIncludesProjectRoot:
             f'Stage 3 payload for dark_factory must contain Use project_root="..." directive. '
             f'Got payload:\n{payload[:500]}'
         )
-

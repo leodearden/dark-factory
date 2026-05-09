@@ -297,3 +297,34 @@ class TestUpdateEdgeVerifiedFilter:
         assert stats['edges_updated'] == 0, (
             'Legacy update_edge op without verified key must not count toward edges_updated'
         )
+
+    @pytest.mark.asyncio
+    async def test_truthy_non_true_verified_value_does_not_count(self, journal):
+        """Truthy-but-not-True values like 'true' (string) or 1 (int) must NOT count.
+
+        The strict ``is True`` identity check in ``_count_update_edge`` prevents
+        coerced / loosely-typed values from slipping through.  This test pins
+        the string-'true' case explicitly.
+        """
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+
+        await _log_write(
+            journal, causation_id=run_id, operation='update_edge',
+            result_summary={'verified': 'true', 'status': 'updated', 'store': 'graphiti'},
+        )
+
+        reports: dict[str, StageReport | dict] = {
+            'memory_consolidator': _stage_report(
+                StageId.memory_consolidator,
+                now - timedelta(minutes=1),
+                now + timedelta(minutes=1),
+            ),
+        }
+
+        await verify_and_rewrite_stats(run_id, reports, journal)
+
+        stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+        assert stats['edges_updated'] == 0, (
+            "Truthy-but-not-True 'verified' (e.g. string 'true') must not count as verified"
+        )

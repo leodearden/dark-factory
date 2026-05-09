@@ -998,6 +998,26 @@ class TestUpdateEdgeVerification:
         service.graphiti.get_edge_text.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_update_edge_with_empty_string_fact_runs_verification(self, service):
+        """fact='' is not None so get_edge_text must still be called and verified computed.
+
+        Guards against an accidental future change from ``if fact is not None:``
+        to ``if fact:`` which would silently skip verification for empty-string
+        facts and regress the invalid_at-only bypass.
+        """
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': '', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', ''))
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='', project_id='test'
+        )
+
+        service.graphiti.get_edge_text.assert_called_once_with('e-1', group_id='test')
+        assert result['verified'] is True
+
+    @pytest.mark.asyncio
     async def test_update_edge_logs_verified_in_journal(self, service):
         """The verified field must appear in the result_summary logged to the write journal."""
         service.graphiti.update_edge = AsyncMock(
