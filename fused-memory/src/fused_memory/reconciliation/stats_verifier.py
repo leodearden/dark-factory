@@ -86,19 +86,17 @@ def _count_update_edge(op: dict) -> bool:
 def _count_add_memory(op: dict) -> bool:
     """Return True if the add_memory op actually produced a stored memory.
 
-    Mem0 may dedup a write and return an empty ``memory_ids`` list. Graphiti
-    writes are enqueued asynchronously and don't produce IDs inline — we fall
-    back to ``stores_written`` to know whether at least one backend accepted the
-    write. An op that reached neither store is a no-op and must not count.
+    Mem0 may dedup a write and return an empty ``memory_ids`` list. Only ops
+    where ``memory_ids`` is a non-empty list count toward ``memories_added``.
+    Graphiti-only async-enqueued writes (``memory_ids=[]``, ``stores=['graphiti']``)
+    are tracked separately under ``graphiti_writes_queued`` via ``_count_graphiti_queued``.
+    An op that reached neither store with a returned ID is a no-op here.
     """
     if not op.get('success', 1):
         return False
     rs = _parse_result_summary(op.get('result_summary'))
     memory_ids = rs.get('memory_ids')
-    if isinstance(memory_ids, list) and memory_ids:
-        return True
-    stores = rs.get('stores') or rs.get('stores_written')
-    return bool(isinstance(stores, list) and stores)
+    return bool(isinstance(memory_ids, list) and memory_ids)
 
 
 def _stage_window(report: StageReport | dict) -> tuple[datetime | None, datetime | None]:
