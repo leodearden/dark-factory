@@ -997,6 +997,36 @@ class TestUpdateEdgeVerification:
         assert result['verified'] is True
         service.graphiti.get_edge_text.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_update_edge_logs_verified_in_journal(self, service):
+        """The verified field must appear in the result_summary logged to the write journal."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
+        journal_mock = MagicMock()
+        journal_mock.log_write_op = AsyncMock()
+        journal_mock.log_backend_op = AsyncMock()
+        service._write_journal = journal_mock
+
+        # --- matching readback: verified=True ---
+        await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='test')
+
+        call_args = journal_mock.log_write_op.call_args
+        result_summary = call_args.kwargs.get('result_summary', {})
+        assert result_summary.get('verified') is True
+        assert result_summary.get('status') == 'updated'
+
+        # --- mismatched readback: verified=False ---
+        journal_mock.log_write_op.reset_mock()
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'stale'))
+
+        await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='test')
+
+        call_args = journal_mock.log_write_op.call_args
+        result_summary = call_args.kwargs.get('result_summary', {})
+        assert result_summary.get('verified') is False
+
 
 class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
