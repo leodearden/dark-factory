@@ -195,7 +195,7 @@ Review the above data and perform memory consolidation:
 5. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
-"""
+{f'Use project_root="{self.project_root}" for tasks scoped to this project.' if self.project_root else ''}"""
 
     async def _format_assembled_payload(self, watermark: Watermark) -> str:
         """Format a payload from ContextAssembler output — event-driven context."""
