@@ -137,6 +137,86 @@ def _compute_stale_flags(
     return sorted(fid for fid, count in persistence_counts.items() if count >= threshold)
 
 
+async def _track_flag_persistence(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    flag_ids: list[str],
+) -> dict[str, int]:
+    """Track how many Stage 2 cycles each flag has survived.
+
+    For each *flag_id* in *flag_ids*:
+
+    1. Searches Mem0 for prior ``stage2_persistence_marker`` memories keyed on
+       the flag id.  The search hit-count is the number of prior cycles.
+    2. Writes a fresh marker so the count accumulates across cycles.
+    3. Returns ``{flag_id: prior_count + 1}`` where the "+1" accounts for the
+       current cycle.
+
+    On search failure: prior_count defaults to 0 so the cycle count is 1.
+    On add_memory failure: the count is still returned (write is best-effort).
+    Both failures log WARNING.
+
+    Note: markers accumulate monotonically (same pattern as ``stage1_flag_marker``
+    in ``flag_dedup.py``).  FIX C's prompt-driven deletion ensures healthy flags
+    never reach threshold; the monotonic growth is bounded to failure cases.
+    Manual GC is acceptable — see design decision in plan.json.
+    """
+    if not flag_ids:
+        return {}
+
+    counts: dict[str, int] = {}
+    for flag_id in flag_ids:
+        # ── count prior markers ──────────────────────────────────────────────
+        prior_count = 0
+        try:
+            prior_results = await memory_service.search(
+                query=f'stage2_persistence_marker flag_id={flag_id}',
+                project_id=project_id,
+                categories=['observations_and_summaries'],
+                limit=100,
+            )
+            for r in prior_results:
+                meta = dict(r.metadata or {})
+                if (
+                    meta.get('source') == 'stage2_persistence_marker'
+                    and meta.get('flag_id') == flag_id
+                ):
+                    prior_count += 1
+        except Exception:
+            logger.warning(
+                'reconciliation._track_flag_persistence: search failed for flag_id=%s; '
+                'treating prior_count as 0',
+                flag_id,
+                extra={'project_id': project_id, 'flag_id': flag_id},
+            )
+
+        # ── write this-cycle marker ──────────────────────────────────────────
+        try:
+            await memory_service.add_memory(
+                content=f'Stage 2 flag-persistence marker: flag_id={flag_id} run={run_id}',
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata={
+                    'source': 'stage2_persistence_marker',
+                    'flag_id': flag_id,
+                    'run_id': run_id,
+                },
+                causation_id=run_id,
+                _source='stage2_flag_relay',
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation._track_flag_persistence: add_memory failed for flag_id=%s; '
+                'count still returned',
+                flag_id,
+                extra={'project_id': project_id, 'flag_id': flag_id},
+            )
+
+        counts[flag_id] = prior_count + 1
+    return counts
+
+
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
