@@ -455,10 +455,39 @@ class TaskKnowledgeSync(BaseStage):
         run_id: str,
         model: str | None = None,
     ) -> StageReport:
-        """Capture run_id, run briefing-refresh hook, then delegate to BaseStage.run()."""
+        """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
+        apply the same-run Stage 1 human_operator_required dedup post-processor.
+
+        Post-processing: after ``super().run()`` returns, any Stage 2 items whose
+        ``(task_id, flag_type, resolution_status='human_operator_required')`` 3-tuple
+        matches a Stage 1 item flagged ``human_operator_required`` in the same run are
+        dropped from ``report.items_flagged``.  An INFO log
+        ``reconciliation.stage2_suppressed_stage1_dup_flags`` is emitted whenever
+        suppressions fire.  The post-processor is a no-op when ``prior_reports`` is
+        empty or Stage 1's ``items_flagged`` is empty.
+        """
         self._current_run_id = run_id
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
-        return await super().run(events, watermark, prior_reports, run_id, model=model)
+        report = await super().run(events, watermark, prior_reports, run_id, model=model)
+
+        # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
+        if prior_reports and prior_reports[0].items_flagged:
+            kept, suppressed = _suppress_same_run_human_operator_dups(
+                report.items_flagged,
+                prior_reports[0].items_flagged,
+            )
+            if suppressed:
+                logger.info(
+                    'reconciliation.stage2_suppressed_stage1_dup_flags',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': self.project_id,
+                        'suppressed_count': len(suppressed),
+                    },
+                )
+                report.items_flagged = kept
+
+        return report
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
