@@ -6213,7 +6213,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert not any(
                 r.name == target_logger
                 and r.levelno == logging.WARNING
-                and 'cache build' in r.getMessage()
+                and 'during cache build' in r.getMessage()
                 and 'task_id=99' in r.getMessage()
                 for r in caplog.records
             )
