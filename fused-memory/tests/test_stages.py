@@ -39,6 +39,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
+    _verify_set_task_status_post_action,
 )
 from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
@@ -5263,3 +5264,148 @@ class TestTaskKnowledgeSyncStage2Guards:
             rec = guard_logs[0]
             assert getattr(rec, 'task_id', None) == '42'
             assert getattr(rec, 'reason', None) == 'not_applicable'
+
+    class TestSetTaskStatusPostActionVerification:
+        """Unit + integration tests for _verify_set_task_status_post_action helper."""
+
+        def _make_op(
+            self,
+            *,
+            op_id: str = 'op-sts-1',
+            agent_id: str = 'recon-stage-task_knowledge_sync',
+            operation: str = 'set_task_status',
+            params: dict | None = None,
+        ) -> dict:
+            """Return a minimal write_journal op dict for set_task_status testing."""
+            return {
+                'id': op_id,
+                'agent_id': agent_id,
+                'operation': operation,
+                'params': json.dumps(params or {'task_id': '7', 'status': 'done'}),
+                'layer': 'write_op',
+                'causation_id': 'run-test',
+                'created_at': '2026-01-01T00:00:00',
+            }
+
+        @pytest.mark.asyncio
+        async def test_unit_live_mismatch_returns_violation(self):
+            """set_task_status op targeting done but live is pending -> one mismatch."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'pending'}
+
+            ops = [self._make_op(op_id='op-sts-mismatch', params={'task_id': '7', 'status': 'done'})]
+            mismatches = await _verify_set_task_status_post_action(
+                ops, taskmaster, '/project'
+            )
+
+            assert len(mismatches) == 1
+            m = mismatches[0]
+            assert m['op_id'] == 'op-sts-mismatch'
+            assert m['task_id'] == '7'
+            assert m['target_status'] == 'done'
+            assert m['live_status'] == 'pending'
+
+        @pytest.mark.asyncio
+        async def test_unit_live_matches_target_no_mismatch(self):
+            """set_task_status op where live status equals target -> no mismatch."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'done'}
+
+            ops = [self._make_op(params={'task_id': '7', 'status': 'done'})]
+            mismatches = await _verify_set_task_status_post_action(
+                ops, taskmaster, '/project'
+            )
+
+            assert mismatches == []
+
+        @pytest.fixture
+        def mock_deps_integration(self):
+            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+            write_journal_mock = MagicMock()
+            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+            journal_mock = MagicMock()
+            journal_mock.write_journal = write_journal_mock
+            return {
+                'memory_service': AsyncMock(),
+                'taskmaster': AsyncMock(),
+                'journal': journal_mock,
+                'config': config,
+            }
+
+        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
+            report = {'flagged_items': flagged_items, 'summary': 'ok'}
+            if stats:
+                report['stats'] = stats
+            return MagicMock(
+                success=True,
+                report=report,
+                llm_calls=1,
+                tokens_used=0,
+                cost_usd=0.0,
+                model='m',
+            )
+
+        @pytest.mark.asyncio
+        async def test_run_records_set_task_status_mismatch(self, mock_deps_integration, caplog):
+            """run() decrements tasks_modified and adds set_task_status_post_action_mismatches."""
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_integration)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            # Synthetic op: stage-2 agent called set_task_status(done) for task 7
+            # but live status is pending (the interceptor rejected it silently)
+            sts_op = {
+                'id': 'op-sts-integration-1',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'operation': 'set_task_status',
+                'params': json.dumps({'task_id': '7', 'status': 'done'}),
+                'layer': 'write_op',
+                'causation_id': 'test-run-1137-b',
+                'created_at': '2026-01-01T00:00:00',
+            }
+            mock_deps_integration['journal'].write_journal.get_ops_by_causation.return_value = [sts_op]
+
+            # live status is pending (transition did not stick)
+            mock_deps_integration['taskmaster'].get_task.return_value = {'status': 'pending'}
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [], stats={'tasks_modified': 5}
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[],
+                    run_id='test-run-1137-b',
+                )
+
+            # Guard 3: mismatch counter incremented
+            assert report.stats.get('set_task_status_post_action_mismatches') == 1
+
+            # Guard 3: tasks_modified decremented from 5 to 4
+            assert report.stats.get('tasks_modified') == 4
+
+            # Guard 3: WARNING log
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            guard_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'set_task_status_post_action_mismatch' in r.getMessage()
+            ]
+            assert len(guard_logs) == 1, (
+                f'expected one set_task_status_post_action_mismatch WARNING log, got {len(guard_logs)}'
+            )
+            rec = guard_logs[0]
+            assert getattr(rec, 'task_id', None) == '7'
+            assert getattr(rec, 'target_status', None) == 'done'
+            assert getattr(rec, 'live_status', None) == 'pending'
