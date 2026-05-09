@@ -1282,8 +1282,22 @@ class Scheduler:
             # Dispatch cooldown gate: if the task was recently dispatched and
             # carries a reconciliation/steward signal, suppress re-dispatch
             # until the settle window elapses.  Both gates must pass.
-            cooldown_active, _signal = self._dispatch_cooldown_active(t, tid_str)
+            cooldown_active, signal_label = self._dispatch_cooldown_active(t, tid_str)
             if cooldown_active:
+                remaining_secs = (
+                    self.config.dispatch_cooldown_secs
+                    - (time.monotonic() - self._last_dispatch_at.get(tid_str, 0.0))
+                )
+                metadata = t.get('metadata') or {}
+                recon_reset_value = metadata.get('recon_reset_count', 0)
+                logger.info(
+                    'Task %s dispatch suppressed by cooldown: signal=%s,'
+                    ' recon_reset_count=%s, remaining=%.1fs',
+                    tid_str,
+                    signal_label,
+                    recon_reset_value,
+                    remaining_secs,
+                )
                 continue
             if not self._deps_satisfied(t, status_map):
                 continue
