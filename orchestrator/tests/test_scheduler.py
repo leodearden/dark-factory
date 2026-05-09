@@ -1538,6 +1538,52 @@ class TestDispatchCooldownGate:
             '_last_dispatch_at must NOT be cleared for in-progress tasks'
         )
 
+    @pytest.mark.asyncio
+    async def test_dispatch_cooldown_skip_logged(self, monkeypatch, caplog):
+        """When the dispatch cooldown gate suppresses a re-dispatch, an INFO
+        log record must be emitted containing: 'cooldown', the task id, the
+        signal label, and a remaining-time number."""
+        import logging
+
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First acquire — gate not yet armed
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+        scheduler.release('99')
+
+        # Suppressed second acquire — gate active
+        with caplog.at_level(logging.INFO, logger='orchestrator.scheduler'):
+            a2 = await scheduler.acquire_next()
+
+        assert a2 is None, 'Gate must have suppressed the second dispatch'
+
+        # Verify the log record
+        cooldown_records = [
+            r for r in caplog.records
+            if 'cooldown' in r.getMessage().lower()
+            or 'suppressed' in r.getMessage().lower()
+        ]
+        assert cooldown_records, 'Expected at least one log record mentioning cooldown'
+
+        log_text = cooldown_records[0].getMessage()
+        assert '99' in log_text, f'Task id "99" missing from log: {log_text!r}'
+        assert 'recon_reset_count' in log_text, (
+            f'Signal label "recon_reset_count" missing from log: {log_text!r}'
+        )
+        # remaining time should be a number — check any digit appears in the message
+        import re
+        assert re.search(r'\d+', log_text), (
+            f'Remaining time number missing from log: {log_text!r}'
+        )
+
 
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
