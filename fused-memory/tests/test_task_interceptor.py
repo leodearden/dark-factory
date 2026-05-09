@@ -2215,6 +2215,58 @@ async def test_done_provenance_found_on_main_runs_ancestor_check(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_found_on_main_with_on_main_commit_passes(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='found_on_main' with commit+note where commit is on main is accepted."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': sha,
+            'note': 'sibling task 99 landed this on main',
+        },
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    dp = persisted['done_provenance']
+    assert dp['kind'] == 'found_on_main'
+    assert dp['commit'] == sha
+    assert dp['note'] == 'sibling task 99 landed this on main'
+    # No commit_input when the full SHA was supplied
+    assert 'commit_input' not in dp
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_found_on_main_short_sha_resolved(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='found_on_main' with a short-SHA prefix resolves to the full 40-char SHA."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': sha[:7],
+            'note': 'sibling task 99 landed this on main',
+        },
+    )
+
+    assert 'error' not in result
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    dp = persisted['done_provenance']
+    assert dp['commit'] == sha           # resolved to full SHA
+    assert dp['commit_input'] == sha[:7]  # original short ref preserved
+
+
+@pytest.mark.asyncio
 async def test_update_task_rejects_metadata_done_provenance(
     taskmaster, reconciler, event_buffer
 ):
