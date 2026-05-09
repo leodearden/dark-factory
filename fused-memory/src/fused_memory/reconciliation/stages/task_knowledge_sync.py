@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
+from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -42,6 +43,17 @@ from fused_memory.reconciliation.task_filter import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_status(task_data: dict) -> str:
+    """Extract status from a Taskmaster get_task response dict."""
+    if 'status' in task_data:
+        return task_data['status']
+    data = task_data.get('data', {})
+    if isinstance(data, dict):
+        return data.get('status', 'unknown')
+    return 'unknown'
+
 
 # Projects allowed to use the briefing-refresh hook.  This is a reify-specific
 # feature; gating on project_id prevents accidental triggering by other projects
@@ -153,6 +165,314 @@ def _suppress_same_run_human_operator_dups(
         kept.append(item)
 
     return kept, suppressed
+
+
+# ── Stage 2 post-flight guard helpers (task 1137) ────────────────────────────
+
+
+async def _classify_terminal_state_violations(
+    ops: list[dict],
+    taskmaster,
+    project_root: str,
+    agent_id: str,
+    status_cache: dict[str, str] | None = None,
+) -> list[dict]:
+    """Classify write_journal ops that mutated tasks already in a terminal state.
+
+    For every ``update_task`` op authored by the Stage 2 agent, fetches the
+    *live* task status from Taskmaster and returns a violation record when the
+    status is in ``TERMINAL_STATUSES`` (done, cancelled).
+
+    The "skip the write entirely" semantics described in the task specification
+    cannot be enforced post-hoc (the LLM's write already landed), so this
+    helper *reclassifies* the op instead.  Callers are expected to:
+
+    - increment ``stats['not_applicable_count']`` by ``len(violations)``
+    - decrement ``stats['tasks_modified']`` by ``len(violations)`` (clamped at 0)
+
+    ops from ``agent_id='task-interceptor'`` are intentionally excluded; the
+    interceptor performs legitimate ``update_task(metadata=...)`` calls during
+    set_task_status (e.g. ``done_provenance`` audit-field merge).
+
+    Args:
+        ops: Write-journal op dicts returned by
+            ``WriteJournal.get_ops_by_causation(run_id)`` (layer=='write_op').
+        taskmaster: Taskmaster backend (must have an async ``get_task`` method).
+        project_root: Absolute path to the Taskmaster project directory.
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'live_status', 'reason': 'not_applicable'}``
+        dicts, one per qualifying violation.  Empty list when no violations are
+        found.
+    """
+    violations: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != agent_id:
+            continue
+        if op.get('operation') != 'update_task':
+            continue
+
+        # Parse params JSON to extract task_id
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._classify_terminal_state_violations: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+
+        task_id = str(params.get('task_id', '')).strip()
+        if not task_id:
+            continue
+
+        if status_cache is not None:
+            live_status = status_cache.get(task_id, 'unknown')
+        else:
+            # Fallback: fetch live status individually (used in unit tests)
+            try:
+                task_data = await taskmaster.get_task(task_id, project_root)
+            except Exception:
+                logger.warning(
+                    'reconciliation._classify_terminal_state_violations: '
+                    'get_task failed for task_id=%s; skipping op',
+                    task_id,
+                )
+                continue
+            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+
+        if live_status in TERMINAL_STATUSES:
+            violations.append({
+                'op_id': op.get('id'),
+                'task_id': task_id,
+                'live_status': live_status,
+                'reason': 'not_applicable',
+            })
+
+    return violations
+
+
+async def _verify_set_task_status_post_action(
+    ops: list[dict],
+    taskmaster,
+    project_root: str,
+    agent_id: str,
+    status_cache: dict[str, str] | None = None,
+) -> list[dict]:
+    """Verify that each Stage 2 set_task_status op actually took effect.
+
+    For every ``set_task_status`` op authored by the Stage 2 agent, fetches the
+    *live* task status from Taskmaster and returns a mismatch record when the live
+    status differs from the op's target ``status`` param.
+
+    This catches cases where the task_interceptor's terminal-exit gate (or other
+    guards) silently rejected the status transition but the LLM still inflated its
+    self-reported ``tasks_modified`` count.
+
+    Args:
+        ops: Write-journal op dicts (``layer=='write_op'``).
+        taskmaster: Taskmaster backend.
+        project_root: Absolute path to the Taskmaster project directory.
+        agent_id: The agent_id string to filter ops on (derived from stage_id).
+        status_cache: Pre-fetched ``{task_id: live_status}`` dict built by
+            ``_apply_post_flight_guards``.  When provided, skips individual
+            ``taskmaster.get_task`` calls.
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'target_status', 'live_status'}`` dicts.
+    """
+    mismatches: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != agent_id:
+            continue
+        if op.get('operation') != 'set_task_status':
+            continue
+
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._verify_set_task_status_post_action: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+
+        task_id = str(params.get('task_id', '')).strip()
+        target_status = str(params.get('status', '')).strip()
+        if not task_id or not target_status:
+            continue
+
+        if status_cache is not None:
+            live_status = status_cache.get(task_id, 'unknown')
+        else:
+            try:
+                task_data = await taskmaster.get_task(task_id, project_root)
+            except Exception:
+                logger.warning(
+                    'reconciliation._verify_set_task_status_post_action: '
+                    'get_task failed for task_id=%s; skipping op',
+                    task_id,
+                )
+                continue
+            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+
+        if live_status != target_status:
+            mismatches.append({
+                'op_id': op.get('id'),
+                'task_id': task_id,
+                'target_status': target_status,
+                'live_status': live_status,
+            })
+
+    return mismatches
+
+
+# Metadata keys that mark an add_memory op for freshness checking.
+# The LLM may emit either ``snapshot_status`` (canonical) or ``observed_status``
+# (natural-language alias).  Both keys carry the same semantics: the task status
+# that was observed *before* the LLM started writing this memory.  The guard
+# fetches the *live* status and flags a mismatch if they differ.
+_STAGE2_STALL_SNAPSHOT_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_status')
+
+
+async def _check_stall_guard_freshness(
+    ops: list[dict],
+    taskmaster,
+    project_root: str,
+    agent_id: str,
+    status_cache: dict[str, str] | None = None,
+) -> list[dict]:
+    """Check that add_memory ops written against a snapshot status are still fresh.
+
+    For every ``add_memory`` op authored by the Stage 2 agent whose
+    ``params.metadata`` contains a ``snapshot_status`` (or ``observed_status``)
+    key AND a ``task_id``, this helper fetches the *live* task status and flags
+    a mismatch.
+
+    A mismatch indicates that the memory was written against a stale snapshot —
+    the LLM observed the task in one state, wrote a memory anchored to that
+    state, but the task has since transitioned.
+
+    Args:
+        ops: Write-journal op dicts (``layer=='write_op'``).
+        taskmaster: Taskmaster backend.
+        project_root: Absolute path to the Taskmaster project directory.
+        agent_id: The agent_id string to filter ops on (derived from stage_id).
+        status_cache: Pre-fetched ``{task_id: live_status}`` dict built by
+            ``_apply_post_flight_guards``.  When provided, skips individual
+            ``taskmaster.get_task`` calls.
+
+    Returns:
+        List of ``{'op_id', 'task_id', 'snapshot_status', 'live_status'}`` dicts.
+    """
+    violations: list[dict] = []
+    for op in ops:
+        if op.get('agent_id') != agent_id:
+            continue
+        if op.get('operation') != 'add_memory':
+            continue
+
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._check_stall_guard_freshness: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
+            continue
+
+        metadata = params.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            continue
+
+        task_id = str(metadata.get('task_id', '')).strip()
+        if not task_id:
+            continue
+
+        # Resolve snapshot_status or its alias
+        snapshot_status: str | None = None
+        for key in _STAGE2_STALL_SNAPSHOT_KEYS:
+            if key in metadata:
+                snapshot_status = str(metadata[key])
+                break
+        if snapshot_status is None:
+            continue  # Op not opted into freshness checking
+
+        if status_cache is not None:
+            live_status = status_cache.get(task_id, 'unknown')
+        else:
+            try:
+                task_data = await taskmaster.get_task(task_id, project_root)
+            except Exception:
+                logger.warning(
+                    'reconciliation._check_stall_guard_freshness: '
+                    'get_task failed for task_id=%s; skipping op',
+                    task_id,
+                )
+                continue
+            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+
+        if live_status != snapshot_status:
+            violations.append({
+                'op_id': op.get('id'),
+                'task_id': task_id,
+                'snapshot_status': snapshot_status,
+                'live_status': live_status,
+            })
+
+    return violations
+
+
+def _check_flag_counter_completeness(
+    report_stats: dict,
+    prior_reports: list[StageReport],
+) -> dict:
+    """Compare ``report.stats['stage1_flags_processed']`` against Stage 1's truth.
+
+    Stage 1 (memory_consolidator) emits ``StageReport.items_flagged`` — the
+    definitive list of flags it raised for Stage 2 to process.  This guard
+    compares that ground-truth count against whatever Stage 2 self-reported in
+    ``stats['stage1_flags_processed']``.
+
+    Pure stats-arithmetic — no taskmaster calls, no I/O.
+
+    Args:
+        report_stats: The ``StageReport.stats`` dict from Stage 2's run.
+        prior_reports: Reports from earlier stages in this cycle.  When
+            non-empty, ``prior_reports[0]`` must be the Stage 1
+            (``memory_consolidator``) report — guarded by a stage-identity
+            check to avoid a silent wrong-baseline comparison if the pipeline
+            is ever reordered.  When empty, no baseline is available and the
+            function returns ``mismatch=False`` unconditionally.
+
+    Returns:
+        ``{'expected': int, 'reported': int, 'mismatch': bool}``
+        ``mismatch`` is ``True`` only when a Stage 1 baseline exists and
+        ``reported != expected``.
+    """
+    reported = report_stats.get('stage1_flags_processed', 0)
+    if not prior_reports:
+        return {'expected': 0, 'reported': reported, 'mismatch': False}
+
+    # Mirror the stage-identity guard used by the same-run dedup block above
+    # (lines ~757-761) — only treat prior_reports[0] as a Stage 1 baseline
+    # when it actually is Stage 1.  A wrong stage would produce a meaningless
+    # expected count and silently clamp stats to garbage.
+    if prior_reports[0].stage != StageId.memory_consolidator:
+        return {'expected': 0, 'reported': reported, 'mismatch': False}
+
+    expected = len(prior_reports[0].items_flagged)
+    return {
+        'expected': expected,
+        'reported': reported,
+        'mismatch': expected != reported,
+    }
 
 
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
@@ -496,7 +816,187 @@ class TaskKnowledgeSync(BaseStage):
                 # length against the LLM's own flagged_count (suggestion 2).
                 report.stats['stage2_stage1_dups_suppressed'] = len(suppressed)
 
+        # --- post-flight guards (task 1137) ---
+        await self._apply_post_flight_guards(report, prior_reports, run_id)
+
         return report
+
+    async def _apply_post_flight_guards(
+        self,
+        report: StageReport,
+        prior_reports: list[StageReport],
+        run_id: str,
+    ) -> None:
+        """Apply four orthogonal post-flight integrity guards to *report*.
+
+        Each guard reads the write-journal op stream and/or calls
+        ``taskmaster.get_task()`` to verify what the Stage 2 LLM actually did,
+        then mutates ``report.stats`` in place to reflect the true picture.
+
+        Guards run whenever ``super().run()`` returns (success or failure
+        report), so partial-run artefacts are still classified correctly.
+        If ``super().run()`` raises rather than returning, guards do not fire.
+
+        Degrades gracefully when ``self.journal`` or
+        ``self.journal.write_journal`` is ``None`` — Guards 1-3 skip (no ops
+        available), Guard 4 still fires (pure stats arithmetic).
+
+        Args:
+            report: The ``StageReport`` returned by ``super().run()``.
+                Mutated in place.
+            prior_reports: Stage reports for all earlier stages in this cycle.
+                Guard 4 reads ``prior_reports[0].items_flagged``.
+            run_id: Current reconciliation run identifier.
+        """
+        # Derive agent_id from stage_id so it stays in sync with base.py:125.
+        _stage_agent_id = f'recon-stage-{self.stage_id.value}'
+
+        # Fetch write_journal ops once; share across Guards 1-3.
+        ops: list[dict] = []
+        if self.journal is not None and self.journal.write_journal is not None:
+            try:
+                ops = await self.journal.write_journal.get_ops_by_causation(run_id)
+            except Exception:
+                logger.warning(
+                    'reconciliation._apply_post_flight_guards: '
+                    'get_ops_by_causation failed for run_id=%s; '
+                    'skipping Guards 1-3',
+                    run_id,
+                )
+                ops = []
+
+        # Pre-fetch all unique task_ids referenced by stage-2 ops concurrently,
+        # building a shared status_cache so Guards 1-3 avoid N+1 get_task calls.
+        status_cache: dict[str, str] | None = None
+        if ops and self.taskmaster and self.project_root:
+            task_ids: set[str] = set()
+            for op in ops:
+                if op.get('agent_id') != _stage_agent_id:
+                    continue
+                params_raw = op.get('params') or '{}'
+                try:
+                    params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                operation = op.get('operation')
+                if operation in ('update_task', 'set_task_status'):
+                    tid = str(params.get('task_id', '')).strip()
+                    if tid:
+                        task_ids.add(tid)
+                elif operation == 'add_memory':
+                    meta = params.get('metadata') or {}
+                    if isinstance(meta, dict):
+                        tid = str(meta.get('task_id', '')).strip()
+                        if tid:
+                            task_ids.add(tid)
+
+            if task_ids:
+                fetch_results = await asyncio.gather(
+                    *(self.taskmaster.get_task(tid, self.project_root) for tid in task_ids),
+                    return_exceptions=True,
+                )
+                status_cache = {}
+                for tid, result in zip(task_ids, fetch_results, strict=True):
+                    if isinstance(result, BaseException):
+                        logger.warning(
+                            'reconciliation._apply_post_flight_guards: '
+                            'get_task failed for task_id=%s during cache build; '
+                            'guards will report unknown for this task',
+                            tid,
+                        )
+                        status_cache[tid] = 'unknown'
+                    else:
+                        status_cache[tid] = (
+                            _extract_status(result) if isinstance(result, dict) else 'unknown'
+                        )
+
+        # Guard 1 — terminal-state pre-check
+        if self.taskmaster and self.project_root:
+            terminal_violations = await _classify_terminal_state_violations(
+                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+            )
+            if terminal_violations:
+                report.stats['not_applicable_count'] = (
+                    report.stats.get('not_applicable_count', 0) + len(terminal_violations)
+                )
+                # Decrement inflated success counters (clamped at 0)
+                report.stats['tasks_modified'] = max(
+                    0,
+                    report.stats.get('tasks_modified', 0) - len(terminal_violations),
+                )
+                for v in terminal_violations:
+                    logger.info(
+                        'reconciliation.skipped_done_task',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': v['task_id'],
+                            'reason': v['reason'],
+                        },
+                    )
+
+        # Guard 2 — stall-guard freshness gate
+        if self.taskmaster and self.project_root:
+            freshness_violations = await _check_stall_guard_freshness(
+                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+            )
+            if freshness_violations:
+                report.stats['stall_guard_freshness_violations'] = (
+                    report.stats.get('stall_guard_freshness_violations', 0)
+                    + len(freshness_violations)
+                )
+                for v in freshness_violations:
+                    logger.warning(
+                        'reconciliation.stall_guard_freshness_violation',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': v['task_id'],
+                            'snapshot_status': v['snapshot_status'],
+                            'live_status': v['live_status'],
+                        },
+                    )
+
+        # Guard 3 — post-action set_task_status verification
+        if self.taskmaster and self.project_root:
+            sts_mismatches = await _verify_set_task_status_post_action(
+                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+            )
+            if sts_mismatches:
+                report.stats['set_task_status_post_action_mismatches'] = (
+                    report.stats.get('set_task_status_post_action_mismatches', 0)
+                    + len(sts_mismatches)
+                )
+                report.stats['tasks_modified'] = max(
+                    0,
+                    report.stats.get('tasks_modified', 0) - len(sts_mismatches),
+                )
+                for m in sts_mismatches:
+                    logger.warning(
+                        'reconciliation.set_task_status_post_action_mismatch',
+                        extra={
+                            'run_id': run_id,
+                            'project_id': self.project_id,
+                            'task_id': m['task_id'],
+                            'target_status': m['target_status'],
+                            'live_status': m['live_status'],
+                        },
+                    )
+
+        # Guard 4 — flag-counter completeness (pure stats arithmetic, no I/O)
+        flag_check = _check_flag_counter_completeness(report.stats, prior_reports)
+        if flag_check['mismatch']:
+            logger.warning(
+                'reconciliation.stage1_flags_processed_mismatch',
+                extra={
+                    'run_id': run_id,
+                    'project_id': self.project_id,
+                    'expected': flag_check['expected'],
+                    'reported': flag_check['reported'],
+                },
+            )
+            # Clamp to truth so downstream verifiers see the real picture.
+            report.stats['stage1_flags_processed'] = flag_check['expected']
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
