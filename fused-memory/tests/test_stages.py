@@ -5705,3 +5705,256 @@ class TestTaskKnowledgeSyncStage2Guards:
             rec = guard_logs[0]
             assert getattr(rec, 'expected', None) == 5
             assert getattr(rec, 'reported', None) == 3
+
+    class TestComposition:
+        """All four guards fire in a single stage.run() invocation."""
+
+        @pytest.fixture
+        def mock_deps_composition(self):
+            config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+            write_journal_mock = MagicMock()
+            write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
+            journal_mock = MagicMock()
+            journal_mock.write_journal = write_journal_mock
+            return {
+                'memory_service': AsyncMock(),
+                'taskmaster': AsyncMock(),
+                'journal': journal_mock,
+                'config': config,
+            }
+
+        def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
+            report = {'flagged_items': flagged_items, 'summary': 'ok'}
+            if stats:
+                report['stats'] = stats
+            return MagicMock(
+                success=True,
+                report=report,
+                llm_calls=1,
+                tokens_used=0,
+                cost_usd=0.0,
+                model='m',
+            )
+
+        @pytest.mark.asyncio
+        async def test_all_four_guards_fire_together(self, mock_deps_composition, caplog):
+            """All four guards fire simultaneously in a single stage.run() call.
+
+            Op stream contains:
+              (a) terminal-state update_task violation (task 42 -> done)
+              (b) set_task_status post-action mismatch (task 7: target=done, live=pending)
+              (c) stall-guard freshness violation (task 11: snapshot=in-progress, live=done)
+            Stats seed: tasks_modified=5, memories_written=3, stage1_flags_processed=1
+            Stage 1 prior report: 4 items_flagged -> Guard 4 expects 4, reported 1 -> mismatch.
+            """
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            # Three ops that each trip a different guard
+            ops = [
+                {  # Guard 1: terminal-state update_task for task 42
+                    'id': 'op-term-42',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'update_task',
+                    'params': json.dumps({'task_id': '42'}),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-compose-1',
+                    'created_at': '2026-01-01T00:00:00',
+                },
+                {  # Guard 3: set_task_status target=done but live=pending for task 7
+                    'id': 'op-sts-7',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'set_task_status',
+                    'params': json.dumps({'task_id': '7', 'status': 'done'}),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-compose-1',
+                    'created_at': '2026-01-01T00:00:01',
+                },
+                {  # Guard 2: stall-guard freshness: snapshot=in-progress but live=done for task 11
+                    'id': 'op-mem-11',
+                    'agent_id': 'recon-stage-task_knowledge_sync',
+                    'operation': 'add_memory',
+                    'params': json.dumps({
+                        'content': 'task 11 is stalled',
+                        'metadata': {'task_id': '11', 'snapshot_status': 'in-progress'},
+                    }),
+                    'layer': 'write_op',
+                    'causation_id': 'test-run-compose-1',
+                    'created_at': '2026-01-01T00:00:02',
+                },
+            ]
+            mock_deps_composition['journal'].write_journal.get_ops_by_causation.return_value = ops
+
+            # taskmaster.get_task returns different live statuses per task_id
+            async def get_task_side_effect(task_id, project_root):
+                return {
+                    '42': {'status': 'done'},    # triggers Guard 1 (terminal)
+                    '7': {'status': 'pending'},  # triggers Guard 3 (sts mismatch)
+                    '11': {'status': 'done'},    # triggers Guard 2 (freshness)
+                }.get(task_id, {'status': 'pending'})
+
+            mock_deps_composition['taskmaster'].get_task.side_effect = get_task_side_effect
+
+            # Stage 1 prior report with 4 items_flagged (Guard 4 expects 4, reports 1)
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[{'id': str(i)} for i in range(4)],
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [],
+                        stats={
+                            'tasks_modified': 5,
+                            'memories_written': 3,
+                            'stage1_flags_processed': 1,
+                        },
+                    )),
+                ),
+                caplog.at_level(
+                    logging.INFO,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-compose-1',
+                )
+
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+            # Guard 1: not_applicable_count=1, tasks_modified decremented from 5 to 4
+            assert report.stats.get('not_applicable_count') == 1
+
+            # Guard 3: set_task_status_post_action_mismatches=1, tasks_modified further decremented to 3
+            assert report.stats.get('set_task_status_post_action_mismatches') == 1
+
+            # Guard 1 + Guard 3 combined: tasks_modified = 5 - 1 - 1 = 3
+            assert report.stats.get('tasks_modified') == 3
+
+            # Guard 2: stall_guard_freshness_violations=1
+            assert report.stats.get('stall_guard_freshness_violations') == 1
+
+            # Guard 4: stage1_flags_processed clamped to 4 (truth from prior_reports)
+            assert report.stats.get('stage1_flags_processed') == 4
+
+            # Exactly four structured log records (one per guard):
+            # 1 INFO skipped_done_task
+            info_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.INFO
+                and 'skipped_done_task' in r.getMessage()
+            ]
+            assert len(info_logs) == 1, f'expected 1 skipped_done_task INFO, got {len(info_logs)}'
+
+            # 1 WARNING set_task_status_post_action_mismatch
+            sts_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'set_task_status_post_action_mismatch' in r.getMessage()
+            ]
+            assert len(sts_logs) == 1, (
+                f'expected 1 set_task_status_post_action_mismatch WARNING, got {len(sts_logs)}'
+            )
+
+            # 1 WARNING stall_guard_freshness_violation
+            freshness_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stall_guard_freshness_violation' in r.getMessage()
+            ]
+            assert len(freshness_logs) == 1, (
+                f'expected 1 stall_guard_freshness_violation WARNING, got {len(freshness_logs)}'
+            )
+
+            # 1 WARNING stage1_flags_processed_mismatch
+            flag_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stage1_flags_processed_mismatch' in r.getMessage()
+            ]
+            assert len(flag_logs) == 1, (
+                f'expected 1 stage1_flags_processed_mismatch WARNING, got {len(flag_logs)}'
+            )
+
+        @pytest.mark.asyncio
+        async def test_null_write_journal_degrades_gracefully(self, mock_deps_composition, caplog):
+            """When write_journal is None, Guards 1-3 skip gracefully; Guard 4 still fires.
+
+            No exception should be raised. Stats keys for Guards 1-3 should be absent.
+            Guard 4 still emits its warning because it is pure stats arithmetic.
+            """
+            # Override write_journal to None to simulate a stand without a journal
+            mock_deps_composition['journal'].write_journal = None
+
+            stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
+            stage.project_id = 'dark_factory'
+            stage.project_root = '/project'
+
+            _now = datetime.now(tz=UTC)
+            stage1_prior = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=_now,
+                completed_at=_now,
+                items_flagged=[{'id': str(i)} for i in range(4)],
+            )
+
+            with (
+                patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+                patch(
+                    'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                    new=AsyncMock(return_value=self._make_cli_result(
+                        [],
+                        stats={
+                            'tasks_modified': 5,
+                            'stage1_flags_processed': 1,
+                        },
+                    )),
+                ),
+                caplog.at_level(
+                    logging.WARNING,
+                    logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='dark_factory'),
+                    prior_reports=[stage1_prior],
+                    run_id='test-run-compose-null-journal',
+                )
+
+            target_logger = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+            # Guards 1-3 should NOT have fired (no write_journal ops available)
+            assert 'not_applicable_count' not in report.stats
+            assert 'set_task_status_post_action_mismatches' not in report.stats
+            assert 'stall_guard_freshness_violations' not in report.stats
+            # tasks_modified unchanged (no guard decrements applied)
+            assert report.stats.get('tasks_modified') == 5
+
+            # Guard 4 must still fire (pure stats arithmetic, no write_journal dependency)
+            assert report.stats.get('stage1_flags_processed') == 4  # clamped to truth
+
+            flag_logs = [
+                r for r in caplog.records
+                if r.name == target_logger
+                and r.levelno == logging.WARNING
+                and 'stage1_flags_processed_mismatch' in r.getMessage()
+            ]
+            assert len(flag_logs) == 1, (
+                f'expected 1 stage1_flags_processed_mismatch WARNING even with null journal, '
+                f'got {len(flag_logs)}'
+            )
