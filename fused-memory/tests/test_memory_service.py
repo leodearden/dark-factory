@@ -916,6 +916,25 @@ class TestUpdateEdge:
         assert result['refreshed_nodes'] == ['n-src', 'n-tgt']
 
 
+class TestUpdateEdgeVerification:
+    """Tests for the post-write persistence verification in update_edge (Guard 2)."""
+
+    @pytest.mark.asyncio
+    async def test_update_edge_returns_verified_true_when_readback_matches(self, service):
+        """When get_edge_text returns the same fact text, verified must be True."""
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        service.graphiti.get_edge_text = AsyncMock(return_value=('Edge', 'new fact'))
+
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new fact', project_id='test'
+        )
+
+        assert result['verified'] is True
+        service.graphiti.get_edge_text.assert_called_once_with('e-1', group_id='test')
+
+
 class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
     async def test_search_then_delete_graphiti_roundtrip(self, service):
