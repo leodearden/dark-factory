@@ -376,11 +376,15 @@ class TaskKnowledgeSync(BaseStage):
         # _query_stage2_flags is best-effort: search failures yield [] internally.
         active_flags = await _query_stage2_flags(self.memory, self.project_id)
 
+        # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
+        # the active-query path ONLY.  Stage 1's structured-output flags are
+        # intentionally emitted by the LLM and must not be suppressed here.
+        surviving = [f for f in active_flags if not _should_skip_known_bug_1139_flag(f)]
+
         # Build the combined flags list: Stage 1 structured-output first, then
-        # Mem0 active-query results.  The Stage 1 path is left untouched — the
-        # scope filter below only applies to the Mem0-active-query path.
+        # surviving Mem0 active-query results.
         combined_flags: list[dict] = list(stage1_report.items_flagged if stage1_report else [])
-        for f in active_flags:
+        for f in surviving:
             combined_flags.append({
                 '_source': 'mem0_active_query',
                 'flag_id': f['id'],
