@@ -99,6 +99,27 @@ def _count_add_memory(op: dict) -> bool:
     return bool(isinstance(memory_ids, list) and memory_ids)
 
 
+def _count_graphiti_queued(op: dict) -> bool:
+    """Return True if the add_memory op was a graphiti-only async enqueue.
+
+    Graphiti writes are enqueued asynchronously and return no ``memory_ids``
+    inline. An op counts as a graphiti-only enqueue iff it succeeded,
+    ``memory_ids`` is empty (so it was not counted toward ``memories_added``),
+    and ``stores``/``stores_written`` contains ``'graphiti'``. These are
+    tallied separately under ``graphiti_writes_queued`` rather than
+    ``memories_added`` to avoid inflating the memories count.
+    """
+    if not op.get('success', 1):
+        return False
+    rs = _parse_result_summary(op.get('result_summary'))
+    memory_ids = rs.get('memory_ids')
+    if isinstance(memory_ids, list) and memory_ids:
+        # Non-empty IDs: this op is a memories_added, not a graphiti enqueue.
+        return False
+    stores = rs.get('stores') or rs.get('stores_written')
+    return bool(isinstance(stores, list) and 'graphiti' in stores)
+
+
 def _stage_window(report: StageReport | dict) -> tuple[datetime | None, datetime | None]:
     if isinstance(report, StageReport):
         return report.started_at, report.completed_at
