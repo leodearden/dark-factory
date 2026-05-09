@@ -4689,3 +4689,50 @@ class TestStage1PromptForbidsAddEpisodeForTemporalFacts:
             "The ## Snapshot Discipline section must explicitly mention 'task status' "
             "(or 'task-status') to confirm Guard 1 is generalised beyond task-counts"
         )
+
+
+class TestStage1PromptGuard3IsoDateAndCycleSummary:
+    """Pin Guard 3 contracts: ISO-date encoding in fact text + valid_at limitation
+    acknowledgement in cycle summary (step-5).
+    """
+
+    def test_prompt_instructs_encode_date_in_fact_text(self):
+        """The update_edge Temporal Limitation section must instruct the agent to
+        encode the effective date in the fact text itself when writing temporal facts.
+        Expected tokens: 'encode' + 'fact text' (or close paraphrase with ISO-date).
+        """
+        section = _extract_section(
+            STAGE1_SYSTEM_PROMPT, '## update_edge Temporal Limitation'
+        )
+        assert section, (
+            'STAGE1_SYSTEM_PROMPT must have a ## update_edge Temporal Limitation section'
+        )
+        section_lower = section.lower()
+        has_encode = 'encode' in section_lower
+        has_fact_text = 'fact text' in section_lower
+        has_iso = 'iso' in section_lower or 'iso-date' in section_lower or 'iso_date' in section_lower
+        assert has_encode or (has_fact_text and has_iso), (
+            "The ## update_edge Temporal Limitation section must instruct the agent "
+            "to encode the effective date in the fact text itself "
+            "(expected 'encode' or 'fact text' + ISO-date hint in the same section)"
+        )
+
+    def test_prompt_instructs_note_valid_at_limitation_in_cycle_summary(self):
+        """The update_edge Temporal Limitation section must instruct the agent to
+        note the valid_at limitation in the cycle summary.
+        Expected tokens: 'valid_at' AND 'cycle summary' co-located in same section.
+        """
+        section = _extract_section(
+            STAGE1_SYSTEM_PROMPT, '## update_edge Temporal Limitation'
+        )
+        assert section, (
+            'STAGE1_SYSTEM_PROMPT must have a ## update_edge Temporal Limitation section'
+        )
+        section_lower = section.lower()
+        assert 'valid_at' in section_lower, (
+            "The ## update_edge Temporal Limitation section must mention 'valid_at'"
+        )
+        assert 'cycle summary' in section_lower or 'summary' in section_lower, (
+            "The ## update_edge Temporal Limitation section must instruct the agent "
+            "to note the valid_at limitation in the cycle summary"
+        )
