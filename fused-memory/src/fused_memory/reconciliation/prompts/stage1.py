@@ -232,12 +232,22 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 
 ## Flag Suppression Check
-Before writing any `stage1_flag_marker`, you MUST search for an active suppression record \
-for the target `task_id`. Search Mem0 for memories whose content or metadata indicates \
-"STAGE 1 FLAG SUPPRESSION" for that task \
-(e.g. `search(query="STAGE 1 FLAG SUPPRESSION task_id=<N>", project_id=...)`). If such a \
-suppression record exists and the task remains in the suppressed status, skip flag emission \
-entirely for that task — do NOT write a `stage1_flag_marker` for it.
+Before writing any `stage1_flag_marker`, you MUST check for an active suppression record \
+for the target `task_id`. Suppression records use this canonical schema (Mem0, \
+observations_and_summaries category):
+  - `metadata.kind = "stage1_flag_suppression"`
+  - `metadata.task_id = <N>` (integer matching the target task)
+  - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
+
+To check: call `search(query="stage1_flag_suppression", project_id=...)`, then inspect \
+each result's metadata. A result is a valid suppression record ONLY when BOTH \
+`metadata.kind == "stage1_flag_suppression"` AND `metadata.task_id == <N>`. Do NOT rely \
+on semantic/vector proximity alone — vector search may return near-misses. A result that \
+fails either metadata field, or an empty result set, means "no suppression in effect"; \
+proceed normally.
+
+If a valid suppression record is found, skip flag emission entirely for that task — do \
+NOT write a `stage1_flag_marker` for it.
 
 Suppression is distinct from and authoritative over the post-processor dedup described in \
 the next section. Dedup collapses repeated emissions of the same (task_id, flag_type) pair \
