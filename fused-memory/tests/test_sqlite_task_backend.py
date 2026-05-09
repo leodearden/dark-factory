@@ -334,6 +334,32 @@ async def test_remove_tasks_atomicity_on_malformed_id(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_remove_tasks_rejects_nested_subtask_id_atomically(backend, project_root):
+    """remove_tasks raises INVALID_TASK_ID for 3+-level nested ids and rolls back.
+
+    Regression contract: the nested-subtask-id path propagates through the
+    public ``remove_tasks`` API surface (not just the private ``_parse_task_id``
+    helper) and the entire batch is aborted — no rows are deleted.
+    """
+    await backend.add_task(project_root=project_root, title='alpha')
+    await backend.add_task(project_root=project_root, title='beta')
+
+    with pytest.raises(TaskmasterError) as exc_info:
+        # '1.2.3' is a 3-level nested id — not supported; the whole batch
+        # must fail before any delete runs.
+        await backend.remove_tasks(
+            ['1', '1.2.3', '2'], project_root=project_root,
+        )
+
+    assert exc_info.value.code == 'INVALID_TASK_ID'
+    assert 'nested subtask ids not supported' in exc_info.value.message
+
+    # State must be unchanged — both tasks still present.
+    listing = await backend.get_tasks(project_root=project_root)
+    assert sorted(t['id'] for t in listing['tasks']) == ['1', '2']
+
+
+@pytest.mark.asyncio
 async def test_remove_tasks_empty_list_is_noop(backend, project_root):
     dto = await backend.remove_tasks([], project_root=project_root)
     assert dto['successful'] == 0
