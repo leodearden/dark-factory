@@ -1612,6 +1612,56 @@ class TestDispatchCooldownGate:
         )
 
     @pytest.mark.asyncio
+    async def test_signal_bearing_dispatch_arms_cooldown_gate(self, monkeypatch):
+        """A task dispatched WITH a cooldown signal must arm _last_dispatch_at.
+
+        Symmetric positive companion to test_signal_free_dispatch_does_not_arm_cooldown_gate.
+
+        The production arming logic lives at scheduler.py:1415-1416, gated by
+        ``_dispatch_cooldown_signal(task) is not None``.  The end-to-end suppression
+        tests (test_recon_reset_gt_1_blocks_immediate_redispatch,
+        test_steward_signals_block_immediate_redispatch) only verify that the second
+        acquire_next() returns None — they never inspect _last_dispatch_at directly.
+        A regression that flips the conditional to never-arm but coincidentally still
+        returns None via a different code path (dispatch guard, _dispatched set, lock
+        conflict, fairness park, deps gate) would slip through those tests.  This test
+        makes the gate-arming step an explicit, targeted assertion so such a regression
+        cannot hide.
+
+        Steps:
+          1. Dispatch a task carrying recon_reset_count=2 (a known gate-arming signal).
+          2. Assert _last_dispatch_at['99'] was set (direct gate-arming assertion).
+          3. Release and re-acquire within the 1800s cooldown window; assert None
+             (end-to-end suppression — confirms the armed gate is honoured).
+        """
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Dispatch the task — recon_reset_count=2 is a gate-arming signal
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        # Gate MUST be armed for signal-bearing tasks (direct positive assertion)
+        assert '99' in scheduler._last_dispatch_at, (
+            '_last_dispatch_at must be set for signal-bearing dispatches '
+            '(recon_reset_count=2)'
+        )
+
+        # End-to-end suppression: follow-up acquire within cooldown window must return None
+        scheduler.release('99')
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, (
+            'Follow-up acquire_next within cooldown window must be suppressed '
+            'end-to-end for signal-bearing tasks'
+        )
+
+    @pytest.mark.asyncio
     async def test_cooldown_log_suppressed_when_deps_unsatisfied(self, monkeypatch, caplog):
         """Cooldown-suppression INFO log must NOT fire for deps-blocked tasks.
 
