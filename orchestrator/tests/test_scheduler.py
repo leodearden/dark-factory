@@ -1590,6 +1590,72 @@ class TestDispatchCooldownGate:
         )
 
     @pytest.mark.asyncio
+    async def test_cooldown_log_suppressed_when_deps_unsatisfied(self, monkeypatch, caplog):
+        """Cooldown-suppression INFO log must NOT fire for deps-blocked tasks.
+
+        Before the fix, the cooldown gate ran before _deps_satisfied, causing
+        a spammy INFO log for every tick a task had a steward signal AND an
+        unsatisfied dep.  After the fix, deps are checked first and such tasks
+        skip silently.
+        """
+        import json as _json
+        import logging
+
+        # task '50' is in-progress (not pending, not terminal — does not clear
+        # _last_dispatch_at).  task '99' is pending but depends on '50'.
+        task_blocking = {
+            'id': '50',
+            'title': 'Blocking dep task',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+        task_waiting = {
+            'id': '99',
+            'title': 'Waiting task with cooldown signal',
+            'status': 'pending',
+            'dependencies': [{'id': '50'}],
+            'metadata': {'files': ['backend'], 'recon_reset_count': 2},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': _json.dumps({'tasks': [task_blocking, task_waiting]}),
+                    }
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        # Simulate a prior dispatch — gate would be active for task '99'
+        scheduler._last_dispatch_at['99'] = time.monotonic()
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.scheduler'):
+            result = await scheduler.acquire_next()
+
+        assert result is None, 'No dispatchable tasks — result must be None'
+
+        # On current main the cooldown gate fires before deps check and logs.
+        # After the fix deps-blocked tasks are silently skipped — no cooldown log.
+        noisy_records = [
+            r for r in caplog.records
+            if 'cooldown' in r.getMessage().lower()
+            or 'suppressed' in r.getMessage().lower()
+        ]
+        assert not noisy_records, (
+            f'Cooldown log must not fire for deps-blocked tasks; got: '
+            + ', '.join(r.getMessage() for r in noisy_records)
+        )
+
+    @pytest.mark.asyncio
     async def test_acquire_next_tolerates_non_string_reopen_reason(self, monkeypatch):
         """A non-string truthy reopen_reason (e.g. a dict) must not raise AttributeError.
 
