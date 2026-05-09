@@ -11,6 +11,7 @@ import pytest_asyncio
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.stats_verifier import (
     _OP_TO_STAT,
+    _STAT_ALIASES,
     _bucket_ops_by_stage,
     _count_add_memory,
     _count_graphiti_queued,
@@ -391,6 +392,22 @@ def test_op_to_stat_mapping_covers_core_memory_operations():
     """Guard against accidental deletions of key op-to-stat mappings."""
     for key in ('add_memory', 'delete_memory', 'update_edge', 'add_episode'):
         assert key in _OP_TO_STAT
+
+
+def test_stat_aliases_values_are_canonical_keys():
+    """Guard: _STAT_ALIASES values must all resolve to keys in the canonical set.
+
+    Prevents chained aliases (a → b where b is itself an alias key) from
+    silently propagating stale values in _apply_observed. The canonical set is
+    _OP_TO_STAT.values() ∪ {'graphiti_writes_queued'}.
+    """
+    canonical = frozenset(_OP_TO_STAT.values()) | {'graphiti_writes_queued'}
+    for alias_key, canonical_key in _STAT_ALIASES.items():
+        assert canonical_key in canonical, (
+            f"_STAT_ALIASES['{alias_key}'] = '{canonical_key}' is not a canonical key. "
+            f"Canonical keys: {sorted(canonical)}. "
+            "Chained aliases silently propagate stale values in _apply_observed."
+        )
 
 
 class TestUpdateEdgeVerifiedFilter:

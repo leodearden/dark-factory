@@ -237,7 +237,7 @@ def _apply_observed(
 
     # Write canonical keys first so the alias pass can read the canonical
     # observed value without needing to compute it twice.
-    canonical_keys = frozenset(_OP_TO_STAT.values()) | {'graphiti_writes_queued'}
+    canonical_keys = _TRACKED_STAT_KEYS - frozenset(_STAT_ALIASES)
     for stat_key in canonical_keys:
         # Always record the observed value — zero is meaningful (means "no
         # writes happened for this op"). Only snapshot the original when it
