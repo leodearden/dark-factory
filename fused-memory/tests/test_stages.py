@@ -3796,3 +3796,59 @@ class TestMemoryConsolidatorFlagDedup:
         # dedup_flags must NOT have been called for remediation runs
         dedup_mock.assert_not_awaited()
         assert report is not None
+
+
+# ---------------------------------------------------------------------------
+# Task 1139 — FIX A / FIX D helpers
+# ---------------------------------------------------------------------------
+
+class TestShouldSkipKnownBug1139Flag:
+    """_should_skip_known_bug_1139_flag returns True only for task-1139/bug-mechanics flags."""
+
+    def _import(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _should_skip_known_bug_1139_flag,
+        )
+        return _should_skip_known_bug_1139_flag
+
+    def test_skip_task_id_string_1139(self):
+        fn = self._import()
+        assert fn({'task_id': '1139'}) is True
+
+    def test_skip_task_id_int_1139(self):
+        """Integer task_id is coerced to string for comparison."""
+        fn = self._import()
+        assert fn({'task_id': 1139}) is True
+
+    def test_skip_bug_mechanics_content_no_task_id(self):
+        """Flag with bug-mechanics content is skipped even without task_id."""
+        fn = self._import()
+        flag = {
+            'content': (
+                'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2 '
+                'but does NOT include them in flagged_items'
+            ),
+        }
+        assert fn(flag) is True
+
+    def test_skip_content_marker_flag_for_stage2_not_include(self):
+        """The second content marker substring also triggers a skip."""
+        fn = self._import()
+        flag = {'content': 'flag_for_stage2=true but does NOT include them in flagged_items'}
+        assert fn(flag) is True
+
+    def test_pass_different_task_id_742(self):
+        fn = self._import()
+        assert fn({'task_id': '742'}) is False
+
+    def test_pass_different_task_id_with_unrelated_content(self):
+        fn = self._import()
+        assert fn({'task_id': '742', 'content': 'unrelated finding'}) is False
+
+    def test_pass_empty_dict(self):
+        fn = self._import()
+        assert fn({}) is False
+
+    def test_pass_content_mentions_stage1_but_not_bug(self):
+        fn = self._import()
+        assert fn({'content': 'mentions Stage 1 but not the bug'}) is False
