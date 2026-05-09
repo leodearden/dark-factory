@@ -1653,10 +1653,11 @@ class MemoryService:
             }
         status['projects'] = projects
 
-        # Queue stats (unchanged)
+        # Queue stats — scoped to project_id when given so dead-letter counts
+        # reflect only this project's rows, not the global write_queue table.
         if self.durable_queue:
             try:
-                status['queue'] = await self.durable_queue.get_stats()
+                status['queue'] = await self.durable_queue.get_stats(group_id=project_id)
             except Exception as e:
                 status['queue'] = {'error': str(e)}
 
