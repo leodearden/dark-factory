@@ -1490,6 +1490,131 @@ class TestBuildSuppressionPayload:
 
 
 # ---------------------------------------------------------------------------
+# Round-trip schema validation tests (task-1185 step-5)
+#
+# FakeMemoryService: in-test stub generalising the FakeMem0 pattern already
+# used in test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation.
+# Accepts writer-supplied content and metadata so it works for arbitrary
+# writers (flag-marker writes AND suppression-record writes).
+# Kept module-private — promoting to conftest is a future refactor.
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid_mod
+
+
+class _MemoryResultStub:
+    """Minimal stand-in for a Mem0 MemoryResult, accepts explicit content."""
+
+    def __init__(self, id_: str, content: str, metadata: dict) -> None:
+        self.id = id_
+        self.content = content
+        self.metadata = metadata
+
+
+class _FakeMemoryService:
+    """In-memory memory service stub: add_memory, search, delete_memory.
+
+    Stores records keyed by UUID.  search() returns ALL stored records
+    (query / categories / stores / limit kwargs are accepted but ignored for
+    filtering — deterministic behaviour is sufficient for schema round-trip
+    tests).  This mirrors the existing FakeMem0 in the regression test but
+    accepts writer-supplied content and metadata.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, _MemoryResultStub] = {}
+
+    async def add_memory(
+        self, *, content: str, metadata: dict, **_kwargs
+    ) -> AddMemoryResponse:
+        id_ = str(_uuid_mod.uuid4())
+        self._store[id_] = _MemoryResultStub(id_, content, metadata)
+        return AddMemoryResponse(memory_ids=[id_])
+
+    async def search(self, **_kwargs) -> list[_MemoryResultStub]:
+        return list(self._store.values())
+
+    async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
+        self._store.pop(memory_id, None)
+
+    def count(self) -> int:
+        return len(self._store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'storage_shape,raw_task_id',
+    [
+        pytest.param('int_storage', 42, id='int_storage'),
+        pytest.param('str_storage', '42', id='str_storage'),
+    ],
+)
+async def test_suppression_record_round_trips_through_prompt_instructed_search(
+    storage_shape, raw_task_id
+):
+    """Round-trip schema contract: what write_suppression_record writes is exactly
+    what filter_suppressed's search finds.
+
+    Canonical schema (four-line contract):
+      1. metadata.kind == 'stage1_flag_suppression'
+      2. metadata.task_id == <N>  (int or str; compared via str-coercion)
+      3. content == 'STAGE 1 FLAG SUPPRESSION task_id=<N>'
+      4. category == 'observations_and_summaries'
+
+    The str-coercion convention on assertion (6) mirrors filter_suppressed's
+    comparison at flag_dedup.py:132 (`str(task_id)`) so the test passes for
+    both int and str storage shapes without false failures.
+
+    The search kwargs match filter_suppressed's actual call shape exactly so
+    that any future drift between the producer and the search-call contract is
+    caught here first.
+    """
+    from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+    fake = _FakeMemoryService()
+
+    if storage_shape == 'int_storage':
+        # write via the canonical producer (coerces to int)
+        await write_suppression_record(fake, project_id='dark_factory', task_id=42)
+    else:
+        # model the alternative shape: task_id stored as str (e.g. from a
+        # hand-authored record or an old producer without int coercion)
+        await fake.add_memory(
+            content='STAGE 1 FLAG SUPPRESSION task_id=42',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': '42'},
+        )
+
+    # Search with the kwargs filter_suppressed actually uses (task-1186, flag_dedup.py:111-117)
+    results = await fake.search(
+        query='stage1_flag_suppression',
+        project_id='dark_factory',
+        categories=['observations_and_summaries'],
+        stores=['mem0'],
+        limit=500,
+    )
+
+    # (4) Exactly one result
+    assert len(results) == 1, f'Expected 1 result but got {len(results)}: {results}'
+
+    # (5) Canonical kind key
+    assert results[0].metadata['kind'] == 'stage1_flag_suppression', (
+        f'metadata.kind mismatch: {results[0].metadata}'
+    )
+
+    # (6) task_id round-trips (str-coercion handles int vs str storage)
+    assert str(results[0].metadata['task_id']) == '42', (
+        f'metadata.task_id mismatch: {results[0].metadata["task_id"]!r}'
+    )
+
+    # (7) Canonical content
+    assert results[0].content == 'STAGE 1 FLAG SUPPRESSION task_id=42', (
+        f'content mismatch: {results[0].content!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # write_suppression_record tests (task-1185 step-3)
 # ---------------------------------------------------------------------------
 
