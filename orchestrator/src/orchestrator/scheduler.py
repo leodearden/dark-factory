@@ -893,17 +893,8 @@ class Scheduler:
                 return False
         return True
 
-    def _dispatch_cooldown_active(
-        self, task: dict, tid: str
-    ) -> tuple[bool, str | None]:
-        """Return (is_active, signal_label) for the per-task dispatch cooldown gate.
-
-        The gate is active when ALL of:
-        1. The task has a prior dispatch recorded in ``_last_dispatch_at``.
-        2. The elapsed time since that dispatch is less than
-           ``config.dispatch_cooldown_secs`` (strict less-than).
-        3. The task's metadata carries a reset/steward signal indicating
-           it was just touched by reconciliation or the steward.
+    def _dispatch_cooldown_signal(self, task: dict) -> str | None:
+        """Return the signal label if *task* carries a dispatch-cooldown signal.
 
         Signals (OR semantics — any one arms the gate):
         - ``recon_reset_count > 1``: task has been reset by reconciliation
@@ -912,19 +903,10 @@ class Scheduler:
         - ``recon_stage2_blocked_at``: truthy value → stage-2 block.
         - ``reopen_reason`` containing the substring ``'steward'`` (case-insensitive).
 
-        Returns the signal label for use in operator-visible log messages.
+        Returns the matched signal label (for log messages), or ``None`` if no
+        signal is present.  Used both by :meth:`_dispatch_cooldown_active` and
+        at the dispatch site to guard ``_last_dispatch_at`` arming.
         """
-        last_dispatch = self._last_dispatch_at.get(tid)
-        if last_dispatch is None:
-            return False, None
-        elapsed = time.monotonic() - last_dispatch
-        if elapsed >= self.config.dispatch_cooldown_secs:
-            # Entry is past the window and no longer affects behaviour — drop it
-            # to keep the dict bounded over long-running processes (e.g. tasks
-            # removed via remove_task without ever reaching a terminal status).
-            self._last_dispatch_at.pop(tid, None)
-            return False, None
-
         metadata = task.get('metadata') or {}
 
         # recon_reset_count > 1 (strict — first reset is allowed).
@@ -937,22 +919,66 @@ class Scheduler:
         except (TypeError, ValueError):
             recon_count = 0
         if recon_count > 1:
-            return True, 'recon_reset_count'
+            return 'recon_reset_count'
 
         # steward_clear_at: any truthy value
         if metadata.get('steward_clear_at'):
-            return True, 'steward_clear_at'
+            return 'steward_clear_at'
 
         # recon_stage2_blocked_at: any truthy value
         if metadata.get('recon_stage2_blocked_at'):
-            return True, 'recon_stage2_blocked_at'
+            return 'recon_stage2_blocked_at'
 
         # reopen_reason containing 'steward' (case-insensitive — field is
         # human-authored prose and future producers may use different casing).
-        reopen_reason = metadata.get('reopen_reason', '') or ''
-        if 'steward' in reopen_reason.lower():
-            return True, 'reopen_reason'
+        # Non-string values (e.g. a dict from a malformed producer) are treated
+        # as no-signal rather than str()-coerced: a repr containing the substring
+        # 'steward' (e.g. {'steward_unblock_failure': True}) would be an
+        # accidental false positive under str() coercion.
+        reopen_reason = metadata.get('reopen_reason') or ''
+        if isinstance(reopen_reason, str) and 'steward' in reopen_reason.lower():
+            return 'reopen_reason'
 
+        return None
+
+    def _dispatch_cooldown_active(
+        self, task: dict, tid: str
+    ) -> tuple[bool, str | None]:
+        """Return (is_active, signal_label) for the per-task dispatch cooldown gate.
+
+        The gate is active when ALL of:
+        1. The task has a prior dispatch recorded in ``_last_dispatch_at``.
+        2. The elapsed time since that dispatch is less than
+           ``config.dispatch_cooldown_secs`` (strict less-than).
+        3. The task's metadata carries a reset/steward signal indicating
+           it was just touched by reconciliation or the steward.
+
+        Signal detection is delegated to :meth:`_dispatch_cooldown_signal`.
+        Returns the signal label for use in operator-visible log messages.
+
+        **Timing note**: ``_last_dispatch_at`` is only armed when the *dispatch
+        itself* is signal-bearing (see :meth:`acquire_next`).  A steward signal
+        that arrives *after* a signal-free dispatch will not retroactively
+        suppress re-dispatch within the prior dispatch window — the gate only
+        guards against rapid re-dispatch of tasks that were *already* flagged
+        at the moment they were first picked up.
+        """
+        last_dispatch = self._last_dispatch_at.get(tid)
+        if last_dispatch is None:
+            return False, None
+        elapsed = time.monotonic() - last_dispatch
+        if elapsed >= self.config.dispatch_cooldown_secs:
+            # Entry is past the window and no longer affects behaviour — drop it
+            # to keep the dict bounded for tasks that remain visible past the
+            # window.  Tasks deleted via remove_task before their window elapses
+            # leave an orphan entry until the window expires naturally; this is
+            # an acceptable trade-off (bounded by dispatch_cooldown_secs).
+            self._last_dispatch_at.pop(tid, None)
+            return False, None
+
+        signal = self._dispatch_cooldown_signal(task)
+        if signal is not None:
+            return True, signal
         return False, None
 
     def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
@@ -1287,6 +1313,8 @@ class Scheduler:
                 if time.monotonic() < cooldown_deadline:
                     continue
                 del self._requeue_until[tid_str]
+            if not self._deps_satisfied(t, status_map):
+                continue
             # Dispatch cooldown gate: if the task was recently dispatched and
             # carries a reconciliation/steward signal, suppress re-dispatch
             # until the settle window elapses.  Both gates must pass.
@@ -1309,8 +1337,6 @@ class Scheduler:
                     metadata.get(signal_label),
                     remaining_secs,
                 )
-                continue
-            if not self._deps_satisfied(t, status_map):
                 continue
             candidates.append(t)
 
@@ -1363,7 +1389,13 @@ class Scheduler:
                 continue
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
-                self._last_dispatch_at[task_id] = time.monotonic()  # arm cooldown gate
+                # arm cooldown gate — only for signal-bearing dispatches.
+                # Steward signals that arrive *after* a signal-free dispatch
+                # will not retroactively suppress re-dispatch; the gate is
+                # intentionally scoped to tasks that were already flagged
+                # when first picked up (bounded _last_dispatch_at size).
+                if self._dispatch_cooldown_signal(task) is not None:
+                    self._last_dispatch_at[task_id] = time.monotonic()
                 self._dispatched_priority[task_id] = pri
                 self._task_start_times[task_id] = time.monotonic()
                 if task_id == top_id:

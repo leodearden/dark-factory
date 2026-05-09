@@ -1589,6 +1589,178 @@ class TestDispatchCooldownGate:
             f'Remaining time number missing from log: {log_text!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_signal_free_dispatch_does_not_arm_cooldown_gate(self, monkeypatch):
+        """A task dispatched with no cooldown signal must NOT arm _last_dispatch_at.
+
+        Only tasks carrying a steward/reconciliation signal (recon_reset_count>1,
+        steward_clear_at, recon_stage2_blocked_at, or steward reopen_reason) should
+        arm the gate.  Signal-free dispatches must leave _last_dispatch_at empty so
+        the dict doesn't accumulate stale entries for tasks removed without ever
+        reaching a terminal status.
+        """
+        task = self._pending_task_with({'files': ['backend']})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Dispatch the task — no steward/recon signal in metadata
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        # Gate must NOT be armed for signal-free tasks
+        assert '99' not in scheduler._last_dispatch_at, (
+            '_last_dispatch_at must not be set for signal-free dispatches'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cooldown_log_suppressed_when_deps_unsatisfied(self, monkeypatch, caplog):
+        """Cooldown-suppression INFO log must NOT fire for deps-blocked tasks.
+
+        Before the fix, the cooldown gate ran before _deps_satisfied, causing
+        a spammy INFO log for every tick a task had a steward signal AND an
+        unsatisfied dep.  After the fix, deps are checked first and such tasks
+        skip silently.
+        """
+        import json as _json
+        import logging
+
+        # task '50' is in-progress (not pending, not terminal — does not clear
+        # _last_dispatch_at).  task '99' is pending but depends on '50'.
+        task_blocking = {
+            'id': '50',
+            'title': 'Blocking dep task',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+        task_waiting = {
+            'id': '99',
+            'title': 'Waiting task with cooldown signal',
+            'status': 'pending',
+            'dependencies': [{'id': '50'}],
+            'metadata': {'files': ['backend'], 'recon_reset_count': 2},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': _json.dumps({'tasks': [task_blocking, task_waiting]}),
+                    }
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        # Simulate a prior dispatch — gate would be active for task '99'
+        scheduler._last_dispatch_at['99'] = time.monotonic()
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.scheduler'):
+            result = await scheduler.acquire_next()
+
+        assert result is None, 'No dispatchable tasks — result must be None'
+
+        # On current main the cooldown gate fires before deps check and logs.
+        # After the fix deps-blocked tasks are silently skipped — no cooldown log.
+        noisy_records = [
+            r for r in caplog.records
+            if 'cooldown' in r.getMessage().lower()
+            or 'suppressed' in r.getMessage().lower()
+        ]
+        assert not noisy_records, (
+            'Cooldown log must not fire for deps-blocked tasks; got: '
+            + ', '.join(r.getMessage() for r in noisy_records)
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_tolerates_non_string_reopen_reason(self, monkeypatch):
+        """A non-string truthy reopen_reason (e.g. a dict) must not raise and must not arm the gate.
+
+        The ``isinstance`` guard in ``_dispatch_cooldown_signal`` rejects non-string
+        ``reopen_reason`` values as no-signal rather than str()-coercing them
+        (which could produce false positives for dicts like
+        ``{'steward_unblock_failure': True}`` whose repr contains 'steward').
+
+        This test explicitly exercises the gate code path: ``_last_dispatch_at``
+        is primed manually before the second acquire so that ``_dispatch_cooldown_active``
+        is reached.  The gate must return inactive (non-string → no signal), so the
+        second dispatch must succeed rather than raise or be suppressed.
+        """
+        task = self._pending_task_with(
+            {'files': ['backend'], 'reopen_reason': {'malformed': 'producer'}}
+        )
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First acquire — non-string reopen_reason → no signal → gate NOT armed
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+        assert '99' not in scheduler._last_dispatch_at, (
+            'Non-string reopen_reason must not arm the cooldown gate on first dispatch'
+        )
+
+        scheduler.release('99')
+
+        # Prime _last_dispatch_at manually so the gate code path is reached on
+        # the second acquire (simulates a hypothetical prior signal-bearing dispatch).
+        scheduler._last_dispatch_at['99'] = time.monotonic()
+
+        # Second acquire — gate path is now reachable.  The isinstance guard
+        # sees a dict (not a str) and returns no signal → gate inactive → dispatch
+        # must succeed without raising AttributeError.
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99', (
+            'Non-string reopen_reason must not raise and must not falsely suppress dispatch'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dict_reopen_reason_with_steward_key_does_not_arm_gate(self, monkeypatch):
+        """A dict reopen_reason whose str() repr contains 'steward' must NOT arm the gate.
+
+        Under the old str()-coerce approach, ``{'steward_unblock_failure': True}``
+        would stringify to a repr containing ``'steward'`` and falsely arm the
+        cooldown gate.  The isinstance guard fixes this by treating all non-string
+        values as no-signal, regardless of their repr content.
+        """
+        task = self._pending_task_with(
+            {'files': ['backend'], 'reopen_reason': {'steward_unblock_failure': True}}
+        )
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        # Confirm directly: signal helper must return None for non-string reopen_reason
+        assert scheduler._dispatch_cooldown_signal(task) is None, (
+            'Dict reopen_reason must not trigger cooldown signal even if its '
+            'str() repr contains the "steward" substring'
+        )
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a = await scheduler.acquire_next()
+        assert a is not None and a.task_id == '99', 'Dispatch must succeed'
+        assert '99' not in scheduler._last_dispatch_at, (
+            'Dict reopen_reason with "steward" key must not arm the cooldown gate'
+        )
+
 
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
