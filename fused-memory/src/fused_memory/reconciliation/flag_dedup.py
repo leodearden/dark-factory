@@ -28,6 +28,13 @@ dedup_flags call collapses them to a single row.  Write-first ordering
 guarantees at-least-one-marker: either the new marker exists (proceed to
 delete priors) or write failed (priors intact for next cycle).
 
+Reclamation bound: ``find_prior_memories`` is called with ``limit=50``, so if
+past leakage produced more than 50 markers for one (task_id, flag_type) pair,
+each cycle reclaims at most 50 of them.  In practice leakage is bounded by
+the number of outage cycles (transient Mem0 failures) and is expected to
+remain far below 50; the self-healing property still holds over multiple
+cycles.
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
@@ -96,7 +103,8 @@ async def dedup_flags(
         if priors:
             # --- HIT: atomic-replacement ---
             # (1) Extract annotation from the FIRST prior BEFORE deleting any.
-            #     Annotation pinned to first-found prior (earliest known run_id).
+            #     Annotation pinned to the first-found prior (search-order —
+            #     typically highest-relevance, not necessarily earliest).
             first_prior = priors[0]
             prior_run_id = (first_prior.metadata or {}).get('run_id') or 'unknown'
             if prior_run_id == 'unknown':
@@ -157,7 +165,7 @@ async def dedup_flags(
             # dedup cycles.  _source='stage1_flag_dedup' distinguishes these
             # from 'targeted_recon' writes in the audit journal.
             #
-            # Marker-growth caveat: when find_prior_memory returns None due to
+            # Marker-growth caveat: when find_prior_memories returns [] due to
             # a search failure (transient Mem0 outage) rather than a genuine
             # miss, this branch still writes a new marker.  During a sustained
             # outage every cycle will write a marker for recurring flags,
