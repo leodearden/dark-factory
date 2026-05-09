@@ -232,29 +232,34 @@ When the payload title is "Remediation Run", you are operating in focused remedi
 - Report each finding's resolution status: fixed, partially_fixed, or unresolved.
 
 ## Flag Suppression Check
-Before writing any `stage1_flag_marker`, you MUST check for an active suppression record \
-for the target `task_id`. Suppression records use this canonical schema (Mem0, \
-observations_and_summaries category):
+**The deterministic suppression gate is enforced in code** by \
+`flag_dedup.filter_suppressed`, which runs as the first step of the post-processor \
+before any flag reaches the signature-dedup loop.  You do not need to perform this \
+check yourself — suppressed flags are dropped automatically.
+
+As an optimisation you *may* skip emitting a flag for a task that you know is \
+suppressed, but the code gate is the authoritative enforcement point; any flag you \
+emit for a suppressed task_id will be dropped by the post-processor regardless.
+
+Canonical suppression record schema (Mem0, observations_and_summaries category) — \
+this is the producer's contract source-of-truth read by the post-processor:
   - `metadata.kind = "stage1_flag_suppression"`
   - `metadata.task_id = <N>` (integer matching the target task)
   - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
 
-To check: call `search(query="stage1_flag_suppression", project_id=...)`, then inspect \
-each result's metadata. A result is a valid suppression record ONLY when BOTH \
-`metadata.kind == "stage1_flag_suppression"` AND `metadata.task_id == <N>`. Do NOT rely \
-on semantic/vector proximity alone — vector search may return near-misses. A result that \
-fails either metadata field, or an empty result set, means "no suppression in effect"; \
-proceed normally.
+If you do choose to check: call `search(query="stage1_flag_suppression", \
+project_id=...)`, then inspect each result's metadata. A result is a valid \
+suppression record ONLY when BOTH `metadata.kind == "stage1_flag_suppression"` AND \
+`metadata.task_id == <N>`. Do NOT rely on semantic/vector proximity alone — vector \
+search may return near-misses. A result that fails either metadata field, or an \
+empty result set, means "no suppression in effect"; proceed normally.
 
-If a valid suppression record is found, skip flag emission entirely for that task — do \
-NOT write a `stage1_flag_marker` for it.
-
-Suppression is distinct from and authoritative over the post-processor dedup described in \
-the next section. Dedup collapses repeated emissions of the same (task_id, flag_type) pair \
-across runs; suppression authoritatively forbids ANY flag emission for a specific task. \
-The contamination cycle motivating this check: Stage 1 writes a violating flag → Stage 3 \
-detects it → remediation deletes it → next cycle Stage 1 writes it again. The suppression \
-record breaks this cycle at the source by preventing the Stage 1 write in the first place.
+Suppression is distinct from the post-processor dedup described in the next section. \
+Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
+suppression authoritatively forbids ANY flag emission for a specific task. \
+The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
+detects it → remediation deletes it → next cycle Stage 1 writes it again. \
+`flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
 
 ## Flag Deduplication
 Stage 1's flag emission is post-processed by an automatic deduplicator that searches Mem0 \
