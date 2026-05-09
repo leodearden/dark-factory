@@ -37,6 +37,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _queue_briefing_refresh_tasks,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
+    _suppress_same_run_human_operator_dups,
 )
 from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
@@ -4650,15 +4651,9 @@ class TestStage3PayloadIncludesProjectRoot:
 class TestSuppressSameRunHumanOperatorDups:
     """Unit tests for _suppress_same_run_human_operator_dups(stage2_flagged, stage1_flagged)."""
 
-    def _fn(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _suppress_same_run_human_operator_dups,
-        )
-        return _suppress_same_run_human_operator_dups
-
     def test_both_empty_returns_empty_tuples(self):
         """Both empty inputs → ([], [])."""
-        kept, suppressed = self._fn()([], [])
+        kept, suppressed = _suppress_same_run_human_operator_dups([], [])
         assert kept == []
         assert suppressed == []
 
@@ -4670,7 +4665,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 's2 dup'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert kept == []
         assert len(suppressed) == 1
         assert suppressed[0]['description'] == 's2 dup'
@@ -4683,7 +4678,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'stage2 unique'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4695,7 +4690,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'in_progress', 'description': 'different status'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert kept[0]['resolution_status'] == 'in_progress'
         assert suppressed == []
@@ -4708,7 +4703,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '99', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4720,7 +4715,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'stale_dependency', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4732,7 +4727,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4744,7 +4739,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 1
         assert suppressed == []
 
@@ -4756,7 +4751,7 @@ class TestSuppressSameRunHumanOperatorDups:
         stage2 = [
             {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert kept == []
         assert len(suppressed) == 1
 
@@ -4776,7 +4771,7 @@ class TestSuppressSameRunHumanOperatorDups:
             # exact dup for task 77 — should be suppressed
             {'task_id': '77', 'flag_type': 'stale_dependency', 'resolution_status': 'human_operator_required', 'description': 'dup2'},
         ]
-        kept, suppressed = self._fn()(stage2, stage1)
+        kept, suppressed = _suppress_same_run_human_operator_dups(stage2, stage1)
         assert len(kept) == 2
         assert len(suppressed) == 2
         kept_descs = {item['description'] for item in kept}
