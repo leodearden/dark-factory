@@ -1241,6 +1241,355 @@ class TestRequeueCooldown:
         assert a2 is not None and a2.task_id == '99'
 
 
+class TestDispatchCooldownConfig:
+    """Validate the dispatch_cooldown_secs config field defaults and constraints."""
+
+    def test_default_dispatch_cooldown_secs(self):
+        """OrchestratorConfig() defaults dispatch_cooldown_secs to 1800.0."""
+        config = OrchestratorConfig()
+        assert config.dispatch_cooldown_secs == 1800.0
+
+    def test_accepts_value_above_floor(self):
+        """OrchestratorConfig(dispatch_cooldown_secs=600.0) is valid (above 300.0 floor)."""
+        config = OrchestratorConfig(dispatch_cooldown_secs=600.0)
+        assert config.dispatch_cooldown_secs == 600.0
+
+    def test_rejects_value_below_floor(self):
+        """OrchestratorConfig(dispatch_cooldown_secs=120.0) raises ValidationError."""
+        import pydantic
+        with pytest.raises(pydantic.ValidationError):
+            OrchestratorConfig(dispatch_cooldown_secs=120.0)
+
+
+class TestDispatchCooldownGate:
+    """Tests for the per-task dispatch cooldown gate that prevents immediate
+    re-grab after reconciliation reset or steward clear."""
+
+    def _make_task_response(self, task: dict) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+
+    def _pending_task_with(self, metadata: dict) -> dict:
+        return {
+            'id': '99',
+            'title': 'Dispatch cooldown test task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': metadata,
+        }
+
+    @pytest.mark.asyncio
+    async def test_recon_reset_gt_1_blocks_immediate_redispatch(self, monkeypatch):
+        """recon_reset_count > 1 arms the dispatch cooldown gate.
+
+        First acquire succeeds (gate not yet armed).  After normal release,
+        second acquire must be blocked because the task has recon_reset_count=2.
+        """
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First acquire — gate not yet armed
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        # Normal release (not requeued)
+        scheduler.release('99')
+
+        # Second acquire immediately — gate must block (recon_reset_count=2)
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, (
+            'Task with recon_reset_count=2 must not be re-dispatched during cooldown'
+        )
+
+    @pytest.mark.asyncio
+    async def test_recon_reset_eq_1_does_not_block(self, monkeypatch):
+        """recon_reset_count=1 (first reset) must NOT trigger the cooldown gate.
+
+        Only counts > 1 indicate a repeated reset loop.
+        """
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 1})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+
+        scheduler.release('99')
+
+        # Second acquire must succeed — only the first reset, no loop yet
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99', (
+            'recon_reset_count=1 must not block re-dispatch'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('metadata,signal', [
+        (
+            {'files': ['backend'], 'steward_clear_at': '2026-04-27T13:04:06Z'},
+            'steward_clear_at',
+        ),
+        (
+            {'files': ['backend'], 'recon_stage2_blocked_at': '2026-04-27T13:04:06Z'},
+            'recon_stage2_blocked_at',
+        ),
+        (
+            {'files': ['backend'], 'reopen_reason': 'steward stash-pop resolution'},
+            'reopen_reason',
+        ),
+    ])
+    async def test_steward_signals_block_immediate_redispatch(
+        self, monkeypatch, metadata, signal
+    ):
+        """Steward signals (steward_clear_at, recon_stage2_blocked_at,
+        reopen_reason containing 'steward') arm the dispatch cooldown gate."""
+        task = self._pending_task_with(metadata)
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99', 'Initial dispatch must succeed'
+
+        scheduler.release('99')
+
+        a2 = await scheduler.acquire_next()
+        assert a2 is None, (
+            f'Task with signal {signal!r} must not be re-dispatched during cooldown'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_steward_reopen_reason_does_not_block(self, monkeypatch):
+        """reopen_reason without 'steward' substring must NOT trigger the gate.
+
+        Only the literal substring 'steward' arms the gate; other reopen reasons
+        such as 'un-defer script' are orchestrator-internal and must dispatch normally.
+        """
+        task = self._pending_task_with(
+            {'files': ['backend'], 'reopen_reason': 'un-defer script'}
+        )
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+
+        scheduler.release('99')
+
+        # Must succeed — 'un-defer script' does not contain 'steward'
+        a2 = await scheduler.acquire_next()
+        assert a2 is not None and a2.task_id == '99', (
+            "reopen_reason='un-defer script' must not block re-dispatch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_cooldown_expires_after_window(self, monkeypatch):
+        """Cooldown gate expires exactly at the configured window edge (strict <).
+
+        After 601s with a 600s window the gate is open; after 599s it is still closed.
+        """
+        import time as _time_module
+
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=600.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First dispatch — arms the gate
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+        scheduler.release('99')
+
+        original_monotonic = _time_module.monotonic
+
+        # Patch time.monotonic globally (all callers — asyncio internals, lock_table
+        # lease/park clocks — also see the shifted value).  This is intentional: the
+        # test carries no reservations, so the only effect of the large offset is that
+        # expired-park pruning finds nothing to evict, which does not affect the
+        # cooldown assertion.  The +599/+601 offsets straddle the 600s window boundary.
+        # --- just inside window (+599s): gate still active ---
+        monkeypatch.setattr(
+            _time_module, 'monotonic', lambda: original_monotonic() + 599.0
+        )
+        a_inside = await scheduler.acquire_next()
+        assert a_inside is None, 'Gate must still be active at +599s (inside 600s window)'
+
+        # --- just past window (+601s): gate must be open ---
+        monkeypatch.setattr(
+            _time_module, 'monotonic', lambda: original_monotonic() + 601.0
+        )
+        a_outside = await scheduler.acquire_next()
+        assert a_outside is not None and a_outside.task_id == '99', (
+            'Gate must be open at +601s (past 600s window)'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('terminal_status', ['done', 'cancelled'])
+    async def test_terminal_status_clears_last_dispatch_at(
+        self, monkeypatch, terminal_status
+    ):
+        """When acquire_next observes a task in done/cancelled, _last_dispatch_at
+        must be cleared for that task so a future re-dispatch starts clean."""
+        import json as _json
+
+        task = {
+            'id': '42',
+            'title': 'Terminal sweep test',
+            'status': terminal_status,
+            'dependencies': [],
+            'metadata': {},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        # Prime _last_dispatch_at as if task '42' was previously dispatched
+        scheduler._last_dispatch_at['42'] = time.monotonic()
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        # acquire_next returns None (task is terminal, not pending)
+        result = await scheduler.acquire_next()
+        assert result is None
+
+        # _last_dispatch_at must be cleared after observing the terminal status
+        assert '42' not in scheduler._last_dispatch_at, (
+            f'_last_dispatch_at must be cleared when task is {terminal_status!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_progress_status_preserves_last_dispatch_at(self, monkeypatch):
+        """In-progress status must NOT clear _last_dispatch_at (only terminal clears it)."""
+        import json as _json
+
+        task = {
+            'id': '42',
+            'title': 'In-progress sweep test',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(task) + ']}',
+                    }
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        original_ts = time.monotonic()
+        scheduler._last_dispatch_at['42'] = original_ts
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        await scheduler.acquire_next()
+
+        # Entry must still be present for in-progress tasks
+        assert '42' in scheduler._last_dispatch_at, (
+            '_last_dispatch_at must NOT be cleared for in-progress tasks'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_cooldown_skip_logged(self, monkeypatch, caplog):
+        """When the dispatch cooldown gate suppresses a re-dispatch, an INFO
+        log record must be emitted containing: 'cooldown', the task id, the
+        signal label, and a remaining-time number."""
+        import logging
+
+        task = self._pending_task_with({'files': ['backend'], 'recon_reset_count': 2})
+        task_response = self._make_task_response(task)
+
+        config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # First acquire — gate not yet armed
+        a1 = await scheduler.acquire_next()
+        assert a1 is not None and a1.task_id == '99'
+        scheduler.release('99')
+
+        # Suppressed second acquire — gate active
+        with caplog.at_level(logging.INFO, logger='orchestrator.scheduler'):
+            a2 = await scheduler.acquire_next()
+
+        assert a2 is None, 'Gate must have suppressed the second dispatch'
+
+        # Verify the log record
+        cooldown_records = [
+            r for r in caplog.records
+            if 'cooldown' in r.getMessage().lower()
+            or 'suppressed' in r.getMessage().lower()
+        ]
+        assert cooldown_records, 'Expected at least one log record mentioning cooldown'
+
+        log_text = cooldown_records[0].getMessage()
+        assert '99' in log_text, f'Task id "99" missing from log: {log_text!r}'
+        # Check the field-qualified form "signal=recon_reset_count" so a
+        # regression that selected a different signal label would fail here.
+        assert 'signal=recon_reset_count' in log_text, (
+            f'"signal=recon_reset_count" missing from log: {log_text!r}'
+        )
+        # remaining time should be a number — check any digit appears in the message
+        import re
+        assert re.search(r'\d+', log_text), (
+            f'Remaining time number missing from log: {log_text!r}'
+        )
+
+
 class TestFairness:
     """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
 
@@ -1688,9 +2037,8 @@ class TestSetTaskStatusForwarding:
         monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
         mock = AsyncMock(side_effect=OSError(2, 'No such file'))
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-        with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'):
-            with pytest.raises(RuntimeError, match='3 transient retries'):
-                await scheduler.set_task_status('1', 'in-progress')
+        with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'), pytest.raises(RuntimeError, match='3 transient retries'):
+            await scheduler.set_task_status('1', 'in-progress')
         # Three attempts before raising.
         assert mock.await_count == 3, (
             f'Expected 3 dispatch attempts, got {mock.await_count}'
@@ -1985,6 +2333,7 @@ class TestExtractRejection:
     def test_text_block_fallback(self):
         """When structuredContent is absent, parse the JSON text block."""
         import json as _json
+
         from orchestrator.scheduler import extract_rejection
         payload = {'success': False, 'error': 'terminal_exit_rejected'}
         msg = extract_rejection({
