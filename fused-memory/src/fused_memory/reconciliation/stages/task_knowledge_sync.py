@@ -119,6 +119,24 @@ async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     return flags
 
 
+def _compute_stale_flags(
+    persistence_counts: dict[str, int],
+    threshold: int = STAGE2_FLAG_PERSISTENCE_THRESHOLD,
+) -> list[str]:
+    """Return sorted list of flag_ids whose persistence count is >= *threshold*.
+
+    Args:
+        persistence_counts: Mapping of flag_id → cycle count (from
+            ``_track_flag_persistence``).
+        threshold: Minimum count to be considered stale.  Defaults to
+            ``STAGE2_FLAG_PERSISTENCE_THRESHOLD`` (3).
+
+    Returns:
+        Sorted list of flag_id strings that meet or exceed the threshold.
+    """
+    return sorted(fid for fid, count in persistence_counts.items() if count >= threshold)
+
+
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
