@@ -4588,3 +4588,60 @@ async def test_stage3_payload_for_reify_emits_reify_root(
         f'Stage 3 payload for project_id={project_id!r} must not contain '
         f'dark-factory path — cross-contamination guard (task 1143)'
     )
+
+
+# ── step-19: UnknownProjectError tests ────────────────────────────────────────
+
+class TestUnknownProjectError:
+    """Tests for the UnknownProjectError exception class (task 1143 step-19/20).
+
+    These tests fail before step-20 with ImportError because UnknownProjectError
+    does not yet exist in fused_memory.reconciliation.harness.
+    """
+
+    def test_unknown_project_error_is_value_error_subclass(self):
+        """UnknownProjectError must subclass ValueError for backward-compat.
+
+        Any existing or future ``except ValueError`` callsite (test code, callers
+        of ``_known_project_root_for``) must continue to match after step-20.
+        """
+        from fused_memory.reconciliation.harness import UnknownProjectError  # noqa: F401
+
+        assert issubclass(UnknownProjectError, ValueError) is True, (
+            'UnknownProjectError must subclass ValueError for backward-compat '
+            '(task 1143 step-20)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_known_project_root_for_raises_unknown_project_error_specifically(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """_known_project_root_for raises UnknownProjectError (not bare ValueError).
+
+        After step-20, the narrow exception type lets _project_loop distinguish
+        a KNOWN_PROJECT_ROOTS misconfiguration from generic ValueErrors raised by
+        stages (e.g. watermark/stage project_id mismatch, unset limits).
+        """
+        from fused_memory.reconciliation.harness import UnknownProjectError
+
+        harness = _make_harness_with_known_projects(
+            journal, event_buffer, mock_memory_service,
+            {'dark_factory': '/home/leo/src/dark-factory'},
+        )
+
+        with pytest.raises(UnknownProjectError) as exc_info:
+            harness._known_project_root_for('not_a_real_project')
+
+        # Subclass relationship — must also satisfy bare ValueError catches
+        assert isinstance(exc_info.value, ValueError) is True, (
+            'UnknownProjectError must be an instance of ValueError '
+            '(task 1143 step-20 backward-compat)'
+        )
+
+        err_msg = str(exc_info.value)
+        assert 'not_a_real_project' in err_msg, (
+            f'Error message must include the unknown project_id; got: {err_msg!r}'
+        )
+        assert 'dark_factory' in err_msg, (
+            f'Error message must include known project_ids; got: {err_msg!r}'
+        )
