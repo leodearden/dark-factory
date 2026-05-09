@@ -3978,3 +3978,104 @@ class TestComputeStaleFlags:
             STAGE2_FLAG_PERSISTENCE_THRESHOLD,
         )
         assert STAGE2_FLAG_PERSISTENCE_THRESHOLD == 3
+
+
+class TestTrackFlagPersistence:
+    """_track_flag_persistence writes markers and returns cycle counts."""
+
+    def _make_prior(self, flag_id):
+        """Return a SimpleNamespace that looks like a Mem0 MemoryResult for a prior marker."""
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=f'marker-{flag_id}',
+            content=f'Stage 2 flag-persistence marker: flag_id={flag_id}',
+            metadata={'source': 'stage2_persistence_marker', 'flag_id': flag_id},
+        )
+
+    @pytest.mark.asyncio
+    async def test_writes_marker_and_returns_prior_plus_one(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
+        memory_service = AsyncMock()
+        # 2 prior markers for flag-A
+        memory_service.search.return_value = [self._make_prior('flag-A'), self._make_prior('flag-A')]
+        memory_service.add_memory.return_value = {'memory_ids': ['new-marker-1']}
+
+        result = await _track_flag_persistence(memory_service, 'reify', 'run-1', ['flag-A'])
+
+        assert result == {'flag-A': 3}  # 2 prior + 1 (this cycle)
+        memory_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_search_called_with_categories_and_flag_id(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
+        memory_service = AsyncMock()
+        memory_service.search.return_value = []
+        memory_service.add_memory.return_value = {'memory_ids': []}
+
+        await _track_flag_persistence(memory_service, 'proj', 'run-2', ['flag-B'])
+
+        call = memory_service.search.call_args
+        assert call is not None
+        kwargs = call.kwargs
+        assert kwargs.get('categories') == ['observations_and_summaries'] or \
+            ['observations_and_summaries'] in call.args
+        # query must reference the flag id
+        query_arg = kwargs.get('query') or (call.args[0] if call.args else '')
+        assert 'flag-B' in str(query_arg) or 'flag-B' in str(call.args)
+
+    @pytest.mark.asyncio
+    async def test_add_memory_called_with_persistence_marker_metadata(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
+        memory_service = AsyncMock()
+        memory_service.search.return_value = []
+        memory_service.add_memory.return_value = {'memory_ids': ['m1']}
+
+        await _track_flag_persistence(memory_service, 'proj', 'run-3', ['flag-C'])
+
+        call = memory_service.add_memory.call_args
+        assert call is not None
+        kwargs = call.kwargs
+        meta = kwargs.get('metadata', {})
+        assert meta.get('source') == 'stage2_persistence_marker'
+        assert meta.get('flag_id') == 'flag-C'
+        assert meta.get('run_id') == 'run-3'
+
+    @pytest.mark.asyncio
+    async def test_search_failure_degrades_to_count_1(self, caplog):
+        """On search failure, prior count is 0, so this cycle count = 1."""
+        import logging
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
+        memory_service = AsyncMock()
+        memory_service.search.side_effect = RuntimeError('Mem0 down')
+        memory_service.add_memory.return_value = {'memory_ids': []}
+
+        with caplog.at_level(logging.WARNING):
+            result = await _track_flag_persistence(memory_service, 'proj', 'run-4', ['flag-D'])
+
+        assert result == {'flag-D': 1}
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_add_memory_failure_still_returns_count(self, caplog):
+        import logging
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [self._make_prior('flag-E')]
+        memory_service.add_memory.side_effect = RuntimeError('write failed')
+
+        with caplog.at_level(logging.WARNING):
+            result = await _track_flag_persistence(memory_service, 'proj', 'run-5', ['flag-E'])
+
+        assert result == {'flag-E': 2}  # 1 prior + 1
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_empty_flag_ids_returns_empty_no_calls(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _track_flag_persistence
+        memory_service = AsyncMock()
+
+        result = await _track_flag_persistence(memory_service, 'proj', 'run-6', [])
+
+        assert result == {}
+        memory_service.search.assert_not_awaited()
+        memory_service.add_memory.assert_not_awaited()
