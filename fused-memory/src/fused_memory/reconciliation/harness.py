@@ -800,11 +800,15 @@ class ReconciliationHarness:
 
             except asyncio.CancelledError:
                 raise  # Propagate shutdown
-            except ValueError as e:
+            except UnknownProjectError as e:
                 # task 1143: KNOWN_PROJECT_ROOTS misconfiguration — fail fast, no retry.
-                # A ValueError from _known_project_root_for indicates the project_id has
-                # no registry entry.  Retrying every 5 s would spam logs; return instead
-                # so run_loop can log the task failure once rather than on every cycle.
+                # Catching the narrow UnknownProjectError (not bare ValueError) ensures
+                # generic ValueErrors from stages fall through to the except Exception
+                # retry path below:
+                #   - stages/base.py: watermark↔stage project_id mismatch (transient
+                #     during instance handover; naturally recoverable next cycle)
+                #   - stages/memory_consolidator.py: unset episode_limit/memory_limit
+                #     (programming bug; should surface and retry, not abort the loop)
                 logger.error(
                     f'Project loop aborting for {project_id}: misconfiguration — {e}. '
                     f'Set DASHBOARD_KNOWN_PROJECT_ROOTS to include this project (task 1143).'
