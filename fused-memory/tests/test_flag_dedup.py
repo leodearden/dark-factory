@@ -1487,3 +1487,118 @@ class TestBuildSuppressionPayload:
         payload = build_suppression_payload(42)
         assert 'project_id' not in payload
         assert 'project_id' not in payload.get('metadata', {})
+
+
+# ---------------------------------------------------------------------------
+# write_suppression_record tests (task-1185 step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteSuppressionRecord:
+    """Async tests for write_suppression_record(memory_service, *, project_id, task_id, causation_id).
+
+    All tests import write_suppression_record inside the test body so collection
+    does not fail before step-4 lands.  Each test uses an AsyncMock memory_service.
+    """
+
+    @pytest.mark.asyncio
+    async def test_calls_add_memory_with_canonical_payload_kwargs(self):
+        """(a) add_memory called once with correct canonical schema kwargs."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['supp-1'])
+        )
+        await write_suppression_record(memory_service, project_id='p', task_id=42)
+
+        memory_service.add_memory.assert_called_once()
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs['content'] == 'STAGE 1 FLAG SUPPRESSION task_id=42'
+        assert kwargs['category'] == 'observations_and_summaries'
+        assert kwargs['metadata'] == {'kind': 'stage1_flag_suppression', 'task_id': 42}
+
+    @pytest.mark.asyncio
+    async def test_passes_project_id_through(self):
+        """(b) project_id is forwarded to add_memory."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['supp-1'])
+        )
+        await write_suppression_record(memory_service, project_id='autopilot_video', task_id=42)
+
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs['project_id'] == 'autopilot_video'
+
+    @pytest.mark.asyncio
+    async def test_passes_causation_id_through_when_provided(self):
+        """(c) causation_id is forwarded when explicitly provided."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['supp-1'])
+        )
+        await write_suppression_record(
+            memory_service, project_id='p', task_id=42, causation_id='recon-run-99'
+        )
+
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs['causation_id'] == 'recon-run-99'
+
+    @pytest.mark.asyncio
+    async def test_omits_causation_id_when_not_provided(self):
+        """(d) causation_id is None when not provided."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['supp-1'])
+        )
+        await write_suppression_record(memory_service, project_id='p', task_id=42)
+
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs.get('causation_id') is None
+
+    @pytest.mark.asyncio
+    async def test_uses_distinct_source_sentinel(self):
+        """(e) _source='stage1_flag_suppression' distinguishes from stage1_flag_dedup/targeted_recon."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['supp-1'])
+        )
+        await write_suppression_record(memory_service, project_id='p', task_id=42)
+
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs['_source'] == 'stage1_flag_suppression'
+
+    @pytest.mark.asyncio
+    async def test_returns_add_memory_response(self):
+        """(f) returns the AddMemoryResponse from the memory_service."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        expected = AddMemoryResponse(memory_ids=['supp-1'])
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(return_value=expected)
+        result = await write_suppression_record(memory_service, project_id='p', task_id=42)
+
+        assert result.memory_ids == ['supp-1']
+
+    @pytest.mark.asyncio
+    async def test_coerces_str_task_id(self):
+        """(g) passing task_id='42' produces metadata.task_id == 42 (int)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['supp-1'])
+        )
+        await write_suppression_record(memory_service, project_id='p', task_id='42')
+
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['task_id'] == 42
+        assert isinstance(kwargs['metadata']['task_id'], int)
