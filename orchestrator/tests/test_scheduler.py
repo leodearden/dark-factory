@@ -1679,7 +1679,7 @@ class TestDispatchCooldownGate:
             or 'suppressed' in r.getMessage().lower()
         ]
         assert not noisy_records, (
-            f'Cooldown log must not fire for deps-blocked tasks; got: '
+            'Cooldown log must not fire for deps-blocked tasks; got: '
             + ', '.join(r.getMessage() for r in noisy_records)
         )
 
