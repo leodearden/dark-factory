@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
+    StageId,
     StageReport,
     Watermark,
 )
@@ -26,6 +27,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
@@ -90,6 +92,67 @@ def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
         return True
     content = flag.get('content', '')
     return any(marker in content for marker in _KNOWN_BUG_1139_CONTENT_MARKERS)
+
+
+def _suppress_same_run_human_operator_dups(
+    stage2_flagged: list[dict],
+    stage1_flagged: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Partition *stage2_flagged* into (kept, suppressed) by comparing against Stage 1.
+
+    A Stage 2 item is **suppressed** iff ALL of the following hold:
+
+    1. The Stage 2 item has ``resolution_status == 'human_operator_required'``.
+    2. Stage 1 has an item with the **same** ``(task_id, flag_type)`` pair whose
+       ``resolution_status`` is also ``'human_operator_required'``.
+
+    In other words, this filter enforces the 3-tuple
+    ``(task_id, flag_type, resolution_status='human_operator_required')``
+    deduplication described in task 1154, but expresses the ``resolution_status``
+    constraint as a predicate on both sides rather than as a key dimension.
+    This mirrors the established ``compute_flag_signature`` convention in
+    ``flag_dedup.py``, which uses a 2-tuple ``(task_id, flag_type)`` key
+    and treats ``None`` values as a "skip this entry" sentinel.
+
+    **str() coercion**: ``task_id`` and ``flag_type`` are coerced via ``str()``
+    when building or looking up keys.  LLM output frequently emits ``task_id``
+    as an integer in some cycles and as a string in others; without coercion,
+    ``42 != '42'`` would silently miss duplicates.
+
+    **None-skip rule**: Stage 1 entries where ``task_id`` or ``flag_type`` is
+    ``None`` (absent from the dict) form no key and therefore can never suppress
+    any Stage 2 item.  Falsy-but-valid values like ``task_id=0`` or
+    ``flag_type=''`` *do* form valid keys (matching ``compute_flag_signature``).
+
+    Args:
+        stage2_flagged: The ``items_flagged`` list from Stage 2's ``StageReport``.
+        stage1_flagged: The ``items_flagged`` list from Stage 1's ``StageReport``.
+
+    Returns:
+        ``(kept, suppressed)`` — two lists that together partition *stage2_flagged*.
+    """
+    # Build the set of (task_id, flag_type) keys from Stage 1 entries that are
+    # human_operator_required AND have both fields present.  Delegates key
+    # construction to compute_flag_signature so the coercion logic stays in
+    # one place and both modules stay in sync if it ever changes.
+    stage1_hor_keys: set[tuple[str, str]] = {
+        sig
+        for item in stage1_flagged
+        if item.get('resolution_status') == 'human_operator_required'
+        and (sig := compute_flag_signature(item)) is not None
+    }
+
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for item in stage2_flagged:
+        if item.get('resolution_status') == 'human_operator_required':
+            sig = compute_flag_signature(item)
+            if sig is not None and sig in stage1_hor_keys:
+                suppressed.append(item)
+                continue
+        kept.append(item)
+
+    return kept, suppressed
 
 
 async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
@@ -388,10 +451,52 @@ class TaskKnowledgeSync(BaseStage):
         run_id: str,
         model: str | None = None,
     ) -> StageReport:
-        """Capture run_id, run briefing-refresh hook, then delegate to BaseStage.run()."""
+        """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
+        apply the same-run Stage 1 human_operator_required dedup post-processor.
+
+        Post-processing: after ``super().run()`` returns, any Stage 2 items whose
+        ``(task_id, flag_type, resolution_status='human_operator_required')`` 3-tuple
+        matches a Stage 1 item flagged ``human_operator_required`` in the same run are
+        dropped from ``report.items_flagged``.  An INFO log
+        ``reconciliation.stage2_suppressed_stage1_dup_flags`` is emitted whenever
+        suppressions fire, and ``report.stats['stage2_stage1_dups_suppressed']`` records
+        the suppressed count so downstream consumers can reconcile the count against the
+        LLM's own ``flagged_count``.  The post-processor is a no-op when
+        ``prior_reports`` is empty, ``prior_reports[0].stage`` is not
+        ``memory_consolidator``, or Stage 1's ``items_flagged`` is empty.
+        """
         self._current_run_id = run_id
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
-        return await super().run(events, watermark, prior_reports, run_id, model=model)
+        report = await super().run(events, watermark, prior_reports, run_id, model=model)
+
+        # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
+        # Guard on stage identity so a future reorder of prior_reports doesn't
+        # accidentally dedup against the wrong stage (suggestion 3).
+        if (
+            prior_reports
+            and prior_reports[0].stage == StageId.memory_consolidator
+            and prior_reports[0].items_flagged
+        ):
+            kept, suppressed = _suppress_same_run_human_operator_dups(
+                report.items_flagged,
+                prior_reports[0].items_flagged,
+            )
+            if suppressed:
+                logger.info(
+                    'reconciliation.stage2_suppressed_stage1_dup_flags',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': self.project_id,
+                        'suppressed_count': len(suppressed),
+                    },
+                )
+                report.items_flagged = kept
+                # Record the suppressed count in stats so downstream consumers
+                # (Stage 3 prompt, observability) can reconcile items_flagged
+                # length against the LLM's own flagged_count (suggestion 2).
+                report.stats['stage2_stage1_dups_suppressed'] = len(suppressed)
+
+        return report
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
