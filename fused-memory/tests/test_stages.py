@@ -4194,3 +4194,114 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         )
         assert project_id_used == 'reify', \
             f'search must be called with project_id="reify", got: {project_id_used}'
+
+
+class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
+    """Scope filter suppresses task-1139/bug-mechanics flags from Mem0 active-query path."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='reify')
+
+    def _make_flag(self, flag_id, content, task_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=flag_id,
+            content=content,
+            metadata={'flag_for_stage2': True, 'task_id': task_id},
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_742_flag_passes_through(self, mock_deps, watermark):
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['memory_service'].search.return_value = [
+            self._make_flag('mem-742', 'legitimate finding for task 742', '742'),
+            self._make_flag('mem-1139', 'some flag for task 1139', '1139'),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+
+        assert 'legitimate finding for task 742' in section, \
+            'task 742 flag must appear in the payload'
+
+    @pytest.mark.asyncio
+    async def test_task_1139_flag_suppressed(self, mock_deps, watermark):
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['memory_service'].search.return_value = [
+            self._make_flag('mem-1139', 'some flag for task 1139', '1139'),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+
+        assert 'some flag for task 1139' not in section, \
+            'task_id=1139 flags must be suppressed by the scope filter'
+
+    @pytest.mark.asyncio
+    async def test_bug_mechanics_content_suppressed(self, mock_deps, watermark):
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        bug_content = (
+            'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2 '
+            'but does NOT include them in flagged_items'
+        )
+        mock_deps['memory_service'].search.return_value = [
+            self._make_flag('mem-bug', bug_content, ''),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+
+        assert bug_content not in section, \
+            'Bug-mechanics content must be suppressed by scope filter'
+
+    @pytest.mark.asyncio
+    async def test_stage1_items_flagged_for_task_1139_not_suppressed(self, mock_deps, watermark):
+        """Stage 1 structured-output flags for task 1139 are NOT filtered.
+        The scope filter only applies to the Mem0 active-query path."""
+        from datetime import UTC, datetime
+        from fused_memory.models.reconciliation import StageReport
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[
+                {'task_id': '1139', 'flag_type': 'assumption_invalid',
+                 'description': 'stage1 emitted this intentionally for 1139'},
+            ],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+
+        assert 'stage1 emitted this intentionally for 1139' in section, \
+            'Stage 1 items_flagged are never scope-filtered; only Mem0 active-query flags are'
