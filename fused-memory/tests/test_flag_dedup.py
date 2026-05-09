@@ -816,6 +816,89 @@ async def test_dedup_flags_add_memory_exception_does_not_raise_and_warns(caplog)
 
 
 # ---------------------------------------------------------------------------
+# task-1165 step-5 — HIT path: deterministic prior-marker selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_orders():
+    """HIT path: prior selection must be deterministic regardless of search return order.
+
+    Builds three priors with ids 'aaa', 'mmm', 'zzz' and distinct run_ids.
+    Runs dedup_flags twice with different search return orders:
+    - Run 1: search returns [zzz, aaa, mmm]
+    - Run 2: search returns [mmm, zzz, aaa]
+
+    Both runs must:
+    - annotate persisted_from_run='r-aaa' (lowest-id-lex prior wins)
+    - have the FIRST delete_memory call target memory_id='aaa'
+
+    Today this fails because priors[0] reflects search order.
+    """
+
+    def _prior(id_: str, run_id: str) -> MagicMock:
+        r = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '99',
+            'flag_type': 'stale_metadata',
+            'run_id': run_id,
+            'last_seen_run_id': run_id,
+        })
+        r.id = id_
+        return r
+
+    prior_aaa = _prior('aaa', 'r-aaa')
+    prior_mmm = _prior('mmm', 'r-mmm')
+    prior_zzz = _prior('zzz', 'r-zzz')
+
+    flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'test'}]
+
+    # Run 1: search returns [zzz, aaa, mmm] — aaa is NOT first
+    memory_service_1 = AsyncMock()
+    memory_service_1.search = AsyncMock(return_value=[prior_zzz, prior_aaa, prior_mmm])
+    memory_service_1.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service_1.delete_memory = AsyncMock(return_value=None)
+
+    result_1 = await __import__('fused_memory.reconciliation.flag_dedup', fromlist=['dedup_flags']).dedup_flags(
+        memory_service=memory_service_1,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # Run 2: search returns [mmm, zzz, aaa] — different order
+    memory_service_2 = AsyncMock()
+    memory_service_2.search = AsyncMock(return_value=[prior_mmm, prior_zzz, prior_aaa])
+    memory_service_2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service_2.delete_memory = AsyncMock(return_value=None)
+
+    result_2 = await __import__('fused_memory.reconciliation.flag_dedup', fromlist=['dedup_flags']).dedup_flags(
+        memory_service=memory_service_2,
+        project_id='p',
+        run_id='r2',
+        flags=flags,
+    )
+
+    # Both runs should annotate with 'r-aaa' (lowest lex id = 'aaa')
+    assert result_1[0]['persisted_from_run'] == 'r-aaa', (
+        f"Run 1: expected persisted_from_run='r-aaa' but got {result_1[0].get('persisted_from_run')!r}"
+    )
+    assert result_2[0]['persisted_from_run'] == 'r-aaa', (
+        f"Run 2: expected persisted_from_run='r-aaa' but got {result_2[0].get('persisted_from_run')!r}"
+    )
+
+    # First delete in each run must target 'aaa'
+    first_delete_1 = memory_service_1.delete_memory.call_args_list[0].kwargs.get('memory_id')
+    assert first_delete_1 == 'aaa', (
+        f"Run 1: expected first delete to target 'aaa' but got {first_delete_1!r}"
+    )
+    first_delete_2 = memory_service_2.delete_memory.call_args_list[0].kwargs.get('memory_id')
+    assert first_delete_2 == 'aaa', (
+        f"Run 2: expected first delete to target 'aaa' but got {first_delete_2!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # task-1165 step-3 — MISS path: respects add_memory response memory_ids
 # ---------------------------------------------------------------------------
 
