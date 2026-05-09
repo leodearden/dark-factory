@@ -1062,7 +1062,7 @@ class TestCloseLogsExceptions:
         )
         record = error_records[0]
         assert 'MemoryService.close' in record.message
-        assert log_fragment in record.message
+        assert f'{log_fragment}.close failed' in record.message
         # logger.exception sets exc_info — verify traceback is captured
         assert record.exc_info is not None, (
             'Expected exc_info to be populated (use logger.exception, not logger.error)'
