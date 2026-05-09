@@ -230,4 +230,18 @@ volume and diagnose systemic failures in the flag-relay pipeline.
 Stale flags require human investigation. Do not attempt to silently resolve them by \
 re-acting on the same content — escalate (and delete) so an operator can diagnose the \
 root cause without being spammed by repeat alarms.
+
+## Same-Run Stage 1 human_operator_required Suppression
+Do not re-emit a finding already marked `human_operator_required` by Stage 1 in the \
+same run unless Stage 2 has new evidence not present in Stage 1's description. If the \
+flag recurs across runs, increment a `recurrence_count` in the existing memory marker \
+instead of writing a new finding.
+
+The Python harness enforces this dedup as defence-in-depth: after the LLM returns, \
+the post-processor drops any Stage 2 item whose `(task_id, flag_type, \
+resolution_status='human_operator_required')` 3-tuple matches a Stage 1 item flagged \
+`human_operator_required` in the same run. This means the final report delivered to \
+Stage 3 may contain fewer items than the LLM emitted — this is intentional, not an \
+error. The mechanism mirrors task 1146's Stage 1 atomic-replacement pattern, applying \
+the same defence-in-depth principle on the Stage 2 emission side.
 """
