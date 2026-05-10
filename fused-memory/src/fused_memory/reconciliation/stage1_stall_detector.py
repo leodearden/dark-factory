@@ -41,6 +41,19 @@ Stall marker accumulation:
   considered lower than the complexity of a cleanup hook.  If per-episode
   isolation is needed in future, scope the count to a time window via
   additional metadata filters on ``count_memories_by_metadata``.
+
+Dedup interaction:
+  ``dedup_flags(...)`` runs in ``stages/memory_consolidator.py`` (lines 71-76)
+  **before** ``extract_human_operator_task_ids`` is called at line 84.  A
+  ``human_operator_required`` flag suppressed by dedup that cycle is therefore
+  invisible to ``extract_human_operator_task_ids``, so
+  ``track_human_operator_stalls`` does NOT bump the stall counter for that
+  cycle.  The ``STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD = 5`` consequently counts
+  *"cycles where the flag survived dedup"*, not *"consecutive real stall
+  cycles"*.  A genuinely-stalled task can therefore take materially more than 5
+  cycles to escalate if dedup intermittently suppresses its flag.  This is
+  intentional / accepted behaviour (option (a) from the original review) — no
+  behaviour change in this task.
 """
 
 from __future__ import annotations
