@@ -16,7 +16,6 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
-import re
 from pathlib import Path
 from typing import IO, Literal, overload
 
@@ -589,21 +588,13 @@ async def test_startup_nudge_emitted_once_across_two_constructions(
         f'Expected exactly 1 startup nudge across 2 constructions; '
         f'got {len(nudge_records)}: {[r.getMessage() for r in nudge_records]}'
     )
-    # Verify the %d placeholder in '(%d project(s))' was substituted with the
-    # actual project count.  Anchoring the regex on the parenthesized fragment
-    # (rather than substring-checking the whole message) defends against false
-    # matches from unrelated digits in the message — e.g. the literal 'task 1164'
-    # at the end would satisfy a bare substring check for counts in
-    # {1, 4, 6, 11, 14, 16, 64, 116, 164, 1164}.
-    formatted = nudge_records[0].getMessage()
-    match = re.search(r'\((\d+) project\(s\)\)', formatted)
-    assert match is not None, (
-        f'Expected parenthesized "(N project(s))" fragment in nudge message; '
-        f'got: {formatted!r}'
-    )
-    assert int(match.group(1)) == len(j1._known_projects), (
-        f'Expected substituted project count {len(j1._known_projects)} in '
-        f'parenthesized fragment; got {match.group(1)!r} from message: {formatted!r}'
+    # Verify the %d argument was actually passed to the logger (not pre-formatted
+    # into the message string) and equals the project count.  LogRecord.args[0]
+    # gives the raw integer directly — no string parsing, no digit collisions
+    # with unrelated tokens in the log message (e.g. task references).
+    assert nudge_records[0].args[0] == len(j1._known_projects), (
+        f'Expected logger arg {len(j1._known_projects)} but got '
+        f'{nudge_records[0].args[0]!r}'
     )
 
 
