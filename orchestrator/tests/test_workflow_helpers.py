@@ -132,3 +132,55 @@ def test_test_workflow_e2e_uses_canonical_helpers() -> None:
         'test_workflow_e2e._make_status_setting_steward must be re-exported from _workflow_helpers, '
         'not redefined locally — duplicate definitions diverge silently'
     )
+
+
+# ---------------------------------------------------------------------------
+# Source-content test — test_workflow_status_on_resume must not cross-import
+# ---------------------------------------------------------------------------
+
+
+def test_status_on_resume_uses_workflow_helpers_not_e2e() -> None:
+    """test_workflow_status_on_resume.py must import from _workflow_helpers, not test_workflow_e2e.
+
+    Uses the same re.compile(...).search(...) pattern as
+    tests/scripts/test_pytest_workspace_collection.py to enforce module decoupling.
+    Asserts:
+      (a) 'from _workflow_helpers import' is present
+      (b) 'from test_workflow_e2e import' is absent
+      (c) orchestrator imports come after _workflow_helpers import (first-party-last)
+    """
+    import re  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    source = (Path(__file__).parent / 'test_workflow_status_on_resume.py').read_text()
+
+    # Positive: must import from _workflow_helpers
+    assert re.search(r'^from _workflow_helpers import\b', source, re.MULTILINE), (
+        'test_workflow_status_on_resume.py must import workflow fakes from '
+        '_workflow_helpers (the canonical source). Cross-test-file imports are '
+        'fragile — see task 1195.'
+    )
+
+    # Negative: must not cross-import from sibling test module
+    assert not re.search(r'^from test_workflow_e2e import\b', source, re.MULTILINE), (
+        'test_workflow_status_on_resume.py must NOT import from sibling test module '
+        'test_workflow_e2e. Use _workflow_helpers instead. Task 1195 extracted the '
+        'shared helpers to break this coupling.'
+    )
+
+    # Ordering: orchestrator imports must come after _workflow_helpers import
+    lines = source.splitlines()
+    helpers_line = next(
+        (i for i, ln in enumerate(lines) if re.match(r'^from _workflow_helpers import\b', ln)),
+        None,
+    )
+    orchestrator_line = next(
+        (i for i, ln in enumerate(lines) if re.match(r'^from orchestrator\b', ln)),
+        None,
+    )
+    if helpers_line is not None and orchestrator_line is not None:
+        assert orchestrator_line > helpers_line, (
+            'orchestrator imports must come AFTER _workflow_helpers import in '
+            'test_workflow_status_on_resume.py (first-party-orchestrator-last grouping). '
+            f'_workflow_helpers at line {helpers_line + 1}, orchestrator at line {orchestrator_line + 1}.'
+        )
