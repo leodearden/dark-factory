@@ -8,6 +8,7 @@ test_workflow_e2e.py (task 1195).
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import pytest
 from escalation.queue import EscalationQueue
@@ -72,7 +73,7 @@ async def test_fake_briefing_smoke() -> None:
     assert isinstance(arch_prompt, str) and arch_prompt, 'architect prompt must be non-empty'
 
 
-def test_make_resolving_steward_returns_class(tmp_path: pytest.TempPathFactory) -> None:
+def test_make_resolving_steward_returns_class(tmp_path: Path) -> None:
     """_make_resolving_steward returns a class with async start/stop methods."""
     from _workflow_helpers import _make_resolving_steward  # noqa: PLC0415
 
@@ -83,7 +84,7 @@ def test_make_resolving_steward_returns_class(tmp_path: pytest.TempPathFactory) 
     assert inspect.iscoroutinefunction(steward_cls.stop), 'stop must be an async method'
 
 
-def test_make_status_setting_steward_returns_class(tmp_path: pytest.TempPathFactory) -> None:
+def test_make_status_setting_steward_returns_class(tmp_path: Path) -> None:
     """_make_status_setting_steward returns a class with async start/stop methods."""
     from _workflow_helpers import (  # noqa: PLC0415
         FakeScheduler,
