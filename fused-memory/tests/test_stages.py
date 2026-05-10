@@ -3805,6 +3805,7 @@ class TestBriefingKnownGapsRefresh:
             {'id': 123},
             {'id': True},
             {'id': '   '},
+            {'id': '  100  '},
         ],
         ids=[
             'none',
@@ -3815,6 +3816,7 @@ class TestBriefingKnownGapsRefresh:
             'int_not_str',
             'id_bool',
             'id_whitespace',
+            'id_mixed_whitespace',
         ],
     )
     async def test_queue_refresh_tasks_treats_unexpected_shape_as_failure(
