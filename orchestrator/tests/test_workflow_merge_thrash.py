@@ -229,47 +229,6 @@ async def test_metadata_persistence_failure_is_non_fatal():
     f.mark_blocked.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_dropped_plan_targets_excluded_from_thrash_counter():
-    """Fix 2 short-circuits dropped_plan_targets → never enters thrash counter.
-
-    The thrash helper is only called from the merge-phase loop after
-    _submit_to_merge_queue returns REQUEUED.  The drop-guard reason
-    routes through _mark_blocked(escalate_to_human=True), which returns
-    BLOCKED — the loop's ``if merge_outcome != WorkflowOutcome.REQUEUED:
-    return merge_outcome`` short-circuit fires before the thrash check.
-
-    Pin this contract so a future refactor can't accidentally route
-    dropped_plan_targets through the steward path and let it accumulate
-    in this counter.
-    """
-    # Inspect the source of _submit_to_merge_queue: it must short-circuit on
-    # the drop-guard prefix before the steward / thrash path.
-    import inspect
-
-    from orchestrator.merge_queue import (
-        DROPPED_PLAN_TARGETS_REASON_PREFIX,
-        MergeOutcome,
-    )
-    from orchestrator.workflow import TaskWorkflow
-    src = inspect.getsource(TaskWorkflow._submit_to_merge_queue)
-    assert 'DROPPED_PLAN_TARGETS_REASON_PREFIX' in src, (
-        '_submit_to_merge_queue must reference the drop-guard prefix to '
-        'short-circuit before the merge-thrash path'
-    )
-    assert 'escalate_to_human=True' in src, (
-        '_submit_to_merge_queue must call _mark_blocked(escalate_to_human=True) '
-        'on the drop-guard short-circuit so it cannot return REQUEUED'
-    )
-
-    # And confirm the prefix matches what the merge worker actually emits,
-    # so the short-circuit is wired to the same string production-side.
-    sample_outcome = MergeOutcome(
-        'blocked',
-        reason=f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: foo.py. extra context',
-    )
-    assert sample_outcome.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX)
-
 
 @pytest.mark.asyncio
 async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
