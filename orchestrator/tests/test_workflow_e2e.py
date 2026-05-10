@@ -1607,6 +1607,57 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
     return _FakeSteward
 
 
+def _make_resolve_then_dismiss_chained_steward(
+    queue: EscalationQueue, task_id: str,
+) -> type:
+    """Steward that RESOLVES the workflow's pending L0(s), then submits a
+    follow-on L0 of its own (e.g. ``infra_issue`` after handling a
+    ``task_failure``) and DISMISSES it with terminate=True.
+
+    Mirrors the live failure mode that drove the broadened guard: the
+    steward chains a fresh L0 and gives up on it.  ``get_by_task(...,
+    level=0, status='pending')`` after ``start()`` returns no pending
+    entries (chained one is dismissed), so the post-steward
+    ``if not remaining:`` branch runs and the broadened window-scoped
+    guard must catch the dismissed chained L0 — even though it is NOT
+    the one the workflow itself submitted (``created_l0_id``).
+    """
+    from escalation.models import Escalation
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        async def start(self) -> None:
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            assert pending, 'expected at least one pending L0 escalation to chain off'
+            for esc in pending:
+                queue.resolve(
+                    esc.id, 'Resolved by FakeSteward (workflow L0)',
+                    resolved_by='fake-steward',
+                )
+            chained = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='steward',
+                severity='blocking',
+                category='infra_issue',
+                summary='Chained follow-on L0 from steward',
+                detail='steward identified a follow-on infra issue while resolving',
+            )
+            queue.submit(chained)
+            queue.resolve(
+                chained.id,
+                'Terminating cleanly — needs human triage',
+                dismiss=True, resolved_by='fake-steward',
+            )
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
 @pytest.mark.asyncio
 class TestTaskFailureEscalation:
     """Blocked tasks create escalation entries in the queue."""
@@ -2543,6 +2594,49 @@ class TestMarkBlockedFalseDoneGuard:
         # An L1 escalation must have been submitted.
         assert queue.has_open_l1(task_assignment.task_id), (
             'Fix A: L1 escalation must be open after steward dismisses-with-terminate'
+        )
+
+    async def test_steward_chained_l0_dismiss_blocks_with_l1(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Broadened Fix A: when the steward resolves the workflow's L0
+        cleanly but then submits a chained follow-on L0 (e.g. an
+        ``infra_issue`` raised during steward handling) and dismisses
+        THAT one with terminate=True, the workflow must still treat it
+        as "agent gives up" — submit an L1 and return BLOCKED rather
+        than re-pending the task.
+
+        Pins the window-scoped guard.  The narrow ``created_l0_id``
+        check from the original Fix A misses this case because the
+        dismissed L0 is NOT the one the workflow itself submitted.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        workflow._steward_factory = _make_resolve_then_dismiss_chained_steward(
+            queue, task_assignment.task_id,
+        )
+
+        outcome = await workflow._mark_blocked('architect produced no plan.json')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r} — broadened guard '
+            'should catch chained dismissed L0s, not just created_l0_id'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'blocked', (
+            f'Final status must be blocked (not requeued), got {statuses}'
+        )
+        assert queue.has_open_l1(task_assignment.task_id), (
+            'Broadened Fix A: L1 must be open after a chained L0 is '
+            'dismissed-with-terminate during the steward window'
         )
 
     async def test_steward_resolves_still_requeues_no_l1(
