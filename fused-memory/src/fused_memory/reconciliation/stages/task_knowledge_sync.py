@@ -183,6 +183,8 @@ async def _resolve_live_status(
     project_root: str,
     status_cache: dict[str, str] | None,
     op_name: str,
+    *,
+    _parsed_params: dict | None = None,
 ) -> tuple[str, str] | None:
     """Return (task_id, live_status) for a write_journal op, or None to skip it.
 
@@ -210,17 +212,24 @@ async def _resolve_live_status(
         op_name: Calling helper's name, embedded in WARNING log messages so
             existing log greps remain stable (e.g.
             'reconciliation._verify_set_task_status_post_action: ...').
+        _parsed_params: Optional pre-parsed params dict.  When provided, the
+            JSON-parse step is skipped entirely, avoiding a second
+            ``json.loads`` call in callers that already parsed params locally
+            (Guards 2 and 3).
     """
-    params_raw = op.get('params') or '{}'
-    try:
-        params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
-    except (json.JSONDecodeError, TypeError):
-        logger.warning(
-            'reconciliation.%s: failed to parse params JSON for op_id=%s; skipping',
-            op_name,
-            op.get('id'),
-        )
-        return None
+    if _parsed_params is not None:
+        params = _parsed_params
+    else:
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation.%s: failed to parse params JSON for op_id=%s; skipping',
+                op_name,
+                op.get('id'),
+            )
+            return None
 
     if op.get('operation') == 'add_memory':
         metadata = params.get('metadata') or {}
@@ -357,11 +366,17 @@ async def _verify_set_task_status_post_action(
         if op.get('operation') != 'set_task_status':
             continue
 
-        # Parse params locally to extract target_status (the helper returns task_id+live_status only)
+        # Parse params locally to extract target_status; pass pre-parsed dict to the
+        # helper to avoid a second json.loads call on the same small payload.
         params_raw = op.get('params') or '{}'
         try:
             params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
         except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._verify_set_task_status_post_action: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
             continue
         target_status = str(params.get('status', '')).strip()
         if not target_status:
@@ -373,6 +388,7 @@ async def _verify_set_task_status_post_action(
             project_root,
             status_cache,
             '_verify_set_task_status_post_action',
+            _parsed_params=params,
         )
         if resolved is None:
             continue
@@ -439,10 +455,16 @@ async def _check_stall_guard_freshness(
         # Parse params locally to check for snapshot_status / observed_status keys
         # before calling _resolve_live_status — this preserves the early-continue that
         # prevents get_task from being called when the op has no freshness key.
+        # The pre-parsed dict is then passed to the helper to avoid a second json.loads.
         params_raw = op.get('params') or '{}'
         try:
             params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
         except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation._check_stall_guard_freshness: '
+                'failed to parse params JSON for op_id=%s; skipping',
+                op.get('id'),
+            )
             continue
         metadata = params.get('metadata') or {}
         if not isinstance(metadata, dict):
@@ -463,6 +485,7 @@ async def _check_stall_guard_freshness(
             project_root,
             status_cache,
             '_check_stall_guard_freshness',
+            _parsed_params=params,
         )
         if resolved is None:
             continue

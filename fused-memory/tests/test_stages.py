@@ -5649,6 +5649,19 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert result == ('42', 'unknown')
 
         @pytest.mark.asyncio
+        async def test_returns_unknown_when_fallback_returns_dict_without_status(self):
+            """Dict get_task result with no 'status' key -> _extract_status fallback -> 'unknown'."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'id': '42'}  # dict, but no 'status' key
+            op = self._make_op(operation='update_task', params={'task_id': '42'})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', None,
+                '_classify_terminal_state_violations',
+            )
+            assert result == ('42', 'unknown')
+            taskmaster.get_task.assert_called_once_with('42', '/project')
+
+        @pytest.mark.asyncio
         async def test_returns_none_on_malformed_params_json(self, caplog):
             """Malformed params JSON -> returns None and emits WARNING containing op_name."""
             taskmaster = AsyncMock()
