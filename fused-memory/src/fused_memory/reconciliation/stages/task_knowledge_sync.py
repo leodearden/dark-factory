@@ -41,6 +41,7 @@ from fused_memory.reconciliation.prompts.stage2 import (
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    _id_key,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
@@ -1107,12 +1108,14 @@ class TaskKnowledgeSync(BaseStage):
                 filtered.done_tasks,
                 filtered.cancelled_tasks,
             )
-            excessive_ids = sorted(
-                int(t['id'])
-                for t in all_tasks
-                if isinstance(t.get('id'), (int, str))
-                and int(t['id']) > _AUTOPILOT_VIDEO_TASK_CEILING
-            )
+            # Use _id_key for dotted subtask IDs ('450.2' → 450); it returns 0
+            # on unparseable IDs, which falls below the ceiling and is ignored.
+            # Dedupe via set since a parent + its subtasks both yield the parent id.
+            excessive_ids = sorted({
+                pid
+                for pid in (_id_key(t) for t in all_tasks)
+                if pid > _AUTOPILOT_VIDEO_TASK_CEILING
+            })
             if excessive_ids:
                 logger.warning(
                     "reconciliation.stage2_contamination_guard_fires "
