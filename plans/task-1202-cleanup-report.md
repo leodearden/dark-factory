@@ -208,6 +208,75 @@ This pre-absent state will be formally audited in step-7 with DO-NOT-DELETE cont
 
 ---
 
+## Graphiti Deletions (Step 5)
+
+**Timestamp:** 2026-05-10T14:58 UTC
+
+### Pre-deletion state (from step-4 FalkorDB queries)
+
+All three TO-DELETE Graphiti edges were confirmed absent from FalkorDB via direct `COUNT` queries before deletion was attempted (count=0 for afcce6aa, 91043e4f, 86f14abc in both `dark_factory` and `dark-factory` graphs).
+
+### Deletion calls
+
+| UUID | delete_memory call | Response | Post-delete verification |
+|------|--------------------|----------|--------------------------|
+| `afcce6aa` | `store=graphiti, project_id=dark_factory` | `{"status":"deleted","store":"graphiti","id":"afcce6aa"}` | Semantic search returns no result for this prefix |
+| `91043e4f` | `store=graphiti, project_id=dark_factory` | `{"status":"deleted","store":"graphiti","id":"91043e4f"}` | Semantic search returns no result for this prefix |
+| `86f14abc` | `store=graphiti, project_id=dark_factory` | `{"status":"deleted","store":"graphiti","id":"86f14abc"}` | Semantic search returns no result for this prefix |
+
+All three delete calls returned `"status":"deleted"`. The fused-memory Graphiti delete layer processes the deletion idempotently (returns success even if the underlying FalkorDB STARTS WITH query showed count=0 before the call). The net result is the same: all three edges are confirmed absent from the knowledge graph.
+
+**PASS.** Three Graphiti contamination edges deleted (or confirmed absent). No escalation needed.
+
+---
+
+## Mem0 Deletions (Step 6)
+
+**Timestamp:** 2026-05-10T15:00 UTC
+
+### 562cb2dd eligibility verification
+
+Per plan design decision #6, task 1155 status must be confirmed `done` before deleting `562cb2dd`:
+
+```
+mcp__fused-memory__get_task(id=1155, project_root="/home/leo/src/dark-factory")
+→ status: "done", updatedAt: "2026-05-10T13:24:34.022Z"
+```
+
+**ELIGIBLE.** Task 1155 is done → `562cb2dd` is eligible for deletion.
+
+### Deletion calls
+
+| UUID | delete_memory call | Response | Analysis |
+|------|--------------------|----------|----------|
+| `46099c8e` | `store=mem0, project_id=dark_factory` | **ERROR 400:** "value 46099c8e is not a valid point ID, valid values are either an unsigned integer or a UUID" | 8-char prefix rejected by Qdrant |
+| `dbfcf1ec` | `store=mem0, project_id=dark_factory` | **ERROR 400:** "value dbfcf1ec is not a valid point ID" | 8-char prefix rejected by Qdrant |
+| `9d93845c` | `store=mem0, project_id=dark_factory` | **ERROR 400:** "value 9d93845c is not a valid point ID" | 8-char prefix rejected by Qdrant |
+| `a1c732a9` | `store=mem0, project_id=dark_factory` | **ERROR 400:** "value a1c732a9 is not a valid point ID" | 8-char prefix rejected by Qdrant |
+| `562cb2dd` | `store=mem0, project_id=dark_factory` | **ERROR 400:** "value 562cb2dd is not a valid point ID" | 8-char prefix rejected by Qdrant |
+
+All five Mem0 delete attempts returned `400 Bad Request` from Qdrant. The cleanup plan used 8-character UUID prefixes, but Qdrant requires full UUIDs for point-level operations.
+
+### Post-delete absence verification
+
+Qdrant paginated scroll (offset from `{prefix}-0000-0000-0000-000000000000`, all three dark_factory collections) confirmed **no points exist** with IDs matching these 8-character prefixes:
+
+| UUID | Qdrant collections searched | Result |
+|------|----------------------------|--------|
+| `46099c8e` | fused_dark_factory, fused_dark-factory, fused_-home-leo-src-dark-factory | **NOT FOUND** |
+| `dbfcf1ec` | all three | **NOT FOUND** |
+| `9d93845c` | all three | **NOT FOUND** |
+| `a1c732a9` | all three | **NOT FOUND** |
+| `562cb2dd` | all three | **NOT FOUND** |
+
+### Conclusion
+
+The five Mem0 markers are **confirmed absent** from all dark_factory Qdrant collections. The `400 Bad Request` errors reflect a tool limitation (8-char prefixes not valid Qdrant IDs), not a failure to find present entries. The cleanup goal (these entries must be absent) is already achieved. No escalation needed — the entries do not exist in the store.
+
+This pattern is consistent with the step-1 D1 discrepancy and the pre-absent state of all other cleanup targets found in step-4.
+
+---
+
 ## Restart (Step 2)
 
 **Command:** `bash scripts/restart-fused-memory.sh --drain`
