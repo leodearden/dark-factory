@@ -262,8 +262,13 @@ If you do choose to check: call \
 `search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
 categories=['observations_and_summaries'], stores=['mem0'], limit=50)` — \
 include `task_id=<N>` in the query string to bias vector ranking toward the \
-right record, and pin `categories`/`stores`/`limit` to avoid the default \
-`limit=10` silently missing the record on a busy project. Then inspect each \
+right record (the post-processor's bulk fetch uses the bare \
+`stage1_flag_suppression` query and filters by metadata afterward; \
+appending `task_id=<N>` here is a single-task optimisation), and pin \
+`categories`/`stores`/`limit` to avoid the default `limit=10` silently \
+missing the record on a busy project (`filter_suppressed` uses `limit=501` \
+for its project-wide sweep; 50 is sufficient here because `task_id=<N>` \
+biases ranking toward the one record you need). Then inspect each \
 result's metadata. A result is a valid suppression record ONLY when BOTH \
 `metadata.kind == "stage1_flag_suppression"` AND \
 `str(result.metadata.get('task_id')) == str(target_task_id)`. Do NOT rely on \
