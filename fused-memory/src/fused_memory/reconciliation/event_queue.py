@@ -569,17 +569,25 @@ class EventQueue:
         need the count, not the record contents.
 
         When *project_id* is ``None`` (the common/hot path), each file is
-        walked line-by-line and non-empty lines are counted directly — no
-        ``json.loads`` calls, no dict allocations.  When *project_id* is
-        provided, ``json.loads`` is called on each line to extract
-        ``event['project_id']`` for filtering; malformed lines are skipped
-        with a logged warning (same behaviour as :meth:`read_dead_letters`).
+        opened in binary mode and non-empty lines are counted in a single
+        forward pass — no ``json.loads`` calls, no dict allocations, and no
+        reverse-seek machinery.  **Note:** malformed JSON lines are counted
+        as records in this path (they are non-empty bytes), whereas
+        :meth:`read_dead_letters` skips them with a logged warning.  The
+        discrepancy is bounded by the rate of file corruption and is
+        acceptable for status reporting.
+
+        When *project_id* is provided, a forward binary scan with
+        ``json.loads`` per line is used to filter by
+        ``event['project_id']``; malformed lines are skipped with a logged
+        warning (same behaviour as :meth:`read_dead_letters`).
 
         Robustness contract mirrors :meth:`read_dead_letters`:
 
         - Per-file ``OSError`` is caught, logged, and the file is skipped.
-        - An outer ``except Exception`` catches anything unexpected and
-          returns ``0`` rather than propagating.
+        - An outer ``except Exception`` catches anything unexpected, logs at
+          ``error`` level so operators notice, and returns ``0`` rather than
+          propagating (since this is a health-check path).
 
         Args:
             project_id: When given, only records whose
@@ -599,25 +607,29 @@ class EventQueue:
                 if not path.exists():
                     continue
                 try:
-                    for line in _iter_lines_reversed(path):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if project_id is None:
-                            # Hot path: no json.loads needed — count non-empty lines.
-                            count += 1
-                        else:
-                            try:
-                                rec = json.loads(line)
-                            except json.JSONDecodeError as exc:
-                                logger.warning(
-                                    'EventQueue.count_dead_letters: malformed line in %s: %s',
-                                    path, exc,
-                                )
-                                continue
-                            event = rec.get('event') or {}
-                            if event.get('project_id') == project_id:
-                                count += 1
+                    if project_id is None:
+                        # Hot path: forward binary scan — count non-empty lines
+                        # without json.loads.  Order is irrelevant for counting.
+                        with path.open('rb') as f:
+                            count += sum(1 for line in f if line.strip())
+                    else:
+                        # Filter path: forward binary scan with json.loads.
+                        with path.open('rb') as f:
+                            for raw in f:
+                                line = raw.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    rec = json.loads(line)
+                                except json.JSONDecodeError as exc:
+                                    logger.warning(
+                                        'EventQueue.count_dead_letters: malformed line in %s: %s',
+                                        path, exc,
+                                    )
+                                    continue
+                                event = rec.get('event') or {}
+                                if event.get('project_id') == project_id:
+                                    count += 1
                 except OSError as exc:
                     logger.warning(
                         'EventQueue.count_dead_letters: cannot read %s: %s', path, exc,
@@ -625,7 +637,7 @@ class EventQueue:
                     continue
 
         except Exception as exc:
-            logger.warning(
+            logger.error(
                 'EventQueue.count_dead_letters: unexpected error: %s', exc,
             )
             return 0

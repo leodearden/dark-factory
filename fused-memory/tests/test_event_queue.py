@@ -989,8 +989,7 @@ def test_read_dead_letters_cross_file_ordering(tmp_path):
 # ── count_dead_letters ─────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_count_dead_letters_returns_zero_when_file_missing(tmp_path):
+def test_count_dead_letters_returns_zero_when_file_missing(tmp_path):
     """count_dead_letters returns 0 when the dead-letter file does not exist."""
     buf = AsyncMock()
     buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
