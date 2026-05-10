@@ -892,6 +892,95 @@ async def test_blocked_skips_hints_attached_on_interceptor_rejection(
     )
 
 
+@pytest.mark.asyncio
+async def test_blocked_treats_non_dict_response_as_failure(
+    reconciler, mock_memory_service, mock_taskmaster
+):
+    """When task_interceptor.update_task() returns None (non-dict), it must be treated
+    as a failure — not silently classified as success.
+
+    Under the old formula ``not (isinstance(resp, dict) and resp.get('error'))``,
+    ``None`` evaluates to success (the inner expression is False, outer not→True).
+    After the fix (``_interceptor_write_succeeded``), non-dicts always → False.
+
+    Assertions:
+    (1) interceptor.update_task called once.
+    (2) No 'hints_attached' in result['actions'].
+    (3) Exactly one 'hints_skipped' action with error='unknown' and reason=None.
+    (4) Journal contains exactly one 'skip' row with detail error='unknown'.
+    (5) Journal contains NO 'hints_attached' row.
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    mock_interceptor = _AsyncMock()
+    mock_interceptor.update_task = _AsyncMock(return_value=None)  # non-dict response
+    reconciler.task_interceptor = mock_interceptor
+
+    journal_spy = _AsyncMock()
+    reconciler.journal.add_run_action = journal_spy
+
+    mock_memory_service.search = _AsyncMock(return_value=[
+        MemoryResult(id='1', content='blocker info', source_store=SourceStore.mem0, entities=['EntityA']),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='42',
+        transition='blocked',
+        project_id='test-project',
+        project_root='/tmp/test',
+        task_before={'id': '42', 'title': 'Blocked task', 'status': 'in-progress'},
+    )
+
+    # (1) interceptor was called
+    mock_interceptor.update_task.assert_called_once()
+
+    # (2) no hints_attached action
+    hints_attached = [a for a in result.get('actions', []) if a.get('type') == 'hints_attached']
+    assert hints_attached == [], (
+        f'None response must NOT produce hints_attached; got: {result.get("actions", [])}'
+    )
+
+    # (3) exactly one hints_skipped with error='unknown'
+    hints_skipped = [a for a in result.get('actions', []) if a.get('type') == 'hints_skipped']
+    assert len(hints_skipped) == 1, (
+        f'Expected exactly one hints_skipped, got: {result.get("actions", [])}'
+    )
+    skip = hints_skipped[0]
+    assert skip.get('error') == 'unknown', (
+        f"Non-dict response must produce error='unknown', got: {skip}"
+    )
+    assert skip.get('reason') is None, (
+        f"Non-dict response must produce reason=None, got: {skip}"
+    )
+
+    # (4) journal must contain exactly one 'skip' row with error='unknown'
+    journal_skip_rows = [
+        c for c in journal_spy.call_args_list
+        if len(c.args) >= 4
+        and c.args[1] == 'skip'
+        and c.args[2] == 'taskmaster'
+        and c.args[3] == 'update_task'
+    ]
+    assert len(journal_skip_rows) == 1, (
+        f'Expected one journal skip row, got: {journal_skip_rows!r}'
+    )
+    detail = journal_skip_rows[0].args[4] if len(journal_skip_rows[0].args) >= 5 else {}
+    assert detail.get('error') == 'unknown', (
+        f"journal skip row must carry error='unknown', got: {detail}"
+    )
+
+    # (5) journal must NOT contain a hints_attached row
+    journal_hints_rows = [
+        c for c in journal_spy.call_args_list
+        if len(c.args) >= 5
+        and isinstance(c.args[4], dict)
+        and c.args[4].get('type') == 'hints_attached'
+    ]
+    assert journal_hints_rows == [], (
+        f'journal must not record hints_attached on None response; got: {journal_hints_rows}'
+    )
+
+
 class TestServerWiringContract:
     """step-34/35: TargetedReconciler.planned_episode_registry must be wired from
     MemoryService after MemoryService.initialize() creates it."""
