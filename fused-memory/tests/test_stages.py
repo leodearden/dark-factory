@@ -6780,3 +6780,23 @@ class TestPropagateEscalationQueueHelper:
             assert stage._escalation_queue is sentinel_queue, (
                 'Helper must not overwrite _escalation_queue when harness has no queue'
             )
+
+    def test_propagates_url_only_when_queue_is_none(self, minimal_harness):
+        """When only URL is set on harness, URL propagates but queue is left at pre-existing value."""
+        sentinel_queue = MagicMock()
+        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
+        minimal_harness._escalation_queue = None
+
+        stages = [
+            MagicMock(_escalation_url=None, _escalation_queue=sentinel_queue)
+            for _ in range(3)
+        ]
+        minimal_harness._propagate_escalation_queue(stages)
+
+        for stage in stages:
+            assert stage._escalation_url == 'http://test.local:9999/mcp', (
+                'Helper must propagate _escalation_url when harness has a URL'
+            )
+            assert stage._escalation_queue is sentinel_queue, (
+                'Helper must not overwrite _escalation_queue when harness queue is None'
+            )
