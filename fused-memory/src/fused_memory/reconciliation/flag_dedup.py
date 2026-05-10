@@ -353,7 +353,13 @@ def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
       - ``metadata.task_id = <N>`` (int — coerced by this function)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
-    tid = int(task_id)
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f'build_suppression_payload: task_id must be an int or numeric '
+            f'string, got {task_id!r}'
+        ) from e
     return {
         'content': f'STAGE 1 FLAG SUPPRESSION task_id={tid}',
         'category': 'observations_and_summaries',
