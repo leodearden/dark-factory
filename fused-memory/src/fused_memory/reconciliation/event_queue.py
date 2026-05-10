@@ -489,6 +489,18 @@ class EventQueue:
 
     # ── read dead-letters ──────────────────────────────────────────────
 
+    def _dead_letter_paths(self) -> list[Path]:
+        """Return the ordered list of dead-letter paths: current, then .1, .2 …
+
+        Both :meth:`read_dead_letters` and :meth:`count_dead_letters` enumerate
+        the same set of files; this helper ensures that enumeration stays
+        consistent if ``keep_rotations`` semantics or path conventions ever change.
+        """
+        paths: list[Path] = [self._dead_letter_path]
+        for i in range(1, self._keep_rotations + 1):
+            paths.append(Path(f'{self._dead_letter_path}.{i}'))
+        return paths
+
     def read_dead_letters(
         self,
         *,
@@ -512,14 +524,9 @@ class EventQueue:
             ``failed_at``.  Never raises — I/O errors yield an empty list
             plus a logged warning.
         """
-        # Build the ordered list of paths: current first, then .1, .2, …
-        paths: list[Path] = [self._dead_letter_path]
-        for i in range(1, self._keep_rotations + 1):
-            paths.append(Path(f'{self._dead_letter_path}.{i}'))
-
         results: list[dict] = []
         try:
-            for path in paths:
+            for path in self._dead_letter_paths():
                 if not path.exists():
                     continue
                 try:
@@ -596,14 +603,9 @@ class EventQueue:
         Returns:
             The integer count.  Never raises.
         """
-        # Build the ordered list of paths: current first, then .1, .2, …
-        paths: list[Path] = [self._dead_letter_path]
-        for i in range(1, self._keep_rotations + 1):
-            paths.append(Path(f'{self._dead_letter_path}.{i}'))
-
         count = 0
         try:
-            for path in paths:
+            for path in self._dead_letter_paths():
                 if not path.exists():
                     continue
                 try:
@@ -637,6 +639,9 @@ class EventQueue:
                     continue
 
         except Exception as exc:
+            # Log at error (not warning like read_dead_letters) so that
+            # operators notice a genuine bug on the frequently-polled
+            # get_status path rather than seeing a silent zero.
             logger.error(
                 'EventQueue.count_dead_letters: unexpected error: %s', exc,
             )
