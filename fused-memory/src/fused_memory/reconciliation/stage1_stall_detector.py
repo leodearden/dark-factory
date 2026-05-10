@@ -18,16 +18,15 @@ Design decisions (captured in plan.json):
 
 Escalation category note:
   ``maybe_escalate_stalled_tasks`` submits escalations with
-  ``category='reconciliation_stale_human_operator'``.  This is an intentional
-  extension of the canonical category set documented in
-  ``escalation/src/escalation/models.py`` (which lists scope_violation,
+  ``category='reconciliation_stale_human_operator'``.  This is a registered
+  member of the canonical category set documented in
+  ``escalation/src/escalation/models.py`` (canonical list: scope_violation,
   design_concern, cleanup_needed, dependency_discovered, risk_identified,
-  infra_issue).  ``Escalation.category`` is a free-form ``str`` field so it
-  will not fail validation; the new value is kept distinct from the Stage 2
+  infra_issue, reconciliation_stale_human_operator).
+  ``Escalation.category`` is a free-form ``str`` field so it will not fail
+  validation; the new value is kept distinct from the Stage 2
   ``reconciliation_stale_flag`` category to allow filtering on each
-  independently.  TODO: Register ``reconciliation_stale_human_operator`` in
-  the enum-comment in ``escalation/models.py`` and any handler dispatch tables
-  that switch on category.
+  independently.
 
 Stall marker accumulation:
   ``stage1_human_operator_stall_marker`` memories accumulate indefinitely —
