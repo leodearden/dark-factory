@@ -18,15 +18,15 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from escalation.models import Escalation
-from escalation.queue import EscalationQueue
-from test_workflow_e2e import (
+from _workflow_helpers import (
     FakeBriefing,
     FakeMcp,
     FakeScheduler,
     _make_resolving_steward,
     _make_status_setting_steward,
 )
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import GitConfig, OrchestratorConfig
