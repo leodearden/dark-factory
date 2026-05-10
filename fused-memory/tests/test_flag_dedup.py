@@ -2093,3 +2093,27 @@ class TestStage1PromptSuppressionSearchErrorFallback:
         section = self._get_suppression_section()
         assert 'not-in-effect' in section or 'not in effect' in section
         assert 'cycle summary' in section
+
+
+class TestStage1PromptSuppressionTaskIdComparison:
+    """STAGE1_SYSTEM_PROMPT must mandate str()-coercion on both sides of the task_id comparison."""
+
+    def _get_suppression_section(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        parts = STAGE1_SYSTEM_PROMPT.split('## Flag Suppression Check')
+        assert len(parts) == 2, "Expected exactly one '## Flag Suppression Check' heading"
+        section = parts[1].split('## Flag Deduplication')[0]
+        return section
+
+    def test_section_pins_str_coercion_on_both_sides(self):
+        """Section must mandate str() coercion on both sides and not contain the old bare int comparison."""
+        section = self._get_suppression_section()
+        assert "str(result.metadata.get('task_id')) == str(target_task_id)" in section
+        # Regression guard: old bare comparison must not coexist
+        assert 'metadata.task_id == <N>' not in section
+
+    def test_section_acknowledges_producer_int_coercion_asymmetry(self):
+        """Section must explain why readers coerce to str even though producers pin int."""
+        section = self._get_suppression_section()
+        assert 'int' in section
+        assert 'historical' in section or 'round-trip' in section or 'JSON' in section
