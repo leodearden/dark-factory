@@ -1169,7 +1169,7 @@ async def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_l
     )
 
     # count_dead_letters filter path (project_id given) skips malformed lines — matches read.
-    assert filtered_count == 2, (
+    assert filtered_count == len(proj_records) == 2, (
         f'count_dead_letters filter path must skip malformed line; got {filtered_count}'
     )
 
