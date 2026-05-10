@@ -266,12 +266,7 @@ emit for a suppressed task_id will be dropped by the post-processor regardless.
 Canonical suppression record schema (Mem0, observations_and_summaries category) — \
 this is the producer's contract source-of-truth read by the post-processor:
   - `metadata.kind = "stage1_flag_suppression"`
-  - `metadata.task_id = <N>` (pinned to `int` by the producer \
-`write_suppression_record` → `build_suppression_payload` via `int()` coercion; \
-readers MUST compare as strings via \
-`str(result.metadata.get('task_id')) == str(target_task_id)` because Mem0 \
-metadata round-trips through JSON and historical writers in this codebase have \
-stored task_id as both `int` and `str`)
+  - `metadata.task_id = <N>` (pinned to `int` by `build_suppression_payload`)
   - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
 
 Producing a suppression record: operators and remediation hooks should call \
@@ -282,21 +277,16 @@ future schema changes touch one location.
 
 If you do choose to check: call \
 `search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
-categories=['observations_and_summaries'], stores=['mem0'], limit=50)` — \
-include `task_id=<N>` in the query string to bias vector ranking toward the \
-right record (the post-processor's bulk fetch uses the bare \
-`stage1_flag_suppression` query and filters by metadata afterward; \
-appending `task_id=<N>` here is a single-task optimisation), and pin \
-`categories`/`stores`/`limit` to avoid the default `limit=10` silently \
-missing the record on a busy project (`filter_suppressed` uses `limit=501` \
-for its project-wide sweep; 50 is sufficient here because `task_id=<N>` \
-biases ranking toward the one record you need). Then inspect each \
-result's metadata. A result is a valid suppression record ONLY when BOTH \
+categories=['observations_and_summaries'], stores=['mem0'], limit=50)`. \
+`task_id=<N>` in the query biases vector ranking; `limit=50` overrides the \
+default `limit=10` so a busy project doesn't drop the record.  Mem0 metadata \
+round-trips through JSON and tolerant readers (`filter_suppressed`) compare via \
+`str(...)` so the contract is robust to any caller passing the value as a \
+numeric string — a result is a valid suppression record ONLY when BOTH \
 `metadata.kind == "stage1_flag_suppression"` AND \
 `str(result.metadata.get('task_id')) == str(target_task_id)`. Do NOT rely on \
-semantic/vector proximity alone — vector \
-search may return near-misses. A result that fails either metadata field, or an \
-empty result set, means "no suppression in effect"; proceed normally.
+semantic/vector proximity alone — a result that fails either metadata field, or \
+an empty result set, means "no suppression in effect"; proceed normally.
 
 If the suppression search returns an error or times out, treat suppression as \
 not-in-effect and proceed with normal flag emission; record the search failure \
