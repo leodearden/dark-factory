@@ -143,3 +143,35 @@ The plan notes 562cb2dd is eligible because "task 1155 marked done 2026-05-10." 
 ---
 
 *Report continues in subsequent sections appended by steps 2-7.*
+
+---
+
+## Restart (Step 2)
+
+**Command:** `bash scripts/restart-fused-memory.sh --drain`
+
+| Event | Timestamp (UTC) |
+|-------|-----------------|
+| Drain SIGUSR1 sent to PID 3918180 | 2026-05-10T13:37:55 UTC |
+| Drain outcome | **Timed out after 120s** (no "Harness fully drained" in journal); script proceeded with restart anyway (documented WARNING behavior) |
+| `systemctl --user restart fused-memory` | ~2026-05-10T13:39:55 UTC |
+| Health check result | **OK** (http://localhost:8002/health responded) |
+| Script exit code | **0 (success)** |
+
+**Post-restart service state:**
+
+| Field | Value |
+|-------|-------|
+| `ActiveState` | active |
+| `MainPID` | 1009584 (was 3918180 before restart) |
+| `ActiveEnterTimestamp` | Sun 2026-05-10 14:40:25 BST (= 2026-05-10T13:40:25 UTC) |
+
+**Fix-activation confirmation:**
+
+```
+Fix commit 8a9609f652 timestamp : 2026-05-09 10:49:17 +0100 = 2026-05-09T09:49:17 UTC
+Post-restart ActiveEnterTimestamp: 2026-05-10T13:40:25 UTC
+Margin                            : +27h51m — daemon started AFTER fix landed ✓
+```
+
+**PASS.** The daemon is now running post-fix code.
