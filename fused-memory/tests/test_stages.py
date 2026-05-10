@@ -1381,6 +1381,39 @@ class TestRunIdValidation(BaseStageValidationTest):
         assert f'run_id: {run_id_value}' in captured_kwargs['payload']
 
 
+class TestStage2GuardrailProjectIdGating:
+    """Tests that the contamination guardrail is injected only for the
+    autopilot_video project, not for other projects like dark_factory.
+
+    The load-bearing behavioural contract:
+    - build_stage2_system_prompt('autopilot_video') includes the guardrail section.
+    - build_stage2_system_prompt('dark_factory') does NOT include the guardrail section.
+
+    This prevents the dark_factory misfire: when any non-autopilot project runs Stage 2,
+    the shared prompt must not contain the autopilot-specific halt instruction.
+    """
+
+    def test_guardrail_renders_for_autopilot_video_project(self):
+        """build_stage2_system_prompt('autopilot_video') must include the
+        Contamination Guardrail section."""
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+        prompt = build_stage2_system_prompt(project_id='autopilot_video')
+        assert 'Contamination Guardrail' in prompt, (
+            "Expected 'Contamination Guardrail' in the autopilot_video prompt — "
+            "the guardrail must be injected when project_id == 'autopilot_video'."
+        )
+
+    def test_guardrail_omitted_for_other_projects(self):
+        """build_stage2_system_prompt('dark_factory') must NOT include the
+        Contamination Guardrail section — the guardrail is autopilot_video-specific."""
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+        prompt = build_stage2_system_prompt(project_id='dark_factory')
+        assert 'Contamination Guardrail' not in prompt, (
+            "Expected 'Contamination Guardrail' to be absent from the dark_factory "
+            "prompt — the guardrail must NOT fire for non-autopilot projects."
+        )
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
