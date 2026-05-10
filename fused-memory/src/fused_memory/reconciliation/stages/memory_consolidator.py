@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -25,9 +24,6 @@ from fused_memory.reconciliation.stage1_stall_detector import (
 )
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, format_filtered_task_tree
-
-if TYPE_CHECKING:
-    pass
 
 
 class MemoryConsolidator(BaseStage):
@@ -80,29 +76,33 @@ class MemoryConsolidator(BaseStage):
             )
 
         # ── Stale human-operator-required detector (task 1201) ────────────────
-        # Extract task_ids of flags still requiring human action after dedup.
-        hor_task_ids = extract_human_operator_task_ids(report.items_flagged or [])
-        if hor_task_ids:
-            stall_counts = await track_human_operator_stalls(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                run_id=run_id,
-                task_ids=hor_task_ids,
-            )
-            stalled = compute_stalled_task_ids(stall_counts)
-            report.stats['stage1_human_operator_stalled'] = len(stalled)
-            if stalled and self._escalation_queue is not None:
-                escalated = await maybe_escalate_stalled_tasks(
-                    escalation_queue=self._escalation_queue,
+        # Short-circuit when the escalation queue is unavailable — writing Mem0
+        # markers that nothing will ever consume only wastes Qdrant capacity.
+        # If a queue becomes available in a future cycle the counter starts
+        # from zero for that cycle; that is an acceptable trade-off.
+        if self._escalation_queue is not None:
+            hor_task_ids = extract_human_operator_task_ids(report.items_flagged or [])
+            if hor_task_ids:
+                stall_counts = await track_human_operator_stalls(
+                    memory_service=self.memory,
                     project_id=self.project_id,
                     run_id=run_id,
-                    stalled_task_ids=stalled,
-                    stall_counts=stall_counts,
-                    flags=report.items_flagged or [],
+                    task_ids=hor_task_ids,
                 )
-                report.stats['stage1_human_operator_escalated'] = len(escalated)
-            else:
-                report.stats['stage1_human_operator_escalated'] = 0
+                stalled = compute_stalled_task_ids(stall_counts)
+                report.stats['stage1_human_operator_stalled'] = len(stalled)
+                if stalled:
+                    escalated = await maybe_escalate_stalled_tasks(
+                        escalation_queue=self._escalation_queue,
+                        project_id=self.project_id,
+                        run_id=run_id,
+                        stalled_task_ids=stalled,
+                        stall_counts=stall_counts,
+                        flags=report.items_flagged or [],
+                    )
+                    report.stats['stage1_human_operator_escalated'] = len(escalated)
+                else:
+                    report.stats['stage1_human_operator_escalated'] = 0
         return report
 
     def get_system_prompt(self) -> str:

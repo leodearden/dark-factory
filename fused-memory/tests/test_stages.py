@@ -4153,8 +4153,12 @@ class TestMemoryConsolidatorStaleOperatorDetector:
         assert report.stats.get('stage1_human_operator_escalated', 0) == 0
 
     @pytest.mark.asyncio
-    async def test_no_escalation_queue_still_tracks(self, mock_deps):
-        """(d) _escalation_queue is None → track still runs, escalate NOT called; no crash."""
+    async def test_no_escalation_queue_skips_all_stall_logic(self, mock_deps):
+        """(d) _escalation_queue is None → entire stall-detector block skipped; no crash.
+
+        Tracking is suppressed (not just escalation) to avoid accumulating Mem0
+        markers that nothing will ever consume when escalation is unavailable.
+        """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
         stage.project_id = 'p'
         stage.episode_limit = 10
@@ -4165,7 +4169,6 @@ class TestMemoryConsolidatorStaleOperatorDetector:
         base_report = self._make_base_report(items_flagged=[hor_flag])
 
         track_mock = AsyncMock(return_value={'1155': 6})
-        compute_mock = MagicMock(return_value=['1155'])
         escalate_mock = AsyncMock(return_value=[])
         dedup_mock = AsyncMock(return_value=[hor_flag])
 
@@ -4173,7 +4176,6 @@ class TestMemoryConsolidatorStaleOperatorDetector:
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.compute_stalled_task_ids', new=compute_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
         ):
             report = await stage.run(
@@ -4183,13 +4185,13 @@ class TestMemoryConsolidatorStaleOperatorDetector:
                 run_id='r-1201-d',
             )
 
-        # track still runs (records cycle counts for future cycles)
-        track_mock.assert_awaited_once()
-        # escalate NOT called when queue is None
+        # when queue is None, track is NOT called (no Mem0 markers written)
+        track_mock.assert_not_awaited()
+        # escalate also NOT called
         escalate_mock.assert_not_awaited()
-        # stalled count recorded
-        assert report.stats['stage1_human_operator_stalled'] == 1
-        assert report.stats['stage1_human_operator_escalated'] == 0
+        # stats not set (no stall logic ran)
+        assert report.stats.get('stage1_human_operator_stalled', 0) == 0
+        assert report.stats.get('stage1_human_operator_escalated', 0) == 0
 
     @pytest.mark.asyncio
     async def test_remediation_mode_skips_all_stall_logic(self, mock_deps):
