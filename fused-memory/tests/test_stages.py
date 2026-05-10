@@ -1453,7 +1453,7 @@ class TestAutopilotVideoTaskCeilingFreshness:
         except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
             pytest.skip('autopilot_video tasks.json not available in this environment')
 
-        assert _AUTOPILOT_VIDEO_TASK_CEILING >= max_id, (
+        assert max_id <= _AUTOPILOT_VIDEO_TASK_CEILING, (
             f'_AUTOPILOT_VIDEO_TASK_CEILING={_AUTOPILOT_VIDEO_TASK_CEILING} is below '
             f'the observed max task id {max_id} in autopilot_video tasks.json.  '
             f'Bump _AUTOPILOT_VIDEO_TASK_CEILING in '

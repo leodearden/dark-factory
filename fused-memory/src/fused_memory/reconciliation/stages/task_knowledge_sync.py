@@ -34,7 +34,6 @@ from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
 )
 from fused_memory.reconciliation.prompts.stage2 import (
-    STAGE2_SYSTEM_PROMPT,
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
