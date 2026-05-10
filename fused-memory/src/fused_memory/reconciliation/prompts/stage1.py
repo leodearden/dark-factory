@@ -265,6 +265,12 @@ result's metadata. A result is a valid suppression record ONLY when BOTH \
 search may return near-misses. A result that fails either metadata field, or an \
 empty result set, means "no suppression in effect"; proceed normally.
 
+If the suppression search returns an error or times out, treat suppression as \
+not-in-effect and proceed with normal flag emission; record the search failure \
+in your cycle summary so operators can re-check. This mirrors the conservative \
+pass-through that the post-processor's `filter_suppressed` already performs in \
+code, keeping prompt-driven and code-driven outcomes aligned.
+
 Suppression is distinct from the post-processor dedup described in the next section. \
 Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
 suppression authoritatively forbids ANY flag emission for a specific task. \
