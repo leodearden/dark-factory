@@ -1053,11 +1053,13 @@ def create_mcp_server(
 
                 event_dead: int = 0
                 if event_queue is not None:
-                    records = await asyncio.to_thread(
-                        event_queue.read_dead_letters,
+                    # Use count_dead_letters (streaming line count) instead of
+                    # len(read_dead_letters(...)) — get_status is polled frequently by
+                    # Stage 1 reconciliation and we do not need to materialise records.
+                    event_dead = await asyncio.to_thread(
+                        event_queue.count_dead_letters,
                         project_id=project_id,
                     )
-                    event_dead = len(records)
 
                 queue_section['dead_letters'] = {
                     'durable_queue': durable_dead,

@@ -489,6 +489,18 @@ class EventQueue:
 
     # ── read dead-letters ──────────────────────────────────────────────
 
+    def _dead_letter_paths(self) -> list[Path]:
+        """Return the ordered list of dead-letter paths: current, then .1, .2 …
+
+        Both :meth:`read_dead_letters` and :meth:`count_dead_letters` enumerate
+        the same set of files; this helper ensures that enumeration stays
+        consistent if ``keep_rotations`` semantics or path conventions ever change.
+        """
+        paths: list[Path] = [self._dead_letter_path]
+        for i in range(1, self._keep_rotations + 1):
+            paths.append(Path(f'{self._dead_letter_path}.{i}'))
+        return paths
+
     def read_dead_letters(
         self,
         *,
@@ -512,14 +524,9 @@ class EventQueue:
             ``failed_at``.  Never raises — I/O errors yield an empty list
             plus a logged warning.
         """
-        # Build the ordered list of paths: current first, then .1, .2, …
-        paths: list[Path] = [self._dead_letter_path]
-        for i in range(1, self._keep_rotations + 1):
-            paths.append(Path(f'{self._dead_letter_path}.{i}'))
-
         results: list[dict] = []
         try:
-            for path in paths:
+            for path in self._dead_letter_paths():
                 if not path.exists():
                     continue
                 try:
@@ -559,3 +566,85 @@ class EventQueue:
             return []
 
         return results
+
+    def count_dead_letters(self, *, project_id: str | None = None) -> int:
+        """Return the number of dead-letter records across JSONL file(s).
+
+        A faster equivalent of ``len(self.read_dead_letters(project_id=...))``:
+        streams the JSONL files without materialising records into memory.
+        Intended for hot-path callers such as :func:`get_status` that only
+        need the count, not the record contents.
+
+        When *project_id* is ``None`` (the common/hot path), each file is
+        opened in binary mode and non-empty lines are counted in a single
+        forward pass — no ``json.loads`` calls, no dict allocations, and no
+        reverse-seek machinery.  **Note:** malformed JSON lines are counted
+        as records in this path (they are non-empty bytes), whereas
+        :meth:`read_dead_letters` skips them with a logged warning.  The
+        discrepancy is bounded by the rate of file corruption and is
+        acceptable for status reporting.
+
+        When *project_id* is provided, a forward binary scan with
+        ``json.loads`` per line is used to filter by
+        ``event['project_id']``; malformed lines are skipped with a logged
+        warning (same behaviour as :meth:`read_dead_letters`).
+
+        Robustness contract mirrors :meth:`read_dead_letters`:
+
+        - Per-file ``OSError`` is caught, logged, and the file is skipped.
+        - An outer ``except Exception`` catches anything unexpected, logs at
+          ``error`` level so operators notice, and returns ``0`` rather than
+          propagating (since this is a health-check path).
+
+        Args:
+            project_id: When given, only records whose
+                ``event['project_id']`` matches are counted.
+
+        Returns:
+            The integer count.  Never raises.
+        """
+        count = 0
+        try:
+            for path in self._dead_letter_paths():
+                if not path.exists():
+                    continue
+                try:
+                    if project_id is None:
+                        # Hot path: forward binary scan — count non-empty lines
+                        # without json.loads.  Order is irrelevant for counting.
+                        with path.open('rb') as f:
+                            count += sum(1 for line in f if line.strip())
+                    else:
+                        # Filter path: forward binary scan with json.loads.
+                        with path.open('rb') as f:
+                            for raw in f:
+                                line = raw.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    rec = json.loads(line)
+                                except json.JSONDecodeError as exc:
+                                    logger.warning(
+                                        'EventQueue.count_dead_letters: malformed line in %s: %s',
+                                        path, exc,
+                                    )
+                                    continue
+                                event = rec.get('event') or {}
+                                if event.get('project_id') == project_id:
+                                    count += 1
+                except OSError as exc:
+                    logger.warning(
+                        'EventQueue.count_dead_letters: cannot read %s: %s', path, exc,
+                    )
+                    continue
+
+        except Exception as exc:
+            # Log at error (not warning like read_dead_letters) so that
+            # operators notice a genuine bug on the frequently-polled
+            # get_status path rather than seeing a silent zero.
+            logger.error(
+                'EventQueue.count_dead_letters: unexpected error: %s', exc,
+            )
+            return 0
+
+        return count
