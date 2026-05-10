@@ -7,11 +7,12 @@ import json
 import logging
 import os
 import traceback
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException
@@ -308,13 +309,23 @@ class ReconciliationHarness:
             self.config, usage_gate=self.usage_gate,
         )
         stages = [stage1, stage2, stage3]
+        self._propagate_escalation_queue(stages)
+        return stages
+
+    def _propagate_escalation_queue(self, stages: Iterable[Any]) -> None:
+        """Apply harness's escalation URL and queue to each stage in *stages*.
+
+        Shared by ``_make_stages`` (cold path: fresh stages each cycle) and
+        ``_start_escalation_server`` (hot path: stages pre-built in __init__).
+        Defensive: only assigns when the harness has a value, so cold-path
+        callers before escalation startup leave stages untouched.
+        """
         if self._escalation_url:
             for s in stages:
                 s._escalation_url = self._escalation_url
         if self._escalation_queue is not None:
             for s in stages:
                 s._escalation_queue = self._escalation_queue
-        return stages
 
     @staticmethod
     def _configure_consolidator(
@@ -579,9 +590,8 @@ class ReconciliationHarness:
         # Store escalation URL and queue for _make_stages() and set on existing stages
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url
-        for stage in self.stages:
-            stage._escalation_url = escalation_url
-            stage._escalation_queue = self._escalation_queue
+        # Both _escalation_url and _escalation_queue are set above, so helper will propagate.
+        self._propagate_escalation_queue(self.stages)
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
