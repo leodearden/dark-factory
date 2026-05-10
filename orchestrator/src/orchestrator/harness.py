@@ -1812,7 +1812,7 @@ Output JSON matching the schema. Every task must appear in the output.
         queue_dir = Path(self.config.escalation.queue_dir)
         if not queue_dir.is_absolute():
             queue_dir = self.config.project_root / queue_dir
-        self._escalation_queue = EscalationQueue(queue_dir)
+        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-unbound]
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
@@ -1822,7 +1822,7 @@ Output JSON matching the schema. Every task must appear in the output.
         if self.review_checkpoint is not None:
             self.review_checkpoint.escalation_queue = self._escalation_queue
 
-        mcp_server = create_server(
+        mcp_server = create_server(  # type: ignore[possibly-unbound]
             self._escalation_queue,
             merge_queue=self._merge_queue,
             orch_config=self.config,
