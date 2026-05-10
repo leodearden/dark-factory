@@ -456,3 +456,50 @@ async def test_worker_dead_escalations_respect_cooldown(store, tmp_path):
         handle.close()
 
 
+@pytest.mark.asyncio
+async def test_janitor_accepts_known_projects_kwarg_and_uses_injected_map(store, tmp_path):
+    """Injected known_projects map drives tick() resolution even when primary_project_root=''.
+
+    Uses primary_project_root='' deliberately so the only way to resolve
+    project_root is via the injected map. An escalation file landing at
+    tmp_path/data/escalations/ proves the map was used.
+    """
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        project_id = _project_id_for(tmp_path)
+        ticket_id = await store.submit(
+            project_id=project_id,
+            candidate_json=_candidate_blob(task_id='t1', escalation_id='esc-di-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+
+        janitor = TicketJanitor(
+            store,
+            primary_project_root='',
+            known_projects={project_id: str(tmp_path)},
+        )
+        await janitor.tick()
+
+        files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, (
+            f'Expected exactly one escalation file via injected map; got {[f.name for f in files]}'
+        )
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_janitor_default_known_projects_kwarg_falls_back_to_build_known_projects_map(
+    store, tmp_path
+):
+    """When known_projects kwarg is omitted, janitor falls back to build_known_projects_map.
+
+    Verifies back-compat: existing tests that pass primary_project_root still work.
+    """
+    from fused_memory.models.scope import build_known_projects_map
+
+    janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
+    expected = build_known_projects_map(str(tmp_path))
+    assert janitor._known_projects == expected
+
+
