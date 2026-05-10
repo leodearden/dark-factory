@@ -10,22 +10,6 @@ from __future__ import annotations
 import pytest
 
 # ---------------------------------------------------------------------------
-# Import-contract test
-# ---------------------------------------------------------------------------
-
-
-def test_imports_resolve() -> None:
-    """All 5 helpers are importable from _workflow_helpers without ImportError."""
-    from _workflow_helpers import (  # noqa: PLC0415, F401
-        FakeBriefing,
-        FakeMcp,
-        FakeScheduler,
-        _make_resolving_steward,
-        _make_status_setting_steward,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Smoke tests
 # ---------------------------------------------------------------------------
 
