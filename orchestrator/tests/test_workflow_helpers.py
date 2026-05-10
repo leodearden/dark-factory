@@ -1,8 +1,9 @@
-"""Contract + smoke tests for the _workflow_helpers module.
+"""Smoke tests for the _workflow_helpers module.
 
-Verifies that the 5 shared workflow test-helpers are importable from
-_workflow_helpers and behave as expected after extraction from
-test_workflow_e2e.py (task 1195).
+Verifies that FakeScheduler, FakeMcp, and FakeBriefing behave as expected.
+Import-contract verification for _make_resolving_steward and
+_make_status_setting_steward relies on indirect coverage from
+test_workflow_e2e.py and test_workflow_status_on_resume.py.
 """
 
 from __future__ import annotations
@@ -39,35 +40,42 @@ def test_fake_mcp_smoke() -> None:
 async def test_fake_briefing_smoke() -> None:
     """FakeBriefing returns a non-empty string for each of the 7 prompt-builder methods.
 
-    Asserts shape only (non-empty str).  Substring/interpolation checks are
-    omitted deliberately — they pin internal f-string wording that no caller
-    observes and break on harmless refactors.  The real workflow tests in
-    test_workflow_e2e.py and test_workflow_status_on_resume.py exercise
-    FakeBriefing in its actual call path and form the true contract.
+    Asserts shape (non-empty str) and that each method threads its key input
+    argument into the output.  Literal wording tokens (e.g. 'Plan task:') are
+    not checked — only the caller-supplied argument value must appear in the
+    result, guarding against a builder silently dropping its argument.
     """
     from _workflow_helpers import FakeBriefing  # noqa: PLC0415
 
     briefing = FakeBriefing()
 
+    # build_implementer_prompt returns a fixed string ('Implement the plan')
+    # without interpolating its arguments, so only a shape check applies here.
     impl_prompt = await briefing.build_implementer_prompt({'title': 't'}, [])
     assert isinstance(impl_prompt, str) and impl_prompt, 'implementer prompt must be non-empty'
 
     arch_prompt = await briefing.build_architect_prompt({'title': 'my task'})
     assert isinstance(arch_prompt, str) and arch_prompt, 'architect prompt must be non-empty'
+    assert 'my task' in arch_prompt, 'architect prompt must include the task title'
 
     debug_prompt = await briefing.build_debugger_prompt('test failure msg', {})
     assert isinstance(debug_prompt, str) and debug_prompt, 'debugger prompt must be non-empty'
+    assert 'test failure msg' in debug_prompt, 'debugger prompt must include the failure text'
 
     review_prompt = await briefing.build_reviewer_prompt('comprehensive', 'some diff')
     assert isinstance(review_prompt, str) and review_prompt, 'reviewer prompt must be non-empty'
+    assert 'comprehensive' in review_prompt, 'reviewer prompt must include the reviewer_type'
 
     judge_prompt = await briefing.build_completion_judge_prompt(
         {'steps': [1, 2]}, [], 'some diff', task_id='42'
     )
     assert isinstance(judge_prompt, str) and judge_prompt, 'completion-judge prompt must be non-empty'
+    assert '42' in judge_prompt, 'completion-judge prompt must include the task_id'
 
     merge_prompt = await briefing.build_merger_prompt('conflict text', 'intent text')
     assert isinstance(merge_prompt, str) and merge_prompt, 'merger prompt must be non-empty'
+    assert 'conflict text' in merge_prompt, 'merger prompt must include the conflict text'
 
     resume_prompt = await briefing.build_resume_prompt({}, {}, 'the summary', 'the resolution')
     assert isinstance(resume_prompt, str) and resume_prompt, 'resume prompt must be non-empty'
+    assert 'the resolution' in resume_prompt, 'resume prompt must include the resolution'
