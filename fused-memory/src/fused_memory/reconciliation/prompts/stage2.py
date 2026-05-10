@@ -1,40 +1,12 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
+from fused_memory.reconciliation.policies.autopilot_video import (
+    AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
+)
+from fused_memory.reconciliation.policies.autopilot_video import (
+    AUTOPILOT_VIDEO_PROJECT_ID as _AUTOPILOT_VIDEO_PROJECT_ID,
+)
 from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
-
-# Max task id observed in autopilot_video/.taskmaster/tasks/tasks.json at task-1192
-# commit time.  Step-8's regression test (TestAutopilotVideoTaskCeilingFreshness) fails
-# when autopilot_video grows past this value — bump the constant and re-evaluate the
-# contamination guardrail's premise before the next production cycle.
-_AUTOPILOT_VIDEO_TASK_CEILING: int = 606
-
-# Named constant for the project ID so the magic string has a single source of truth
-# across build_stage2_system_prompt(), task_knowledge_sync.py's warning check, and
-# any future per-project guardrail additions.
-_AUTOPILOT_VIDEO_PROJECT_ID: str = 'autopilot_video'
-
-# Autopilot-video-specific contamination guardrail — injected by
-# build_stage2_system_prompt() only when project_id == 'autopilot_video'.
-# Using the named constant so there is a single source of truth for the ceiling value.
-_AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL: str = f"""\
-## Cross-Project Contamination Guardrail (Pre-flight)
-When any task ID in the reconciliation payload exceeds {_AUTOPILOT_VIDEO_TASK_CEILING} \
-(the autopilot_video task ceiling), Stage 2 must take ZERO task actions — including \
-memory_hints updates, set_task_status, add_subtask, or any other task write — for the \
-remainder of that cycle. This is not a matter of judgment; it is an unconditional gate.
-
-Required behaviour when the guardrail fires:
-- Take ZERO task actions (no set_task_status, no add_subtask, no update_task, \
-no add_dependency, no remove_task, no resolve_ticket).
-- Write a single `add_memory(category='observations_and_summaries')` to the \
-autopilot_video project documenting the abort: which task IDs exceeded the ceiling \
-and that Stage 2 halted without acting.
-- File cross-project task suggestions in the structured report's \
-`cross_project_findings` section rather than as live task writes.
-- Exit immediately after writing the summary memory; do not continue to the normal \
-reconciliation loop.
-
-"""
 
 STAGE2_SYSTEM_PROMPT = f"""\
 You are a Task-Knowledge Sync agent operating in sleep mode. Your role is to reconcile \
@@ -328,6 +300,15 @@ def build_stage2_system_prompt(project_id: str) -> str:
             f"build_stage2_system_prompt: injection sentinel {sentinel!r} not found in "
             "STAGE2_SYSTEM_PROMPT — the section header was likely renamed or removed. "
             "Update the sentinel string in build_stage2_system_prompt() to match."
+        )
+    count = STAGE2_SYSTEM_PROMPT.count(sentinel)
+    if count != 1:
+        raise RuntimeError(
+            f"build_stage2_system_prompt: injection sentinel {sentinel!r} appears "
+            f"{count} times in STAGE2_SYSTEM_PROMPT — expected exactly 1.  "
+            "A duplicate heading would cause the guardrail to be injected at the "
+            "first occurrence only, silently misplacing it if the order changes. "
+            "Deduplicate the heading before adding the autopilot_video guardrail."
         )
     return STAGE2_SYSTEM_PROMPT.replace(
         sentinel,
