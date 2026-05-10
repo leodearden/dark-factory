@@ -373,6 +373,20 @@ class TargetedReconciler:
                         'error': error_code,
                         'reason': reason,
                     })
+                    # Symmetric durable audit row for the rejection path — mirrors the
+                    # 'write' row emitted on success (above). Verb 'skip' lets operators
+                    # filter `WHERE action_type='skip'` to compute rejection cardinality
+                    # without inspecting detail JSON (task 1184).
+                    await self.journal.add_run_action(
+                        run_id, 'skip', 'taskmaster', 'update_task',
+                        {
+                            'task_id': task_id,
+                            'type': 'hints_skipped',
+                            'error': error_code,
+                            'reason': reason,
+                        },
+                        causation_id=run_id,
+                    )
                     logger.info(
                         f'Hints skipped for task {task_id}: '
                         f'update_task rejected with error={error_code!r} reason={reason!r}'
