@@ -1414,6 +1414,54 @@ class TestStage2GuardrailProjectIdGating:
         )
 
 
+class TestAutopilotVideoTaskCeilingFreshness:
+    """Regression guard: _AUTOPILOT_VIDEO_TASK_CEILING must be >= the observed max task
+    id in autopilot_video's tasks.json.
+
+    This is a drift-detector test that passes on first commit (606 >= 606) and fails
+    in the future if autopilot_video grows past the hardcoded ceiling constant.  Mirroring
+    the TestTierConfig / TestProjectIdGuidelineConstants pattern — passes immediately,
+    serves as a future-drift alarm rather than a red→green TDD transition.
+
+    The test skips gracefully when autopilot_video/tasks.json is not accessible so CI
+    runs outside leo's workstation are not broken.
+    """
+
+    def test_ceiling_constant_not_below_observed_max_id(self):
+        """_AUTOPILOT_VIDEO_TASK_CEILING must be >= the max task id currently in
+        autopilot_video/.taskmaster/tasks/tasks.json.
+
+        If this test fails: the autopilot_video project has grown past the ceiling
+        constant.  Bump _AUTOPILOT_VIDEO_TASK_CEILING in
+        fused_memory/reconciliation/prompts/stage2.py to the new max id and
+        re-evaluate whether the contamination guardrail's premise —
+        'all task IDs > ceiling are necessarily cross-project contamination' —
+        still reflects reality before running the next production cycle.
+        """
+        import json
+
+        import pytest
+
+        from fused_memory.reconciliation.prompts.stage2 import _AUTOPILOT_VIDEO_TASK_CEILING
+
+        tasks_path = '/home/leo/src/autopilot-video/.taskmaster/tasks/tasks.json'
+        try:
+            with open(tasks_path) as fh:
+                data = json.load(fh)
+            tasks = data['master']['tasks']
+            max_id = max(int(t['id']) for t in tasks)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
+            pytest.skip('autopilot_video tasks.json not available in this environment')
+
+        assert _AUTOPILOT_VIDEO_TASK_CEILING >= max_id, (
+            f'_AUTOPILOT_VIDEO_TASK_CEILING={_AUTOPILOT_VIDEO_TASK_CEILING} is below '
+            f'the observed max task id {max_id} in autopilot_video tasks.json.  '
+            f'Bump _AUTOPILOT_VIDEO_TASK_CEILING in '
+            f'fused_memory/reconciliation/prompts/stage2.py to {max_id} and '
+            f're-evaluate the contamination guardrail premise before the next cycle.'
+        )
+
+
 class TestTierConfig:
     """MemoryConsolidator respects tier limits."""
 
