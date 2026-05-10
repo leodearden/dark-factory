@@ -16,13 +16,13 @@ from fused_memory.models.reconciliation import (
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
 from fused_memory.reconciliation.flag_dedup import dedup_flags
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stage1_stall_detector import (
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
-from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, format_filtered_task_tree
 
@@ -103,10 +103,6 @@ class MemoryConsolidator(BaseStage):
                 report.stats['stage1_human_operator_escalated'] = len(escalated)
             else:
                 report.stats['stage1_human_operator_escalated'] = 0
-        else:
-            report.stats['stage1_human_operator_stalled'] = 0
-            report.stats['stage1_human_operator_escalated'] = 0
-
         return report
 
     def get_system_prompt(self) -> str:

@@ -4075,6 +4075,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
         escalate_mock.assert_awaited_once()
         # escalate called with the right queue
         escalate_call = escalate_mock.await_args
+        assert escalate_call is not None
         assert escalate_call.kwargs.get('escalation_queue') is fake_queue or escalate_call.args[0] is fake_queue
 
         assert report.stats['stage1_human_operator_stalled'] == 1

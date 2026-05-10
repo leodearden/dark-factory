@@ -9,19 +9,18 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fused_memory.reconciliation.stage1_stall_detector import (
-    STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD,
     _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
+    STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD,
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
-
 
 # ---------------------------------------------------------------------------
 # Constants
