@@ -4499,8 +4499,6 @@ async def test_remediation_uses_threaded_project_root_not_mutated_registry(
     and sets stage.project_root = '/path/B'.
     AFTER the fix it passes: the threaded value '/path/A' wins.
     """
-    from fused_memory.reconciliation.harness import TierConfig
-
     harness = _make_harness_with_known_projects(
         journal, event_buffer, mock_memory_service,
         {
