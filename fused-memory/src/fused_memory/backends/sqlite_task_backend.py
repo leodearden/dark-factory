@@ -995,13 +995,59 @@ def _parse_dependency_list(raw: str | None) -> list[int]:
     return out
 
 
+def _merge_values(old: object, new: object) -> object:
+    """Recursively merge *new* into *old* using additive semantics.
+
+    Rules (applied depth-first):
+    * Both values are **lists** — concatenate, then deduplicate hashable items
+      in stable old-then-new order.  If any item is unhashable, fall back to
+      plain concatenation (no dedup).
+    * Both values are **dicts** — recurse over the union of keys; keys present
+      in only one side pass through unchanged; collisions recurse.
+    * All other cases (scalar collision, type mismatch) — **OLD wins**,
+      preserving the audit-field protection of the original implementation.
+    """
+    if isinstance(old, list) and isinstance(new, list):
+        combined = old + new
+        try:
+            seen: set = set()
+            deduped = []
+            for item in combined:
+                if item not in seen:
+                    seen.add(item)
+                    deduped.append(item)
+            return deduped
+        except TypeError:
+            return combined
+    if isinstance(old, dict) and isinstance(new, dict):
+        merged: dict = {}
+        for key in old.keys() | new.keys():
+            if key in old and key in new:
+                merged[key] = _merge_values(old[key], new[key])
+            elif key in old:
+                merged[key] = old[key]
+            else:
+                merged[key] = new[key]
+        return merged
+    # Scalar collision or type mismatch — OLD wins.
+    return old
+
+
 def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) -> str:
     """Merge ``incoming`` metadata JSON into ``existing_raw``.
 
-    Both halves are JSON-decoded and merged shallowly; ``append=True``
-    preserves existing keys when there is a collision, otherwise the new
-    value wins. If either side fails to decode, the new value replaces the
-    old verbatim — matches Taskmaster's "last write wins" behaviour.
+    When ``append=True`` the merge is additive and recursive:
+    * List-valued keys are concatenated and deduplicated (hashable items only)
+      in stable old-then-new order.
+    * Dict-valued keys are merged recursively with the same rules.
+    * Scalar collisions and type-mismatched collisions resolve to OLD-wins,
+      preserving audit fields such as ``prd`` and ``spawned_from``.
+
+    When ``append=False`` (or when ``existing_raw`` is ``None``) the incoming
+    value replaces whatever was there — last-write-wins.
+
+    If either side fails to JSON-decode, the new value replaces the old
+    verbatim — matches Taskmaster's "last write wins" fallback.
     """
     if existing_raw is None or not append:
         return incoming
@@ -1012,5 +1058,5 @@ def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) ->
         return incoming
     if not isinstance(old, dict) or not isinstance(new, dict):
         return incoming
-    merged = {**new, **old} if append else {**old, **new}
+    merged = _merge_values(old, new)
     return json.dumps(merged)
