@@ -1572,6 +1572,32 @@ class TestBuildSuppressionPayload:
         """str task_id is coerced to int; resulting payload equals canonical schema."""
         assert build_suppression_payload('42') == self._CANONICAL
 
+    def test_invalid_task_id_raises_descriptive_value_error(self):
+        """Non-numeric task_id raises ValueError with function-name and bad-value context.
+
+        The bare int() raises a context-free ValueError; the hardened implementation
+        must wrap it with:
+        - 'build_suppression_payload' in the error message (function-name context)
+        - the bad value itself in the error message (bad-value context)
+        - __cause__ set to the original ValueError/TypeError (from e chaining)
+        """
+        with pytest.raises(ValueError) as exc_info:
+            build_suppression_payload('abc')
+
+        error_message = str(exc_info.value)
+        assert 'build_suppression_payload' in error_message, (
+            f"Expected 'build_suppression_payload' in error message but got: {error_message!r}"
+        )
+        assert 'abc' in error_message, (
+            f"Expected bad value 'abc' in error message but got: {error_message!r}"
+        )
+        assert exc_info.value.__cause__ is not None, (
+            'Expected __cause__ to be set (from e chaining) but it was None'
+        )
+        assert isinstance(exc_info.value.__cause__, (ValueError, TypeError)), (
+            f'Expected __cause__ to be ValueError or TypeError but got: {type(exc_info.value.__cause__)}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Round-trip schema validation tests (task-1185 step-5)
