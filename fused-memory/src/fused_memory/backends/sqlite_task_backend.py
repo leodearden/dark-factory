@@ -402,10 +402,8 @@ class SqliteTaskBackend:
         # get_task surfaces a single task — Taskmaster returns int id here
         # (asymmetric with get_tasks; mirror that quirk to keep wire-compat).
         if parent_id is None:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 out['id'] = int(out['id'])
-            except (TypeError, ValueError):
-                pass
             # Walk subtasks under this top-level for completeness.
             subtask_cursor = await conn.execute(
                 'SELECT * FROM tasks WHERE tag = ? AND parent_id = ? ORDER BY id',
@@ -429,24 +427,23 @@ class SqliteTaskBackend:
         tag = tag or DEFAULT_TAG
         tid, parent_id = _parse_task_id(task_id)
         parent_db = parent_id if parent_id is not None else _TOP_LEVEL_SENTINEL
-        async with self._write_lock(project_root):
-            async with self._txn(project_root) as conn:
-                cursor = await conn.execute(
-                    'SELECT status FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid, parent_db),
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT status FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                (tag, tid, parent_db),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    f'No tasks found for ID(s): {task_id}',
                 )
-                row = await cursor.fetchone()
-                if row is None:
-                    raise TaskmasterError(
-                        'TASKMASTER_TOOL_ERROR',
-                        f'No tasks found for ID(s): {task_id}',
-                    )
-                old_status = row['status']
-                await conn.execute(
-                    'UPDATE tasks SET status = ?, updated_at = ? '
-                    'WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (status, _now(), tag, tid, parent_db),
-                )
+            old_status = row['status']
+            await conn.execute(
+                'UPDATE tasks SET status = ?, updated_at = ? '
+                'WHERE tag = ? AND id = ? AND parent_id = ?',
+                (status, _now(), tag, tid, parent_db),
+            )
         return {
             'message': f'Successfully updated 1 task(s) to "{status}"',
             'tasks': [{
@@ -489,32 +486,33 @@ class SqliteTaskBackend:
 
         deps_list = _parse_dependency_list(dependencies)
 
-        async with self._write_lock(project_root):
-            async with self._txn(project_root) as conn:
-                cursor = await conn.execute(
-                    'SELECT COALESCE(MAX(id), 0) FROM tasks WHERE tag = ? AND parent_id = ?',
-                    (tag, _TOP_LEVEL_SENTINEL),
-                )
-                next_id = (await cursor.fetchone())[0] + 1
-                await conn.execute(
-                    """
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT COALESCE(MAX(id), 0) FROM tasks WHERE tag = ? AND parent_id = ?',
+                (tag, _TOP_LEVEL_SENTINEL),
+            )
+            _max_row = await cursor.fetchone()
+            assert _max_row is not None  # COALESCE(MAX(id), 0) always returns a row
+            next_id = _max_row[0] + 1
+            await conn.execute(
+                """
                     INSERT INTO tasks (tag, id, parent_id, title, description,
                                        details, test_strategy, status, priority,
                                        metadata, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, '', 'pending', ?, ?, ?)
                     """,
-                    (
-                        tag, next_id, _TOP_LEVEL_SENTINEL, title,
-                        description or '', details or '',
-                        priority or 'medium', metadata, _now(),
-                    ),
+                (
+                    tag, next_id, _TOP_LEVEL_SENTINEL, title,
+                    description or '', details or '',
+                    priority or 'medium', metadata, _now(),
+                ),
+            )
+            for dep in deps_list:
+                await conn.execute(
+                    'INSERT OR IGNORE INTO dependencies '
+                    '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
+                    (tag, next_id, _TOP_LEVEL_SENTINEL, dep),
                 )
-                for dep in deps_list:
-                    await conn.execute(
-                        'INSERT OR IGNORE INTO dependencies '
-                        '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
-                        (tag, next_id, _TOP_LEVEL_SENTINEL, dep),
-                    )
         return {
             'id': str(next_id),
             'message': f'Successfully added new task #{next_id}',
@@ -547,108 +545,107 @@ class SqliteTaskBackend:
         tid, parent_id = _parse_task_id(task_id)
         parent_db = parent_id if parent_id is not None else _TOP_LEVEL_SENTINEL
 
-        async with self._write_lock(project_root):
-            async with self._txn(project_root) as conn:
-                cursor = await conn.execute(
-                    'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid, parent_db),
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                (tag, tid, parent_db),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    f'No tasks found for ID(s): {task_id}',
                 )
-                row = await cursor.fetchone()
-                if row is None:
+
+            # Build the SET clause from non-None structured fields plus
+            # the prompt-derived details path.
+            set_columns: list[str] = []
+            set_values: list[Any] = []
+
+            if title is not None:
+                set_columns.append('title = ?')
+                set_values.append(title)
+            if description is not None:
+                set_columns.append('description = ?')
+                set_values.append(description)
+            if priority is not None:
+                set_columns.append('priority = ?')
+                set_values.append(priority)
+            if status is not None:
+                set_columns.append('status = ?')
+                set_values.append(status)
+
+            # details: explicit param wins over prompt. Both honor ``append``.
+            existing_details = row['details'] or ''
+            if details is not None:
+                new_details = (
+                    f'{existing_details}\n\n{details}'
+                    if (append and existing_details) else details
+                )
+                set_columns.append('details = ?')
+                set_values.append(new_details)
+            elif prompt is not None:
+                new_details = (
+                    f'{existing_details}\n\n{prompt}'
+                    if (append and existing_details) else prompt
+                )
+                set_columns.append('details = ?')
+                set_values.append(new_details)
+
+            if metadata is not None:
+                new_metadata = _merge_metadata(
+                    row['metadata'], metadata, append=append,
+                )
+                set_columns.append('metadata = ?')
+                set_values.append(new_metadata)
+
+            # updated_at always advances, even on a no-op write — matches
+            # the original behaviour and avoids surprising "stale" reads.
+            set_columns.append('updated_at = ?')
+            set_values.append(_now())
+
+            set_clause = ', '.join(set_columns)
+            set_values.extend([tag, tid, parent_db])
+            await conn.execute(
+                f'UPDATE tasks SET {set_clause} '
+                f'WHERE tag = ? AND id = ? AND parent_id = ?',
+                set_values,
+            )
+
+            # Dependencies: replace-mode only. Subtask deps are unsupported
+            # (matches add_dependency); structured callers pass top-level
+            # ids only. Empty list clears all deps.
+            if dependencies is not None:
+                if parent_id is not None:
                     raise TaskmasterError(
                         'TASKMASTER_TOOL_ERROR',
-                        f'No tasks found for ID(s): {task_id}',
+                        'update_task: subtask dependencies are not supported',
                     )
-
-                # Build the SET clause from non-None structured fields plus
-                # the prompt-derived details path.
-                set_columns: list[str] = []
-                set_values: list[Any] = []
-
-                if title is not None:
-                    set_columns.append('title = ?')
-                    set_values.append(title)
-                if description is not None:
-                    set_columns.append('description = ?')
-                    set_values.append(description)
-                if priority is not None:
-                    set_columns.append('priority = ?')
-                    set_values.append(priority)
-                if status is not None:
-                    set_columns.append('status = ?')
-                    set_values.append(status)
-
-                # details: explicit param wins over prompt. Both honor ``append``.
-                existing_details = row['details'] or ''
-                if details is not None:
-                    new_details = (
-                        f'{existing_details}\n\n{details}'
-                        if (append and existing_details) else details
-                    )
-                    set_columns.append('details = ?')
-                    set_values.append(new_details)
-                elif prompt is not None:
-                    new_details = (
-                        f'{existing_details}\n\n{prompt}'
-                        if (append and existing_details) else prompt
-                    )
-                    set_columns.append('details = ?')
-                    set_values.append(new_details)
-
-                if metadata is not None:
-                    new_metadata = _merge_metadata(
-                        row['metadata'], metadata, append=append,
-                    )
-                    set_columns.append('metadata = ?')
-                    set_values.append(new_metadata)
-
-                # updated_at always advances, even on a no-op write — matches
-                # the original behaviour and avoids surprising "stale" reads.
-                set_columns.append('updated_at = ?')
-                set_values.append(_now())
-
-                set_clause = ', '.join(set_columns)
-                set_values.extend([tag, tid, parent_db])
-                await conn.execute(
-                    f'UPDATE tasks SET {set_clause} '
-                    f'WHERE tag = ? AND id = ? AND parent_id = ?',
-                    set_values,
-                )
-
-                # Dependencies: replace-mode only. Subtask deps are unsupported
-                # (matches add_dependency); structured callers pass top-level
-                # ids only. Empty list clears all deps.
-                if dependencies is not None:
-                    if parent_id is not None:
+                parsed_deps: list[int] = []
+                for raw in dependencies:
+                    dep_tid, dep_parent = _parse_task_id(raw)
+                    if dep_parent is not None:
                         raise TaskmasterError(
                             'TASKMASTER_TOOL_ERROR',
                             'update_task: subtask dependencies are not supported',
                         )
-                    parsed_deps: list[int] = []
-                    for raw in dependencies:
-                        dep_tid, dep_parent = _parse_task_id(raw)
-                        if dep_parent is not None:
-                            raise TaskmasterError(
-                                'TASKMASTER_TOOL_ERROR',
-                                'update_task: subtask dependencies are not supported',
-                            )
-                        parsed_deps.append(dep_tid)
-                    await conn.execute(
-                        'DELETE FROM dependencies WHERE tag = ? AND task_id = ? AND parent_id = ?',
-                        (tag, tid, _TOP_LEVEL_SENTINEL),
-                    )
-                    for dep in parsed_deps:
-                        await conn.execute(
-                            'INSERT OR IGNORE INTO dependencies '
-                            '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
-                            (tag, tid, _TOP_LEVEL_SENTINEL, dep),
-                        )
-
-                refreshed_cursor = await conn.execute(
-                    'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, tid, parent_db),
+                    parsed_deps.append(dep_tid)
+                await conn.execute(
+                    'DELETE FROM dependencies WHERE tag = ? AND task_id = ? AND parent_id = ?',
+                    (tag, tid, _TOP_LEVEL_SENTINEL),
                 )
-                refreshed = await refreshed_cursor.fetchone()
+                for dep in parsed_deps:
+                    await conn.execute(
+                        'INSERT OR IGNORE INTO dependencies '
+                        '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
+                        (tag, tid, _TOP_LEVEL_SENTINEL, dep),
+                    )
+
+            refreshed_cursor = await conn.execute(
+                'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                (tag, tid, parent_db),
+            )
+            refreshed = await refreshed_cursor.fetchone()
         deps = (
             await self._fetch_dependencies(
                 await self._get_connection(project_root), tag,
@@ -689,41 +686,42 @@ class SqliteTaskBackend:
                 'add_subtask: title is required',
             )
 
-        async with self._write_lock(project_root):
-            async with self._txn(project_root) as conn:
-                cursor = await conn.execute(
-                    'SELECT id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, parent_tid, _TOP_LEVEL_SENTINEL),
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                (tag, parent_tid, _TOP_LEVEL_SENTINEL),
+            )
+            if (await cursor.fetchone()) is None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    f'Parent task not found: {parent_id}',
                 )
-                if (await cursor.fetchone()) is None:
-                    raise TaskmasterError(
-                        'TASKMASTER_TOOL_ERROR',
-                        f'Parent task not found: {parent_id}',
-                    )
 
-                max_cursor = await conn.execute(
-                    'SELECT COALESCE(MAX(id), 0) FROM tasks WHERE tag = ? AND parent_id = ?',
-                    (tag, parent_tid),
-                )
-                next_id = (await max_cursor.fetchone())[0] + 1
-                await conn.execute(
-                    """
+            max_cursor = await conn.execute(
+                'SELECT COALESCE(MAX(id), 0) FROM tasks WHERE tag = ? AND parent_id = ?',
+                (tag, parent_tid),
+            )
+            _max_row = await max_cursor.fetchone()
+            assert _max_row is not None  # COALESCE(MAX(id), 0) always returns a row
+            next_id = _max_row[0] + 1
+            await conn.execute(
+                """
                     INSERT INTO tasks (tag, id, parent_id, title, description,
                                        details, test_strategy, status, priority,
                                        metadata, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, '', 'pending', NULL, NULL, ?)
                     """,
-                    (
-                        tag, next_id, parent_tid, title, description or '',
-                        details or '', _now(),
-                    ),
-                )
+                (
+                    tag, next_id, parent_tid, title, description or '',
+                    details or '', _now(),
+                ),
+            )
 
-                refreshed_cursor = await conn.execute(
-                    'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                    (tag, next_id, parent_tid),
-                )
-                refreshed = await refreshed_cursor.fetchone()
+            refreshed_cursor = await conn.execute(
+                'SELECT * FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                (tag, next_id, parent_tid),
+            )
+            refreshed = await refreshed_cursor.fetchone()
 
         subtask_dict = (
             _row_to_task(refreshed, []) if refreshed is not None else {}
@@ -759,107 +757,106 @@ class SqliteTaskBackend:
         # caller's input order.
         parsed: list[tuple[int, int | None]] = [_parse_task_id(raw) for raw in ids]
 
-        async with self._write_lock(project_root):
-            async with self._txn(project_root) as conn:
-                # One SELECT to identify which requested rows exist. SQLite's
-                # default SQL parameter limit (999) bounds batch size; realistic
-                # callers stay well under it.
-                where_pairs = ' OR '.join(
-                    '(id = ? AND parent_id = ?)' for _ in parsed
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            # One SELECT to identify which requested rows exist. SQLite's
+            # default SQL parameter limit (999) bounds batch size; realistic
+            # callers stay well under it.
+            where_pairs = ' OR '.join(
+                '(id = ? AND parent_id = ?)' for _ in parsed
+            )
+            params: list[Any] = [tag]
+            for tid, parent_id in parsed:
+                parent_db = (
+                    parent_id if parent_id is not None
+                    else _TOP_LEVEL_SENTINEL
                 )
-                params: list[Any] = [tag]
-                for tid, parent_id in parsed:
-                    parent_db = (
-                        parent_id if parent_id is not None
-                        else _TOP_LEVEL_SENTINEL
-                    )
-                    params.extend([tid, parent_db])
-                cursor = await conn.execute(
+                params.extend([tid, parent_db])
+            cursor = await conn.execute(
+                f'SELECT id, parent_id FROM tasks '
+                f'WHERE tag = ? AND ({where_pairs})',
+                params,
+            )
+            existing_keys: set[tuple[int, int]] = {
+                (row['id'], row['parent_id'])
+                for row in await cursor.fetchall()
+            }
+
+            # Classify into existing (to remove) vs missing. Dedupe by
+            # (id, parent_id) so duplicate caller input doesn't double-count.
+            removed_keys: set[tuple[int, int]] = set()
+            removed_display: list[str] = []
+            existing_top_tids: set[int] = set()
+            failed_display: list[str] = []
+            failed_seen: set[str] = set()
+
+            for tid, parent_id in parsed:
+                parent_db = (
+                    parent_id if parent_id is not None
+                    else _TOP_LEVEL_SENTINEL
+                )
+                key = (tid, parent_db)
+                disp = _format_task_id(tid, parent_id)
+                if key not in existing_keys:
+                    if disp not in failed_seen:
+                        failed_display.append(disp)
+                        failed_seen.add(disp)
+                    continue
+                if key not in removed_keys:
+                    removed_keys.add(key)
+                    removed_display.append(disp)
+                if parent_id is None:
+                    existing_top_tids.add(tid)
+
+            # Cascade: every existing top-level pulls in its subtasks.
+            # Skip subtasks already explicitly listed by the caller so
+            # they aren't reported twice.
+            if existing_top_tids:
+                top_list = list(existing_top_tids)
+                top_placeholders = ','.join('?' for _ in top_list)
+                sub_cursor = await conn.execute(
                     f'SELECT id, parent_id FROM tasks '
-                    f'WHERE tag = ? AND ({where_pairs})',
-                    params,
+                    f'WHERE tag = ? AND parent_id IN ({top_placeholders})',
+                    [tag, *top_list],
                 )
-                existing_keys: set[tuple[int, int]] = {
-                    (row['id'], row['parent_id'])
-                    for row in await cursor.fetchall()
-                }
-
-                # Classify into existing (to remove) vs missing. Dedupe by
-                # (id, parent_id) so duplicate caller input doesn't double-count.
-                removed_keys: set[tuple[int, int]] = set()
-                removed_display: list[str] = []
-                existing_top_tids: set[int] = set()
-                failed_display: list[str] = []
-                failed_seen: set[str] = set()
-
-                for tid, parent_id in parsed:
-                    parent_db = (
-                        parent_id if parent_id is not None
-                        else _TOP_LEVEL_SENTINEL
-                    )
-                    key = (tid, parent_db)
-                    disp = _format_task_id(tid, parent_id)
-                    if key not in existing_keys:
-                        if disp not in failed_seen:
-                            failed_display.append(disp)
-                            failed_seen.add(disp)
+                sub_rows = sorted(
+                    await sub_cursor.fetchall(),
+                    key=lambda r: (r['parent_id'], r['id']),
+                )
+                for sub_row in sub_rows:
+                    sub_key = (sub_row['id'], sub_row['parent_id'])
+                    if sub_key in removed_keys:
                         continue
-                    if key not in removed_keys:
-                        removed_keys.add(key)
-                        removed_display.append(disp)
-                    if parent_id is None:
-                        existing_top_tids.add(tid)
+                    removed_keys.add(sub_key)
+                    removed_display.append(
+                        _format_task_id(sub_row['id'], sub_row['parent_id']),
+                    )
 
-                # Cascade: every existing top-level pulls in its subtasks.
-                # Skip subtasks already explicitly listed by the caller so
-                # they aren't reported twice.
-                if existing_top_tids:
-                    top_list = list(existing_top_tids)
-                    top_placeholders = ','.join('?' for _ in top_list)
-                    sub_cursor = await conn.execute(
-                        f'SELECT id, parent_id FROM tasks '
-                        f'WHERE tag = ? AND parent_id IN ({top_placeholders})',
-                        [tag, *top_list],
-                    )
-                    sub_rows = sorted(
-                        await sub_cursor.fetchall(),
-                        key=lambda r: (r['parent_id'], r['id']),
-                    )
-                    for sub_row in sub_rows:
-                        sub_key = (sub_row['id'], sub_row['parent_id'])
-                        if sub_key in removed_keys:
-                            continue
-                        removed_keys.add(sub_key)
-                        removed_display.append(
-                            _format_task_id(sub_row['id'], sub_row['parent_id']),
-                        )
-
-                # Two batch DELETEs — tasks then their owning dependencies.
-                # Cross-task deps pointing AT removed ids stay dangling on
-                # purpose (matches the original single-id behaviour and lets
-                # validate_dependencies surface them).
-                if removed_keys:
-                    keys_list = list(removed_keys)
-                    task_pairs = ' OR '.join(
-                        '(id = ? AND parent_id = ?)' for _ in keys_list
-                    )
-                    task_params: list[Any] = [tag]
-                    for tid, pdb in keys_list:
-                        task_params.extend([tid, pdb])
-                    await conn.execute(
-                        f'DELETE FROM tasks WHERE tag = ? AND ({task_pairs})',
-                        task_params,
-                    )
-                    dep_pairs = ' OR '.join(
-                        '(task_id = ? AND parent_id = ?)' for _ in keys_list
-                    )
-                    dep_params: list[Any] = [tag]
-                    for tid, pdb in keys_list:
-                        dep_params.extend([tid, pdb])
-                    await conn.execute(
-                        f'DELETE FROM dependencies WHERE tag = ? AND ({dep_pairs})',
-                        dep_params,
-                    )
+            # Two batch DELETEs — tasks then their owning dependencies.
+            # Cross-task deps pointing AT removed ids stay dangling on
+            # purpose (matches the original single-id behaviour and lets
+            # validate_dependencies surface them).
+            if removed_keys:
+                keys_list = list(removed_keys)
+                task_pairs = ' OR '.join(
+                    '(id = ? AND parent_id = ?)' for _ in keys_list
+                )
+                task_params: list[Any] = [tag]
+                for tid, pdb in keys_list:
+                    task_params.extend([tid, pdb])
+                await conn.execute(
+                    f'DELETE FROM tasks WHERE tag = ? AND ({task_pairs})',
+                    task_params,
+                )
+                dep_pairs = ' OR '.join(
+                    '(task_id = ? AND parent_id = ?)' for _ in keys_list
+                )
+                dep_params: list[Any] = [tag]
+                for tid, pdb in keys_list:
+                    dep_params.extend([tid, pdb])
+                await conn.execute(
+                    f'DELETE FROM dependencies WHERE tag = ? AND ({dep_pairs})',
+                    dep_params,
+                )
 
         successful = len(removed_display)
         failed = len(failed_display)
@@ -897,29 +894,28 @@ class SqliteTaskBackend:
                 'add_dependency: subtask dependencies are not supported',
             )
 
-        async with self._write_lock(project_root):
-            async with self._txn(project_root) as conn:
-                # Verify both endpoints exist before inserting.
-                for tid_check in (tid, dep_tid):
-                    cursor = await conn.execute(
-                        'SELECT id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
-                        (tag, tid_check, _TOP_LEVEL_SENTINEL),
-                    )
-                    if (await cursor.fetchone()) is None:
-                        raise TaskmasterError(
-                            'TASKMASTER_TOOL_ERROR',
-                            f'No tasks found for ID(s): {tid_check}',
-                        )
-                if tid == dep_tid:
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            # Verify both endpoints exist before inserting.
+            for tid_check in (tid, dep_tid):
+                cursor = await conn.execute(
+                    'SELECT id FROM tasks WHERE tag = ? AND id = ? AND parent_id = ?',
+                    (tag, tid_check, _TOP_LEVEL_SENTINEL),
+                )
+                if (await cursor.fetchone()) is None:
                     raise TaskmasterError(
                         'TASKMASTER_TOOL_ERROR',
-                        'add_dependency: task cannot depend on itself',
+                        f'No tasks found for ID(s): {tid_check}',
                     )
-                await conn.execute(
-                    'INSERT OR IGNORE INTO dependencies '
-                    '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
-                    (tag, tid, _TOP_LEVEL_SENTINEL, dep_tid),
+            if tid == dep_tid:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    'add_dependency: task cannot depend on itself',
                 )
+            await conn.execute(
+                'INSERT OR IGNORE INTO dependencies '
+                '(tag, task_id, parent_id, depends_on) VALUES (?, ?, ?, ?)',
+                (tag, tid, _TOP_LEVEL_SENTINEL, dep_tid),
+            )
         return {
             'id': str(tid),
             'dependency_id': str(dep_tid),
@@ -937,13 +933,12 @@ class SqliteTaskBackend:
         tag = tag or DEFAULT_TAG
         tid, _ = _parse_task_id(task_id)
         dep_tid, _ = _parse_task_id(depends_on)
-        async with self._write_lock(project_root):
-            async with self._txn(project_root) as conn:
-                await conn.execute(
-                    'DELETE FROM dependencies WHERE tag = ? AND task_id = ? '
-                    'AND parent_id = ? AND depends_on = ?',
-                    (tag, tid, _TOP_LEVEL_SENTINEL, dep_tid),
-                )
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            await conn.execute(
+                'DELETE FROM dependencies WHERE tag = ? AND task_id = ? '
+                'AND parent_id = ? AND depends_on = ?',
+                (tag, tid, _TOP_LEVEL_SENTINEL, dep_tid),
+            )
         return {
             'id': str(tid),
             'dependency_id': str(dep_tid),
