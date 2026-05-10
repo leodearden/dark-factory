@@ -138,6 +138,13 @@ async def filter_suppressed(
     if not flags:
         return []
 
+    # Why this sweep differs from the Stage 1 prompt's optional single-task check:
+    # This bulk fetch uses the bare 'stage1_flag_suppression' query (no 'task_id=<N>'
+    # appended) because the post-processor needs all records project-wide and filters
+    # by metadata.task_id afterward.  The prompt's single-task spot-check appends
+    # 'task_id=<N>' to bias vector ranking toward the one record it needs, and uses
+    # limit=50 because that ranking bias makes the smaller limit sufficient — the 501
+    # headroom is only needed for this project-wide sweep.
     try:
         results = await memory_service.search(
             query='stage1_flag_suppression',
