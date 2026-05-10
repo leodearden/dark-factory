@@ -15,16 +15,38 @@ Design decisions (captured in plan.json):
   so each stalled task receives at most one pending level-1 escalation.
 - Graceful import of the optional ``escalation`` package via
   ``HAS_ESCALATION`` / ``try/except ImportError`` per harness.py:47-55.
+
+Escalation category note:
+  ``maybe_escalate_stalled_tasks`` submits escalations with
+  ``category='reconciliation_stale_human_operator'``.  This is an intentional
+  extension of the canonical category set documented in
+  ``escalation/src/escalation/models.py`` (which lists scope_violation,
+  design_concern, cleanup_needed, dependency_discovered, risk_identified,
+  infra_issue).  ``Escalation.category`` is a free-form ``str`` field so it
+  will not fail validation; the new value is kept distinct from the Stage 2
+  ``reconciliation_stale_flag`` category to allow filtering on each
+  independently.  TODO: Register ``reconciliation_stale_human_operator`` in
+  the enum-comment in ``escalation/models.py`` and any handler dispatch tables
+  that switch on category.
+
+Stall marker accumulation:
+  ``stage1_human_operator_stall_marker`` memories accumulate indefinitely —
+  there is no cleanup hook tied to task resolution or escalation resolution.
+  This means that if a task transitions out of ``human_operator_required``,
+  gets resolved, and later flips back (e.g. via a remediation re-flag), the
+  prior cycle count carries over and the next cycle may immediately exceed
+  the threshold.  This is **accepted behavior**: ``EscalationQueue.has_open_l1``
+  prevents a duplicate level-1 escalation if one is already pending, and
+  the cost of a spurious re-escalation for a genuinely-re-stalled task is
+  considered lower than the complexity of a cleanup hook.  If per-episode
+  isolation is needed in future, scope the count to a time window via
+  additional metadata filters on ``count_memories_by_metadata``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
@@ -104,8 +126,12 @@ async def track_human_operator_stalls(
     so a single Qdrant failure degrades gracefully.
 
     On count failure: prior_count defaults to 0 (cycle count becomes 1).
-    On add_memory failure: the count is still returned (write is best-effort).
-    Both failures log WARNING.
+    On add_memory failure: the current-cycle count is still returned, but no
+    marker is persisted — so the next cycle will again observe prior_count=0
+    and return 1.  The counter is therefore **best-effort and not guaranteed
+    monotonic across cycles during sustained write failures**.  Both failures
+    log WARNING; a persistent write failure can be distinguished from a
+    genuinely-non-stale task only by correlating the WARNING log stream.
 
     Empty *task_ids* returns ``{}`` with no I/O.
     """
@@ -242,6 +268,8 @@ async def maybe_escalate_stalled_tasks(
         detail = '\n'.join(detail_parts)
 
         try:
+            # make_id() and Escalation() are inside the try so that id-generation
+            # or constructor failures are caught and logged rather than escaping.
             esc = Escalation(  # type: ignore[possibly-undefined]
                 id=escalation_queue.make_id(task_id),
                 task_id=task_id,
@@ -256,7 +284,7 @@ async def maybe_escalate_stalled_tasks(
             escalated.append(task_id)
         except Exception as exc:
             logger.warning(
-                'stage1_stall_detector: failed to submit escalation for task_id=%s: %s',
+                'stage1_stall_detector: failed to escalate task_id=%s (id-gen, construction, or submit): %s',
                 task_id,
                 exc,
                 extra={'project_id': project_id, 'task_id': task_id},
