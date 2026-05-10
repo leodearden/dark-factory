@@ -1108,6 +1108,78 @@ async def test_count_dead_letters_spans_rotated_files(tmp_path):
     assert q.count_dead_letters() == len(all_records) == 3
 
 
+@pytest.mark.asyncio
+async def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_line(
+    tmp_path, caplog
+):
+    """count_dead_letters hot-path counts malformed lines; read_dead_letters skips them.
+
+    This is a characterisation / regression-guard test for the divergence documented
+    in the count_dead_letters() docstring (task 1162):
+
+    - count_dead_letters() with no project_id: binary forward scan, no json.loads.
+      Malformed lines are counted as records (they are non-empty bytes).
+    - count_dead_letters(project_id=...) filter path: json.loads per line, skips
+      malformed lines with a WARNING — same behaviour as read_dead_letters().
+    - read_dead_letters(): skips malformed lines with a WARNING.
+
+    If a future change "fixes" the hot-path to skip malformed lines (or removes the
+    skip in read_dead_letters), this test fails and pinpoints the regression.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(2):
+            q.enqueue(_make_event(project_id='proj-x'))
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    finally:
+        await q.close()
+
+    # Inject a malformed line AFTER close so the drainer cannot overwrite it.
+    # Same pattern as test_read_dead_letters_tolerates_malformed_line.
+    with dl.open('a', encoding='utf-8') as fh:
+        fh.write('not-json-at-all\n')
+
+    with caplog.at_level(logging.WARNING):
+        valid_records = q.read_dead_letters()
+        proj_records = q.read_dead_letters(project_id='proj-x')
+        no_filter_count = q.count_dead_letters()
+        filtered_count = q.count_dead_letters(project_id='proj-x')
+
+    # read_dead_letters skips malformed lines — 2 valid records.
+    assert len(valid_records) == 2, (
+        f'read_dead_letters must skip malformed line; got {len(valid_records)} records'
+    )
+
+    # count_dead_letters hot-path (no project_id) counts malformed lines — 3 total.
+    # This is the documented divergence from read_dead_letters().
+    assert no_filter_count == len(valid_records) + 1 == 3, (
+        f'count_dead_letters hot-path must count malformed line; got {no_filter_count}'
+    )
+
+    # count_dead_letters filter path (project_id given) skips malformed lines — matches read.
+    assert filtered_count == len(proj_records) == 2, (
+        f'count_dead_letters filter path must skip malformed line; got {filtered_count}'
+    )
+
+    # At least one WARNING about malformed line must be logged by read_dead_letters
+    # and/or count_dead_letters filter path.
+    assert any('malformed line' in r.message for r in caplog.records), (
+        'Expected a WARNING containing "malformed line" to be logged'
+    )
+
+
 # ── _iter_lines_reversed ───────────────────────────────────────────────
 
 
