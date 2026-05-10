@@ -1,11 +1,10 @@
-"""Tests for ``TaskWorkflow._reconcile_metadata_files_for_done`` (Fix 1).
+"""Tests for ``TaskWorkflow._reconcile_metadata_files_for_done``.
 
-The helper updates ``metadata.files`` to the architect-declared file set
-(or clears it on no-plan paths) immediately before each
-``set_task_status('done')`` call.  Without this step the phantom-done gate
-in fused-memory rejects the transition with ``done_gate_missing_files``
-when the architect has rewritten scope, leaving the task stranded
-in-progress despite a successful merge.
+Refactored 2026-05-10 (Stage 2 of stuck-done recovery): truth source is
+the merge-diff (``git diff base..merge_sha``), not the architect's
+``plan.files``.  The architect's plan can include files that get squashed
+or refactored away before merge; the merge-diff is the actual record of
+what landed.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ def _make_workflow(
     *,
     project_root: Path,
     task_id: str = '101',
-) -> tuple[TaskWorkflow, AsyncMock]:
+) -> tuple[TaskWorkflow, AsyncMock, AsyncMock]:
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
@@ -38,50 +37,82 @@ def _make_workflow(
     scheduler = MagicMock()
     scheduler.update_task = update_task
 
+    git_ops = MagicMock()
+    get_merge_diff_files = AsyncMock(return_value=[])
+    git_ops.get_merge_diff_files = get_merge_diff_files
+
     wf = TaskWorkflow(
         assignment=assignment,
         config=config,
-        git_ops=MagicMock(),
+        git_ops=git_ops,
         scheduler=scheduler,
         briefing=MagicMock(),
         mcp=MagicMock(),
     )
-    return wf, update_task
+    return wf, update_task, get_merge_diff_files
 
 
 @pytest.mark.asyncio
-async def test_updates_with_plan_files_when_present(tmp_path: Path):
-    """A populated plan refreshes ``metadata.files`` to the architect's set."""
-    wf, update_task = _make_workflow(project_root=tmp_path)
-    wf.plan = {'files': ['src/a.py', 'src/b.py'], 'steps': []}
+async def test_writes_merge_diff_files_when_merge_sha_and_base_commit_set(
+    tmp_path: Path,
+):
+    """Happy path: writes git-diff base..merge_sha (not plan.files)."""
+    wf, update_task, get_merge_diff_files = _make_workflow(project_root=tmp_path)
+    wf._base_commit = 'a' * 40
+    wf._merge_sha = 'b' * 40
+    # plan.files names what the architect said it would touch — but the
+    # merge actually landed a different set of paths.
+    wf.plan = {'files': ['old/path.py'], 'steps': []}
+    get_merge_diff_files.return_value = [
+        'src/landed_a.py', 'src/landed_b.py',
+    ]
 
     await wf._reconcile_metadata_files_for_done()
 
+    get_merge_diff_files.assert_awaited_once_with('a' * 40, 'b' * 40)
     update_task.assert_awaited_once_with(
-        '101', {'files': ['src/a.py', 'src/b.py']},
+        '101', {'files': ['src/landed_a.py', 'src/landed_b.py']},
     )
 
 
 @pytest.mark.asyncio
-async def test_clears_when_plan_empty(tmp_path: Path):
-    """No plan ran (found-on-main paths) → clear ``metadata.files``.
+async def test_clears_when_merge_sha_missing(tmp_path: Path):
+    """No merge_sha (already-on-main shortcuts) → write empty list.
 
-    An empty list disarms the phantom-done gate (``if declared:`` is False
-    in fused-memory's ``_extract_metadata_files``).
+    The gate-skip-when-verified-provenance branch in fused-memory's
+    task_interceptor.py handles the missing-files case.
     """
-    wf, update_task = _make_workflow(project_root=tmp_path)
-    # self.plan defaults to empty dict — exercise the no-plan path.
+    wf, update_task, get_merge_diff_files = _make_workflow(project_root=tmp_path)
+    wf._base_commit = 'a' * 40
+    wf._merge_sha = None
+    wf.plan = {'files': ['anything.py']}
 
     await wf._reconcile_metadata_files_for_done()
 
+    get_merge_diff_files.assert_not_awaited()
     update_task.assert_awaited_once_with('101', {'files': []})
 
 
 @pytest.mark.asyncio
-async def test_clears_when_plan_has_no_files_key(tmp_path: Path):
-    """Plan present but missing the ``files`` key → still clear safely."""
-    wf, update_task = _make_workflow(project_root=tmp_path)
-    wf.plan = {'steps': [{'description': 's'}]}
+async def test_clears_when_base_commit_missing(tmp_path: Path):
+    """No base_commit (eval mode without create_worktree) → empty list."""
+    wf, update_task, get_merge_diff_files = _make_workflow(project_root=tmp_path)
+    wf._base_commit = None
+    wf._merge_sha = 'b' * 40
+
+    await wf._reconcile_metadata_files_for_done()
+
+    get_merge_diff_files.assert_not_awaited()
+    update_task.assert_awaited_once_with('101', {'files': []})
+
+
+@pytest.mark.asyncio
+async def test_writes_empty_list_when_diff_returns_empty(tmp_path: Path):
+    """Empty diff (e.g. revert merge) → empty list, no error."""
+    wf, update_task, get_merge_diff_files = _make_workflow(project_root=tmp_path)
+    wf._base_commit = 'a' * 40
+    wf._merge_sha = 'b' * 40
+    get_merge_diff_files.return_value = []
 
     await wf._reconcile_metadata_files_for_done()
 

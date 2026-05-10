@@ -906,30 +906,41 @@ class TestReviewLoop:
                 return result
 
             async def _implementer(self, cwd: Path) -> AgentResult:
-                """Handle the extra step-3 on second pass."""
+                """Handle the extra step-3 on second pass.
+
+                First-round (step-1 test + step-2 impl): delegate to the
+                parent implementer so lib.py and test_lib.py actually land
+                — Decision-1's pre-merge subset check needs the branch to
+                touch the files declared in plan['files'].
+                """
                 artifacts = TaskArtifacts(cwd)
                 pending = artifacts.get_pending_steps()
 
                 if not pending:
                     return AgentResult(success=True, output='Nothing to do')
 
-                for step in pending:
-                    if step['id'] == 'step-3':
-                        # Add edge case test
-                        test_content = (cwd / 'test_lib.py').read_text()
-                        test_content += '\ndef test_farewell_empty():\n    assert farewell("") == "Goodbye, "\n'
-                        (cwd / 'test_lib.py').write_text(test_content)
+                # If step-3 (re-plan-added) is in the pending set, handle it
+                # explicitly here; otherwise let the parent implementer do
+                # the normal first-round work.
+                step_3 = next(
+                    (s for s in pending if s['id'] == 'step-3'), None,
+                )
+                if step_3 is None:
+                    return await super()._implementer(cwd)
 
-                    await _run(['git', 'add', '-A'], cwd=cwd)
-                    rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=cwd)
-                    if rc != 0:
-                        await _run(['git', 'commit', '-m', f'Complete {step["id"]}'], cwd=cwd)
-                        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=cwd)
-                        artifacts.update_step_status(step['id'], 'done', commit=sha)
-                    else:
-                        artifacts.update_step_status(step['id'], 'done')
-
-                return await super()._implementer(cwd)
+                test_content = (cwd / 'test_lib.py').read_text()
+                test_content += (
+                    '\ndef test_farewell_empty():\n'
+                    '    assert farewell("") == "Goodbye, "\n'
+                )
+                (cwd / 'test_lib.py').write_text(test_content)
+                await _run(['git', 'add', '-A'], cwd=cwd)
+                await _run(['git', 'commit', '-m', 'Complete step-3'], cwd=cwd)
+                _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=cwd)
+                artifacts.update_step_status('step-3', 'done', commit=sha)
+                return AgentResult(
+                    success=True, output='Completed step-3', cost_usd=1.00,
+                )
 
         stub = ReviewAgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)

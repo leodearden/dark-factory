@@ -52,7 +52,10 @@ __all__ = [
     'TaskAssignment',
     'ModuleLockTable',
     'Scheduler',
+    'SetTaskStatusRejected',
     'TerminalExitRejection',
+    'DoneGateRejection',
+    'ProvenanceValidationRejection',
     'extract_rejection',
     'extract_structured_rejection',
     'is_transient_rejection',
@@ -66,7 +69,26 @@ __all__ = [
 _TERMINAL_STATUSES = frozenset({'done', 'cancelled'})
 
 
-class TerminalExitRejection(Exception):
+class SetTaskStatusRejected(Exception):
+    """Base class for non-transient set_task_status rejections.
+
+    Catch this to handle the whole family (terminal-exit, phantom-done,
+    provenance) uniformly. Subclasses carry typed fields for callers that
+    need to react to a specific kind. Callers that previously relied on
+    the silent-WARNING-and-return behaviour must now wrap the call.
+    """
+
+    def __init__(self, task_id: str, error_code: str, raw: str, message: str | None = None):
+        self.task_id = task_id
+        self.error_code = error_code
+        self.raw = raw
+        super().__init__(
+            message
+            or f'set_task_status({task_id!r}) rejected: {error_code} — {raw}'
+        )
+
+
+class TerminalExitRejection(SetTaskStatusRejected):
     """Server's terminal-exit gate refused a non-terminal write because the row is terminal.
 
     Raised only when the rejection is a logical contradiction (caller asked
@@ -79,13 +101,58 @@ class TerminalExitRejection(Exception):
     """
 
     def __init__(self, task_id: str, old_status: str, target_status: str, raw: str):
-        self.task_id = task_id
         self.old_status = old_status
         self.target_status = target_status
-        self.raw = raw
         super().__init__(
-            f'set_task_status({task_id!r}, {target_status!r}) refused: '
-            f'task is currently {old_status!r} (terminal-exit gate)'
+            task_id=task_id,
+            error_code='terminal_exit_rejected',
+            raw=raw,
+            message=(
+                f'set_task_status({task_id!r}, {target_status!r}) refused: '
+                f'task is currently {old_status!r} (terminal-exit gate)'
+            ),
+        )
+
+
+class DoneGateRejection(SetTaskStatusRejected):
+    """Phantom-done gate refused: ``metadata.files`` lists missing paths.
+
+    Raised when fused-memory returns ``error == 'done_gate_missing_files'``.
+    The workflow's happy-path handler catches this, logs honestly, and
+    routes the task to ``_mark_blocked`` so the architect's claim does not
+    silently disagree with the persistence layer.
+    """
+
+    def __init__(self, task_id: str, missing_files: list[str], raw: str):
+        self.missing_files = list(missing_files)
+        super().__init__(
+            task_id=task_id,
+            error_code='done_gate_missing_files',
+            raw=raw,
+            message=(
+                f'set_task_status({task_id!r}, "done") refused: '
+                f'phantom-done gate — missing files: {missing_files!r}'
+            ),
+        )
+
+
+class ProvenanceValidationRejection(SetTaskStatusRejected):
+    """done_provenance validation refused the transition.
+
+    Raised for both ``done_provenance_required`` and
+    ``done_provenance_invalid`` (unresolved commit, branch-only SHA, etc).
+    The error_code field distinguishes the two server-side codes.
+    """
+
+    def __init__(self, task_id: str, error_code: str, raw: str):
+        super().__init__(
+            task_id=task_id,
+            error_code=error_code,
+            raw=raw,
+            message=(
+                f'set_task_status({task_id!r}, "done") refused: '
+                f'{error_code} — {raw}'
+            ),
         )
 
 # Error-type names that indicate a transient backend failure (taskmaster
@@ -713,29 +780,64 @@ class Scheduler:
                 return  # success
             last_rejection = rejection
             if not is_transient_rejection(rejection):
-                # Distinguish logical-contradiction terminal_exit_rejected
-                # responses (caller asked for a non-terminal target with no
-                # reopen_reason on a terminal row) from benign rejections.
-                # Only the contradiction path raises — every other caller
-                # site already swallows the warning + returns.
+                # Non-transient rejection: classify and raise so callers can
+                # react instead of finding out via a divergent on-disk state.
+                # Two terminal-target carve-outs preserve idempotency:
+                #   1. ``terminal_exit_rejected`` for a TERMINAL target with
+                #      no reopen_reason — the server treats this as a no-op,
+                #      not a contradiction. Log and return.
+                #   2. ``terminal_exit_rejected`` when the caller passed
+                #      reopen_reason — the caller already acknowledged the
+                #      terminal state; surface as a warning.
                 structured = extract_structured_rejection(response)
-                if (
-                    isinstance(structured, dict)
-                    and structured.get('error') == 'terminal_exit_rejected'
-                    and status not in _TERMINAL_STATUSES
-                    and reopen_reason is None
-                ):
+                error_code = (
+                    str(structured.get('error', ''))
+                    if isinstance(structured, dict)
+                    else ''
+                )
+                if error_code == 'terminal_exit_rejected':
+                    if status in _TERMINAL_STATUSES or reopen_reason is not None:
+                        logger.warning(
+                            'set_task_status(%s, %s) rejected by fused-memory: %s',
+                            task_id, status, rejection,
+                        )
+                        return
                     raise TerminalExitRejection(
                         task_id=task_id,
-                        old_status=str(structured.get('from_status', '')),
+                        old_status=str(structured.get('from_status', ''))
+                        if isinstance(structured, dict) else '',
                         target_status=status,
                         raw=rejection,
                     )
-                logger.warning(
-                    'set_task_status(%s, %s) rejected by fused-memory: %s',
-                    task_id, status, rejection,
+                if error_code == 'done_gate_missing_files':
+                    missing = []
+                    if isinstance(structured, dict):
+                        raw_missing = structured.get('missing_files') or []
+                        if isinstance(raw_missing, list):
+                            missing = [
+                                m for m in raw_missing if isinstance(m, str)
+                            ]
+                    raise DoneGateRejection(
+                        task_id=task_id,
+                        missing_files=missing,
+                        raw=rejection,
+                    )
+                if error_code in (
+                    'done_provenance_required',
+                    'done_provenance_invalid',
+                ):
+                    raise ProvenanceValidationRejection(
+                        task_id=task_id,
+                        error_code=error_code,
+                        raw=rejection,
+                    )
+                # Any other non-transient rejection: raise the family base
+                # so callers can catch SetTaskStatusRejected uniformly.
+                raise SetTaskStatusRejected(
+                    task_id=task_id,
+                    error_code=error_code or 'unknown',
+                    raw=rejection,
                 )
-                return  # non-transient — surface and stop
             logger.info(
                 'set_task_status(%s, %s) transient rejection '
                 '(attempt %d/%d): %s — retrying',
@@ -747,6 +849,33 @@ class Scheduler:
         raise RuntimeError(
             f'set_task_status({task_id}, {status}) failed after '
             f'{_TRANSIENT_RETRIES} transient retries: {last_rejection}'
+        )
+
+    async def mark_done(
+        self,
+        task_id: str,
+        *,
+        kind: str,
+        sha: str,
+        note: str | None = None,
+    ) -> None:
+        """Set ``task_id`` done with verified ``done_provenance``.
+
+        Centralises the provenance-construction shape shared by every
+        workflow / harness call site that marks a task done.  ``sha`` is
+        mandatory: a ``kind='merged'`` (or ``'found_on_main'``) without a
+        commit is a workflow bug, not a normal case — the server's
+        provenance gate would reject it anyway.
+
+        Exceptions from ``set_task_status`` propagate; callers handle the
+        rejection family explicitly so a stuck-done can never be silently
+        swallowed.
+        """
+        provenance: dict[str, str] = {'kind': kind, 'commit': sha}
+        if note is not None:
+            provenance['note'] = note
+        await self.set_task_status(
+            task_id, 'done', done_provenance=provenance,
         )
 
     async def get_status(self, task_id: str) -> str | None:

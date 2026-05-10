@@ -23,6 +23,10 @@ def harness() -> Harness:
     # and populate only the fields we exercise.
     h = Harness.__new__(Harness)
     h._workflow_cancel_events = {}
+    # cancel_workflow stamps wall-clock for the reconcile sweep's grace
+    # window (R3 race guard).  Initialise here so the bypass-__init__
+    # fixture matches the real Harness attribute set.
+    h._workflow_cancel_at = {}
     return h
 
 

@@ -43,12 +43,43 @@ class DropGuardResult:
     dropped: list[str] = field(default_factory=list)
 
 
+@dataclass
+class PlanFilesTouchedResult:
+    """Structured return value from :func:`_check_plan_files_touched_in_branch`.
+
+    Attributes:
+        not_touched: Plan-file entries that the branch's history did NOT
+            touch.  Non-empty means the architect declared work that the
+            branch never actually delivered.  Empty list means every plan
+            entry is covered by some commit on the branch.
+    """
+
+    not_touched: list[str] = field(default_factory=list)
+
+
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
 """Prefix of the ``MergeOutcome.reason`` string emitted when the drop-guard
 detects work on the task tip that the merge commit dropped.  Workflow-side
 short-circuits use this prefix to route the outcome straight to L1 without
 invoking the steward (the gate fires only on real merger drops post-rewrite,
 which is the human-judgement case the gate was built for)."""
+
+
+PLAN_FILES_NOT_TOUCHED_REASON_PREFIX = 'Plan files not touched by branch'
+"""Prefix of the ``MergeOutcome.reason`` string emitted by the pre-merge
+Decision-1 check.  When the architect declared specific plan files but
+the branch's history (``base..HEAD``) doesn't touch them, the implementation
+hasn't actually delivered against the plan — short-circuit straight to L1
+without involving the steward (mutating plan.json to silence the gate
+would defeat its purpose)."""
+
+
+POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX = 'Post-merge content equivalence failed'
+"""Prefix of the ``MergeOutcome.reason`` string emitted by the post-merge
+Decision-2 check.  After ``advance_main`` succeeds, we verify that
+``branch_HEAD`` and the advanced main SHA have the same tree (modulo
+``.task/``).  Any divergence indicates conflict resolution dropped or
+rewrote work and needs human judgement, not a steward retry."""
 
 
 async def _check_plan_targets_in_tree(
@@ -108,6 +139,163 @@ async def _check_plan_targets_in_tree(
             task_id or '<unknown>', merge_commit_sha, task_head, dropped,
         )
     return DropGuardResult(dropped=dropped)
+
+
+async def _check_plan_files_touched_in_branch(
+    plan_files: list[str],
+    base_sha: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> PlanFilesTouchedResult:
+    """Pre-merge Decision-1 check: every plan file must be touched on the branch.
+
+    For each entry in ``plan_files``, classify as touched if either:
+        (a) the entry appears verbatim in
+            ``git log --name-only base..branch_head`` (file path), OR
+        (b) the entry resolves to a directory in the branch tree (via
+            ``git ls-tree``) and at least one touched file path has it as
+            a path-prefix (directory entries are valid plan targets when
+            an agent stages multiple files inside).
+
+    Empty ``plan_files`` returns no entries — vacuously satisfied.
+
+    Fail-open on git error (matches :func:`_check_plan_targets_in_tree`):
+    return an empty ``PlanFilesTouchedResult`` so a transient diff error
+    doesn't block a real merge.  Loud-log so regressions surface in ops.
+    """
+    if not plan_files:
+        return PlanFilesTouchedResult()
+
+    touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
+    touched_set = set(touched)
+
+    not_touched: list[str] = []
+    for entry in plan_files:
+        if not entry:
+            continue
+        if entry in touched_set:
+            continue
+
+        # Directory match: ask the branch tree what kind of object the
+        # entry names.  ``git ls-tree`` prints "<mode> tree <sha>\t<path>"
+        # for directories and "<mode> blob <sha>\t<path>" for files.
+        rc, ls_out, ls_err = await _run(
+            ['git', 'ls-tree', branch_head, '--', entry],
+            cwd=git_ops.project_root,
+        )
+        if rc == 0 and ls_out.strip() and ' tree ' in ls_out:
+            # Directory: prefix-match against the touched set.
+            prefix = entry.rstrip('/') + '/'
+            if any(t.startswith(prefix) for t in touched_set):
+                continue
+
+        not_touched.append(entry)
+
+    if not_touched:
+        logger.warning(
+            'plan-files-touched: not_touched task_id=%s '
+            'base=%s head=%s entries=%r',
+            task_id or '<unknown>', base_sha, branch_head, not_touched,
+        )
+    return PlanFilesTouchedResult(not_touched=not_touched)
+
+
+async def _check_post_merge_equivalence(
+    task_worktree: Path,
+    advanced_sha: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str]:
+    """Return branch-touched paths whose ``advanced_sha`` blob differs from ``branch_HEAD``.
+
+    Decision-2 post-merge gate: every file the branch touched must appear
+    in the advanced main commit with identical content.  Files the branch
+    did NOT touch are excluded — main legitimately includes work from
+    siblings or earlier merges that the branch never saw.
+
+    Scope (touched set): the merge-base of branch and advanced_sha is the
+    pre-branch baseline; ``git diff --name-only base..branch_head`` lists
+    every path the branch produced.  We then ask git whether any of those
+    paths differ between ``branch_HEAD`` and ``advanced_sha`` — non-empty
+    = the merge dropped or rewrote work.
+
+    Empty list = clean preservation (ff-merge, --no-ff with no conflicts,
+    clean rebase).  Non-empty = caller treats as a hard failure.
+
+    Fail-open on git error: returns an empty list and logs a WARNING.
+    The call is a defense-in-depth check; a transient git error must
+    not block a successful merge from being recorded.
+    """
+    rc, head_out, head_err = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: git rev-parse HEAD failed in %s '
+            '(rc=%d, stderr=%s); failing open. task_id=%s advanced_sha=%s',
+            task_worktree, rc, head_err.strip(),
+            task_id or '<unknown>', advanced_sha,
+        )
+        return []
+    branch_head = head_out.strip()
+
+    # Determine the branch's touched set against the merge-base with main.
+    # Using merge-base (rather than the workflow's _base_commit, which the
+    # caller doesn't provide here) keeps the helper self-contained.
+    rc, mb_out, mb_err = await _run(
+        ['git', 'merge-base', branch_head, advanced_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: merge-base failed for %s..%s '
+            '(rc=%d, stderr=%s); failing open. task_id=%s',
+            branch_head, advanced_sha, rc, mb_err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+    base_sha = mb_out.strip()
+
+    rc, touched_out, touched_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            base_sha, branch_head, '--', ':!.task/',
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: branch-touched diff failed for %s..%s '
+            '(rc=%d, stderr=%s); failing open. task_id=%s',
+            base_sha, branch_head, rc, touched_err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+    touched = [ln.strip() for ln in touched_out.splitlines() if ln.strip()]
+    if not touched:
+        return []
+
+    # Compare branch_head vs advanced_sha restricted to those touched paths.
+    rc, out, err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            branch_head, advanced_sha, '--', *touched,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: scoped diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            branch_head, advanced_sha, rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
 ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
@@ -615,14 +803,48 @@ class MergeWorker:
             # the earlier timeouts has cleared (e.g. test was flaky, host
             # contention eased).  Reset so future timeouts start from 0.
             self._post_merge_verify_timeouts.pop(req.task_id, None)
-            logger.info(f'Task {req.task_id}: merged to main successfully')
-            _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
-            push_status = await self._git_ops.push_main()
             # Use the post-rebase SHA actually placed on main (advance_main
             # rebases on CAS retry; merge_result.merge_commit is the stale
             # pre-rebase SHA and would fail done_provenance ancestor check).
             advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
                 or merge_result.merge_commit
+
+            # Decision-2 post-merge content-equivalence check: the branch's
+            # tip and the advanced main SHA must agree on every non-.task/
+            # path.  Catches conflict-resolution drops and rebase regressions
+            # that would otherwise land silently with a "successful merge"
+            # log line.  Loud failure here is preferable to a stuck-done
+            # task discovered hours later.
+            equiv_failed = await _check_post_merge_equivalence(
+                req.worktree, advanced_sha, self._git_ops,
+                task_id=req.task_id,
+            )
+            if equiv_failed:
+                logger.warning(
+                    'Task %s: post-merge equivalence failed — '
+                    'branch HEAD and advanced main %s diverge in: %r',
+                    req.task_id, advanced_sha[:12], equiv_failed,
+                )
+                _emit_merge_attempt(
+                    self._event_store, req.task_id,
+                    'post_merge_equivalence_failed',
+                    duration_ms=_elapsed_ms(t0),
+                )
+                return MergeOutcome(
+                    'blocked',
+                    reason=(
+                        f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+                        f'branch and main diverge in '
+                        f'{", ".join(equiv_failed)}. '
+                        f'Conflict resolution likely dropped or rewrote '
+                        f'work; review {advanced_sha[:12]} against the '
+                        f'task branch tip.'
+                    ),
+                )
+
+            logger.info(f'Task {req.task_id}: merged to main successfully')
+            _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
+            push_status = await self._git_ops.push_main()
             return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
         if result in ('wip_overlap', 'pop_conflict'):
@@ -1533,17 +1755,52 @@ class SpeculativeMergeWorker:
                 self._cas_retries.pop(req.task_id, None)
                 # Loop-breaker counter reset on success — see MergeWorker.
                 self._post_merge_verify_timeouts.pop(req.task_id, None)
+                # Use the post-rebase SHA actually placed on main (see
+                # advance_main docstring — local merge_commit is stale
+                # after a CAS-retry rebase and fails done_provenance
+                # ancestor check).
+                advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
+                    or merge_commit
+
+                # Decision-2 post-merge content-equivalence check (see
+                # MergeWorker for full rationale).  Speculative path runs
+                # the same gate so an over-eager rebase doesn't drop work.
+                equiv_failed = await _check_post_merge_equivalence(
+                    req.worktree, advanced_sha, self._git_ops,
+                    task_id=req.task_id,
+                )
+                if equiv_failed:
+                    logger.warning(
+                        'Task %s (speculative): post-merge equivalence '
+                        'failed — branch HEAD and advanced main %s '
+                        'diverge in: %r',
+                        req.task_id, advanced_sha[:12], equiv_failed,
+                    )
+                    _emit_merge_attempt(
+                        self._event_store, req.task_id,
+                        'post_merge_equivalence_failed',
+                        duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
+                    await self._git_ops.cleanup_merge_worktree(merge_wt)
+                    if not req.result.done():
+                        req.result.set_result(MergeOutcome(
+                            'blocked',
+                            reason=(
+                                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+                                f'branch and main diverge in '
+                                f'{", ".join(equiv_failed)}. '
+                                f'Conflict resolution likely dropped or '
+                                f'rewrote work; review {advanced_sha[:12]} '
+                                f'against the task branch tip.'
+                            ),
+                        ))
+                    return True
+
                 logger.info(f'Task {req.task_id}: merged to main successfully')
                 _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 push_status = await self._git_ops.push_main()
                 if not req.result.done():
-                    # Use the post-rebase SHA actually placed on main (see
-                    # advance_main docstring — local merge_commit is stale
-                    # after a CAS-retry rebase and fails done_provenance
-                    # ancestor check).
-                    advanced_sha = getattr(self._git_ops, '_last_advanced_sha', None) \
-                        or merge_commit
                     req.result.set_result(MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status))
                 return True
 

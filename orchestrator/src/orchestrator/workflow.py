@@ -41,6 +41,9 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import (
+    DoneGateRejection,
+    ProvenanceValidationRejection,
+    SetTaskStatusRejected,
     TaskAssignment,
     TerminalExitRejection,
     files_to_modules,
@@ -293,6 +296,11 @@ class TaskWorkflow:
         self._steward: Any | None = None
         self._config_dir: TaskConfigDir | None = None
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
+        # Base commit for the current run's worktree (set in run() right after
+        # create_worktree).  Captured here so _reconcile_metadata_files_for_done
+        # can diff base..merge_sha and write the actually-changed paths instead
+        # of the architect's plan.files (which the merge may have squashed).
+        self._base_commit: str | None = None
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
@@ -316,17 +324,26 @@ class TaskWorkflow:
         return files if files else None
 
     async def _reconcile_metadata_files_for_done(self) -> None:
-        """Set ``metadata.files`` to plan files (or clear) before set_task_status('done').
+        """Set ``metadata.files`` to the merge-diff files before set_task_status('done').
 
-        The phantom-done gate (fused-memory ``task_interceptor.py``) rejects
-        done transitions when files in ``metadata.files`` don't exist at
-        ``project_root``.  Architect plans often rewrite scope, leaving
-        ``metadata.files`` stale and stranding the task in-progress after a
-        successful merge.  Refresh the field to the architect-declared file set
-        (or clear it on no-plan paths) so the gate validates against current
-        truth.
+        Truth source: ``git diff --name-only --no-renames <_base_commit>..<_merge_sha>``
+        (excluding ``.task/``) — i.e. the files that actually landed on main,
+        not the architect's plan.files (which the merge may have squashed,
+        refactored, or rewritten).  Pre-fix, plan.files-derived metadata
+        could include paths that no longer existed post-merge, tripping the
+        phantom-done gate even though provenance was correct.
+
+        Fall-back paths: when ``_merge_sha`` or ``_base_commit`` is None
+        (already-on-main shortcuts, eval mode without a merge), write an
+        empty list — the fused-memory gate-skip-when-verified-provenance
+        branch handles the missing-files case from there.
         """
-        files = list(self.plan.get('files', [])) if self.plan else []
+        if self._merge_sha and self._base_commit:
+            files = await self.git_ops.get_merge_diff_files(
+                self._base_commit, self._merge_sha,
+            )
+        else:
+            files = []
         await self.scheduler.update_task(self.task_id, {'files': files})
 
     def _enter_phase(self, new_state: WorkflowState) -> None:
@@ -370,6 +387,7 @@ class TaskWorkflow:
                 )
                 stdout, _ = await proc.communicate()
                 base_commit = stdout.decode().strip()
+            self._base_commit = base_commit
             # Per-task config dir for credential isolation
             self._config_dir = TaskConfigDir(self.task_id)
 
@@ -832,13 +850,36 @@ class TaskWorkflow:
             await self._await_steward_completion()
             self._enter_phase(WorkflowState.DONE)
             await self._reconcile_metadata_files_for_done()
-            await self.scheduler.set_task_status(
-                self.task_id, 'done',
-                done_provenance=(
-                    {'kind': 'merged', 'commit': self._merge_sha}
-                    if self._merge_sha else None
-                ),
-            )
+            if not self._merge_sha:
+                # Should never happen on the happy path — _submit_to_merge_queue
+                # always populates _merge_sha on success.  Defensive bail-out
+                # rather than passing done_provenance=None (which the server
+                # gate now rejects with done_provenance_required).
+                logger.error(
+                    'Task %s: SUCCESS path reached without _merge_sha — '
+                    'cannot construct done_provenance',
+                    self.task_id,
+                )
+                return await self._mark_blocked(
+                    'Internal: SUCCESS without merge_sha — provenance unconstructable',
+                    escalate_to_human=True,
+                )
+            try:
+                await self.scheduler.mark_done(
+                    self.task_id, kind='merged', sha=self._merge_sha,
+                )
+            except SetTaskStatusRejected as exc:
+                # set_task_status rejected the done write — the architect's
+                # claim is contradicted by the persistence layer.  Honest log
+                # + L1 instead of pretending the task is DONE.
+                logger.error(
+                    'Task %s: set_task_status(done) rejected — %s: %s',
+                    self.task_id, exc.error_code, exc.raw,
+                )
+                return await self._mark_blocked(
+                    f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
+                    escalate_to_human=True,
+                )
             logger.info(
                 f'Task {self.task_id} DONE — '
                 f'cost=${self.metrics.total_cost_usd:.2f} '
@@ -882,6 +923,21 @@ class TaskWorkflow:
                 self.task_id, e.cumulative_cost,
             )
             return await self._mark_blocked(reason, detail=detail)
+
+        except SetTaskStatusRejected as exc:
+            # A persistence-layer rejection escaped one of the workflow's
+            # set_task_status / mark_done call sites without an explicit
+            # handler.  Route to L1: the row state contradicts what the
+            # workflow tried to write, which a steward retry can't unstick.
+            # Caught BEFORE the broad Exception so it gets dedicated framing.
+            logger.error(
+                'Task %s: unhandled set_task_status rejection — %s: %s',
+                self.task_id, exc.error_code, exc.raw,
+            )
+            return await self._mark_blocked(
+                f'Unhandled set_task_status rejection: {exc.error_code} — {exc.raw}',
+                escalate_to_human=True,
+            )
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
@@ -2054,17 +2110,28 @@ class TaskWorkflow:
         )
         self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done()
-        await self.scheduler.set_task_status(
-            self.task_id, 'done',
-            done_provenance={
-                'kind': 'found_on_main',
-                'commit': commit,
-                'note': (
+        try:
+            await self.scheduler.mark_done(
+                self.task_id,
+                kind='found_on_main',
+                sha=commit,
+                note=(
                     f'architect-reported task already on main; '
                     f'evidence: {evidence[:400]}'
                 ),
-            },
-        )
+            )
+        except SetTaskStatusRejected as exc:
+            # Architect's claim is contradicted by the persistence layer —
+            # L1-worthy: a steward retry can't reconcile a phantom-done or
+            # provenance ancestor mismatch.
+            logger.error(
+                'Task %s: mark_done rejected after already_done report — %s: %s',
+                self.task_id, exc.error_code, exc.raw,
+            )
+            return await self._mark_blocked(
+                f'Architect already_done rejected: {exc.error_code} — {exc.raw}',
+                escalate_to_human=True,
+            )
         return WorkflowOutcome.DONE
 
     async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
@@ -2837,10 +2904,54 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         paths suppress task-status transitions — the caller retries
         the merge in-place instead of requeueing via the scheduler.
         """
-        from orchestrator.merge_queue import MergeOutcome, MergeRequest, enqueue_merge_request
+        from orchestrator.merge_queue import (
+            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+            MergeOutcome,
+            MergeRequest,
+            _check_plan_files_touched_in_branch,
+            _emit_merge_attempt,
+            enqueue_merge_request,
+        )
 
         assert self.worktree is not None
         assert self.merge_queue is not None
+
+        # Decision-1 pre-merge subset check: refuse to merge a branch that
+        # never touched the architect's declared plan files.  Short-circuit
+        # straight to L1 — steward mediation could mutate plan.json to
+        # silence the gate, defeating its purpose.
+        if (
+            self._task_files
+            and self._base_commit is not None
+        ):
+            rc, branch_head, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+            )
+            if rc == 0 and branch_head.strip():
+                check = await _check_plan_files_touched_in_branch(
+                    list(self._task_files),
+                    self._base_commit,
+                    branch_head.strip(),
+                    self.git_ops,
+                    task_id=self.task_id,
+                )
+                if check.not_touched:
+                    reason = (
+                        f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: '
+                        f'{", ".join(check.not_touched)}. '
+                        f'The architect declared these files but no commit '
+                        f'on the branch touched them.  Implementation has '
+                        f'not delivered against the plan.'
+                    )
+                    _emit_merge_attempt(
+                        self.event_store, self.task_id,
+                        'plan_files_not_touched',
+                    )
+                    return await self._mark_blocked(
+                        reason,
+                        merge_phase=merge_phase,
+                        escalate_to_human=True,
+                    )
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         merge_request = MergeRequest(
@@ -2908,9 +3019,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
-        from orchestrator.merge_queue import DROPPED_PLAN_TARGETS_REASON_PREFIX
+        from orchestrator.merge_queue import (
+            DROPPED_PLAN_TARGETS_REASON_PREFIX,
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+        )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
+            return await self._mark_blocked(
+                result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+            )
+        # Decision-2 short-circuit: post-merge equivalence is also a
+        # human-judgement case (conflict-resolution drops / rebase
+        # regressions); same L1-not-steward routing.
+        if result.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX):
+            self._write_merge_failure_review(
+                'post_merge_equivalence_failed', result.reason,
+            )
             return await self._mark_blocked(
                 result.reason,
                 merge_phase=merge_phase,
@@ -3721,17 +3847,25 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done()
-        await self.scheduler.set_task_status(
-            self.task_id, 'done',
-            done_provenance={
-                'kind': 'found_on_main',
-                'commit': main_sha,
-                'note': (
+        try:
+            await self.scheduler.mark_done(
+                self.task_id,
+                kind='found_on_main',
+                sha=main_sha,
+                note=(
                     'branch already on main at workflow start '
                     '(pre-PLAN recovery)'
                 ),
-            },
-        )
+            )
+        except SetTaskStatusRejected as exc:
+            logger.error(
+                'Task %s: pre-PLAN recovery mark_done rejected — %s: %s',
+                self.task_id, exc.error_code, exc.raw,
+            )
+            return await self._mark_blocked(
+                f'Pre-PLAN recovery rejected: {exc.error_code} — {exc.raw}',
+                escalate_to_human=True,
+            )
         return WorkflowOutcome.DONE
 
     def _escalate_plan_overwrite(self) -> None:

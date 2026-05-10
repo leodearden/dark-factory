@@ -57,6 +57,16 @@ def _make(
     # set_task_status('done').  Stub as AsyncMock so the await succeeds.
     scheduler.update_task = AsyncMock(return_value=True)
 
+    # Stage 1: workflow now calls scheduler.mark_done — wire the helper
+    # to forward into set_task_status so existing assertions still observe
+    # the (task_id, 'done', done_provenance=...) call shape.
+    async def _fake_mark_done(tid, *, kind, sha, note=None):
+        provenance: dict = {'kind': kind, 'commit': sha}
+        if note is not None:
+            provenance['note'] = note
+        await set_task_status(tid, 'done', done_provenance=provenance)
+    scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+
     is_ancestor = AsyncMock(return_value=commit_on_main)
     get_main_sha = AsyncMock(return_value=main_sha)
     git_ops = MagicMock()

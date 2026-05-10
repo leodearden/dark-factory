@@ -2350,42 +2350,41 @@ class TestSetTaskStatusForwarding:
 
     @pytest.mark.asyncio
     async def test_non_transient_rejection_does_not_retry(
-        self, scheduler: Scheduler, monkeypatch, caplog
+        self, scheduler: Scheduler, monkeypatch
     ):
-        """Phantom-done gate (non-transient) is logged once and returns — no retry."""
-        import logging as _logging
+        """Phantom-done gate (non-transient) raises DoneGateRejection — no retry."""
+        from orchestrator.scheduler import DoneGateRejection
         monkeypatch.setattr('orchestrator.scheduler._TRANSIENT_BACKOFF_BASE', 0.0)
         rejection = {
             'result': {'structuredContent': {
                 'success': False, 'error': 'done_gate_missing_files',
+                'missing_files': ['src/missing.py'],
                 'hint': 'metadata.files lists missing paths',
             }},
         }
         mock = AsyncMock(return_value=rejection)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+        with pytest.raises(DoneGateRejection) as excinfo:
             await scheduler.set_task_status('42', 'done', done_provenance={
                 'kind': 'merged', 'commit': 'deadbeef',
             })
         assert mock.await_count == 1, 'non-transient rejection must not retry'
-        warned = [
-            r for r in caplog.records if 'rejected by fused-memory' in r.message
-        ]
-        assert warned and 'done_gate_missing_files' in warned[0].message
+        assert excinfo.value.task_id == '42'
+        assert excinfo.value.missing_files == ['src/missing.py']
 
     @pytest.mark.asyncio
-    async def test_structured_rejection_is_logged_as_warning(
-        self, scheduler: Scheduler, monkeypatch, caplog,
+    async def test_structured_rejection_raises_on_provenance_invalid(
+        self, scheduler: Scheduler, monkeypatch,
     ):
-        """fused-memory's structured error dicts (no exception) are surfaced.
+        """fused-memory's done_provenance_invalid raises ProvenanceValidationRejection.
 
         Regression for the silent-rejection bug that left tasks stuck
         in-progress after CAS retry: workflow.set_task_status('done', ...) was
         passed a stale merge SHA, fused-memory's done_provenance ancestor
         check rejected it, scheduler dropped the response on the floor.
+        Now propagates so the caller can route to L1.
         """
-        import logging as _logging
-        # Structured rejection wrapped in MCP envelope with structuredContent.
+        from orchestrator.scheduler import ProvenanceValidationRejection
         rejection_response = {
             'result': {
                 'structuredContent': {
@@ -2400,17 +2399,54 @@ class TestSetTaskStatusForwarding:
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=rejection_response),
         )
-        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+        with pytest.raises(ProvenanceValidationRejection) as excinfo:
             await scheduler.set_task_status('42', 'done', done_provenance={
                 'kind': 'merged', 'commit': 'deadbeef',
             })
-        rejected = [
-            rec for rec in caplog.records
-            if 'rejected by fused-memory' in rec.message
-        ]
-        assert rejected, f'expected a rejection warning, got: {[r.message for r in caplog.records]}'
-        assert 'done_provenance_invalid' in rejected[0].message
-        assert '42' in rejected[0].message
+        assert excinfo.value.task_id == '42'
+        assert excinfo.value.error_code == 'done_provenance_invalid'
+
+    @pytest.mark.asyncio
+    async def test_provenance_required_raises(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """done_provenance_required raises ProvenanceValidationRejection."""
+        from orchestrator.scheduler import ProvenanceValidationRejection
+        rejection_response = {
+            'result': {'structuredContent': {
+                'success': False,
+                'error': 'done_provenance_required',
+                'hint': 'done_provenance is required',
+            }},
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=rejection_response),
+        )
+        with pytest.raises(ProvenanceValidationRejection) as excinfo:
+            await scheduler.set_task_status('42', 'done')
+        assert excinfo.value.error_code == 'done_provenance_required'
+
+    @pytest.mark.asyncio
+    async def test_unknown_non_transient_rejection_raises_base(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """An unrecognised non-transient error_code raises SetTaskStatusRejected."""
+        from orchestrator.scheduler import SetTaskStatusRejected
+        rejection_response = {
+            'result': {'structuredContent': {
+                'success': False,
+                'error': 'something_unexpected',
+                'hint': 'novel server-side rejection',
+            }},
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=rejection_response),
+        )
+        with pytest.raises(SetTaskStatusRejected) as excinfo:
+            await scheduler.set_task_status('42', 'in-progress')
+        assert excinfo.value.error_code == 'something_unexpected'
 
     @pytest.mark.asyncio
     async def test_success_response_does_not_log_warning(
