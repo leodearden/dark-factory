@@ -1133,7 +1133,12 @@ class TestFilterSuppressed:
 
     @pytest.mark.asyncio
     async def test_search_called_with_canonical_kwargs(self):
-        """(c) search called with canonical kwargs (project_id, categories, stores, limit, query)."""
+        """(c) search called with canonical kwargs (project_id, categories, stores, limit, query).
+
+        limit=501 is used internally (not 500) so that genuine overflow can be
+        detected without false positives at the boundary — see filter_suppressed
+        docstring for details.
+        """
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
         memory_service = AsyncMock()
@@ -1146,7 +1151,7 @@ class TestFilterSuppressed:
         assert kwargs.get('project_id') == 'p'
         assert kwargs.get('categories') == ['observations_and_summaries']
         assert kwargs.get('stores') == ['mem0']
-        assert kwargs.get('limit') == 500
+        assert kwargs.get('limit') == 501  # sentinel: request one extra to detect overflow
         assert 'stage1_flag_suppression' in kwargs.get('query', '')
 
     @pytest.mark.asyncio
@@ -1236,6 +1241,53 @@ class TestFilterSuppressed:
         assert len(result) == 1
         assert result[0] == flags[0]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('suppression_records,label', [
+        ([], 'empty_set'),
+        (
+            [_make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': 'None'})],
+            'none_string_in_set',
+        ),
+        (
+            [_make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': 42})],
+            'other_valid_id_in_set',
+        ),
+    ], ids=['empty_set', 'none_string_in_set', 'other_valid_id_in_set'])
+    async def test_flag_with_none_task_id_never_dropped(self, suppression_records, label):
+        """(h) flag with task_id=None is never suppressed regardless of suppression set contents.
+
+        The consumer-side guard short-circuits to 'keep' when flag_tid is None,
+        regardless of what is in the suppressed_task_ids set.  This is symmetric
+        with the producer-side suppression-record guard that skips None/empty
+        task_ids when building the suppressed set.
+
+        Three cases are parametrized to express the invariant directly:
+        - empty_set: trivially preserved (no suppression records at all)
+        - none_string_in_set: 'None' as a literal string passes the producer
+          guard; without the consumer guard, str(None) == 'None' would drop
+          the flag — this is the key regression scenario.
+        - other_valid_id_in_set: a real suppression id (42) must not suppress
+          a flag whose task_id is None.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=suppression_records)
+
+        # Flag whose task_id key is present but set to Python None.
+        flag_with_None_task_id = {'task_id': None, 'flag_type': 'missing_deliverable'}
+        flags = [flag_with_None_task_id]
+
+        result = await filter_suppressed(memory_service, 'p', flags)
+
+        # The flag must always be preserved — task_id=None is not a valid suppression target.
+        assert len(result) == 1, (
+            f'[{label}] Expected flag with task_id=None to be preserved but result was: {result}'
+        )
+        assert result[0] == flag_with_None_task_id, (
+            f'[{label}] Preserved flag differs from input: {result[0]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-1186 step-3 — filter_suppressed: search exception → pass-through + WARNING
@@ -1275,6 +1327,91 @@ async def test_filter_suppressed_search_exception_returns_flags_unchanged_and_wa
         'filter_suppressed' in m
         for m in warning_messages
     ), f'Expected WARNING mentioning filter_suppressed but got: {warning_messages}'
+
+
+# ---------------------------------------------------------------------------
+# task-1188 step-3 — filter_suppressed: saturation WARNING at limit=500
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_warns_when_search_results_saturate_limit(caplog):
+    """filter_suppressed emits WARNING when search returns > 500 records (true overflow).
+
+    The search uses limit=501 internally so that exactly-500-result sets are
+    not false-positive warned.  501 results confirm the real set is larger than
+    500 and genuine truncation is occurring.  Operators need a WARNING so
+    dashboards can alert on incomplete coverage.
+
+    Asserts:
+    (a) At least one WARNING is emitted.
+    (b) The WARNING message mentions the project_id ('proj_saturation').
+    (c) The WARNING message contains '500', 'saturat', or 'truncat' to signal the
+        saturation condition without pinning exact wording.
+    (d) The non-suppressed flag (task_id=9999) is preserved in the result — a
+        regression where saturation swallowed all flags would be caught here.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    records_501 = [
+        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
+        for i in range(501)
+    ]
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=records_501)
+
+    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await filter_suppressed(memory_service, 'proj_saturation', flags)
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'proj_saturation' in m for m in warning_messages
+    ), f'Expected WARNING mentioning project_id but got: {warning_messages}'
+    assert any(
+        ('500' in m or 'saturat' in m or 'truncat' in m)
+        for m in warning_messages
+    ), f'Expected WARNING signalling saturation condition but got: {warning_messages}'
+    # (d) Non-suppressed flag must pass through even at the saturation boundary.
+    assert result == flags, (
+        f'Expected non-suppressed flag to be preserved at saturation but got: {result}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_does_not_warn_when_search_results_below_limit(caplog):
+    """filter_suppressed does NOT emit saturation WARNING when results count is <= 500.
+
+    Negative test: prevents accidental always-on logging.  500 results (the
+    effective business limit) must NOT trigger the saturation signal — only
+    501+ (genuine overflow) should warn.  This eliminates the false-positive
+    boundary case that would otherwise fire whenever a project has exactly 500
+    active suppression records with no truncation occurring.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    records_500 = [
+        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
+        for i in range(500)
+    ]
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=records_500)
+
+    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        await filter_suppressed(memory_service, 'proj_below', flags)
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any(
+        ('500' in m or 'saturat' in m or 'truncat' in m)
+        for m in warning_messages
+    ), f'Unexpected saturation WARNING with 500 results: {warning_messages}'
 
 
 # ---------------------------------------------------------------------------
@@ -1461,6 +1598,32 @@ class TestBuildSuppressionPayload:
         """str task_id is coerced to int; resulting payload equals canonical schema."""
         assert build_suppression_payload('42') == self._CANONICAL
 
+    def test_invalid_task_id_raises_descriptive_value_error(self):
+        """Non-numeric task_id raises ValueError with function-name and bad-value context.
+
+        The bare int() raises a context-free ValueError; the hardened implementation
+        must wrap it with:
+        - 'build_suppression_payload' in the error message (function-name context)
+        - the bad value itself in the error message (bad-value context)
+        - __cause__ set to the original ValueError/TypeError (from e chaining)
+        """
+        with pytest.raises(ValueError) as exc_info:
+            build_suppression_payload('abc')
+
+        error_message = str(exc_info.value)
+        assert 'build_suppression_payload' in error_message, (
+            f"Expected 'build_suppression_payload' in error message but got: {error_message!r}"
+        )
+        assert 'abc' in error_message, (
+            f"Expected bad value 'abc' in error message but got: {error_message!r}"
+        )
+        assert exc_info.value.__cause__ is not None, (
+            'Expected __cause__ to be set (from e chaining) but it was None'
+        )
+        assert isinstance(exc_info.value.__cause__, (ValueError, TypeError)), (
+            f'Expected __cause__ to be ValueError or TypeError but got: {type(exc_info.value.__cause__)}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Round-trip schema validation tests (task-1185 step-5)
@@ -1491,10 +1654,12 @@ class _FakeMemoryService:
       catches drift between the producer's ``metadata.kind`` and the reader's
       search query (e.g. filter_suppressed passes ``query='stage1_flag_suppression'``
       which must match the kind the producer wrote).
+    * When ``categories`` is provided, only records whose stored category is in
+      the list are returned.  ``categories=None`` (kwarg absent) means no category
+      filter — all records pass.  This enforces the producer→reader category
+      contract so that a category mismatch is caught by tests using this fake.
     * ``limit`` truncates the result list when provided.
-    * All other kwargs (``categories``, ``stores``, ``project_id``) are
-      accepted and ignored for simplicity; they are not needed for the
-      schema-contract tests here.
+    * All other kwargs (``stores``, ``project_id``) are accepted and ignored.
 
     This mirrors the existing FakeMem0 in the regression test but accepts
     writer-supplied content and metadata.
@@ -1502,18 +1667,27 @@ class _FakeMemoryService:
 
     def __init__(self) -> None:
         self._store: dict[str, _MemoryResultStub] = {}
+        self._categories: dict[str, str] = {}
 
     async def add_memory(
-        self, *, content: str, metadata: dict, **_kwargs
+        self, *, content: str, category: str, metadata: dict, **_kwargs
     ) -> AddMemoryResponse:
         id_ = str(_uuid_mod.uuid4())
         self._store[id_] = _MemoryResultStub(id_, content, metadata)
+        self._categories[id_] = category
         return AddMemoryResponse(memory_ids=[id_])
 
     async def search(
-        self, *, query: str = '', limit: int | None = None, **_kwargs
+        self,
+        *,
+        query: str = '',
+        limit: int | None = None,
+        categories: list[str] | None = None,
+        **_kwargs,
     ) -> list[_MemoryResultStub]:
         results = list(self._store.values())
+        if categories is not None:
+            results = [r for r in results if self._categories.get(r.id) in categories]
         if query:
             results = [r for r in results if r.metadata.get('kind') == query]
         if limit is not None:
@@ -1522,37 +1696,72 @@ class _FakeMemoryService:
 
     async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
         self._store.pop(memory_id, None)
+        self._categories.pop(memory_id, None)
 
     def count(self) -> int:
         return len(self._store)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'raw_task_id',
-    [
-        pytest.param(42, id='int_storage'),
-        pytest.param('42', id='str_storage'),
-    ],
-)
-async def test_suppression_record_round_trips_through_prompt_instructed_search(raw_task_id):
-    """Round-trip schema contract: what write_suppression_record writes is exactly
-    what filter_suppressed's search finds.
+async def test_fake_memory_service_search_filters_by_categories_kwarg():
+    """_FakeMemoryService enforces category routing when categories kwarg is provided.
+
+    Asserts:
+    (a) A record stored with category='observations_and_summaries' is found when
+        searching with categories=['observations_and_summaries'] (matching category).
+    (b) The same record is NOT found when searching with categories=['preferences_and_norms']
+        (category mismatch → 0 results).
+    (c) The same record IS found when no categories kwarg is provided (absent kwarg =
+        no category filter).
+
+    Today _FakeMemoryService ignores the categories kwarg (accepts via **_kwargs), so
+    case (b) returns 1 result instead of 0 — this test fails on current code.
+    """
+    fake = _FakeMemoryService()
+    await fake.add_memory(
+        content='x',
+        category='observations_and_summaries',
+        metadata={'kind': 'stage1_flag_suppression', 'task_id': 1},
+    )
+
+    # (a) Matching category → 1 result
+    results_matching = await fake.search(
+        query='stage1_flag_suppression',
+        categories=['observations_and_summaries'],
+    )
+    assert len(results_matching) == 1, (
+        f'Expected 1 result for matching category but got {len(results_matching)}'
+    )
+
+    # (b) Mismatched category → 0 results
+    results_mismatch = await fake.search(
+        query='stage1_flag_suppression',
+        categories=['preferences_and_norms'],
+    )
+    assert len(results_mismatch) == 0, (
+        f'Expected 0 results for mismatched category but got {len(results_mismatch)}'
+    )
+
+    # (c) No categories kwarg → no filter, 1 result
+    results_no_filter = await fake.search(query='stage1_flag_suppression')
+    assert len(results_no_filter) == 1, (
+        f'Expected 1 result with no categories filter but got {len(results_no_filter)}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_suppression_record_round_trips_via_producer():
+    """Round-trip schema contract (producer path): write_suppression_record writes
+    exactly what filter_suppressed's search finds.
+
+    Exercises ONLY the canonical producer path (int task_id → write_suppression_record).
+    A regression in write_suppression_record's int(task_id) coercion would be caught here.
 
     Canonical schema (four-line contract):
       1. metadata.kind == 'stage1_flag_suppression'
-      2. metadata.task_id == <N>  (int or str; compared via str-coercion)
-      3. content == 'STAGE 1 FLAG SUPPRESSION task_id=<N>'
+      2. metadata.task_id == 42 (int)
+      3. content == 'STAGE 1 FLAG SUPPRESSION task_id=42'
       4. category == 'observations_and_summaries'
-
-    Parametrized over raw_task_id: int (42) exercises write_suppression_record
-    directly; str ('42') models a hand-authored or legacy record stored with
-    task_id as str.  Changing the parametrize value changes test behavior —
-    raw_task_id is consumed to construct both the payload and the expected values.
-
-    The str-coercion convention on assertion (6) mirrors filter_suppressed's
-    comparison at flag_dedup.py (`str(task_id)`) so the test passes for both
-    int and str storage shapes without false failures.
 
     The search kwargs match filter_suppressed's actual call shape exactly so
     that any future drift between the producer and the search-call contract is
@@ -1560,22 +1769,12 @@ async def test_suppression_record_round_trips_through_prompt_instructed_search(r
     """
     from fused_memory.reconciliation.flag_dedup import write_suppression_record
 
-    tid_int = int(raw_task_id)
-    expected_content = f'STAGE 1 FLAG SUPPRESSION task_id={tid_int}'
+    raw_task_id = 42
+    expected_content = f'STAGE 1 FLAG SUPPRESSION task_id={raw_task_id}'
     fake = _FakeMemoryService()
 
-    if isinstance(raw_task_id, int):
-        # write via the canonical producer (coerces to int)
-        await write_suppression_record(fake, project_id='dark_factory', task_id=raw_task_id)
-    else:
-        # model the alternative shape: task_id stored as str (e.g. from a
-        # hand-authored record or an old producer without int coercion)
-        await fake.add_memory(
-            content=expected_content,
-            category='observations_and_summaries',
-            project_id='dark_factory',
-            metadata={'kind': 'stage1_flag_suppression', 'task_id': raw_task_id},
-        )
+    # Write via the canonical producer (coerces to int).
+    await write_suppression_record(fake, project_id='dark_factory', task_id=raw_task_id)
 
     # Search with the kwargs filter_suppressed actually uses (task-1186)
     results = await fake.search(
@@ -1594,7 +1793,60 @@ async def test_suppression_record_round_trips_through_prompt_instructed_search(r
         f'metadata.kind mismatch: {results[0].metadata}'
     )
 
-    # (6) task_id round-trips (str-coercion handles int vs str storage)
+    # (6) task_id is stored as int by the producer
+    assert results[0].metadata['task_id'] == raw_task_id, (
+        f'metadata.task_id mismatch: {results[0].metadata["task_id"]!r}'
+    )
+
+    # (7) Canonical content
+    assert results[0].content == expected_content, (
+        f'content mismatch: {results[0].content!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_str_suppression_record_round_trips_through_consumer_search():
+    """Round-trip schema contract (legacy-str consumer path): a hand-authored or
+    legacy record with str task_id is found by filter_suppressed's search.
+
+    Exercises ONLY the legacy-str path: task_id stored as str '42' via
+    fake.add_memory directly, modelling records written before int coercion was
+    enforced.  The reader's str-coercion makes the record visible to filter_suppressed.
+
+    Canonical schema assertions use str-coercion so the test accurately reflects
+    what a str-task_id record actually looks like in Mem0.
+    """
+    raw_task_id = '42'
+    tid_int = int(raw_task_id)
+    expected_content = f'STAGE 1 FLAG SUPPRESSION task_id={tid_int}'
+    fake = _FakeMemoryService()
+
+    # Model the legacy/hand-authored str-task_id storage shape directly.
+    await fake.add_memory(
+        content=expected_content,
+        category='observations_and_summaries',
+        project_id='dark_factory',
+        metadata={'kind': 'stage1_flag_suppression', 'task_id': raw_task_id},
+    )
+
+    # Search with the kwargs filter_suppressed actually uses (task-1186)
+    results = await fake.search(
+        query='stage1_flag_suppression',
+        project_id='dark_factory',
+        categories=['observations_and_summaries'],
+        stores=['mem0'],
+        limit=500,
+    )
+
+    # (4) Exactly one result
+    assert len(results) == 1, f'Expected 1 result but got {len(results)}: {results}'
+
+    # (5) Canonical kind key
+    assert results[0].metadata['kind'] == 'stage1_flag_suppression', (
+        f'metadata.kind mismatch: {results[0].metadata}'
+    )
+
+    # (6) task_id round-trips via str-coercion (legacy records store as str)
     assert str(results[0].metadata['task_id']) == str(tid_int), (
         f'metadata.task_id mismatch: {results[0].metadata["task_id"]!r}'
     )
@@ -1621,57 +1873,76 @@ async def test_suppression_record_round_trips_through_prompt_instructed_search(r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'raw_task_id',
-    [
-        pytest.param(42, id='int_storage'),
-        pytest.param('42', id='str_storage'),
-    ],
-)
-async def test_filter_suppressed_drops_flags_written_by_producer(raw_task_id):
-    """Producer→reader contract: flags written by write_suppression_record are dropped by filter_suppressed.
+async def test_filter_suppressed_drops_flag_written_by_producer():
+    """Producer→reader contract (producer path): flag written by write_suppression_record
+    is dropped by filter_suppressed.
 
-    Per task-1185 description: "once that function lands, extend the test to also assert
-    filter_suppressed correctly drops matching flags for both int and str task_id storage
-    variants."  filter_suppressed is now on main (task-1186).
-
-    Parametrized over raw_task_id: int (42) exercises write_suppression_record
-    directly; str ('42') models the alternative storage shape.  Changing the
-    parametrize value changes which task_id is suppressed and which flag is
-    kept — raw_task_id is consumed in both the write step and the flag construction.
-
-    This test would have caught a producer that wrote metadata.kind under a
-    different key, or task_id under a non-coercible type, because filter_suppressed
-    requires BOTH fields to be present and correct before adding task_id to the
-    suppressed set.
+    Exercises ONLY the canonical producer path (int task_id → write_suppression_record).
+    A regression in write_suppression_record's int(task_id) coercion would be caught here.
 
     Test body:
       (1) build a FakeMemoryService;
-      (2) write the suppression record (int: via write_suppression_record;
-          str: directly via fake.add_memory with str task_id);
+      (2) write the suppression record via write_suppression_record (int task_id);
       (3) call filter_suppressed with a matching flag and an unrelated flag;
       (4) assert the suppressed flag is dropped;
       (5) assert the unrelated flag is preserved.
     """
     from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
 
+    task_id = 42
+    fake = _FakeMemoryService()
+    await write_suppression_record(fake, project_id='dark_factory', task_id=task_id)
+
+    flags = [
+        {'task_id': task_id, 'flag_type': 'missing_deliverable'},  # should be dropped
+        {'task_id': 99, 'flag_type': 'stale_metadata'},             # should be kept
+    ]
+
+    result = await filter_suppressed(fake, 'dark_factory', flags)
+
+    # (4) Suppressed flag is dropped
+    assert len(result) == 1, (
+        f'Expected 1 surviving flag but got {len(result)}: {result}'
+    )
+    # (5) Unrelated flag is preserved
+    assert result[0]['task_id'] == 99, (
+        f"Expected surviving flag task_id=99 but got {result[0]['task_id']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_drops_flag_for_legacy_str_consumer_record():
+    """Producer→reader contract (legacy-str consumer path): a hand-authored record
+    with str task_id still causes filter_suppressed to drop the matching flag.
+
+    Exercises ONLY the legacy-str path: task_id stored as str '42' via
+    fake.add_memory directly.  The reader's str-coercion handles both int and str
+    suppression records, so a legacy str record must suppress the corresponding flag.
+
+    Test body:
+      (1) build a FakeMemoryService;
+      (2) write a legacy str-task_id record directly via fake.add_memory;
+      (3) call filter_suppressed with a matching flag and an unrelated flag;
+      (4) assert the suppressed flag is dropped;
+      (5) assert the unrelated flag is preserved.
+    """
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    raw_task_id = '42'
     tid_int = int(raw_task_id)
     fake = _FakeMemoryService()
 
-    if isinstance(raw_task_id, int):
-        await write_suppression_record(fake, project_id='dark_factory', task_id=raw_task_id)
-    else:
-        # model the str-task_id storage shape (alternative producer path)
-        await fake.add_memory(
-            content=f'STAGE 1 FLAG SUPPRESSION task_id={tid_int}',
-            category='observations_and_summaries',
-            project_id='dark_factory',
-            metadata={'kind': 'stage1_flag_suppression', 'task_id': raw_task_id},
-        )
+    # Model the legacy/hand-authored str-task_id storage shape directly.
+    await fake.add_memory(
+        content=f'STAGE 1 FLAG SUPPRESSION task_id={tid_int}',
+        category='observations_and_summaries',
+        project_id='dark_factory',
+        metadata={'kind': 'stage1_flag_suppression', 'task_id': raw_task_id},
+    )
 
     flags = [
-        {'task_id': tid_int, 'flag_type': 'missing_deliverable'},   # should be dropped
-        {'task_id': 99, 'flag_type': 'stale_metadata'},              # should be kept
+        {'task_id': tid_int, 'flag_type': 'missing_deliverable'},  # should be dropped
+        {'task_id': 99, 'flag_type': 'stale_metadata'},             # should be kept
     ]
 
     result = await filter_suppressed(fake, 'dark_factory', flags)

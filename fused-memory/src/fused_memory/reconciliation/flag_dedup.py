@@ -76,6 +76,14 @@ logger = logging.getLogger(__name__)
 
 
 class _SuppressionMetadata(TypedDict):
+    """Producer-side contract: ``task_id`` is pinned to ``int``.
+
+    Reader (``filter_suppressed``) tolerates and str-coerces both ``int``
+    and ``str`` task_ids for backward compat with legacy hand-authored
+    records — do NOT tighten the reader to int-only without a migration
+    of any pre-existing str-task_id records in Mem0.
+    """
+
     kind: Literal['stage1_flag_suppression']
     task_id: int
 
@@ -116,8 +124,12 @@ async def filter_suppressed(
     preventing a malformed record from accidentally suppressing flags that have
     no task_id.
 
-    The search uses ``limit=500``.  Projects with more than 500 active
-    suppression records would see the excess truncated; in practice suppression
+    The search uses ``limit=501`` internally so that genuine overflow can be
+    detected without false positives.  When exactly 500 results are returned
+    Mem0 may have returned the entire set (no truncation); when 501 are
+    returned it confirms more than 500 records exist and the excess is
+    silently dropped.  A WARNING is logged in the overflow case so dashboards
+    can alert on incomplete suppression coverage.  In practice suppression
     records are a small operator-managed set and 500 provides ample headroom.
 
     On search exception: logs a WARNING and returns *flags* unchanged
@@ -132,13 +144,21 @@ async def filter_suppressed(
             project_id=project_id,
             categories=['observations_and_summaries'],
             stores=['mem0'],
-            limit=500,
+            limit=501,
         )
     except Exception as e:
         logger.warning(
             'filter_suppressed search failed for project %s: %s', project_id, e
         )
         return flags
+
+    if len(results) > 500:
+        logger.warning(
+            'filter_suppressed: result count exceeded 500 for project %s; '
+            'suppression set truncated to 500',
+            project_id,
+        )
+        results = results[:500]
 
     suppressed_task_ids: set[str] = set()
     for r in results:
@@ -150,7 +170,13 @@ async def filter_suppressed(
             continue
         suppressed_task_ids.add(str(task_id))
 
-    return [f for f in flags if str(f.get('task_id', '')) not in suppressed_task_ids]
+    def _keep(f: dict[str, Any]) -> bool:
+        flag_tid = f.get('task_id')
+        if flag_tid is None or flag_tid == '':
+            return True  # symmetric with producer-side suppression-record guard above
+        return str(flag_tid) not in suppressed_task_ids
+
+    return [f for f in flags if _keep(f)]
 
 
 async def dedup_flags(
@@ -341,7 +367,13 @@ def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
       - ``metadata.task_id = <N>`` (int — coerced by this function)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
-    tid = int(task_id)
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f'build_suppression_payload: task_id must be an int or numeric '
+            f'string, got {task_id!r}'
+        ) from e
     return {
         'content': f'STAGE 1 FLAG SUPPRESSION task_id={tid}',
         'category': 'observations_and_summaries',
