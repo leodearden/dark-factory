@@ -253,9 +253,14 @@ project_id=..., task_id=N)` rather than constructing the canonical schema by han
 The helper coerces `task_id` to int and pins the metadata.kind/content shape so \
 future schema changes touch one location.
 
-If you do choose to check: call `search(query="stage1_flag_suppression", \
-project_id=...)`, then inspect each result's metadata. A result is a valid \
-suppression record ONLY when BOTH `metadata.kind == "stage1_flag_suppression"` AND \
+If you do choose to check: call \
+`search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
+categories=['observations_and_summaries'], stores=['mem0'], limit=50)` — \
+include `task_id=<N>` in the query string to bias vector ranking toward the \
+right record, and pin `categories`/`stores`/`limit` to avoid the default \
+`limit=10` silently missing the record on a busy project. Then inspect each \
+result's metadata. A result is a valid suppression record ONLY when BOTH \
+`metadata.kind == "stage1_flag_suppression"` AND \
 `metadata.task_id == <N>`. Do NOT rely on semantic/vector proximity alone — vector \
 search may return near-misses. A result that fails either metadata field, or an \
 empty result set, means "no suppression in effect"; proceed normally.
