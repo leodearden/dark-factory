@@ -17,6 +17,7 @@ import fcntl
 import json
 import logging
 from pathlib import Path
+import re
 from typing import IO, Literal, overload
 
 import pytest
@@ -588,12 +589,21 @@ async def test_startup_nudge_emitted_once_across_two_constructions(
         f'Expected exactly 1 startup nudge across 2 constructions; '
         f'got {len(nudge_records)}: {[r.getMessage() for r in nudge_records]}'
     )
-    # Verify the %d placeholder was substituted with the actual project count;
-    # check the count value only — not surrounding prose — to avoid brittleness.
+    # Verify the %d placeholder in '(%d project(s))' was substituted with the
+    # actual project count.  Anchoring the regex on the parenthesized fragment
+    # (rather than substring-checking the whole message) defends against false
+    # matches from unrelated digits in the message — e.g. the literal 'task 1164'
+    # at the end would satisfy a bare substring check for counts in
+    # {1, 4, 6, 11, 14, 16, 64, 116, 164, 1164}.
     formatted = nudge_records[0].getMessage()
-    assert str(len(j1._known_projects)) in formatted, (
-        f'Expected project count {len(j1._known_projects)!r} in nudge message; '
+    match = re.search(r'\((\d+) project\(s\)\)', formatted)
+    assert match is not None, (
+        f'Expected parenthesized "(N project(s))" fragment in nudge message; '
         f'got: {formatted!r}'
+    )
+    assert int(match.group(1)) == len(j1._known_projects), (
+        f'Expected substituted project count {len(j1._known_projects)} in '
+        f'parenthesized fragment; got {match.group(1)!r} from message: {formatted!r}'
     )
 
 
