@@ -238,15 +238,15 @@ async def test_dropped_plan_targets_excluded_from_thrash_counter():
     dropped_plan_targets through the steward path and let it accumulate
     in this counter.
     """
+    # Inspect the source of _submit_to_merge_queue: it must short-circuit on
+    # the drop-guard prefix before the steward / thrash path.
+    import inspect
+
     from orchestrator.merge_queue import (
         DROPPED_PLAN_TARGETS_REASON_PREFIX,
         MergeOutcome,
     )
     from orchestrator.workflow import TaskWorkflow
-
-    # Inspect the source of _submit_to_merge_queue: it must short-circuit on
-    # the drop-guard prefix before the steward / thrash path.
-    import inspect
     src = inspect.getsource(TaskWorkflow._submit_to_merge_queue)
     assert 'DROPPED_PLAN_TARGETS_REASON_PREFIX' in src, (
         '_submit_to_merge_queue must reference the drop-guard prefix to '

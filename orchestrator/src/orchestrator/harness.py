@@ -21,7 +21,7 @@ from orchestrator.agents.invoke import invoke_agent
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
+from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import Scheduler, files_to_modules

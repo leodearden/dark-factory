@@ -29,7 +29,6 @@ from orchestrator.workflow import (
     WorkflowOutcome,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures + helpers
 # ---------------------------------------------------------------------------
@@ -203,12 +202,6 @@ class TestInterIterationRebaseEventLabel:
 
         workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
         artifacts.update_base_commit(wt_info.base_commit)
-
-        # Capture log SHAs before.
-        _, before_shas, _ = await _run(
-            ['git', 'log', '--oneline', '--format=%H'], cwd=wt,
-        )
-        before = before_shas.strip().splitlines()
 
         result = await workflow._inter_iteration_rebase(
             event_label='verify_phase_rebase',
