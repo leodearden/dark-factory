@@ -30,3 +30,25 @@ _STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
 _STAGE3_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools='search, get_entity, get_episodes, get_status, get_tasks, get_task'
 )
+
+# Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
+# invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
+# writes under their `memories_*` stats; only the stat-key tokens differ between stages.
+_GRAPHITI_QUEUED_GUIDANCE_TEMPLATE = (
+    "Graphiti-only async-enqueued writes show `stores: ['graphiti']` in the response but "
+    "return `memory_ids: []` because the write is queued rather than persisted inline. These "
+    "must NOT be counted under {stat_keys_phrase}. Report them instead under "
+    "a separate `graphiti_writes_queued` stat. The stats verifier enforces this split "
+    "independently and will override any inflated {primary_stat_key} count, but you should "
+    "report it correctly from the start to avoid divergence."
+)
+
+_STAGE1_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
+    stat_keys_phrase="`memories_added` / `memories_written`",
+    primary_stat_key="`memories_added`",
+)
+
+_STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
+    stat_keys_phrase="`memories_written`",
+    primary_stat_key="`memories_written`",
+)

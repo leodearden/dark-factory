@@ -6800,3 +6800,4 @@ class TestPropagateEscalationQueueHelper:
             assert stage._escalation_queue is sentinel_queue, (
                 'Helper must not overwrite _escalation_queue when harness queue is None'
             )
+
