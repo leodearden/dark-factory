@@ -1682,6 +1682,7 @@ async def test_remediation_propagates_tier_limits_to_consolidator(
         'parent-run-id',
         findings,
         tier,
+        project_root='/tmp/test-project',
     )
 
     assert captured.get('episode_limit') == 125, (
@@ -1729,6 +1730,7 @@ async def test_remediation_sets_project_id_and_root_on_all_stages(
         'parent-run-id',
         findings,
         tier,
+        project_root='/srv/my-project',
     )
 
     for name, attrs in stage_attrs.items():
@@ -1774,6 +1776,7 @@ async def test_remediation_sets_remediation_mode_on_task_knowledge_sync(
         'parent-run-id',
         findings,
         tier,
+        project_root='/tmp/test-project',
     )
 
     assert captured.get('remediation_mode') is True
@@ -1808,6 +1811,7 @@ async def test_remediation_forwards_tier_model_to_stage_run(
         'parent-run-id',
         findings,
         tier,
+        project_root='/tmp/test-project',
     )
 
     for name, call_args in models_seen.items():
@@ -2674,6 +2678,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
+            project_root='/tmp/test-project',
         )
 
         assert captured.get('filtered_task_tree') is expected_tree, (
@@ -2722,6 +2727,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
+            project_root='/tmp/test-project',
         )
 
         assert captured.get('filtered_task_tree') is expected_tree, (
@@ -2832,6 +2838,7 @@ class TestHarnessFilteredTaskTreeWiring:
                 'parent-run-id',
                 findings,
                 tier,
+                project_root='/tmp/test-project',
             )
         finally:
             ReconciliationHarness._configure_task_sync = staticmethod(real_helper)  # type: ignore[method-assign]
@@ -2885,6 +2892,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
+            project_root='/tmp/test-project',
             filtered_task_tree=prefetched_tree,
         )
 
@@ -2948,15 +2956,18 @@ class TestHarnessFilteredTaskTreeWiring:
 
         findings = [_make_s3_findings()[0]]
         tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
-        # No filtered_task_tree kwarg — method must fall back to _fetch_filtered_task_tree
+        # No filtered_task_tree kwarg — method must fall back to _fetch_filtered_task_tree.
+        # project_root='/my/project' is threaded explicitly (injected above as the registry value,
+        # but now passed directly as the threaded kwarg rather than re-resolved at call time).
         await harness._run_remediation_pass(
             'test-project',
             'parent-run-id',
             findings,
             tier,
+            project_root='/my/project',
         )
 
-        # project_root comes from _known_projects['test-project'] = '/my/project' (injected above)
+        # _fetch_filtered_task_tree must be called with the threaded project_root value.
         harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
 
 
@@ -4394,24 +4405,28 @@ async def test_run_full_cycle_hard_binds_project_root_via_known_projects(
 
 
 @pytest.mark.asyncio
-async def test_remediation_pass_hard_binds_via_known_projects(
+async def test_remediation_pass_uses_threaded_project_root_over_registry(
     journal, event_buffer, mock_memory_service
 ):
-    """_run_remediation_pass derives project_root from the registry, not from a caller argument.
+    """_run_remediation_pass uses the caller-threaded project_root, not the registry value.
 
-    Defense-in-depth guard (task 1143 step-9/amendment): the function computes project_root
-    via self._known_project_root_for(project_id) — it accepts no project_root argument at
-    the API level, making the registry the unambiguous source of truth.
+    Task 1163 reverses the task-1143 defense-in-depth contract: the caller now threads
+    project_root as a required kwarg.  This test verifies that the threaded value wins
+    even when _known_projects contains a DIFFERENT value for the same project_id.
 
-    The harness has _known_projects = {'reify': '/home/leo/src/reify', 'dark_factory': ...}.
-    All three stage.project_root captures must equal '/home/leo/src/reify'.
+    The harness has _known_projects = {'reify': '/path/B', 'dark_factory': ...} (wrong
+    registry value).  We call _run_remediation_pass with project_root='/path/A' (the
+    correct threaded value from run_full_cycle's pre-cycle resolution).
+
+    All three stage.project_root captures must equal '/path/A', proving the threaded
+    value wins and the registry is not consulted by _run_remediation_pass itself.
     """
     from fused_memory.reconciliation.harness import TierConfig
 
     harness = _make_harness_with_known_projects(
         journal, event_buffer, mock_memory_service,
         {
-            'reify': '/home/leo/src/reify',
+            'reify': '/path/B',  # WRONG value — must NOT be used by _run_remediation_pass
             'dark_factory': '/home/leo/src/dark-factory',
         },
     )
@@ -4436,17 +4451,106 @@ async def test_remediation_pass_hard_binds_via_known_projects(
         parent_run_id='test-parent-run',
         findings=findings,
         tier=tier,
+        project_root='/path/A',  # threaded caller value — must win over registry '/path/B'
     )
 
     assert len(captured_roots) == 3, (
         f"Expected 3 stage captures, got {len(captured_roots)}: {list(captured_roots)}"
     )
-    expected = '/home/leo/src/reify'
+    expected = '/path/A'
     for stage_name, root in captured_roots.items():
         assert root == expected, (
-            f"{stage_name}: expected registry-bound project_root={expected!r} "
-            f"but got {root!r} — _run_remediation_pass must use _known_project_root_for('reify') "
-            f"(task 1143 defense-in-depth)"
+            f"{stage_name}: expected threaded project_root={expected!r} "
+            f"but got {root!r} — _run_remediation_pass must use the caller-supplied "
+            f"project_root kwarg, not _known_project_root_for('reify') (task 1163)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_remediation_uses_threaded_project_root_not_mutated_registry(
+    journal, event_buffer, mock_memory_service
+):
+    """Regression: remediation sees the project_root resolved at run_full_cycle entry,
+    not the registry value that may have changed after cycle entry.
+
+    Task 1163: _run_remediation_pass previously re-resolved project_root via
+    _known_project_root_for(project_id) at its own call site (line 1143).  This
+    meant a mid-cycle mutation of _known_projects could give remediation a different
+    root than the primary cycle used — a cross-contamination risk.
+
+    After the fix, project_root is resolved ONCE by run_full_cycle at line 868
+    (before any side-effects) and threaded through _maybe_remediate →
+    _run_remediation_pass as a required kwarg.
+
+    Setup:
+    - _known_projects = {'reify': '/path/A', 'dark_factory': ...}
+    - Stage 3's before_return mutates _known_projects['reify'] = '/path/B'
+      (simulates a mid-cycle registry update) AND returns one actionable finding
+      to trigger the remediation pass.
+    - Stages 0 and 1 capture stage.project_root when mutation_done is True
+      (i.e. during the remediation pass only).
+    - Stage 3 captures stage.project_root when mutation_done is already True
+      (i.e. the remediation-pass Stage 3 run).
+
+    Assertion: all three remediation-pass captures equal '/path/A'
+    (the pre-mutation resolution), NOT '/path/B' (the mutated registry value).
+
+    TODAY this test fails: _run_remediation_pass re-resolves after the mutation
+    and sets stage.project_root = '/path/B'.
+    AFTER the fix it passes: the threaded value '/path/A' wins.
+    """
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {
+            'reify': '/path/A',
+            'dark_factory': '/home/leo/src/dark-factory',
+        },
+    )
+
+    # Pin the same stage instances so before_return callbacks registered here
+    # remain effective during the remediation pass (same _make_stages shim used
+    # by ~10 other tests in this file).
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    # Push one event so run_full_cycle has something to drain for 'reify'.
+    await event_buffer.push(_make_event('reify'))
+
+    mutation_done: list[bool] = [False]
+    remediation_roots: list[str] = []
+
+    async def capture_if_post_mutation(stage):
+        """Stages 0 and 1: capture project_root only during the remediation pass."""
+        if mutation_done[0]:
+            remediation_roots.append(stage.project_root)
+
+    async def stage3_callback(stage):
+        """Stage 3: on the PRIMARY pass mutate the registry; on REMEDIATION pass capture."""
+        if not mutation_done[0]:
+            # Primary-cycle Stage 3: simulate mid-cycle registry mutation and flag it.
+            mutation_done[0] = True
+            harness._known_projects['reify'] = '/path/B'
+        else:
+            # Remediation-pass Stage 3: capture the project_root that was threaded in.
+            remediation_roots.append(stage.project_root)
+
+    _mock_stage_run(stages[0], before_return=capture_if_post_mutation)
+    _mock_stage_run(stages[1], before_return=capture_if_post_mutation)
+    # Stage 3 returns one actionable finding to trigger _maybe_remediate.
+    _mock_stage_run(stages[2], items_flagged=[_make_s3_findings()[0]], before_return=stage3_callback)
+
+    await harness.run_full_cycle('reify', 'buffer_size:1')
+
+    assert len(remediation_roots) == 3, (
+        f'Expected 3 project_root captures from the remediation pass '
+        f'(one per stage), got {len(remediation_roots)}: {remediation_roots!r}'
+    )
+    for root in remediation_roots:
+        assert root == '/path/A', (
+            f'Remediation stage saw project_root={root!r} but expected '
+            f"'/path/A' (run_full_cycle's pre-mutation resolution at line 868). "
+            f"Got '/path/B' means _run_remediation_pass re-resolved from the "
+            f'mutated registry (task 1163 regression).'
         )
 
 
