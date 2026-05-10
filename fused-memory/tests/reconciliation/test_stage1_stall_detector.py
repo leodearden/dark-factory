@@ -9,6 +9,8 @@ Covers:
 
 from __future__ import annotations
 
+import importlib
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -413,3 +415,65 @@ class TestMaybeEscalateStalledTasks:
 
         # Should NOT raise; failed task excluded
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# TestEscalationBinding
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationBinding:
+    """Verify Escalation is unconditionally bound on the module namespace.
+
+    .. warning::
+        This class calls ``importlib.reload(mod)`` twice — once with
+        ``sys.modules['escalation']`` poisoned to ``None`` and once in the
+        ``finally`` block to restore the real module state.  ``reload()``
+        re-executes the entire module body, which rebinds **all** module-level
+        attributes (loggers, constants, etc.).  Any test that relies on a
+        module-level patch established at import/collection time (e.g. a
+        session-scoped autouse fixture that patches ``stage1_stall_detector.logger``)
+        will see that patch wiped out after this class runs.  If you add such a
+        patch in the future, ensure it is re-applied **after** this class or
+        refactor to restore module state explicitly instead of relying on reload.
+    """
+
+    def test_escalation_bound_when_package_unavailable(self):
+        """Escalation is bound to None and _HAS_ESCALATION is False when the
+        escalation package cannot be imported.
+
+        Uses sys.modules injection + importlib.reload to exercise the
+        ``except ImportError`` branch without restarting the interpreter.
+        A finally-block restores the real package and reloads the module so
+        subsequent tests in the suite see the normal module state.
+        """
+        import fused_memory.reconciliation.stage1_stall_detector as mod
+
+        # Sentinel distinguishes "key was absent" from "key was None"
+        _absent = object()
+        orig = {k: sys.modules.get(k, _absent) for k in ('escalation', 'escalation.models')}
+
+        try:
+            # Setting a sys.modules entry to None causes Python's import
+            # machinery to raise ImportError on the next ``from ... import``.
+            sys.modules['escalation'] = None  # type: ignore[assignment]
+            sys.modules['escalation.models'] = None  # type: ignore[assignment]
+
+            importlib.reload(mod)
+
+            assert hasattr(mod, 'Escalation'), (
+                'Escalation must be bound on the module even when the '
+                'escalation package is unavailable'
+            )
+            assert mod.Escalation is None
+            assert mod._HAS_ESCALATION is False
+        finally:
+            # Restore sys.modules to pre-test state so subsequent tests see
+            # the real escalation package.
+            for k, v in orig.items():
+                if v is _absent:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v  # type: ignore[assignment]
+            # Reload with real imports restored so module bindings are correct.
+            importlib.reload(mod)

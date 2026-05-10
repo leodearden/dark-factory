@@ -41,6 +41,19 @@ Stall marker accumulation:
   considered lower than the complexity of a cleanup hook.  If per-episode
   isolation is needed in future, scope the count to a time window via
   additional metadata filters on ``count_memories_by_metadata``.
+
+Dedup interaction:
+  ``dedup_flags(...)`` runs in ``stages/memory_consolidator.py`` (lines 71-76)
+  **before** ``extract_human_operator_task_ids`` is called at line 84.  A
+  ``human_operator_required`` flag suppressed by dedup that cycle is therefore
+  invisible to ``extract_human_operator_task_ids``, so
+  ``track_human_operator_stalls`` does NOT bump the stall counter for that
+  cycle.  The ``STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD = 5`` consequently counts
+  *"cycles where the flag survived dedup"*, not *"consecutive real stall
+  cycles"*.  A genuinely-stalled task can therefore take materially more than 5
+  cycles to escalate if dedup intermittently suppresses its flag.  This is
+  intentional / accepted behaviour (option (a) from the original review) — no
+  behaviour change in this task.
 """
 
 from __future__ import annotations
@@ -52,6 +65,7 @@ try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     _HAS_ESCALATION = True
 except ImportError:
+    Escalation = None  # type: ignore[assignment,misc]
     _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
@@ -225,7 +239,7 @@ async def maybe_escalate_stalled_tasks(
     Returns the list of task_ids that actually received a new escalation.
     Returns ``[]`` immediately when the ``escalation`` package is unavailable.
     """
-    if not _HAS_ESCALATION:
+    if Escalation is None:
         return []
 
     # Build first-seen flag lookup for representative descriptions
@@ -270,7 +284,7 @@ async def maybe_escalate_stalled_tasks(
         try:
             # make_id() and Escalation() are inside the try so that id-generation
             # or constructor failures are caught and logged rather than escaping.
-            esc = Escalation(  # type: ignore[possibly-undefined]
+            esc = Escalation(
                 id=escalation_queue.make_id(task_id),
                 task_id=task_id,
                 agent_role='reconciliation-stage1',
