@@ -4494,10 +4494,6 @@ async def test_remediation_uses_threaded_project_root_not_mutated_registry(
 
     Assertion: all three remediation-pass captures equal '/path/A'
     (the pre-mutation resolution), NOT '/path/B' (the mutated registry value).
-
-    TODAY this test fails: _run_remediation_pass re-resolves after the mutation
-    and sets stage.project_root = '/path/B'.
-    AFTER the fix it passes: the threaded value '/path/A' wins.
     """
     harness = _make_harness_with_known_projects(
         journal, event_buffer, mock_memory_service,
