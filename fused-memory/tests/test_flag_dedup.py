@@ -1133,7 +1133,12 @@ class TestFilterSuppressed:
 
     @pytest.mark.asyncio
     async def test_search_called_with_canonical_kwargs(self):
-        """(c) search called with canonical kwargs (project_id, categories, stores, limit, query)."""
+        """(c) search called with canonical kwargs (project_id, categories, stores, limit, query).
+
+        limit=501 is used internally (not 500) so that genuine overflow can be
+        detected without false positives at the boundary — see filter_suppressed
+        docstring for details.
+        """
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
         memory_service = AsyncMock()
@@ -1146,7 +1151,7 @@ class TestFilterSuppressed:
         assert kwargs.get('project_id') == 'p'
         assert kwargs.get('categories') == ['observations_and_summaries']
         assert kwargs.get('stores') == ['mem0']
-        assert kwargs.get('limit') == 500
+        assert kwargs.get('limit') == 501  # sentinel: request one extra to detect overflow
         assert 'stage1_flag_suppression' in kwargs.get('query', '')
 
     @pytest.mark.asyncio
@@ -1237,29 +1242,37 @@ class TestFilterSuppressed:
         assert result[0] == flags[0]
 
     @pytest.mark.asyncio
-    async def test_flag_with_explicit_None_task_id_not_dropped_by_None_string_in_suppressed_set(self):
-        """(h) flag with task_id=None must NOT be dropped even when 'None' is in the suppressed set.
+    @pytest.mark.parametrize('suppression_records,label', [
+        ([], 'empty_set'),
+        (
+            [_make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': 'None'})],
+            'none_string_in_set',
+        ),
+        (
+            [_make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': 42})],
+            'other_valid_id_in_set',
+        ),
+    ], ids=['empty_set', 'none_string_in_set', 'other_valid_id_in_set'])
+    async def test_flag_with_none_task_id_never_dropped(self, suppression_records, label):
+        """(h) flag with task_id=None is never suppressed regardless of suppression set contents.
 
-        Producer-side guard (lines 149-150) drops records with task_id=None or ''.
-        But a suppression record can reach the set with task_id='None' (the literal
-        string) if a hand-authored or legacy record stores that value — it passes the
-        `is None or == ''` guard and is added as str('None')='None'.
+        The consumer-side guard short-circuits to 'keep' when flag_tid is None,
+        regardless of what is in the suppressed_task_ids set.  This is symmetric
+        with the producer-side suppression-record guard that skips None/empty
+        task_ids when building the suppressed set.
 
-        Without the consumer-side guard, `str(f.get('task_id', ''))` returns 'None'
-        for a flag whose task_id key is present but set to None, so the flag is
-        incorrectly dropped.  With the symmetric consumer guard (short-circuit to
-        keep when flag_tid is None or ''), the flag must be preserved.
+        Three cases are parametrized to express the invariant directly:
+        - empty_set: trivially preserved (no suppression records at all)
+        - none_string_in_set: 'None' as a literal string passes the producer
+          guard; without the consumer guard, str(None) == 'None' would drop
+          the flag — this is the key regression scenario.
+        - other_valid_id_in_set: a real suppression id (42) must not suppress
+          a flag whose task_id is None.
         """
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        # A suppression record with task_id='None' (literal string — passes
-        # producer guard since 'None' is not None and not '').
-        suppression_record_with_None_string = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': 'None',  # literal string 'None', not Python None
-        })
         memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[suppression_record_with_None_string])
+        memory_service.search = AsyncMock(return_value=suppression_records)
 
         # Flag whose task_id key is present but set to Python None.
         flag_with_None_task_id = {'task_id': None, 'flag_type': 'missing_deliverable'}
@@ -1267,11 +1280,13 @@ class TestFilterSuppressed:
 
         result = await filter_suppressed(memory_service, 'p', flags)
 
-        # The flag must be preserved — task_id=None is not a valid suppression target.
+        # The flag must always be preserved — task_id=None is not a valid suppression target.
         assert len(result) == 1, (
-            f'Expected flag with task_id=None to be preserved but result was: {result}'
+            f'[{label}] Expected flag with task_id=None to be preserved but result was: {result}'
         )
-        assert result[0] == flag_with_None_task_id
+        assert result[0] == flag_with_None_task_id, (
+            f'[{label}] Preserved flag differs from input: {result[0]}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1321,16 +1336,60 @@ async def test_filter_suppressed_search_exception_returns_flags_unchanged_and_wa
 
 @pytest.mark.asyncio
 async def test_filter_suppressed_warns_when_search_results_saturate_limit(caplog):
-    """filter_suppressed emits WARNING when search returns >= 500 records (saturation signal).
+    """filter_suppressed emits WARNING when search returns > 500 records (true overflow).
 
-    500 results mean the limit was reached; excess suppression records are silently
-    truncated.  Operators need a WARNING so dashboards can alert on incomplete coverage.
+    The search uses limit=501 internally so that exactly-500-result sets are
+    not false-positive warned.  501 results confirm the real set is larger than
+    500 and genuine truncation is occurring.  Operators need a WARNING so
+    dashboards can alert on incomplete coverage.
 
     Asserts:
     (a) At least one WARNING is emitted.
     (b) The WARNING message mentions the project_id ('proj_saturation').
     (c) The WARNING message contains '500', 'saturat', or 'truncat' to signal the
         saturation condition without pinning exact wording.
+    (d) The non-suppressed flag (task_id=9999) is preserved in the result — a
+        regression where saturation swallowed all flags would be caught here.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    records_501 = [
+        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
+        for i in range(501)
+    ]
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=records_501)
+
+    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await filter_suppressed(memory_service, 'proj_saturation', flags)
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'proj_saturation' in m for m in warning_messages
+    ), f'Expected WARNING mentioning project_id but got: {warning_messages}'
+    assert any(
+        ('500' in m or 'saturat' in m or 'truncat' in m)
+        for m in warning_messages
+    ), f'Expected WARNING signalling saturation condition but got: {warning_messages}'
+    # (d) Non-suppressed flag must pass through even at the saturation boundary.
+    assert result == flags, (
+        f'Expected non-suppressed flag to be preserved at saturation but got: {result}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_does_not_warn_when_search_results_below_limit(caplog):
+    """filter_suppressed does NOT emit saturation WARNING when results count is <= 500.
+
+    Negative test: prevents accidental always-on logging.  500 results (the
+    effective business limit) must NOT trigger the saturation signal — only
+    501+ (genuine overflow) should warn.  This eliminates the false-positive
+    boundary case that would otherwise fire whenever a project has exactly 500
+    active suppression records with no truncation occurring.
     """
     import logging
 
@@ -1346,46 +1405,13 @@ async def test_filter_suppressed_warns_when_search_results_saturate_limit(caplog
     flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
-        await filter_suppressed(memory_service, 'proj_saturation', flags)
-
-    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any(
-        'proj_saturation' in m for m in warning_messages
-    ), f'Expected WARNING mentioning project_id but got: {warning_messages}'
-    assert any(
-        ('500' in m or 'saturat' in m or 'truncat' in m)
-        for m in warning_messages
-    ), f'Expected WARNING signalling saturation condition but got: {warning_messages}'
-
-
-@pytest.mark.asyncio
-async def test_filter_suppressed_does_not_warn_when_search_results_below_limit(caplog):
-    """filter_suppressed does NOT emit saturation WARNING when results count is below 500.
-
-    Negative test: prevents accidental always-on logging.  499 results must not
-    trigger the saturation signal.
-    """
-    import logging
-
-    from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-    records_499 = [
-        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
-        for i in range(499)
-    ]
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=records_499)
-
-    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
-
-    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
         await filter_suppressed(memory_service, 'proj_below', flags)
 
     warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert not any(
         ('500' in m or 'saturat' in m or 'truncat' in m)
         for m in warning_messages
-    ), f'Unexpected saturation WARNING with 499 results: {warning_messages}'
+    ), f'Unexpected saturation WARNING with 500 results: {warning_messages}'
 
 
 # ---------------------------------------------------------------------------

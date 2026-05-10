@@ -124,8 +124,12 @@ async def filter_suppressed(
     preventing a malformed record from accidentally suppressing flags that have
     no task_id.
 
-    The search uses ``limit=500``.  Projects with more than 500 active
-    suppression records would see the excess truncated; in practice suppression
+    The search uses ``limit=501`` internally so that genuine overflow can be
+    detected without false positives.  When exactly 500 results are returned
+    Mem0 may have returned the entire set (no truncation); when 501 are
+    returned it confirms more than 500 records exist and the excess is
+    silently dropped.  A WARNING is logged in the overflow case so dashboards
+    can alert on incomplete suppression coverage.  In practice suppression
     records are a small operator-managed set and 500 provides ample headroom.
 
     On search exception: logs a WARNING and returns *flags* unchanged
@@ -140,7 +144,7 @@ async def filter_suppressed(
             project_id=project_id,
             categories=['observations_and_summaries'],
             stores=['mem0'],
-            limit=500,
+            limit=501,
         )
     except Exception as e:
         logger.warning(
@@ -148,11 +152,13 @@ async def filter_suppressed(
         )
         return flags
 
-    if len(results) >= 500:
+    if len(results) > 500:
         logger.warning(
-            'filter_suppressed hit limit=500 for project %s; suppression set may be truncated',
+            'filter_suppressed: result count exceeded 500 for project %s; '
+            'suppression set truncated to 500',
             project_id,
         )
+        results = results[:500]
 
     suppressed_task_ids: set[str] = set()
     for r in results:
@@ -167,7 +173,7 @@ async def filter_suppressed(
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
         if flag_tid is None or flag_tid == '':
-            return True  # symmetric with producer guard at lines 149-150
+            return True  # symmetric with producer-side suppression-record guard above
         return str(flag_tid) not in suppressed_task_ids
 
     return [f for f in flags if _keep(f)]
