@@ -326,12 +326,15 @@ class ReconciliationHarness:
         ``_start_escalation_server`` (hot path: stages pre-built in __init__).
         Defensive: only assigns when the harness has a value, so cold-path
         callers before escalation startup leave stages untouched.
+
+        Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``
+        work correctly — the prior two-pass form would silently skip the queue
+        assignment once the URL pass exhausted the iterator.
         """
-        if self._escalation_url:
-            for s in stages:
+        for s in stages:
+            if self._escalation_url:
                 s._escalation_url = self._escalation_url
-        if self._escalation_queue is not None:
-            for s in stages:
+            if self._escalation_queue is not None:
                 s._escalation_queue = self._escalation_queue
 
     @staticmethod
