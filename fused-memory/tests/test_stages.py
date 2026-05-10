@@ -6884,28 +6884,29 @@ class TestBaseStageEscalationQueueAttribute:
         assert stage._escalation_queue is fake_queue
 
 
+@pytest.fixture
+def minimal_harness():
+    """Construct a minimal ReconciliationHarness with all deps mocked."""
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    config = FusedMemoryConfig()
+    memory_service = AsyncMock()
+    taskmaster = AsyncMock()
+    journal = AsyncMock()
+    event_buffer = AsyncMock()
+    harness = ReconciliationHarness(
+        memory_service=memory_service,
+        taskmaster=taskmaster,
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+    return harness
+
+
 class TestHarnessWiresEscalationQueueOntoStages:
     """ReconciliationHarness._make_stages wires _escalation_queue onto each stage."""
-
-    @pytest.fixture
-    def minimal_harness(self):
-        """Construct a minimal ReconciliationHarness with all deps mocked."""
-        from fused_memory.config.schema import FusedMemoryConfig
-        from fused_memory.reconciliation.harness import ReconciliationHarness
-
-        config = FusedMemoryConfig()
-        memory_service = AsyncMock()
-        taskmaster = AsyncMock()
-        journal = AsyncMock()
-        event_buffer = AsyncMock()
-        harness = ReconciliationHarness(
-            memory_service=memory_service,
-            taskmaster=taskmaster,
-            journal=journal,
-            event_buffer=event_buffer,
-            config=config,
-        )
-        return harness
 
     def test_make_stages_wires_escalation_queue(self, minimal_harness):
         """_make_stages() propagates harness._escalation_queue to each returned stage."""
@@ -6932,26 +6933,6 @@ class TestHarnessWiresEscalationQueueOntoStages:
 
 class TestPropagateEscalationQueueHelper:
     """ReconciliationHarness._propagate_escalation_queue wires URL and queue onto an arbitrary stage list."""
-
-    @pytest.fixture
-    def minimal_harness(self):
-        """Construct a minimal ReconciliationHarness with all deps mocked."""
-        from fused_memory.config.schema import FusedMemoryConfig
-        from fused_memory.reconciliation.harness import ReconciliationHarness
-
-        config = FusedMemoryConfig()
-        memory_service = AsyncMock()
-        taskmaster = AsyncMock()
-        journal = AsyncMock()
-        event_buffer = AsyncMock()
-        harness = ReconciliationHarness(
-            memory_service=memory_service,
-            taskmaster=taskmaster,
-            journal=journal,
-            event_buffer=event_buffer,
-            config=config,
-        )
-        return harness
 
     def test_propagates_url_and_queue_onto_pre_existing_stages(self, minimal_harness):
         """Helper propagates harness URL and queue to every stage in the supplied list."""
