@@ -3964,13 +3964,8 @@ class TestFileStructureInvariants:
 # ---------------------------------------------------------------------------
 # Static Protocol conformance checks (pyright-verified)
 #
-# FakeScheduler is imported from _workflow_helpers (no longer defined inline).
-# pyright resolves the imported reference to the concrete class for full structural
-# conformance — no forward-reference suppression needed. The block lives at the
-# bottom of the file so that the import of FakeScheduler is already resolved before
-# pyright evaluates the conformance expressions; placing it at the top would still
-# work after extraction (since the import is hoisted), but keeping it here is
-# consistent with the established layout and avoids unnecessary diff noise.
+# FakeScheduler is imported from _workflow_helpers at the top of this file;
+# pyright resolves it to the concrete class for full structural conformance.
 #
 # CI gate — how enforcement actually reaches this file:
 #   • hooks/project-checks (invoked by hooks/pre-commit on main-branch commits)
