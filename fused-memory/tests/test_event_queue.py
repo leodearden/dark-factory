@@ -986,6 +986,129 @@ def test_read_dead_letters_cross_file_ordering(tmp_path):
     )
 
 
+# ── count_dead_letters ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_count_dead_letters_returns_zero_when_file_missing(tmp_path):
+    """count_dead_letters returns 0 when the dead-letter file does not exist."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'absent.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    # Do NOT call start()/close() — file is never created.
+    assert not dl.exists(), 'Precondition: file must not exist'
+
+    assert q.count_dead_letters() == 0
+    assert q.count_dead_letters(project_id='proj-x') == 0
+
+
+@pytest.mark.asyncio
+async def test_count_dead_letters_matches_read_dead_letters_no_filter(tmp_path):
+    """count_dead_letters() == len(read_dead_letters()) when no filter is given."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(5):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    finally:
+        await q.close()
+
+    all_records = q.read_dead_letters()
+    assert len(all_records) == 5, f'Expected 5 dead-lettered records, got {len(all_records)}'
+    assert q.count_dead_letters() == len(all_records) == 5
+
+
+@pytest.mark.asyncio
+async def test_count_dead_letters_matches_read_dead_letters_project_id_filter(tmp_path):
+    """count_dead_letters(project_id=X) == len(read_dead_letters(project_id=X))."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(3):
+            q.enqueue(_make_event(project_id='proj-a'))
+        for _ in range(2):
+            q.enqueue(_make_event(project_id='proj-b'))
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    finally:
+        await q.close()
+
+    proj_a_records = q.read_dead_letters(project_id='proj-a')
+    assert len(proj_a_records) == 3
+    assert q.count_dead_letters(project_id='proj-a') == len(proj_a_records) == 3
+
+    proj_b_records = q.read_dead_letters(project_id='proj-b')
+    assert len(proj_b_records) == 2
+    assert q.count_dead_letters(project_id='proj-b') == len(proj_b_records) == 2
+
+
+@pytest.mark.asyncio
+async def test_count_dead_letters_spans_rotated_files(tmp_path):
+    """count_dead_letters spans current + rotated files; equals len(read_dead_letters())."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=500,
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        # 3 events trigger rotation: events 1+2 fill the pre-rotation file,
+        # event 3 lands in the fresh file (mirrors test_read_dead_letters_after_rotation).
+        for _ in range(3):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    finally:
+        await q.close()
+
+    assert (tmp_path / 'dl.jsonl.1').exists(), 'Rotation must have occurred'
+
+    all_records = q.read_dead_letters()
+    assert len(all_records) == 3, (
+        f'read_dead_letters must return 3 records across rotated files; got {len(all_records)}'
+    )
+    assert q.count_dead_letters() == len(all_records) == 3
+
+
 # ── _iter_lines_reversed ───────────────────────────────────────────────
 
 
