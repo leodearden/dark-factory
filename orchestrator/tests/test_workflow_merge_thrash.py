@@ -253,6 +253,9 @@ async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
     wf.merge_queue = MagicMock()
     wf.plan = {'files': []}
     wf._module_configs = []
+    # Pre-seed with a sentinel so we can distinguish "never touched" (good)
+    # from "reset to None coincidentally" (would silently pass a weaker test).
+    wf._last_merge_block_reason = 'sentinel'
 
     async def fake_enqueue(queue, req: MergeRequest, event_store):
         req.result.set_result(MergeOutcome(
@@ -272,6 +275,7 @@ async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
     f.mark_blocked.assert_awaited_once()
     _, kwargs = f.mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is True
-    # (c) thrash counter cannot be incremented: drop-guard path skipped the
-    # _last_merge_block_reason capture that would feed the thrash signature.
-    assert wf._last_merge_block_reason is None
+    # (c) thrash counter cannot be incremented: the drop-guard short-circuit at
+    # workflow.py:2911-2918 returns before the steward-path capture at line 2921
+    # that sets _last_merge_block_reason — the sentinel must be unchanged.
+    assert wf._last_merge_block_reason == 'sentinel'
