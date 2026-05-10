@@ -3795,8 +3795,26 @@ class TestBriefingKnownGapsRefresh:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'bogus_result',
-        [None, {'message': 'no id field'}, 'string-not-dict', {'id': None}, {'id': ''}],
-        ids=['none', 'dict_without_id', 'non_dict', 'dict_id_none', 'dict_id_empty'],
+        [
+            None,
+            {'message': 'no id field'},
+            'string-not-dict',
+            {'id': None},
+            {'id': ''},
+            {'id': 123},
+            {'id': True},
+            {'id': '   '},
+        ],
+        ids=[
+            'none',
+            'dict_without_id',
+            'non_dict',
+            'dict_id_none',
+            'dict_id_empty',
+            'int_not_str',
+            'id_bool',
+            'id_whitespace',
+        ],
     )
     async def test_queue_refresh_tasks_treats_unexpected_shape_as_failure(
         self, bogus_result, caplog,
