@@ -177,6 +177,78 @@ def _suppress_same_run_human_operator_dups(
 # ── Stage 2 post-flight guard helpers (task 1137) ────────────────────────────
 
 
+async def _resolve_live_status(
+    op: dict,
+    taskmaster,
+    project_root: str,
+    status_cache: dict[str, str] | None,
+    op_name: str,
+) -> tuple[str, str] | None:
+    """Return (task_id, live_status) for a write_journal op, or None to skip it.
+
+    Centralizes the param-parse + task_id-extract + cache-or-fetch boilerplate
+    shared by Guards 1-3. Returns ``None`` when:
+      * ``op['params']`` is malformed JSON
+      * task_id is missing (or empty after str-strip)
+      * status_cache is provided but task_id is absent (cache-build failure)
+      * fallback ``taskmaster.get_task`` raises
+
+    The task_id source is keyed off ``op.get('operation')``:
+      * ``'add_memory'``      → ``params['metadata']['task_id']``
+      * anything else         → ``params['task_id']``
+
+    In fallback mode (status_cache is None), a non-dict ``get_task`` result
+    yields ``live_status='unknown'`` (preserves pre-refactor behaviour).
+
+    Args:
+        op: A single write_journal op dict. Caller is expected to have already
+            filtered by ``agent_id`` and ``operation``.
+        taskmaster: Taskmaster backend (used only in fallback mode).
+        project_root: Absolute path to the Taskmaster project directory.
+        status_cache: Pre-fetched ``{task_id: live_status}`` dict built by
+            ``_apply_post_flight_guards``, or ``None`` for per-op fallback.
+        op_name: Calling helper's name, embedded in WARNING log messages so
+            existing log greps remain stable (e.g.
+            'reconciliation._verify_set_task_status_post_action: ...').
+    """
+    params_raw = op.get('params') or '{}'
+    try:
+        params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(
+            'reconciliation.%s: failed to parse params JSON for op_id=%s; skipping',
+            op_name, op.get('id'),
+        )
+        return None
+
+    if op.get('operation') == 'add_memory':
+        metadata = params.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            return None
+        task_id = str(metadata.get('task_id', '')).strip()
+    else:
+        task_id = str(params.get('task_id', '')).strip()
+    if not task_id:
+        return None
+
+    if status_cache is not None:
+        if task_id not in status_cache:
+            return None  # cache build failed for this task; skip
+        live_status = status_cache[task_id]
+    else:
+        try:
+            task_data = await taskmaster.get_task(task_id, project_root)
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: get_task failed for task_id=%s; skipping op',
+                op_name, task_id,
+            )
+            return None
+        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+
+    return task_id, live_status
+
+
 async def _classify_terminal_state_violations(
     ops: list[dict],
     taskmaster,
@@ -219,38 +291,13 @@ async def _classify_terminal_state_violations(
         if op.get('operation') != 'update_task':
             continue
 
-        # Parse params JSON to extract task_id
-        params_raw = op.get('params') or '{}'
-        try:
-            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'reconciliation._classify_terminal_state_violations: '
-                'failed to parse params JSON for op_id=%s; skipping',
-                op.get('id'),
-            )
+        resolved = await _resolve_live_status(
+            op, taskmaster, project_root, status_cache,
+            '_classify_terminal_state_violations',
+        )
+        if resolved is None:
             continue
-
-        task_id = str(params.get('task_id', '')).strip()
-        if not task_id:
-            continue
-
-        if status_cache is not None:
-            if task_id not in status_cache:
-                continue  # cache build failed for this task; skip per fallback semantics
-            live_status = status_cache[task_id]
-        else:
-            # Fallback: fetch live status individually (used in unit tests)
-            try:
-                task_data = await taskmaster.get_task(task_id, project_root)
-            except Exception:
-                logger.warning(
-                    'reconciliation._classify_terminal_state_violations: '
-                    'get_task failed for task_id=%s; skipping op',
-                    task_id,
-                )
-                continue
-            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        task_id, live_status = resolved
 
         if live_status in TERMINAL_STATUSES:
             violations.append({
@@ -299,37 +346,23 @@ async def _verify_set_task_status_post_action(
         if op.get('operation') != 'set_task_status':
             continue
 
+        # Parse params locally to extract target_status (the helper returns task_id+live_status only)
         params_raw = op.get('params') or '{}'
         try:
             params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
         except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'reconciliation._verify_set_task_status_post_action: '
-                'failed to parse params JSON for op_id=%s; skipping',
-                op.get('id'),
-            )
             continue
-
-        task_id = str(params.get('task_id', '')).strip()
         target_status = str(params.get('status', '')).strip()
-        if not task_id or not target_status:
+        if not target_status:
             continue
 
-        if status_cache is not None:
-            if task_id not in status_cache:
-                continue  # cache build failed for this task; skip per fallback semantics
-            live_status = status_cache[task_id]
-        else:
-            try:
-                task_data = await taskmaster.get_task(task_id, project_root)
-            except Exception:
-                logger.warning(
-                    'reconciliation._verify_set_task_status_post_action: '
-                    'get_task failed for task_id=%s; skipping op',
-                    task_id,
-                )
-                continue
-            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        resolved = await _resolve_live_status(
+            op, taskmaster, project_root, status_cache,
+            '_verify_set_task_status_post_action',
+        )
+        if resolved is None:
+            continue
+        task_id, live_status = resolved
 
         if live_status != target_status:
             mismatches.append({
@@ -387,23 +420,16 @@ async def _check_stall_guard_freshness(
         if op.get('operation') != 'add_memory':
             continue
 
+        # Parse params locally to check for snapshot_status / observed_status keys
+        # before calling _resolve_live_status — this preserves the early-continue that
+        # prevents get_task from being called when the op has no freshness key.
         params_raw = op.get('params') or '{}'
         try:
             params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
         except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'reconciliation._check_stall_guard_freshness: '
-                'failed to parse params JSON for op_id=%s; skipping',
-                op.get('id'),
-            )
             continue
-
         metadata = params.get('metadata') or {}
         if not isinstance(metadata, dict):
-            continue
-
-        task_id = str(metadata.get('task_id', '')).strip()
-        if not task_id:
             continue
 
         # Resolve snapshot_status or its alias
@@ -413,23 +439,15 @@ async def _check_stall_guard_freshness(
                 snapshot_status = str(metadata[key])
                 break
         if snapshot_status is None:
-            continue  # Op not opted into freshness checking
+            continue  # Op not opted into freshness checking; skip before any get_task call
 
-        if status_cache is not None:
-            if task_id not in status_cache:
-                continue  # cache build failed for this task; skip per fallback semantics
-            live_status = status_cache[task_id]
-        else:
-            try:
-                task_data = await taskmaster.get_task(task_id, project_root)
-            except Exception:
-                logger.warning(
-                    'reconciliation._check_stall_guard_freshness: '
-                    'get_task failed for task_id=%s; skipping op',
-                    task_id,
-                )
-                continue
-            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        resolved = await _resolve_live_status(
+            op, taskmaster, project_root, status_cache,
+            '_check_stall_guard_freshness',
+        )
+        if resolved is None:
+            continue
+        task_id, live_status = resolved
 
         if live_status != snapshot_status:
             violations.append({
