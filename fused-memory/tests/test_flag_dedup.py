@@ -1315,6 +1315,80 @@ async def test_filter_suppressed_search_exception_returns_flags_unchanged_and_wa
 
 
 # ---------------------------------------------------------------------------
+# task-1188 step-3 — filter_suppressed: saturation WARNING at limit=500
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_warns_when_search_results_saturate_limit(caplog):
+    """filter_suppressed emits WARNING when search returns >= 500 records (saturation signal).
+
+    500 results mean the limit was reached; excess suppression records are silently
+    truncated.  Operators need a WARNING so dashboards can alert on incomplete coverage.
+
+    Asserts:
+    (a) At least one WARNING is emitted.
+    (b) The WARNING message mentions the project_id ('proj_saturation').
+    (c) The WARNING message contains '500', 'saturat', or 'truncat' to signal the
+        saturation condition without pinning exact wording.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    records_500 = [
+        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
+        for i in range(500)
+    ]
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=records_500)
+
+    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        await filter_suppressed(memory_service, 'proj_saturation', flags)
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'proj_saturation' in m for m in warning_messages
+    ), f'Expected WARNING mentioning project_id but got: {warning_messages}'
+    assert any(
+        ('500' in m or 'saturat' in m or 'truncat' in m)
+        for m in warning_messages
+    ), f'Expected WARNING signalling saturation condition but got: {warning_messages}'
+
+
+@pytest.mark.asyncio
+async def test_filter_suppressed_does_not_warn_when_search_results_below_limit(caplog):
+    """filter_suppressed does NOT emit saturation WARNING when results count is below 500.
+
+    Negative test: prevents accidental always-on logging.  499 results must not
+    trigger the saturation signal.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+    records_499 = [
+        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
+        for i in range(499)
+    ]
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=records_499)
+
+    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        await filter_suppressed(memory_service, 'proj_below', flags)
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any(
+        ('500' in m or 'saturat' in m or 'truncat' in m)
+        for m in warning_messages
+    ), f'Unexpected saturation WARNING with 499 results: {warning_messages}'
+
+
+# ---------------------------------------------------------------------------
 # task-1186 step-5 — integration: dedup_flags calls filter_suppressed FIRST
 # ---------------------------------------------------------------------------
 
