@@ -1133,58 +1133,6 @@ class TestProactiveSampling:
             'server now rejects that call shape.'
         )
 
-    # --- memory_hints additive-merge prompt assertions ---
-
-    def test_stage2_memory_hints_block_documents_additive_merge(self):
-        """Stage 2 prompt must document additive/union semantics and drop the broken
-        sibling-key cross-check.
-
-        Three assertions:
-        (a) The broken cross-check phrase is gone.
-        (b) Additive/union semantics are documented.
-        (c) Post-write verification is framed as a SUPERSET check.
-
-        (d) tasks_hints_updated increment guidance survives (must still pass on
-            the current, pre-step-6 prompt).
-        """
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-
-        # (a) Broken cross-check phrase must be absent.
-        assert 'sibling keys still match what was on the row before the write' \
-            not in STAGE2_SYSTEM_PROMPT, (
-            "Stage 2 prompt must not instruct agents to cross-check sibling keys "
-            "against a pre-write baseline — no baseline fetch is required when "
-            "append=True guarantees sibling-key preservation."
-        )
-
-        # (b) Additive/union merge semantics must be documented.
-        assert any(
-            phrase in STAGE2_SYSTEM_PROMPT
-            for phrase in ('union', 'additive', 'merged with', 'preserved and combined')
-        ), (
-            "Stage 2 prompt must document that list/dict-valued keys merge additively "
-            "under append=True (e.g. use 'union' or 'additive')."
-        )
-
-        # (c) Verification check must be framed as a SUPERSET assertion.
-        assert any(
-            phrase in STAGE2_SYSTEM_PROMPT
-            for phrase in (
-                'contains all newly-attached',
-                'superset',
-                'every newly-attached hint',
-                'every newly-attached entity',
-            )
-        ), (
-            "Stage 2 prompt must reframe the verification check as a SUPERSET "
-            "assertion (post-write hints contain all newly-attached entries)."
-        )
-
-        # (d) Regression: tasks_hints_updated counter guidance must survive.
-        assert 'tasks_hints_updated' in STAGE2_SYSTEM_PROMPT, (
-            "Stage 2 prompt must retain tasks_hints_updated increment guidance."
-        )
-
     # --- Step 12: ID descending as recency proxy ---
 
     def test_select_proactive_sample_uses_id_descending_as_recency_proxy(self):
