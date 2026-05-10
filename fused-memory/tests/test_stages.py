@@ -3795,8 +3795,26 @@ class TestBriefingKnownGapsRefresh:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'bogus_result',
-        [None, {'message': 'no id field'}, 'string-not-dict', {'id': None}, {'id': ''}],
-        ids=['none', 'dict_without_id', 'non_dict', 'dict_id_none', 'dict_id_empty'],
+        [
+            None,
+            {'message': 'no id field'},
+            'string-not-dict',
+            {'id': None},
+            {'id': ''},
+            {'id': 123},
+            {'id': True},
+            {'id': '   '},
+        ],
+        ids=[
+            'none',
+            'dict_without_id',
+            'non_dict',
+            'dict_id_none',
+            'dict_id_empty',
+            'int_not_str',
+            'id_bool',
+            'id_whitespace',
+        ],
     )
     async def test_queue_refresh_tasks_treats_unexpected_shape_as_failure(
         self, bogus_result, caplog,
@@ -3829,6 +3847,57 @@ class TestBriefingKnownGapsRefresh:
         assert len(warning_records) == 1
         assert 'briefing_refresh_add_task_unexpected_shape' in warning_records[0].getMessage()
         assert getattr(warning_records[0], 'task_id', None) == '1751'
+
+    # ------------------------------------------------------------------ #
+    # _queue_briefing_refresh_tasks — mixed success/failure in one call    #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_partitions_created_and_failed_correctly_in_mixed_run(
+        self, caplog,
+    ):
+        """Loop continues past a failed creation; created/failed are correctly partitioned.
+
+        Pins post-confirmation partitioning for the multi-mismatch path:
+        a failed add_task must NOT abort the loop or inflate the created list.
+        """
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.add_task.side_effect = [
+            {'id': '100', 'message': 'created'},   # success
+            {'id': ''},                              # DTO-violating empty id → failed
+            {'id': '300', 'message': 'created'},   # success
+        ]
+
+        mismatches = [
+            {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap1'},
+            {'task_id': '1820', 'title': 'Baz', 'subproject': 'bar', 'what': 'gap2'},
+            {'task_id': '1900', 'title': 'Qux', 'subproject': 'bar', 'what': 'gap3'},
+        ]
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+
+        assert result['created'] == ['100', '300'], (
+            f'expected created=[100, 300], got {result["created"]!r}'
+        )
+        assert result['failed'] == ['1820'], (
+            f'expected failed=[1820], got {result["failed"]!r}'
+        )
+        assert result['skipped'] == []
+        # All three mismatches must be attempted; a failure must not break the loop.
+        assert taskmaster.add_task.call_count == 3
+        # Exactly one warning must be emitted for the failed creation, pinning observability.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'briefing_refresh_add_task_unexpected_shape' in r.getMessage()
+        ]
+        assert len(warning_records) == 1
+        assert getattr(warning_records[0], 'task_id', None) == '1820'
 
 
 # ---------------------------------------------------------------------------
