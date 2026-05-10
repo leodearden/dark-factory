@@ -16,6 +16,12 @@ from fused_memory.models.reconciliation import (
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
 from fused_memory.reconciliation.flag_dedup import dedup_flags
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+from fused_memory.reconciliation.stage1_stall_detector import (
+    compute_stalled_task_ids,
+    extract_human_operator_task_ids,
+    maybe_escalate_stalled_tasks,
+    track_human_operator_stalls,
+)
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, format_filtered_task_tree
@@ -72,6 +78,34 @@ class MemoryConsolidator(BaseStage):
                 run_id=run_id,
                 flags=report.items_flagged,
             )
+
+        # ── Stale human-operator-required detector (task 1201) ────────────────
+        # Extract task_ids of flags still requiring human action after dedup.
+        hor_task_ids = extract_human_operator_task_ids(report.items_flagged or [])
+        if hor_task_ids:
+            stall_counts = await track_human_operator_stalls(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                run_id=run_id,
+                task_ids=hor_task_ids,
+            )
+            stalled = compute_stalled_task_ids(stall_counts)
+            report.stats['stage1_human_operator_stalled'] = len(stalled)
+            if stalled and self._escalation_queue is not None:
+                escalated = await maybe_escalate_stalled_tasks(
+                    escalation_queue=self._escalation_queue,
+                    project_id=self.project_id,
+                    run_id=run_id,
+                    stalled_task_ids=stalled,
+                    stall_counts=stall_counts,
+                    flags=report.items_flagged or [],
+                )
+                report.stats['stage1_human_operator_escalated'] = len(escalated)
+            else:
+                report.stats['stage1_human_operator_escalated'] = 0
+        else:
+            report.stats['stage1_human_operator_stalled'] = 0
+            report.stats['stage1_human_operator_escalated'] = 0
 
         return report
 
