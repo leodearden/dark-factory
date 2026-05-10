@@ -138,6 +138,7 @@ async def filter_suppressed(
     if not flags:
         return []
 
+    # Bulk fetch: bare query + filter by metadata post-hoc. See docstring re: limit=501.
     try:
         results = await memory_service.search(
             query='stage1_flag_suppression',
@@ -168,7 +169,7 @@ async def filter_suppressed(
         task_id = meta.get('task_id')
         if task_id is None or task_id == '':
             continue
-        suppressed_task_ids.add(str(task_id))
+        suppressed_task_ids.add(str(task_id))  # required: Mem0 JSON round-trip may yield int or str
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
