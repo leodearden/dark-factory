@@ -1164,20 +1164,28 @@ async def test_count_dead_letters_diverges_from_read_dead_letters_on_malformed_l
 
     # count_dead_letters hot-path (no project_id) counts malformed lines — 3 total.
     # This is the documented divergence from read_dead_letters().
-    assert no_filter_count == len(valid_records) + 1 == 3, (
+    assert no_filter_count == 3, (
         f'count_dead_letters hot-path must count malformed line; got {no_filter_count}'
     )
 
     # count_dead_letters filter path (project_id given) skips malformed lines — matches read.
-    assert filtered_count == len(proj_records) == 2, (
+    assert filtered_count == 2, (
         f'count_dead_letters filter path must skip malformed line; got {filtered_count}'
     )
 
-    # At least one WARNING about malformed line must be logged by read_dead_letters
-    # and/or count_dead_letters filter path.
-    assert any('malformed line' in r.message for r in caplog.records), (
-        'Expected a WARNING containing "malformed line" to be logged'
-    )
+    # Both code paths must log a WARNING for the malformed line: read_dead_letters skips
+    # with a warning, and count_dead_letters filter path (project_id given) also skips
+    # with a warning.  Checking both ensures neither path quietly drops the log line.
+    read_warns = [
+        r for r in caplog.records
+        if 'read_dead_letters' in r.message and 'malformed line' in r.message
+    ]
+    count_warns = [
+        r for r in caplog.records
+        if 'count_dead_letters' in r.message and 'malformed line' in r.message
+    ]
+    assert read_warns, 'Expected read_dead_letters to log a WARNING for the malformed line'
+    assert count_warns, 'Expected count_dead_letters filter path to log a WARNING for the malformed line'
 
 
 # ── _iter_lines_reversed ───────────────────────────────────────────────
