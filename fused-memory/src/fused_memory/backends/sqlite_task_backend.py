@@ -1053,5 +1053,9 @@ def _merge_metadata(existing_raw: str | None, incoming: str, *, append: bool) ->
         return incoming
     if not isinstance(old, dict) or not isinstance(new, dict):
         return incoming
-    merged = _merge_values(old, new)
+    try:
+        merged = _merge_values(old, new)
+    except RecursionError:
+        # Pathologically deep metadata; fall back to last-write-wins.
+        return incoming
     return json.dumps(merged)

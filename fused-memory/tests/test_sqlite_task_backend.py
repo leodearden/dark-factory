@@ -285,6 +285,23 @@ async def test_update_task_memory_hints_union(backend, project_root):
     assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
 
 
+def test_merge_metadata_list_of_dicts_concatenates_without_dedup():
+    """Unhashable list items (dicts) fall back to plain concatenation — no dedup."""
+    old_raw = '{"x":[{"k":1}]}'
+    new_raw = '{"x":[{"k":1}]}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    # Both dicts present; unhashable items are NOT deduped (plain concat).
+    assert result == {"x": [{"k": 1}, {"k": 1}]}
+
+
+def test_merge_metadata_type_mismatch_old_wins():
+    """Type mismatch (old=list, new=dict) resolves to OLD wins under append=True."""
+    old_raw = '{"x":[1,2]}'
+    new_raw = '{"x":{"a":1}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result["x"] == [1, 2]
+
+
 # ── add_subtask / nested IDs ───────────────────────────────────────
 
 
