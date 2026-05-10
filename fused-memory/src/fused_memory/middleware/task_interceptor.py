@@ -2788,6 +2788,22 @@ class TaskInterceptor:
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        """Write task metadata through all interceptor gates.
+
+        Gates (run in order; each returns early with a structured error dict on rejection):
+
+        1. ``_reject_status_in_update_task`` — rejects ``status=`` writes; returns
+           ``{'success': False, 'error': 'status_via_update_task', 'task_id': …, …}``.
+        2. ``_reject_done_provenance_in_update_metadata`` — rejects ``metadata``
+           payloads containing ``done_provenance``; same ``{'success': False, …}`` shape.
+        3. ``_backlog_gate`` — rejects when the reconciliation backlog exceeds the
+           project threshold; returns ``BacklogVerdict.to_error_dict()`` which has the
+           shape ``{'error': '<msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
+           (no ``success`` key).
+
+        Callers must use :func:`_interceptor_write_succeeded` to distinguish a successful
+        write from a gate rejection — do NOT re-implement the formula inline.
+        """
         if err := _reject_status_in_update_task(task_id, kwargs.get('status')):
             return err
         if err := _reject_done_provenance_in_update_metadata(
@@ -3508,6 +3524,34 @@ def _reject_done_provenance_in_update_metadata(
             'backstop on the merge sha.'
         ),
     }
+
+
+def _interceptor_write_succeeded(resp: object) -> bool:
+    """Return True iff *resp* represents a successful TaskInterceptor write.
+
+    Centralises the success/failure contract so all callers use a single,
+    tested formula instead of hand-rolling ``not (isinstance(…) and …)``.
+
+    Rejection-dict shapes this helper recognises as failures:
+
+    * ``_reject_status_in_update_task`` →
+      ``{'success': False, 'error': 'status_via_update_task', 'task_id': …, …}``
+    * ``_reject_done_provenance_in_update_metadata`` →
+      ``{'success': False, 'error': 'done_provenance_via_update_task', 'task_id': …, …}``
+    * ``BacklogVerdict.to_error_dict()`` →
+      ``{'error': '<rendered-msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
+      (no ``success`` key — defeated by the ``not resp.get('error')`` clause)
+
+    The ``success`` key defaults to ``True`` so a successful Taskmaster passthrough
+    that does not include an explicit ``success`` field still classifies correctly
+    (empty ``{}`` → success). Non-dict responses (``None``, strings, lists) are
+    always treated as failures.
+    """
+    return (
+        isinstance(resp, dict)
+        and bool(resp.get('success', True))
+        and not resp.get('error')
+    )
 
 
 def _done_provenance_missing_error(task_id: str) -> dict:
