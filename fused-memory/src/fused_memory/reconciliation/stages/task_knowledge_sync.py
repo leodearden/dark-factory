@@ -177,6 +177,89 @@ def _suppress_same_run_human_operator_dups(
 # ── Stage 2 post-flight guard helpers (task 1137) ────────────────────────────
 
 
+async def _resolve_live_status(
+    op: dict,
+    taskmaster,
+    project_root: str,
+    status_cache: dict[str, str] | None,
+    op_name: str,
+    *,
+    _parsed_params: dict | None = None,
+) -> tuple[str, str] | None:
+    """Return (task_id, live_status) for a write_journal op, or None to skip it.
+
+    Centralizes the param-parse + task_id-extract + cache-or-fetch boilerplate
+    shared by Guards 1-3. Returns ``None`` when:
+      * ``op['params']`` is malformed JSON
+      * task_id is missing (or empty after str-strip)
+      * status_cache is provided but task_id is absent (cache-build failure)
+      * fallback ``taskmaster.get_task`` raises
+
+    The task_id source is keyed off ``op.get('operation')``:
+      * ``'add_memory'``      → ``params['metadata']['task_id']``
+      * anything else         → ``params['task_id']``
+
+    In fallback mode (status_cache is None), a non-dict ``get_task`` result
+    yields ``live_status='unknown'`` (preserves pre-refactor behaviour).
+
+    Args:
+        op: A single write_journal op dict. Caller is expected to have already
+            filtered by ``agent_id`` and ``operation``.
+        taskmaster: Taskmaster backend (used only in fallback mode).
+        project_root: Absolute path to the Taskmaster project directory.
+        status_cache: Pre-fetched ``{task_id: live_status}`` dict built by
+            ``_apply_post_flight_guards``, or ``None`` for per-op fallback.
+        op_name: Calling helper's name, embedded in WARNING log messages so
+            existing log greps remain stable (e.g.
+            'reconciliation._verify_set_task_status_post_action: ...').
+        _parsed_params: Optional pre-parsed params dict.  When provided, the
+            JSON-parse step is skipped entirely, avoiding a second
+            ``json.loads`` call in callers that already parsed params locally
+            (Guards 2 and 3).
+    """
+    if _parsed_params is not None:
+        params = _parsed_params
+    else:
+        params_raw = op.get('params') or '{}'
+        try:
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'reconciliation.%s: failed to parse params JSON for op_id=%s; skipping',
+                op_name,
+                op.get('id'),
+            )
+            return None
+
+    if op.get('operation') == 'add_memory':
+        metadata = params.get('metadata') or {}
+        if not isinstance(metadata, dict):
+            return None
+        task_id = str(metadata.get('task_id', '')).strip()
+    else:
+        task_id = str(params.get('task_id', '')).strip()
+    if not task_id:
+        return None
+
+    if status_cache is not None:
+        if task_id not in status_cache:
+            return None  # cache build failed for this task; skip
+        live_status = status_cache[task_id]
+    else:
+        try:
+            task_data = await taskmaster.get_task(task_id, project_root)
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: get_task failed for task_id=%s; skipping op',
+                op_name,
+                task_id,
+            )
+            return None
+        live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+
+    return task_id, live_status
+
+
 async def _classify_terminal_state_violations(
     ops: list[dict],
     taskmaster,
@@ -206,6 +289,10 @@ async def _classify_terminal_state_violations(
             ``WriteJournal.get_ops_by_causation(run_id)`` (layer=='write_op').
         taskmaster: Taskmaster backend (must have an async ``get_task`` method).
         project_root: Absolute path to the Taskmaster project directory.
+        agent_id: The agent_id string to filter ops on (derived from stage_id).
+        status_cache: Pre-fetched ``{task_id: live_status}`` dict built by
+            ``_apply_post_flight_guards``.  When provided, skips individual
+            ``taskmaster.get_task`` calls.
 
     Returns:
         List of ``{'op_id', 'task_id', 'live_status', 'reason': 'not_applicable'}``
@@ -219,46 +306,26 @@ async def _classify_terminal_state_violations(
         if op.get('operation') != 'update_task':
             continue
 
-        # Parse params JSON to extract task_id
-        params_raw = op.get('params') or '{}'
-        try:
-            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'reconciliation._classify_terminal_state_violations: '
-                'failed to parse params JSON for op_id=%s; skipping',
-                op.get('id'),
-            )
+        resolved = await _resolve_live_status(
+            op,
+            taskmaster,
+            project_root,
+            status_cache,
+            '_classify_terminal_state_violations',
+        )
+        if resolved is None:
             continue
-
-        task_id = str(params.get('task_id', '')).strip()
-        if not task_id:
-            continue
-
-        if status_cache is not None:
-            if task_id not in status_cache:
-                continue  # cache build failed for this task; skip per fallback semantics
-            live_status = status_cache[task_id]
-        else:
-            # Fallback: fetch live status individually (used in unit tests)
-            try:
-                task_data = await taskmaster.get_task(task_id, project_root)
-            except Exception:
-                logger.warning(
-                    'reconciliation._classify_terminal_state_violations: '
-                    'get_task failed for task_id=%s; skipping op',
-                    task_id,
-                )
-                continue
-            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        task_id, live_status = resolved
 
         if live_status in TERMINAL_STATUSES:
-            violations.append({
-                'op_id': op.get('id'),
-                'task_id': task_id,
-                'live_status': live_status,
-                'reason': 'not_applicable',
-            })
+            violations.append(
+                {
+                    'op_id': op.get('id'),
+                    'task_id': task_id,
+                    'live_status': live_status,
+                    'reason': 'not_applicable',
+                }
+            )
 
     return violations
 
@@ -299,6 +366,8 @@ async def _verify_set_task_status_post_action(
         if op.get('operation') != 'set_task_status':
             continue
 
+        # Parse params locally to extract target_status; pass pre-parsed dict to the
+        # helper to avoid a second json.loads call on the same small payload.
         params_raw = op.get('params') or '{}'
         try:
             params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
@@ -309,35 +378,31 @@ async def _verify_set_task_status_post_action(
                 op.get('id'),
             )
             continue
-
-        task_id = str(params.get('task_id', '')).strip()
         target_status = str(params.get('status', '')).strip()
-        if not task_id or not target_status:
+        if not target_status:
             continue
 
-        if status_cache is not None:
-            if task_id not in status_cache:
-                continue  # cache build failed for this task; skip per fallback semantics
-            live_status = status_cache[task_id]
-        else:
-            try:
-                task_data = await taskmaster.get_task(task_id, project_root)
-            except Exception:
-                logger.warning(
-                    'reconciliation._verify_set_task_status_post_action: '
-                    'get_task failed for task_id=%s; skipping op',
-                    task_id,
-                )
-                continue
-            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        resolved = await _resolve_live_status(
+            op,
+            taskmaster,
+            project_root,
+            status_cache,
+            '_verify_set_task_status_post_action',
+            _parsed_params=params,
+        )
+        if resolved is None:
+            continue
+        task_id, live_status = resolved
 
         if live_status != target_status:
-            mismatches.append({
-                'op_id': op.get('id'),
-                'task_id': task_id,
-                'target_status': target_status,
-                'live_status': live_status,
-            })
+            mismatches.append(
+                {
+                    'op_id': op.get('id'),
+                    'task_id': task_id,
+                    'target_status': target_status,
+                    'live_status': live_status,
+                }
+            )
 
     return mismatches
 
@@ -387,6 +452,10 @@ async def _check_stall_guard_freshness(
         if op.get('operation') != 'add_memory':
             continue
 
+        # Parse params locally to check for snapshot_status / observed_status keys
+        # before calling _resolve_live_status — this preserves the early-continue that
+        # prevents get_task from being called when the op has no freshness key.
+        # The pre-parsed dict is then passed to the helper to avoid a second json.loads.
         params_raw = op.get('params') or '{}'
         try:
             params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
@@ -397,13 +466,8 @@ async def _check_stall_guard_freshness(
                 op.get('id'),
             )
             continue
-
         metadata = params.get('metadata') or {}
         if not isinstance(metadata, dict):
-            continue
-
-        task_id = str(metadata.get('task_id', '')).strip()
-        if not task_id:
             continue
 
         # Resolve snapshot_status or its alias
@@ -413,31 +477,29 @@ async def _check_stall_guard_freshness(
                 snapshot_status = str(metadata[key])
                 break
         if snapshot_status is None:
-            continue  # Op not opted into freshness checking
+            continue  # Op not opted into freshness checking; skip before any get_task call
 
-        if status_cache is not None:
-            if task_id not in status_cache:
-                continue  # cache build failed for this task; skip per fallback semantics
-            live_status = status_cache[task_id]
-        else:
-            try:
-                task_data = await taskmaster.get_task(task_id, project_root)
-            except Exception:
-                logger.warning(
-                    'reconciliation._check_stall_guard_freshness: '
-                    'get_task failed for task_id=%s; skipping op',
-                    task_id,
-                )
-                continue
-            live_status = _extract_status(task_data) if isinstance(task_data, dict) else 'unknown'
+        resolved = await _resolve_live_status(
+            op,
+            taskmaster,
+            project_root,
+            status_cache,
+            '_check_stall_guard_freshness',
+            _parsed_params=params,
+        )
+        if resolved is None:
+            continue
+        task_id, live_status = resolved
 
         if live_status != snapshot_status:
-            violations.append({
-                'op_id': op.get('id'),
-                'task_id': task_id,
-                'snapshot_status': snapshot_status,
-                'live_status': live_status,
-            })
+            violations.append(
+                {
+                    'op_id': op.get('id'),
+                    'task_id': task_id,
+                    'snapshot_status': snapshot_status,
+                    'live_status': live_status,
+                }
+            )
 
     return violations
 
@@ -526,12 +588,14 @@ async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
     for r in results:
         meta = dict(r.metadata or {})
         if meta.get('flag_for_stage2'):
-            flags.append({
-                'id': r.id,
-                'content': r.content,
-                'metadata': meta,
-                'task_id': str(meta.get('task_id', '')),
-            })
+            flags.append(
+                {
+                    'id': r.id,
+                    'content': r.content,
+                    'metadata': meta,
+                    'task_id': str(meta.get('task_id', '')),
+                }
+            )
     return flags
 
 
@@ -724,10 +788,7 @@ async def _write_escalation_markers(
     write_results = await asyncio.gather(
         *(
             memory_service.add_memory(
-                content=(
-                    f'Stage 2 escalation marker: flag_id={fid} '
-                    f'escalated in run={run_id}'
-                ),
+                content=(f'Stage 2 escalation marker: flag_id={fid} escalated in run={run_id}'),
                 category='observations_and_summaries',
                 project_id=project_id,
                 metadata={
@@ -943,9 +1004,9 @@ class TaskKnowledgeSync(BaseStage):
                 ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
             )
             if terminal_violations:
-                report.stats['not_applicable_count'] = (
-                    report.stats.get('not_applicable_count', 0) + len(terminal_violations)
-                )
+                report.stats['not_applicable_count'] = report.stats.get(
+                    'not_applicable_count', 0
+                ) + len(terminal_violations)
                 # Decrement inflated success counters (clamped at 0)
                 report.stats['tasks_modified'] = max(
                     0,
@@ -968,10 +1029,9 @@ class TaskKnowledgeSync(BaseStage):
                 ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
             )
             if freshness_violations:
-                report.stats['stall_guard_freshness_violations'] = (
-                    report.stats.get('stall_guard_freshness_violations', 0)
-                    + len(freshness_violations)
-                )
+                report.stats['stall_guard_freshness_violations'] = report.stats.get(
+                    'stall_guard_freshness_violations', 0
+                ) + len(freshness_violations)
                 for v in freshness_violations:
                     logger.warning(
                         'reconciliation.stall_guard_freshness_violation',
@@ -990,10 +1050,9 @@ class TaskKnowledgeSync(BaseStage):
                 ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
             )
             if sts_mismatches:
-                report.stats['set_task_status_post_action_mismatches'] = (
-                    report.stats.get('set_task_status_post_action_mismatches', 0)
-                    + len(sts_mismatches)
-                )
+                report.stats['set_task_status_post_action_mismatches'] = report.stats.get(
+                    'set_task_status_post_action_mismatches', 0
+                ) + len(sts_mismatches)
                 report.stats['tasks_modified'] = max(
                     0,
                     report.stats.get('tasks_modified', 0) - len(sts_mismatches),
@@ -1045,13 +1104,17 @@ class TaskKnowledgeSync(BaseStage):
             # already injected the full task tree into self.filtered_task_tree.
             existing_tasks: list[dict] | None = None
             if self.filtered_task_tree is not None:
-                existing_tasks = list(itertools.chain(
-                    self.filtered_task_tree.active_tasks,
-                    self.filtered_task_tree.done_tasks,
-                    self.filtered_task_tree.cancelled_tasks,
-                ))
+                existing_tasks = list(
+                    itertools.chain(
+                        self.filtered_task_tree.active_tasks,
+                        self.filtered_task_tree.done_tasks,
+                        self.filtered_task_tree.cancelled_tasks,
+                    )
+                )
             summary = await _queue_briefing_refresh_tasks(
-                self.taskmaster, self.project_root, mismatches,
+                self.taskmaster,
+                self.project_root,
+                mismatches,
                 existing_tasks=existing_tasks,
                 run_id=run_id,
             )
@@ -1123,11 +1186,11 @@ class TaskKnowledgeSync(BaseStage):
             if excessive_ids:
                 self._contamination_detected = True
                 logger.warning(
-                    "reconciliation.stage2_contamination_guard_fires "
-                    "project_id=%s task_ids_above_ceiling=%s ceiling=%d — "
-                    "verify this is cross-project contamination, not autopilot_video "
-                    "growth past the ceiling constant; task-mutating tools will be "
-                    "blocked for this run via get_disallowed_tools()",
+                    'reconciliation.stage2_contamination_guard_fires '
+                    'project_id=%s task_ids_above_ceiling=%s ceiling=%d — '
+                    'verify this is cross-project contamination, not autopilot_video '
+                    'growth past the ceiling constant; task-mutating tools will be '
+                    'blocked for this run via get_disallowed_tools()',
                     self.project_id,
                     excessive_ids,
                     AUTOPILOT_VIDEO_TASK_CEILING,
@@ -1149,7 +1212,8 @@ class TaskKnowledgeSync(BaseStage):
         # fabricated from metadata.modules. Empty string when no done tasks
         # carry done_provenance (legacy tree, warn-only rollout).
         provenance_section = await _render_done_provenance_section(
-            filtered.done_tasks, self.project_root,
+            filtered.done_tasks,
+            self.project_root,
         )
 
         remediation_note = ''
@@ -1165,12 +1229,13 @@ class TaskKnowledgeSync(BaseStage):
             # Pool intentionally excludes unknown-status tasks (dropped by
             # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
             sample = _select_proactive_sample(
-                itertools.chain(filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks),
+                itertools.chain(
+                    filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks
+                ),
                 self.MIN_TASK_SAMPLE,
             )
             proactive_sample_section = (
-                f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
-                f'{format_task_list(sample)}\n'
+                f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
@@ -1204,7 +1269,10 @@ class TaskKnowledgeSync(BaseStage):
             )
         run_id_for_markers = self._current_run_id or ''
         persistence_counts = await _track_flag_persistence(
-            self.memory, self.project_id, run_id_for_markers, surviving_ids,
+            self.memory,
+            self.project_id,
+            run_id_for_markers,
+            surviving_ids,
         )
         stale_ids = _compute_stale_flags(persistence_counts)
 
@@ -1213,7 +1281,9 @@ class TaskKnowledgeSync(BaseStage):
         # (reviewer note on FIX D, task 1139).  Only the *newly* stale flags
         # render in the section and get a fresh escalation marker.
         newly_stale_ids, already_escalated_ids = await _filter_already_escalated_flags(
-            self.memory, self.project_id, stale_ids,
+            self.memory,
+            self.project_id,
+            stale_ids,
         )
         if already_escalated_ids:
             logger.info(
@@ -1231,12 +1301,14 @@ class TaskKnowledgeSync(BaseStage):
         # surviving Mem0 active-query results.
         combined_flags: list[dict] = list(stage1_report.items_flagged if stage1_report else [])
         for f in surviving:
-            combined_flags.append({
-                '_source': 'mem0_active_query',
-                'flag_id': f['id'],
-                'task_id': f['task_id'],
-                'content': f['content'],
-            })
+            combined_flags.append(
+                {
+                    '_source': 'mem0_active_query',
+                    'flag_id': f['id'],
+                    'task_id': f['task_id'],
+                    'content': f['content'],
+                }
+            )
 
         flagged_text = _format_flagged(combined_flags, run_stage='stage2')
 
@@ -1277,7 +1349,10 @@ class TaskKnowledgeSync(BaseStage):
             # _filter_already_escalated_flags suppresses re-escalation if FIX C
             # deletion fails.  Best-effort: marker writes never raise.
             await _write_escalation_markers(
-                self.memory, self.project_id, run_id_for_markers, stale_ids,
+                self.memory,
+                self.project_id,
+                run_id_for_markers,
+                stale_ids,
             )
 
         known_projects_section = self._format_known_projects_section()
@@ -1340,11 +1415,7 @@ For cross-project routing see "Known Projects" above.
         for pid, root in ordered:
             marker = '  (current)' if pid == self.project_id else ''
             lines.append(f'- {pid:<{width}}  → {root}{marker}')
-        return (
-            '\n### Known Projects (for cross-project routing)\n'
-            + '\n'.join(lines)
-            + '\n'
-        )
+        return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
 
     @staticmethod
     def _warn_if_count_tasks_mismatch(
@@ -1407,6 +1478,7 @@ class IntegrityCheck(BaseStage):
 
     def get_system_prompt(self) -> str:
         from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
         return STAGE3_SYSTEM_PROMPT
 
     def get_disallowed_tools(self) -> list[str]:
@@ -1583,7 +1655,8 @@ async def _render_done_provenance_section(
 
         if commit and project_root:
             diff_block = await _git_show_name_only(
-                project_root, commit,
+                project_root,
+                commit,
                 max_files=max_files_per_task,
                 max_chars=max_chars_per_task,
             )
@@ -1600,8 +1673,11 @@ async def _render_done_provenance_section(
 
 
 async def _git_show_name_only(
-    project_root: str, commit: str,
-    *, max_files: int, max_chars: int,
+    project_root: str,
+    commit: str,
+    *,
+    max_files: int,
+    max_chars: int,
 ) -> str:
     """Run ``git show --name-only --format=%H%n%ai%n%s <commit>`` and truncate.
 
@@ -1621,8 +1697,14 @@ async def _git_show_name_only(
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            'git', '-C', project_root, 'show', '--name-only',
-            '--format=%H%n%ai%n%s', '--no-color', commit,
+            'git',
+            '-C',
+            project_root,
+            'show',
+            '--name-only',
+            '--format=%H%n%ai%n%s',
+            '--no-color',
+            commit,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1707,9 +1789,12 @@ async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | Non
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(script_path),
-            '--briefing', str(briefing_path),
-            '--tasks', str(tasks_path),
+            sys.executable,
+            str(script_path),
+            '--briefing',
+            str(briefing_path),
+            '--tasks',
+            str(tasks_path),
             '--json',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1782,11 +1867,7 @@ async def _queue_briefing_refresh_tasks(
     if existing_tasks is None:
         existing_raw = await taskmaster.get_tasks(project_root=project_root)
         existing_tasks = existing_raw.get('tasks', []) if isinstance(existing_raw, dict) else []
-    pending_titles = {
-        t.get('title', '')
-        for t in existing_tasks
-        if t.get('status') == 'pending'
-    }
+    pending_titles = {t.get('title', '') for t in existing_tasks if t.get('status') == 'pending'}
 
     created: list[str] = []
     skipped: list[str] = []
@@ -1794,7 +1875,8 @@ async def _queue_briefing_refresh_tasks(
 
     task_metadata: str | None = (
         json.dumps({'_causation_id': run_id, 'agent_id': 'recon-stage-task_knowledge_sync'})
-        if run_id else None
+        if run_id
+        else None
     )
 
     for mismatch in mismatches:
@@ -1808,11 +1890,7 @@ async def _queue_briefing_refresh_tasks(
         subproject = mismatch.get('subproject', '')
         task_title = mismatch.get('title', '')
         what = mismatch.get('what', '')
-        description = (
-            f'Subproject: {subproject}\n'
-            f'Task title: {task_title}\n'
-            f'Gap: {what}'
-        )
+        description = f'Subproject: {subproject}\nTask title: {task_title}\nGap: {what}'
         try:
             result = await taskmaster.add_task(
                 project_root=project_root,
