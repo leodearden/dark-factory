@@ -419,71 +419,80 @@ class TaskWorkflow:
         self._phase_cost_at_entry = self.metrics.total_cost_usd
         self.state = new_state
 
+    async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
+        """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
+
+        Extracted from ``run()`` so the state machine stays under pyright's
+        complexity threshold.  Side-effects:
+
+        - ``set_task_status('in-progress')``
+        - populates ``self.worktree`` / ``self._base_commit`` /
+          ``self._config_dir`` / ``self.artifacts`` / ``self._old_plan_base``
+        - sets ``self._worktree_external = True`` when the caller pre-created
+          the worktree (eval mode) so the cleanup path knows to leave it alone
+        - syncs per-worktree venvs unless the worktree is external
+        - removes any ``.task/`` paths inherited as tracked from main
+        """
+        await self.scheduler.set_task_status(self.task_id, 'in-progress')
+
+        # Create worktree (captures base commit for stable diffs).
+        # If the caller pre-created the worktree (eval mode) skip creation
+        # and rev-parse HEAD instead.
+        if self.worktree is None:
+            worktree_info = await self.git_ops.create_worktree(branch_name)
+            self.worktree = worktree_info.path
+            base_commit = worktree_info.base_commit
+        else:
+            self._worktree_external = True
+            proc = await asyncio.create_subprocess_exec(
+                'git', 'rev-parse', 'HEAD',
+                cwd=str(self.worktree),
+                stdout=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            base_commit = stdout.decode().strip()
+        self._base_commit = base_commit
+        self._config_dir = TaskConfigDir(self.task_id)
+
+        if not self._worktree_external:
+            await self._sync_worktree_venvs()
+
+        self.artifacts = TaskArtifacts(self.worktree)
+        # Capture old base_commit before init() overwrites metadata.json
+        # — _plan() uses it for revalidation diff.
+        self._old_plan_base = self.artifacts.read_base_commit()
+        self.artifacts.init(
+            self.task_id,
+            self.task.get('title', ''),
+            self.task.get('description', ''),
+            base_commit=base_commit,
+        )
+
+        # ── .task/ contamination guard ────────────────────────────
+        # If .task/ slipped into git on main (inherited contamination),
+        # untrack it here so agents don't accidentally commit it.
+        # Defense-in-depth — create_worktree() should have scrubbed, but
+        # this catches the eval-mode path and race conditions.
+        rc, tracked, _ = await _run(
+            ['git', 'ls-files', '--', '.task/'],
+            cwd=self.worktree,
+        )
+        if rc == 0 and tracked.strip():
+            logger.warning(
+                'Task %s: .task/ is tracked in git (inherited contamination) '
+                '— removing from index. Files: %s',
+                self.task_id, tracked.strip()[:200],
+            )
+            await _run(
+                ['git', 'rm', '-r', '--cached', '--', '.task/'],
+                cwd=self.worktree,
+            )
+
     async def run(self) -> WorkflowOutcome:
         """Execute the full state machine."""
         branch_name = self.task_id
         try:
-            # Set task in-progress
-            await self.scheduler.set_task_status(self.task_id, 'in-progress')
-
-            # Create worktree (captures base commit for stable diffs)
-            # If worktree is already set (e.g. eval mode), skip creation
-            if self.worktree is None:
-                worktree_info = await self.git_ops.create_worktree(branch_name)
-                self.worktree = worktree_info.path
-                base_commit = worktree_info.base_commit
-            else:
-                # Eval mode: worktree was pre-created, skip creation and cleanup
-                self._worktree_external = True
-                proc = await asyncio.create_subprocess_exec(
-                    'git', 'rev-parse', 'HEAD',
-                    cwd=str(self.worktree),
-                    stdout=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                base_commit = stdout.decode().strip()
-            self._base_commit = base_commit
-            # Per-task config dir for credential isolation
-            self._config_dir = TaskConfigDir(self.task_id)
-
-            # Sync per-worktree venvs so imports resolve from worktree source
-            if not self._worktree_external:
-                await self._sync_worktree_venvs()
-
-            self.artifacts = TaskArtifacts(self.worktree)
-            # Capture old base_commit before init() overwrites metadata.json.
-            # Used by _plan() to compute the diff for plan revalidation.
-            self._old_plan_base = self.artifacts.read_base_commit()
-            self.artifacts.init(
-                self.task_id,
-                self.task.get('title', ''),
-                self.task.get('description', ''),
-                base_commit=base_commit,
-            )
-
-            # ── .task/ contamination guard ────────────────────────────
-            # After init() creates the .task/ scratch directory, verify it
-            # is NOT tracked in git.  If it is (inherited from a contaminated
-            # main), untrack it so agents don't accidentally commit it.
-            # This is defense-in-depth: create_worktree() should have already
-            # scrubbed, but the guard here catches the eval-mode path and
-            # any race conditions.
-            rc, tracked, _ = await _run(
-                ['git', 'ls-files', '--', '.task/'],
-                cwd=self.worktree,
-            )
-            if rc == 0 and tracked.strip():
-                logger.warning(
-                    'Task %s: .task/ is tracked in git (inherited contamination) '
-                    '— removing from index. Files: %s',
-                    self.task_id, tracked.strip()[:200],
-                )
-                await _run(
-                    ['git', 'rm', '-r', '--cached', '--', '.task/'],
-                    cwd=self.worktree,
-                )
-                # Don't commit the removal separately — it'll be part of
-                # the first real commit the agent makes.
+            await self._setup_worktree_and_artifacts(branch_name)
 
             # ── Pre-PLAN ghost-loop recovery ──────────────────────────
             # If the worktree's branch is already merged to main AND there
