@@ -545,6 +545,10 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
     # escalation is skipped, but the _known_projects lookup itself is exercised.
     await janitor.tick()
 
+    proj_b_id = _project_id_for(proj_b)
+    assert proj_b_id not in janitor._known_projects, (
+        'post-init env mutation must not leak into snapshotted registry'
+    )
     assert janitor._known_projects == pre_mutation, (
         'post-init env mutation must not change the janitor registry; '
         f'registry changed from {pre_mutation} to {janitor._known_projects}'
