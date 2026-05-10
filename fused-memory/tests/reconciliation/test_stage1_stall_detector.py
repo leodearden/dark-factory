@@ -423,7 +423,20 @@ class TestMaybeEscalateStalledTasks:
 
 
 class TestEscalationBinding:
-    """Verify Escalation is unconditionally bound on the module namespace."""
+    """Verify Escalation is unconditionally bound on the module namespace.
+
+    .. warning::
+        This class calls ``importlib.reload(mod)`` twice — once with
+        ``sys.modules['escalation']`` poisoned to ``None`` and once in the
+        ``finally`` block to restore the real module state.  ``reload()``
+        re-executes the entire module body, which rebinds **all** module-level
+        attributes (loggers, constants, etc.).  Any test that relies on a
+        module-level patch established at import/collection time (e.g. a
+        session-scoped autouse fixture that patches ``stage1_stall_detector.logger``)
+        will see that patch wiped out after this class runs.  If you add such a
+        patch in the future, ensure it is re-applied **after** this class or
+        refactor to restore module state explicitly instead of relying on reload.
+    """
 
     def test_escalation_bound_when_package_unavailable(self):
         """Escalation is bound to None and _HAS_ESCALATION is False when the

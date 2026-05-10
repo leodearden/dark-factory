@@ -239,9 +239,8 @@ async def maybe_escalate_stalled_tasks(
     Returns the list of task_ids that actually received a new escalation.
     Returns ``[]`` immediately when the ``escalation`` package is unavailable.
     """
-    if not _HAS_ESCALATION:
+    if Escalation is None:
         return []
-    assert Escalation is not None  # noqa: S101 — narrows type for static checkers
 
     # Build first-seen flag lookup for representative descriptions
     flag_by_task: dict[str, dict] = {}
