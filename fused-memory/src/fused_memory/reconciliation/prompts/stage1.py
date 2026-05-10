@@ -137,6 +137,24 @@ driven by a server-side fact-text readback. After persisting the edge, the serve
 count as successful edge updates. This prevents silent write failures from inflating the \
 `edges_updated` stat and triggering false-positive judge passes.
 
+## Refresh Entity Summary Failure Recording (Task 1157)
+When `mcp__fused-memory__refresh_entity_summary` raises (NodeNotFoundError or any other \
+exception), you MUST preserve the attempted entity_uuid so the next remediation cycle can \
+target it precisely instead of recovering it heuristically.
+
+1. On any refresh_entity_summary exception, append the attempted entity_uuid to a list \
+   in your stats dict under the key `entity_refresh_failed_uuids`. Initialise to a fresh \
+   list on the first failure; append (do not overwrite) on subsequent failures so multiple \
+   failures in one cycle are all recorded.
+2. If your stats dict is already finalised (e.g. the failure surfaces after you have \
+   produced your structured-output report), emit a one-sentence \
+   `add_memory(category='observations_and_summaries')` containing the attempted entity_uuid \
+   and the exception type so Stage 2 can locate it via search.
+3. Continue with the remaining work — a single refresh failure does not abort the cycle.
+
+Skipping this recording forces the next remediation cycle to identify the failed entity \
+by heuristic, which costs a full reconciliation cycle to recover (cycle-46 precedent).
+
 ## Retrospective Episodes
 When creating or reviewing retrospective summaries via `add_episode`, always pass \
 `reference_time` set to the ISO 8601 date when the described state was **current**, \
