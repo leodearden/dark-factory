@@ -235,8 +235,8 @@ def _apply_observed(
 
     reported_snapshot: dict[str, Any] = {}
 
-    # Write canonical keys first so the alias pass can read the canonical
-    # observed value without needing to compute it twice.
+    # Write canonical keys from observed; aliases are written separately from
+    # the same observed source so the two passes are order-independent.
     canonical_keys = _TRACKED_STAT_KEYS - frozenset(_STAT_ALIASES)
     for stat_key in canonical_keys:
         # Always record the observed value — zero is meaningful (means "no
@@ -246,11 +246,14 @@ def _apply_observed(
             reported_snapshot[stat_key] = stats[stat_key]
         stats[stat_key] = observed.get(stat_key, 0)
 
-    # Write alias keys to the same observed value as their canonical counterpart.
+    # Read from observed (not stats) so the pass is order-independent: even if a
+    # future misconfiguration chains aliases, each alias resolves against the
+    # immutable observed counts. The canonical-keys guard test in tests/ enforces
+    # that canonical_key is a real canonical key.
     for alias_key, canonical_key in _STAT_ALIASES.items():
         if alias_key in stats:
             reported_snapshot[alias_key] = stats[alias_key]
-        stats[alias_key] = stats[canonical_key]
+        stats[alias_key] = observed.get(canonical_key, 0)
 
     if reported_snapshot:
         stats['_reported'] = reported_snapshot
