@@ -10,7 +10,9 @@ Covers:
 from __future__ import annotations
 
 import ast
+import importlib.util
 import pathlib
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -480,3 +482,50 @@ class TestEscalationBinding:
             "The 'except ImportError' branch in stage1_stall_detector.py "
             "must contain the literal 'Escalation = None' assignment"
         )
+
+    def test_except_branch_binds_escalation_to_none(self):
+        """Behavioral check: except ImportError branch sets Escalation=None and _HAS_ESCALATION=False.
+
+        Loads an isolated copy of the production module from source via
+        ``importlib.util.spec_from_file_location`` against a synthetic module
+        name, with ``sys.modules['escalation']`` and
+        ``sys.modules['escalation.models']`` stubbed to ``None`` so Python
+        treats them as failed imports and falls through to the except branch.
+        The live ``fused_memory.reconciliation.stage1_stall_detector`` cache
+        entry is never overwritten — no reload blast radius.
+        """
+        import fused_memory.reconciliation.stage1_stall_detector as live_mod
+
+        source_path = live_mod.__file__
+        _MISSING = object()
+
+        esc_saved = sys.modules.get('escalation', _MISSING)
+        esc_models_saved = sys.modules.get('escalation.models', _MISSING)
+
+        try:
+            sys.modules['escalation'] = None  # type: ignore[assignment]
+            sys.modules['escalation.models'] = None  # type: ignore[assignment]
+
+            spec = importlib.util.spec_from_file_location(
+                '_test_stage1_stall_detector_isolated', source_path
+            )
+            fresh_mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(fresh_mod)  # type: ignore[union-attr]
+
+            assert fresh_mod.Escalation is None, (
+                'When escalation package is unavailable, '
+                'the except ImportError branch must bind Escalation = None'
+            )
+            assert fresh_mod._HAS_ESCALATION is False, (
+                'When escalation package is unavailable, '
+                'the except ImportError branch must set _HAS_ESCALATION = False'
+            )
+        finally:
+            if esc_saved is _MISSING:
+                sys.modules.pop('escalation', None)
+            else:
+                sys.modules['escalation'] = esc_saved  # type: ignore[assignment]
+            if esc_models_saved is _MISSING:
+                sys.modules.pop('escalation.models', None)
+            else:
+                sys.modules['escalation.models'] = esc_models_saved  # type: ignore[assignment]
