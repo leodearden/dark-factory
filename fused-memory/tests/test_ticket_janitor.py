@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 from pathlib import Path
 from typing import IO, Literal, overload
 
@@ -544,9 +545,55 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
     # escalation is skipped, but the _known_projects lookup itself is exercised.
     await janitor.tick()
 
+    proj_b_id = _project_id_for(proj_b)
+    assert proj_b_id not in janitor._known_projects, (
+        'post-init env mutation must not leak into snapshotted registry'
+    )
     assert janitor._known_projects == pre_mutation, (
         'post-init env mutation must not change the janitor registry; '
         f'registry changed from {pre_mutation} to {janitor._known_projects}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_nudge_emitted_once_across_two_constructions(
+    store, tmp_path, caplog, monkeypatch
+):
+    """The startup INFO nudge fires exactly once per process regardless of
+    how many TicketJanitor instances are constructed.
+
+    Guards the once-per-process semantics from task 1210: the class-level
+    ``_registry_log_emitted`` flag must be set to True after the first
+    construction and suppress the log in all subsequent ones.  Resetting
+    the flag at the start of this test makes the assertion order-independent
+    — it does not matter which earlier test in the module already tripped
+    the flag.
+    """
+    # Reset via monkeypatch so pytest restores the original value automatically,
+    # even if an assertion fails mid-test.
+    monkeypatch.setattr(TicketJanitor, '_registry_log_emitted', False)
+    caplog.set_level(logging.INFO, logger='fused_memory.middleware.ticket_janitor')
+
+    j1 = TicketJanitor(store, primary_project_root=str(tmp_path))
+    # Guard's side-effect: flag must be True after the first construction.
+    assert TicketJanitor._registry_log_emitted is True
+
+    TicketJanitor(store, primary_project_root=str(tmp_path))  # second construction must not re-emit
+
+    nudge_records = [
+        r for r in caplog.records
+        if 'project registry snapshotted at init' in r.getMessage()
+    ]
+    assert len(nudge_records) == 1, (
+        f'Expected exactly 1 startup nudge across 2 constructions; '
+        f'got {len(nudge_records)}: {[r.getMessage() for r in nudge_records]}'
+    )
+    # Verify the %d placeholder was substituted with the actual project count;
+    # check the count value only — not surrounding prose — to avoid brittleness.
+    formatted = nudge_records[0].getMessage()
+    assert str(len(j1._known_projects)) in formatted, (
+        f'Expected project count {len(j1._known_projects)!r} in nudge message; '
+        f'got: {formatted!r}'
     )
 
 
