@@ -2070,3 +2070,26 @@ class TestStage1PromptSuppressionSearchKwargs:
         assert "categories=['observations_and_summaries']" in section
         assert "stores=['mem0']" in section
         assert 'limit=50' in section
+
+
+class TestStage1PromptSuppressionSearchErrorFallback:
+    """STAGE1_SYSTEM_PROMPT must document error/timeout fallback for the suppression search."""
+
+    def _get_suppression_section(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        parts = STAGE1_SYSTEM_PROMPT.split('## Flag Suppression Check')
+        assert len(parts) == 2, "Expected exactly one '## Flag Suppression Check' heading"
+        section = parts[1].split('## Flag Deduplication')[0]
+        return section
+
+    def test_section_documents_error_or_timeout_fallback(self):
+        """Section must mention both 'error' and some form of timeout."""
+        section = self._get_suppression_section().lower()
+        assert 'error' in section
+        assert 'timeout' in section or 'time out' in section or 'times out' in section
+
+    def test_section_instructs_treat_as_not_in_effect_on_failure(self):
+        """Section must instruct the agent to treat suppression as not-in-effect and log to cycle summary."""
+        section = self._get_suppression_section()
+        assert 'not-in-effect' in section or 'not in effect' in section
+        assert 'cycle summary' in section
