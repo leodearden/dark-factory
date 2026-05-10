@@ -4889,8 +4889,7 @@ class TestProjectLoopNarrowsExceptionHandling:
 class TestKnownProjectsInjection:
     """Tests for the known_projects DI kwarg on ReconciliationHarness (task 1164)."""
 
-    @pytest.mark.asyncio
-    async def test_harness_accepts_known_projects_kwarg_and_uses_it(
+    def test_harness_accepts_known_projects_kwarg_and_uses_it(
         self, journal, event_buffer, mock_memory_service, monkeypatch
     ):
         """Injected known_projects dict wins; build_known_projects_map is NOT called.
