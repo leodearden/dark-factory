@@ -865,6 +865,49 @@ class TestStage1PromptMentionsRefreshEntitySummary:
 
 
 # ---------------------------------------------------------------------------
+# Contract test: entity_refresh_failed_uuids flows through _format_report
+# ---------------------------------------------------------------------------
+
+class TestEntityRefreshFailedUuidsFlowsToStage2Payload:
+    """Behavioral test: entity_refresh_failed_uuids in Stage 1 stats reaches Stage 2 payload.
+
+    The producer→consumer contract is:
+      Stage 1 writes entity_refresh_failed_uuids to its stats dict →
+      _format_report JSON-serializes stats into the Stage 2 user prompt →
+      Stage 2 reads the UUIDs from the payload.
+
+    This class pins the serialization step so that renaming or dropping the key
+    is caught before it silently breaks Stage 2's retry logic.
+    """
+
+    def test_stage1_stats_with_failed_uuids_preserved_by_format_report(self):
+        """UUIDs in stats['entity_refresh_failed_uuids'] appear in _format_report output.
+
+        _format_report embeds stats as a JSON string in the Stage 2 user prompt (via
+        task_knowledge_sync.py assemble_payload). A UUID placed in the list under
+        entity_refresh_failed_uuids must survive into the rendered string intact so
+        Stage 2 can parse and retry it.
+        """
+        from datetime import datetime, timezone
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _format_report
+
+        now = datetime.now(tz=timezone.utc)
+        report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=now,
+            completed_at=now,
+            stats={"entity_refresh_failed_uuids": ["uuid-aaaa-1111", "uuid-bbbb-2222"]},
+        )
+
+        rendered = _format_report(report)
+
+        assert "entity_refresh_failed_uuids" in rendered
+        assert "uuid-aaaa-1111" in rendered
+        assert "uuid-bbbb-2222" in rendered
+
+
+# ---------------------------------------------------------------------------
 # step-15: partial_failure_misreported fix in MemoryService.refresh_entity_summary
 # ---------------------------------------------------------------------------
 

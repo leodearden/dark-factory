@@ -140,7 +140,7 @@ count as successful edge updates. This prevents silent write failures from infla
 ## Refresh Entity Summary Failure Recording (Task 1157)
 When the response from `mcp__fused-memory__refresh_entity_summary` contains an `error` \
 field (commonly with `error_type` such as `NodeNotFoundError`), you MUST preserve the \
-attempted entity_uuid so the next remediation cycle can target it precisely instead of \
+attempted entity_uuid so Stage 2 of this cycle can target it precisely instead of \
 recovering it heuristically. **A response is a successful refresh only when it does NOT \
 contain an `error` key.**
 
@@ -155,11 +155,7 @@ contain an `error` key.**
 The stats dict is the single channel for these UUIDs. Do **not** invent side-channel \
 markers (e.g. `add_episode(source_description="REFRESH_FAILURE:...")`): episode \
 `source_description` is not surfaced by `search`/`get_episodes`, so any such marker is \
-unrecoverable and Stage 2 has no way to read it. If the stats dict were ever truly \
-unavailable, the correct fallback would be a Mem0 memory whose **content** includes the \
-UUID and whose **metadata** carries `{{kind: "refresh_failure", entity_uuid: <uuid>}}` so \
-Stage 2 can retrieve it by metadata key — but in practice the stats dict is always \
-available, so just record the UUID there.
+unrecoverable and Stage 2 has no way to read it.
 
 Skipping this recording forces Stage 2 to re-scan all entity summaries heuristically to \
 discover which one failed, costing a full reconciliation cycle instead of one targeted \

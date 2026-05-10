@@ -234,9 +234,13 @@ For each UUID in `entity_refresh_failed_uuids`:
    and include a note in your structured report so the operator can investigate the \
    persistently unreachable entity.
 
-Process all listed UUIDs before beginning other reconciliation work. Each retry costs \
-one tool call; skipping them forces the next Stage 1 cycle to re-discover the failed \
-entity by scanning all entity summaries heuristically.
+Process up to 20 UUIDs before beginning other reconciliation work. Record any remainder \
+(beyond the 20-UUID cap) in `entity_refresh_retried_deferred` in your stats so the \
+next cycle can pick them up. If you encounter 3 or more consecutive errors, stop \
+retrying and record the remaining UUIDs in `entity_refresh_retried_deferred` — \
+consecutive errors likely indicate a backend outage rather than individual entity \
+problems. Each retry costs one tool call; skipping them forces the next Stage 1 cycle \
+to re-discover the failed entity by scanning all entity summaries heuristically.
 
 ## Mem0 Active-Query Flag Deletion (FIX C)
 Some flagged items in the "Stage 1 Flagged Items" section originate from a Mem0 \
