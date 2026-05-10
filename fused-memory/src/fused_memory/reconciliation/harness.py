@@ -1138,18 +1138,17 @@ class ReconciliationHarness:
     ) -> None:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
 
-        project_root is threaded from the parent caller (run_full_cycle resolves it
-        once at line 868 via _known_project_root_for before any side-effects; task 1163
+        project_root is threaded from the parent caller: run_full_cycle resolves it
+        once at entry via _known_project_root_for, before any side-effects, and
         threads it through _maybe_remediate so remediation always uses the pre-cycle
-        snapshot, immune to any mid-cycle registry mutations).
+        snapshot, immune to any mid-cycle registry mutations (task 1163).
 
         If filtered_task_tree is provided it is used directly; otherwise a fresh
         tree is fetched via _fetch_filtered_task_tree.  Callers that already hold
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
-        # project_root is the value threaded from the parent caller — do NOT
-        # re-resolve here via _known_project_root_for (task 1163).
+        # project_root is threaded by the caller — see docstring (task 1163).
 
         run_id = str(uuid4())
         run = ReconciliationRun(
