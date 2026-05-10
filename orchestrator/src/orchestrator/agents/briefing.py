@@ -182,6 +182,85 @@ and either confirm it, update it, or recreate it from scratch.
 5. Do NOT remove or replace steps with status "done".
 """
 
+    async def build_plan_tightening_prompt(
+        self,
+        task: dict,
+        plan: dict,
+        not_touched: list[str],
+        worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
+        context: str | None = None,
+    ) -> str:
+        """Architect narrowing pass after the pre-merge plan-files gate.
+
+        The merge gate flagged ``not_touched``: plan-declared files that
+        no commit on the branch actually touched.  Give the architect
+        ONE bounded chance to drop genuinely-unneeded entries via
+        ``update_plan_metadata(files=[narrowed list])``.
+
+        Lenient semantics — the architect may keep some flagged entries
+        (treating them as genuinely needed; the gate's re-check is then
+        the source of truth).  The only hard constraint is no NEW files:
+        a post-pass subset check rejects any plan that added entries
+        beyond the current ``plan.files`` set.
+        """
+        if context is None:
+            context = await self._get_memory_context(task.get('id'))
+
+        task_block = self._format_task(task)
+        identity = self._agent_identity(task.get('id'), 'architect')
+
+        current_files = list(plan.get('files', []))
+        files_list = '\n'.join(f'- `{f}`' for f in current_files) or '_(empty)_'
+        not_touched_list = '\n'.join(f'- `{f}`' for f in not_touched) or '_(none)_'
+
+        return f"""\
+{context}
+
+{identity}
+
+# Task
+
+{task_block}
+
+# Plan Tightening — Architect Narrowing Pass
+
+The pre-merge gate flagged that some files you declared in this task's
+plan were never touched by any commit on the branch.  Before the merge
+can proceed, please narrow the plan against current branch state — drop
+entries that turned out not to be needed, or confirm the plan if the
+work is genuinely incomplete.
+
+## Current plan files
+
+{files_list}
+
+## Flagged — declared but not touched on the branch
+
+{not_touched_list}
+
+## Action — choose exactly ONE
+
+a. **Drop genuinely-unneeded entries**: call
+   `update_plan_metadata(files=[<narrowed list>])` with a subset of the
+   current plan files.  You may keep some flagged entries if you judge
+   them genuinely needed; the gate's re-check is the source of truth.
+b. **Plan is honest as-is**: call `confirm_plan()` unchanged.  The
+   workflow will then escalate to a human — choose this only when the
+   work is genuinely incomplete and the flagged files really do need
+   edits.
+
+## Forbidden for this pass
+
+Do not call `create_plan`, `add_plan_step`, or `replace_plan_step`.
+This narrowing pass is scoped strictly to the `files` list; step
+rewrites belong to a separate revalidation flow.
+
+You must NOT add new files to the plan: the post-pass verifier rejects
+any plan whose `files` list contains entries beyond the current set
+above.  If the work needs new files, call `confirm_plan()` instead and
+let a human triage the scope change.
+"""
+
     async def build_simple_task_prompt(
         self,
         task: dict,

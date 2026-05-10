@@ -6,6 +6,9 @@ normalizer in :meth:`Scheduler.get_tasks` is responsible for the coerce;
 this test confirms ``_format_task`` builds the prompt without raising
 ``AttributeError`` when handed the wire shape downstream consumers
 should now see.
+
+Also covers :meth:`BriefingAssembler.build_plan_tightening_prompt`,
+introduced for the plan-files-not-touched architect-narrowing retry.
 """
 
 from __future__ import annotations
@@ -69,3 +72,73 @@ class TestFormatTaskMetadataInvariant:
         out = briefing._format_task(task)
         assert '**ID:** 3' in out
         assert 'Modules' not in out
+
+
+@pytest.mark.asyncio
+class TestBuildPlanTighteningPrompt:
+    """Architect narrowing pass after the plan-files-not-touched gate.
+
+    Prohibition assertions use positive-directive form per
+    feedback_test_assert_negative_directives.md — the prompt itself
+    contains the token names it forbids, so a bare ``not in`` would
+    self-conflict.
+    """
+
+    async def _build(
+        self,
+        briefing: BriefingAssembler,
+        files: list[str] | None = None,
+        not_touched: list[str] | None = None,
+    ) -> str:
+        task = {
+            'id': '2656',
+            'title': 'Test task',
+            'description': 'Demo',
+        }
+        plan = {'files': files if files is not None else ['a.py', 'b.py', 'c.py']}
+        return await briefing.build_plan_tightening_prompt(
+            task,
+            plan,
+            not_touched if not_touched is not None else ['a.py', 'b.py'],
+            worktree=None,
+            context='',
+        )
+
+    async def test_mentions_both_valid_actions(self, briefing: BriefingAssembler):
+        prompt = await self._build(briefing)
+        assert 'update_plan_metadata' in prompt
+        assert 'confirm_plan' in prompt
+
+    async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
+        prompt = await self._build(
+            briefing,
+            files=['x.py', 'y.py', 'z.py'],
+            not_touched=['x.py', 'y.py'],
+        )
+        assert 'x.py' in prompt
+        assert 'y.py' in prompt
+        # Current plan files should also be visible.
+        assert 'z.py' in prompt
+
+    async def test_forbids_creation_and_step_edits(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._build(briefing)
+        # Positive-directive assertions covering the forbidden tools.
+        # The prompt mentions create_plan/add_plan_step/replace_plan_step
+        # while listing them as off-limits — assert by section header
+        # rather than 'not in prompt' to avoid the self-conflict pattern.
+        assert 'Forbidden' in prompt or 'Do not call' in prompt
+        assert 'create_plan' in prompt
+        assert 'add_plan_step' in prompt
+        assert 'replace_plan_step' in prompt
+
+    async def test_states_new_file_addition_will_be_rejected(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._build(briefing)
+        assert 'must NOT add new files' in prompt
+
+    async def test_includes_agent_identity(self, briefing: BriefingAssembler):
+        prompt = await self._build(briefing)
+        assert 'claude-task-2656-architect' in prompt

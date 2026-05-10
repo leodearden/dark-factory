@@ -155,6 +155,10 @@ class _BriefingLike(Protocol):
         changed_files: list[str], worktree: Path | None = ...,
         context: str | None = ...,
     ) -> str: ...
+    async def build_plan_tightening_prompt(
+        self, task: dict, plan: dict, not_touched: list[str],
+        worktree: Path | None = ..., context: str | None = ...,
+    ) -> str: ...
     async def build_simple_task_prompt(
         self, task: dict, worktree: Path | None = ...,
         context: str | None = ...,
@@ -323,6 +327,11 @@ class TaskWorkflow:
         # check (Fix 3).  Cleared between merge attempts so a stale
         # reason from an earlier task slot can't poison the signature.
         self._last_merge_block_reason: str | None = None
+
+        # One-shot guard for the architect plan-tightening retry.  Set
+        # True on first _try_narrow_plan call regardless of outcome so
+        # the workflow never loops the narrowing pass on the same task.
+        self._plan_tightened: bool = False
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -2922,6 +2931,46 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         return True
 
+    async def _try_narrow_plan(self, not_touched: list[str]) -> bool:
+        """Give the architect ONE chance to narrow the plan after the
+        merge gate flagged declared-but-untouched files.
+
+        Lenient semantics: the architect may keep some flagged entries
+        (treating them as genuinely needed); the only hard constraint
+        is no NEW files may be added.  The gate's re-check is the
+        source of truth for pass/fail.
+
+        Returns True when the narrowing pass should be re-checked
+        against the gate, False otherwise (one-shot already fired,
+        architect invocation failed, or post-pass subset check rejected
+        the new plan because it introduced new files).
+        """
+        if self._plan_tightened:
+            return False
+        self._plan_tightened = True
+
+        before = set(self.plan.get('files', []))
+        prompt = await self.briefing.build_plan_tightening_prompt(
+            self.task, self.plan, not_touched, worktree=self.worktree,
+        )
+        assert self.worktree is not None
+        assert self.artifacts is not None
+        result = await self._invoke(ARCHITECT, prompt, self.worktree)
+        if not result.success:
+            return False
+
+        self.plan = self.artifacts.read_plan()
+        after = set(self.plan.get('files', []))
+        if not after.issubset(before):
+            logger.warning(
+                'Task %s: narrowing pass added new files %s — rejecting',
+                self.task_id, sorted(after - before),
+            )
+            return False
+        # Lenient: partial narrowing or confirm_plan() both fall through
+        # to the gate's re-check below.
+        return True
+
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
         *, merge_phase: bool = False,
@@ -2950,9 +2999,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         assert self.merge_queue is not None
 
         # Decision-1 pre-merge subset check: refuse to merge a branch that
-        # never touched the architect's declared plan files.  Short-circuit
-        # straight to L1 — steward mediation could mutate plan.json to
-        # silence the gate, defeating its purpose.
+        # never touched the architect's declared plan files.  Before
+        # escalating, give the architect ONE bounded chance to narrow the
+        # plan against current branch state — only the architect (not the
+        # steward) is allowed to mediate, and only to drop genuinely
+        # unneeded entries.  Adding new files is rejected by the helper's
+        # subset check.  The gate's re-check is the source of truth for
+        # pass/fail.
         if (
             self._task_files
             and self._base_commit is not None
@@ -2968,6 +3021,26 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.git_ops,
                     task_id=self.task_id,
                 )
+                narrowing_succeeded = False
+                if check.not_touched:
+                    narrowed = await self._try_narrow_plan(check.not_touched)
+                    if narrowed:
+                        # Re-check the (possibly narrowed) plan against the
+                        # gate.  ``_task_files`` reads from ``self.plan``,
+                        # which ``_try_narrow_plan`` has refreshed from disk.
+                        rc2, branch_head2, _ = await _run(
+                            ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+                        )
+                        if rc2 == 0 and branch_head2.strip():
+                            check = await _check_plan_files_touched_in_branch(
+                                list(self._task_files or []),
+                                self._base_commit,
+                                branch_head2.strip(),
+                                self.git_ops,
+                                task_id=self.task_id,
+                            )
+                            if not check.not_touched:
+                                narrowing_succeeded = True
                 if check.not_touched:
                     reason = (
                         f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: '
@@ -2984,6 +3057,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         reason,
                         merge_phase=merge_phase,
                         escalate_to_human=True,
+                    )
+                if narrowing_succeeded:
+                    # Distinguish honest over-declaration (handled here)
+                    # from human-triage-required (emitted just above).
+                    _emit_merge_attempt(
+                        self.event_store, self.task_id,
+                        'plan_files_narrowed',
                     )
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
@@ -4218,7 +4298,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         resolved_by='auto-dismissed',
                     )
 
-        created_l0_id: str | None = None
         if self.escalation_queue and not skip_escalation:
             # Don't create a duplicate if level-1 already pending
             if not self.escalation_queue.has_open_l1(self.task_id):
@@ -4237,7 +4316,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     workflow_state=self.state.value,
                 )
                 self.escalation_queue.submit(esc)
-                created_l0_id = esc.id
 
                 if self.event_store:
                     self.event_store.emit(
@@ -4255,6 +4333,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     reason, detail or reason,
                 )
                 return WorkflowOutcome.BLOCKED
+
+            # Capture window-start for the broadened dismiss-with-terminate
+            # guard below.  Any L0 whose resolved_at falls inside this window
+            # is attributable to the current steward invocation — including
+            # follow-on L0s the steward chains and dismisses itself, not just
+            # the L0 the workflow itself just submitted (the original narrow
+            # Fix A guard tracked only that one).
+            steward_window_start = datetime.now(UTC).isoformat()
 
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
@@ -4310,26 +4396,36 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
                         return WorkflowOutcome.BLOCKED
 
-                    # Fix A: detect dismiss-with-terminate.  When the
-                    # steward's resolve_issue(terminate=True) marks the L0
-                    # 'dismissed' (rather than 'resolved'), the agent
-                    # signaled "I cannot fix this" — re-pending will loop
-                    # the same failure.  Halt here, submit an L1 so a
-                    # human can intervene, and return BLOCKED.
-                    if created_l0_id is not None:
-                        last_l0 = self.escalation_queue.get(created_l0_id)
-                        if (
-                            last_l0 is not None
-                            and last_l0.status == 'dismissed'
-                        ):
-                            logger.warning(
-                                'Task %s: steward dismissed L0 (terminate) '
-                                '— halting, escalating to L1', self.task_id,
-                            )
-                            await self._ensure_l1_escalation_for_blocked(
-                                reason, detail or reason,
-                            )
-                            return WorkflowOutcome.BLOCKED
+                    # Fix A (broadened): detect dismiss-with-terminate for
+                    # ANY L0 on this task whose resolved_at falls inside the
+                    # current steward invocation window — not just the L0
+                    # the workflow itself just submitted (the original narrow
+                    # Fix A guard tracked only that one).
+                    #
+                    # The steward may chain a follow-on L0 (e.g. an
+                    # ``infra_issue`` raised while resolving the original
+                    # ``task_failure``) and dismiss-with-terminate THAT one.
+                    # That is still "agent gives up", so halt and submit an
+                    # L1 instead of re-pending the task.
+                    dismissed_l0s = self.escalation_queue.get_by_task(
+                        self.task_id, status='dismissed', level=0,
+                    )
+                    recent_dismissals = [
+                        e for e in dismissed_l0s
+                        if e.resolved_at is not None
+                        and e.resolved_at >= steward_window_start
+                    ]
+                    if recent_dismissals:
+                        logger.warning(
+                            'Task %s: steward dismissed %d L0(s) during this '
+                            'invocation (ids=%s) — halting, escalating to L1',
+                            self.task_id, len(recent_dismissals),
+                            [e.id for e in recent_dismissals],
+                        )
+                        await self._ensure_l1_escalation_for_blocked(
+                            reason, detail or reason,
+                        )
+                        return WorkflowOutcome.BLOCKED
 
                     if self.event_store:
                         self.event_store.emit(
