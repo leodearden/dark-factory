@@ -6217,3 +6217,31 @@ class TestTaskKnowledgeSyncStage2Guards:
                 and 'task_id=99' in r.getMessage()
                 for r in caplog.records
             )
+
+
+class TestStage2NumericContaminationGuardrail:
+    """STAGE2_SYSTEM_PROMPT must contain an unconditional abort guardrail for
+    contaminated payloads that include autopilot_video task IDs (> 606).
+
+    Forensics 2026-05-10: Stage 2 failed to abort in cycles ~41 and ~56 when
+    given a mixed payload; the prompt contained no numeric ceiling or ZERO-action
+    instruction that would force the agent to halt before attempting task writes.
+    """
+
+    def test_prompt_pins_606_ceiling_and_zero_actions_phrase(self):
+        """STAGE2_SYSTEM_PROMPT must contain the numeric ceiling 606, reference
+        'autopilot_video task ceiling', and mandate 'ZERO task actions'."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert '606' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain the numeric ceiling '606' "
+            "(the autopilot_video task ceiling)"
+        )
+        assert 'autopilot_video task ceiling' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must name 'autopilot_video task ceiling' so "
+            "the agent knows why 606 is the boundary"
+        )
+        assert 'ZERO task actions' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain the phrase 'ZERO task actions' "
+            "to enforce the unconditional abort on contaminated payloads"
+        )
