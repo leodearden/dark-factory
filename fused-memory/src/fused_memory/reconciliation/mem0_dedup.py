@@ -72,10 +72,13 @@ async def find_prior_memories(
             limit=limit,
         )
     except Exception as e:
-        # Log under the plural function name so operators grepping logs find it.
-        # (Old phrasing was 'find_prior_memory search failed' — keep in mind
-        # when searching historical log archives.)
-        _log.warning('find_prior_memories search failed for task %s: %s', task_id, e)
+        # Log message uses the singular 'find_prior_memory' phrasing intentionally.
+        # The function name is an implementation detail; this string is an operator-
+        # facing API consumed by external alerting / log-shipping rules.  Both
+        # find_prior_memory and find_prior_memories share this code path, so the
+        # phrasing is decoupled from the helper name on purpose.  Do not rename
+        # without coordinating with downstream operators.
+        _log.warning('find_prior_memory search failed for task %s: %s', task_id, e)
         return []
 
     task_id_str = str(task_id)
