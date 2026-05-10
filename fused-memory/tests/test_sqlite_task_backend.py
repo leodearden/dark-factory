@@ -12,6 +12,7 @@ import pytest_asyncio
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
     _format_task_id,
+    _merge_metadata,
     _parse_task_id,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -204,6 +205,39 @@ async def test_update_task_overwrites_metadata_without_append(backend, project_r
     )
     one = await backend.get_task('1', project_root=project_root)
     assert one['metadata'] == {'prd': 'new.md'}
+
+
+# ── _merge_metadata: new additive-merge semantics ─────────────────
+
+
+def test_merge_metadata_list_collision_appends():
+    """(a) Top-level list collision under append=True concatenates."""
+    result = json.loads(_merge_metadata('{"tags":["a"]}', '{"tags":["b"]}', append=True))
+    assert result == {"tags": ["a", "b"]}
+
+
+def test_merge_metadata_list_collision_dedupes_stable_order():
+    """(b) Duplicate items are deduped in stable old-then-new order."""
+    result = json.loads(
+        _merge_metadata('{"tags":["a","b"]}', '{"tags":["b","c"]}', append=True)
+    )
+    assert result == {"tags": ["a", "b", "c"]}
+
+
+def test_merge_metadata_scalar_collision_old_wins_under_append():
+    """(c) Regression: scalar collision still resolves OLD-wins under append=True."""
+    result = json.loads(
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=True)
+    )
+    assert result == {"prd": "old.md"}
+
+
+def test_merge_metadata_append_false_replaces_verbatim():
+    """(d) Regression: append=False replaces the metadata verbatim."""
+    result = json.loads(
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=False)
+    )
+    assert result == {"prd": "new.md"}
 
 
 # ── add_subtask / nested IDs ───────────────────────────────────────
