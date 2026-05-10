@@ -9,9 +9,7 @@ Covers:
 
 from __future__ import annotations
 
-import ast
 import importlib.util
-import pathlib
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
@@ -427,14 +425,16 @@ class TestMaybeEscalateStalledTasks:
 class TestEscalationBinding:
     """Verify Escalation is unconditionally bound on the module namespace.
 
-    Two lightweight checks replace the previous importlib.reload approach:
+    Two behavioral checks replace the previous importlib.reload approach:
 
-    1. A runtime attribute check — verifies the binding exists in the currently
-       loaded module (catches regressions where the name is dropped entirely).
-    2. A static AST check — verifies the ``except ImportError`` branch in the
-       source contains the literal ``Escalation = None`` assignment (catches the
-       regression even when CI has the escalation package installed, so the
-       try-branch is taken at runtime and the except-branch is never executed).
+    1. ``test_escalation_attribute_is_bound`` — runtime hasattr on the loaded
+       module; catches regressions where the symbol is dropped entirely.
+    2. ``test_except_branch_binds_escalation_to_none`` — loads a fresh isolated
+       copy of the production module from source via
+       ``importlib.util.spec_from_file_location`` with ``sys.modules['escalation']``
+       and ``sys.modules['escalation.models']`` stubbed to ``None``; asserts the
+       except branch binds ``Escalation = None`` and ``_HAS_ESCALATION = False``
+       as actual runtime behavior even when CI has escalation installed.
     """
 
     def test_escalation_attribute_is_bound(self):
@@ -443,44 +443,6 @@ class TestEscalationBinding:
 
         assert hasattr(mod, 'Escalation'), (
             'Escalation must be bound on the module namespace at all times'
-        )
-
-    def test_except_importerror_branch_assigns_none(self):
-        """The except ImportError branch contains the literal Escalation = None.
-
-        This static check catches the regression even when the escalation
-        package is installed in CI (i.e. the try-branch is taken at runtime).
-        """
-        import fused_memory.reconciliation.stage1_stall_detector as mod
-
-        src = pathlib.Path(mod.__file__).read_text()
-        tree = ast.parse(src)
-
-        found = False
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Try):
-                continue
-            for handler in node.handlers:
-                if not (
-                    isinstance(handler.type, ast.Name)
-                    and handler.type.id == 'ImportError'
-                ):
-                    continue
-                for stmt in handler.body:
-                    if (
-                        isinstance(stmt, ast.Assign)
-                        and any(
-                            isinstance(t, ast.Name) and t.id == 'Escalation'
-                            for t in stmt.targets
-                        )
-                        and isinstance(stmt.value, ast.Constant)
-                        and stmt.value.value is None
-                    ):
-                        found = True
-
-        assert found, (
-            "The 'except ImportError' branch in stage1_stall_detector.py "
-            "must contain the literal 'Escalation = None' assignment"
         )
 
     def test_except_branch_binds_escalation_to_none(self):
