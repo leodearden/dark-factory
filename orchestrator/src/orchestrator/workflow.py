@@ -91,6 +91,15 @@ class _SchedulerLike(Protocol):
         done_provenance: dict | None = ...,
         reopen_reason: str | None = ...,
     ) -> None: ...
+    async def mark_done(
+        self,
+        task_id: str,
+        /,
+        *,
+        kind: str,
+        sha: str,
+        note: str | None = ...,
+    ) -> None: ...
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str], /
     ) -> bool: ...
@@ -320,6 +329,54 @@ class TaskWorkflow:
         """Return the file list from the current plan, or None if unavailable/empty."""
         files = self.plan.get('files', [])
         return files if files else None
+
+    async def _finalise_merged_done(self) -> WorkflowOutcome:
+        """Common DONE-finalisation for the happy-path merge.
+
+        Refreshes ``metadata.files`` from the merge diff, then calls
+        ``mark_done`` with ``kind='merged'``.  Extracted from ``run()`` so
+        the state machine stays under pyright's complexity threshold.
+
+        Returns ``WorkflowOutcome.DONE`` on success; ``BLOCKED`` (with L1)
+        when the persistence layer refuses or ``_merge_sha`` is missing.
+        """
+        await self._reconcile_metadata_files_for_done()
+        if not self._merge_sha:
+            # Should never happen on the happy path — _submit_to_merge_queue
+            # always populates _merge_sha on success.  Defensive bail-out
+            # rather than passing done_provenance=None (which the server
+            # gate now rejects with done_provenance_required).
+            logger.error(
+                'Task %s: SUCCESS path reached without _merge_sha — '
+                'cannot construct done_provenance',
+                self.task_id,
+            )
+            return await self._mark_blocked(
+                'Internal: SUCCESS without merge_sha — provenance unconstructable',
+                escalate_to_human=True,
+            )
+        try:
+            await self.scheduler.mark_done(
+                self.task_id, kind='merged', sha=self._merge_sha,
+            )
+        except SetTaskStatusRejected as exc:
+            # Persistence layer refused the done write — the architect's
+            # claim is contradicted by the row state.  Honest log + L1
+            # instead of pretending the task is DONE.
+            logger.error(
+                'Task %s: set_task_status(done) rejected — %s: %s',
+                self.task_id, exc.error_code, exc.raw,
+            )
+            return await self._mark_blocked(
+                f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
+                escalate_to_human=True,
+            )
+        logger.info(
+            f'Task {self.task_id} DONE — '
+            f'cost=${self.metrics.total_cost_usd:.2f} '
+            f'invocations={self.metrics.agent_invocations}'
+        )
+        return WorkflowOutcome.DONE
 
     async def _reconcile_metadata_files_for_done(self) -> None:
         """Set ``metadata.files`` to the merge-diff files before set_task_status('done').
@@ -847,43 +904,7 @@ class TaskWorkflow:
             await self._ensure_steward_started()
             await self._await_steward_completion()
             self._enter_phase(WorkflowState.DONE)
-            await self._reconcile_metadata_files_for_done()
-            if not self._merge_sha:
-                # Should never happen on the happy path — _submit_to_merge_queue
-                # always populates _merge_sha on success.  Defensive bail-out
-                # rather than passing done_provenance=None (which the server
-                # gate now rejects with done_provenance_required).
-                logger.error(
-                    'Task %s: SUCCESS path reached without _merge_sha — '
-                    'cannot construct done_provenance',
-                    self.task_id,
-                )
-                return await self._mark_blocked(
-                    'Internal: SUCCESS without merge_sha — provenance unconstructable',
-                    escalate_to_human=True,
-                )
-            try:
-                await self.scheduler.mark_done(
-                    self.task_id, kind='merged', sha=self._merge_sha,
-                )
-            except SetTaskStatusRejected as exc:
-                # set_task_status rejected the done write — the architect's
-                # claim is contradicted by the persistence layer.  Honest log
-                # + L1 instead of pretending the task is DONE.
-                logger.error(
-                    'Task %s: set_task_status(done) rejected — %s: %s',
-                    self.task_id, exc.error_code, exc.raw,
-                )
-                return await self._mark_blocked(
-                    f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
-                    escalate_to_human=True,
-                )
-            logger.info(
-                f'Task {self.task_id} DONE — '
-                f'cost=${self.metrics.total_cost_usd:.2f} '
-                f'invocations={self.metrics.agent_invocations}'
-            )
-            return WorkflowOutcome.DONE
+            return await self._finalise_merged_done()
 
         except AllAccountsCappedException as e:
             logger.warning(
