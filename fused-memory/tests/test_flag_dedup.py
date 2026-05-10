@@ -1714,8 +1714,8 @@ async def test_fake_memory_service_search_filters_by_categories_kwarg():
     (c) The same record IS found when no categories kwarg is provided (absent kwarg =
         no category filter).
 
-    Today _FakeMemoryService ignores the categories kwarg (accepts via **_kwargs), so
-    case (b) returns 1 result instead of 0 — this test fails on current code.
+    Pins the contract that _FakeMemoryService applies the categories filter
+    (case (b) would return 1 instead of 0 if the filter were dropped).
     """
     fake = _FakeMemoryService()
     await fake.add_memory(
