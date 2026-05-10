@@ -238,7 +238,7 @@ class ReconciliationHarness:
             The absolute project_root path for *project_id*.
 
         Raises:
-            ValueError: If *project_id* is not in ``self._known_projects``.
+            UnknownProjectError: (a ``ValueError`` subclass) If *project_id* is not in ``self._known_projects``.
         """
         try:
             return self._known_projects[project_id]
