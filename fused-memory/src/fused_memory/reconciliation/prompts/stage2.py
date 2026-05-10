@@ -214,6 +214,35 @@ cycle, do NOT re-act — instead note in your summary that the flag was carried 
 run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
 the flag as a normal finding and act on it.
 
+## Consuming Stage 1 Refresh Failures (Task 1157)
+At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
+`entity_refresh_failed_uuids` list in its structured report. These are entities whose \
+`mcp__fused-memory__refresh_entity_summary` call raised in the prior Stage 1 run; they \
+are targeted retries, not heuristic re-scans.
+
+If no `entity_refresh_failed_uuids` list is present in the payload, also run \
+`mcp__fused-memory__search` for episodes whose `source_description` contains the marker \
+`REFRESH_FAILURE:` — Stage 1 writes these as a fallback when its stats dict is already \
+finalised and it cannot amend the structured report. Treat any matching episodes as an \
+additional source of UUIDs to retry.
+
+For each UUID collected from either source:
+1. Call `mcp__fused-memory__get_entity(entity_uuid=<uuid>)` to confirm the entity is \
+   still reachable. If `get_entity` raises, add the UUID to \
+   `entity_refresh_retried_failed` in your stats and include a note in your structured \
+   report — the entity may have been deleted since Stage 1 attempted the refresh.
+2. If `get_entity` succeeds, call \
+   `mcp__fused-memory__refresh_entity_summary(entity_uuid=<uuid>)` to complete the \
+   deferred refresh. On success, add the UUID to `entity_refresh_retried_succeeded` in \
+   your stats.
+3. If `refresh_entity_summary` raises again, add the UUID to \
+   `entity_refresh_retried_failed` in your stats and include a note in your structured \
+   report so the operator can investigate the persistently unreachable entity.
+
+Process all listed UUIDs before beginning other reconciliation work. Each retry costs one \
+or two tool calls; skipping them forces the next Stage 1 cycle to re-discover the failed \
+entity by scanning all entity summaries heuristically.
+
 ## Mem0 Active-Query Flag Deletion (FIX C)
 Some flagged items in the "Stage 1 Flagged Items" section originate from a Mem0 \
 active-query path (identified by a `_source: mem0_active_query` marker or a `flag_id` \

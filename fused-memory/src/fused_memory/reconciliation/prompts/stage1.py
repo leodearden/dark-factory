@@ -143,17 +143,22 @@ exception), you MUST preserve the attempted entity_uuid so the next remediation 
 target it precisely instead of recovering it heuristically.
 
 1. On any refresh_entity_summary exception, append the attempted entity_uuid to a list \
-   in your stats dict under the key `entity_refresh_failed_uuids`. Initialise to a fresh \
-   list on the first failure; append (do not overwrite) on subsequent failures so multiple \
-   failures in one cycle are all recorded.
-2. If your stats dict is already finalised (e.g. the failure surfaces after you have \
-   produced your structured-output report), emit a one-sentence \
-   `add_memory(category='observations_and_summaries')` containing the attempted entity_uuid \
-   and the exception type so Stage 2 can locate it via search.
+   in your stats dict under the key `entity_refresh_failed_uuids`. Do this **before** \
+   finalising your structured-output report so the UUID is always in the primary stats \
+   channel. Initialise to a fresh list on the first failure; append (do not overwrite) on \
+   subsequent failures so multiple failures in one cycle are all recorded.
+2. If (in an exceptional edge case) your stats dict is already finalised, call \
+   `add_episode` with a `source_description` containing the marker string \
+   `REFRESH_FAILURE:<entity_uuid>:<exception_type>` so Stage 2 can locate it via an \
+   exact-string search on that marker rather than a semantic similarity match (UUIDs are \
+   opaque and do not embed meaningfully). Verify that the `add_episode` response contains \
+   a non-empty `episode_id` before continuing; if it is empty or absent, note the \
+   double-failure in your structured report.
 3. Continue with the remaining work — a single refresh failure does not abort the cycle.
 
-Skipping this recording forces the next remediation cycle to identify the failed entity \
-by heuristic, which costs a full reconciliation cycle to recover (cycle-46 precedent).
+Skipping this recording forces Stage 2 to re-scan all entity summaries heuristically to \
+discover which one failed, costing a full reconciliation cycle instead of one targeted \
+`refresh_entity_summary` call per UUID.
 
 ## Retrospective Episodes
 When creating or reviewing retrospective summaries via `add_episode`, always pass \
