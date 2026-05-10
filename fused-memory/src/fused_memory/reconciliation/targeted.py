@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 from fused_memory.models.reconciliation import (
     MemoryHints,
     ReconciliationRun,
@@ -353,7 +354,9 @@ class TargetedReconciler:
                 # The audit trail must not lie: only emit 'hints_attached' when the
                 # write actually succeeded; emit 'hints_skipped' with diagnostics on
                 # rejection so operators have a positive, queryable signal (task 1136).
-                write_succeeded = not (isinstance(resp, dict) and resp.get('error'))
+                # Non-dict responses (e.g. None) are always failures — contract is
+                # centralised in interceptor_write_succeeded (task 1184).
+                write_succeeded = interceptor_write_succeeded(resp)
 
                 if write_succeeded:
                     result['actions'].append({
@@ -373,6 +376,20 @@ class TargetedReconciler:
                         'error': error_code,
                         'reason': reason,
                     })
+                    # Symmetric durable audit row for the rejection path — mirrors the
+                    # 'write' row emitted on success (above). Verb 'skip' lets operators
+                    # filter `WHERE action_type='skip'` to compute rejection cardinality
+                    # without inspecting detail JSON (task 1184).
+                    await self.journal.add_run_action(
+                        run_id, 'skip', 'taskmaster', 'update_task',
+                        {
+                            'task_id': task_id,
+                            'type': 'hints_skipped',
+                            'error': error_code,
+                            'reason': reason,
+                        },
+                        causation_id=run_id,
+                    )
                     logger.info(
                         f'Hints skipped for task {task_id}: '
                         f'update_task rejected with error={error_code!r} reason={reason!r}'

@@ -4936,3 +4936,76 @@ async def test_set_task_status_done_with_provenance_preserves_metadata(
     assert persisted['memory_hints'] == {'queries': ['hint']}
 
 
+# ── task-1184: interceptor_write_succeeded helper contract ──
+
+
+class TestInterceptorWriteSucceeded:
+    """Unit tests for the module-level ``interceptor_write_succeeded(resp)`` helper.
+
+    The helper centralises the success/failure contract for all three rejection-dict
+    shapes produced by TaskInterceptor gates:
+      • ``_reject_status_in_update_task`` → ``{'success': False, 'error': '<code>', …}``
+      • ``_reject_done_provenance_in_update_metadata`` → same shape
+      • ``BacklogVerdict.to_error_dict()`` → ``{'error': '<msg>', 'error_type': '<code>', …}``
+        (no ``success`` key)
+    """
+
+    def _fn(self):
+        from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+        return interceptor_write_succeeded
+
+    def test_explicit_success_true(self):
+        """{'success': True} → True."""
+        assert self._fn()({'success': True}) is True
+
+    def test_explicit_success_true_with_extra_keys(self):
+        """{'success': True, 'id': '1.1'} → True (extra keys, no error key → success)."""
+        assert self._fn()({'success': True, 'id': '1.1'}) is True
+
+    def test_empty_dict_is_success(self):
+        """{'} → True (defaults: success=True, error=None — some fixtures use bare {})."""
+        assert self._fn()({}) is True
+
+    def test_reject_status_via_update_task(self):
+        """_reject_status_in_update_task shape → False."""
+        resp = {
+            'success': False,
+            'error': 'status_via_update_task',
+            'task_id': '1',
+            'status': 'done',
+            'hint': 'use set_task_status',
+        }
+        assert self._fn()(resp) is False
+
+    def test_reject_done_provenance_via_update_task(self):
+        """_reject_done_provenance_in_update_metadata shape → False."""
+        resp = {
+            'success': False,
+            'error': 'done_provenance_via_update_task',
+            'task_id': '1',
+            'hint': 'use set_task_status',
+        }
+        assert self._fn()(resp) is False
+
+    def test_backlog_verdict_error_dict(self):
+        """BacklogVerdict.to_error_dict() shape → False (no 'success' key, has 'error')."""
+        resp = {
+            'error': 'ReconciliationBacklogExceeded: backlog 600 > threshold 500',
+            'error_type': 'ReconciliationBacklogExceeded',
+            'backlog': 600,
+            'threshold': 500,
+            'project_id': 'test-project',
+        }
+        assert self._fn()(resp) is False
+
+    def test_none_response_is_failure(self):
+        """None → False (defensive: non-dict must never be treated as success)."""
+        assert self._fn()(None) is False
+
+    def test_string_response_is_failure(self):
+        """Unexpected string → False."""
+        assert self._fn()('unexpected string') is False
+
+    def test_list_response_is_failure(self):
+        """[] → False."""
+        assert self._fn()([]) is False

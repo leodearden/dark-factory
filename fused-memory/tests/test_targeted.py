@@ -10,6 +10,7 @@ from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
+from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -752,25 +753,65 @@ async def test_blocked_routes_update_through_task_interceptor_when_wired(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'rejection_dict, expected_error, expected_reason',
+    [
+        # (1) backlog-gate rejection — real BacklogVerdict.to_error_dict() shape
+        # (no 'success' key, no 'reason' key; 'error' is a rendered message string,
+        #  real code lives in 'error_type' = 'ReconciliationBacklogExceeded')
+        (
+            BacklogVerdict(outcome='rejection', backlog=600, threshold=500, project_id='test-project').to_error_dict(),
+            BacklogVerdict(outcome='rejection', backlog=600, threshold=500, project_id='test-project').to_error_dict()['error'],
+            None,  # no 'reason' key in BacklogVerdict dict
+        ),
+        # (2) _reject_status_in_update_task shape
+        (
+            {
+                'success': False,
+                'error': 'status_via_update_task',
+                'task_id': '42',
+                'status': 'done',
+                'hint': 'use set_task_status',
+            },
+            'status_via_update_task',
+            None,
+        ),
+        # (3) _reject_done_provenance_in_update_metadata shape
+        (
+            {
+                'success': False,
+                'error': 'done_provenance_via_update_task',
+                'task_id': '42',
+                'hint': 'use set_task_status',
+            },
+            'done_provenance_via_update_task',
+            None,
+        ),
+    ],
+    ids=['backlog_verdict', 'status_via_update_task', 'done_provenance_via_update_task'],
+)
 async def test_blocked_skips_hints_attached_on_interceptor_rejection(
-    reconciler, mock_memory_service, mock_taskmaster
+    reconciler, mock_memory_service, mock_taskmaster,
+    rejection_dict, expected_error, expected_reason,
 ):
     """When task_interceptor.update_task() returns a rejection dict, the audit signals
-    must honestly reflect the failed write:
+    must honestly reflect the failed write across all three interceptor gate shapes.
 
+    Assertions:
     (1) mock_interceptor.update_task called once  — the write was attempted.
     (2) mock_taskmaster.update_task NOT called     — no fallback bypass when interceptor set.
     (3) No 'hints_attached' action in result       — must not lie about a write that failed.
     (4) No 'hints_attached' journal entry          — ditto in the journal.
     (5) Exactly one 'hints_skipped' action with error/reason matching the rejection.
+    (6) Journal contains exactly one 'skip' row for 'update_task' with the correct
+        detail dict (type='hints_skipped', task_id='42', error=expected_error,
+        reason=expected_reason) — durable audit trail for rejection-rate queries.
     """
     from unittest.mock import AsyncMock as _AsyncMock
 
-    # Wire interceptor that simulates a backlog-gate rejection (not an exception — a dict)
+    # Wire interceptor returning the parametrized rejection shape
     mock_interceptor = _AsyncMock()
-    mock_interceptor.update_task = _AsyncMock(
-        return_value={'success': False, 'error': 'backlog_gate_rejected', 'reason': 'queue_lag'}
-    )
+    mock_interceptor.update_task = _AsyncMock(return_value=rejection_dict)
     reconciler.task_interceptor = mock_interceptor
 
     # Spy on journal.add_run_action so we can inspect every emitted action row
@@ -820,11 +861,126 @@ async def test_blocked_skips_hints_attached_on_interceptor_rejection(
         f'Expected exactly one hints_skipped action, got: {result.get("actions", [])}'
     )
     skip = hints_skipped[0]
-    assert skip.get('error') == 'backlog_gate_rejected', (
+    assert skip.get('error') == expected_error, (
         f'hints_skipped must carry the rejection error code, got: {skip}'
     )
-    assert skip.get('reason') == 'queue_lag', (
+    assert skip.get('reason') == expected_reason, (
         f'hints_skipped must carry the rejection reason, got: {skip}'
+    )
+
+    # (6) journal must contain exactly one 'skip' row for update_task with correct detail
+    journal_skip_rows = [
+        c for c in journal_spy.call_args_list
+        if len(c.args) >= 4
+        and c.args[1] == 'skip'
+        and c.args[2] == 'taskmaster'
+        and c.args[3] == 'update_task'
+    ]
+    assert len(journal_skip_rows) == 1, (
+        f'Expected exactly one journal skip row for update_task, '
+        f'got: {journal_skip_rows!r} from calls: {journal_spy.call_args_list!r}'
+    )
+    detail = journal_skip_rows[0].args[4] if len(journal_skip_rows[0].args) >= 5 else {}
+    assert detail.get('type') == 'hints_skipped', (
+        f"journal skip row detail must have type='hints_skipped', got: {detail}"
+    )
+    assert detail.get('task_id') == '42', (
+        f"journal skip row detail must carry task_id='42', got: {detail}"
+    )
+    assert detail.get('error') == expected_error, (
+        f'journal skip row detail must carry error={expected_error!r}, got: {detail}'
+    )
+    assert detail.get('reason') == expected_reason, (
+        f'journal skip row detail must carry reason={expected_reason!r}, got: {detail}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_treats_non_dict_response_as_failure(
+    reconciler, mock_memory_service, mock_taskmaster
+):
+    """When task_interceptor.update_task() returns None (non-dict), it must be treated
+    as a failure — not silently classified as success.
+
+    Under the old formula ``not (isinstance(resp, dict) and resp.get('error'))``,
+    ``None`` evaluates to success (the inner expression is False, outer not→True).
+    After the fix (``interceptor_write_succeeded``), non-dicts always → False.
+
+    Assertions:
+    (1) interceptor.update_task called once.
+    (2) No 'hints_attached' in result['actions'].
+    (3) Exactly one 'hints_skipped' action with error='unknown' and reason=None.
+    (4) Journal contains exactly one 'skip' row with detail error='unknown'.
+    (5) Journal contains NO 'hints_attached' row.
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    mock_interceptor = _AsyncMock()
+    mock_interceptor.update_task = _AsyncMock(return_value=None)  # non-dict response
+    reconciler.task_interceptor = mock_interceptor
+
+    journal_spy = _AsyncMock()
+    reconciler.journal.add_run_action = journal_spy
+
+    mock_memory_service.search = _AsyncMock(return_value=[
+        MemoryResult(id='1', content='blocker info', source_store=SourceStore.mem0, entities=['EntityA']),
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='42',
+        transition='blocked',
+        project_id='test-project',
+        project_root='/tmp/test',
+        task_before={'id': '42', 'title': 'Blocked task', 'status': 'in-progress'},
+    )
+
+    # (1) interceptor was called
+    mock_interceptor.update_task.assert_called_once()
+
+    # (2) no hints_attached action
+    hints_attached = [a for a in result.get('actions', []) if a.get('type') == 'hints_attached']
+    assert hints_attached == [], (
+        f'None response must NOT produce hints_attached; got: {result.get("actions", [])}'
+    )
+
+    # (3) exactly one hints_skipped with error='unknown'
+    hints_skipped = [a for a in result.get('actions', []) if a.get('type') == 'hints_skipped']
+    assert len(hints_skipped) == 1, (
+        f'Expected exactly one hints_skipped, got: {result.get("actions", [])}'
+    )
+    skip = hints_skipped[0]
+    assert skip.get('error') == 'unknown', (
+        f"Non-dict response must produce error='unknown', got: {skip}"
+    )
+    assert skip.get('reason') is None, (
+        f"Non-dict response must produce reason=None, got: {skip}"
+    )
+
+    # (4) journal must contain exactly one 'skip' row with error='unknown'
+    journal_skip_rows = [
+        c for c in journal_spy.call_args_list
+        if len(c.args) >= 4
+        and c.args[1] == 'skip'
+        and c.args[2] == 'taskmaster'
+        and c.args[3] == 'update_task'
+    ]
+    assert len(journal_skip_rows) == 1, (
+        f'Expected one journal skip row, got: {journal_skip_rows!r}'
+    )
+    detail = journal_skip_rows[0].args[4] if len(journal_skip_rows[0].args) >= 5 else {}
+    assert detail.get('error') == 'unknown', (
+        f"journal skip row must carry error='unknown', got: {detail}"
+    )
+
+    # (5) journal must NOT contain a hints_attached row
+    journal_hints_rows = [
+        c for c in journal_spy.call_args_list
+        if len(c.args) >= 5
+        and isinstance(c.args[4], dict)
+        and c.args[4].get('type') == 'hints_attached'
+    ]
+    assert journal_hints_rows == [], (
+        f'journal must not record hints_attached on None response; got: {journal_hints_rows}'
     )
 
 
