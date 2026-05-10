@@ -244,7 +244,12 @@ emit for a suppressed task_id will be dropped by the post-processor regardless.
 Canonical suppression record schema (Mem0, observations_and_summaries category) — \
 this is the producer's contract source-of-truth read by the post-processor:
   - `metadata.kind = "stage1_flag_suppression"`
-  - `metadata.task_id = <N>` (integer matching the target task)
+  - `metadata.task_id = <N>` (pinned to `int` by the producer \
+`write_suppression_record` → `build_suppression_payload` via `int()` coercion; \
+readers MUST compare as strings via \
+`str(result.metadata.get('task_id')) == str(target_task_id)` because Mem0 \
+metadata round-trips through JSON and historical writers in this codebase have \
+stored task_id as both `int` and `str`)
   - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
 
 Producing a suppression record: operators and remediation hooks should call \
@@ -261,7 +266,8 @@ right record, and pin `categories`/`stores`/`limit` to avoid the default \
 `limit=10` silently missing the record on a busy project. Then inspect each \
 result's metadata. A result is a valid suppression record ONLY when BOTH \
 `metadata.kind == "stage1_flag_suppression"` AND \
-`metadata.task_id == <N>`. Do NOT rely on semantic/vector proximity alone — vector \
+`str(result.metadata.get('task_id')) == str(target_task_id)`. Do NOT rely on \
+semantic/vector proximity alone — vector \
 search may return near-misses. A result that fails either metadata field, or an \
 empty result set, means "no suppression in effect"; proceed normally.
 
