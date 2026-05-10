@@ -175,3 +175,38 @@ Margin                            : +27h51m — daemon started AFTER fix landed 
 ```
 
 **PASS.** The daemon is now running post-fix code.
+
+---
+
+## Post-Restart Payload Verification (Step 3)
+
+**Observation window:** 2026-05-10T13:40:25 UTC (restart) to 2026-05-10T13:52 UTC (~12 minutes)
+
+No new autopilot_video reconciliation cycle fired within the 15-minute observation window. The autopilot_video full cycle interval is approximately 5-6 hours (observed: full cycles at 07:03, 12:06 UTC — ~5h apart). The plan's upper bound of 15 minutes is insufficient to observe a live cycle. Per plan design decision, verification continues using the "cached payload available" structural approach.
+
+### Structural proof — fix is active
+
+| Evidence | Detail |
+|----------|--------|
+| SqliteTaskBackend log at 14:40:32 BST | `SqliteTaskBackend opened /home/leo/src/autopilot-video/.taskmaster/tasks/tasks.db` — **hyphen** path (correct) |
+| Pre-fix behavior | Pre-restart daemon was using wrong path `autopilot_video` (underscore), causing `_fetch_filtered_task_tree` to fail and fall back to dark_factory task tree |
+| autopilot-video task database contents | `min_id=1, max_id=606, count=603` — ONLY task IDs ≤606, **zero dark_factory 1000-range IDs** |
+| Contamination mechanism broken | The fix resolves the project_root to the correct hyphen-path; the SqliteTaskBackend is now opening the correct DB |
+
+### Last pre-restart cycle — confirmed contaminated (cycle 59)
+
+Run `531ba300` (full, 12:06–13:14 UTC, pre-restart) stage_reports confirm contamination:
+- Stage 1 flag `contamination_persists_post_fix`: "All 14 active tasks in payload are dark-factory IDs. Fix commit 8a9609f652 deployed but fused-memory service NOT restarted."
+- `affected_ids` in remediation run `46777e5b`: `["55489b30", "46099c8e", "afcce6aa", "91043e4f", "86f14abc", "dbfcf1ec", "9d93845c", "a1c732a9"]`
+- `skip_edges`: `["46acf163"]` (confirmed absent)
+- `do_not_delete`: `["10bb647f", "c25cc342", "9601f9e5", "03b30150", "d4761d8b"]`
+- Cleanup plan Mem0 ID created by remediation run: `098c70cb` ✓ (matches task description)
+
+### Reconciliation DB additional confirmations
+
+- **Task 1155 status**: `done` (verified via dark_factory tasks.db) → `562cb2dd` is eligible for deletion
+- **Watermark for autopilot_video**: last full run = `531ba300` (pre-restart, contaminated); no new run started since restart
+
+### GATE verdict
+
+**PASS.** The fix is structurally active: the new daemon is opening the correct autopilot-video database (`/home/leo/src/autopilot-video`, hyphen). The correct database contains ONLY task IDs 1–606 — no dark_factory 1000-range IDs. The contamination mechanism (wrong project_root → wrong DB → dark_factory task tree served to autopilot_video recon) is broken. Deletions may proceed.
