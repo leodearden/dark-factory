@@ -4256,6 +4256,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 return WorkflowOutcome.BLOCKED
 
+            # Capture window-start for the broadened dismiss-with-terminate
+            # guard below.  Any L0 whose resolved_at falls inside this window
+            # is attributable to the current steward invocation — including
+            # follow-on L0s the steward chains and dismisses itself, not just
+            # ``created_l0_id`` (the original narrow Fix A guard).
+            steward_window_start = datetime.now(UTC).isoformat()
+
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
             if self._steward:
@@ -4310,26 +4317,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
                         return WorkflowOutcome.BLOCKED
 
-                    # Fix A: detect dismiss-with-terminate.  When the
-                    # steward's resolve_issue(terminate=True) marks the L0
-                    # 'dismissed' (rather than 'resolved'), the agent
-                    # signaled "I cannot fix this" — re-pending will loop
-                    # the same failure.  Halt here, submit an L1 so a
-                    # human can intervene, and return BLOCKED.
-                    if created_l0_id is not None:
-                        last_l0 = self.escalation_queue.get(created_l0_id)
-                        if (
-                            last_l0 is not None
-                            and last_l0.status == 'dismissed'
-                        ):
-                            logger.warning(
-                                'Task %s: steward dismissed L0 (terminate) '
-                                '— halting, escalating to L1', self.task_id,
-                            )
-                            await self._ensure_l1_escalation_for_blocked(
-                                reason, detail or reason,
-                            )
-                            return WorkflowOutcome.BLOCKED
+                    # Fix A (broadened): detect dismiss-with-terminate for
+                    # ANY L0 on this task whose resolved_at falls inside the
+                    # current steward invocation window — not just the L0
+                    # the workflow itself submitted (``created_l0_id``).
+                    #
+                    # The steward may chain a follow-on L0 (e.g. an
+                    # ``infra_issue`` raised while resolving the original
+                    # ``task_failure``) and dismiss-with-terminate THAT one.
+                    # That is still "agent gives up", so halt and submit an
+                    # L1 instead of re-pending the task.  ``created_l0_id``
+                    # is now redundant for this guard but referenced
+                    # nowhere else; left for a follow-up cleanup.
+                    dismissed_l0s = self.escalation_queue.get_by_task(
+                        self.task_id, status='dismissed', level=0,
+                    )
+                    recent_dismissals = [
+                        e for e in dismissed_l0s
+                        if e.resolved_at is not None
+                        and e.resolved_at >= steward_window_start
+                    ]
+                    if recent_dismissals:
+                        logger.warning(
+                            'Task %s: steward dismissed %d L0(s) during this '
+                            'invocation (ids=%s) — halting, escalating to L1',
+                            self.task_id, len(recent_dismissals),
+                            [e.id for e in recent_dismissals],
+                        )
+                        await self._ensure_l1_escalation_for_blocked(
+                            reason, detail or reason,
+                        )
+                        return WorkflowOutcome.BLOCKED
 
                     if self.event_store:
                         self.event_store.emit(
