@@ -1415,28 +1415,57 @@ class TestStage2GuardrailProjectIdGating:
 
 
 class TestAutopilotVideoTaskCeilingFreshness:
-    """Regression guard: _AUTOPILOT_VIDEO_TASK_CEILING must be >= the observed max task
-    id in autopilot_video's tasks.json.
+    """Regression guard: _AUTOPILOT_VIDEO_TASK_CEILING must be >= the committed max task
+    id in tests/fixtures/autopilot_video_max_id.json.
 
-    This is a drift-detector test that passes on first commit (606 >= 606) and fails
-    in the future if autopilot_video grows past the hardcoded ceiling constant.  Mirroring
-    the TestTierConfig / TestProjectIdGuidelineConstants pattern — passes immediately,
-    serves as a future-drift alarm rather than a red→green TDD transition.
+    This is a drift-detector test that runs on every CI pass — it never skips, because
+    it reads a committed JSON fixture rather than an absolute workstation path.  The
+    fixture {"max_id": 606} is the contract: bump it *together with* the constant when
+    autopilot_video grows, then re-evaluate the guardrail's premise before the next
+    production cycle.
 
-    The test skips gracefully when autopilot_video/tasks.json is not accessible so CI
-    runs outside leo's workstation are not broken.
+    Workflow when autopilot_video grows past the ceiling:
+    1. Update _AUTOPILOT_VIDEO_TASK_CEILING in prompts/stage2.py to the new max id.
+    2. Update tests/fixtures/autopilot_video_max_id.json to {"max_id": <new max>}.
+    3. Re-evaluate whether 'task IDs > ceiling ⟹ cross-project contamination' still holds.
+    4. Run this test to confirm both changes are consistent.
+
+    Mirroring the TestTierConfig / TestProjectIdGuidelineConstants drift-detector pattern.
     """
 
-    def test_ceiling_constant_not_below_observed_max_id(self):
-        """_AUTOPILOT_VIDEO_TASK_CEILING must be >= the max task id currently in
-        autopilot_video/.taskmaster/tasks/tasks.json.
+    def test_ceiling_constant_not_below_fixture_max_id(self):
+        """_AUTOPILOT_VIDEO_TASK_CEILING must be >= the max_id in the committed fixture.
 
-        If this test fails: the autopilot_video project has grown past the ceiling
-        constant.  Bump _AUTOPILOT_VIDEO_TASK_CEILING in
-        fused_memory/reconciliation/prompts/stage2.py to the new max id and
-        re-evaluate whether the contamination guardrail's premise —
-        'all task IDs > ceiling are necessarily cross-project contamination' —
-        still reflects reality before running the next production cycle.
+        Primary assertion (always runs — no skip).  The fixture
+        tests/fixtures/autopilot_video_max_id.json is the committed contract for the
+        ceiling value.  If this test fails, both the fixture AND the constant in
+        prompts/stage2.py must be updated together (see class docstring).
+        """
+        import json
+        from pathlib import Path
+
+        from fused_memory.reconciliation.prompts.stage2 import _AUTOPILOT_VIDEO_TASK_CEILING
+
+        fixture_path = Path(__file__).parent / 'fixtures' / 'autopilot_video_max_id.json'
+        fixture_data = json.loads(fixture_path.read_text())
+        fixture_max_id = int(fixture_data['max_id'])
+
+        assert _AUTOPILOT_VIDEO_TASK_CEILING >= fixture_max_id, (
+            f'_AUTOPILOT_VIDEO_TASK_CEILING={_AUTOPILOT_VIDEO_TASK_CEILING} is below '
+            f'the committed fixture max_id={fixture_max_id}.  '
+            f'Bump _AUTOPILOT_VIDEO_TASK_CEILING in '
+            f'fused_memory/reconciliation/prompts/stage2.py to {fixture_max_id} and '
+            f're-evaluate the contamination guardrail premise before the next cycle.  '
+            f'Also update tests/fixtures/autopilot_video_max_id.json if the live task '
+            f'tree has grown further.'
+        )
+
+    def test_ceiling_constant_not_below_live_max_id(self):
+        """_AUTOPILOT_VIDEO_TASK_CEILING must be >= the max id in the live tasks.json.
+
+        Secondary assertion (skips gracefully when autopilot_video is not on this
+        machine).  On Leo's workstation this catches the case where autopilot_video
+        has grown but neither the fixture nor the constant has been updated yet.
         """
         import json
 
@@ -1457,7 +1486,8 @@ class TestAutopilotVideoTaskCeilingFreshness:
             f'_AUTOPILOT_VIDEO_TASK_CEILING={_AUTOPILOT_VIDEO_TASK_CEILING} is below '
             f'the observed max task id {max_id} in autopilot_video tasks.json.  '
             f'Bump _AUTOPILOT_VIDEO_TASK_CEILING in '
-            f'fused_memory/reconciliation/prompts/stage2.py to {max_id} and '
+            f'fused_memory/reconciliation/prompts/stage2.py to {max_id}, update '
+            f'tests/fixtures/autopilot_video_max_id.json to {{"max_id": {max_id}}}, and '
             f're-evaluate the contamination guardrail premise before the next cycle.'
         )
 

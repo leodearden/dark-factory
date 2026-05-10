@@ -8,6 +8,11 @@ from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
 # contamination guardrail's premise before the next production cycle.
 _AUTOPILOT_VIDEO_TASK_CEILING: int = 606
 
+# Named constant for the project ID so the magic string has a single source of truth
+# across build_stage2_system_prompt(), task_knowledge_sync.py's warning check, and
+# any future per-project guardrail additions.
+_AUTOPILOT_VIDEO_PROJECT_ID: str = 'autopilot_video'
+
 # Autopilot-video-specific contamination guardrail — injected by
 # build_stage2_system_prompt() only when project_id == 'autopilot_video'.
 # Using the named constant so there is a single source of truth for the ceiling value.
@@ -315,10 +320,18 @@ def build_stage2_system_prompt(project_id: str) -> str:
     ``memory_consolidator.py`` as the in-repo precedent for project-id-aware prompt
     assembly.
     """
-    if project_id != 'autopilot_video':
+    if project_id != _AUTOPILOT_VIDEO_PROJECT_ID:
         return STAGE2_SYSTEM_PROMPT
+    sentinel = '## Available Tools'
+    if sentinel not in STAGE2_SYSTEM_PROMPT:
+        raise RuntimeError(
+            f"build_stage2_system_prompt: injection sentinel {sentinel!r} not found in "
+            "STAGE2_SYSTEM_PROMPT — the section header was likely renamed or removed. "
+            "Update the sentinel string in build_stage2_system_prompt() to match."
+        )
     return STAGE2_SYSTEM_PROMPT.replace(
-        '## Available Tools',
-        f'{_AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL}## Available Tools',
-        1,  # single replacement — idempotent if called twice
+        sentinel,
+        f'{_AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL}{sentinel}',
+        1,  # replace only the first occurrence — guards against accidental duplication
+            # if the sentinel ever appears more than once in the prompt
     )

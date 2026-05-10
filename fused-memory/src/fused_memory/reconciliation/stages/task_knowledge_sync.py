@@ -34,6 +34,8 @@ from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
 )
 from fused_memory.reconciliation.prompts.stage2 import (
+    _AUTOPILOT_VIDEO_PROJECT_ID,
+    _AUTOPILOT_VIDEO_TASK_CEILING,
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
@@ -1093,6 +1095,34 @@ class TaskKnowledgeSync(BaseStage):
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
+
+        # Defence-in-depth: log a structured warning when the contamination guardrail
+        # condition is met so operators can distinguish a true cross-project contamination
+        # (IDs ≫ ceiling) from autopilot_video legitimately growing past the ceiling
+        # (update _AUTOPILOT_VIDEO_TASK_CEILING + fixture if the latter).  The prompt-side
+        # guardrail fires on the LLM's honour; this warning is the programmatic signal.
+        if self.project_id == _AUTOPILOT_VIDEO_PROJECT_ID:
+            all_tasks = itertools.chain(
+                filtered.active_tasks,
+                filtered.done_tasks,
+                filtered.cancelled_tasks,
+            )
+            excessive_ids = sorted(
+                int(t['id'])
+                for t in all_tasks
+                if isinstance(t.get('id'), (int, str))
+                and int(t['id']) > _AUTOPILOT_VIDEO_TASK_CEILING
+            )
+            if excessive_ids:
+                logger.warning(
+                    "reconciliation.stage2_contamination_guard_fires "
+                    "project_id=%s task_ids_above_ceiling=%s ceiling=%d — "
+                    "verify this is cross-project contamination, not autopilot_video "
+                    "growth past the ceiling constant",
+                    self.project_id,
+                    excessive_ids,
+                    _AUTOPILOT_VIDEO_TASK_CEILING,
+                )
 
         # Render "Recently Completed Tasks" section.
         # Invariant: filter_task_tree() always appends to done_tasks when it increments
