@@ -280,9 +280,9 @@ If you do choose to check: call \
 categories=['observations_and_summaries'], stores=['mem0'], limit=50)`. \
 `task_id=<N>` in the query biases vector ranking; `limit=50` overrides the \
 default `limit=10` so a busy project doesn't drop the record.  Mem0 metadata \
-round-trips through JSON and tolerant readers (`filter_suppressed`) compare via \
-`str(...)` so the contract is robust to any caller passing the value as a \
-numeric string — a result is a valid suppression record ONLY when BOTH \
+round-trips through JSON and may deserialize `task_id` as either `int` or \
+`str`; compare via `str(...)` on both sides — this coercion is a correctness \
+requirement: a result is a valid suppression record ONLY when BOTH \
 `metadata.kind == "stage1_flag_suppression"` AND \
 `str(result.metadata.get('task_id')) == str(target_task_id)`. Do NOT rely on \
 semantic/vector proximity alone — a result that fails either metadata field, or \
