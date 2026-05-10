@@ -1,6 +1,9 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
-from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+from fused_memory.reconciliation.prompts import (
+    _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
+    _STAGE1_PROJECT_ID_GUIDELINE,
+)
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
@@ -109,12 +112,7 @@ different content or note the deduplication in your report.
 Invariant: `len(memory_ids_returned) == memories_written == memories_added`. Both keys \
 must carry the same count and both count only writes where `memory_ids` was non-empty.
 
-Graphiti-only async-enqueued writes show `stores: ['graphiti']` in the response but \
-return `memory_ids: []` because the write is queued rather than persisted inline. These \
-must NOT be counted under `memories_added` / `memories_written`. Report them instead under \
-a separate `graphiti_writes_queued` stat. The stats verifier enforces this split \
-independently and will override any inflated `memories_added` count, but you should report \
-it correctly from the start to avoid divergence.
+{_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
 
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
