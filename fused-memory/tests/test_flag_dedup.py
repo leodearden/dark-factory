@@ -2034,3 +2034,39 @@ def test_write_suppression_record_importable_from_canonical_path():
     (see STAGE1_SYSTEM_PROMPT ## Flag Suppression Check section).
     """
     from fused_memory.reconciliation.flag_dedup import write_suppression_record  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Prompt-contract tests: ## Flag Suppression Check hardening (task 1187)
+# ---------------------------------------------------------------------------
+
+class TestStage1PromptSuppressionSearchKwargs:
+    """STAGE1_SYSTEM_PROMPT's suppression-check search call must pin all filter kwargs."""
+
+    def _get_suppression_section(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        # Extract the section between ## Flag Suppression Check and ## Flag Deduplication
+        parts = STAGE1_SYSTEM_PROMPT.split('## Flag Suppression Check')
+        assert len(parts) == 2, "Expected exactly one '## Flag Suppression Check' heading"
+        section_and_after = parts[1]
+        section = section_and_after.split('## Flag Deduplication')[0]
+        return section
+
+    def test_search_query_includes_task_id(self):
+        """The search query string must include 'stage1_flag_suppression task_id=' to bias vector ranking."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert 'stage1_flag_suppression task_id=' in STAGE1_SYSTEM_PROMPT
+
+    def test_search_call_pins_filter_kwargs(self):
+        """The search call must specify categories, stores, and limit (not rely on defaults)."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert "categories=['observations_and_summaries']" in STAGE1_SYSTEM_PROMPT
+        assert "stores=['mem0']" in STAGE1_SYSTEM_PROMPT
+        assert 'limit=50' in STAGE1_SYSTEM_PROMPT
+
+    def test_search_call_documented_inside_suppression_section(self):
+        """The filter kwargs must appear within the ## Flag Suppression Check section, not elsewhere."""
+        section = self._get_suppression_section()
+        assert "categories=['observations_and_summaries']" in section
+        assert "stores=['mem0']" in section
+        assert 'limit=50' in section
