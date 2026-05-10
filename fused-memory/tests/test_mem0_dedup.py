@@ -336,3 +336,55 @@ async def test_find_prior_memories_search_failure_returns_empty_list_and_warns(c
         f'Expected a WARNING mentioning task 77 but got: '
         f'{[r.message for r in caplog.records]}'
     )
+
+
+# --- Step 1166 — log message phrasing is operator-facing API ---
+
+
+@pytest.mark.asyncio
+async def test_find_prior_memories_search_failure_log_message_pins_singular_phrasing(caplog):
+    """WARNING emitted on search failure must use singular 'find_prior_memory search failed'.
+
+    The log message is an operator-facing API consumed by external alerting and
+    log-shipping rules.  The function name is an implementation detail and must
+    not influence the phrasing.  This test pins the literal substring so that
+    any future rename trips a CI failure rather than silently breaking downstream
+    alert rules.
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memories
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
+
+    caller_logger = logging.getLogger('test.caller_logger')
+    with caplog.at_level(logging.WARNING, logger='test.caller_logger'):
+        await find_prior_memories(
+            memory_service,
+            project_id='p',
+            task_id='88',
+            kind={'flag_type': 'foo'},
+            query='q',
+            log=caller_logger,
+        )
+
+    warning_messages = [
+        r.message for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+
+    # Desired singular phrasing must be present
+    assert any(
+        'find_prior_memory search failed' in msg for msg in warning_messages
+    ), (
+        'WARNING phrasing is operator-facing log-shipping API; do not change without '
+        'coordinating with downstream alert rules. '
+        f'Got: {warning_messages!r}'
+    )
+
+    # Regressed plural phrasing must NOT appear
+    assert not any(
+        'find_prior_memories search failed' in msg for msg in warning_messages
+    ), (
+        'WARNING phrasing is operator-facing log-shipping API; do not change without '
+        'coordinating with downstream alert rules. '
+        f'Got: {warning_messages!r}'
+    )
