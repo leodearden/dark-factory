@@ -1665,6 +1665,53 @@ class _FakeMemoryService:
 
 
 @pytest.mark.asyncio
+async def test_fake_memory_service_search_filters_by_categories_kwarg():
+    """_FakeMemoryService enforces category routing when categories kwarg is provided.
+
+    Asserts:
+    (a) A record stored with category='observations_and_summaries' is found when
+        searching with categories=['observations_and_summaries'] (matching category).
+    (b) The same record is NOT found when searching with categories=['preferences_and_norms']
+        (category mismatch → 0 results).
+    (c) The same record IS found when no categories kwarg is provided (absent kwarg =
+        no category filter).
+
+    Today _FakeMemoryService ignores the categories kwarg (accepts via **_kwargs), so
+    case (b) returns 1 result instead of 0 — this test fails on current code.
+    """
+    fake = _FakeMemoryService()
+    await fake.add_memory(
+        content='x',
+        category='observations_and_summaries',
+        metadata={'kind': 'stage1_flag_suppression', 'task_id': 1},
+    )
+
+    # (a) Matching category → 1 result
+    results_matching = await fake.search(
+        query='stage1_flag_suppression',
+        categories=['observations_and_summaries'],
+    )
+    assert len(results_matching) == 1, (
+        f'Expected 1 result for matching category but got {len(results_matching)}'
+    )
+
+    # (b) Mismatched category → 0 results
+    results_mismatch = await fake.search(
+        query='stage1_flag_suppression',
+        categories=['preferences_and_norms'],
+    )
+    assert len(results_mismatch) == 0, (
+        f'Expected 0 results for mismatched category but got {len(results_mismatch)}'
+    )
+
+    # (c) No categories kwarg → no filter, 1 result
+    results_no_filter = await fake.search(query='stage1_flag_suppression')
+    assert len(results_no_filter) == 1, (
+        f'Expected 1 result with no categories filter but got {len(results_no_filter)}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_suppression_record_round_trips_via_producer():
     """Round-trip schema contract (producer path): write_suppression_record writes
     exactly what filter_suppressed's search finds.
