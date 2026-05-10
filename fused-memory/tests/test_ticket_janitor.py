@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 from pathlib import Path
 from typing import IO, Literal, overload
 
@@ -547,6 +548,46 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
     assert janitor._known_projects == pre_mutation, (
         'post-init env mutation must not change the janitor registry; '
         f'registry changed from {pre_mutation} to {janitor._known_projects}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_nudge_emitted_once_across_two_constructions(
+    store, tmp_path, caplog
+):
+    """The startup INFO nudge fires exactly once per process regardless of
+    how many TicketJanitor instances are constructed.
+
+    Guards the once-per-process semantics from task 1210: the class-level
+    ``_registry_log_emitted`` flag must be set to True after the first
+    construction and suppress the log in all subsequent ones.  Resetting
+    the flag at the start of this test makes the assertion order-independent
+    — it does not matter which earlier test in the module already tripped
+    the flag.
+    """
+    # Reset so the assertion is independent of test-execution order.
+    TicketJanitor._registry_log_emitted = False
+    caplog.set_level(logging.INFO, logger='fused_memory.middleware.ticket_janitor')
+
+    j1 = TicketJanitor(store, primary_project_root=str(tmp_path))
+    # Guard's side-effect: flag must be True after the first construction.
+    assert TicketJanitor._registry_log_emitted is True
+
+    j2 = TicketJanitor(store, primary_project_root=str(tmp_path))  # noqa: F841
+
+    nudge_records = [
+        r for r in caplog.records
+        if 'project registry snapshotted at init' in r.getMessage()
+    ]
+    assert len(nudge_records) == 1, (
+        f'Expected exactly 1 startup nudge across 2 constructions; '
+        f'got {len(nudge_records)}: {[r.getMessage() for r in nudge_records]}'
+    )
+    # Verify the %d placeholder was substituted with the actual project count.
+    formatted = nudge_records[0].getMessage()
+    expected_fragment = f'({len(j1._known_projects)} project(s))'
+    assert expected_fragment in formatted, (
+        f'Expected {expected_fragment!r} in nudge message; got: {formatted!r}'
     )
 
 
