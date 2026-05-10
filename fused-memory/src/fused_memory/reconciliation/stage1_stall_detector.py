@@ -52,6 +52,7 @@ try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     _HAS_ESCALATION = True
 except ImportError:
+    Escalation = None  # type: ignore[assignment,misc]
     _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
@@ -270,7 +271,7 @@ async def maybe_escalate_stalled_tasks(
         try:
             # make_id() and Escalation() are inside the try so that id-generation
             # or constructor failures are caught and logged rather than escaping.
-            esc = Escalation(  # type: ignore[possibly-undefined]
+            esc = Escalation(
                 id=escalation_queue.make_id(task_id),
                 task_id=task_id,
                 agent_role='reconciliation-stage1',
