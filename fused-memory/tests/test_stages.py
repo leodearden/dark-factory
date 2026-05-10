@@ -5743,6 +5743,25 @@ class TestTaskKnowledgeSyncStage2Guards:
             assert result is None
             assert '_classify_terminal_state_violations' in caplog.text
 
+        @pytest.mark.asyncio
+        async def test_parsed_params_bypasses_json_parse(self, caplog):
+            """_parsed_params={'task_id': '42'} skips json.loads(op['params']) entirely — bypass contract from Stage 2 amend (task 1177)."""
+            taskmaster = AsyncMock()
+            op = self._make_op(operation='update_task')
+            op['params'] = 'not valid json'
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ):
+                result = await _resolve_live_status(
+                    op, taskmaster, '/project', {'42': 'done'},
+                    '_test_parsed_params_bypass',
+                    _parsed_params={'task_id': '42'},
+                )
+            assert result == ('42', 'done')
+            taskmaster.get_task.assert_not_called()
+            assert 'failed to parse params JSON' not in caplog.text
+
     class TestTerminalStatePreCheck:
         """Unit tests for _classify_terminal_state_violations helper."""
 
