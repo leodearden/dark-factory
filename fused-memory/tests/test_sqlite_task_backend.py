@@ -12,6 +12,7 @@ import pytest_asyncio
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
     _format_task_id,
+    _merge_metadata,
     _parse_task_id,
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -204,6 +205,101 @@ async def test_update_task_overwrites_metadata_without_append(backend, project_r
     )
     one = await backend.get_task('1', project_root=project_root)
     assert one['metadata'] == {'prd': 'new.md'}
+
+
+# ── _merge_metadata: new additive-merge semantics ─────────────────
+
+
+def test_merge_metadata_list_collision_appends():
+    """(a) Top-level list collision under append=True concatenates."""
+    result = json.loads(_merge_metadata('{"tags":["a"]}', '{"tags":["b"]}', append=True))
+    assert result == {"tags": ["a", "b"]}
+
+
+def test_merge_metadata_list_collision_dedupes_stable_order():
+    """(b) Duplicate items are deduped in stable old-then-new order."""
+    result = json.loads(
+        _merge_metadata('{"tags":["a","b"]}', '{"tags":["b","c"]}', append=True)
+    )
+    assert result == {"tags": ["a", "b", "c"]}
+
+
+def test_merge_metadata_scalar_collision_old_wins_under_append():
+    """(c) Regression: scalar collision still resolves OLD-wins under append=True."""
+    result = json.loads(
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=True)
+    )
+    assert result == {"prd": "old.md"}
+
+
+def test_merge_metadata_append_false_replaces_verbatim():
+    """(d) Regression: append=False replaces the metadata verbatim."""
+    result = json.loads(
+        _merge_metadata('{"prd":"old.md"}', '{"prd":"new.md"}', append=False)
+    )
+    assert result == {"prd": "new.md"}
+
+
+# ── _merge_metadata: recursive dict-merge (memory_hints shape) ────
+
+
+def test_merge_metadata_nested_dict_lists_union():
+    """(a) memory_hints dict shape: inner list values union additively."""
+    old_raw = '{"memory_hints":{"entities":["A"],"queries":["q1"]}}'
+    new_raw = '{"memory_hints":{"entities":["B"],"queries":["q2"]}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"memory_hints": {"entities": ["A", "B"], "queries": ["q1", "q2"]}}
+
+
+def test_merge_metadata_nested_dict_lists_dedup():
+    """(b) Overlap within inner lists is deduped in stable order."""
+    old_raw = '{"memory_hints":{"entities":["A","B"],"queries":[]}}'
+    new_raw = '{"memory_hints":{"entities":["B","C"],"queries":[]}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"memory_hints": {"entities": ["A", "B", "C"], "queries": []}}
+
+
+def test_merge_metadata_nested_scalar_collision_old_wins():
+    """(c) Nested scalar collision resolves OLD-wins."""
+    old_raw = '{"audit":{"created_by":"x"}}'
+    new_raw = '{"audit":{"created_by":"y","updated_by":"z"}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"audit": {"created_by": "x", "updated_by": "z"}}
+
+
+@pytest.mark.asyncio
+async def test_update_task_memory_hints_union(backend, project_root):
+    """(d) End-to-end through update_task: memory_hints union via append=True."""
+    await backend.add_task(
+        project_root=project_root,
+        title='hinted',
+        metadata=json.dumps({'memory_hints': {'entities': ['A'], 'queries': ['q1']}}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['B'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    hints = task['metadata']['memory_hints']
+    assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
+
+
+def test_merge_metadata_list_of_dicts_concatenates_without_dedup():
+    """Unhashable list items (dicts) fall back to plain concatenation — no dedup."""
+    old_raw = '{"x":[{"k":1}]}'
+    new_raw = '{"x":[{"k":1}]}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    # Both dicts present; unhashable items are NOT deduped (plain concat).
+    assert result == {"x": [{"k": 1}, {"k": 1}]}
+
+
+def test_merge_metadata_type_mismatch_old_wins():
+    """Type mismatch (old=list, new=dict) resolves to OLD wins under append=True."""
+    old_raw = '{"x":[1,2]}'
+    new_raw = '{"x":{"a":1}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result["x"] == [1, 2]
 
 
 # ── add_subtask / nested IDs ───────────────────────────────────────
