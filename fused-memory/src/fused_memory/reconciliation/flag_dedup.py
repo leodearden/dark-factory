@@ -140,6 +140,12 @@ async def filter_suppressed(
         )
         return flags
 
+    if len(results) >= 500:
+        logger.warning(
+            'filter_suppressed hit limit=500 for project %s; suppression set may be truncated',
+            project_id,
+        )
+
     suppressed_task_ids: set[str] = set()
     for r in results:
         meta = r.metadata or {}
