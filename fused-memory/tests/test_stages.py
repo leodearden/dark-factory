@@ -6755,10 +6755,10 @@ class TestPropagateEscalationQueueHelper:
 
         for stage in stages:
             assert stage._escalation_url == 'http://test.local:9999/mcp', (
-                f'Stage did not receive _escalation_url from harness'
+                'Stage did not receive _escalation_url from harness'
             )
             assert stage._escalation_queue is fake_queue, (
-                f'Stage did not receive _escalation_queue from harness'
+                'Stage did not receive _escalation_queue from harness'
             )
 
     def test_no_op_when_harness_has_no_url_or_queue(self, minimal_harness):
