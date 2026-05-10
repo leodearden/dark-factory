@@ -364,6 +364,10 @@ async def run_server():
     if _primary_root:
         _primary_root = str(Path(_primary_root).expanduser().resolve())
     _extra_roots = known_project_roots_from_env()
+    # Single source of truth for the project registry — derived once and used to
+    # build the path-scope guard (ProjectPrefixRegistry), then passed through to
+    # ReconciliationHarness and TicketJanitor so all three consumers share the
+    # same snapshot (task 1164).
     _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
@@ -542,6 +546,7 @@ async def run_server():
         reconciliation_harness = ReconciliationHarness(
             memory_service, taskmaster, recon_journal, event_buffer, config,
             backlog_policy=backlog_policy,
+            known_projects=_known_projects_map,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -626,6 +631,7 @@ async def run_server():
                 task_interceptor.is_worker_alive
                 if task_interceptor is not None else None
             ),
+            known_projects=_known_projects_map,
         )
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),

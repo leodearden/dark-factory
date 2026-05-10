@@ -37,9 +37,10 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from fused_memory.models.scope import build_known_projects_map
 
 if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
@@ -71,25 +72,6 @@ _UNPARSEABLE_PROJECT = '_unparseable_project_'
 # earn a separate per-project group rather than collapsing across reviews.
 _NO_ESCALATION = '_no_escalation_'
 
-
-def _project_root_from_id(project_id: str, primary_root: str = '') -> str | None:
-    """Reverse-lookup a project_root for a given project_id.
-
-    Uses :func:`build_known_projects_map` so the lookup matches exactly the
-    same id-derivation rule the rest of fused-memory uses (basename
-    lowercased + ``-``→``_``). The map is rebuilt every tick so a
-    DASHBOARD_KNOWN_PROJECT_ROOTS change picked up via SIGHUP becomes
-    visible to the janitor on the next sweep without a process restart.
-    Returns None when the project_id can't be resolved; the caller falls
-    back to logging-only.
-    """
-    from fused_memory.models.scope import build_known_projects_map
-
-    try:
-        mapping = build_known_projects_map(primary_root)
-    except Exception:
-        return None
-    return mapping.get(project_id)
 
 
 def _orchestrator_running(project_root: str) -> bool:
@@ -127,16 +109,34 @@ class TicketJanitor:
 
     Constructed once per fused-memory process and ticked on a fixed interval
     by the lifespan-managed task in :func:`server.main.run_server`.
+
+    The ``{project_id → project_root}`` registry is snapshotted at ``__init__``
+    time (either from the injected ``known_projects`` kwarg or via
+    :func:`~fused_memory.models.scope.build_known_projects_map`) — no per-tick
+    rebuild occurs.  This matches :class:`ReconciliationHarness` behaviour and
+    means a process restart is required to pick up
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` changes (task 1164).
+
+    .. note::
+
+        Prior to task 1164, ``DASHBOARD_KNOWN_PROJECT_ROOTS`` was re-read on
+        every ``tick()`` call, giving apparent SIGHUP-propagation behaviour.
+        That dynamic re-read was an inconsistency — :class:`ReconciliationHarness`
+        has always snapshotted at init — and was intentionally removed to
+        homogenise the two consumers.  Operators who previously relied on
+        SIGHUP-triggered project-map refresh must now restart the process instead.
+        See ``plans/deep-squishing-lagoon.md`` for the trade-off discussion.
     """
 
     def __init__(
         self,
-        store: 'TicketStore',
+        store: TicketStore,
         *,
         cooldown_secs: float = 3600.0,
         batch_limit: int = 100,
         primary_project_root: str = '',
         liveness_probe: Callable[[str], bool] | None = None,
+        known_projects: dict[str, str] | None = None,
     ) -> None:
         self._store = store
         self._cooldown_secs = cooldown_secs
@@ -147,13 +147,20 @@ class TicketJanitor:
         # for projects whose worker is dead are terminalised as
         # ``failed/worker_dead``. None disables the reaper (legacy behaviour).
         self._liveness_probe = liveness_probe
+        # Registry snapshotted at init — no per-tick rebuild (task 1164).
+        # When known_projects is injected (server startup), store a defensive
+        # copy so external mutation doesn't affect routing after init.
+        self._known_projects: dict[str, str] = (
+            dict(known_projects) if known_projects is not None
+            else build_known_projects_map(primary_project_root)
+        )
         # group_key → monotonic timestamps of recent escalations, used for
         # rolling-window cooldown. group_key is (project_id, task_id,
         # escalation_id). Reset on process restart by design.
         self._escalation_log: dict[tuple[str, str, str], list[float]] = defaultdict(list)
         self._queues: dict[str, EscalationQueue] = {}
 
-    def _queue_for(self, project_root: str) -> 'EscalationQueue':
+    def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
             q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
@@ -278,7 +285,7 @@ class TicketJanitor:
                 # the missing import is fixed) to retry.
                 continue
 
-            project_root = _project_root_from_id(project_id, self._primary_root)
+            project_root = self._known_projects.get(project_id)
             if project_root is None:
                 logger.warning(
                     'ticket_janitor: cannot resolve project_root for '

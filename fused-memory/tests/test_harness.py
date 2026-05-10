@@ -4888,3 +4888,80 @@ class TestProjectLoopNarrowsExceptionHandling:
             f'If 0 calls, the except ValueError is aborting instead of falling '
             f'through to except Exception (task 1143 step-22).'
         )
+
+
+class TestKnownProjectsInjection:
+    """Tests for the known_projects DI kwarg on ReconciliationHarness (task 1164)."""
+
+    @pytest.mark.asyncio
+    async def test_harness_accepts_known_projects_kwarg_and_uses_it(
+        self, journal, event_buffer, mock_memory_service, monkeypatch
+    ):
+        """Injected known_projects dict wins; build_known_projects_map is NOT called.
+
+        Patching build_known_projects_map to raise proves that the DI path skips
+        the env-var-consulting factory entirely — not just that the result differs.
+        """
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+
+        def _must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "build_known_projects_map must not be called when known_projects is injected"
+            )
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.harness.build_known_projects_map',
+            _must_not_be_called,
+        )
+
+        injected = {'pid_a': '/path/a', 'pid_b': '/path/b'}
+        config = FusedMemoryConfig(
+            reconciliation=ReconciliationConfig(
+                enabled=True,
+                explore_codebase_root='/tmp/test',
+                agent_llm_provider='anthropic',
+                agent_llm_model='claude-sonnet-4-20250514',
+            )
+        )
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=None,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+            known_projects=injected,
+        )
+        # The harness stores a defensive copy equal to the injected dict.
+        assert harness._known_projects == {'pid_a': '/path/a', 'pid_b': '/path/b'}
+
+    @pytest.mark.asyncio
+    async def test_harness_default_known_projects_kwarg_falls_back_to_build_known_projects_map(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """When known_projects kwarg is omitted, harness falls back to build_known_projects_map.
+
+        This verifies back-compat: all existing tests that construct ReconciliationHarness
+        without the kwarg continue to get the env-derived map.
+        """
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.models.scope import build_known_projects_map
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+
+        config = FusedMemoryConfig(
+            reconciliation=ReconciliationConfig(
+                enabled=True,
+                explore_codebase_root='/tmp/test',
+                agent_llm_provider='anthropic',
+                agent_llm_model='claude-sonnet-4-20250514',
+            )
+        )
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=None,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+        )
+        expected = build_known_projects_map(harness._project_root)
+        assert harness._known_projects == expected
