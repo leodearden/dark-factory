@@ -218,15 +218,12 @@ the flag as a normal finding and act on it.
 At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
 `entity_refresh_failed_uuids` list in its structured report. These are entities whose \
 `mcp__fused-memory__refresh_entity_summary` call raised in the prior Stage 1 run; they \
-are targeted retries, not heuristic re-scans.
+are targeted retries, not heuristic re-scans. The stats dict is the single authoritative \
+channel for these UUIDs — do not search for `source_description` markers or other \
+side channels, because Stage 1 does not write them and the fused-memory `search` API \
+does not match on episode `source_description` anyway.
 
-If no `entity_refresh_failed_uuids` list is present in the payload, also run \
-`mcp__fused-memory__search` for episodes whose `source_description` contains the marker \
-`REFRESH_FAILURE:` — Stage 1 writes these as a fallback when its stats dict is already \
-finalised and it cannot amend the structured report. Treat any matching episodes as an \
-additional source of UUIDs to retry.
-
-For each UUID collected from either source:
+For each UUID in `entity_refresh_failed_uuids`:
 1. Call `mcp__fused-memory__get_entity(entity_uuid=<uuid>)` to confirm the entity is \
    still reachable. If `get_entity` raises, add the UUID to \
    `entity_refresh_retried_failed` in your stats and include a note in your structured \

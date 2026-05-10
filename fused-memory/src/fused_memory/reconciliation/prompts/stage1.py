@@ -143,18 +143,21 @@ exception), you MUST preserve the attempted entity_uuid so the next remediation 
 target it precisely instead of recovering it heuristically.
 
 1. On any refresh_entity_summary exception, append the attempted entity_uuid to a list \
-   in your stats dict under the key `entity_refresh_failed_uuids`. Do this **before** \
-   finalising your structured-output report so the UUID is always in the primary stats \
-   channel. Initialise to a fresh list on the first failure; append (do not overwrite) on \
-   subsequent failures so multiple failures in one cycle are all recorded.
-2. If (in an exceptional edge case) your stats dict is already finalised, call \
-   `add_episode` with a `source_description` containing the marker string \
-   `REFRESH_FAILURE:<entity_uuid>:<exception_type>` so Stage 2 can locate it via an \
-   exact-string search on that marker rather than a semantic similarity match (UUIDs are \
-   opaque and do not embed meaningfully). Verify that the `add_episode` response contains \
-   a non-empty `episode_id` before continuing; if it is empty or absent, note the \
-   double-failure in your structured report.
-3. Continue with the remaining work — a single refresh failure does not abort the cycle.
+   in your stats dict under the key `entity_refresh_failed_uuids`. The stats dict is \
+   built up across the cycle and emitted in your structured-output report at the end, so \
+   you always have the opportunity to record the UUID there before finalising. Initialise \
+   to a fresh list on the first failure; append (do not overwrite) on subsequent failures \
+   so multiple failures in one cycle are all recorded.
+2. Continue with the remaining work — a single refresh failure does not abort the cycle.
+
+The stats dict is the single channel for these UUIDs. Do **not** invent side-channel \
+markers (e.g. `add_episode(source_description="REFRESH_FAILURE:...")`): episode \
+`source_description` is not surfaced by `search`/`get_episodes`, so any such marker is \
+unrecoverable and Stage 2 has no way to read it. If the stats dict were ever truly \
+unavailable, the correct fallback would be a Mem0 memory whose **content** includes the \
+UUID and whose **metadata** carries `{{kind: "refresh_failure", entity_uuid: <uuid>}}` so \
+Stage 2 can retrieve it by metadata key — but in practice the stats dict is always \
+available, so just record the UUID there.
 
 Skipping this recording forces Stage 2 to re-scan all entity summaries heuristically to \
 discover which one failed, costing a full reconciliation cycle instead of one targeted \
