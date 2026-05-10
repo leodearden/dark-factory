@@ -4298,7 +4298,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         resolved_by='auto-dismissed',
                     )
 
-        created_l0_id: str | None = None
         if self.escalation_queue and not skip_escalation:
             # Don't create a duplicate if level-1 already pending
             if not self.escalation_queue.has_open_l1(self.task_id):
@@ -4317,7 +4316,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     workflow_state=self.state.value,
                 )
                 self.escalation_queue.submit(esc)
-                created_l0_id = esc.id
 
                 if self.event_store:
                     self.event_store.emit(
@@ -4340,7 +4338,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # guard below.  Any L0 whose resolved_at falls inside this window
             # is attributable to the current steward invocation — including
             # follow-on L0s the steward chains and dismisses itself, not just
-            # ``created_l0_id`` (the original narrow Fix A guard).
+            # the L0 the workflow itself just submitted (the original narrow
+            # Fix A guard tracked only that one).
             steward_window_start = datetime.now(UTC).isoformat()
 
             # Give the steward a chance to resolve the escalation
@@ -4400,15 +4399,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # Fix A (broadened): detect dismiss-with-terminate for
                     # ANY L0 on this task whose resolved_at falls inside the
                     # current steward invocation window — not just the L0
-                    # the workflow itself submitted (``created_l0_id``).
+                    # the workflow itself just submitted (the original narrow
+                    # Fix A guard tracked only that one).
                     #
                     # The steward may chain a follow-on L0 (e.g. an
                     # ``infra_issue`` raised while resolving the original
                     # ``task_failure``) and dismiss-with-terminate THAT one.
                     # That is still "agent gives up", so halt and submit an
-                    # L1 instead of re-pending the task.  ``created_l0_id``
-                    # is now redundant for this guard but referenced
-                    # nowhere else; left for a follow-up cleanup.
+                    # L1 instead of re-pending the task.
                     dismissed_l0s = self.escalation_queue.get_by_task(
                         self.task_id, status='dismissed', level=0,
                     )
