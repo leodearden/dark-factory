@@ -138,11 +138,13 @@ count as successful edge updates. This prevents silent write failures from infla
 `edges_updated` stat and triggering false-positive judge passes.
 
 ## Refresh Entity Summary Failure Recording (Task 1157)
-When `mcp__fused-memory__refresh_entity_summary` raises (NodeNotFoundError or any other \
-exception), you MUST preserve the attempted entity_uuid so the next remediation cycle can \
-target it precisely instead of recovering it heuristically.
+When the response from `mcp__fused-memory__refresh_entity_summary` contains an `error` \
+field (commonly with `error_type` such as `NodeNotFoundError`), you MUST preserve the \
+attempted entity_uuid so the next remediation cycle can target it precisely instead of \
+recovering it heuristically. **A response is a successful refresh only when it does NOT \
+contain an `error` key.**
 
-1. On any refresh_entity_summary exception, append the attempted entity_uuid to a list \
+1. On any refresh_entity_summary error response, append the attempted entity_uuid to a list \
    in your stats dict under the key `entity_refresh_failed_uuids`. The stats dict is \
    built up across the cycle and emitted in your structured-output report at the end, so \
    you always have the opportunity to record the UUID there before finalising. Initialise \
