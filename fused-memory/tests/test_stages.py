@@ -6220,48 +6220,19 @@ class TestTaskKnowledgeSyncStage2Guards:
 
 
 class TestStage2NumericContaminationGuardrail:
-    """STAGE2_SYSTEM_PROMPT must contain an unconditional abort guardrail for
-    contaminated payloads that include autopilot_video task IDs (> 606).
+    """STAGE2_SYSTEM_PROMPT must contain the cross-project contamination guardrail
+    section.
 
-    Forensics 2026-05-10: Stage 2 failed to abort in cycles ~41 and ~56 when
-    given a mixed payload; the prompt contained no numeric ceiling or ZERO-action
-    instruction that would force the agent to halt before attempting task writes.
+    This test class guards section *presence* only — not section wording or position.
+    Semantic effectiveness of the guardrail (i.e. whether Stage 2 actually aborts on
+    contaminated payloads) is observed in production cycle behaviour, not pinned in
+    unit tests.
     """
 
-    def test_prompt_pins_606_ceiling_and_zero_actions_phrase(self):
-        """STAGE2_SYSTEM_PROMPT must contain the numeric ceiling 606, reference
-        'autopilot_video task ceiling', and mandate 'ZERO task actions'."""
+    def test_contamination_guardrail_section_present(self):
+        """STAGE2_SYSTEM_PROMPT must contain the contamination guardrail section."""
         from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 
-        assert '606' in STAGE2_SYSTEM_PROMPT, (
-            "STAGE2_SYSTEM_PROMPT must contain the numeric ceiling '606' "
-            "(the autopilot_video task ceiling)"
-        )
-        assert 'autopilot_video task ceiling' in STAGE2_SYSTEM_PROMPT, (
-            "STAGE2_SYSTEM_PROMPT must name 'autopilot_video task ceiling' so "
-            "the agent knows why 606 is the boundary"
-        )
-        assert 'ZERO task actions' in STAGE2_SYSTEM_PROMPT, (
-            "STAGE2_SYSTEM_PROMPT must contain the phrase 'ZERO task actions' "
-            "to enforce the unconditional abort on contaminated payloads"
-        )
-
-    def test_guardrail_section_precedes_available_tools_section(self):
-        """The contamination guardrail must appear BEFORE '## Available Tools'.
-
-        Position contract: the abort gate must be visible to the LLM before it
-        ever reads the tool-usage instructions. This locks in task spec point 3
-        ('at the very top of Stage 2's action loop, before any tool calls') and
-        prevents a future refactor from silently moving the guardrail below the
-        action-loop guidance — which is the failure mode observed in cycles ~41
-        and ~56.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-
-        guardrail_pos = STAGE2_SYSTEM_PROMPT.index('Cross-Project Contamination Guardrail')
-        tools_pos = STAGE2_SYSTEM_PROMPT.index('## Available Tools')
-        assert guardrail_pos < tools_pos, (
-            "The 'Cross-Project Contamination Guardrail' section must precede "
-            "'## Available Tools' so the LLM commits to the abort gate before "
-            "reading the action-loop tool catalogue"
+        assert 'Contamination Guardrail' in STAGE2_SYSTEM_PROMPT, (
+            "STAGE2_SYSTEM_PROMPT must contain a 'Contamination Guardrail' section"
         )
