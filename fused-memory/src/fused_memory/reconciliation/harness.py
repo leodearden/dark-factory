@@ -103,6 +103,7 @@ class ReconciliationHarness:
         event_buffer: EventBuffer,
         config: FusedMemoryConfig,
         backlog_policy: BacklogPolicy | None = None,
+        known_projects: dict[str, str] | None = None,
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
@@ -120,7 +121,13 @@ class ReconciliationHarness:
         # cross-project task filing.  Reuses the dashboard's existing env var
         # to avoid two sources of truth — see plans/deep-squishing-lagoon.md
         # for the trade-off (rename to a neutral name is a tracked followup).
-        self._known_projects: dict[str, str] = build_known_projects_map(self._project_root)
+        # When a known_projects kwarg is supplied (server startup), the harness
+        # uses that snapshot instead of building its own — single source of
+        # truth across harness, ticket janitor, and path-scope guard (task 1164).
+        self._known_projects: dict[str, str] = (
+            dict(known_projects) if known_projects is not None
+            else build_known_projects_map(self._project_root)
+        )
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
