@@ -229,7 +229,6 @@ async def test_metadata_persistence_failure_is_non_fatal():
     f.mark_blocked.assert_awaited_once()
 
 
-
 @pytest.mark.asyncio
 async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
     tmp_path: Path, monkeypatch,
@@ -275,7 +274,8 @@ async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
     f.mark_blocked.assert_awaited_once()
     _, kwargs = f.mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is True
-    # (c) thrash counter cannot be incremented: the drop-guard short-circuit at
-    # workflow.py:2911-2918 returns before the steward-path capture at line 2921
-    # that sets _last_merge_block_reason — the sentinel must be unchanged.
+    # (c) thrash counter cannot be incremented: the drop-guard short-circuit in
+    # _submit_to_merge_queue returns via _mark_blocked before reaching the
+    # steward-path capture that sets _last_merge_block_reason — the sentinel
+    # must be unchanged.
     assert wf._last_merge_block_reason == 'sentinel'
