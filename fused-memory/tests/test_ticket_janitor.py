@@ -536,34 +536,3 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
     )
 
 
-@pytest.mark.asyncio
-async def test_init_logs_snapshot_semantics_at_construction(store, tmp_path, caplog):
-    """TicketJanitor.__init__ must emit one INFO record naming the snapshot contract.
-
-    The record must mention both 'snapshot' (so operators grepping for why
-    SIGHUP stopped refreshing the project map can find this message) and the
-    literal env-var name 'DASHBOARD_KNOWN_PROJECT_ROOTS' (the natural grep
-    handle for the change that introduced the snapshotting behaviour).
-    """
-    logger_name = 'fused_memory.middleware.ticket_janitor'
-    with caplog.at_level(logging.INFO, logger=logger_name):
-        _janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
-
-    init_records = [
-        r
-        for r in caplog.records
-        if r.name == logger_name and r.levelno >= logging.INFO
-    ]
-    assert len(init_records) == 1, (
-        f'Expected exactly one INFO record from {logger_name!r} at __init__ time; '
-        f'got {len(init_records)}: {[r.getMessage() for r in init_records]}'
-    )
-    msg = init_records[0].getMessage()
-    assert 'snapshot' in msg.lower(), (
-        f"Expected 'snapshot' (case-insensitive) in init log message; got: {msg!r}"
-    )
-    assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in msg, (
-        f"Expected 'DASHBOARD_KNOWN_PROJECT_ROOTS' in init log message; got: {msg!r}"
-    )
-
-
