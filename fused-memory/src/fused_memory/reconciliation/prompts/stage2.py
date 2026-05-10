@@ -2,15 +2,21 @@
 
 from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
 
-STAGE2_SYSTEM_PROMPT = f"""\
-You are a Task-Knowledge Sync agent operating in sleep mode. Your role is to reconcile \
-task state against memory state, ensuring tasks and knowledge are mutually consistent.
+# Max task id observed in autopilot_video/.taskmaster/tasks/tasks.json at task-1192
+# commit time.  Step-8's regression test (TestAutopilotVideoTaskCeilingFreshness) fails
+# when autopilot_video grows past this value — bump the constant and re-evaluate the
+# contamination guardrail's premise before the next production cycle.
+_AUTOPILOT_VIDEO_TASK_CEILING: int = 606
 
+# Autopilot-video-specific contamination guardrail — injected by
+# build_stage2_system_prompt() only when project_id == 'autopilot_video'.
+# Using the named constant so there is a single source of truth for the ceiling value.
+_AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL: str = f"""\
 ## Cross-Project Contamination Guardrail (Pre-flight)
-When any task ID in the reconciliation payload exceeds 606 (the autopilot_video task \
-ceiling), Stage 2 must take ZERO task actions — including memory_hints updates, \
-set_task_status, add_subtask, or any other task write — for the remainder of that cycle. \
-This is not a matter of judgment; it is an unconditional gate.
+When any task ID in the reconciliation payload exceeds {_AUTOPILOT_VIDEO_TASK_CEILING} \
+(the autopilot_video task ceiling), Stage 2 must take ZERO task actions — including \
+memory_hints updates, set_task_status, add_subtask, or any other task write — for the \
+remainder of that cycle. This is not a matter of judgment; it is an unconditional gate.
 
 Required behaviour when the guardrail fires:
 - Take ZERO task actions (no set_task_status, no add_subtask, no update_task, \
@@ -22,6 +28,12 @@ and that Stage 2 halted without acting.
 `cross_project_findings` section rather than as live task writes.
 - Exit immediately after writing the summary memory; do not continue to the normal \
 reconciliation loop.
+
+"""
+
+STAGE2_SYSTEM_PROMPT = f"""\
+You are a Task-Knowledge Sync agent operating in sleep mode. Your role is to reconcile \
+task state against memory state, ensuring tasks and knowledge are mutually consistent.
 
 ## Available Tools
 You have full access to fused-memory MCP tools for both memory and task operations:
@@ -287,3 +299,26 @@ Stage 3 may contain fewer items than the LLM emitted — this is intentional, no
 error. The mechanism mirrors task 1146's Stage 1 atomic-replacement pattern, applying \
 the same defence-in-depth principle on the Stage 2 emission side.
 """
+
+
+def build_stage2_system_prompt(project_id: str) -> str:
+    """Return the Stage 2 system prompt, conditionally injecting the autopilot_video
+    contamination guardrail section.
+
+    For ``project_id == 'autopilot_video'`` the guardrail is inserted immediately after
+    the two-line role description and before ``## Available Tools`` so the LLM reads it
+    before any tool-use guidance.  For all other projects the static
+    ``STAGE2_SYSTEM_PROMPT`` is returned unmodified — the guardrail is
+    autopilot_video-specific and must not fire on dark_factory or any other project.
+
+    This mirrors Stage 1's payload-side ``str.format(project_id=…)`` pattern from
+    ``memory_consolidator.py`` as the in-repo precedent for project-id-aware prompt
+    assembly.
+    """
+    if project_id != 'autopilot_video':
+        return STAGE2_SYSTEM_PROMPT
+    return STAGE2_SYSTEM_PROMPT.replace(
+        '## Available Tools',
+        f'{_AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL}## Available Tools',
+        1,  # single replacement — idempotent if called twice
+    )

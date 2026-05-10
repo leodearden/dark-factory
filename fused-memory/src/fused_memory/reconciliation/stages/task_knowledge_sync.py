@@ -33,7 +33,10 @@ from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
 )
-from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import (
+    STAGE2_SYSTEM_PROMPT,
+    build_stage2_system_prompt,
+)
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
@@ -764,7 +767,7 @@ class TaskKnowledgeSync(BaseStage):
     _current_run_id: str | None = None
 
     def get_system_prompt(self) -> str:
-        return STAGE2_SYSTEM_PROMPT
+        return build_stage2_system_prompt(self.project_id)
 
     def get_disallowed_tools(self) -> list[str]:
         return STAGE2_DISALLOWED
