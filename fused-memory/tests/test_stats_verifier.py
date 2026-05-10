@@ -557,3 +557,64 @@ class TestUpdateEdgeVerifiedFilter:
         assert stats['edges_updated'] == 0, (
             "Truthy-but-not-True 'verified' (e.g. string 'true') must not count as verified"
         )
+
+
+@pytest.mark.asyncio
+async def test_alias_pass_reads_from_observed_for_order_independence(journal, monkeypatch):
+    """Alias pass reads from observed, not stats — structurally order-independent.
+
+    Scenario: A chained alias ``'foo' -> 'memories_written'`` is injected after
+    the existing ``'memories_written' -> 'memories_added'`` entry.  Under the
+    old implementation (``stats[alias_key] = stats[canonical_key]``), the result
+    for ``'foo'`` depends on dict-insertion order: since ``'memories_written'``
+    is iterated first, ``stats['memories_written']`` is already 1 when ``'foo'``
+    is processed, so ``stats['foo'] = 1``.  Under the fixed implementation
+    (``stats[alias_key] = observed.get(canonical_key, 0)``), the result is
+    always ``observed.get('memories_written', 0) = 0``, because
+    ``'memories_written'`` is an alias key, not a canonical key emitted by
+    ``_observed_counts``.
+
+    This test pins the structural property: ``stats['foo']`` must equal 0
+    regardless of iteration order, proving that the alias pass reads from the
+    immutable ``observed`` dict rather than the just-mutated ``stats`` dict.
+    """
+    import fused_memory.reconciliation.stats_verifier as sv  # noqa: PLC0415
+
+    # Inject a chained alias AFTER the existing 'memories_written' entry so
+    # the old code produces the wrong result via insertion-order luck
+    # (memories_written is processed first, setting stats['memories_written']=1,
+    # then foo reads that stale stats value and incorrectly becomes 1 too).
+    chained_aliases = {'memories_written': 'memories_added', 'foo': 'memories_written'}
+    monkeypatch.setattr(sv, '_STAT_ALIASES', chained_aliases)
+    monkeypatch.setattr(sv, '_TRACKED_STAT_KEYS',
+                        sv._TRACKED_STAT_KEYS | frozenset({'foo'}))
+
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    # One successful add_memory op → observed = {'memories_added': 1, ...}
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator, stage_start, stage_end,
+        ),
+    }
+
+    await verify_and_rewrite_stats(run_id, reports, journal)
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+
+    # Single-level alias: memories_written -> memories_added (canonical, in observed).
+    assert stats['memories_added'] == 1
+    assert stats['memories_written'] == 1
+
+    # Chained alias: foo -> memories_written (alias key, NOT in observed).
+    # Fixed behavior:  observed.get('memories_written', 0) = 0  (deterministic).
+    # Old behavior:    stats['memories_written'] = 1             (insertion-order accident).
+    assert stats['foo'] == 0
