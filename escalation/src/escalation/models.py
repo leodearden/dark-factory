@@ -14,7 +14,8 @@ class Escalation:
     agent_role: str
     severity: str  # "blocking" | "info"
     category: str  # scope_violation, design_concern, cleanup_needed,
-    # dependency_discovered, risk_identified, infra_issue
+    # dependency_discovered, risk_identified, infra_issue,
+    # reconciliation_stale_human_operator
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
