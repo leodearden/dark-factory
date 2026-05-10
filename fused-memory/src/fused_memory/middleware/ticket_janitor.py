@@ -116,6 +116,16 @@ class TicketJanitor:
     rebuild occurs.  This matches :class:`ReconciliationHarness` behaviour and
     means a process restart is required to pick up
     ``DASHBOARD_KNOWN_PROJECT_ROOTS`` changes (task 1164).
+
+    .. note::
+
+        Prior to task 1164, ``DASHBOARD_KNOWN_PROJECT_ROOTS`` was re-read on
+        every ``tick()`` call, giving apparent SIGHUP-propagation behaviour.
+        That dynamic re-read was an inconsistency — :class:`ReconciliationHarness`
+        has always snapshotted at init — and was intentionally removed to
+        homogenise the two consumers.  Operators who previously relied on
+        SIGHUP-triggered project-map refresh must now restart the process instead.
+        See ``plans/deep-squishing-lagoon.md`` for the trade-off discussion.
     """
 
     def __init__(

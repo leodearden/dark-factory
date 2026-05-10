@@ -4897,15 +4897,23 @@ class TestKnownProjectsInjection:
     async def test_harness_accepts_known_projects_kwarg_and_uses_it(
         self, journal, event_buffer, mock_memory_service, monkeypatch
     ):
-        """Injected known_projects dict wins; env var / build_known_projects_map is NOT consulted.
+        """Injected known_projects dict wins; build_known_projects_map is NOT called.
 
-        Passing a decoy value via DASHBOARD_KNOWN_PROJECT_ROOTS proves that the
-        harness ignores the env var when known_projects is supplied explicitly.
+        Patching build_known_projects_map to raise proves that the DI path skips
+        the env-var-consulting factory entirely — not just that the result differs.
         """
         from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
         from fused_memory.reconciliation.harness import ReconciliationHarness
 
-        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '/some/decoy/path')
+        def _must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "build_known_projects_map must not be called when known_projects is injected"
+            )
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.harness.build_known_projects_map',
+            _must_not_be_called,
+        )
 
         injected = {'pid_a': '/path/a', 'pid_b': '/path/b'}
         config = FusedMemoryConfig(
@@ -4926,8 +4934,6 @@ class TestKnownProjectsInjection:
         )
         # The harness stores a defensive copy equal to the injected dict.
         assert harness._known_projects == {'pid_a': '/path/a', 'pid_b': '/path/b'}
-        # Decoy path from env must NOT appear in the stored map.
-        assert '/some/decoy/path' not in harness._known_projects.values()
 
     @pytest.mark.asyncio
     async def test_harness_default_known_projects_kwarg_falls_back_to_build_known_projects_map(

@@ -364,9 +364,10 @@ async def run_server():
     if _primary_root:
         _primary_root = str(Path(_primary_root).expanduser().resolve())
     _extra_roots = known_project_roots_from_env()
-    # Single source of truth for the project registry — threaded into the path-scope
-    # guard, ReconciliationHarness, and TicketJanitor so all three consumers share
-    # exactly the same snapshot (task 1164).
+    # Single source of truth for the project registry — derived once and used to
+    # build the path-scope guard (ProjectPrefixRegistry), then passed through to
+    # ReconciliationHarness and TicketJanitor so all three consumers share the
+    # same snapshot (task 1164).
     _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
