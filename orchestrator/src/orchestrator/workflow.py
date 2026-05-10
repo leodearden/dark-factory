@@ -493,6 +493,11 @@ class TaskWorkflow:
         branch_name = self.task_id
         try:
             await self._setup_worktree_and_artifacts(branch_name)
+            # After setup, both attributes are guaranteed populated.
+            # The asserts narrow the types so the rest of run() can
+            # use self.worktree / self.artifacts without re-checking.
+            assert self.worktree is not None
+            assert self.artifacts is not None
 
             # ── Pre-PLAN ghost-loop recovery ──────────────────────────
             # If the worktree's branch is already merged to main AND there
