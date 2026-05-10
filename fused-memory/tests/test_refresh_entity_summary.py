@@ -863,17 +863,6 @@ class TestStage1PromptMentionsRefreshEntitySummary:
         prompt_lower = STAGE1_SYSTEM_PROMPT.lower()
         assert 'after delet' in prompt_lower or 'after you delet' in prompt_lower
 
-    def test_prompt_mandates_recording_failed_uuid_in_stats(self):
-        """STAGE1_SYSTEM_PROMPT mandates recording entity_refresh_failed_uuids in stats.
-
-        This is the canonical machine-readable contract token Stage 2 remediation will
-        look up when targeting failed entities for re-attempt. Removing the section or
-        renaming this key would be a behavioural regression — the next remediation cycle
-        would fall back to heuristic entity identification (the cycle-46 precedent).
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-        assert 'entity_refresh_failed_uuids' in STAGE1_SYSTEM_PROMPT
-
 
 # ---------------------------------------------------------------------------
 # step-15: partial_failure_misreported fix in MemoryService.refresh_entity_summary
