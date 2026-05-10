@@ -214,6 +214,34 @@ cycle, do NOT re-act — instead note in your summary that the flag was carried 
 run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
 the flag as a normal finding and act on it.
 
+## Consuming Stage 1 Refresh Failures (Task 1157)
+At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
+`entity_refresh_failed_uuids` list in its structured report. These are entities whose \
+prior `mcp__fused-memory__refresh_entity_summary` call returned an error response in \
+the Stage 1 run; they are targeted retries, not heuristic re-scans. The stats dict is \
+the single authoritative channel for these UUIDs — do not search for `source_description` \
+markers or other side channels, because Stage 1 does not write them and the fused-memory \
+`search` API does not match on episode `source_description` anyway.
+
+For each UUID in `entity_refresh_failed_uuids`:
+1. Call `mcp__fused-memory__refresh_entity_summary(entity_uuid=<uuid>, \
+   project_id=<current project_id>)` to attempt the deferred refresh.
+2. Inspect the response. **A response is a successful refresh only when it does NOT \
+   contain an `error` key.** On a successful refresh, add the UUID to \
+   `entity_refresh_retried_succeeded` in your stats.
+3. If the response contains an `error` field (commonly with `error_type` such as \
+   `NodeNotFoundError`), add the UUID to `entity_refresh_retried_failed` in your stats \
+   and include a note in your structured report so the operator can investigate the \
+   persistently unreachable entity.
+
+Process up to 20 UUIDs before beginning other reconciliation work. Record any remainder \
+(beyond the 20-UUID cap) in `entity_refresh_retried_deferred` in your stats so the \
+next cycle can pick them up. If you encounter 3 or more consecutive errors, stop \
+retrying and record the remaining UUIDs in `entity_refresh_retried_deferred` — \
+consecutive errors likely indicate a backend outage rather than individual entity \
+problems. Each retry costs one tool call; skipping them forces the next Stage 1 cycle \
+to re-discover the failed entity by scanning all entity summaries heuristically.
+
 ## Mem0 Active-Query Flag Deletion (FIX C)
 Some flagged items in the "Stage 1 Flagged Items" section originate from a Mem0 \
 active-query path (identified by a `_source: mem0_active_query` marker or a `flag_id` \
