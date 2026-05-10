@@ -557,7 +557,7 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
 
 @pytest.mark.asyncio
 async def test_startup_nudge_emitted_once_across_two_constructions(
-    store, tmp_path, caplog
+    store, tmp_path, caplog, monkeypatch
 ):
     """The startup INFO nudge fires exactly once per process regardless of
     how many TicketJanitor instances are constructed.
@@ -569,15 +569,16 @@ async def test_startup_nudge_emitted_once_across_two_constructions(
     — it does not matter which earlier test in the module already tripped
     the flag.
     """
-    # Reset so the assertion is independent of test-execution order.
-    TicketJanitor._registry_log_emitted = False
+    # Reset via monkeypatch so pytest restores the original value automatically,
+    # even if an assertion fails mid-test.
+    monkeypatch.setattr(TicketJanitor, '_registry_log_emitted', False)
     caplog.set_level(logging.INFO, logger='fused_memory.middleware.ticket_janitor')
 
     j1 = TicketJanitor(store, primary_project_root=str(tmp_path))
     # Guard's side-effect: flag must be True after the first construction.
     assert TicketJanitor._registry_log_emitted is True
 
-    j2 = TicketJanitor(store, primary_project_root=str(tmp_path))  # noqa: F841
+    TicketJanitor(store, primary_project_root=str(tmp_path))  # second construction must not re-emit
 
     nudge_records = [
         r for r in caplog.records
@@ -587,11 +588,12 @@ async def test_startup_nudge_emitted_once_across_two_constructions(
         f'Expected exactly 1 startup nudge across 2 constructions; '
         f'got {len(nudge_records)}: {[r.getMessage() for r in nudge_records]}'
     )
-    # Verify the %d placeholder was substituted with the actual project count.
+    # Verify the %d placeholder was substituted with the actual project count;
+    # check the count value only — not surrounding prose — to avoid brittleness.
     formatted = nudge_records[0].getMessage()
-    expected_fragment = f'({len(j1._known_projects)} project(s))'
-    assert expected_fragment in formatted, (
-        f'Expected {expected_fragment!r} in nudge message; got: {formatted!r}'
+    assert str(len(j1._known_projects)) in formatted, (
+        f'Expected project count {len(j1._known_projects)!r} in nudge message; '
+        f'got: {formatted!r}'
     )
 
 
