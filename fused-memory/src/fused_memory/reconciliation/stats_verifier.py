@@ -246,13 +246,10 @@ def _apply_observed(
             reported_snapshot[stat_key] = stats[stat_key]
         stats[stat_key] = observed.get(stat_key, 0)
 
-    # Write alias keys from observed (not from stats) so this pass is
-    # structurally order-independent and robust against future chained-alias
-    # misconfigurations.  Reading from the immutable observed dict means the
-    # result is always observed.get(canonical_key, 0) regardless of which
-    # alias keys have already been processed.  The data-layer guard
-    # test_stat_aliases_values_are_canonical_keys still enforces that
-    # canonical_key is a true canonical key (i.e. produced by _observed_counts).
+    # Read from observed (not stats) so the pass is order-independent: even if a
+    # future misconfiguration chains aliases, each alias resolves against the
+    # immutable observed counts. The canonical-keys guard test in tests/ enforces
+    # that canonical_key is a real canonical key.
     for alias_key, canonical_key in _STAT_ALIASES.items():
         if alias_key in stats:
             reported_snapshot[alias_key] = stats[alias_key]

@@ -561,23 +561,7 @@ class TestUpdateEdgeVerifiedFilter:
 
 @pytest.mark.asyncio
 async def test_alias_pass_reads_from_observed_for_order_independence(journal, monkeypatch):
-    """Alias pass reads from observed, not stats — structurally order-independent.
-
-    Scenario: A chained alias ``'foo' -> 'memories_written'`` is injected after
-    the existing ``'memories_written' -> 'memories_added'`` entry.  Under the
-    old implementation (``stats[alias_key] = stats[canonical_key]``), the result
-    for ``'foo'`` depends on dict-insertion order: since ``'memories_written'``
-    is iterated first, ``stats['memories_written']`` is already 1 when ``'foo'``
-    is processed, so ``stats['foo'] = 1``.  Under the fixed implementation
-    (``stats[alias_key] = observed.get(canonical_key, 0)``), the result is
-    always ``observed.get('memories_written', 0) = 0``, because
-    ``'memories_written'`` is an alias key, not a canonical key emitted by
-    ``_observed_counts``.
-
-    This test pins the structural property: ``stats['foo']`` must equal 0
-    regardless of iteration order, proving that the alias pass reads from the
-    immutable ``observed`` dict rather than the just-mutated ``stats`` dict.
-    """
+    """Alias pass reads from observed, not stats — verifies order-independence under a chained alias."""
     import fused_memory.reconciliation.stats_verifier as sv  # noqa: PLC0415
 
     # Inject a chained alias AFTER the existing 'memories_written' entry so
