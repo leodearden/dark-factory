@@ -4451,6 +4451,96 @@ async def test_remediation_pass_hard_binds_via_known_projects(
 
 
 @pytest.mark.asyncio
+async def test_remediation_uses_threaded_project_root_not_mutated_registry(
+    journal, event_buffer, mock_memory_service
+):
+    """Regression: remediation sees the project_root resolved at run_full_cycle entry,
+    not the registry value that may have changed after cycle entry.
+
+    Task 1163: _run_remediation_pass previously re-resolved project_root via
+    _known_project_root_for(project_id) at its own call site (line 1143).  This
+    meant a mid-cycle mutation of _known_projects could give remediation a different
+    root than the primary cycle used — a cross-contamination risk.
+
+    After the fix, project_root is resolved ONCE by run_full_cycle at line 868
+    (before any side-effects) and threaded through _maybe_remediate →
+    _run_remediation_pass as a required kwarg.
+
+    Setup:
+    - _known_projects = {'reify': '/path/A', 'dark_factory': ...}
+    - Stage 3's before_return mutates _known_projects['reify'] = '/path/B'
+      (simulates a mid-cycle registry update) AND returns one actionable finding
+      to trigger the remediation pass.
+    - Stages 0 and 1 capture stage.project_root when mutation_done is True
+      (i.e. during the remediation pass only).
+    - Stage 3 captures stage.project_root when mutation_done is already True
+      (i.e. the remediation-pass Stage 3 run).
+
+    Assertion: all three remediation-pass captures equal '/path/A'
+    (the pre-mutation resolution), NOT '/path/B' (the mutated registry value).
+
+    TODAY this test fails: _run_remediation_pass re-resolves after the mutation
+    and sets stage.project_root = '/path/B'.
+    AFTER the fix it passes: the threaded value '/path/A' wins.
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {
+            'reify': '/path/A',
+            'dark_factory': '/home/leo/src/dark-factory',
+        },
+    )
+
+    # Pin the same stage instances so before_return callbacks registered here
+    # remain effective during the remediation pass (same _make_stages shim used
+    # by ~10 other tests in this file).
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    # Push one event so run_full_cycle has something to drain for 'reify'.
+    await event_buffer.push(_make_event('reify'))
+
+    mutation_done: list[bool] = [False]
+    remediation_roots: list[str] = []
+
+    async def capture_if_post_mutation(stage):
+        """Stages 0 and 1: capture project_root only during the remediation pass."""
+        if mutation_done[0]:
+            remediation_roots.append(stage.project_root)
+
+    async def stage3_callback(stage):
+        """Stage 3: on the PRIMARY pass mutate the registry; on REMEDIATION pass capture."""
+        if not mutation_done[0]:
+            # Primary-cycle Stage 3: simulate mid-cycle registry mutation and flag it.
+            mutation_done[0] = True
+            harness._known_projects['reify'] = '/path/B'
+        else:
+            # Remediation-pass Stage 3: capture the project_root that was threaded in.
+            remediation_roots.append(stage.project_root)
+
+    _mock_stage_run(stages[0], before_return=capture_if_post_mutation)
+    _mock_stage_run(stages[1], before_return=capture_if_post_mutation)
+    # Stage 3 returns one actionable finding to trigger _maybe_remediate.
+    _mock_stage_run(stages[2], items_flagged=[_make_s3_findings()[0]], before_return=stage3_callback)
+
+    await harness.run_full_cycle('reify', 'buffer_size:1')
+
+    assert len(remediation_roots) == 3, (
+        f'Expected 3 project_root captures from the remediation pass '
+        f'(one per stage), got {len(remediation_roots)}: {remediation_roots!r}'
+    )
+    for root in remediation_roots:
+        assert root == '/path/A', (
+            f'Remediation stage saw project_root={root!r} but expected '
+            f"'/path/A' (run_full_cycle's pre-mutation resolution at line 868). "
+            f"Got '/path/B' means _run_remediation_pass re-resolved from the "
+            f'mutated registry (task 1163 regression).'
+        )
+
+
+@pytest.mark.asyncio
 async def test_dark_factory_full_cycle_no_regression(
     journal, event_buffer, mock_memory_service
 ):
