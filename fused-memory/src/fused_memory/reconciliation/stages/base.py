@@ -43,7 +43,7 @@ class BaseStage:
         self,
         stage_id: StageId,
         memory_service: MemoryService,
-        taskmaster: 'TaskBackendProtocol | None',
+        taskmaster: TaskBackendProtocol | None,
         journal: ReconciliationJournal,
         config: ReconciliationConfig,
         usage_gate=None,
@@ -63,7 +63,7 @@ class BaseStage:
         self.known_projects: dict[str, str] = {}
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
-        self._escalation_queue: 'EscalationQueue | None' = None
+        self._escalation_queue: EscalationQueue | None = None
 
     def get_disallowed_tools(self) -> list[str]:
         """Override in subclass — return MCP tool names this stage may NOT use."""
