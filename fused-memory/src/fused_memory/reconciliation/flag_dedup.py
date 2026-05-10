@@ -76,6 +76,14 @@ logger = logging.getLogger(__name__)
 
 
 class _SuppressionMetadata(TypedDict):
+    """Producer-side contract: ``task_id`` is pinned to ``int``.
+
+    Reader (``filter_suppressed``) tolerates and str-coerces both ``int``
+    and ``str`` task_ids for backward compat with legacy hand-authored
+    records — do NOT tighten the reader to int-only without a migration
+    of any pre-existing str-task_id records in Mem0.
+    """
+
     kind: Literal['stage1_flag_suppression']
     task_id: int
 
