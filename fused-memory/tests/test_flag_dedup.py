@@ -1857,6 +1857,23 @@ async def test_legacy_str_suppression_record_round_trips_through_consumer_search
     )
 
 
+@pytest.mark.asyncio
+async def test_write_suppression_record_propagates_invalid_task_id():
+    """Pins that ValueError from build_suppression_payload propagates out of the
+    public write_suppression_record entry point unchanged.
+
+    Regression pin: a future producer change that wraps build_suppression_payload
+    in a swallow-all try/except would silently break invalid-task_id detection.
+    The existing test_invalid_task_id_raises_descriptive_value_error covers
+    build_suppression_payload directly; this test closes the public-API gap.
+    """
+    from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+    fake = _FakeMemoryService()
+    with pytest.raises(ValueError):
+        await write_suppression_record(fake, project_id='p', task_id='abc')
+
+
 # ---------------------------------------------------------------------------
 # filter_suppressed end-to-end test (task-1185 step-6)
 #
