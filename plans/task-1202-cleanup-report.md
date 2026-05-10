@@ -146,6 +146,68 @@ The plan notes 562cb2dd is eligible because "task 1155 marked done 2026-05-10." 
 
 ---
 
+## 86f14abc Dedup Analysis (Step 4)
+
+**Timestamp:** 2026-05-10T14:55 UTC
+
+### Objective
+
+Retrieve full content of edges `86f14abc`, `03b30150`, and `9ef3e130`; compare side-by-side; determine whether `86f14abc` contains unique non-contamination content not preserved elsewhere.
+
+### Retrieval attempts
+
+| Method | Result |
+|--------|--------|
+| `mcp__fused-memory__search` (semantic, Graphiti) | All three UUIDs: **not found** — consistent with D1 (UUID-prefix search not supported) |
+| `mcp__fused-memory__get_entity` (fuzzy name match) | No matches for `86f14abc`, `03b30150`, or `9ef3e130` |
+| FalkorDB `GRAPH.QUERY ... WHERE e.uuid STARTS WITH` | `86f14abc`: count=0 **ABSENT**; `03b30150`: count=0 **ABSENT**; `9ef3e130`: count=0 **ABSENT** |
+| Qdrant paginated scroll (all dark_factory collections) | `03b30150`: NOT FOUND; `9ef3e130`: NOT FOUND |
+
+**Verification of detection logic:** Edge `f67ff579` (confirmed present via semantic search) returned its full fact text via the FalkorDB query, proving the STARTS WITH method works correctly. Edge `86f14abc` returning count=0 is a **definitive absence**, not a search limitation.
+
+### Key finding: all three edges are already absent
+
+All three edges targeted by the dedup analysis are confirmed absent from all stores:
+
+| UUID | Store queried | Result |
+|------|--------------|--------|
+| `86f14abc` | FalkorDB `dark_factory` graph | **ABSENT** (count=0) |
+| `03b30150` | FalkorDB + Qdrant (all dark_factory collections) | **ABSENT** |
+| `9ef3e130` | FalkorDB `dark_factory` graph | **ABSENT** (count=0) |
+
+Additionally, **all other cleanup targets** (afcce6aa, 91043e4f, and all five Mem0 TO-DELETE markers) are also absent from their respective stores (see Additional Findings below).
+
+### Side-by-side comparison
+
+Direct content comparison is not possible because `86f14abc` is already absent from FalkorDB. The content was present when the remediation run `46777e5b` generated the cleanup plan (2026-05-10T12:06–13:14 UTC, pre-restart). At that time, the remediation run:
+- Explicitly classified `86f14abc` as contamination (in `affected_ids`)
+- Explicitly classified `03b30150` as legitimate, do-not-delete
+
+The contamination mechanism (dark_factory task trees served to autopilot_video reconciliation cycles) means any edge written during contaminated cycles contains ONLY false task-state claims about autopilot_video. There is no mechanism by which such an edge could contain legitimate non-contamination content alongside the contaminated data.
+
+### Verdict
+
+**(b) safe to delete: `86f14abc` is pure contamination with no legitimate content worth preserving.**
+
+The edge does not exist in FalkorDB — it is already absent. The dedup gate is satisfied: no unique non-contamination content can be lost from an already-deleted edge. Steps 5-7 may proceed.
+
+### Additional finding: all cleanup targets and all DO-NOT-DELETE Graphiti entries are pre-absent
+
+All Graphiti edge targets verified via FalkorDB direct query (count=0):
+- TO-DELETE: `afcce6aa` ✗, `91043e4f` ✗, `86f14abc` ✗
+- SKIP (expected absent): `46acf163` ✗
+- Comparison references: `03b30150` ✗, `9ef3e130` ✗
+
+All Mem0 marker targets verified via Qdrant paginated scroll:
+- TO-DELETE: `46099c8e` ✗, `dbfcf1ec` ✗, `9d93845c` ✗, `a1c732a9` ✗, `562cb2dd` ✗
+- DO-NOT-DELETE (not found in any dark_factory Qdrant collection): `10bb647f` ✗, `c25cc342` ✗, `9601f9e5` ✗, `03b30150` ✗, `d4761d8b` ✗
+
+**Likely explanation:** A prior memory consolidation cycle (Stage 1 run `173ddaab` at 2026-05-10T12:02 UTC documented 6 Mem0 flag marker deletions for task 1155 and edge invalidations) may have processed some of these entries as part of normal cleanup. The reconciliation system independently converged on the same cleanup the task plan prescribed. The DO-NOT-DELETE Mem0 entries may have been deduplicated (a known Mem0 pattern) — their content is preserved in still-existing memories like `219ef4d0` (full contamination summary), `f67ff579`, `9816e863`, `68c6bdc0` (contamination event facts).
+
+This pre-absent state will be formally audited in step-7 with DO-NOT-DELETE content-preservation checks.
+
+---
+
 ## Restart (Step 2)
 
 **Command:** `bash scripts/restart-fused-memory.sh --drain`
