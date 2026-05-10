@@ -1899,7 +1899,7 @@ async def _queue_briefing_refresh_tasks(
                 metadata=task_metadata,
             )
             id_val = result.get('id') if isinstance(result, dict) else None
-            if isinstance(id_val, str) and id_val.strip():
+            if isinstance(id_val, str) and id_val and id_val.strip() == id_val:
                 created.append(id_val)
             else:
                 logger.warning(
