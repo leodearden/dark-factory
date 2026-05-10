@@ -150,7 +150,13 @@ async def filter_suppressed(
             continue
         suppressed_task_ids.add(str(task_id))
 
-    return [f for f in flags if str(f.get('task_id', '')) not in suppressed_task_ids]
+    def _keep(f: dict[str, Any]) -> bool:
+        flag_tid = f.get('task_id')
+        if flag_tid is None or flag_tid == '':
+            return True  # symmetric with producer guard at lines 149-150
+        return str(flag_tid) not in suppressed_task_ids
+
+    return [f for f in flags if _keep(f)]
 
 
 async def dedup_flags(
