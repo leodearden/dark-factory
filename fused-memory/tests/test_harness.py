@@ -1682,6 +1682,7 @@ async def test_remediation_propagates_tier_limits_to_consolidator(
         'parent-run-id',
         findings,
         tier,
+        project_root='/tmp/test-project',
     )
 
     assert captured.get('episode_limit') == 125, (
@@ -1729,6 +1730,7 @@ async def test_remediation_sets_project_id_and_root_on_all_stages(
         'parent-run-id',
         findings,
         tier,
+        project_root='/srv/my-project',
     )
 
     for name, attrs in stage_attrs.items():
@@ -1774,6 +1776,7 @@ async def test_remediation_sets_remediation_mode_on_task_knowledge_sync(
         'parent-run-id',
         findings,
         tier,
+        project_root='/tmp/test-project',
     )
 
     assert captured.get('remediation_mode') is True
@@ -1808,6 +1811,7 @@ async def test_remediation_forwards_tier_model_to_stage_run(
         'parent-run-id',
         findings,
         tier,
+        project_root='/tmp/test-project',
     )
 
     for name, call_args in models_seen.items():
@@ -2674,6 +2678,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
+            project_root='/tmp/test-project',
         )
 
         assert captured.get('filtered_task_tree') is expected_tree, (
@@ -2722,6 +2727,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
+            project_root='/tmp/test-project',
         )
 
         assert captured.get('filtered_task_tree') is expected_tree, (
@@ -2832,6 +2838,7 @@ class TestHarnessFilteredTaskTreeWiring:
                 'parent-run-id',
                 findings,
                 tier,
+                project_root='/tmp/test-project',
             )
         finally:
             ReconciliationHarness._configure_task_sync = staticmethod(real_helper)  # type: ignore[method-assign]
@@ -2885,6 +2892,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
+            project_root='/tmp/test-project',
             filtered_task_tree=prefetched_tree,
         )
 
@@ -2948,15 +2956,18 @@ class TestHarnessFilteredTaskTreeWiring:
 
         findings = [_make_s3_findings()[0]]
         tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
-        # No filtered_task_tree kwarg — method must fall back to _fetch_filtered_task_tree
+        # No filtered_task_tree kwarg — method must fall back to _fetch_filtered_task_tree.
+        # project_root='/my/project' is threaded explicitly (injected above as the registry value,
+        # but now passed directly as the threaded kwarg rather than re-resolved at call time).
         await harness._run_remediation_pass(
             'test-project',
             'parent-run-id',
             findings,
             tier,
+            project_root='/my/project',
         )
 
-        # project_root comes from _known_projects['test-project'] = '/my/project' (injected above)
+        # _fetch_filtered_task_tree must be called with the threaded project_root value.
         harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
 
 
@@ -4394,24 +4405,28 @@ async def test_run_full_cycle_hard_binds_project_root_via_known_projects(
 
 
 @pytest.mark.asyncio
-async def test_remediation_pass_hard_binds_via_known_projects(
+async def test_remediation_pass_uses_threaded_project_root_over_registry(
     journal, event_buffer, mock_memory_service
 ):
-    """_run_remediation_pass derives project_root from the registry, not from a caller argument.
+    """_run_remediation_pass uses the caller-threaded project_root, not the registry value.
 
-    Defense-in-depth guard (task 1143 step-9/amendment): the function computes project_root
-    via self._known_project_root_for(project_id) — it accepts no project_root argument at
-    the API level, making the registry the unambiguous source of truth.
+    Task 1163 reverses the task-1143 defense-in-depth contract: the caller now threads
+    project_root as a required kwarg.  This test verifies that the threaded value wins
+    even when _known_projects contains a DIFFERENT value for the same project_id.
 
-    The harness has _known_projects = {'reify': '/home/leo/src/reify', 'dark_factory': ...}.
-    All three stage.project_root captures must equal '/home/leo/src/reify'.
+    The harness has _known_projects = {'reify': '/path/B', 'dark_factory': ...} (wrong
+    registry value).  We call _run_remediation_pass with project_root='/path/A' (the
+    correct threaded value from run_full_cycle's pre-cycle resolution).
+
+    All three stage.project_root captures must equal '/path/A', proving the threaded
+    value wins and the registry is not consulted by _run_remediation_pass itself.
     """
     from fused_memory.reconciliation.harness import TierConfig
 
     harness = _make_harness_with_known_projects(
         journal, event_buffer, mock_memory_service,
         {
-            'reify': '/home/leo/src/reify',
+            'reify': '/path/B',  # WRONG value — must NOT be used by _run_remediation_pass
             'dark_factory': '/home/leo/src/dark-factory',
         },
     )
@@ -4436,17 +4451,18 @@ async def test_remediation_pass_hard_binds_via_known_projects(
         parent_run_id='test-parent-run',
         findings=findings,
         tier=tier,
+        project_root='/path/A',  # threaded caller value — must win over registry '/path/B'
     )
 
     assert len(captured_roots) == 3, (
         f"Expected 3 stage captures, got {len(captured_roots)}: {list(captured_roots)}"
     )
-    expected = '/home/leo/src/reify'
+    expected = '/path/A'
     for stage_name, root in captured_roots.items():
         assert root == expected, (
-            f"{stage_name}: expected registry-bound project_root={expected!r} "
-            f"but got {root!r} — _run_remediation_pass must use _known_project_root_for('reify') "
-            f"(task 1143 defense-in-depth)"
+            f"{stage_name}: expected threaded project_root={expected!r} "
+            f"but got {root!r} — _run_remediation_pass must use the caller-supplied "
+            f"project_root kwarg, not _known_project_root_for('reify') (task 1163)"
         )
 
 

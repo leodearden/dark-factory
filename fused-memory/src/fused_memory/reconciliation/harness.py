@@ -965,8 +965,10 @@ class ReconciliationHarness:
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
 
-            # Remediation pass: pass pre-fetched tree to avoid a redundant fetch (ref: task 478)
+            # Remediation pass: thread project_root resolved above (task 1163) and pass
+            # pre-fetched tree to avoid a redundant fetch (ref: task 478).
             await self._maybe_remediate(project_id, run_id, run, tier,
+                                        project_root=project_root,
                                         filtered_task_tree=filtered_task_tree)
 
             logger.info(
@@ -1074,6 +1076,7 @@ class ReconciliationHarness:
         parent_run: ReconciliationRun,
         tier: TierConfig,
         *,
+        project_root: str,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
@@ -1112,6 +1115,7 @@ class ReconciliationHarness:
             )
             await self._run_remediation_pass(
                 project_id, parent_run_id, actionable, tier,
+                project_root=project_root,
                 filtered_task_tree=filtered_task_tree,
             )
         except Exception as e:
@@ -1129,18 +1133,23 @@ class ReconciliationHarness:
         findings: list[dict],
         tier: TierConfig,
         *,
+        project_root: str,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
+
+        project_root is threaded from the parent caller (run_full_cycle resolves it
+        once at line 868 via _known_project_root_for before any side-effects; task 1163
+        threads it through _maybe_remediate so remediation always uses the pre-cycle
+        snapshot, immune to any mid-cycle registry mutations).
 
         If filtered_task_tree is provided it is used directly; otherwise a fresh
         tree is fetched via _fetch_filtered_task_tree.  Callers that already hold
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
-        # task 1143: hard-bind from registry — the canonical source of truth so no
-        # caller can introduce cross-contamination via a stale or wrong argument.
-        project_root = self._known_project_root_for(project_id)
+        # project_root is the value threaded from the parent caller — do NOT
+        # re-resolve here via _known_project_root_for (task 1163).
 
         run_id = str(uuid4())
         run = ReconciliationRun(
