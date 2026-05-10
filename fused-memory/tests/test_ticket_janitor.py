@@ -588,12 +588,13 @@ async def test_startup_nudge_emitted_once_across_two_constructions(
         f'Expected exactly 1 startup nudge across 2 constructions; '
         f'got {len(nudge_records)}: {[r.getMessage() for r in nudge_records]}'
     )
-    # Verify the %d placeholder was substituted with the actual project count;
-    # check the count value only — not surrounding prose — to avoid brittleness.
-    formatted = nudge_records[0].getMessage()
-    assert str(len(j1._known_projects)) in formatted, (
-        f'Expected project count {len(j1._known_projects)!r} in nudge message; '
-        f'got: {formatted!r}'
+    # Verify the %d argument was actually passed to the logger (not pre-formatted
+    # into the message string) and equals the project count.  LogRecord.args[0]
+    # gives the raw integer directly — no string parsing, no digit collisions
+    # with unrelated tokens in the log message (e.g. task references).
+    assert nudge_records[0].args[0] == len(j1._known_projects), (
+        f'Expected logger arg {len(j1._known_projects)} but got '
+        f'{nudge_records[0].args[0]!r}'
     )
 
 
