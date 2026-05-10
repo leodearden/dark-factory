@@ -888,12 +888,12 @@ class TestEntityRefreshFailedUuidsFlowsToStage2Payload:
         entity_refresh_failed_uuids must survive into the rendered string intact so
         Stage 2 can parse and retry it.
         """
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         from fused_memory.models.reconciliation import StageId, StageReport
         from fused_memory.reconciliation.stages.task_knowledge_sync import _format_report
 
-        now = datetime.now(tz=datetime.UTC)
+        now = datetime.now(tz=timezone.utc)
         report = StageReport(
             stage=StageId.memory_consolidator,
             started_at=now,
