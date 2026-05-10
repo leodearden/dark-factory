@@ -4930,8 +4930,7 @@ class TestKnownProjectsInjection:
         # The harness stores a defensive copy equal to the injected dict.
         assert harness._known_projects == {'pid_a': '/path/a', 'pid_b': '/path/b'}
 
-    @pytest.mark.asyncio
-    async def test_harness_default_known_projects_kwarg_falls_back_to_build_known_projects_map(
+    def test_harness_default_known_projects_kwarg_falls_back_to_build_known_projects_map(
         self, journal, event_buffer, mock_memory_service
     ):
         """When known_projects kwarg is omitted, harness falls back to build_known_projects_map.
