@@ -47,8 +47,8 @@ from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
-    _id_key,
     filter_task_tree,
+    id_key,
 )
 
 _MOCK_TYPES = (AsyncMock, MagicMock)
@@ -1151,11 +1151,11 @@ class TestProactiveSampling:
         )
 
     def test_select_proactive_sample_non_int_ids_sort_equivalent_to_id_key(self):
-        """_select_proactive_sample sorts non-parseable string ids identically to _id_key fallback=0.
+        """_select_proactive_sample sorts non-parseable string ids identically to id_key fallback=0.
 
-        Non-int ids map to 0 via _id_key, so they sort last (after all positive-int ids)
+        Non-int ids map to 0 via id_key, so they sort last (after all positive-int ids)
         within the same status bucket. This documents the expected behaviour and acts as
-        a regression guard before the inline sort_key is replaced with _id_key in step-4.
+        a regression guard before the inline sort_key is replaced with id_key in step-4.
         """
         tasks = [
             {'id': 'abc', 'title': 'Task abc', 'status': 'pending', 'dependencies': []},
@@ -1167,7 +1167,7 @@ class TestProactiveSampling:
         ids = [t['id'] for t in result]
 
         # int ids (5, 2) must precede non-parseable string ids ('abc', 'xyz')
-        # because _id_key('abc') == _id_key('xyz') == 0 < 2 < 5, sorted descending
+        # because id_key('abc') == id_key('xyz') == 0 < 2 < 5, sorted descending
         int_ids = [i for i in ids if isinstance(i, int)]
         str_ids = [i for i in ids if isinstance(i, str)]
         assert int_ids == [5, 2], f'Int ids should be [5, 2] descending. Got: {int_ids}'
@@ -1179,10 +1179,10 @@ class TestProactiveSampling:
             f'int_ids at positions {[ids.index(i) for i in int_ids]}, '
             f'str_ids at positions {[ids.index(s) for s in str_ids]}'
         )
-        # Verify _id_key agrees: all non-int ids yield 0
+        # Verify id_key agrees: all non-int ids yield 0
         for t in tasks:
             if isinstance(t['id'], str):
-                assert _id_key(t) == 0, f'_id_key should return 0 for non-int id {t["id"]!r}'
+                assert id_key(t) == 0, f'id_key should return 0 for non-int id {t["id"]!r}'
 
     # --- Step 13: empty task tree handled gracefully ---
 
@@ -1379,6 +1379,142 @@ class TestRunIdValidation(BaseStageValidationTest):
             )
         assert 'payload' in captured_kwargs
         assert f'run_id: {run_id_value}' in captured_kwargs['payload']
+
+
+class TestStage2GuardrailProjectIdGating:
+    """Tests that the contamination guardrail is injected only for the
+    autopilot_video project, not for other projects like dark_factory.
+
+    The load-bearing behavioural contract:
+    - build_stage2_system_prompt('autopilot_video') includes the guardrail section.
+    - build_stage2_system_prompt('dark_factory') does NOT include the guardrail section.
+
+    This prevents the dark_factory misfire: when any non-autopilot project runs Stage 2,
+    the shared prompt must not contain the autopilot-specific halt instruction.
+    """
+
+    def test_guardrail_renders_for_autopilot_video_project(self):
+        """build_stage2_system_prompt('autopilot_video') must include the
+        Contamination Guardrail section, ceiling value, before ## Available Tools,
+        and at least one representative forbidden tool name."""
+        from fused_memory.reconciliation.policies.autopilot_video import (
+            AUTOPILOT_VIDEO_TASK_CEILING,
+        )
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+        prompt = build_stage2_system_prompt(project_id='autopilot_video')
+        assert 'Contamination Guardrail' in prompt, (
+            "Expected 'Contamination Guardrail' in the autopilot_video prompt — "
+            "the guardrail must be injected when project_id == 'autopilot_video'."
+        )
+        assert str(AUTOPILOT_VIDEO_TASK_CEILING) in prompt, (
+            f"Expected the ceiling value {AUTOPILOT_VIDEO_TASK_CEILING!r} to appear "
+            "in the rendered autopilot_video prompt — a typo in the f-string would "
+            "silently omit it."
+        )
+        assert prompt.index('Contamination Guardrail') < prompt.index('## Available Tools'), (
+            "Contamination Guardrail section must appear BEFORE ## Available Tools "
+            "in the autopilot_video prompt so the LLM reads the gate before any "
+            "tool-use guidance."
+        )
+        assert 'set_task_status' in prompt, (
+            "Expected 'set_task_status' to appear in the guardrail block — "
+            "the list of forbidden actions must include at least this representative tool."
+        )
+
+    def test_guardrail_omitted_for_other_projects(self):
+        """build_stage2_system_prompt('dark_factory') must NOT include the
+        Contamination Guardrail section — the guardrail is autopilot_video-specific."""
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+        prompt = build_stage2_system_prompt(project_id='dark_factory')
+        assert 'Contamination Guardrail' not in prompt, (
+            "Expected 'Contamination Guardrail' to be absent from the dark_factory "
+            "prompt — the guardrail must NOT fire for non-autopilot projects."
+        )
+
+
+class TestAutopilotVideoTaskCeilingFreshness:
+    """Consistency check: AUTOPILOT_VIDEO_TASK_CEILING must match the committed fixture.
+
+    This is a *consistency* test, not a live drift detector — it verifies that the
+    constant in policies/autopilot_video.py and the committed fixture
+    tests/fixtures/autopilot_video_max_id.json agree with each other.  It does NOT
+    detect that autopilot_video has outgrown the ceiling in production; that requires
+    updating both values together when autopilot_video's task count grows.
+
+    A secondary test (test_ceiling_constant_not_below_live_max_id) skips on CI and
+    runs only on workstations that have the live autopilot_video repository — it is
+    the actual early-warning detector.
+
+    Workflow when autopilot_video grows past the ceiling:
+    1. Update AUTOPILOT_VIDEO_TASK_CEILING in policies/autopilot_video.py.
+    2. Update tests/fixtures/autopilot_video_max_id.json to {"max_id": <new max>}.
+    3. Re-evaluate whether 'task IDs > ceiling ⟹ cross-project contamination' still holds.
+    4. Run this test to confirm both changes are consistent.
+
+    Mirroring the TestTierConfig / TestProjectIdGuidelineConstants drift-detector pattern.
+    """
+
+    def test_ceiling_constant_consistent_with_fixture(self):
+        """AUTOPILOT_VIDEO_TASK_CEILING must be >= the max_id in the committed fixture.
+
+        This is a consistency check between the constant and the fixture — both must
+        be updated together when autopilot_video grows.  The fixture is the committed
+        contract; if this fails, see the class docstring update workflow.
+        """
+        import json
+        from pathlib import Path
+
+        from fused_memory.reconciliation.policies.autopilot_video import (
+            AUTOPILOT_VIDEO_TASK_CEILING,
+        )
+
+        fixture_path = Path(__file__).parent / 'fixtures' / 'autopilot_video_max_id.json'
+        fixture_data = json.loads(fixture_path.read_text())
+        fixture_max_id = int(fixture_data['max_id'])
+
+        assert fixture_max_id <= AUTOPILOT_VIDEO_TASK_CEILING, (
+            f'AUTOPILOT_VIDEO_TASK_CEILING={AUTOPILOT_VIDEO_TASK_CEILING} is below '
+            f'the committed fixture max_id={fixture_max_id}.  '
+            f'Bump AUTOPILOT_VIDEO_TASK_CEILING in '
+            f'fused_memory/reconciliation/policies/autopilot_video.py to {fixture_max_id} '
+            f'and re-evaluate the contamination guardrail premise before the next cycle.  '
+            f'Also update tests/fixtures/autopilot_video_max_id.json if the live task '
+            f'tree has grown further.'
+        )
+
+    def test_ceiling_constant_not_below_live_max_id(self):
+        """AUTOPILOT_VIDEO_TASK_CEILING must be >= the max id in the live tasks.json.
+
+        Secondary assertion (skips gracefully when autopilot_video is not on this
+        machine).  On Leo's workstation this is the actual early-warning detector:
+        it catches the case where autopilot_video has grown but neither the fixture
+        nor the constant has been updated yet.
+        """
+        import json
+
+        import pytest
+
+        from fused_memory.reconciliation.policies.autopilot_video import (
+            AUTOPILOT_VIDEO_TASK_CEILING,
+        )
+
+        tasks_path = '/home/leo/src/autopilot-video/.taskmaster/tasks/tasks.json'
+        try:
+            with open(tasks_path) as fh:
+                data = json.load(fh)
+            tasks = data['master']['tasks']
+            max_id = max(int(t['id']) for t in tasks)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
+            pytest.skip('autopilot_video tasks.json not available in this environment')
+
+        assert max_id <= AUTOPILOT_VIDEO_TASK_CEILING, (
+            f'AUTOPILOT_VIDEO_TASK_CEILING={AUTOPILOT_VIDEO_TASK_CEILING} is below '
+            f'the observed max task id {max_id} in autopilot_video tasks.json.  '
+            f'Bump AUTOPILOT_VIDEO_TASK_CEILING in '
+            f'fused_memory/reconciliation/policies/autopilot_video.py to {max_id}, update '
+            f'tests/fixtures/autopilot_video_max_id.json to {{"max_id": {max_id}}}, and '
+            f're-evaluate the contamination guardrail premise before the next cycle.'
+        )
 
 
 class TestTierConfig:

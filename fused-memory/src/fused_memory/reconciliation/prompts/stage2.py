@@ -1,5 +1,11 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
+from fused_memory.reconciliation.policies.autopilot_video import (
+    AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
+)
+from fused_memory.reconciliation.policies.autopilot_video import (
+    AUTOPILOT_VIDEO_PROJECT_ID as _AUTOPILOT_VIDEO_PROJECT_ID,
+)
 from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
 
 STAGE2_SYSTEM_PROMPT = f"""\
@@ -270,3 +276,43 @@ Stage 3 may contain fewer items than the LLM emitted — this is intentional, no
 error. The mechanism mirrors task 1146's Stage 1 atomic-replacement pattern, applying \
 the same defence-in-depth principle on the Stage 2 emission side.
 """
+
+
+def build_stage2_system_prompt(project_id: str) -> str:
+    """Return the Stage 2 system prompt, conditionally injecting the autopilot_video
+    contamination guardrail section.
+
+    For ``project_id == 'autopilot_video'`` the guardrail is inserted immediately after
+    the two-line role description and before ``## Available Tools`` so the LLM reads it
+    before any tool-use guidance.  For all other projects the static
+    ``STAGE2_SYSTEM_PROMPT`` is returned unmodified — the guardrail is
+    autopilot_video-specific and must not fire on dark_factory or any other project.
+
+    This mirrors Stage 1's payload-side ``str.format(project_id=…)`` pattern from
+    ``memory_consolidator.py`` as the in-repo precedent for project-id-aware prompt
+    assembly.
+    """
+    if project_id != _AUTOPILOT_VIDEO_PROJECT_ID:
+        return STAGE2_SYSTEM_PROMPT
+    sentinel = '## Available Tools'
+    if sentinel not in STAGE2_SYSTEM_PROMPT:
+        raise RuntimeError(
+            f"build_stage2_system_prompt: injection sentinel {sentinel!r} not found in "
+            "STAGE2_SYSTEM_PROMPT — the section header was likely renamed or removed. "
+            "Update the sentinel string in build_stage2_system_prompt() to match."
+        )
+    count = STAGE2_SYSTEM_PROMPT.count(sentinel)
+    if count != 1:
+        raise RuntimeError(
+            f"build_stage2_system_prompt: injection sentinel {sentinel!r} appears "
+            f"{count} times in STAGE2_SYSTEM_PROMPT — expected exactly 1.  "
+            "A duplicate heading would cause the guardrail to be injected at the "
+            "first occurrence only, silently misplacing it if the order changes. "
+            "Deduplicate the heading before adding the autopilot_video guardrail."
+        )
+    return STAGE2_SYSTEM_PROMPT.replace(
+        sentinel,
+        f'{_AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL}{sentinel}',
+        1,  # replace only the first occurrence — guards against accidental duplication
+            # if the sentinel ever appears more than once in the prompt
+    )

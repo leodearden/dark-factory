@@ -59,7 +59,7 @@ _STATUS_PRIORITY: dict[str, int] = {
 }
 
 
-def _id_key(t: dict) -> int:
+def id_key(t: dict) -> int:
     """Return task id as int for sorting, defaulting to 0 on error.
 
     For dotted subtask IDs like '450.2' or '450.2.1', returns the parent
@@ -209,33 +209,33 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')
         priority = _STATUS_PRIORITY.get(status, len(_STATUS_PRIORITY))
-        return (priority, -_id_key(t))
+        return (priority, -id_key(t))
 
     active.sort(key=sort_key)
 
     # Select top-MAX_DONE_TASKS_RETAINED done tasks by id descending (recency proxy).
     # heapq.nlargest is O(n + k log n) heap selection vs O(n log n) sort+slice —
     # effectively O(n) for constant k=MAX_DONE_TASKS_RETAINED=30.
-    # Composite key (_id_key, -original_index) adds the original list position as a
-    # tiebreaker, guaranteeing stable selection for equal _id_key values (mirrors
+    # Composite key (id_key, -original_index) adds the original list position as a
+    # tiebreaker, guaranteeing stable selection for equal id_key values (mirrors
     # Python's stable sort: earlier-appearing tasks win ties).
     done_retained = [
         t for _, t in heapq.nlargest(
             MAX_DONE_TASKS_RETAINED,
             enumerate(done),
-            key=lambda pair: (_id_key(pair[1]), -pair[0]),
+            key=lambda pair: (id_key(pair[1]), -pair[0]),
         )
     ]
 
     # Select top-MAX_CANCELLED_TASKS_RETAINED cancelled tasks by id descending.
     # Cap prevents the '### Recently Cancelled Tasks' section from growing unbounded
     # (that section is exempt from active-task truncation in format_filtered_task_tree).
-    # Composite key tiebreaker guarantees stable selection for equal _id_key values.
+    # Composite key tiebreaker guarantees stable selection for equal id_key values.
     cancelled_retained = [
         t for _, t in heapq.nlargest(
             MAX_CANCELLED_TASKS_RETAINED,
             enumerate(cancelled),
-            key=lambda pair: (_id_key(pair[1]), -pair[0]),
+            key=lambda pair: (id_key(pair[1]), -pair[0]),
         )
     ]
 
