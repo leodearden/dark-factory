@@ -97,3 +97,39 @@ def test_make_status_setting_steward_returns_class(tmp_path: pytest.TempPathFact
     assert inspect.isclass(steward_cls), '_make_status_setting_steward must return a class'
     assert inspect.iscoroutinefunction(steward_cls.start), 'start must be an async method'
     assert inspect.iscoroutinefunction(steward_cls.stop), 'stop must be an async method'
+
+
+# ---------------------------------------------------------------------------
+# Identity test — test_workflow_e2e must re-export from _workflow_helpers
+# ---------------------------------------------------------------------------
+
+
+def test_test_workflow_e2e_uses_canonical_helpers() -> None:
+    """Each helper on test_workflow_e2e is the same object as on _workflow_helpers.
+
+    Fails if test_workflow_e2e re-creates a local definition instead of importing
+    from _workflow_helpers — duplicate definitions diverge silently.
+    """
+    import _workflow_helpers  # noqa: PLC0415
+    import test_workflow_e2e  # noqa: PLC0415
+
+    assert test_workflow_e2e.FakeMcp is _workflow_helpers.FakeMcp, (
+        'test_workflow_e2e.FakeMcp must be re-exported from _workflow_helpers, '
+        'not redefined locally — duplicate definitions diverge silently'
+    )
+    assert test_workflow_e2e.FakeScheduler is _workflow_helpers.FakeScheduler, (
+        'test_workflow_e2e.FakeScheduler must be re-exported from _workflow_helpers, '
+        'not redefined locally — duplicate definitions diverge silently'
+    )
+    assert test_workflow_e2e.FakeBriefing is _workflow_helpers.FakeBriefing, (
+        'test_workflow_e2e.FakeBriefing must be re-exported from _workflow_helpers, '
+        'not redefined locally — duplicate definitions diverge silently'
+    )
+    assert test_workflow_e2e._make_resolving_steward is _workflow_helpers._make_resolving_steward, (
+        'test_workflow_e2e._make_resolving_steward must be re-exported from _workflow_helpers, '
+        'not redefined locally — duplicate definitions diverge silently'
+    )
+    assert test_workflow_e2e._make_status_setting_steward is _workflow_helpers._make_status_setting_steward, (
+        'test_workflow_e2e._make_status_setting_steward must be re-exported from _workflow_helpers, '
+        'not redefined locally — duplicate definitions diverge silently'
+    )
