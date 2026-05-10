@@ -6991,3 +6991,20 @@ class TestPropagateEscalationQueueHelper:
                 'Helper must not overwrite _escalation_queue when harness queue is None'
             )
 
+    def test_propagates_to_single_pass_iterable(self, minimal_harness):
+        """Helper must propagate URL and queue even when stages is a single-pass iterable (e.g., generator/iter())."""
+        fake_queue = MagicMock()
+        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
+        minimal_harness._escalation_queue = fake_queue
+
+        stages = [MagicMock(_escalation_url=None, _escalation_queue=None) for _ in range(3)]
+        minimal_harness._propagate_escalation_queue(iter(stages))
+
+        for stage in stages:
+            assert stage._escalation_url == 'http://test.local:9999/mcp', (
+                'Stage did not receive _escalation_url — single-pass iterator was exhausted by URL pass'
+            )
+            assert stage._escalation_queue is fake_queue, (
+                'Stage did not receive _escalation_queue — single-pass iterator was exhausted by URL pass'
+            )
+
