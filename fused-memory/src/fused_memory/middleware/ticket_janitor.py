@@ -159,6 +159,11 @@ class TicketJanitor:
         # escalation_id). Reset on process restart by design.
         self._escalation_log: dict[tuple[str, str, str], list[float]] = defaultdict(list)
         self._queues: dict[str, EscalationQueue] = {}
+        logger.info(
+            'ticket_janitor: project registry snapshotted at init (%d project(s)); '
+            'restart to pick up DASHBOARD_KNOWN_PROJECT_ROOTS changes (task 1164)',
+            len(self._known_projects),
+        )
 
     def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
