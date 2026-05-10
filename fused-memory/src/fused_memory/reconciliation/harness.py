@@ -327,7 +327,7 @@ class ReconciliationHarness:
         Defensive: only assigns when the harness has a value, so cold-path
         callers before escalation startup leave stages untouched.
 
-        Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``
+        Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``)
         work correctly — the prior two-pass form would silently skip the queue
         assignment once the URL pass exhausted the iterator.
         """
