@@ -21,7 +21,7 @@ from orchestrator.agents.invoke import invoke_agent
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
+from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import Scheduler, files_to_modules
@@ -1807,11 +1807,12 @@ Output JSON matching the schema. Every task must appear in the output.
         if not HAS_ESCALATION:
             logger.info('Escalation package not installed — skipping escalation server')
             return
+        assert HAS_ESCALATION  # narrows type: EscalationQueue and create_server are defined
 
         queue_dir = Path(self.config.escalation.queue_dir)
         if not queue_dir.is_absolute():
             queue_dir = self.config.project_root / queue_dir
-        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
+        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-unbound]
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
@@ -1821,8 +1822,8 @@ Output JSON matching the schema. Every task must appear in the output.
         if self.review_checkpoint is not None:
             self.review_checkpoint.escalation_queue = self._escalation_queue
 
-        mcp_server = create_server(
-            self._escalation_queue,  # type: ignore[possibly-undefined]
+        mcp_server = create_server(  # type: ignore[possibly-unbound]
+            self._escalation_queue,
             merge_queue=self._merge_queue,
             orch_config=self.config,
             event_store=self.event_store,

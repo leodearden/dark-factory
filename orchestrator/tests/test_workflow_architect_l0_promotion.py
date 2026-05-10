@@ -17,11 +17,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from escalation.models import Escalation
+from shared.cli_invoke import AgentResult
+
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from shared.cli_invoke import AgentResult
 
 
 @dataclass

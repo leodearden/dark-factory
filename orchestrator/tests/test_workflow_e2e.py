@@ -2805,6 +2805,7 @@ class TestMarkBlockedFalseDoneGuard:
             f'Expected BLOCKED, got {outcome!r}'
         )
         spy_mark_blocked.assert_awaited_once()
+        assert spy_mark_blocked.await_args is not None
         _args, kwargs = spy_mark_blocked.await_args
         assert kwargs.get('escalate_to_human') is True, (
             'dropped_plan_targets must call _mark_blocked(escalate_to_human=True); '
@@ -4613,6 +4614,7 @@ class TestStaleL1DoesNotSinkRun:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
     ):
         from escalation.models import Escalation
+
         from orchestrator.artifacts import TaskArtifacts
 
         stub = AgentStub()
@@ -5121,6 +5123,9 @@ class TestMarkBlockedBypassDetection:
         scheduler.set_task_status = raising_set  # type: ignore[method-assign]
 
         outcome = await workflow._mark_blocked('synthetic reason')
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED on legitimate-done path (no steward), got {outcome!r}'
+        )
 
         # Legitimate done — no bypass_done L1 and no reopen.
         bypass_l1 = [

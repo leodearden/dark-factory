@@ -26,7 +26,6 @@ from pathlib import Path
 
 import pytest
 
-
 SIGHUP_SCRIPT = textwrap.dedent('''
     """Minimal shape: build UsageGate outside loop, register inside loop."""
     import asyncio

@@ -10,7 +10,6 @@ Verifies the registry-and-set behaviour without spinning up a real workflow:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 

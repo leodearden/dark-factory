@@ -70,10 +70,7 @@ def classify_simple_task(task: dict) -> bool:
         return False
 
     priority = str(task.get('priority') or '').lower()
-    if priority == 'high':
-        return False
-
-    return True
+    return priority != 'high'
 
 
 def sha256_16(data: str) -> str:
