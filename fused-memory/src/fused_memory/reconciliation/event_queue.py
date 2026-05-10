@@ -559,3 +559,75 @@ class EventQueue:
             return []
 
         return results
+
+    def count_dead_letters(self, *, project_id: str | None = None) -> int:
+        """Return the number of dead-letter records across JSONL file(s).
+
+        A faster equivalent of ``len(self.read_dead_letters(project_id=...))``:
+        streams the JSONL files without materialising records into memory.
+        Intended for hot-path callers such as :func:`get_status` that only
+        need the count, not the record contents.
+
+        When *project_id* is ``None`` (the common/hot path), each file is
+        walked line-by-line and non-empty lines are counted directly — no
+        ``json.loads`` calls, no dict allocations.  When *project_id* is
+        provided, ``json.loads`` is called on each line to extract
+        ``event['project_id']`` for filtering; malformed lines are skipped
+        with a logged warning (same behaviour as :meth:`read_dead_letters`).
+
+        Robustness contract mirrors :meth:`read_dead_letters`:
+
+        - Per-file ``OSError`` is caught, logged, and the file is skipped.
+        - An outer ``except Exception`` catches anything unexpected and
+          returns ``0`` rather than propagating.
+
+        Args:
+            project_id: When given, only records whose
+                ``event['project_id']`` matches are counted.
+
+        Returns:
+            The integer count.  Never raises.
+        """
+        # Build the ordered list of paths: current first, then .1, .2, …
+        paths: list[Path] = [self._dead_letter_path]
+        for i in range(1, self._keep_rotations + 1):
+            paths.append(Path(f'{self._dead_letter_path}.{i}'))
+
+        count = 0
+        try:
+            for path in paths:
+                if not path.exists():
+                    continue
+                try:
+                    for line in _iter_lines_reversed(path):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if project_id is None:
+                            # Hot path: no json.loads needed — count non-empty lines.
+                            count += 1
+                        else:
+                            try:
+                                rec = json.loads(line)
+                            except json.JSONDecodeError as exc:
+                                logger.warning(
+                                    'EventQueue.count_dead_letters: malformed line in %s: %s',
+                                    path, exc,
+                                )
+                                continue
+                            event = rec.get('event') or {}
+                            if event.get('project_id') == project_id:
+                                count += 1
+                except OSError as exc:
+                    logger.warning(
+                        'EventQueue.count_dead_letters: cannot read %s: %s', path, exc,
+                    )
+                    continue
+
+        except Exception as exc:
+            logger.warning(
+                'EventQueue.count_dead_letters: unexpected error: %s', exc,
+            )
+            return 0
+
+        return count
