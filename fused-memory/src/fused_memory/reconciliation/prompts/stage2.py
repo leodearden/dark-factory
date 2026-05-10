@@ -167,19 +167,21 @@ top-level payload. When the wrapper has `success: false`, still process each \
 others carry errors. Per-id `result.error` (e.g. terminal-exit gate, \
 bulk-reset-guard rejection) means skip the counter and flag that entry.
 
-After each `mcp__fused-memory__update_task` call that includes a `memory_hints=[...]` \
-parameter, you MUST call `mcp__fused-memory__get_task(id=<task_id>, \
+After each `mcp__fused-memory__update_task` call whose `metadata` payload sets \
+`memory_hints` (typically `metadata={{"memory_hints": [...]}}` with `append=True`), \
+you MUST call `mcp__fused-memory__get_task(id=<task_id>, \
 project_root=<project_root>)` as the canonical confirmation step — unlike \
 `set_task_status`, which returns per-task \
 `{{"taskId": ..., "oldStatus": ..., "newStatus": ...}}` records inline, `update_task` \
 does not reliably echo back the post-write `memory_hints` field (the Taskmaster \
-backend may filter, normalise, or coalesce hint entries). Only increment \
-`tasks_hints_updated` if the returned task's `memory_hints` field contains the \
-expected hint entries. If the returned hints are missing, partial, or otherwise \
-diverge from what was attempted, skip the `tasks_hints_updated` increment and flag \
-the discrepancy in your structured report. This mandatory round-trip parallels the \
-`task_id` confirmation required for `tasks_created` (after `resolve_ticket`) and the \
-`newStatus` confirmation required for `tasks_reopened` (after `set_task_status`).
+backend may filter, normalise, or coalesce hint entries). Always pass `append=True` \
+when attaching `memory_hints` — omitting it replaces the entire metadata blob and \
+silently drops sibling keys (`files`, `spawned_from`, audit fields); the post-write \
+`get_task` should also confirm those sibling keys still match what was on the row \
+before the write. Only increment `tasks_hints_updated` if the returned task's \
+`memory_hints` field contains the expected hint entries. If the returned hints are \
+missing, partial, or otherwise diverge from what was attempted, skip the \
+`tasks_hints_updated` increment and flag the discrepancy in your structured report.
 
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
