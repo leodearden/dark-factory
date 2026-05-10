@@ -240,6 +240,51 @@ def test_merge_metadata_append_false_replaces_verbatim():
     assert result == {"prd": "new.md"}
 
 
+# ── _merge_metadata: recursive dict-merge (memory_hints shape) ────
+
+
+def test_merge_metadata_nested_dict_lists_union():
+    """(a) memory_hints dict shape: inner list values union additively."""
+    old_raw = '{"memory_hints":{"entities":["A"],"queries":["q1"]}}'
+    new_raw = '{"memory_hints":{"entities":["B"],"queries":["q2"]}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"memory_hints": {"entities": ["A", "B"], "queries": ["q1", "q2"]}}
+
+
+def test_merge_metadata_nested_dict_lists_dedup():
+    """(b) Overlap within inner lists is deduped in stable order."""
+    old_raw = '{"memory_hints":{"entities":["A","B"],"queries":[]}}'
+    new_raw = '{"memory_hints":{"entities":["B","C"],"queries":[]}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"memory_hints": {"entities": ["A", "B", "C"], "queries": []}}
+
+
+def test_merge_metadata_nested_scalar_collision_old_wins():
+    """(c) Nested scalar collision resolves OLD-wins."""
+    old_raw = '{"audit":{"created_by":"x"}}'
+    new_raw = '{"audit":{"created_by":"y","updated_by":"z"}}'
+    result = json.loads(_merge_metadata(old_raw, new_raw, append=True))
+    assert result == {"audit": {"created_by": "x", "updated_by": "z"}}
+
+
+@pytest.mark.asyncio
+async def test_update_task_memory_hints_union(backend, project_root):
+    """(d) End-to-end through update_task: memory_hints union via append=True."""
+    await backend.add_task(
+        project_root=project_root,
+        title='hinted',
+        metadata=json.dumps({'memory_hints': {'entities': ['A'], 'queries': ['q1']}}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['B'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    hints = task['metadata']['memory_hints']
+    assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
+
+
 # ── add_subtask / nested IDs ───────────────────────────────────────
 
 
