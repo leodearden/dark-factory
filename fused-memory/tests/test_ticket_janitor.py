@@ -503,3 +503,50 @@ async def test_janitor_default_known_projects_kwarg_falls_back_to_build_known_pr
     assert janitor._known_projects == expected
 
 
+@pytest.mark.asyncio
+async def test_init_snapshots_known_projects_against_post_init_env_mutation(
+    store, tmp_path, monkeypatch
+):
+    """_known_projects is frozen at __init__ time; post-init env mutations have no effect.
+
+    Guards the snapshot contract from task 1164: the registry is built once at
+    construction and never rebuilt on tick(), so DASHBOARD_KNOWN_PROJECT_ROOTS
+    changes require a restart to take effect.
+    """
+    proj_a = tmp_path / 'proj_a'
+    proj_b = tmp_path / 'proj_b'
+    proj_a.mkdir()
+    proj_b.mkdir()
+
+    monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(proj_a))
+    janitor = TicketJanitor(store, primary_project_root='')
+
+    pre_mutation = dict(janitor._known_projects)
+    proj_a_id = _project_id_for(proj_a)
+    assert pre_mutation, 'registry must be non-empty after init with env var set'
+    assert proj_a_id in pre_mutation, (
+        f'proj_a project_id {proj_a_id!r} must appear in registry; got {pre_mutation}'
+    )
+
+    # Submit a failed ticket so tick() has a row to process, forcing it through
+    # the _known_projects.get() code path.  Without rows tick() returns early
+    # and never touches the registry — the snapshot contract would be untested.
+    ticket_id = await store.submit(
+        project_id=proj_a_id,
+        candidate_json=_candidate_blob(task_id='t1', escalation_id='esc-1'),
+    )
+    await _force_failed(store, ticket_id, reason='curator_rejected')
+
+    monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(proj_b))
+
+    # tick() must route the failed ticket using the snapshotted registry, not
+    # the current env.  The proj_a orchestrator lock doesn't exist so the
+    # escalation is skipped, but the _known_projects lookup itself is exercised.
+    await janitor.tick()
+
+    assert janitor._known_projects == pre_mutation, (
+        'post-init env mutation must not change the janitor registry; '
+        f'registry changed from {pre_mutation} to {janitor._known_projects}'
+    )
+
+
