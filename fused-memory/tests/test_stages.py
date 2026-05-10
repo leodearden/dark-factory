@@ -3890,6 +3890,14 @@ class TestBriefingKnownGapsRefresh:
         assert result['skipped'] == []
         # All three mismatches must be attempted; a failure must not break the loop.
         assert taskmaster.add_task.call_count == 3
+        # Exactly one warning must be emitted for the failed creation, pinning observability.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'briefing_refresh_add_task_unexpected_shape' in r.getMessage()
+        ]
+        assert len(warning_records) == 1
+        assert getattr(warning_records[0], 'task_id', None) == '1820'
 
 
 # ---------------------------------------------------------------------------

@@ -1820,9 +1820,9 @@ async def _queue_briefing_refresh_tasks(
                 description=description,
                 metadata=task_metadata,
             )
-            _id_val = result.get('id') if isinstance(result, dict) else None
-            if isinstance(_id_val, str) and _id_val.strip():
-                created.append(_id_val)
+            id_val = result.get('id') if isinstance(result, dict) else None
+            if isinstance(id_val, str) and id_val.strip():
+                created.append(id_val)
             else:
                 logger.warning(
                     'briefing_refresh_add_task_unexpected_shape',
