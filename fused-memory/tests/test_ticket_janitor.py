@@ -505,6 +505,38 @@ async def test_janitor_default_known_projects_kwarg_falls_back_to_build_known_pr
 
 
 @pytest.mark.asyncio
+async def test_init_snapshots_known_projects_against_post_init_env_mutation(
+    store, tmp_path, monkeypatch
+):
+    """_known_projects is frozen at __init__ time; post-init env mutations have no effect.
+
+    Guards the snapshot contract from task 1164: the registry is built once at
+    construction and never rebuilt on tick(), so DASHBOARD_KNOWN_PROJECT_ROOTS
+    changes require a restart to take effect.
+    """
+    proj_a = tmp_path / 'proj_a'
+    proj_b = tmp_path / 'proj_b'
+    proj_a.mkdir()
+    proj_b.mkdir()
+
+    monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(proj_a))
+    janitor = TicketJanitor(store, primary_project_root='')
+
+    pre_mutation = dict(janitor._known_projects)
+    proj_a_id = _project_id_for(proj_a)
+    assert pre_mutation, 'registry must be non-empty after init with env var set'
+    assert proj_a_id in pre_mutation, (
+        f'proj_a project_id {proj_a_id!r} must appear in registry; got {pre_mutation}'
+    )
+
+    monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(proj_b))
+    assert janitor._known_projects == pre_mutation, (
+        'post-init env mutation must not change the janitor registry; '
+        f'registry changed from {pre_mutation} to {janitor._known_projects}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_init_logs_snapshot_semantics_at_construction(store, tmp_path, caplog):
     """TicketJanitor.__init__ must emit one INFO record naming the snapshot contract.
 
