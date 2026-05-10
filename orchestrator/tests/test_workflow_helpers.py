@@ -12,7 +12,6 @@ import inspect
 import pytest
 from escalation.queue import EscalationQueue
 
-
 # ---------------------------------------------------------------------------
 # Import-contract test
 # ---------------------------------------------------------------------------
