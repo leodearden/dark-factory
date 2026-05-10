@@ -37,7 +37,14 @@ def test_fake_mcp_smoke() -> None:
 
 @pytest.mark.asyncio
 async def test_fake_briefing_smoke() -> None:
-    """FakeBriefing returns non-empty strings for all 7 prompt-builder methods."""
+    """FakeBriefing returns a non-empty string for each of the 7 prompt-builder methods.
+
+    Asserts shape only (non-empty str).  Substring/interpolation checks are
+    omitted deliberately — they pin internal f-string wording that no caller
+    observes and break on harmless refactors.  The real workflow tests in
+    test_workflow_e2e.py and test_workflow_status_on_resume.py exercise
+    FakeBriefing in its actual call path and form the true contract.
+    """
     from _workflow_helpers import FakeBriefing  # noqa: PLC0415
 
     briefing = FakeBriefing()
@@ -47,26 +54,20 @@ async def test_fake_briefing_smoke() -> None:
 
     arch_prompt = await briefing.build_architect_prompt({'title': 'my task'})
     assert isinstance(arch_prompt, str) and arch_prompt, 'architect prompt must be non-empty'
-    assert 'my task' in arch_prompt, 'architect prompt must interpolate title'
 
     debug_prompt = await briefing.build_debugger_prompt('test failure msg', {})
     assert isinstance(debug_prompt, str) and debug_prompt, 'debugger prompt must be non-empty'
-    assert 'test failure msg' in debug_prompt, 'debugger prompt must interpolate failures'
 
     review_prompt = await briefing.build_reviewer_prompt('comprehensive', 'some diff')
     assert isinstance(review_prompt, str) and review_prompt, 'reviewer prompt must be non-empty'
-    assert 'comprehensive' in review_prompt, 'reviewer prompt must interpolate reviewer_type'
 
     judge_prompt = await briefing.build_completion_judge_prompt(
         {'steps': [1, 2]}, [], 'some diff', task_id='42'
     )
     assert isinstance(judge_prompt, str) and judge_prompt, 'completion-judge prompt must be non-empty'
-    assert '42' in judge_prompt, 'completion-judge prompt must interpolate task_id'
 
     merge_prompt = await briefing.build_merger_prompt('conflict text', 'intent text')
     assert isinstance(merge_prompt, str) and merge_prompt, 'merger prompt must be non-empty'
-    assert 'conflict text' in merge_prompt, 'merger prompt must interpolate conflicts'
 
     resume_prompt = await briefing.build_resume_prompt({}, {}, 'the summary', 'the resolution')
     assert isinstance(resume_prompt, str) and resume_prompt, 'resume prompt must be non-empty'
-    assert 'the resolution' in resume_prompt, 'resume prompt must interpolate resolution'
