@@ -1628,10 +1628,12 @@ class _FakeMemoryService:
       catches drift between the producer's ``metadata.kind`` and the reader's
       search query (e.g. filter_suppressed passes ``query='stage1_flag_suppression'``
       which must match the kind the producer wrote).
+    * When ``categories`` is provided, only records whose stored category is in
+      the list are returned.  ``categories=None`` (kwarg absent) means no category
+      filter — all records pass.  This enforces the producer→reader category
+      contract so that a category mismatch is caught by tests using this fake.
     * ``limit`` truncates the result list when provided.
-    * All other kwargs (``categories``, ``stores``, ``project_id``) are
-      accepted and ignored for simplicity; they are not needed for the
-      schema-contract tests here.
+    * All other kwargs (``stores``, ``project_id``) are accepted and ignored.
 
     This mirrors the existing FakeMem0 in the regression test but accepts
     writer-supplied content and metadata.
@@ -1639,18 +1641,27 @@ class _FakeMemoryService:
 
     def __init__(self) -> None:
         self._store: dict[str, _MemoryResultStub] = {}
+        self._categories: dict[str, str] = {}
 
     async def add_memory(
-        self, *, content: str, metadata: dict, **_kwargs
+        self, *, content: str, category: str, metadata: dict, **_kwargs
     ) -> AddMemoryResponse:
         id_ = str(_uuid_mod.uuid4())
         self._store[id_] = _MemoryResultStub(id_, content, metadata)
+        self._categories[id_] = category
         return AddMemoryResponse(memory_ids=[id_])
 
     async def search(
-        self, *, query: str = '', limit: int | None = None, **_kwargs
+        self,
+        *,
+        query: str = '',
+        limit: int | None = None,
+        categories: list[str] | None = None,
+        **_kwargs,
     ) -> list[_MemoryResultStub]:
         results = list(self._store.values())
+        if categories is not None:
+            results = [r for r in results if self._categories.get(r.id) in categories]
         if query:
             results = [r for r in results if r.metadata.get('kind') == query]
         if limit is not None:
@@ -1659,6 +1670,7 @@ class _FakeMemoryService:
 
     async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
         self._store.pop(memory_id, None)
+        self._categories.pop(memory_id, None)
 
     def count(self) -> int:
         return len(self._store)
