@@ -438,11 +438,21 @@ class TestEscalationBinding:
     """
 
     def test_escalation_attribute_is_bound(self):
-        """Escalation is always bound on the module namespace."""
+        """Escalation is always bound on the module namespace.
+
+        When the escalation package is installed (normal CI), also asserts the
+        success-branch contract: ``Escalation`` is the real class and
+        ``_HAS_ESCALATION`` is ``True``.
+        """
         import fused_memory.reconciliation.stage1_stall_detector as mod
 
         assert hasattr(mod, 'Escalation'), (
             'Escalation must be bound on the module namespace at all times'
+        )
+        # In this repo the escalation package is always installed, so the
+        # try-branch runs and _HAS_ESCALATION must be True.
+        assert mod._HAS_ESCALATION is True, (
+            '_HAS_ESCALATION must be True when the escalation package is installed'
         )
 
     def test_except_branch_binds_escalation_to_none(self):
@@ -471,7 +481,8 @@ class TestEscalationBinding:
             spec = importlib.util.spec_from_file_location(
                 '_test_stage1_stall_detector_isolated', source_path
             )
-            fresh_mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            assert spec is not None and spec.loader is not None, source_path
+            fresh_mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(fresh_mod)  # type: ignore[union-attr]
 
             assert fresh_mod.Escalation is None, (
