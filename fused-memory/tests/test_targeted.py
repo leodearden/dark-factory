@@ -10,6 +10,7 @@ from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
+from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -755,11 +756,13 @@ async def test_blocked_routes_update_through_task_interceptor_when_wired(
 @pytest.mark.parametrize(
     'rejection_dict, expected_error, expected_reason',
     [
-        # (1) backlog-gate rejection — the original covered shape (synthetic contract dict)
+        # (1) backlog-gate rejection — real BacklogVerdict.to_error_dict() shape
+        # (no 'success' key, no 'reason' key; 'error' is a rendered message string,
+        #  real code lives in 'error_type' = 'ReconciliationBacklogExceeded')
         (
-            {'success': False, 'error': 'backlog_gate_rejected', 'reason': 'queue_lag'},
-            'backlog_gate_rejected',
-            'queue_lag',
+            BacklogVerdict(outcome='rejection', backlog=600, threshold=500, project_id='test-project').to_error_dict(),
+            BacklogVerdict(outcome='rejection', backlog=600, threshold=500, project_id='test-project').to_error_dict()['error'],
+            None,  # no 'reason' key in BacklogVerdict dict
         ),
         # (2) _reject_status_in_update_task shape
         (
@@ -785,7 +788,7 @@ async def test_blocked_routes_update_through_task_interceptor_when_wired(
             None,
         ),
     ],
-    ids=['backlog_gate_rejected', 'status_via_update_task', 'done_provenance_via_update_task'],
+    ids=['backlog_verdict', 'status_via_update_task', 'done_provenance_via_update_task'],
 )
 async def test_blocked_skips_hints_attached_on_interceptor_rejection(
     reconciler, mock_memory_service, mock_taskmaster,
