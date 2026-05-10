@@ -4009,6 +4009,226 @@ class TestMemoryConsolidatorFlagDedup:
 
 
 # ---------------------------------------------------------------------------
+# Task 1201 — MemoryConsolidator stale human-operator detector integration
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorStaleOperatorDetector:
+    """MemoryConsolidator.run() invokes stall-detector helpers after dedup_flags."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _make_base_report(self, items_flagged=None):
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items_flagged or [],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hor_flag_at_threshold_escalated(self, mock_deps):
+        """(a) HOR flag at threshold → track called, compute returns stalled, escalate called; stats recorded."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        fake_queue = MagicMock()
+        stage._escalation_queue = fake_queue
+
+        hor_flag = {'task_id': '1155', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'}
+        base_report = self._make_base_report(items_flagged=[hor_flag])
+
+        track_mock = AsyncMock(return_value={'1155': 7})
+        compute_mock = MagicMock(return_value=['1155'])
+        escalate_mock = AsyncMock(return_value=['1155'])
+        dedup_mock = AsyncMock(return_value=[hor_flag])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.compute_stalled_task_ids', new=compute_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-1201',
+            )
+
+        # track and compute and escalate all called
+        track_mock.assert_awaited_once()
+        compute_mock.assert_called_once_with({'1155': 7})
+        escalate_mock.assert_awaited_once()
+        # escalate called with the right queue
+        escalate_call = escalate_mock.await_args
+        assert escalate_call is not None
+        assert escalate_call.kwargs.get('escalation_queue') is fake_queue or escalate_call.args[0] is fake_queue
+
+        assert report.stats['stage1_human_operator_stalled'] == 1
+        assert report.stats['stage1_human_operator_escalated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_hor_flag_below_threshold_no_escalation(self, mock_deps):
+        """(b) stall count below threshold → maybe_escalate NOT called; stalled=0, escalated=0."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        fake_queue = MagicMock()
+        stage._escalation_queue = fake_queue
+
+        hor_flag = {'task_id': '1155', 'resolution_status': 'human_operator_required'}
+        base_report = self._make_base_report(items_flagged=[hor_flag])
+
+        track_mock = AsyncMock(return_value={'1155': 3})
+        compute_mock = MagicMock(return_value=[])   # empty → below threshold
+        escalate_mock = AsyncMock(return_value=[])
+        dedup_mock = AsyncMock(return_value=[hor_flag])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.compute_stalled_task_ids', new=compute_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-1201-b',
+            )
+
+        track_mock.assert_awaited_once()
+        escalate_mock.assert_not_awaited()
+        assert report.stats['stage1_human_operator_stalled'] == 0
+        assert report.stats['stage1_human_operator_escalated'] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_hor_flags_zero_cost_path(self, mock_deps):
+        """(c) no HOR flags → none of the new helpers are awaited."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage._escalation_queue = MagicMock()
+
+        non_hor_flag = {'task_id': '99', 'flag_type': 'missing_deliverable', 'resolution_status': 'automated'}
+        base_report = self._make_base_report(items_flagged=[non_hor_flag])
+
+        track_mock = AsyncMock(return_value={})
+        escalate_mock = AsyncMock(return_value=[])
+        dedup_mock = AsyncMock(return_value=[non_hor_flag])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-1201-c',
+            )
+
+        track_mock.assert_not_awaited()
+        escalate_mock.assert_not_awaited()
+        assert report.stats.get('stage1_human_operator_stalled', 0) == 0
+        assert report.stats.get('stage1_human_operator_escalated', 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_no_escalation_queue_skips_all_stall_logic(self, mock_deps):
+        """(d) _escalation_queue is None → entire stall-detector block skipped; no crash.
+
+        Tracking is suppressed (not just escalation) to avoid accumulating Mem0
+        markers that nothing will ever consume when escalation is unavailable.
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage._escalation_queue = None  # explicit None
+
+        hor_flag = {'task_id': '1155', 'resolution_status': 'human_operator_required'}
+        base_report = self._make_base_report(items_flagged=[hor_flag])
+
+        track_mock = AsyncMock(return_value={'1155': 6})
+        escalate_mock = AsyncMock(return_value=[])
+        dedup_mock = AsyncMock(return_value=[hor_flag])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-1201-d',
+            )
+
+        # when queue is None, track is NOT called (no Mem0 markers written)
+        track_mock.assert_not_awaited()
+        # escalate also NOT called
+        escalate_mock.assert_not_awaited()
+        # stats not set (no stall logic ran)
+        assert report.stats.get('stage1_human_operator_stalled', 0) == 0
+        assert report.stats.get('stage1_human_operator_escalated', 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_remediation_mode_skips_all_stall_logic(self, mock_deps):
+        """(e) remediation_findings set → ALL stale-operator logic skipped; no crash."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.remediation_findings = [{'description': 'fix me'}]  # remediation mode
+
+        hor_flag = {'task_id': '1155', 'resolution_status': 'human_operator_required'}
+        base_report = self._make_base_report(items_flagged=[hor_flag])
+
+        dedup_mock = AsyncMock(return_value=[hor_flag])
+        track_mock = AsyncMock(return_value={})
+        escalate_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
+            patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-1201-e',
+            )
+
+        dedup_mock.assert_not_awaited()
+        track_mock.assert_not_awaited()
+        escalate_mock.assert_not_awaited()
+        assert report is not None
+
+
+# ---------------------------------------------------------------------------
 # Task 1139 — FIX A / FIX D helpers
 # ---------------------------------------------------------------------------
 
@@ -6422,3 +6642,80 @@ class TestTaskKnowledgeSyncStage2Guards:
                 and 'task_id=99' in r.getMessage()
                 for r in caplog.records
             )
+
+
+# ---------------------------------------------------------------------------
+# Task 1201 — BaseStage._escalation_queue attribute + harness wiring
+# ---------------------------------------------------------------------------
+
+
+class TestBaseStageEscalationQueueAttribute:
+    """BaseStage.__init__ initialises _escalation_queue to None."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def test_escalation_queue_initialised_to_none(self, mock_deps):
+        """(a) Fresh MemoryConsolidator has _escalation_queue == None."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        assert stage._escalation_queue is None
+
+    def test_escalation_queue_is_settable(self, mock_deps):
+        """(b) _escalation_queue is settable and round-trips."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        fake_queue = MagicMock()
+        stage._escalation_queue = fake_queue
+        assert stage._escalation_queue is fake_queue
+
+
+class TestHarnessWiresEscalationQueueOntoStages:
+    """ReconciliationHarness._make_stages wires _escalation_queue onto each stage."""
+
+    @pytest.fixture
+    def minimal_harness(self):
+        """Construct a minimal ReconciliationHarness with all deps mocked."""
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+
+        config = FusedMemoryConfig()
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+        journal = AsyncMock()
+        event_buffer = AsyncMock()
+        harness = ReconciliationHarness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+        )
+        return harness
+
+    def test_make_stages_wires_escalation_queue(self, minimal_harness):
+        """_make_stages() propagates harness._escalation_queue to each returned stage."""
+        fake_queue = MagicMock()
+        minimal_harness._escalation_queue = fake_queue
+
+        stages = minimal_harness._make_stages()
+
+        for stage in stages:
+            assert stage._escalation_queue is fake_queue, (
+                f'Stage {stage.stage_id} did not receive _escalation_queue from harness'
+            )
+
+    def test_make_stages_no_queue_leaves_stages_at_none(self, minimal_harness):
+        """When _escalation_queue is None, stages are left with _escalation_queue=None."""
+        # Ensure harness has no queue (default)
+        minimal_harness._escalation_queue = None
+
+        stages = minimal_harness._make_stages()
+
+        for stage in stages:
+            assert stage._escalation_queue is None

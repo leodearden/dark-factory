@@ -1,0 +1,415 @@
+"""Tests for stage1_stall_detector module — task 1201.
+
+Covers:
+- TestExtractHumanOperatorTaskIds  (step-1/2)
+- TestTrackHumanOperatorStalls     (step-3/4)
+- TestComputeStalledTaskIds        (step-5/6)
+- TestMaybeEscalateStalledTasks    (step-7/8)
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from fused_memory.reconciliation.stage1_stall_detector import (
+    _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
+    STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD,
+    compute_stalled_task_ids,
+    extract_human_operator_task_ids,
+    maybe_escalate_stalled_tasks,
+    track_human_operator_stalls,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+
+class TestConstants:
+    """Assert module-level constants have expected values."""
+
+    def test_threshold_is_five(self):
+        assert STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD == 5
+
+    def test_marker_source_value(self):
+        assert _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE == 'stage1_human_operator_stall_marker'
+
+
+# ---------------------------------------------------------------------------
+# extract_human_operator_task_ids
+# ---------------------------------------------------------------------------
+
+
+class TestExtractHumanOperatorTaskIds:
+    """extract_human_operator_task_ids filters and deduplicates task_ids."""
+
+    def test_returns_task_ids_of_hor_flags(self):
+        """(a) Returns task_ids where resolution_status == 'human_operator_required'."""
+        flags = [
+            {'task_id': '42', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        assert result == ['42']
+
+    def test_skips_other_resolution_statuses(self):
+        """(b) Flags with other resolution_status values are skipped."""
+        flags = [
+            {'task_id': '1', 'resolution_status': 'automated'},
+            {'task_id': '2', 'resolution_status': 'agent_retry'},
+            {'task_id': '3', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        assert result == ['3']
+
+    def test_skips_flags_without_resolution_status(self):
+        """(c) Flags missing the resolution_status key are skipped."""
+        flags = [
+            {'task_id': '7', 'flag_type': 'missing_deliverable'},
+            {'task_id': '8', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        assert result == ['8']
+
+    def test_deduplicates_same_task_id_preserving_first_seen_order(self):
+        """(d) Multiple flags for the same task_id deduplicate, preserving first-seen order."""
+        flags = [
+            {'task_id': '5', 'flag_type': 'A', 'resolution_status': 'human_operator_required'},
+            {'task_id': '3', 'flag_type': 'B', 'resolution_status': 'human_operator_required'},
+            {'task_id': '5', 'flag_type': 'C', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        # '5' seen first, '3' second; '5' not duplicated
+        assert result == ['5', '3']
+
+    def test_coerces_int_task_id_to_str(self):
+        """(e) Int task_id is coerced to str; int 0 and str '0' collapse."""
+        flags = [
+            {'task_id': 0, 'resolution_status': 'human_operator_required'},
+            {'task_id': '0', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        assert result == ['0']
+
+    def test_ignores_flags_with_none_task_id(self):
+        """(f) Flags with task_id=None are skipped."""
+        flags = [
+            {'task_id': None, 'resolution_status': 'human_operator_required'},
+            {'task_id': '99', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        assert result == ['99']
+
+    def test_ignores_flags_with_missing_task_id(self):
+        """(f) Flags missing the task_id key entirely are skipped."""
+        flags = [
+            {'resolution_status': 'human_operator_required'},
+            {'task_id': '10', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        assert result == ['10']
+
+    def test_empty_input_returns_empty_list(self):
+        """(g) Empty input returns []."""
+        assert extract_human_operator_task_ids([]) == []
+
+    def test_multiple_hor_flags_in_order(self):
+        """Multiple distinct HOR task_ids are returned in input order."""
+        flags = [
+            {'task_id': 'b', 'resolution_status': 'human_operator_required'},
+            {'task_id': 'a', 'resolution_status': 'human_operator_required'},
+            {'task_id': 'c', 'resolution_status': 'human_operator_required'},
+        ]
+        result = extract_human_operator_task_ids(flags)
+        assert result == ['b', 'a', 'c']
+
+
+# ---------------------------------------------------------------------------
+# track_human_operator_stalls
+# ---------------------------------------------------------------------------
+
+
+class TestTrackHumanOperatorStalls:
+    """track_human_operator_stalls counts and writes Mem0 stall markers."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_single_task(self):
+        """(a) prior_count=2 → returns {'42': 3}; calls count then add_memory with correct args."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
+
+        result = await track_human_operator_stalls(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='run-001',
+            task_ids=['42'],
+        )
+
+        assert result == {'42': 3}
+
+        # count called with correct filters
+        memory_service.count_memories_by_metadata.assert_awaited_once_with(
+            project_id='proj',
+            filters={
+                'source': 'stage1_human_operator_stall_marker',
+                'task_id': '42',
+            },
+        )
+
+        # add_memory called with correct payload
+        memory_service.add_memory.assert_awaited_once()
+        add_call = memory_service.add_memory.await_args
+        assert add_call is not None
+        assert add_call.kwargs.get('metadata', {}).get('source') == 'stage1_human_operator_stall_marker'
+        assert add_call.kwargs.get('metadata', {}).get('task_id') == '42'
+        assert add_call.kwargs.get('metadata', {}).get('run_id') == 'run-001'
+
+        # search must NOT have been awaited (deterministic count only)
+        memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_failure_treats_prior_as_zero(self):
+        """(b) count failure → returns {'42': 1} (prior=0) and logs WARNING."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('Qdrant timeout')
+        )
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m2']})
+
+        result = await track_human_operator_stalls(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='run-002',
+            task_ids=['42'],
+        )
+
+        # Should gracefully default prior=0 and still return count=1
+        assert result == {'42': 1}
+        # add_memory should still be called (write phase continues)
+        memory_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_add_memory_failure_still_returns_count(self):
+        """(c) add_memory failure → still returns prior+1, logs WARNING."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=4)
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('Qdrant write failed'))
+
+        result = await track_human_operator_stalls(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='run-003',
+            task_ids=['42'],
+        )
+
+        # count still returned despite write failure
+        assert result == {'42': 5}
+
+    @pytest.mark.asyncio
+    async def test_empty_task_ids_returns_empty_dict(self):
+        """(d) empty task_ids=[] → returns {} with no I/O."""
+        memory_service = AsyncMock()
+
+        result = await track_human_operator_stalls(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='run-004',
+            task_ids=[],
+        )
+
+        assert result == {}
+        memory_service.count_memories_by_metadata.assert_not_awaited()
+        memory_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_multiple_task_ids_parallel(self):
+        """(e) multiple task_ids → two count calls and two add_memory calls."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['mx']})
+
+        result = await track_human_operator_stalls(
+            memory_service=memory_service,
+            project_id='proj',
+            run_id='run-005',
+            task_ids=['10', '20'],
+        )
+
+        assert set(result.keys()) == {'10', '20'}
+        assert result['10'] == 2
+        assert result['20'] == 2
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        assert memory_service.add_memory.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# compute_stalled_task_ids
+# ---------------------------------------------------------------------------
+
+
+class TestComputeStalledTaskIds:
+    """compute_stalled_task_ids returns sorted task_ids that meet threshold."""
+
+    def test_empty_dict_returns_empty(self):
+        """(a) empty dict → []."""
+        assert compute_stalled_task_ids({}) == []
+
+    def test_all_below_threshold_returns_empty(self):
+        """(b) all below threshold → []."""
+        assert compute_stalled_task_ids({'a': 1, 'b': 4}, threshold=5) == []
+
+    def test_at_threshold_included(self):
+        """(c) count == threshold → included."""
+        assert compute_stalled_task_ids({'a': 5}, threshold=5) == ['a']
+
+    def test_above_threshold_included(self):
+        """(d) count > threshold → included."""
+        assert compute_stalled_task_ids({'a': 9}, threshold=5) == ['a']
+
+    def test_result_sorted_lexicographically(self):
+        """(e) result is lexicographically sorted."""
+        counts = {'z': 7, 'a': 6, 'm': 5}
+        result = compute_stalled_task_ids(counts, threshold=5)
+        assert result == ['a', 'm', 'z']
+
+    def test_custom_threshold_respected(self):
+        """(f) custom threshold overrides default."""
+        counts = {'x': 3, 'y': 2}
+        assert compute_stalled_task_ids(counts, threshold=3) == ['x']
+        assert compute_stalled_task_ids(counts, threshold=2) == ['x', 'y']
+
+    def test_default_threshold_is_five(self):
+        """(g) calling without explicit threshold uses STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD (5)."""
+        counts = {'a': 4, 'b': 5}
+        result = compute_stalled_task_ids(counts)
+        assert result == ['b']
+
+
+# ---------------------------------------------------------------------------
+# maybe_escalate_stalled_tasks
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeEscalateStalledTasks:
+    """maybe_escalate_stalled_tasks submits level-1 escalations for stalled tasks."""
+
+    def _make_queue(self, has_open_l1_return: bool = False) -> MagicMock:
+        """Build a fake escalation queue."""
+        q = MagicMock()
+        q.has_open_l1.return_value = has_open_l1_return
+        q.make_id.return_value = 'esc-1155-001'
+        q.submit.return_value = 'esc-1155-001'
+        return q
+
+    @pytest.mark.asyncio
+    async def test_happy_path_submits_level1_escalation(self):
+        """(a) happy path: submits Escalation with correct attributes; returns ['1155']."""
+        queue = self._make_queue(has_open_l1_return=False)
+        flags = [
+            {
+                'task_id': '1155',
+                'flag_type': 'assumption_invalid',
+                'resolution_status': 'human_operator_required',
+                'description': 'Task stalled waiting for human review',
+            }
+        ]
+
+        result = await maybe_escalate_stalled_tasks(
+            escalation_queue=queue,
+            project_id='dark_factory',
+            run_id='run-abc',
+            stalled_task_ids=['1155'],
+            stall_counts={'1155': 7},
+            flags=flags,
+        )
+
+        assert result == ['1155']
+        queue.submit.assert_called_once()
+        submitted = queue.submit.call_args[0][0]
+
+        # Verify escalation fields
+        assert submitted.level == 1
+        assert submitted.severity == 'blocking'
+        assert submitted.category == 'reconciliation_stale_human_operator'
+        assert submitted.task_id == '1155'
+        assert submitted.agent_role == 'reconciliation-stage1'
+        assert '1155' in submitted.summary
+        assert '7' in submitted.summary
+        # detail includes flag description and run_id
+        assert 'Task stalled waiting for human review' in submitted.detail
+        assert 'run-abc' in submitted.detail
+
+    @pytest.mark.asyncio
+    async def test_skips_when_open_l1_exists(self):
+        """(b) has_open_l1=True → no submit call; returns []."""
+        queue = self._make_queue(has_open_l1_return=True)
+
+        result = await maybe_escalate_stalled_tasks(
+            escalation_queue=queue,
+            project_id='dark_factory',
+            run_id='run-abc',
+            stalled_task_ids=['1155'],
+            stall_counts={'1155': 7},
+            flags=[],
+        )
+
+        assert result == []
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_already_escalated_and_new(self):
+        """(c) task A already escalated, task B new → only B submitted; returns ['B']."""
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = lambda tid: tid == 'A'
+        queue.make_id.return_value = 'esc-B-001'
+        queue.submit.return_value = 'esc-B-001'
+
+        result = await maybe_escalate_stalled_tasks(
+            escalation_queue=queue,
+            project_id='dark_factory',
+            run_id='run-mixed',
+            stalled_task_ids=['A', 'B'],
+            stall_counts={'A': 8, 'B': 6},
+            flags=[],
+        )
+
+        assert result == ['B']
+        queue.submit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_empty_stalled_list_returns_empty(self):
+        """(d) empty stalled_task_ids → no calls, returns []."""
+        queue = self._make_queue()
+
+        result = await maybe_escalate_stalled_tasks(
+            escalation_queue=queue,
+            project_id='dark_factory',
+            run_id='run-empty',
+            stalled_task_ids=[],
+            stall_counts={},
+            flags=[],
+        )
+
+        assert result == []
+        queue.has_open_l1.assert_not_called()
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_failure_logs_warning_and_excludes_task(self):
+        """(e) submit raises RuntimeError → logs WARNING; failed task excluded from return."""
+        queue = self._make_queue(has_open_l1_return=False)
+        queue.submit.side_effect = RuntimeError('queue full')
+
+        result = await maybe_escalate_stalled_tasks(
+            escalation_queue=queue,
+            project_id='dark_factory',
+            run_id='run-fail',
+            stalled_task_ids=['1155'],
+            stall_counts={'1155': 7},
+            flags=[],
+        )
+
+        # Should NOT raise; failed task excluded
+        assert result == []

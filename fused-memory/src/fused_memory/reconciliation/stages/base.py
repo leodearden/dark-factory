@@ -23,6 +23,8 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.services.memory_service import MemoryService
@@ -41,7 +43,7 @@ class BaseStage:
         self,
         stage_id: StageId,
         memory_service: MemoryService,
-        taskmaster: 'TaskBackendProtocol | None',
+        taskmaster: TaskBackendProtocol | None,
         journal: ReconciliationJournal,
         config: ReconciliationConfig,
         usage_gate=None,
@@ -61,6 +63,7 @@ class BaseStage:
         self.known_projects: dict[str, str] = {}
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
+        self._escalation_queue: EscalationQueue | None = None
 
     def get_disallowed_tools(self) -> list[str]:
         """Override in subclass — return MCP tool names this stage may NOT use."""

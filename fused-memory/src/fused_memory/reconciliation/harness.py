@@ -311,6 +311,9 @@ class ReconciliationHarness:
         if self._escalation_url:
             for s in stages:
                 s._escalation_url = self._escalation_url
+        if self._escalation_queue is not None:
+            for s in stages:
+                s._escalation_queue = self._escalation_queue
         return stages
 
     @staticmethod
@@ -573,11 +576,12 @@ class ReconciliationHarness:
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
         await _sleep(0.5)
 
-        # Store escalation URL for _make_stages() and set on existing stages
+        # Store escalation URL and queue for _make_stages() and set on existing stages
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url
         for stage in self.stages:
             stage._escalation_url = escalation_url
+            stage._escalation_queue = self._escalation_queue
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
