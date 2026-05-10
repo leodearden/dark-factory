@@ -6422,3 +6422,80 @@ class TestTaskKnowledgeSyncStage2Guards:
                 and 'task_id=99' in r.getMessage()
                 for r in caplog.records
             )
+
+
+# ---------------------------------------------------------------------------
+# Task 1201 — BaseStage._escalation_queue attribute + harness wiring
+# ---------------------------------------------------------------------------
+
+
+class TestBaseStageEscalationQueueAttribute:
+    """BaseStage.__init__ initialises _escalation_queue to None."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def test_escalation_queue_initialised_to_none(self, mock_deps):
+        """(a) Fresh MemoryConsolidator has _escalation_queue == None."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        assert stage._escalation_queue is None
+
+    def test_escalation_queue_is_settable(self, mock_deps):
+        """(b) _escalation_queue is settable and round-trips."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        fake_queue = MagicMock()
+        stage._escalation_queue = fake_queue
+        assert stage._escalation_queue is fake_queue
+
+
+class TestHarnessWiresEscalationQueueOntoStages:
+    """ReconciliationHarness._make_stages wires _escalation_queue onto each stage."""
+
+    @pytest.fixture
+    def minimal_harness(self):
+        """Construct a minimal ReconciliationHarness with all deps mocked."""
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+
+        config = FusedMemoryConfig()
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+        journal = AsyncMock()
+        event_buffer = AsyncMock()
+        harness = ReconciliationHarness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+        )
+        return harness
+
+    def test_make_stages_wires_escalation_queue(self, minimal_harness):
+        """_make_stages() propagates harness._escalation_queue to each returned stage."""
+        fake_queue = MagicMock()
+        minimal_harness._escalation_queue = fake_queue
+
+        stages = minimal_harness._make_stages()
+
+        for stage in stages:
+            assert stage._escalation_queue is fake_queue, (
+                f'Stage {stage.stage_id} did not receive _escalation_queue from harness'
+            )
+
+    def test_make_stages_no_queue_leaves_stages_at_none(self, minimal_harness):
+        """When _escalation_queue is None, stages are left with _escalation_queue=None."""
+        # Ensure harness has no queue (default)
+        minimal_harness._escalation_queue = None
+
+        stages = minimal_harness._make_stages()
+
+        for stage in stages:
+            assert stage._escalation_queue is None
