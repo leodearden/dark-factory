@@ -815,6 +815,67 @@ class GitOps:
         )
         return [f for f in output.strip().splitlines() if f.strip()]
 
+    async def get_merge_diff_files(
+        self, base_sha: str, head_sha: str,
+    ) -> list[str]:
+        """Files changed by the merge ``base_sha..head_sha``, excluding ``.task/``.
+
+        Used by ``TaskWorkflow._reconcile_metadata_files_for_done`` to write
+        the actually-changed paths into ``metadata.files`` instead of the
+        architect's ``plan.files`` (which the merge may have squashed or
+        refactored away).  Uses ``--no-renames`` so a rename surfaces as
+        both add+delete; downstream consumers can decide whether to keep
+        or drop the deleted path.
+
+        Returns ``[]`` on git error — the caller treats an empty list as
+        "no scope to record" (the gate-skip in fused-memory's
+        task_interceptor.py covers the missing-paths case anyway).
+        """
+        rc, output, _ = await _run(
+            [
+                'git', 'diff', '--name-only', '--no-renames',
+                base_sha, head_sha, '--', ':!.task/',
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return []
+        return [f for f in output.strip().splitlines() if f.strip()]
+
+    async def get_files_touched_in_branch(
+        self, base_sha: str, branch_head: str,
+    ) -> list[str]:
+        """Files touched by any commit in ``base_sha..branch_head``.
+
+        Union of file paths that appeared in any commit on the branch
+        (history-based, not just the diff).  Used by the pre-merge
+        Decision-1 check: an architect-declared plan target is "touched"
+        if it appears in this set.
+
+        Excludes ``.task/`` and uses ``--no-renames`` so a rename
+        surfaces both old and new paths (the old path is "touched" too).
+
+        Returns ``[]`` on git error so the helper fails open — its
+        consumer logs and proceeds rather than blocking the merge on
+        a transient diff error.
+        """
+        rc, output, _ = await _run(
+            [
+                'git', 'log', '--name-only', '--no-renames',
+                '--pretty=format:', f'{base_sha}..{branch_head}',
+                '--', ':!.task/',
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return []
+        seen: set[str] = set()
+        for ln in output.splitlines():
+            ln = ln.strip()
+            if ln:
+                seen.add(ln)
+        return sorted(seen)
+
     async def merge_to_main(
         self,
         worktree: Path,

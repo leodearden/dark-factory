@@ -1733,6 +1733,65 @@ async def test_done_gate_reports_partial_missing(
 
 
 @pytest.mark.asyncio
+async def test_done_gate_skipped_when_verified_provenance_supplied(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """Phantom-done gate is bypassed when done_provenance.kind ∈
+    {'merged', 'found_on_main'} AND its commit is ancestor-checked.
+
+    The architect's plan can include files that get squashed/refactored
+    away before merge; the ancestor-checked commit vouches the work is on
+    main, so the gate's defense-in-depth role no longer applies.
+    """
+    sha = _init_git_repo(tmp_path)
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1746',
+            'status': 'in-progress',
+            'title': 'Named views',
+            # metadata.files lists a path that's been refactored away
+            'metadata': {'files': ['gui/src/panels/ViewSelector.tsx']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1746', 'done', str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': sha},
+    )
+
+    # Gate skipped — no done_gate_missing_files.
+    assert result.get('error') != 'done_gate_missing_files'
+    # Transition succeeded.
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_still_fires_without_provenance(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """Defense for non-workflow callers: when done_provenance is absent,
+    the phantom-done gate still rejects missing-files transitions.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1747',
+            'status': 'in-progress',
+            'metadata': {'files': ['does_not_exist.py']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1747', 'done', str(tmp_path),
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_gate_missing_files'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_done_gate_does_not_fire_for_non_done_transitions(
     taskmaster, reconciler, event_buffer
 ):

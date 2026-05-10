@@ -701,21 +701,18 @@ class TaskInterceptor:
                         'Failed to persist reopen_reason for task %s: %s', task_id, e,
                     )
 
-            # 2b. Phantom-done gate: if transitioning to done and the task
-            # advertises concrete files in metadata.files, refuse when any of
-            # those files is absent at project_root. Catches set_task_status
-            # calls that bypass the orchestrator's merge gate (reify tasks
-            # 1746/1747/1749, 2026-04-19).
-            if status == 'done':
-                declared = _extract_metadata_files(before)
-                if declared:
-                    missing = _missing_files(project_root, declared)
-                    if missing:
-                        return _done_gate_error(task_id, declared, missing)
-
-            # 2c. Done-provenance gate: require done_provenance={commit?, note?}
-            # so Stage-2 reconciliation has verified evidence to reference
-            # instead of fabricating 'shipped via X' edges from metadata.modules.
+            # 2b. Done-provenance gate: validate done_provenance first (kind +
+            # commit + ancestor backstop) so the verified result can decide
+            # whether the phantom-done gate also needs to fire.
+            #
+            # 2c. Phantom-done gate: refuse when metadata.files lists paths
+            # absent at project_root. Skipped when 2b returns
+            # ``kind ∈ {'merged', 'found_on_main'}`` with a verified commit —
+            # the architect's plan can include files that get squashed/
+            # refactored away before merge, and the ancestor-checked commit
+            # already vouches that the work is on main.  Defense for
+            # non-workflow callers (no provenance / unknown kind) preserves
+            # the original gate behaviour.
             if status == 'done':
                 validation_err, resolved_provenance = await _validate_done_provenance(
                     task_id, done_provenance, project_root,
@@ -723,6 +720,23 @@ class TaskInterceptor:
                 )
                 if validation_err is not None:
                     return validation_err
+
+                _verified_provenance = (
+                    isinstance(resolved_provenance, dict)
+                    and resolved_provenance.get('kind') in (
+                        'merged', 'found_on_main',
+                    )
+                    and resolved_provenance.get('commit') is not None
+                )
+                if not _verified_provenance:
+                    declared = _extract_metadata_files(before)
+                    if declared:
+                        missing = _missing_files(project_root, declared)
+                        if missing:
+                            return _done_gate_error(
+                                task_id, declared, missing,
+                            )
+
                 if resolved_provenance is not None:
                     try:
                         # Read-modify-write: preserve memory_hints / files /

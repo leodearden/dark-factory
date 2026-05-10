@@ -23,7 +23,10 @@ from orchestrator.harness import Harness
 def harness() -> Harness:
     h = Harness.__new__(Harness)
     h._workflow_cancel_events = {}
-    h.scheduler = type('S', (), {})()
+    # cancel_workflow stamps wall-clock for the reconcile sweep grace
+    # window (R3 race guard) — match the real Harness attribute set.
+    h._workflow_cancel_at = {}
+    h.scheduler = type('S', (), {})()  # type: ignore[assignment]
     return h
 
 

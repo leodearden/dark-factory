@@ -8,6 +8,7 @@ import fcntl
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,11 @@ from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
-from orchestrator.scheduler import Scheduler, files_to_modules
+from orchestrator.scheduler import (
+    Scheduler,
+    SetTaskStatusRejected,
+    files_to_modules,
+)
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -45,6 +50,13 @@ except ImportError:
     HAS_STEWARD = False
 
 logger = logging.getLogger(__name__)
+
+# After this many consecutive set_task_status rejections for the same task in
+# the stranded-in-progress / blocked sweep, escalate to L1 instead of looping.
+# A genuine persistent failure (server-side validation contradicts a
+# branch-on-main observation) is L1-worthy; transient PID-liveness or
+# branch-resolution races should clear well before this threshold fires.
+MAX_RECONCILE_FAILURES: int = 5
 
 
 def _pid_alive(pid: int) -> bool:
@@ -240,6 +252,17 @@ class Harness:
         # tasks stranded by transient backend failures get unstrandred
         # without waiting for the next orchestrator restart.  See Fix 4.
         self._stranded_reconcile_task: asyncio.Task | None = None
+
+        # Per-task consecutive-failure counter for the reconcile sweep —
+        # cleared on any successful mark_done, used to gate L1 escalation.
+        self._reconcile_failure_counts: dict[str, int] = {}
+        # Wall-clock of the most recent _workflow_cancel_events.set() call,
+        # keyed by task_id.  R3-race-guard window — the sweep skips a task
+        # whose workflow was cancelled within the last
+        # ``_RECONCILE_CANCEL_GRACE_S`` seconds, since the workflow's
+        # finally: block may still be writing state.
+        self._workflow_cancel_at: dict[str, float] = {}
+        self._RECONCILE_CANCEL_GRACE_S: float = 30.0
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
@@ -1023,8 +1046,16 @@ Output JSON matching the schema. Every task must appear in the output.
         marked_done = 0
         log_prefix = 'Reconcile (mid-run)' if mid_run else 'Reconcile'
 
+        # R4: sweep both 'in-progress' AND 'blocked' so out-of-band-merged
+        # blocked tasks (manual `git merge` while task was blocked) get
+        # marked done by the next sweep cycle.  'cancelled' and 'deferred'
+        # are intentionally excluded — terminal-by-decision and
+        # human-deferred respectively.
+        sweep_statuses = {'in-progress', 'blocked'}
+        now = time.monotonic()
+
         for tid, status in statuses.items():
-            if status != 'in-progress':
+            if status not in sweep_statuses:
                 continue
             if mid_run and (
                 tid in self.scheduler._dispatched
@@ -1033,143 +1064,48 @@ Output JSON matching the schema. Every task must appear in the output.
                 # Actively held by this run's scheduler — not stranded.
                 continue
 
-            branch = f'{self.git_ops.config.branch_prefix}{tid}'
-
-            # Already-on-main fast-path (is_ancestor == True).
-            # Side-effect sequence shared via _mark_in_progress_done.
-            if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
-                # Resolve SHA and build provenance BEFORE invoking the helper —
-                # the helper calls cleanup_worktree which runs 'git branch -D'
-                # and would invalidate any post-cleanup rev-parse
-                # (see git_ops.py cleanup_worktree).
-                branch_sha = await self.git_ops.resolve_branch_sha(branch)
-
-                provenance: dict[str, str] = {
-                    'note': 'reconcile: branch already on main when stranded in-progress',
-                }
-                if branch_sha is not None:
-                    provenance['commit'] = branch_sha
-                else:
-                    logger.warning(
-                        'Reconcile: rev-parse failed for %s — '
-                        'recording note-only provenance for task %s',
-                        branch, tid,
-                    )
-
-                await self._mark_in_progress_done(tid, provenance, 'branch-already-on-main')
-                marked_done += 1
-                continue
-
-            # Branch-deleted fast-path (find_merge_marker).
-            # is_ancestor returned False, but the branch may simply not exist
-            # any more (cleanup_worktree ran after advance_main but before
-            # set_task_status).  Search main for the merge commit subject
-            # 'Merge {branch} into {main}' that merge_to_main writes
-            # (git_ops.py:755).
-            # Side-effect sequence shared via _mark_in_progress_done.
-            marker_sha = await self.git_ops.find_merge_marker(branch)
-            if marker_sha:
-                await self._mark_in_progress_done(
-                    tid,
-                    {
-                        'note': 'reconcile: branch deleted but merge marker found on main',
-                        'commit': marker_sha,
-                    },
-                    'branch-deleted-marker-found',
-                )
-                marked_done += 1
-                continue
-
-            worktree_path = self.git_ops.worktree_base / tid
-            lock_path = worktree_path / '.task' / 'plan.lock'
-
-            if not lock_path.exists():
-                # No worktree or no lock → orphan, revert.
-                # If the worktree directory exists and we haven't promised to
-                # resume this task's plan, clean it up so the scheduler can
-                # create a fresh worktree on re-acquisition without colliding.
+            # R3 race guard: when a workflow soft-cancel was set very
+            # recently, the workflow's finally: block may still be writing
+            # state (release_workflow + cleanup window).  Skip until the
+            # grace period elapses so we don't revert work the workflow
+            # is still finishing.
+            if mid_run:
+                cancelled_at = self._workflow_cancel_at.get(tid)
                 if (
-                    worktree_path.exists()
-                    and tid not in self._recovered_plans
-                    and tid not in self._preserved_worktrees
+                    cancelled_at is not None
+                    and now - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
                 ):
-                    try:
-                        await self.git_ops.cleanup_worktree(worktree_path, tid)
-                    except Exception:
-                        logger.warning(
-                            'Reconcile: cleanup_worktree failed for task %s'
-                            ' (no-lock); continuing',
-                            tid, exc_info=True,
-                        )
-                await self.scheduler.set_task_status(tid, 'pending')
-                logger.info(
-                    'Reconcile: reverted task %s to pending (reason=no-lock)', tid
-                )
-                reverted += 1
-                continue
+                    continue
 
-            # Lock exists — check whether the owner is still alive.
-            owner_alive = False
             try:
-                lock_data = json.loads(lock_path.read_text())
-                if not isinstance(lock_data, dict):
-                    raise ValueError('plan.lock is not a JSON object')
-                owner_pid = lock_data.get('owner_pid')
-                if owner_pid is None:
-                    # Missing or null owner_pid — surface this in logs so
-                    # unexpected lock formats don't fail silently.
-                    logger.warning(
-                        'Reconcile: plan.lock for task %s has no owner_pid;'
-                        ' treating as stale',
-                        tid,
-                    )
-                else:
-                    try:
-                        owner_alive = _pid_alive(int(owner_pid))
-                    except (TypeError, ValueError):
-                        # owner_pid is non-numeric — treat lock as stale.
-                        owner_alive = False
-            except (OSError, json.JSONDecodeError, ValueError):
-                # OSError: file read failure.
-                # JSONDecodeError: malformed JSON text.
-                # ValueError: malformed lock structure (non-dict JSON value).
-                # (Unexpected exception types propagate — they indicate a bug.)
-                owner_alive = False
-
-            if owner_alive:
-                # Live claimant — leave the task alone.
+                outcome = await self._reconcile_one_stranded(
+                    tid, status, mid_run=mid_run,
+                )
+            except SetTaskStatusRejected as exc:
+                # Persistence layer refused our write — count strikes; on
+                # threshold, escalate to L1.  Honest log so future operators
+                # can see *why* the task is still stranded instead of the
+                # old "marked done" misnomer.  Other (unexpected) exception
+                # types intentionally propagate so bugs in the sweep surface
+                # rather than being silently skipped.
+                count = self._reconcile_failure_counts.get(tid, 0) + 1
+                self._reconcile_failure_counts[tid] = count
+                logger.error(
+                    '%s: failed to mark task %s done — %s: %s '
+                    '(consecutive failures=%d/%d)',
+                    log_prefix, tid, exc.error_code, exc.raw,
+                    count, MAX_RECONCILE_FAILURES,
+                )
+                if count >= MAX_RECONCILE_FAILURES and self._escalation_queue:
+                    self._escalate_reconcile_failure(tid, exc, count)
                 continue
 
-            # Stale lock — clear it and revert.
-            if (
-                tid not in self._recovered_plans
-                and tid not in self._preserved_worktrees
-            ):
-                # Full cleanup: remove worktree dir + branch so re-acquisition
-                # creates a fresh worktree without colliding.
-                try:
-                    await self.git_ops.cleanup_worktree(worktree_path, tid)
-                except Exception:
-                    logger.warning(
-                        'Reconcile: cleanup_worktree failed for task %s'
-                        ' (stale-lock); continuing',
-                        tid, exc_info=True,
-                    )
-                # Unconditionally unlink the stale lock so the next sweep
-                # doesn't re-encounter it.  If cleanup_worktree succeeded the
-                # whole worktree dir is gone and this is a cheap no-op;
-                # if cleanup failed we still guarantee the lock is cleared.
-                with contextlib.suppress(OSError):
-                    lock_path.unlink(missing_ok=True)
-            else:
-                # Plan will be resumed — preserve worktree, only clear stale lock.
-                with contextlib.suppress(OSError):
-                    lock_path.unlink()
-            await self.scheduler.set_task_status(tid, 'pending')
-            logger.info(
-                'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
-            )
-            reverted += 1
+            if outcome == 'marked_done':
+                marked_done += 1
+                self._reconcile_failure_counts.pop(tid, None)
+            elif outcome == 'reverted':
+                reverted += 1
+                self._reconcile_failure_counts.pop(tid, None)
 
         if reverted or marked_done:
             logger.info(
@@ -1179,30 +1115,167 @@ Output JSON matching the schema. Every task must appear in the output.
             )
         return reverted + marked_done
 
+    async def _reconcile_one_stranded(
+        self, tid: str, status: str, *, mid_run: bool,
+    ) -> str | None:
+        """Reconcile a single stranded task. Returns 'marked_done', 'reverted', or None.
+
+        Raises ``SetTaskStatusRejected`` if the persistence layer refuses the
+        recovery write — caller handles failure counting + escalation.
+        """
+        branch = f'{self.git_ops.config.branch_prefix}{tid}'
+
+        # Already-on-main fast-path (is_ancestor == True).
+        if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
+            # Resolve SHA BEFORE cleanup_worktree (which runs `git branch -D`
+            # and would invalidate a post-cleanup rev-parse).
+            branch_sha = await self.git_ops.resolve_branch_sha(branch)
+            note = (
+                f'reconcile: branch on main while task was {status} '
+                f'(out-of-band merge)'
+                if status == 'blocked'
+                else 'reconcile: branch already on main when stranded in-progress'
+            )
+            await self._mark_in_progress_done(
+                tid, branch_sha, note, 'branch-already-on-main',
+            )
+            return 'marked_done'
+
+        # Branch-deleted fast-path (find_merge_marker).
+        # is_ancestor returned False, but the branch may simply not exist
+        # any more (cleanup_worktree ran after advance_main but before
+        # set_task_status).
+        marker_sha = await self.git_ops.find_merge_marker(branch)
+        if marker_sha:
+            note = (
+                f'reconcile: merge marker found on main while task was {status}'
+                if status == 'blocked'
+                else 'reconcile: branch deleted but merge marker found on main'
+            )
+            await self._mark_in_progress_done(
+                tid, marker_sha, note, 'branch-deleted-marker-found',
+            )
+            return 'marked_done'
+
+        # No on-main evidence.  For 'blocked' tasks, leave the row alone —
+        # blocked is a deliberate state and we only flip it to done on
+        # observed evidence.
+        if status == 'blocked':
+            return None
+
+        # 'in-progress' and not on main: classify by lock state.
+        worktree_path = self.git_ops.worktree_base / tid
+        lock_path = worktree_path / '.task' / 'plan.lock'
+
+        if not lock_path.exists():
+            # No worktree or no lock → orphan, revert.
+            if (
+                worktree_path.exists()
+                and tid not in self._recovered_plans
+                and tid not in self._preserved_worktrees
+            ):
+                try:
+                    await self.git_ops.cleanup_worktree(worktree_path, tid)
+                except Exception:
+                    logger.warning(
+                        'Reconcile: cleanup_worktree failed for task %s'
+                        ' (no-lock); continuing',
+                        tid, exc_info=True,
+                    )
+            await self.scheduler.set_task_status(tid, 'pending')
+            logger.info(
+                'Reconcile: reverted task %s to pending (reason=no-lock)', tid
+            )
+            return 'reverted'
+
+        # Lock exists — check whether the owner is still alive.
+        owner_alive = False
+        try:
+            lock_data = json.loads(lock_path.read_text())
+            if not isinstance(lock_data, dict):
+                raise ValueError('plan.lock is not a JSON object')
+            owner_pid = lock_data.get('owner_pid')
+            if owner_pid is None:
+                logger.warning(
+                    'Reconcile: plan.lock for task %s has no owner_pid;'
+                    ' treating as stale',
+                    tid,
+                )
+            else:
+                try:
+                    owner_alive = _pid_alive(int(owner_pid))
+                except (TypeError, ValueError):
+                    owner_alive = False
+        except (OSError, json.JSONDecodeError, ValueError):
+            owner_alive = False
+
+        # R3: during a mid_run sweep, owner_pid is almost always the harness
+        # PID (which IS alive by definition).  The dispatch-table filter at
+        # the top of the loop already excluded actively-held tasks; if we
+        # made it here, the workflow has exited without releasing the lock.
+        # Treat the lock as stale and fall through to recovery.
+        if owner_alive and not mid_run:
+            return None  # Live claimant outside our run — leave alone.
+
+        # Stale lock (or mid_run-and-not-active) — clear it and revert.
+        if (
+            tid not in self._recovered_plans
+            and tid not in self._preserved_worktrees
+        ):
+            try:
+                await self.git_ops.cleanup_worktree(worktree_path, tid)
+            except Exception:
+                logger.warning(
+                    'Reconcile: cleanup_worktree failed for task %s'
+                    ' (stale-lock); continuing',
+                    tid, exc_info=True,
+                )
+            with contextlib.suppress(OSError):
+                lock_path.unlink(missing_ok=True)
+        else:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+        await self.scheduler.set_task_status(tid, 'pending')
+        logger.info(
+            'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
+        )
+        return 'reverted'
+
     async def _mark_in_progress_done(
         self,
         tid: str,
-        provenance: dict[str, str],
+        sha: str | None,
+        note: str,
         reason: str,
     ) -> None:
-        """Mark a stranded in-progress task done.
+        """Mark a stranded task done via ``scheduler.mark_done``.
 
-        Encapsulates the pop/cleanup/set_status/log sequence shared by the
-        is_ancestor and find_merge_marker branches in
-        _reconcile_stranded_in_progress.
+        Thin wrapper around ``Scheduler.mark_done`` that owns the side-effect
+        sequence — pop ``_recovered_plans``, attempt ``cleanup_worktree``
+        (swallow errors), call ``mark_done(kind='found_on_main', ...)``
+        because the sweep is *finding* tasks already on main, not actively
+        merging them.
 
         Args:
             tid: The task id (string form, as it appears in get_statuses).
-            provenance: done_provenance dict — caller is responsible for
-                building this (typically {'note': '...', 'commit': <sha>} or
-                note-only when rev-parse fails).
-            reason: Short slug used in both the cleanup-failure WARNING and
-                the success INFO log (e.g. 'branch-already-on-main',
-                'branch-deleted-marker-found').
+            sha: The on-main commit anchoring the recovery.  When ``None``
+                (rev-parse race for a vanishing branch), log + skip — the
+                next sweep retries; ``mark_done`` requires a real SHA.
+            note: Free-text provenance note distinguishing the recovery
+                path (already-on-main vs deleted-but-marker-found).
+            reason: Short slug used in cleanup-failure WARNING and the
+                success INFO log.
 
-        Caller is responsible for incrementing the local marked_done counter
-        and issuing `continue` after this returns.
+        Raises ``SetTaskStatusRejected`` on persistent persistence-layer
+        rejection — caller decides whether to count strikes / escalate.
         """
+        if sha is None:
+            logger.warning(
+                'Reconcile: rev-parse failed for task %s (%s) — '
+                'skipping; next sweep will retry',
+                tid, reason,
+            )
+            return
         worktree_path = self.git_ops.worktree_base / tid
         self._recovered_plans.pop(tid, None)
         if worktree_path.exists():
@@ -1214,12 +1287,58 @@ Output JSON matching the schema. Every task must appear in the output.
                     ' (%s); continuing',
                     tid, reason, exc_info=True,
                 )
-        await self.scheduler.set_task_status(
-            tid, 'done', done_provenance=provenance,
+        await self.scheduler.mark_done(
+            tid, kind='found_on_main', sha=sha, note=note,
         )
         logger.info(
             'Reconcile: marked task %s done (reason=%s)', tid, reason,
         )
+
+    def _escalate_reconcile_failure(
+        self,
+        tid: str,
+        exc: SetTaskStatusRejected,
+        count: int,
+    ) -> None:
+        """Submit an L1 escalation for persistent reconcile failure.
+
+        Fired when the same task has rejected ``mark_done`` MAX_RECONCILE_FAILURES
+        consecutive sweeps in a row — i.e. the persistence layer
+        contradicts a branch-on-main observation persistently enough that
+        steward-mediated retry can't unstick it.
+        """
+        if not self._escalation_queue:
+            return
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role='harness-reconcile',
+            severity='blocking',
+            category='reconcile_persistent_rejection',
+            summary=(
+                f'Reconcile sweep failed to mark task {tid} done '
+                f'{count}x consecutively'
+            )[:200],
+            detail=(
+                f'set_task_status(done) rejected by fused-memory after '
+                f'{count} consecutive sweeps for task {tid}.\n\n'
+                f'error_code: {exc.error_code}\n'
+                f'raw: {exc.raw}\n\n'
+                f'The branch was observed on main (or a merge marker was '
+                f'found) but the persistence layer refuses the transition. '
+                f'Manual investigation required — the row may carry stale '
+                f'metadata.files or the done_provenance ancestor check may '
+                f'be failing.'
+            ),
+            suggested_action='investigate_persistence_layer_rejection',
+        )
+        self._escalation_queue.submit(esc)
+        # Reset counter so we don't re-escalate every sweep — operator
+        # action will resolve and the next true rejection (if any) starts
+        # a fresh strike count.
+        self._reconcile_failure_counts.pop(tid, None)
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
@@ -1349,6 +1468,7 @@ Output JSON matching the schema. Every task must appear in the output.
         finally:
             self._escalation_events.pop(assignment.task_id, None)
             self._workflow_cancel_events.pop(assignment.task_id, None)
+            self._workflow_cancel_at.pop(assignment.task_id, None)
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
             if report is not None:
                 requeued = await self._apply_retry_cap(
@@ -2006,6 +2126,10 @@ Output JSON matching the schema. Every task must appear in the output.
         if event is None:
             return False
         event.set()
+        # Stamp wall-clock so the reconcile sweep can grace-skip this task
+        # for the next _RECONCILE_CANCEL_GRACE_S seconds — the workflow's
+        # finally: block may still be writing state (R3 race guard).
+        self._workflow_cancel_at[task_id] = time.monotonic()
         return True
 
     def is_workflow_active(self, task_id: str) -> bool:

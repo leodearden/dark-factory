@@ -90,6 +90,19 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
 
+    # mark_done forwards to set_task_status so the existing assertions on
+    # set_task_status.call_args_list / set_task_status.assert_awaited_once_with
+    # still cover the recovery-done path after the harness was refactored to
+    # use Scheduler.mark_done as a thin wrapper.
+    async def _fake_mark_done(tid, *, kind, sha, note=None):
+        provenance = {'kind': kind, 'commit': sha}
+        if note is not None:
+            provenance['note'] = note
+        await h.scheduler.set_task_status(
+            tid, 'done', done_provenance=provenance,
+        )
+    h.scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+
     # Keep worktree_base real (under tmp_path) so we can create fake worktrees
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
 
@@ -630,10 +643,11 @@ class TestReconcileStrandedInProgress:
         # is_ancestor must have been invoked with the configured branch + main_branch
         harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
 
-        # set_task_status must be called exactly once: ('50', 'done') with commit + note
+        # set_task_status must be called exactly once: ('50', 'done') with kind/commit/note
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             '50', 'done',
             done_provenance={
+                'kind': 'found_on_main',
                 'commit': 'deadbeef' + 'a' * 32,
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
@@ -675,10 +689,11 @@ class TestReconcileStrandedInProgress:
             worktree_path, tid
         )
 
-        # (3) Task must be marked done with the expected provenance (commit + note)
+        # (3) Task must be marked done with the expected provenance (kind + commit + note)
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'done',
             done_provenance={
+                'kind': 'found_on_main',
                 'commit': 'deadbeef' + 'a' * 32,
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
@@ -725,6 +740,7 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             '51', 'done',
             done_provenance={
+                'kind': 'found_on_main',
                 'commit': 'deadbeef' + 'a' * 32,
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
@@ -743,12 +759,18 @@ class TestReconcileStrandedInProgress:
             'plan.lock should be removed by cleanup_worktree in the is_ancestor guard'
         )
 
-    async def test_already_merged_provenance_omits_commit_when_branch_unresolved(
+    async def test_already_merged_skipped_when_branch_unresolved(
         self, harness: Harness, caplog
     ):
-        """Fallback: when resolve_branch_sha returns None (branch ref vanished after
-        is_ancestor check), done_provenance has only 'note' — no 'commit' key —
-        and a WARNING log is emitted containing the branch name and 'rev-parse'.
+        """When resolve_branch_sha returns None (branch ref vanished after
+        is_ancestor check), the recovery is skipped (no set_task_status('done')
+        call) and a WARNING log is emitted containing the task id and
+        'rev-parse'.
+
+        Behaviour change vs. note-only provenance: ``mark_done`` requires a
+        real SHA so the server-side ancestor check has something to verify;
+        leaving the task in-progress for one more sweep is preferred over
+        recording a phantom done.
         """
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
@@ -759,22 +781,17 @@ class TestReconcileStrandedInProgress:
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await harness._reconcile_stranded_in_progress()
 
-        # Note-only provenance — NO 'commit' key
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '53', 'done',
-            done_provenance={
-                'note': 'reconcile: branch already on main when stranded in-progress',
-            },
-        )
+        # Recovery skipped — no set_task_status call.
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_awaited()  # type: ignore[attr-defined]
 
-        # WARNING log must mention the branch name and 'rev-parse'
+        # WARNING log must mention the task id and 'rev-parse'
         warning_messages = [
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert any(
-            'task/53' in msg and 'rev-parse' in msg
-            for msg in warning_messages
-        ), f'Expected WARNING with task/53 and rev-parse, got: {warning_messages}'
+            '53' in msg and 'rev-parse' in msg for msg in warning_messages
+        ), f'Expected WARNING with task 53 and rev-parse, got: {warning_messages}'
 
     # ------------------------------------------------------------------
     # find_merge_marker guard tests (deleted-branch fast-path)
@@ -808,12 +825,13 @@ class TestReconcileStrandedInProgress:
             f'task/{tid}'
         )
 
-        # Task must be marked done with commit + note provenance
+        # Task must be marked done with kind + commit + note provenance
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'done',
             done_provenance={
-                'note': 'reconcile: branch deleted but merge marker found on main',
+                'kind': 'found_on_main',
                 'commit': marker_sha,
+                'note': 'reconcile: branch deleted but merge marker found on main',
             },
         )
 
@@ -880,8 +898,9 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'done',
             done_provenance={
-                'note': 'reconcile: branch deleted but merge marker found on main',
+                'kind': 'found_on_main',
                 'commit': marker_sha,
+                'note': 'reconcile: branch deleted but merge marker found on main',
             },
         )
 
@@ -937,8 +956,9 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             tid, 'done',
             done_provenance={
-                'note': 'reconcile: branch deleted but merge marker found on main',
+                'kind': 'found_on_main',
                 'commit': marker_sha,
+                'note': 'reconcile: branch deleted but merge marker found on main',
             },
         )
 
@@ -968,56 +988,58 @@ class TestReconcileStrandedInProgress:
         # But the task must be marked done via the is_ancestor path
         harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
 
-    async def test_is_ancestor_not_invoked_for_non_in_progress_tasks(
+    async def test_is_ancestor_not_invoked_for_terminal_or_pending_tasks(
         self, harness: Harness
     ):
         """Placement-efficiency regression lock: is_ancestor is never called
-        when there are no in-progress tasks.
+        for tasks the sweep does not consider stranded — i.e. anything outside
+        ``{in-progress, blocked}``.
 
-        Proves the guard sits below the `if status != 'in-progress': continue`
-        filter and does not waste git invocations on non-in-progress tasks.
+        Note: 'blocked' is now included in the sweep (R4) — out-of-band-merged
+        blocked tasks need recovery — so the input set here is restricted to
+        statuses the sweep does NOT touch.
         """
         harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
             {
                 '60': 'pending',
                 '61': 'done',
-                '62': 'blocked',
                 '63': 'cancelled',
                 '64': 'review',
+                '65': 'deferred',
             },
             None,
         )
 
         await harness._reconcile_stranded_in_progress()
 
-        # is_ancestor must never be called (no in-progress tasks)
+        # is_ancestor must never be called (no sweep-eligible tasks)
         harness.git_ops.is_ancestor.assert_not_called()  # type: ignore[attr-defined]
         # No status changes either
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
-    async def test_find_merge_marker_not_invoked_for_non_in_progress_tasks(
+    async def test_find_merge_marker_not_invoked_for_terminal_or_pending_tasks(
         self, harness: Harness
     ):
         """Placement-efficiency regression lock: find_merge_marker is never
-        called when there are no in-progress tasks.
+        called for tasks the sweep does not consider stranded.
 
-        Proves the guard sits below the `if status != 'in-progress': continue`
-        filter and does not waste git invocations on non-in-progress tasks.
+        Same reasoning as ``test_is_ancestor_not_invoked_for_terminal_or_pending_tasks``:
+        only ``{in-progress, blocked}`` are swept after R4.
         """
         harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
             {
                 '80': 'pending',
                 '81': 'done',
-                '82': 'blocked',
                 '83': 'cancelled',
                 '84': 'review',
+                '85': 'deferred',
             },
             None,
         )
 
         await harness._reconcile_stranded_in_progress()
 
-        # find_merge_marker must never be called (no in-progress tasks)
+        # find_merge_marker must never be called (no sweep-eligible tasks)
         harness.git_ops.find_merge_marker.assert_not_called()  # type: ignore[attr-defined]
         # No status changes either
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
@@ -1035,8 +1057,9 @@ class TestReconcileStrandedInProgress:
                 None,
                 'branch-already-on-main',
                 {
-                    'note': 'reconcile: branch already on main when stranded in-progress',
+                    'kind': 'found_on_main',
                     'commit': 'deadbeef' + 'a' * 32,
+                    'note': 'reconcile: branch already on main when stranded in-progress',
                 },
                 False,
                 id='is_ancestor-branch-success',
@@ -1047,8 +1070,9 @@ class TestReconcileStrandedInProgress:
                 'cafebabe' + 'd' * 32,
                 'branch-deleted-marker-found',
                 {
-                    'note': 'reconcile: branch deleted but merge marker found on main',
+                    'kind': 'found_on_main',
                     'commit': 'cafebabe' + 'd' * 32,
+                    'note': 'reconcile: branch deleted but merge marker found on main',
                 },
                 False,
                 id='marker-branch-success',
@@ -1059,8 +1083,9 @@ class TestReconcileStrandedInProgress:
                 None,
                 'branch-already-on-main',
                 {
-                    'note': 'reconcile: branch already on main when stranded in-progress',
+                    'kind': 'found_on_main',
                     'commit': 'deadbeef' + 'a' * 32,
+                    'note': 'reconcile: branch already on main when stranded in-progress',
                 },
                 True,
                 id='is_ancestor-branch-cleanup-fails',
@@ -1071,8 +1096,9 @@ class TestReconcileStrandedInProgress:
                 'cafebabe' + 'd' * 32,
                 'branch-deleted-marker-found',
                 {
-                    'note': 'reconcile: branch deleted but merge marker found on main',
+                    'kind': 'found_on_main',
                     'commit': 'cafebabe' + 'd' * 32,
+                    'note': 'reconcile: branch deleted but merge marker found on main',
                 },
                 True,
                 id='marker-branch-cleanup-fails',
@@ -1165,8 +1191,9 @@ class TestReconcileStrandedInProgress:
                 True,
                 None,
                 {
-                    'note': 'reconcile: branch already on main when stranded in-progress',
+                    'kind': 'found_on_main',
                     'commit': 'deadbeef' + 'a' * 32,
+                    'note': 'reconcile: branch already on main when stranded in-progress',
                 },
                 id='is_ancestor-branch',
             ),
@@ -1175,8 +1202,9 @@ class TestReconcileStrandedInProgress:
                 False,
                 'cafebabe' + 'd' * 32,
                 {
-                    'note': 'reconcile: branch deleted but merge marker found on main',
+                    'kind': 'found_on_main',
                     'commit': 'cafebabe' + 'd' * 32,
+                    'note': 'reconcile: branch deleted but merge marker found on main',
                 },
                 id='marker-branch',
             ),
@@ -1318,21 +1346,27 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
 
 
 # ---------------------------------------------------------------------------
-# Non-in-progress statuses are ignored (regression guard for non-goal)
+# Sweep only touches {in-progress, blocked} (regression guard for non-goal)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_non_in_progress_statuses_ignored(harness: Harness):
-    """The sweep only touches in-progress tasks; other statuses are untouched."""
-    # Only the 'in-progress' task has no lock (worktree doesn't exist)
+async def test_terminal_and_pending_statuses_ignored(harness: Harness):
+    """The sweep only touches {in-progress, blocked} tasks.
+
+    Blocked tasks are checked (R4: out-of-band-merge recovery) but are only
+    flipped to done when on-main evidence is observed; without is_ancestor /
+    find_merge_marker hits, they stay blocked. ``done`` / ``cancelled`` /
+    ``deferred`` / ``pending`` / ``review`` are never written.
+    """
     harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
         {
             '20': 'pending',
             '21': 'done',
-            '22': 'blocked',
+            '22': 'blocked',  # checked but no on-main evidence → untouched
             '23': 'cancelled',
             '24': 'review',
-            '25': 'in-progress',  # <-- only this one
+            '25': 'in-progress',  # orphan-revert candidate
+            '26': 'deferred',
         },
         None,
     )
@@ -1424,3 +1458,307 @@ async def test_returns_change_count(harness: Harness):
     # One stranded task → returns 1.
     harness.scheduler.get_statuses.return_value = ({'11': 'in-progress'}, None)  # type: ignore[attr-defined]
     assert await harness._reconcile_stranded_in_progress() == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-tid try/except + N-strikes escalation (Stage 1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_one_task_rejection_does_not_kill_sweep(harness: Harness, caplog):
+    """A SetTaskStatusRejected on one task must NOT abort the iteration over others."""
+    from orchestrator.scheduler import DoneGateRejection
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'100': 'in-progress', '101': 'in-progress'}, None,
+    )
+
+    call_count = 0
+
+    async def _flaky_mark_done(tid, *, kind, sha, note=None):
+        nonlocal call_count
+        call_count += 1
+        if tid == '100':
+            raise DoneGateRejection(
+                task_id=tid, missing_files=['x.py'],
+                raw='done_gate_missing_files — metadata.files lists missing paths',
+            )
+
+    harness.scheduler.mark_done = AsyncMock(side_effect=_flaky_mark_done)  # type: ignore[attr-defined]
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.harness'):
+        result = await harness._reconcile_stranded_in_progress()
+
+    # Both tasks attempted; only one succeeded.
+    assert call_count == 2
+    assert result == 1  # only task 101 marked done
+    # Failure counter incremented for the rejecting task.
+    assert harness._reconcile_failure_counts.get('100') == 1
+    assert '101' not in harness._reconcile_failure_counts
+    # Honest log mentions the error_code, not "marked done".
+    assert any(
+        'failed to mark task 100 done' in r.getMessage()
+        and 'done_gate_missing_files' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_n_strikes_escalates_to_l1(harness: Harness):
+    """After MAX_RECONCILE_FAILURES rejections, an L1 is filed.
+
+    Subsequent strikes (already-escalated) reset the counter to avoid
+    re-escalating on every sweep.
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+    from orchestrator.scheduler import DoneGateRejection
+
+    # Inject a stub escalation queue to capture submissions.
+    submissions = []
+
+    class _StubEscalationQueue:
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(submissions)}'
+        def submit(self, esc):
+            submissions.append(esc)
+
+    harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'200': 'in-progress'}, None,
+    )
+
+    async def _always_reject(tid, *, kind, sha, note=None):
+        raise DoneGateRejection(
+            task_id=tid, missing_files=['x.py'],
+            raw='done_gate_missing_files — metadata.files lists missing paths',
+        )
+
+    harness.scheduler.mark_done = AsyncMock(side_effect=_always_reject)  # type: ignore[attr-defined]
+
+    # Run MAX_RECONCILE_FAILURES sweeps — escalation fires on the Nth.
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(submissions) == 1, (
+        f'expected exactly one L1 submission after {MAX_RECONCILE_FAILURES} '
+        f'consecutive rejections, got {len(submissions)}'
+    )
+    esc = submissions[0]
+    assert esc.task_id == '200'
+    assert esc.severity == 'blocking'
+    assert esc.category == 'reconcile_persistent_rejection'
+    # Counter reset after escalation so the next sweep starts a fresh count.
+    assert '200' not in harness._reconcile_failure_counts
+
+
+@pytest.mark.asyncio
+async def test_failure_counter_resets_on_success(harness: Harness):
+    """A successful mark_done clears the per-tid failure counter."""
+    from orchestrator.scheduler import DoneGateRejection
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'300': 'in-progress'}, None,
+    )
+
+    # First sweep: reject.
+    async def _reject(tid, *, kind, sha, note=None):
+        raise DoneGateRejection(
+            task_id=tid, missing_files=['x.py'],
+            raw='done_gate_missing_files',
+        )
+    harness.scheduler.mark_done = AsyncMock(side_effect=_reject)  # type: ignore[attr-defined]
+    await harness._reconcile_stranded_in_progress()
+    assert harness._reconcile_failure_counts.get('300') == 1
+
+    # Second sweep: succeed.
+    async def _succeed(tid, *, kind, sha, note=None):
+        await harness.scheduler.set_task_status(
+            tid, 'done', done_provenance={'kind': kind, 'commit': sha},
+        )
+    harness.scheduler.mark_done = AsyncMock(side_effect=_succeed)  # type: ignore[attr-defined]
+    await harness._reconcile_stranded_in_progress()
+    assert '300' not in harness._reconcile_failure_counts
+
+
+# ---------------------------------------------------------------------------
+# R3: mid_run alive owner_pid (this run's harness PID) → fall through (Stage 3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mid_run_alive_owner_pid_not_in_dispatch_recovers(
+    harness: Harness, tmp_path: Path,
+):
+    """R3 fix: in mid_run sweep, an alive owner_pid that isn't in the
+    dispatch table represents a workflow that exited without releasing the
+    lock — the sweep must fall through to recovery rather than skip.
+
+    Pre-fix: ``if owner_alive: continue`` skipped these tasks forever
+    because harness.pid (this PID) is alive throughout the run.
+    """
+    harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'400': 'in-progress'}, None,
+    )
+
+    # Create a worktree with plan.lock pointing to OUR pid (harness.pid).
+    lock_dir = harness.git_ops.worktree_base / '400' / '.task'
+    lock_dir.mkdir(parents=True)
+    (lock_dir / 'plan.lock').write_text(json.dumps({
+        'session_id': '400-x', 'locked_at': datetime.now(UTC).isoformat(),
+        'owner_pid': os.getpid(),
+    }))
+
+    changed = await harness._reconcile_stranded_in_progress(mid_run=True)
+
+    # Stage 3: must fall through to revert (was skipped pre-fix).
+    assert changed == 1
+    harness.scheduler.set_task_status.assert_called_once_with('400', 'pending')  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_startup_alive_owner_pid_left_alone(harness: Harness):
+    """At startup (mid_run=False), an alive owner_pid still skips recovery.
+
+    R3 only changes mid_run behaviour — the startup path retains the
+    historical skip-on-alive contract.
+    """
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'401': 'in-progress'}, None,
+    )
+
+    lock_dir = harness.git_ops.worktree_base / '401' / '.task'
+    lock_dir.mkdir(parents=True)
+    (lock_dir / 'plan.lock').write_text(json.dumps({
+        'session_id': '401-x', 'locked_at': datetime.now(UTC).isoformat(),
+        'owner_pid': os.getpid(),
+    }))
+
+    changed = await harness._reconcile_stranded_in_progress(mid_run=False)
+
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_mid_run_cancel_window_grace(harness: Harness, tmp_path: Path):
+    """R3 race guard: a workflow whose cancel_event was set within the grace
+    window is skipped — its finally: block may still be writing state.
+
+    Outside the window the sweep proceeds.
+    """
+    harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
+    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'500': 'in-progress'}, None,
+    )
+
+    # Stamp cancel-time NOW — within grace window → skip.
+    import time as _time
+    harness._workflow_cancel_at['500'] = _time.monotonic()
+
+    changed = await harness._reconcile_stranded_in_progress(mid_run=True)
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    # Stamp cancel-time well in the past → proceed.
+    harness._workflow_cancel_at['500'] = (
+        _time.monotonic() - harness._RECONCILE_CANCEL_GRACE_S - 1
+    )
+    changed = await harness._reconcile_stranded_in_progress(mid_run=True)
+    # Task has no worktree → orphan revert.
+    assert changed == 1
+    harness.scheduler.set_task_status.assert_called_once_with('500', 'pending')  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# R4: blocked-task pass (Stage 4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_blocked_with_branch_on_main_marked_done(harness: Harness):
+    """Blocked task whose branch is already on main → marked done.
+
+    Out-of-band-merged-while-blocked recovery: a human merged the branch
+    manually, leaving the row in 'blocked'. Next sweep should mark it done.
+    """
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'600': 'blocked'}, None,
+    )
+
+    changed = await harness._reconcile_stranded_in_progress()
+
+    assert changed == 1
+    # Provenance note distinguishes blocked-merge from in-progress-merge.
+    harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+        '600', 'done',
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': 'deadbeef' + 'a' * 32,
+            'note': 'reconcile: branch on main while task was blocked (out-of-band merge)',
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_without_on_main_evidence_left_alone(harness: Harness):
+    """Blocked task with no on-main evidence → untouched.
+
+    'blocked' is a deliberate state; we only flip it on observed evidence.
+    """
+    # is_ancestor=False, find_merge_marker=None (defaults from fixture)
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'601': 'blocked'}, None,
+    )
+
+    changed = await harness._reconcile_stranded_in_progress()
+
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_and_deferred_never_swept(harness: Harness):
+    """'cancelled' (terminal-by-decision) and 'deferred' (human-deferred) are
+    never touched by the sweep, even when their branch is on main."""
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'700': 'cancelled', '701': 'deferred'}, None,
+    )
+
+    changed = await harness._reconcile_stranded_in_progress()
+
+    assert changed == 0
+    harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+    harness.git_ops.is_ancestor.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_blocked_with_merge_marker_marked_done(harness: Harness):
+    """Blocked task whose branch was deleted but a merge marker is on main."""
+    marker_sha = 'cafe' + 'b' * 36
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'602': 'blocked'}, None,
+    )
+
+    changed = await harness._reconcile_stranded_in_progress()
+
+    assert changed == 1
+    harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+        '602', 'done',
+        done_provenance={
+            'kind': 'found_on_main',
+            'commit': marker_sha,
+            'note': 'reconcile: merge marker found on main while task was blocked',
+        },
+    )

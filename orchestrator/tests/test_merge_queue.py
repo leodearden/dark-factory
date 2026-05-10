@@ -24,7 +24,9 @@ from orchestrator.merge_queue import (
     MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
+    _check_post_merge_equivalence,
 )
 
 # ---------------------------------------------------------------------------
@@ -4465,31 +4467,237 @@ class TestWorktreeMissingHandling:
             f'unexpected reason: {outcome.reason!r}'
         )
 
-    async def test_speculative_merger_surfaces_worktree_missing(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ):
-        worktree = (await git_ops.create_worktree('spec-worktree-missing')).path
-        (worktree / 'f.py').write_text('y=2\n')
-        await git_ops.commit(worktree, 'add f')
-        import shutil as _shutil
-        _shutil.rmtree(worktree)
 
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
-        try:
-            req = _make_request(
-                'spec-worktree-missing', 'spec-worktree-missing', worktree, config,
-            )
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=15)
-        finally:
-            await worker.stop()
-            worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker_task
+@pytest.mark.asyncio
+class TestCheckPlanFilesTouchedInBranch:
+    """Unit tests for the pre-merge Decision-1 subset check."""
 
-        assert outcome.status == 'blocked'
-        assert outcome.reason.startswith(WORKTREE_MISSING_REASON_PREFIX), (
-            f'unexpected reason: {outcome.reason!r}'
+    async def test_empty_plan_files_returns_empty(self, git_ops: GitOps):
+        """Empty plan.files → vacuously satisfied (no entries to check)."""
+        result = await _check_plan_files_touched_in_branch(
+            [], 'a' * 40, 'b' * 40, git_ops,
         )
+        assert result.not_touched == []
+
+    async def test_all_plan_files_touched_in_branch(self, git_ops: GitOps):
+        """Every plan entry appears in the branch history → empty not_touched."""
+        wt = (await git_ops.create_worktree('plan-touched-all')).path
+        rc, base_out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=wt,
+        )
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'src').mkdir()
+        (wt / 'src' / 'a.py').write_text('a = 1\n')
+        (wt / 'src' / 'b.py').write_text('b = 2\n')
+        await git_ops.commit(wt, 'Add a.py + b.py')
+        rc, head_out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=wt,
+        )
+        head = head_out.strip()
+
+        result = await _check_plan_files_touched_in_branch(
+            ['src/a.py', 'src/b.py'], base, head, git_ops,
+            task_id='all-touched',
+        )
+        assert result.not_touched == []
+
+    async def test_single_plan_file_not_touched_flagged(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """A plan entry the branch never touched → flagged + structured WARNING."""
+        wt = (await git_ops.create_worktree('plan-touched-missing')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'src').mkdir()
+        (wt / 'src' / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt, 'Add a.py')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                ['src/a.py', 'src/never_touched.py'],
+                base, head, git_ops, task_id='miss-test',
+            )
+
+        assert result.not_touched == ['src/never_touched.py']
+        warn = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warn, 'expected a structured WARNING when not_touched non-empty'
+        msg = ' '.join(r.getMessage() for r in warn)
+        assert 'miss-test' in msg
+        assert 'src/never_touched.py' in msg
+
+    async def test_directory_prefix_match_passes(self, git_ops: GitOps):
+        """A plan entry that resolves to a directory passes when any touched
+        file has it as a path prefix.
+        """
+        wt = (await git_ops.create_worktree('plan-touched-dir')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'src' / 'pkg').mkdir(parents=True)
+        (wt / 'src' / 'pkg' / 'mod_a.py').write_text('a = 1\n')
+        (wt / 'src' / 'pkg' / 'mod_b.py').write_text('b = 2\n')
+        await git_ops.commit(wt, 'Add pkg/*.py')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        # Plan declares a directory; the touched-set has pkg/mod_a.py and
+        # pkg/mod_b.py — directory entry must satisfy the gate.
+        result = await _check_plan_files_touched_in_branch(
+            ['src/pkg'], base, head, git_ops, task_id='dir-test',
+        )
+        assert result.not_touched == []
+
+    async def test_unknown_entry_neither_file_nor_directory_flagged(
+        self, git_ops: GitOps,
+    ):
+        """Plan entry that's neither a touched file nor a directory in the
+        branch tree → flagged (it's a typo or stale plan reference)."""
+        wt = (await git_ops.create_worktree('plan-touched-typo')).path
+        rc, base_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        base = base_out.strip()
+        (wt / 'real.py').write_text('r = 1\n')
+        await git_ops.commit(wt, 'Add real.py')
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        head = head_out.strip()
+
+        result = await _check_plan_files_touched_in_branch(
+            ['real.py', 'phantom/typo.py'], base, head, git_ops,
+        )
+        assert result.not_touched == ['phantom/typo.py']
+
+
+@pytest.mark.asyncio
+class TestCheckPostMergeEquivalence:
+    """Unit tests for the post-merge Decision-2 content-equivalence check."""
+
+    async def test_ff_merge_passes(self, git_ops: GitOps):
+        """A clean merge whose advanced main matches branch HEAD → empty list."""
+        wt = (await git_ops.create_worktree('equiv-ff')).path
+        (wt / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt, 'Add a.py')
+
+        merge_result = await git_ops.merge_to_main(wt, 'equiv-ff')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='equiv-ff', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            assert advanced is not None
+            failed = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, task_id='equiv-ff-test',
+            )
+            assert failed == []
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_diverging_tree_flags_files(
+        self, git_ops: GitOps,
+    ):
+        """When advanced main has a file the branch lacks (or vice versa),
+        the diverging path is reported.
+
+        Synthesized by pointing the check at a SHA that doesn't match the
+        branch — cheaper than orchestrating a real conflict resolution."""
+        wt = (await git_ops.create_worktree('equiv-diverge')).path
+        (wt / 'branch_only.py').write_text('b = 1\n')
+        await git_ops.commit(wt, 'Add branch_only.py')
+        rc, branch_head_out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=wt,
+        )
+        branch_head = branch_head_out.strip()
+
+        # Use the worktree's BASE SHA as the "advanced" reference — the
+        # branch's commit isn't there, so the diff names branch_only.py.
+        rc, base_out, _ = await _run(
+            ['git', 'rev-parse', 'HEAD~1'], cwd=wt,
+        )
+        assert rc == 0
+        synthetic_main = base_out.strip()
+
+        failed = await _check_post_merge_equivalence(
+            wt, synthetic_main, git_ops, task_id='equiv-diverge-test',
+        )
+        assert failed == ['branch_only.py']
+        assert branch_head != synthetic_main  # sanity
+
+    async def test_dot_task_diff_excluded(self, git_ops: GitOps):
+        """``.task/`` differences are excluded — they legitimately diverge
+        post-cleanup and would false-positive otherwise."""
+        wt = (await git_ops.create_worktree('equiv-task-only')).path
+        (wt / 'real.py').write_text('r = 1\n')
+        await git_ops.commit(wt, 'Add real.py')
+
+        merge_result = await git_ops.merge_to_main(wt, 'equiv-task-only')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        try:
+            await git_ops.advance_main(
+                merge_result.merge_commit, merge_result.merge_worktree,
+                branch='equiv-task-only', max_attempts=1,
+            )
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
+                or merge_result.merge_commit
+            )
+            assert advanced is not None
+
+            # Modify .task/ on the branch — should be excluded from the diff.
+            (wt / '.task').mkdir(exist_ok=True)
+            (wt / '.task' / 'plan.json').write_text('{"local": true}\n')
+            # Note: we don't commit .task/; it's untracked, so it doesn't
+            # affect the branch HEAD commit's tree.  This test asserts the
+            # exclusion pathspec doesn't fire spurious flags.
+
+            failed = await _check_post_merge_equivalence(
+                wt, advanced, git_ops, task_id='equiv-task-test',
+            )
+            assert failed == []
+        finally:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+
+@pytest.mark.asyncio
+async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_class(
+    git_ops, config,
+):
+    """Re-anchor the speculative-merger worktree-missing test after the
+    plan-files-touched test class (the original function body was clipped
+    when the new class was inserted)."""
+    worktree = (await git_ops.create_worktree('spec-worktree-missing')).path
+    (worktree / 'f.py').write_text('y=2\n')
+    await git_ops.commit(worktree, 'add f')
+    import shutil as _shutil
+    _shutil.rmtree(worktree)
+
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops, queue)
+    worker_task = asyncio.create_task(worker.run())
+    try:
+        req = _make_request(
+            'spec-worktree-missing', 'spec-worktree-missing', worktree, config,
+        )
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=15)
+    finally:
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+    assert outcome.status == 'blocked'
+    assert outcome.reason.startswith(WORKTREE_MISSING_REASON_PREFIX), (
+        f'unexpected reason: {outcome.reason!r}'
+    )

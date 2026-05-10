@@ -47,6 +47,22 @@ class FakeScheduler:
         if reopen_reason is not None:
             self.reopen_reasons[task_id] = reopen_reason
 
+    async def mark_done(
+        self,
+        task_id: str,
+        *,
+        kind: str,
+        sha: str,
+        note: str | None = None,
+    ) -> None:
+        """Mirror Scheduler.mark_done: forward to set_task_status with provenance."""
+        provenance: dict = {'kind': kind, 'commit': sha}
+        if note is not None:
+            provenance['note'] = note
+        await self.set_task_status(
+            task_id, 'done', done_provenance=provenance,
+        )
+
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str]
     ) -> bool:
