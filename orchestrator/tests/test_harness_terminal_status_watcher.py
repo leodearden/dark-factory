@@ -26,7 +26,7 @@ def harness() -> Harness:
     # cancel_workflow stamps wall-clock for the reconcile sweep grace
     # window (R3 race guard) — match the real Harness attribute set.
     h._workflow_cancel_at = {}
-    h.scheduler = type('S', (), {})()
+    h.scheduler = type('S', (), {})()  # type: ignore[assignment]
     return h
 
 

@@ -41,8 +41,6 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import (
-    DoneGateRejection,
-    ProvenanceValidationRejection,
     SetTaskStatusRejected,
     TaskAssignment,
     TerminalExitRejection,

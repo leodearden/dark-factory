@@ -22,7 +22,6 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
     MergeWorker,
-    PlanFilesTouchedResult,
     SpeculativeItem,
     SpeculativeMergeWorker,
     _check_plan_files_touched_in_branch,
@@ -4584,20 +4583,24 @@ class TestCheckPostMergeEquivalence:
 
         merge_result = await git_ops.merge_to_main(wt, 'equiv-ff')
         assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
         try:
             await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='equiv-ff', max_attempts=1,
             )
-            advanced = getattr(git_ops, '_last_advanced_sha', None) \
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
                 or merge_result.merge_commit
+            )
+            assert advanced is not None
             failed = await _check_post_merge_equivalence(
                 wt, advanced, git_ops, task_id='equiv-ff-test',
             )
             assert failed == []
         finally:
-            if merge_result.merge_worktree:
-                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
     async def test_diverging_tree_flags_files(
         self, git_ops: GitOps,
@@ -4638,13 +4641,18 @@ class TestCheckPostMergeEquivalence:
 
         merge_result = await git_ops.merge_to_main(wt, 'equiv-task-only')
         assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
         try:
             await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='equiv-task-only', max_attempts=1,
             )
-            advanced = getattr(git_ops, '_last_advanced_sha', None) \
+            advanced = (
+                getattr(git_ops, '_last_advanced_sha', None)
                 or merge_result.merge_commit
+            )
+            assert advanced is not None
 
             # Modify .task/ on the branch — should be excluded from the diff.
             (wt / '.task').mkdir(exist_ok=True)
@@ -4658,8 +4666,7 @@ class TestCheckPostMergeEquivalence:
             )
             assert failed == []
         finally:
-            if merge_result.merge_worktree:
-                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
 
 @pytest.mark.asyncio
