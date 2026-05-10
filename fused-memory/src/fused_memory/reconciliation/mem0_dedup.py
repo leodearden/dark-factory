@@ -72,7 +72,11 @@ async def find_prior_memories(
             limit=limit,
         )
     except Exception as e:
-        # Keep singular 'find_prior_memory' phrasing for log-grep continuity with prior releases.
+        # Singular 'find_prior_memory' phrasing is the historical canonical grep term.  Both
+        # the find_prior_memory (wrapper) and find_prior_memories (this function) share this
+        # code path, so the message cannot match both function names anyway.  Keeping the
+        # singular phrasing preserves ops dashboard / alert-rule grep continuity across all
+        # historical log archives.  Do not change without auditing log-grep consumers.
         _log.warning('find_prior_memory search failed for task %s: %s', task_id, e)
         return []
 
