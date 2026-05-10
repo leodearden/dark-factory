@@ -6895,3 +6895,27 @@ class TestGraphitiQueuedGuidanceConstants:
             primary_stat_key='`memories_written`',
         )
         assert result == _STAGE2_GRAPHITI_QUEUED_GUIDANCE
+
+    # Step 3 tests: stage prompts consume the shared constants
+
+    def test_stage1_prompt_contains_shared_constant(self):
+        """STAGE1_SYSTEM_PROMPT contains _STAGE1_GRAPHITI_QUEUED_GUIDANCE verbatim."""
+        from fused_memory.reconciliation.prompts import _STAGE1_GRAPHITI_QUEUED_GUIDANCE
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert _STAGE1_GRAPHITI_QUEUED_GUIDANCE in STAGE1_SYSTEM_PROMPT
+
+    def test_stage2_prompt_contains_shared_constant(self):
+        """STAGE2_SYSTEM_PROMPT contains _STAGE2_GRAPHITI_QUEUED_GUIDANCE verbatim."""
+        from fused_memory.reconciliation.prompts import _STAGE2_GRAPHITI_QUEUED_GUIDANCE
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        assert _STAGE2_GRAPHITI_QUEUED_GUIDANCE in STAGE2_SYSTEM_PROMPT
+
+    def test_stage1_prompt_has_no_inline_duplication(self):
+        """The canonical anchor phrase appears exactly once in STAGE1_SYSTEM_PROMPT."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        assert STAGE1_SYSTEM_PROMPT.count('queued rather than persisted inline') == 1
+
+    def test_stage2_prompt_has_no_inline_duplication(self):
+        """The canonical anchor phrase appears exactly once in STAGE2_SYSTEM_PROMPT."""
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+        assert STAGE2_SYSTEM_PROMPT.count('queued rather than persisted inline') == 1
