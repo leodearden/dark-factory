@@ -285,6 +285,34 @@ async def test_update_task_memory_hints_union(backend, project_root):
     assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
 
 
+@pytest.mark.asyncio
+async def test_update_task_preserves_sibling_keys_during_memory_hints_append(backend, project_root):
+    """Regression: stage2 prompt promises siblings (`files`, `spawned_from`, audit dicts)
+    survive an additive merge whose incoming payload supplies only `memory_hints`. Lock
+    that promise end-to-end through `update_task`."""
+    await backend.add_task(
+        project_root=project_root,
+        title='audit-row',
+        metadata=json.dumps({
+            'files': ['src/a.py', 'src/b.py'],
+            'spawned_from': 'task-100',
+            'audit': {'created_by': 'x'},
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {
+        'files': ['src/a.py', 'src/b.py'],
+        'spawned_from': 'task-100',
+        'audit': {'created_by': 'x'},
+        'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+    }
+
+
 def test_merge_metadata_list_of_dicts_concatenates_without_dedup():
     """Unhashable list items (dicts) fall back to plain concatenation — no dedup."""
     old_raw = '{"x":[{"k":1}]}'
