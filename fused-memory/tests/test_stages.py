@@ -7008,3 +7008,27 @@ class TestPropagateEscalationQueueHelper:
                 'Stage did not receive _escalation_queue — single-pass iterator was exhausted by URL pass'
             )
 
+    def test_propagates_queue_only_when_url_is_none(self, minimal_harness):
+        """When only queue is set on harness, queue propagates but URL is left at pre-existing value.
+
+        Symmetric counterpart of test_propagates_url_only_when_queue_is_none; completes
+        the asymmetric-guard matrix: (url+queue, neither, url-only, queue-only).
+        """
+        fake_queue = MagicMock()
+        minimal_harness._escalation_url = None
+        minimal_harness._escalation_queue = fake_queue
+
+        stages = [
+            MagicMock(_escalation_url='preexisting', _escalation_queue=None)
+            for _ in range(3)
+        ]
+        minimal_harness._propagate_escalation_queue(stages)
+
+        for stage in stages:
+            assert stage._escalation_queue is fake_queue, (
+                'Helper must propagate _escalation_queue when harness has a queue'
+            )
+            assert stage._escalation_url == 'preexisting', (
+                'Helper must not overwrite _escalation_url when harness has no URL'
+            )
+
