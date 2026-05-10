@@ -2805,6 +2805,7 @@ class TestMarkBlockedFalseDoneGuard:
             f'Expected BLOCKED, got {outcome!r}'
         )
         spy_mark_blocked.assert_awaited_once()
+        assert spy_mark_blocked.await_args is not None
         _args, kwargs = spy_mark_blocked.await_args
         assert kwargs.get('escalate_to_human') is True, (
             'dropped_plan_targets must call _mark_blocked(escalate_to_human=True); '
