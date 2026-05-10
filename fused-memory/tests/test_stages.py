@@ -1450,7 +1450,7 @@ class TestAutopilotVideoTaskCeilingFreshness:
         fixture_data = json.loads(fixture_path.read_text())
         fixture_max_id = int(fixture_data['max_id'])
 
-        assert _AUTOPILOT_VIDEO_TASK_CEILING >= fixture_max_id, (
+        assert fixture_max_id <= _AUTOPILOT_VIDEO_TASK_CEILING, (
             f'_AUTOPILOT_VIDEO_TASK_CEILING={_AUTOPILOT_VIDEO_TASK_CEILING} is below '
             f'the committed fixture max_id={fixture_max_id}.  '
             f'Bump _AUTOPILOT_VIDEO_TASK_CEILING in '
