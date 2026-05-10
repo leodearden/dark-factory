@@ -24,6 +24,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from orchestrator.merge_queue import (
+    DROPPED_PLAN_TARGETS_REASON_PREFIX,
+    MergeOutcome,
+    MergeRequest,
+)
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -264,3 +269,50 @@ async def test_dropped_plan_targets_excluded_from_thrash_counter():
         reason=f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: foo.py. extra context',
     )
     assert sample_outcome.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_dropped_plan_targets_short_circuits_to_l1_excluded_from_thrash(
+    tmp_path: Path, monkeypatch,
+):
+    """Fix 2 short-circuits dropped_plan_targets → never enters thrash counter.
+
+    The thrash helper is only called from the merge-phase loop after
+    _submit_to_merge_queue returns REQUEUED.  The drop-guard reason
+    routes through _mark_blocked(escalate_to_human=True), which returns
+    BLOCKED — the loop's ``if merge_outcome != WorkflowOutcome.REQUEUED:
+    return merge_outcome`` short-circuit fires before the thrash check.
+
+    Pin this contract so a future refactor can't accidentally route
+    dropped_plan_targets through the steward path and let it accumulate
+    in this counter.
+    """
+    f = _make()
+    wf = f.wf
+    wf.worktree = tmp_path / 'wt'
+    wf.worktree.mkdir(parents=True, exist_ok=True)
+    wf.merge_queue = MagicMock()
+    wf.plan = {'files': []}
+    wf._module_configs = []
+
+    async def fake_enqueue(queue, req: MergeRequest, event_store):
+        req.result.set_result(MergeOutcome(
+            'blocked',
+            reason=f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: foo.py',
+        ))
+
+    monkeypatch.setattr(
+        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
+    )
+
+    outcome = await wf._submit_to_merge_queue('99', pre_rebased=False)
+
+    # (a) outcome is BLOCKED
+    assert outcome == WorkflowOutcome.BLOCKED
+    # (b) _mark_blocked awaited with escalate_to_human=True
+    f.mark_blocked.assert_awaited_once()
+    _, kwargs = f.mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is True
+    # (c) thrash counter cannot be incremented: drop-guard path skipped the
+    # _last_merge_block_reason capture that would feed the thrash signature.
+    assert wf._last_merge_block_reason is None
