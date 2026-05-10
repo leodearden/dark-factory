@@ -82,7 +82,7 @@ def _candidate_blob(
 
 
 async def _force_failed(store: TicketStore, ticket_id: str, *, reason: str) -> None:
-    db = store._db
+    db = store._require_db()
     await db.execute(
         "UPDATE tickets SET status='failed', reason=?, resolved_at=datetime('now') "
         "WHERE ticket_id=?",
@@ -422,7 +422,7 @@ async def test_worker_dead_escalations_respect_cooldown(store, tmp_path):
     handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
     try:
         project_id = _project_id_for(tmp_path)
-        a = await store.submit(
+        await store.submit(
             project_id=project_id,
             candidate_json=_candidate_blob(title='first batch'),
         )

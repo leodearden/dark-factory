@@ -37,7 +37,6 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -121,7 +120,7 @@ class TicketJanitor:
 
     def __init__(
         self,
-        store: 'TicketStore',
+        store: TicketStore,
         *,
         cooldown_secs: float = 3600.0,
         batch_limit: int = 100,
@@ -151,7 +150,7 @@ class TicketJanitor:
         self._escalation_log: dict[tuple[str, str, str], list[float]] = defaultdict(list)
         self._queues: dict[str, EscalationQueue] = {}
 
-    def _queue_for(self, project_root: str) -> 'EscalationQueue':
+    def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
             q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
