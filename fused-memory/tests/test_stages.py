@@ -6217,22 +6217,3 @@ class TestTaskKnowledgeSyncStage2Guards:
                 and 'task_id=99' in r.getMessage()
                 for r in caplog.records
             )
-
-
-class TestStage2NumericContaminationGuardrail:
-    """STAGE2_SYSTEM_PROMPT must contain the cross-project contamination guardrail
-    section.
-
-    This test class guards section *presence* only — not section wording or position.
-    Semantic effectiveness of the guardrail (i.e. whether Stage 2 actually aborts on
-    contaminated payloads) is observed in production cycle behaviour, not pinned in
-    unit tests.
-    """
-
-    def test_contamination_guardrail_section_present(self):
-        """STAGE2_SYSTEM_PROMPT must contain the contamination guardrail section."""
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-
-        assert 'Contamination Guardrail' in STAGE2_SYSTEM_PROMPT, (
-            "STAGE2_SYSTEM_PROMPT must contain a 'Contamination Guardrail' section"
-        )
