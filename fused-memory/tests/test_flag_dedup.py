@@ -1236,6 +1236,43 @@ class TestFilterSuppressed:
         assert len(result) == 1
         assert result[0] == flags[0]
 
+    @pytest.mark.asyncio
+    async def test_flag_with_explicit_None_task_id_not_dropped_by_None_string_in_suppressed_set(self):
+        """(h) flag with task_id=None must NOT be dropped even when 'None' is in the suppressed set.
+
+        Producer-side guard (lines 149-150) drops records with task_id=None or ''.
+        But a suppression record can reach the set with task_id='None' (the literal
+        string) if a hand-authored or legacy record stores that value — it passes the
+        `is None or == ''` guard and is added as str('None')='None'.
+
+        Without the consumer-side guard, `str(f.get('task_id', ''))` returns 'None'
+        for a flag whose task_id key is present but set to None, so the flag is
+        incorrectly dropped.  With the symmetric consumer guard (short-circuit to
+        keep when flag_tid is None or ''), the flag must be preserved.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        # A suppression record with task_id='None' (literal string — passes
+        # producer guard since 'None' is not None and not '').
+        suppression_record_with_None_string = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 'None',  # literal string 'None', not Python None
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[suppression_record_with_None_string])
+
+        # Flag whose task_id key is present but set to Python None.
+        flag_with_None_task_id = {'task_id': None, 'flag_type': 'missing_deliverable'}
+        flags = [flag_with_None_task_id]
+
+        result = await filter_suppressed(memory_service, 'p', flags)
+
+        # The flag must be preserved — task_id=None is not a valid suppression target.
+        assert len(result) == 1, (
+            f'Expected flag with task_id=None to be preserved but result was: {result}'
+        )
+        assert result[0] == flag_with_None_task_id
+
 
 # ---------------------------------------------------------------------------
 # task-1186 step-3 — filter_suppressed: search exception → pass-through + WARNING
