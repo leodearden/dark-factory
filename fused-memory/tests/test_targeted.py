@@ -901,7 +901,7 @@ async def test_blocked_treats_non_dict_response_as_failure(
 
     Under the old formula ``not (isinstance(resp, dict) and resp.get('error'))``,
     ``None`` evaluates to success (the inner expression is False, outer not→True).
-    After the fix (``_interceptor_write_succeeded``), non-dicts always → False.
+    After the fix (``interceptor_write_succeeded``), non-dicts always → False.
 
     Assertions:
     (1) interceptor.update_task called once.

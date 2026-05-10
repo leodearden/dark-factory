@@ -2801,7 +2801,7 @@ class TaskInterceptor:
            shape ``{'error': '<msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
            (no ``success`` key).
 
-        Callers must use :func:`_interceptor_write_succeeded` to distinguish a successful
+        Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
         """
         if err := _reject_status_in_update_task(task_id, kwargs.get('status')):
@@ -3526,7 +3526,7 @@ def _reject_done_provenance_in_update_metadata(
     }
 
 
-def _interceptor_write_succeeded(resp: object) -> bool:
+def interceptor_write_succeeded(resp: object) -> bool:
     """Return True iff *resp* represents a successful TaskInterceptor write.
 
     Centralises the success/failure contract so all callers use a single,
@@ -3543,9 +3543,16 @@ def _interceptor_write_succeeded(resp: object) -> bool:
       (no ``success`` key — defeated by the ``not resp.get('error')`` clause)
 
     The ``success`` key defaults to ``True`` so a successful Taskmaster passthrough
-    that does not include an explicit ``success`` field still classifies correctly
-    (empty ``{}`` → success). Non-dict responses (``None``, strings, lists) are
-    always treated as failures.
+    that does not include an explicit ``success`` field still classifies correctly.
+    Non-dict responses (``None``, strings, lists) are always treated as failures.
+
+    .. warning::
+        An empty dict ``{}`` is treated as success (both ``success`` and ``error`` are
+        absent, so both default to their "no problem" values). This is intentional for
+        fixture compatibility, but it means a future upstream bug that returns ``{}``
+        instead of ``{'success': True, 'id': …}`` would be silently classified as a
+        successful write. Production Taskmaster responses always include at least one
+        of ``success`` or ``id``; if you see a ``{}`` in logs, investigate the caller.
     """
     return (
         isinstance(resp, dict)

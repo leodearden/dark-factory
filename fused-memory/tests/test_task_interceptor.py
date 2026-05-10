@@ -4936,11 +4936,11 @@ async def test_set_task_status_done_with_provenance_preserves_metadata(
     assert persisted['memory_hints'] == {'queries': ['hint']}
 
 
-# ── task-1184: _interceptor_write_succeeded helper contract ──
+# ── task-1184: interceptor_write_succeeded helper contract ──
 
 
 class TestInterceptorWriteSucceeded:
-    """Unit tests for the module-level ``_interceptor_write_succeeded(resp)`` helper.
+    """Unit tests for the module-level ``interceptor_write_succeeded(resp)`` helper.
 
     The helper centralises the success/failure contract for all three rejection-dict
     shapes produced by TaskInterceptor gates:
@@ -4951,8 +4951,8 @@ class TestInterceptorWriteSucceeded:
     """
 
     def _fn(self):
-        from fused_memory.middleware.task_interceptor import _interceptor_write_succeeded
-        return _interceptor_write_succeeded
+        from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+        return interceptor_write_succeeded
 
     def test_explicit_success_true(self):
         """{'success': True} → True."""

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.middleware.task_interceptor import _interceptor_write_succeeded
+from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 from fused_memory.models.reconciliation import (
     MemoryHints,
     ReconciliationRun,
@@ -355,8 +355,8 @@ class TargetedReconciler:
                 # write actually succeeded; emit 'hints_skipped' with diagnostics on
                 # rejection so operators have a positive, queryable signal (task 1136).
                 # Non-dict responses (e.g. None) are always failures — contract is
-                # centralised in _interceptor_write_succeeded (task 1184).
-                write_succeeded = _interceptor_write_succeeded(resp)
+                # centralised in interceptor_write_succeeded (task 1184).
+                write_succeeded = interceptor_write_succeeded(resp)
 
                 if write_succeeded:
                     result['actions'].append({
