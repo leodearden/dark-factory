@@ -38,6 +38,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _classify_terminal_state_violations,
     _format_flagged,
     _queue_briefing_refresh_tasks,
+    _resolve_live_status,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
@@ -5554,6 +5555,180 @@ def stage2_guard_mock_deps():
 
 class TestTaskKnowledgeSyncStage2Guards:
     """Parent namespace for the four Stage 2 post-flight guard tests."""
+
+    class TestResolveLiveStatus:
+        """Unit tests for the _resolve_live_status shared helper."""
+
+        def _make_op(
+            self,
+            *,
+            op_id: str = 'op-1',
+            agent_id: str = 'recon-stage-task_knowledge_sync',
+            operation: str = 'update_task',
+            params: dict | str | None = None,
+        ) -> dict:
+            """Return a minimal write_journal op dict for _resolve_live_status testing."""
+            if params is None:
+                params = {'task_id': '42'}
+            params_str = json.dumps(params) if isinstance(params, dict) else params
+            return {
+                'id': op_id,
+                'agent_id': agent_id,
+                'operation': operation,
+                'params': params_str,
+                'layer': 'write_op',
+                'causation_id': 'run-test',
+                'created_at': '2026-01-01T00:00:00',
+            }
+
+        @pytest.mark.asyncio
+        async def test_returns_tuple_for_update_task_with_cache_hit(self):
+            """update_task op with cache hit -> ('42', 'done') tuple, get_task not called."""
+            taskmaster = AsyncMock()
+            op = self._make_op(operation='update_task', params={'task_id': '42'})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', {'42': 'done'},
+                '_classify_terminal_state_violations',
+            )
+            assert result == ('42', 'done')
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_returns_tuple_for_set_task_status_with_cache_hit(self):
+            """set_task_status op reads task_id from params (not metadata)."""
+            taskmaster = AsyncMock()
+            op = self._make_op(
+                operation='set_task_status',
+                params={'task_id': '7', 'status': 'done'},
+            )
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', {'7': 'pending'},
+                '_verify_set_task_status_post_action',
+            )
+            assert result == ('7', 'pending')
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_returns_tuple_for_add_memory_reads_metadata_task_id(self):
+            """add_memory op reads task_id from params['metadata']['task_id']."""
+            taskmaster = AsyncMock()
+            op = self._make_op(
+                operation='add_memory',
+                params={'metadata': {'task_id': '11', 'snapshot_status': 'in-progress'}},
+            )
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', {'11': 'done'},
+                '_check_stall_guard_freshness',
+            )
+            assert result == ('11', 'done')
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_returns_tuple_with_fallback_get_task(self):
+            """status_cache=None -> fallback to taskmaster.get_task."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = {'status': 'in-progress'}
+            op = self._make_op(operation='update_task', params={'task_id': '42'})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', None,
+                '_classify_terminal_state_violations',
+            )
+            assert result == ('42', 'in-progress')
+            taskmaster.get_task.assert_called_once_with('42', '/project')
+
+        @pytest.mark.asyncio
+        async def test_returns_unknown_when_fallback_returns_non_dict(self):
+            """Non-dict get_task result in fallback mode -> live_status='unknown'."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.return_value = 'oops'
+            op = self._make_op(operation='update_task', params={'task_id': '42'})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', None,
+                '_classify_terminal_state_violations',
+            )
+            assert result == ('42', 'unknown')
+
+        @pytest.mark.asyncio
+        async def test_returns_none_on_malformed_params_json(self, caplog):
+            """Malformed params JSON -> returns None and emits WARNING containing op_name."""
+            taskmaster = AsyncMock()
+            op = self._make_op(operation='update_task')
+            op['params'] = 'not json'
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ):
+                result = await _resolve_live_status(
+                    op, taskmaster, '/project', None,
+                    '_classify_terminal_state_violations',
+                )
+            assert result is None
+            assert '_classify_terminal_state_violations' in caplog.text
+
+        @pytest.mark.asyncio
+        async def test_returns_none_on_missing_task_id_for_update_task(self):
+            """update_task op with params={} (no task_id) -> returns None."""
+            taskmaster = AsyncMock()
+            op = self._make_op(operation='update_task', params={})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', None,
+                '_classify_terminal_state_violations',
+            )
+            assert result is None
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_returns_none_on_missing_task_id_for_add_memory(self):
+            """add_memory op with metadata={} (no task_id) -> returns None."""
+            taskmaster = AsyncMock()
+            op = self._make_op(operation='add_memory', params={'metadata': {}})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', None,
+                '_check_stall_guard_freshness',
+            )
+            assert result is None
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_returns_none_on_add_memory_with_non_dict_metadata(self):
+            """add_memory op with metadata='oops' (non-dict) -> returns None."""
+            taskmaster = AsyncMock()
+            op = self._make_op(operation='add_memory', params={'metadata': 'oops'})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', None,
+                '_check_stall_guard_freshness',
+            )
+            assert result is None
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_returns_none_on_cache_miss(self):
+            """Cache provided but task_id not in cache -> returns None, get_task NOT called."""
+            taskmaster = AsyncMock()
+            op = self._make_op(operation='update_task', params={'task_id': '42'})
+            result = await _resolve_live_status(
+                op, taskmaster, '/project', {},
+                '_classify_terminal_state_violations',
+            )
+            assert result is None
+            taskmaster.get_task.assert_not_called()
+
+        @pytest.mark.asyncio
+        async def test_returns_none_on_fallback_get_task_exception(self, caplog):
+            """Fallback get_task raises -> returns None and emits WARNING."""
+            taskmaster = AsyncMock()
+            taskmaster.get_task.side_effect = RuntimeError('boom')
+            op = self._make_op(operation='update_task', params={'task_id': '42'})
+            with caplog.at_level(
+                logging.WARNING,
+                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            ):
+                result = await _resolve_live_status(
+                    op, taskmaster, '/project', None,
+                    '_classify_terminal_state_violations',
+                )
+            assert result is None
+            assert '_classify_terminal_state_violations' in caplog.text
 
     class TestTerminalStatePreCheck:
         """Unit tests for _classify_terminal_state_violations helper."""
