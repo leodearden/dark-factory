@@ -128,6 +128,11 @@ class TicketJanitor:
         See ``plans/deep-squishing-lagoon.md`` for the trade-off discussion.
     """
 
+    # Emit the startup discoverability nudge once per process, not once per
+    # construction — the test suite creates many janitors and would otherwise
+    # spam INFO for every test that instantiates one.
+    _registry_log_emitted: bool = False
+
     def __init__(
         self,
         store: TicketStore,
@@ -159,11 +164,13 @@ class TicketJanitor:
         # escalation_id). Reset on process restart by design.
         self._escalation_log: dict[tuple[str, str, str], list[float]] = defaultdict(list)
         self._queues: dict[str, EscalationQueue] = {}
-        logger.info(
-            'ticket_janitor: project registry snapshotted at init (%d project(s)); '
-            'restart to pick up DASHBOARD_KNOWN_PROJECT_ROOTS changes (task 1164)',
-            len(self._known_projects),
-        )
+        if not TicketJanitor._registry_log_emitted:
+            TicketJanitor._registry_log_emitted = True
+            logger.info(
+                'ticket_janitor: project registry snapshotted at init (%d project(s)); '
+                'restart to pick up DASHBOARD_KNOWN_PROJECT_ROOTS changes (task 1164)',
+                len(self._known_projects),
+            )
 
     def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)

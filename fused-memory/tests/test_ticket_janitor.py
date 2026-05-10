@@ -528,7 +528,22 @@ async def test_init_snapshots_known_projects_against_post_init_env_mutation(
         f'proj_a project_id {proj_a_id!r} must appear in registry; got {pre_mutation}'
     )
 
+    # Submit a failed ticket so tick() has a row to process, forcing it through
+    # the _known_projects.get() code path.  Without rows tick() returns early
+    # and never touches the registry — the snapshot contract would be untested.
+    ticket_id = await store.submit(
+        project_id=proj_a_id,
+        candidate_json=_candidate_blob(task_id='t1', escalation_id='esc-1'),
+    )
+    await _force_failed(store, ticket_id, reason='curator_rejected')
+
     monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(proj_b))
+
+    # tick() must route the failed ticket using the snapshotted registry, not
+    # the current env.  The proj_a orchestrator lock doesn't exist so the
+    # escalation is skipped, but the _known_projects lookup itself is exercised.
+    await janitor.tick()
+
     assert janitor._known_projects == pre_mutation, (
         'post-init env mutation must not change the janitor registry; '
         f'registry changed from {pre_mutation} to {janitor._known_projects}'
