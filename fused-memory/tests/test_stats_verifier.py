@@ -574,7 +574,8 @@ def test_alias_pass_reads_from_observed_for_order_independence(monkeypatch):
 
     # One successful add_memory op → observed = {'memories_added': 1}
     observed = {'memories_added': 1}
-    report = _stage_report(StageId.memory_consolidator, datetime.now(UTC), datetime.now(UTC))
+    now = datetime.now(UTC)
+    report = _stage_report(StageId.memory_consolidator, now - timedelta(minutes=1), now + timedelta(minutes=1))
     sv._apply_observed(report, observed)
 
     stats = report.stats
