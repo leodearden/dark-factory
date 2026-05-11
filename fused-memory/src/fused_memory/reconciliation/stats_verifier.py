@@ -248,8 +248,8 @@ def _apply_observed(
 
     # Read from observed (not stats) so the pass is order-independent: even if a
     # future misconfiguration chains aliases, each alias resolves against the
-    # immutable observed counts. The canonical-keys guard test in tests/ enforces
-    # that canonical_key is a real canonical key.
+    # immutable observed counts. _STAT_ALIASES values must be canonical keys
+    # (enforced by a guard test).
     for alias_key, canonical_key in _STAT_ALIASES.items():
         if alias_key in stats:
             reported_snapshot[alias_key] = stats[alias_key]
