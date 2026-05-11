@@ -559,8 +559,7 @@ class TestUpdateEdgeVerifiedFilter:
         )
 
 
-@pytest.mark.asyncio
-async def test_alias_pass_reads_from_observed_for_order_independence(journal, monkeypatch):
+def test_alias_pass_reads_from_observed_for_order_independence(monkeypatch):
     """Alias pass reads from observed, not stats — verifies order-independence under a chained alias."""
     import fused_memory.reconciliation.stats_verifier as sv  # noqa: PLC0415
 
@@ -573,26 +572,12 @@ async def test_alias_pass_reads_from_observed_for_order_independence(journal, mo
     monkeypatch.setattr(sv, '_TRACKED_STAT_KEYS',
                         sv._TRACKED_STAT_KEYS | frozenset({'foo'}))
 
-    run_id = str(uuid.uuid4())
-    now = datetime.now(UTC)
-    stage_start = now - timedelta(minutes=1)
-    stage_end = now + timedelta(minutes=1)
+    # One successful add_memory op → observed = {'memories_added': 1}
+    observed = {'memories_added': 1}
+    report = _stage_report(StageId.memory_consolidator, datetime.now(UTC), datetime.now(UTC))
+    sv._apply_observed(report, observed)
 
-    # One successful add_memory op → observed = {'memories_added': 1, ...}
-    await _log_write(
-        journal, causation_id=run_id, operation='add_memory',
-        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
-    )
-
-    reports: dict[str, StageReport | dict] = {
-        'memory_consolidator': _stage_report(
-            StageId.memory_consolidator, stage_start, stage_end,
-        ),
-    }
-
-    await verify_and_rewrite_stats(run_id, reports, journal)
-
-    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    stats = report.stats
 
     # Single-level alias: memories_written -> memories_added (canonical, in observed).
     assert stats['memories_added'] == 1
