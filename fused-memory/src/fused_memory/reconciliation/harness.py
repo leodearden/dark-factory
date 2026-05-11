@@ -1168,7 +1168,12 @@ class ReconciliationHarness:
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
-        # project_root is threaded by the caller — see docstring (task 1163).
+        # Defense-in-depth assert deliberately omitted.  A registry-bound check such
+        # as `assert project_root in self._known_projects.values()` would fail during
+        # the mid-cycle mutation window that task 1163 was specifically designed to
+        # tolerate: both test_remediation_pass_uses_threaded_project_root_over_registry
+        # and test_remediation_uses_threaded_project_root_not_mutated_registry pass a
+        # project_root that intentionally differs from the current registry value.
 
         run_id = str(uuid4())
         run = ReconciliationRun(

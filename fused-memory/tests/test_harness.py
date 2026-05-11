@@ -4494,10 +4494,6 @@ async def test_remediation_uses_threaded_project_root_not_mutated_registry(
 
     Assertion: all three remediation-pass captures equal '/path/A'
     (the pre-mutation resolution), NOT '/path/B' (the mutated registry value).
-
-    TODAY this test fails: _run_remediation_pass re-resolves after the mutation
-    and sets stage.project_root = '/path/B'.
-    AFTER the fix it passes: the threaded value '/path/A' wins.
     """
     harness = _make_harness_with_known_projects(
         journal, event_buffer, mock_memory_service,
@@ -4893,8 +4889,7 @@ class TestProjectLoopNarrowsExceptionHandling:
 class TestKnownProjectsInjection:
     """Tests for the known_projects DI kwarg on ReconciliationHarness (task 1164)."""
 
-    @pytest.mark.asyncio
-    async def test_harness_accepts_known_projects_kwarg_and_uses_it(
+    def test_harness_accepts_known_projects_kwarg_and_uses_it(
         self, journal, event_buffer, mock_memory_service, monkeypatch
     ):
         """Injected known_projects dict wins; build_known_projects_map is NOT called.
@@ -4935,8 +4930,7 @@ class TestKnownProjectsInjection:
         # The harness stores a defensive copy equal to the injected dict.
         assert harness._known_projects == {'pid_a': '/path/a', 'pid_b': '/path/b'}
 
-    @pytest.mark.asyncio
-    async def test_harness_default_known_projects_kwarg_falls_back_to_build_known_projects_map(
+    def test_harness_default_known_projects_kwarg_falls_back_to_build_known_projects_map(
         self, journal, event_buffer, mock_memory_service
     ):
         """When known_projects kwarg is omitted, harness falls back to build_known_projects_map.
