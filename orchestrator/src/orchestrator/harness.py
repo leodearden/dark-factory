@@ -256,6 +256,12 @@ class Harness:
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
         self._reconcile_failure_counts: dict[str, int] = {}
+        # Per-task consecutive-citation-miss counter for the reconcile sweep —
+        # incremented when the is_ancestor fast-path is short-circuited by a
+        # missing task-id citation on main; reset on any successful flip or
+        # genuine skip (e.g. open L1).  Used to escalate to L1 when the
+        # reconciler refuses to auto-flip a task indefinitely.
+        self._reconcile_skip_counts: dict[str, int] = {}
         # Wall-clock of the most recent _workflow_cancel_events.set() call,
         # keyed by task_id.  R3-race-guard window — the sweep skips a task
         # whose workflow was cancelled within the last
@@ -1126,10 +1132,57 @@ Output JSON matching the schema. Every task must appear in the output.
         branch = f'{self.git_ops.config.branch_prefix}{tid}'
 
         # Already-on-main fast-path (is_ancestor == True).
+        # NB: is_ancestor is degenerate for zero-commit branches whose tip
+        # equals the main HEAD at branch-create time.  Two guards reject
+        # the false-positive shape before we flip the row to done.
         if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
-            # Resolve SHA BEFORE cleanup_worktree (which runs `git branch -D`
-            # and would invalidate a post-cleanup rev-parse).
-            branch_sha = await self.git_ops.resolve_branch_sha(branch)
+            # Guard 1 — open L1 escalation for this task.  An L1 escalation
+            # is the deliberate human-handoff signal (e.g. workflow ran
+            # _mark_blocked(escalate_to_human=True) when the task was
+            # declared unactionable); the reconciler must not second-guess
+            # the disposition, even if the branch tip happens to sit on a
+            # main ancestor.  Skip counter is intentionally NOT incremented
+            # here — the L1 escalation that triggered the skip already
+            # exists, so double-escalating would spam.
+            if (
+                self._escalation_queue is not None
+                and self._escalation_queue.has_open_l1(tid)
+            ):
+                logger.info(
+                    'Reconcile: task %s on main but has open L1 escalation; '
+                    'leaving status=%s (open L1 vetoes auto-flip)',
+                    tid, status,
+                )
+                return None
+
+            # Guard 2 — positive citation evidence on main.  We require a
+            # commit on main whose subject cites the task id; this rejects
+            # the zero-commit-branch shape where is_ancestor returns True
+            # trivially but no commit actually lands the task's work.
+            # Resolve BEFORE cleanup_worktree (which runs `git branch -D`
+            # and would invalidate a post-cleanup grep against the branch).
+            citation_sha = await self.git_ops.find_task_citation_commit(
+                tid,
+                pattern_template=self.git_ops.config.commit_citation_pattern,
+            )
+            if citation_sha is None:
+                count = self._reconcile_skip_counts.get(tid, 0) + 1
+                self._reconcile_skip_counts[tid] = count
+                logger.info(
+                    'Reconcile: task %s branch on main but no commit '
+                    'cites task/%s; leaving status=%s '
+                    '(consecutive citation misses=%d/%d)',
+                    tid, tid, status, count, MAX_RECONCILE_FAILURES,
+                )
+                if (
+                    count >= MAX_RECONCILE_FAILURES
+                    and self._escalation_queue is not None
+                ):
+                    self._escalate_reconcile_skip(tid, status, count)
+                return None
+
+            # Both guards passed — clear the skip counter and flip.
+            self._reconcile_skip_counts.pop(tid, None)
             note = (
                 f'reconcile: branch on main while task was {status} '
                 f'(out-of-band merge)'
@@ -1137,7 +1190,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 else 'reconcile: branch already on main when stranded in-progress'
             )
             await self._mark_in_progress_done(
-                tid, branch_sha, note, 'branch-already-on-main',
+                tid, citation_sha, note, 'branch-already-on-main',
             )
             return 'marked_done'
 
@@ -1339,6 +1392,58 @@ Output JSON matching the schema. Every task must appear in the output.
         # action will resolve and the next true rejection (if any) starts
         # a fresh strike count.
         self._reconcile_failure_counts.pop(tid, None)
+
+    def _escalate_reconcile_skip(
+        self,
+        tid: str,
+        status: str,
+        count: int,
+    ) -> None:
+        """Submit an L1 escalation for persistent citation-miss skips.
+
+        Mirror of ``_escalate_reconcile_failure`` for the case where
+        ``find_task_citation_commit`` keeps returning None despite a stable
+        ``is_ancestor==True`` observation — i.e. the branch sits on main
+        but nothing on main cites the task, so the reconciler refuses to
+        auto-flip the row.  After ``MAX_RECONCILE_FAILURES`` consecutive
+        skips, escalate so a human can resolve manually.
+        """
+        if not self._escalation_queue:
+            return
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role='harness-reconcile',
+            severity='blocking',
+            category='reconcile_citation_missing',
+            summary=(
+                f'Reconciler refuses to auto-flip task {tid}: branch on '
+                f'main but no commit cites the task ({count}x consecutive)'
+            )[:200],
+            detail=(
+                f'reconciler refuses to auto-flip task {tid}: branch on '
+                f'main but no commit cites the task. Status: {status}. '
+                f'Resolve manually.\n\n'
+                f'Consecutive citation misses: {count} / '
+                f'{MAX_RECONCILE_FAILURES}.\n\n'
+                f'The is_ancestor check returns True for task/{tid}, but '
+                f'no commit on main matches the configured citation '
+                f'pattern (GitConfig.commit_citation_pattern, or the '
+                f'built-in default if unset).  Either the merge happened '
+                f'with a non-conventional commit subject, or the branch '
+                f'tip is degenerate (zero-commit branch sitting on a main '
+                f'ancestor).  Inspect the branch and main history; mark '
+                f'the task done manually if the work landed under a '
+                f'non-matching subject, or leave it in its current status '
+                f'and resolve this escalation to silence the sweep.'
+            ),
+            suggested_action='investigate_citation_missing',
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        self._reconcile_skip_counts.pop(tid, None)
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore

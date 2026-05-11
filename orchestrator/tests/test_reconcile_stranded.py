@@ -661,7 +661,11 @@ class TestReconcileStrandedInProgress:
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
         )
-        harness.git_ops.resolve_branch_sha.assert_awaited_once_with('task/50')  # type: ignore[attr-defined]
+        # The found_on_main SHA now comes from the citation-commit grep
+        # rather than the bare branch tip (gated by the post-fix Guard 2).
+        harness.git_ops.find_task_citation_commit.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '50', pattern_template=None,
+        )
 
         # cleanup_worktree must NOT have been called
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
@@ -870,39 +874,13 @@ class TestReconcileStrandedInProgress:
             'plan.lock should be removed by cleanup_worktree in the is_ancestor guard'
         )
 
-    async def test_already_merged_skipped_when_branch_unresolved(
-        self, harness: Harness, caplog
-    ):
-        """When resolve_branch_sha returns None (branch ref vanished after
-        is_ancestor check), the recovery is skipped (no set_task_status('done')
-        call) and a WARNING log is emitted containing the task id and
-        'rev-parse'.
-
-        Behaviour change vs. note-only provenance: ``mark_done`` requires a
-        real SHA so the server-side ancestor check has something to verify;
-        leaving the task in-progress for one more sweep is preferred over
-        recording a phantom done.
-        """
-        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
-        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
-            {'53': 'in-progress'}, None
-        )
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            await harness._reconcile_stranded_in_progress()
-
-        # Recovery skipped — no set_task_status call.
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-        harness.scheduler.mark_done.assert_not_awaited()  # type: ignore[attr-defined]
-
-        # WARNING log must mention the task id and 'rev-parse'
-        warning_messages = [
-            r.message for r in caplog.records if r.levelno >= logging.WARNING
-        ]
-        assert any(
-            '53' in msg and 'rev-parse' in msg for msg in warning_messages
-        ), f'Expected WARNING with task 53 and rev-parse, got: {warning_messages}'
+    # NB: an earlier test (``test_already_merged_skipped_when_branch_unresolved``)
+    # covered the ``resolve_branch_sha returns None`` race during the
+    # is_ancestor fast-path.  After the post-fix flow uses
+    # ``find_task_citation_commit`` to source the done_provenance SHA, that
+    # race is structurally impossible (the citation grep does not depend on
+    # a live branch ref).  Skip-without-flip semantics on missing evidence
+    # are covered by ``test_already_merged_skipped_when_main_lacks_task_citation``.
 
     # ------------------------------------------------------------------
     # find_merge_marker guard tests (deleted-branch fast-path)
@@ -1633,6 +1611,8 @@ async def test_n_strikes_escalates_to_l1(harness: Harness):
             return f'esc-{task_id}-{len(submissions)}'
         def submit(self, esc):
             submissions.append(esc)
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
 
     harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
 
