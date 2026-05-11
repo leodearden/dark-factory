@@ -682,8 +682,8 @@ class TestReconcileStrandedInProgress:
         disposition must take precedence over the degenerate is_ancestor==True
         observation.
         """
-        from escalation.queue import EscalationQueue
         from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
 
         # Wire up a real EscalationQueue and submit an L1 record for task 50.
         queue_dir = tmp_path / 'escalations'
