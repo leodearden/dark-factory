@@ -5,10 +5,15 @@ import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+from fused_memory.middleware.task_interceptor import (
+    _extract_metadata_files,
+    _missing_files,
+    interceptor_write_succeeded,
+)
 from fused_memory.models.reconciliation import (
     MemoryHints,
     ReconciliationRun,
@@ -19,7 +24,21 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 from fused_memory.utils.validation import InputValidationError, require_project_root
+
+# Defensive import — escalation is an optional workspace package (mirrors
+# scope_violation_escalator.py:43-48).  When absent, L1 escalation degrades
+# to a logged no-op; the sweep still cancels deterministic orphans and
+# blocks ambiguous ones, so the dashboard still surfaces orphan state.
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    _HAS_ESCALATION = True
+except ImportError:  # pragma: no cover — exercised only in minimal envs
+    Escalation = None  # type: ignore[assignment,misc]
+    EscalationQueue = None  # type: ignore[assignment,misc]
+    _HAS_ESCALATION = False
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -27,6 +46,17 @@ if TYPE_CHECKING:
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
 logger = logging.getLogger(__name__)
+
+# Reopen-reason prefix used by the cancellation sweep when it auto-cancels or
+# auto-blocks a descendant of a cancelled parent.  Recursion guard: when the
+# sweep's own writes fire `_on_task_cancelled` again on the descendant, the
+# inner handler short-circuits via `reason.startswith(...)` so the sweep
+# doesn't fan out a second time on each descendant.
+_PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
+
+# Default location of the per-project escalation queue.  Matches the
+# convention used by scope_violation_escalator.py and ticket_janitor.py.
+_ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 
 
 class TargetedReconciler:
@@ -93,8 +123,16 @@ class TargetedReconciler:
         project_id: str,
         task_before: dict,
         project_root: str,
+        reopen_reason: str | None = None,
     ) -> dict:
-        """Run targeted reconciliation for a single task state transition."""
+        """Run targeted reconciliation for a single task state transition.
+
+        ``reopen_reason`` is plumbed from ``TaskInterceptor._apply_status_transition``
+        and consumed by the cancellation-sweep recursion guard: when the sweep
+        auto-cancels a descendant with ``reopen_reason="parent_cancelled:<A>"``,
+        the resulting transition fires this handler again on the descendant,
+        and the guard short-circuits to prevent redundant re-sweep.
+        """
         run_id = str(uuid_mod.uuid4())
         start = datetime.now(UTC)
 
@@ -122,7 +160,16 @@ class TargetedReconciler:
             if handler is None:
                 result = {'task_id': task_id, 'actions': [], 'note': f'No handler for {transition}'}
             else:
-                result = await handler(task_id, project_id, project_root, task_before, run_id)
+                # Only _on_task_cancelled consumes reopen_reason today (sweep
+                # recursion guard).  Threading it via **kwargs avoids touching
+                # the other handlers' signatures.
+                handler_kwargs: dict[str, Any] = {}
+                if transition == 'cancelled':
+                    handler_kwargs['reopen_reason'] = reopen_reason
+                result = await handler(
+                    task_id, project_id, project_root, task_before, run_id,
+                    **handler_kwargs,
+                )
 
             elapsed = (datetime.now(UTC) - start).total_seconds()
             await self.journal.complete_run(run_id, 'completed')
@@ -402,45 +449,335 @@ class TargetedReconciler:
         return result
 
     async def _on_task_cancelled(
-        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
+        self,
+        task_id: str,
+        project_id: str,
+        project_root: str,
+        task_before: dict,
+        run_id: str,
+        *,
+        reopen_reason: str | None = None,
     ) -> dict:
-        """Task cancelled. Flag subtasks and dependents for review."""
+        """Task cancelled. Flag subtasks; sweep top-level dep-tree for orphans.
+
+        The sweep classifies each non-terminal descendant (tasks where
+        ``metadata.spawned_from == task_id`` OR ``task_id`` is in ``dependencies``)
+        into one of three routes:
+
+        1. **Cancel** — deterministic orphan: top-level review-followup of A
+           (``spawned_from == A`` AND ``escalation_id`` set) whose declared
+           ``metadata.files`` (if any) no longer exist at ``project_root``.
+        2. **L1 escalate** — ambiguous descendant + orchestrator live for the
+           project. A blocking ``scope_violation`` escalation is filed.
+        3. **Block** — ambiguous descendant + orchestrator dead.
+           ``set_task_status('blocked', reopen_reason='parent_cancelled:<A>;
+           needs_recheck_against_main')`` + metadata.parent_cancelled = A.
+
+        Subtasks (``parent_id == task_id``) remain flag-only per the
+        pre-existing behaviour — out of scope for this sweep.
+
+        Recursion guard: when the sweep's own cancel/block writes fire
+        ``_on_task_cancelled`` again on the descendant, the inner call
+        short-circuits before touching the dep-tree.  Detection is via
+        ``reopen_reason.startswith('parent_cancelled:')`` — the sweep is
+        the only writer that uses that prefix.
+        """
         task = _extract_task(task_before)
         result: dict = {'task_id': task_id, 'actions': []}
 
-        # Check for subtasks
-        subtasks = task.get('subtasks', [])
-        if subtasks:
-            active_subtasks = [
-                s for s in subtasks
-                if isinstance(s, dict) and s.get('status') not in ('done', 'cancelled')
-            ]
-            if active_subtasks:
-                result['actions'].append({
-                    'type': 'subtasks_need_review',
-                    'count': len(active_subtasks),
-                    'subtask_ids': [s.get('id') for s in active_subtasks],
-                })
+        # Recursion guard: skip when this cancellation was itself triggered
+        # by the sweep.  Without the guard, each cancel write would re-enter
+        # the handler and walk the dep-tree again — quadratic for a chain.
+        if (
+            reopen_reason
+            and reopen_reason.startswith(_PARENT_CANCELLED_REOPEN_PREFIX)
+        ):
+            return result
 
-        # Check for tasks that depend on this one
-        try:
-            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
-            all_tasks = all_tasks_data.get('tasks', [])
-            if isinstance(all_tasks, list):
-                for t in all_tasks:
-                    if not isinstance(t, dict):
-                        continue
-                    deps = t.get('dependencies', [])
-                    if task_id in [str(d) for d in deps] and t.get('status') not in ('done', 'cancelled'):
-                        result['actions'].append({
-                            'type': 'dependent_affected',
-                            'task_id': t.get('id'),
-                            'title': t.get('title'),
-                        })
-        except Exception as e:
-            logger.warning(f'Dependent check failed for cancelled task {task_id}: {e}')
+        # Flag subtasks for review (preserved behaviour — out of sweep scope).
+        subtasks = task.get('subtasks', []) or []
+        active_subtasks = [
+            s for s in subtasks
+            if isinstance(s, dict) and s.get('status') not in ('done', 'cancelled')
+        ]
+        if active_subtasks:
+            result['actions'].append({
+                'type': 'subtasks_need_review',
+                'count': len(active_subtasks),
+                'subtask_ids': [s.get('id') for s in active_subtasks],
+            })
+
+        # Sweep top-level descendants — orphan review-followups + dependents.
+        sweep_actions = await self._sweep_cancelled_descendants(
+            parent_id=task_id,
+            project_root=project_root,
+            run_id=run_id,
+        )
+        result['actions'].extend(sweep_actions)
 
         return result
+
+    async def _sweep_cancelled_descendants(
+        self,
+        *,
+        parent_id: str,
+        project_root: str,
+        run_id: str,
+    ) -> list[dict]:
+        """Classify and route each non-terminal descendant of ``parent_id``.
+
+        Returns the list of actions taken so the caller can surface them in
+        the reconciliation result.  Failures are logged and swallowed so a
+        single descendant's I/O glitch doesn't abandon the rest of the sweep.
+
+        Requires ``self.task_interceptor`` to be wired (production wiring is
+        verified by ``TestServerWiringContract``); without it the sweep
+        no-ops because direct ``self.taskmaster`` writes would bypass the
+        per-project write_lock and the terminal-exit / done-provenance gates.
+        """
+        actions: list[dict] = []
+        if self.task_interceptor is None:
+            logger.warning(
+                'sweep: task_interceptor not wired; skipping descendant sweep '
+                'for cancelled parent %s',
+                parent_id,
+            )
+            return actions
+
+        try:
+            tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+        except Exception as e:
+            logger.warning(
+                'sweep: get_tasks failed for cancelled parent %s: %s',
+                parent_id, e,
+            )
+            return actions
+
+        all_tasks = tasks_data.get('tasks', []) if isinstance(tasks_data, dict) else []
+        if not isinstance(all_tasks, list):
+            return actions
+
+        orchestrator_live = is_orchestrator_live_for(project_root)
+        parent_id_str = str(parent_id)
+
+        for t in all_tasks:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get('id', '') or '')
+            if not tid or tid == parent_id_str:
+                continue
+            if str(t.get('status', '') or '') in ('done', 'cancelled'):
+                continue
+
+            metadata = t.get('metadata') if isinstance(t.get('metadata'), dict) else {}
+            spawned_from = metadata.get('spawned_from') if isinstance(metadata, dict) else None
+            spawned_from_str = (
+                spawned_from if isinstance(spawned_from, str) and spawned_from else None
+            )
+            escalation_id_raw = (
+                metadata.get('escalation_id') if isinstance(metadata, dict) else None
+            )
+            escalation_id = (
+                escalation_id_raw
+                if isinstance(escalation_id_raw, str) and escalation_id_raw
+                else None
+            )
+            deps = [str(d) for d in (t.get('dependencies') or [])]
+
+            is_spawn_from_parent = spawned_from_str == parent_id_str
+            is_dependent = parent_id_str in deps
+            if not is_spawn_from_parent and not is_dependent:
+                continue  # leave: unrelated top-level task
+
+            declared_files = _extract_metadata_files(t)
+            missing = (
+                _missing_files(project_root, declared_files) if declared_files else []
+            )
+            files_some_exist = bool(declared_files) and len(missing) < len(declared_files)
+
+            # Deterministic orphan: a review-followup (spawned_from + escalation_id)
+            # whose declared files don't exist on main.  Both signals must agree —
+            # spawned_from alone is "ambiguous", and file-evidence on main means
+            # the task may still be actionable.
+            deterministic_orphan = (
+                is_spawn_from_parent
+                and escalation_id is not None
+                and not files_some_exist
+            )
+
+            if deterministic_orphan:
+                action = await self._sweep_cancel_orphan(
+                    task_id=tid, parent_id=parent_id_str, project_root=project_root,
+                )
+            elif orchestrator_live:
+                action = self._sweep_escalate_l1(
+                    task_id=tid,
+                    parent_id=parent_id_str,
+                    escalation_id=escalation_id,
+                    is_dependent=is_dependent,
+                    project_root=project_root,
+                )
+            else:
+                action = await self._sweep_block_orphan(
+                    task_id=tid,
+                    parent_id=parent_id_str,
+                    escalation_id=escalation_id,
+                    is_dependent=is_dependent,
+                    project_root=project_root,
+                )
+
+            if action is not None:
+                actions.append(action)
+
+        return actions
+
+    async def _sweep_cancel_orphan(
+        self, *, task_id: str, parent_id: str, project_root: str,
+    ) -> dict | None:
+        """Auto-cancel a deterministic-orphan review-followup."""
+        reason = f'{_PARENT_CANCELLED_REOPEN_PREFIX}{parent_id}'
+        try:
+            assert self.task_interceptor is not None  # narrowed by caller
+            await self.task_interceptor.set_task_status(
+                task_id=task_id,
+                status='cancelled',
+                project_root=project_root,
+                reopen_reason=reason,
+            )
+        except Exception as e:
+            logger.warning(
+                'sweep: cancel failed for orphan %s (parent %s): %s',
+                task_id, parent_id, e,
+            )
+            return None
+        return {
+            'type': 'descendant_cancelled',
+            'task_id': task_id,
+            'parent_id': parent_id,
+            'reopen_reason': reason,
+        }
+
+    async def _sweep_block_orphan(
+        self,
+        *,
+        task_id: str,
+        parent_id: str,
+        escalation_id: str | None,
+        is_dependent: bool,
+        project_root: str,
+    ) -> dict | None:
+        """Auto-block an ambiguous descendant + record parent_cancelled metadata.
+
+        Two-write pattern: set_task_status('blocked') first, then update_task
+        with ``append=True`` to merge parent_cancelled audit fields without
+        clobbering existing metadata (memory_hints / files / spawned_from).
+        Per feedback_set_task_status_replaces_metadata.md.
+        """
+        reason = (
+            f'{_PARENT_CANCELLED_REOPEN_PREFIX}{parent_id}; needs_recheck_against_main'
+        )
+        try:
+            assert self.task_interceptor is not None  # narrowed by caller
+            await self.task_interceptor.set_task_status(
+                task_id=task_id,
+                status='blocked',
+                project_root=project_root,
+                reopen_reason=reason,
+            )
+        except Exception as e:
+            logger.warning(
+                'sweep: block (status) failed for descendant %s (parent %s): %s',
+                task_id, parent_id, e,
+            )
+            return None
+
+        meta: dict[str, Any] = {
+            'parent_cancelled': parent_id,
+            'needs_recheck_against_main': True,
+            'parent_cancelled_relation': 'dependent' if is_dependent else 'spawned_from',
+        }
+        if escalation_id:
+            meta['review_escalation_id'] = escalation_id
+
+        try:
+            await self.task_interceptor.update_task(
+                task_id=task_id,
+                project_root=project_root,
+                metadata=json.dumps(meta),
+                append=True,
+            )
+        except Exception as e:
+            logger.warning(
+                'sweep: block (metadata) failed for descendant %s (parent %s): %s',
+                task_id, parent_id, e,
+            )
+        return {
+            'type': 'descendant_blocked',
+            'task_id': task_id,
+            'parent_id': parent_id,
+            'reopen_reason': reason,
+        }
+
+    def _sweep_escalate_l1(
+        self,
+        *,
+        task_id: str,
+        parent_id: str,
+        escalation_id: str | None,
+        is_dependent: bool,
+        project_root: str,
+    ) -> dict | None:
+        """File an L1 escalation for an ambiguous descendant when orch is live."""
+        # is-None narrows the optional types for pyright (mirrors
+        # stage1_stall_detector.py:241).  HAS_ESCALATION is informational.
+        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+            logger.debug(
+                'sweep: escalation pkg unavailable; cannot file L1 for orphan %s',
+                task_id,
+            )
+            return None
+        relation = 'dependent' if is_dependent else 'review-followup'
+        summary = (
+            f'Task {task_id} orphaned: parent {parent_id} cancelled '
+            f'({relation})'
+        )
+        detail_lines = [
+            f'Parent task {parent_id} was cancelled.',
+            f'This task is a {relation} of the cancelled parent; its scope likely '
+            'references artifacts that only existed on the parent branch.',
+            'Decide whether to expand_scope (re-scope against main) or abort_task '
+            '(cancel as orphan).',
+        ]
+        if escalation_id:
+            detail_lines.append(f'Originating review escalation: {escalation_id}')
+        detail = '\n'.join(detail_lines)
+
+        try:
+            queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            esc = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='reconciler',
+                severity='blocking',
+                category='scope_violation',
+                summary=summary,
+                detail=detail,
+                suggested_action='expand_scope|abort_task',
+                level=1,
+            )
+            esc_id = queue.submit(esc)
+        except Exception as e:
+            logger.warning(
+                'sweep: L1 escalate failed for orphan %s (parent %s): %s',
+                task_id, parent_id, e,
+            )
+            return None
+        return {
+            'type': 'descendant_escalated',
+            'task_id': task_id,
+            'parent_id': parent_id,
+            'escalation_id': esc_id,
+        }
 
     async def _on_task_deferred(
         self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str

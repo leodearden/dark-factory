@@ -127,6 +127,7 @@ async def test_set_task_status_done_triggers_async_reconciliation(interceptor, r
         project_id='project',
         project_root='/project',
         task_before={'id': '1', 'status': 'pending', 'title': 'Test Task'},
+        reopen_reason=None,
     )
 
 
@@ -1351,6 +1352,7 @@ async def test_reconciler_receives_both_ids(interceptor, reconciler):
         project_id='dark_factory',
         project_root='/home/leo/src/dark-factory',
         task_before={'id': '1', 'status': 'pending', 'title': 'Test Task'},
+        reopen_reason=None,
     )
 
 
