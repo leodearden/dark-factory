@@ -26,6 +26,7 @@ and .task/.gitignore are NOT sufficient — agents bypass them routinely.
 
 import asyncio
 import logging
+import re
 import shutil
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -46,6 +47,26 @@ AdvanceResult = Literal[
 
 
 PushResult = Literal['pushed', 'noop', 'rejected', 'error']
+
+
+# Default commit-citation pattern for ``find_task_citation_commit``.
+#
+# Matches dark-factory / reify conventions on main:
+#   - Conventional-commit subjects that cite the task id in parens or
+#     after a colon: ``impl(50): xyz`` / ``fix(50): xyz`` / ``test(50: ...)``.
+#   - Subjects that mention the task branch directly: ``... task/50 ...``
+#     anywhere in the subject line.
+#   - The canonical no-ff merge subject ``Merge task/50 into <main>`` produced
+#     by ``merge_to_main``.
+#
+# The ``{tid}`` placeholder is interpolated via ``str.format`` with the
+# escaped task id; a ``\b`` (word boundary) at each side blocks substring
+# overlap so ``task/3399`` doesn't match a row that cites ``task/339``.
+DEFAULT_COMMIT_CITATION_PATTERN: str = (
+    r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
+    r'(\(\b{tid}\b[):]|.*\btask/{tid}\b)'
+    r'|^Merge task/{tid} into '
+)
 
 
 class ScrubOutcome(Enum):
@@ -762,6 +783,52 @@ class GitOps:
                 'git', 'log', self.config.main_branch,
                 '--fixed-strings',
                 f'--grep={grep_pattern}',
+                '--max-count=1',
+                '--format=%H',
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not out:
+            return None
+        return out
+
+    async def find_task_citation_commit(
+        self, tid: str, *, pattern_template: str | None = None,
+    ) -> str | None:
+        """Search main's history for a commit whose subject cites *tid*.
+
+        Used by the reconciler to gate the ``is_ancestor==True`` fast-path:
+        ``is_ancestor`` returns True trivially for zero-commit branches
+        whose tip equals the main HEAD at branch-create time, which
+        false-positives blocked/escalated tasks.  Requiring a positive
+        citation on main rejects that degenerate case.
+
+        Args:
+            tid: Bare task id (no ``task/`` prefix); the prefix is added
+                by the default pattern where appropriate.
+            pattern_template: Optional override for the citation pattern.
+                Defaults to ``DEFAULT_COMMIT_CITATION_PATTERN``.  Empty
+                string disables the check by returning None immediately
+                (caller opt-out for projects without citation conventions).
+
+        Returns:
+            The 40-char commit SHA of the most recent matching commit on
+            main, or None when no commit cites the task or the pattern is
+            disabled.
+        """
+        template = (
+            pattern_template
+            if pattern_template is not None
+            else DEFAULT_COMMIT_CITATION_PATTERN
+        )
+        if template == '':
+            return None
+        pattern = template.format(tid=re.escape(tid))
+        rc, out, _ = await _run(
+            [
+                'git', 'log', self.config.main_branch,
+                '--extended-regexp',
+                f'--grep={pattern}',
                 '--max-count=1',
                 '--format=%H',
             ],
