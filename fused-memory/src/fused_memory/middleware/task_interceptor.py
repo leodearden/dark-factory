@@ -3529,8 +3529,13 @@ def _reject_done_provenance_in_update_metadata(
 def interceptor_write_succeeded(resp: object) -> bool:
     """Return True iff *resp* represents a successful TaskInterceptor write.
 
-    Centralises the success/failure contract so all callers use a single,
-    tested formula instead of hand-rolling ``not (isinstance(…) and …)``.
+    Centralises the success/failure contract for *internal* consumers that
+    need a boolean classification (e.g. reconciliation hint-attachment in
+    ``TargetedReconciler._on_task_blocked``).  MCP passthrough call sites
+    (such as ``server/tools.py``'s ``update_task`` handler) must return the
+    raw response dict to the client so rejection details (``error``,
+    ``hint``, ``task_id``) reach the user — do **not** route them through
+    this helper.
 
     Rejection-dict shapes this helper recognises as failures:
 
