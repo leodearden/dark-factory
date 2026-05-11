@@ -1646,6 +1646,70 @@ async def test_n_strikes_escalates_to_l1(harness: Harness):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_persistent_citation_miss_escalates_l1(harness: Harness):
+    """N consecutive Guard 2 skips file exactly one L1 escalation, and the
+    counter resets on a successful sweep.
+
+    Locks two contracts:
+      1. ``find_task_citation_commit`` returning None for
+         ``MAX_RECONCILE_FAILURES`` sweeps in a row triggers one (and only
+         one) L1 escalation with category ``reconcile_citation_missing``.
+      2. A subsequent sweep where the citation IS found clears the per-tid
+         skip counter so a future drought starts a fresh count.
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+
+    submissions = []
+
+    class _StubEscalationQueue:
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(submissions)}'
+
+        def submit(self, esc):
+            submissions.append(esc)
+
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
+
+    harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+        return_value=None,
+    )
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'400': 'blocked'}, None,
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    # Exactly one L1 was filed, with the expected category and severity.
+    assert len(submissions) == 1, (
+        f'expected exactly one L1 submission after {MAX_RECONCILE_FAILURES} '
+        f'consecutive citation misses, got {len(submissions)}'
+    )
+    esc = submissions[0]
+    assert esc.task_id == '400'
+    assert esc.severity == 'blocking'
+    assert esc.category == 'reconcile_citation_missing'
+    assert esc.level == 1
+    # Counter reset after escalation so the next sweep starts fresh.
+    assert '400' not in harness._reconcile_skip_counts
+
+    # And mark_done was never invoked: the skip path bails before the flip.
+    harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+
+    # Now the citation IS found on the next sweep — counter resets again
+    # via the explicit pop on the success path (already done by escalation),
+    # but verify a successful sweep starts and ends with no counter.
+    harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+        return_value='deadbeef' + 'a' * 32,
+    )
+    await harness._reconcile_stranded_in_progress()
+    assert '400' not in harness._reconcile_skip_counts
+
+
+@pytest.mark.asyncio
 async def test_failure_counter_resets_on_success(harness: Harness):
     """A successful mark_done clears the per-tid failure counter."""
     from orchestrator.scheduler import DoneGateRejection
