@@ -53,6 +53,24 @@ class TestDefaults:
         config = OrchestratorConfig()
         assert config.git.main_branch == 'main'
         assert config.git.branch_prefix == 'task/'
+        # commit_citation_pattern defaults to None — git_ops uses the built-in
+        # DEFAULT_COMMIT_CITATION_PATTERN when None is passed through.
+        assert config.git.commit_citation_pattern is None
+
+    def test_git_commit_citation_pattern_explicit_override(self):
+        """An explicit non-empty pattern is accepted verbatim."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig(commit_citation_pattern=r'^custom\(.*\) ')
+        assert cfg.commit_citation_pattern == r'^custom\(.*\) '
+
+    def test_git_commit_citation_pattern_empty_string_disables(self):
+        """An explicit empty string disables the citation check; consumer
+        code (``find_task_citation_commit``) treats '' as opt-out."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig(commit_citation_pattern='')
+        assert cfg.commit_citation_pattern == ''
 
     def test_fused_memory_defaults(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
