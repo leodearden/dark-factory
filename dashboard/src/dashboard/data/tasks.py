@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 def _shape_task(task: dict) -> dict | None:
     """Trim an MCP get_tasks row to the dashboard's persistent shape.
 
-    MCP returns top-level ids as strings and includes description/details/
-    testStrategy/subtasks/updatedAt that the dashboard does not render.
-    Cast id at the boundary; drop the rest.
+    MCP returns top-level ids as strings and includes details/testStrategy/
+    subtasks/updatedAt that the dashboard does not render. Cast id at the
+    boundary; drop the rest.
     """
     raw_id = task.get('id')
     try:
@@ -51,6 +51,7 @@ def _shape_task(task: dict) -> dict | None:
     return {
         'id': tid,
         'title': task.get('title') or '',
+        'description': task.get('description') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': deps,

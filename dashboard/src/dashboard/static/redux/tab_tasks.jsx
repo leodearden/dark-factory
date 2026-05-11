@@ -199,33 +199,6 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
   );
 }
 
-// ── Hard-coded long descriptions per task (so the detail panel has real content) ──
-const TASK_DESCRIPTIONS = {
-  'T-19': 'Implement an exponential-backoff retry policy for the consolidation agent. The agent currently throws on transient store errors and the orchestrator restarts it cold, losing in-flight context. Add a retry decorator that distinguishes transient (network, 5xx, lock contention) from terminal (validation, auth) errors. Cap at 5 retries with jitter; emit OTel spans per attempt; persist attempt count in the task journal so restarts resume mid-policy.',
-  'T-12': 'Backfill burndown snapshots from the orchestrator journal so we can show 30-day history. The collector only persists current state, so anything before deployment day is missing. Walk the journal in 15-minute buckets, reconstruct task counts at each timestamp, and write to the burndown table. Idempotent: rerunning over the same range must produce identical rows.',
-  'T-7':  'Add cross-store dedup at consolidation time. Today the consolidation agent writes the same memory to both Mem0 and Graphiti when classifications disagree, producing duplicate rows on every reconciliation pass. Block on T-21 (dedup index) and T-23 (hash collision handling); emit a metric for dedup hits so we can tell whether duplication is dropping post-deploy.',
-  'T-21': 'Build a content-addressed dedup index for the Graphiti store. Hash should incorporate normalized text + entity set + timestamp bucket. Index must support O(1) lookups during write and survive store-side compaction. Output: a `dedup_idx` table + the read/write helpers. Migration script to backfill from existing rows is in scope.',
-  'T-23': 'Hash collision handling for the dedup index. With ~10M memories projected and a 64-bit content hash we expect rare collisions; current behavior is silent overwrite. Add a fallback path that reads candidate row, byte-compares, and only treats as dedup if equal. On mismatch, fall back to a second hash function and log a collision event. Depends on T-21.',
-  'T-24': 'Scheduler quiescence detector. The orchestrator currently has no way to know when "all useful work has been scheduled" — it busy-loops waking up every second. Detect quiescence by watching the task journal write rate and the in-flight count; emit a `quiescent` event so downstream tools (e.g. background reconciliation, snapshot) can run during idle periods. Depends on T-12 to read the journal.',
-  'T-25': 'Burndown forecast model. Take the BURNDOWN_BY_PROJECT timeseries and fit a simple regression to project tasks-remaining out 7 days. Render a confidence band on the burndown chart. Stretch goal: switch to a state-space model that handles the discontinuity from new task additions. Blocked on T-12 (data) and T-24 (we want forecasts to update only during quiescent windows).',
-  'T-17': 'Heuristic pre-filter for the consolidation classifier. Skip the LLM call entirely for memories matching simple regexes (timestamps, structured logs, repeated phrases). Drops classifier cost by ~40% on observed traffic with no measurable accuracy loss.',
-  'T-16': 'Cross-project dedup. Same memory observed by two different projects should not produce two graph nodes. Uses the same hash from T-21 but queries across project namespaces.',
-  'T-15': 'Mem0 collection partitioning. Split the single mega-collection into per-project collections so Mem0 query latency stops scaling with total memory count.',
-  'T-14': 'Restart-safe burndown collector. Persist collector state every flush so an orchestrator restart does not lose the in-flight bucket.',
-  'T-13': 'Watchdog timer tuning. The watchdog was killing tasks at the 90s mark even when they were making progress; raise to 180s and add a heartbeat check.',
-
-  'T-8':  'Parser error recovery for partial DSL. Today a single syntax error aborts the whole parse. Implement panic-mode recovery at statement boundaries so we can show all errors in one pass and still produce a usable AST for downstream tools (LSP, linter). Synchronization tokens: `;`, `}`, `def`, `let`.',
-  'T-11': 'DSL lexer rewrite for nested macros. The current lexer cannot handle `macro!{ macro!{ ... } }` because it greedily matches the outer `}`. Rewrite as a state-machine lexer that tracks brace depth per macro context.',
-  'T-18': 'Macro expansion error messages. When expansion fails inside a nested macro, the error currently points at the outermost macro call — useless for debugging. Thread span info through expansion so the error points at the actual failing token.',
-  'T-6':  'AST node visitor refactor. Migrate from inheritance-based visitors to a trait-object dispatch so plugins can register visitors without forking the AST crate.',
-
-  'T-4':  'Scene boundary detection v2. Replace the histogram-diff detector with a learned model. Same input/output contract; should reduce false positives at scene transitions with motion blur. Reuse the optimized frame sampler from T-2.',
-  'T-9':  'Subtitle alignment. SRT timestamps drift by up to 400ms over a 30-minute clip. Re-align using audio-track resampling (T-22) plus dynamic-time-warping against a phoneme transcript. Currently blocked on T-22.',
-  'T-22': 'Audio track resampling. Pull-up/down arbitrary audio sample rates to the canonical 48kHz used by the rest of the pipeline. Important: preserve sample alignment so subtitle and scene boundaries stay in sync.',
-  'T-26': 'Multi-pass encoder pipeline. Two-pass x265 with rate-control stats from pass 1. Wire into the existing single-pass entrypoint; pass 1 runs at 4x speed with quality disabled.',
-  'T-2':  'Frame sampler optimization. The sampler was decoding every frame and discarding 90%; switch to keyframe-only seeking with selective fine-decode around scene-detection candidate timestamps. ~6x speedup on 4K clips.',
-};
-
 function fmtAge(t) {
   if (t.status === 'done')        return t.completed || '—';
   if (t.status === 'pending')     return 'unstarted';
@@ -238,7 +211,7 @@ function TaskDetail({ task, allTasks }) {
   }
   const deps = task.deps || [];
   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
-  const desc = TASK_DESCRIPTIONS[task.id] || task.title;
+  const desc = task.description || '—';
   return (
     <div className="task-detail">
       <h4>{task.title}</h4>
