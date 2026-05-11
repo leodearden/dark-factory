@@ -51,6 +51,7 @@ def _shape_task(task: dict) -> dict:
         'id': int(task['id']),
         'title': task.get('title') or '',
         'description': task.get('description') or '',
+        'details': task.get('details') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': list(task.get('dependencies') or []),
@@ -195,7 +196,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
     active, _, _ = await collect_active_tasks(client=None, config=cfg)
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
-        'description': '', 'status': 'pending', 'agent': None,
+        'description': '', 'details': '', 'status': 'pending', 'agent': None,
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [], 'locks': [],
     }]
 

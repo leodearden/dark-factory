@@ -228,6 +228,11 @@ function TaskDetail({ task, allTasks }) {
       <div className="section-lbl">Description</div>
       <div className="desc">{desc}</div>
 
+      {task.details && (<>
+        <div className="section-lbl">Details</div>
+        <div className="desc">{task.details}</div>
+      </>)}
+
       <div className="section-lbl">Depends on ({deps.length})</div>
       {deps.length === 0
         ? <span className="chip-empty">no upstream dependencies</span>

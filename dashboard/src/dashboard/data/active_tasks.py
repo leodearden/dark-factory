@@ -11,6 +11,7 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'project': 'dark_factory',
         'title': '...',
         'description': '...',
+        'details': '...',         # may be empty; many tasks have none
         'status': 'in-progress',
         'agent': 'claude-task-19',  # or None if no worktree
         'started': 14,              # minutes since metadata.created_at, 0 if unknown
@@ -144,6 +145,7 @@ async def _shape_one_project(
             'project': project,
             'title': task.get('title') or '',
             'description': task.get('description') or '',
+            'details': task.get('details') or '',
             'status': status,
             'agent': agent,
             'started': _minutes_since(meta.get('created_at')),
