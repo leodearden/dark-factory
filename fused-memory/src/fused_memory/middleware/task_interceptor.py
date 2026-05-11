@@ -791,6 +791,11 @@ class TaskInterceptor:
                     project_id=resolve_project_id(project_root),
                     project_root=project_root,
                     task_before=before,
+                    # Threaded so the cancellation-sweep recursion guard in
+                    # ``_on_task_cancelled`` can detect its own descendant
+                    # writes (reopen_reason starting "parent_cancelled:")
+                    # and short-circuit before re-walking the dep-tree.
+                    reopen_reason=reopen_reason,
                 ),
                 name=f'targeted-recon-{task_id}-{status}',
             )

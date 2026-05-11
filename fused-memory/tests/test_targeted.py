@@ -1070,3 +1070,357 @@ class TestServerWiringContract:
             'through the per-project write_lock (task 1136). '
             'Restore the assignment in server/main.py if this assertion fails.'
         )
+
+
+# ── Auto-sweep dep-tree on task cancellation ─────────────────────────────────
+#
+# When a parent task is cancelled, descendants that reference the cancelled
+# branch's artifacts (review-followups spawned by the architect during the
+# parent's review) become orphan. Surface them immediately via three routes:
+#
+#   1. Cancel — deterministic orphan (spawned_from == A AND escalation_id
+#      present AND files don't exist on main).
+#   2. L1 escalate — ambiguous + orchestrator live for the project.
+#   3. Block — ambiguous + orchestrator dead. set_task_status('blocked') +
+#      metadata carrying parent_cancelled + (optional) review_escalation_id.
+#
+# Dependents (deps include A) never auto-cancel; they take the block-or-L1
+# branch.  Subtasks remain flag-only (out of scope per existing behaviour).
+#
+# Recursion guard: when the sweep's own cancel/block writes fire
+# `_on_task_cancelled` again on the descendant, the inner call short-circuits
+# via the ``reopen_reason.startswith('parent_cancelled:')`` check.
+
+
+class TestSweepCancelledDescendants:
+    """Auto-sweep dep-tree on task cancellation."""
+
+    @pytest.fixture
+    def mock_interceptor(self):
+        from unittest.mock import AsyncMock
+        m = AsyncMock()
+        m.set_task_status = AsyncMock(return_value={'success': True})
+        m.update_task = AsyncMock(return_value={'success': True})
+        return m
+
+    @pytest.fixture
+    def wired_reconciler(self, reconciler, mock_interceptor):
+        reconciler.task_interceptor = mock_interceptor
+        return reconciler
+
+    @pytest.fixture(autouse=True)
+    def _patch_orchestrator_live(self, monkeypatch):
+        """Default to orchestrator dead; tests override per case."""
+        from fused_memory.reconciliation import targeted
+        monkeypatch.setattr(
+            targeted, 'is_orchestrator_live_for', lambda _project_root: False,
+        )
+        return None
+
+    @pytest.mark.asyncio
+    async def test_deterministic_cancel_for_review_followup(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor,
+    ):
+        """B is a review-followup of A (spawned_from + escalation_id, no
+        surviving files); on A's cancellation, B is auto-cancelled with a
+        reopen_reason rooted at A."""
+        mock_taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': 'B', 'status': 'pending', 'title': 'review-followup',
+                    'metadata': {
+                        'spawned_from': 'A',
+                        'escalation_id': 'esc-A-1',
+                    },
+                    'dependencies': [],
+                    'subtasks': [],
+                },
+            ],
+        })
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root='/tmp/test',
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        # set_task_status was called for B with status='cancelled' and
+        # reopen_reason starting 'parent_cancelled:A'
+        mock_interceptor.set_task_status.assert_called_once()
+        call = mock_interceptor.set_task_status.call_args
+        assert call.kwargs.get('task_id') == 'B'
+        assert call.kwargs.get('status') == 'cancelled'
+        reopen = call.kwargs.get('reopen_reason') or ''
+        assert reopen.startswith('parent_cancelled:A'), (
+            f'expected reopen_reason to start with parent_cancelled:A, got {reopen!r}'
+        )
+
+        # The recorded action surfaces the descendant cancel
+        cancels = [a for a in result.get('actions', []) if a.get('type') == 'descendant_cancelled']
+        assert len(cancels) == 1
+        assert cancels[0].get('task_id') == 'B'
+
+    @pytest.mark.asyncio
+    async def test_unrelated_top_level_is_left_untouched(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor,
+    ):
+        """C has no spawned_from chain to A and is not a dependent; sweep
+        leaves it alone (no set_task_status, no update_task)."""
+        mock_taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': 'C', 'status': 'pending', 'title': 'unrelated',
+                    'metadata': {},
+                    'dependencies': [],
+                    'subtasks': [],
+                },
+            ],
+        })
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root='/tmp/test',
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        mock_interceptor.set_task_status.assert_not_called()
+        mock_interceptor.update_task.assert_not_called()
+        # Sweep produced no descendant actions
+        kinds = {a.get('type') for a in result.get('actions', [])}
+        assert 'descendant_cancelled' not in kinds
+        assert 'descendant_blocked' not in kinds
+        assert 'descendant_escalated' not in kinds
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_with_orchestrator_live_files_l1_escalation(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, monkeypatch, tmp_path,
+    ):
+        """B is ambiguous (spawned_from=A but no escalation_id); orchestrator
+        is live → L1 escalation file is written and B's status is unchanged."""
+        from fused_memory.reconciliation import targeted
+        monkeypatch.setattr(targeted, 'is_orchestrator_live_for', lambda _pr: True)
+
+        project_root = str(tmp_path)
+        mock_taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': 'B', 'status': 'pending', 'title': 'ambiguous',
+                    'metadata': {'spawned_from': 'A'},  # no escalation_id
+                    'dependencies': [],
+                    'subtasks': [],
+                },
+            ],
+        })
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=project_root,
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        # No status change for B
+        mock_interceptor.set_task_status.assert_not_called()
+        mock_interceptor.update_task.assert_not_called()
+
+        # Escalation JSON written under <project_root>/data/escalations/
+        esc_dir = tmp_path / 'data' / 'escalations'
+        files = list(esc_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'expected one escalation file, got {files}'
+
+        import json as _json
+        payload = _json.loads(files[0].read_text())
+        assert payload['task_id'] == 'B'
+        assert payload['level'] == 1
+        assert payload['severity'] == 'blocking'
+        assert payload['category'] == 'scope_violation'
+
+        # And the action surfaces in the result
+        escs = [a for a in result.get('actions', []) if a.get('type') == 'descendant_escalated']
+        assert len(escs) == 1
+        assert escs[0].get('task_id') == 'B'
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_with_orchestrator_dead_blocks_with_metadata(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, tmp_path,
+    ):
+        """Same shape as the prior test but with orchestrator dead → B is
+        blocked via set_task_status('blocked', reopen_reason=...) and
+        update_task(metadata=..., append=True) carrying parent_cancelled."""
+        project_root = str(tmp_path)
+        mock_taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': 'B', 'status': 'pending', 'title': 'ambiguous',
+                    'metadata': {'spawned_from': 'A'},  # no escalation_id
+                    'dependencies': [],
+                    'subtasks': [],
+                },
+            ],
+        })
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=project_root,
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        # set_task_status('blocked') with the parent_cancelled reopen_reason
+        mock_interceptor.set_task_status.assert_called_once()
+        sts_call = mock_interceptor.set_task_status.call_args
+        assert sts_call.kwargs.get('task_id') == 'B'
+        assert sts_call.kwargs.get('status') == 'blocked'
+        reopen = sts_call.kwargs.get('reopen_reason') or ''
+        assert reopen.startswith('parent_cancelled:A'), (
+            f'expected reopen_reason to start with parent_cancelled:A, got {reopen!r}'
+        )
+
+        # update_task carries the parent_cancelled metadata with append=True
+        mock_interceptor.update_task.assert_called_once()
+        ut_call = mock_interceptor.update_task.call_args
+        assert ut_call.kwargs.get('task_id') == 'B'
+        assert ut_call.kwargs.get('append') is True
+        import json as _json
+        meta_raw = ut_call.kwargs.get('metadata')
+        meta = _json.loads(meta_raw) if isinstance(meta_raw, str) else meta_raw
+        assert meta.get('parent_cancelled') == 'A'
+
+        # No escalation file written when orchestrator is dead
+        esc_dir = tmp_path / 'data' / 'escalations'
+        files = list(esc_dir.glob('esc-*.json')) if esc_dir.exists() else []
+        assert files == []
+
+        # And the action surfaces in the result
+        blocks = [a for a in result.get('actions', []) if a.get('type') == 'descendant_blocked']
+        assert len(blocks) == 1
+        assert blocks[0].get('task_id') == 'B'
+
+    @pytest.mark.asyncio
+    async def test_dependent_blocked_never_cancelled(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, tmp_path,
+    ):
+        """D depends on A but has no spawned_from link; orchestrator dead →
+        D is blocked, never cancelled, irrespective of escalation_id presence."""
+        project_root = str(tmp_path)
+        mock_taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': 'D', 'status': 'pending', 'title': 'dependent',
+                    'metadata': {},  # no spawned_from
+                    'dependencies': ['A'],
+                    'subtasks': [],
+                },
+            ],
+        })
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=project_root,
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        # Must be blocked, never cancelled
+        mock_interceptor.set_task_status.assert_called_once()
+        call = mock_interceptor.set_task_status.call_args
+        assert call.kwargs.get('task_id') == 'D'
+        assert call.kwargs.get('status') == 'blocked'
+
+        cancels = [a for a in result.get('actions', []) if a.get('type') == 'descendant_cancelled']
+        blocks = [a for a in result.get('actions', []) if a.get('type') == 'descendant_blocked']
+        assert cancels == []
+        assert len(blocks) == 1
+
+    @pytest.mark.asyncio
+    async def test_subtask_flag_only_regression(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor,
+    ):
+        """Subtasks of A remain flag-only — sweep does not touch them
+        (preserves the existing subtasks_need_review behaviour)."""
+        # No top-level descendants to sweep
+        mock_taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root='/tmp/test',
+            task_before={
+                'id': 'A', 'title': 'Parent', 'status': 'in-progress',
+                'subtasks': [
+                    {'id': 'A.1', 'status': 'pending', 'title': 'Sub1'},
+                    {'id': 'A.2', 'status': 'done', 'title': 'Sub2'},
+                ],
+            },
+        )
+
+        review_actions = [a for a in result.get('actions', []) if a.get('type') == 'subtasks_need_review']
+        assert len(review_actions) == 1
+        assert review_actions[0]['count'] == 1
+        # Subtasks are not auto-cancelled or auto-blocked
+        mock_interceptor.set_task_status.assert_not_called()
+        mock_interceptor.update_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recursion_guard_short_circuits_on_parent_cancelled_reason(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor,
+    ):
+        """A second-level cancel triggered by the sweep itself (carrying a
+        reopen_reason starting 'parent_cancelled:') must not re-enter the
+        sweep — guard short-circuits before get_tasks is even called."""
+        get_tasks_spy = AsyncMock(return_value={'tasks': []})
+        mock_taskmaster.get_tasks = get_tasks_spy
+
+        result = await wired_reconciler.reconcile_task(
+            task_id='B', transition='cancelled',
+            project_id='test-project', project_root='/tmp/test',
+            task_before={'id': 'B', 'title': 'orphan child', 'status': 'in-progress'},
+            reopen_reason='parent_cancelled:A',
+        )
+
+        # Sweep is skipped — no descendant enumeration occurred
+        get_tasks_spy.assert_not_called()
+        mock_interceptor.set_task_status.assert_not_called()
+        mock_interceptor.update_task.assert_not_called()
+        sweep_kinds = {'descendant_cancelled', 'descendant_blocked', 'descendant_escalated'}
+        assert not sweep_kinds.intersection(
+            a.get('type') for a in result.get('actions', [])
+        )
+
+    @pytest.mark.asyncio
+    async def test_escalation_file_is_atomic_and_parseable(
+        self, wired_reconciler, mock_taskmaster, monkeypatch, tmp_path,
+    ):
+        """L1 escalation submit leaves no .tmp files and produces a JSON file
+        that round-trips through Escalation.from_json."""
+        from fused_memory.reconciliation import targeted
+        monkeypatch.setattr(targeted, 'is_orchestrator_live_for', lambda _pr: True)
+
+        project_root = str(tmp_path)
+        mock_taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': 'B', 'status': 'pending', 'title': 'ambiguous',
+                    'metadata': {'spawned_from': 'A'},
+                    'dependencies': [],
+                    'subtasks': [],
+                },
+            ],
+        })
+
+        await wired_reconciler.reconcile_task(
+            task_id='A', transition='cancelled',
+            project_id='test-project', project_root=project_root,
+            task_before={'id': 'A', 'title': 'Parent', 'status': 'in-progress'},
+        )
+
+        esc_dir = tmp_path / 'data' / 'escalations'
+        # No leaked .tmp files
+        leftover_tmp = list(esc_dir.glob('*.tmp'))
+        assert leftover_tmp == [], f'leaked tmp files: {leftover_tmp}'
+
+        # Final file round-trips through Escalation.from_json
+        from escalation.models import Escalation
+        files = list(esc_dir.glob('esc-*.json'))
+        assert len(files) == 1
+        esc = Escalation.from_json(files[0].read_text())
+        assert esc.task_id == 'B'
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == 'scope_violation'
