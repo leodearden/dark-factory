@@ -128,6 +128,15 @@ def harness(tmp_path: Path, mock_orch_config):
     # AsyncMock(return_value='<sha>') to exercise the marker path.
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
 
+    # Default: find_task_citation_commit returns a SHA matching the
+    # resolve_branch_sha default so existing happy-path tests pass through the
+    # new citation guard unchanged.  Individual tests may override with
+    # AsyncMock(return_value=None) to exercise the missing-citation path or
+    # with a different SHA to assert citation precedence over branch-tip.
+    h.git_ops.find_task_citation_commit = AsyncMock(
+        return_value='deadbeef' + 'a' * 32,
+    )
+
     return h
 
 
@@ -652,10 +661,116 @@ class TestReconcileStrandedInProgress:
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
         )
-        harness.git_ops.resolve_branch_sha.assert_awaited_once_with('task/50')  # type: ignore[attr-defined]
+        # The found_on_main SHA now comes from the citation-commit grep
+        # rather than the bare branch tip (gated by the post-fix Guard 2).
+        harness.git_ops.find_task_citation_commit.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '50', pattern_template=None,
+        )
 
         # cleanup_worktree must NOT have been called
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_already_merged_skipped_when_l1_escalation_open(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Open L1 escalation for the task → reconciler must NOT flip to done.
+
+        Reproduces the reify-3399 false-positive: branch tip equals main HEAD
+        because the architect was never given a chance to write any commits
+        (the task was declared unactionable and _mark_blocked(escalate_to_human=True)
+        fired before any commit landed).  The deliberate human-escalation
+        disposition must take precedence over the degenerate is_ancestor==True
+        observation.
+        """
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        # Wire up a real EscalationQueue and submit an L1 record for task 50.
+        queue_dir = tmp_path / 'escalations'
+        harness._escalation_queue = EscalationQueue(queue_dir)
+        harness._escalation_queue.submit(Escalation(
+            id=harness._escalation_queue.make_id('50'),
+            task_id='50',
+            agent_role='task-steward',
+            severity='blocking',
+            category='task_failure',
+            summary='Task declared unactionable',
+            level=1,
+            status='pending',
+        ))
+
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'50': 'blocked'}, None
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        # is_ancestor was invoked (proves we got into the branch).
+        harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
+
+        # But neither mark_done nor set_task_status('done', ...) fired —
+        # the L1 guard bailed before the flip.
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_already_merged_skipped_when_main_lacks_task_citation(
+        self, harness: Harness
+    ):
+        """is_ancestor=True but no commit on main cites the task id →
+        reconciler must NOT flip to done.
+
+        Defends the same reify-3399 false-positive shape against tasks without
+        an L1 escalation: a zero-commit branch tip still sits on a main
+        ancestor, but if no commit on main mentions ``task/50`` (or matches the
+        citation pattern), there is no positive evidence of merge and the task
+        must stay in its current status.
+        """
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+            return_value=None,
+        )
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'50': 'blocked'}, None
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_already_merged_uses_citation_commit_when_available(
+        self, harness: Harness
+    ):
+        """is_ancestor=True and a commit on main cites the task id →
+        ``done_provenance.commit`` records the citation SHA, NOT the bare
+        branch tip from ``resolve_branch_sha``.
+
+        The matched commit is stronger evidence than ``is_ancestor`` alone:
+        the citation tells us exactly *which* commit lands the task, so the
+        provenance row points at that commit rather than at the (possibly
+        post-merge) branch ref.
+        """
+        citation_sha = 'cafefeed' + 'b' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+            return_value=citation_sha,
+        )
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'50': 'in-progress'}, None
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        # mark_done was called with the citation SHA, not the branch-tip SHA.
+        harness.scheduler.mark_done.assert_awaited_once()  # type: ignore[attr-defined]
+        kwargs = harness.scheduler.mark_done.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs['sha'] == citation_sha, (
+            f"mark_done must record the citation SHA "
+            f"({citation_sha!r}), got {kwargs['sha']!r}"
+        )
+        assert kwargs['kind'] == 'found_on_main'
 
     async def test_already_merged_drops_recovered_plan_and_cleans_worktree(
         self, harness: Harness
@@ -759,39 +874,13 @@ class TestReconcileStrandedInProgress:
             'plan.lock should be removed by cleanup_worktree in the is_ancestor guard'
         )
 
-    async def test_already_merged_skipped_when_branch_unresolved(
-        self, harness: Harness, caplog
-    ):
-        """When resolve_branch_sha returns None (branch ref vanished after
-        is_ancestor check), the recovery is skipped (no set_task_status('done')
-        call) and a WARNING log is emitted containing the task id and
-        'rev-parse'.
-
-        Behaviour change vs. note-only provenance: ``mark_done`` requires a
-        real SHA so the server-side ancestor check has something to verify;
-        leaving the task in-progress for one more sweep is preferred over
-        recording a phantom done.
-        """
-        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
-        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
-            {'53': 'in-progress'}, None
-        )
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            await harness._reconcile_stranded_in_progress()
-
-        # Recovery skipped — no set_task_status call.
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-        harness.scheduler.mark_done.assert_not_awaited()  # type: ignore[attr-defined]
-
-        # WARNING log must mention the task id and 'rev-parse'
-        warning_messages = [
-            r.message for r in caplog.records if r.levelno >= logging.WARNING
-        ]
-        assert any(
-            '53' in msg and 'rev-parse' in msg for msg in warning_messages
-        ), f'Expected WARNING with task 53 and rev-parse, got: {warning_messages}'
+    # NB: an earlier test (``test_already_merged_skipped_when_branch_unresolved``)
+    # covered the ``resolve_branch_sha returns None`` race during the
+    # is_ancestor fast-path.  After the post-fix flow uses
+    # ``find_task_citation_commit`` to source the done_provenance SHA, that
+    # race is structurally impossible (the citation grep does not depend on
+    # a live branch ref).  Skip-without-flip semantics on missing evidence
+    # are covered by ``test_already_merged_skipped_when_main_lacks_task_citation``.
 
     # ------------------------------------------------------------------
     # find_merge_marker guard tests (deleted-branch fast-path)
@@ -1522,6 +1611,8 @@ async def test_n_strikes_escalates_to_l1(harness: Harness):
             return f'esc-{task_id}-{len(submissions)}'
         def submit(self, esc):
             submissions.append(esc)
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
 
     harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
 
@@ -1552,6 +1643,70 @@ async def test_n_strikes_escalates_to_l1(harness: Harness):
     assert esc.category == 'reconcile_persistent_rejection'
     # Counter reset after escalation so the next sweep starts a fresh count.
     assert '200' not in harness._reconcile_failure_counts
+
+
+@pytest.mark.asyncio
+async def test_reconcile_persistent_citation_miss_escalates_l1(harness: Harness):
+    """N consecutive Guard 2 skips file exactly one L1 escalation, and the
+    counter resets on a successful sweep.
+
+    Locks two contracts:
+      1. ``find_task_citation_commit`` returning None for
+         ``MAX_RECONCILE_FAILURES`` sweeps in a row triggers one (and only
+         one) L1 escalation with category ``reconcile_citation_missing``.
+      2. A subsequent sweep where the citation IS found clears the per-tid
+         skip counter so a future drought starts a fresh count.
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+
+    submissions = []
+
+    class _StubEscalationQueue:
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(submissions)}'
+
+        def submit(self, esc):
+            submissions.append(esc)
+
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
+
+    harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+        return_value=None,
+    )
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {'400': 'blocked'}, None,
+    )
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    # Exactly one L1 was filed, with the expected category and severity.
+    assert len(submissions) == 1, (
+        f'expected exactly one L1 submission after {MAX_RECONCILE_FAILURES} '
+        f'consecutive citation misses, got {len(submissions)}'
+    )
+    esc = submissions[0]
+    assert esc.task_id == '400'
+    assert esc.severity == 'blocking'
+    assert esc.category == 'reconcile_citation_missing'
+    assert esc.level == 1
+    # Counter reset after escalation so the next sweep starts fresh.
+    assert '400' not in harness._reconcile_skip_counts
+
+    # And mark_done was never invoked: the skip path bails before the flip.
+    harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+
+    # Now the citation IS found on the next sweep — counter resets again
+    # via the explicit pop on the success path (already done by escalation),
+    # but verify a successful sweep starts and ends with no counter.
+    harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+        return_value='deadbeef' + 'a' * 32,
+    )
+    await harness._reconcile_stranded_in_progress()
+    assert '400' not in harness._reconcile_skip_counts
 
 
 @pytest.mark.asyncio

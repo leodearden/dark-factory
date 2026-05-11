@@ -391,6 +391,18 @@ class GitConfig(BaseModel):
             'Best-effort: failures are logged but do not fail the merge.'
         ),
     )
+    commit_citation_pattern: str | None = Field(
+        default=None,
+        description=(
+            "Optional override for the reconciler's task-citation pattern "
+            "used by git_ops.find_task_citation_commit to gate the "
+            "is_ancestor fast-path.  None uses the built-in default "
+            "(orchestrator.git_ops.DEFAULT_COMMIT_CITATION_PATTERN), "
+            "which matches dark-factory / reify conventional-commit "
+            "subjects.  Set to an empty string to disable the citation "
+            "check entirely for projects without citation conventions."
+        ),
+    )
 
 
 # --- Per-module overrides ---
