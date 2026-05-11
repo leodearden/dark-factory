@@ -757,11 +757,12 @@ async def test_blocked_routes_update_through_task_interceptor_when_wired(
     'rejection_dict, expected_error, expected_reason',
     [
         # (1) backlog-gate rejection — real BacklogVerdict.to_error_dict() shape
-        # (no 'success' key, no 'reason' key; 'error' is a rendered message string,
-        #  real code lives in 'error_type' = 'ReconciliationBacklogExceeded')
+        # (no 'success' key, no 'reason' key; 'error_type' = 'ReconciliationBacklogExceeded'
+        #  is the stable machine-friendly code; 'error' is the rendered human message —
+        #  task 1215: assert stable code so audit queries work with = '<code>')
         (
             BacklogVerdict(outcome='rejection', backlog=600, threshold=500, project_id='test-project').to_error_dict(),
-            BacklogVerdict(outcome='rejection', backlog=600, threshold=500, project_id='test-project').to_error_dict()['error'],
+            'ReconciliationBacklogExceeded',
             None,  # no 'reason' key in BacklogVerdict dict
         ),
         # (2) _reject_status_in_update_task shape

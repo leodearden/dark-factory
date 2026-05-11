@@ -369,7 +369,9 @@ class TargetedReconciler:
                         causation_id=run_id,
                     )
                 else:
-                    error_code = resp.get('error') if isinstance(resp, dict) else 'unknown'
+                    # Prefer 'error_type' (stable machine-friendly code, e.g. BacklogVerdict)
+                    # over 'error' (rendered human message) for audit-query aggregation — task 1215.
+                    error_code = (resp.get('error_type') or resp.get('error')) if isinstance(resp, dict) else 'unknown'
                     reason = resp.get('reason') if isinstance(resp, dict) else None
                     result['actions'].append({
                         'type': 'hints_skipped',
