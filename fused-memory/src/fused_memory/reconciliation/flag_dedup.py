@@ -169,7 +169,7 @@ async def filter_suppressed(
         task_id = meta.get('task_id')
         if task_id is None or task_id == '':
             continue
-        suppressed_task_ids.add(str(task_id))  # required: Mem0 JSON round-trip may yield int or str
+        suppressed_task_ids.add(str(task_id))  # required: legacy records may carry task_id as int or str; coerce both sides for compat
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
