@@ -27,6 +27,7 @@ class _Fixture:
     dispatch_tool: AsyncMock
     update_task: AsyncMock
     event_emit: MagicMock
+    submit_calls: list[tuple[str, dict]]
 
 
 def _make(
@@ -123,7 +124,6 @@ def _make(
         return {'ok': True}
 
     scheduler.dispatch_tool = _dispatch_recording
-    harness._dispatch_calls = submit_calls  # type: ignore[attr-defined]
 
     return _Fixture(
         harness=harness,
@@ -132,6 +132,7 @@ def _make(
         dispatch_tool=dispatch_tool,
         update_task=update_task,
         event_emit=harness.event_store.emit,
+        submit_calls=submit_calls,
     )
 
 
@@ -160,8 +161,8 @@ async def test_dispatches_redo_on_block(tmp_path: Path):
     assert rename_kwargs['new_branch'] == 'orig-task-skip-attempt'
 
     # submit_task + set_task_status both fired
-    submitted = [c for c in f.harness._dispatch_calls if c[0] == 'submit_task']
-    flipped = [c for c in f.harness._dispatch_calls if c[0] == 'set_task_status']
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
+    flipped = [c for c in f.submit_calls if c[0] == 'set_task_status']
     assert len(submitted) == 1
     assert len(flipped) == 1
     submit_args = submitted[0][1]
@@ -194,7 +195,7 @@ async def test_skipped_when_no_optimistic_path(tmp_path: Path):
     f = _make(project_root=tmp_path / 'proj', optimistic_path=None)
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
     f.git_ops_rename.assert_not_awaited()
-    assert f.harness._dispatch_calls == []
+    assert f.submit_calls == []
 
 
 @pytest.mark.asyncio
@@ -254,7 +255,7 @@ async def test_rename_failure_does_not_block_redo(tmp_path: Path):
 
     # rename was attempted but failed — redo still dispatched
     f.git_ops_rename.assert_awaited_once()
-    submitted = [c for c in f.harness._dispatch_calls if c[0] == 'submit_task']
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
     assert len(submitted) == 1
 
     emit_calls = [
@@ -270,7 +271,7 @@ async def test_no_worktree_no_rename(tmp_path: Path):
     f = _make(project_root=tmp_path / 'proj', worktree_exists=False)
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
     f.git_ops_rename.assert_not_awaited()
-    submitted = [c for c in f.harness._dispatch_calls if c[0] == 'submit_task']
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
     assert len(submitted) == 1
 
 
@@ -281,8 +282,8 @@ async def test_submit_returns_no_task_id(tmp_path: Path):
         submit_returns={'error': 'curator full'},
     )
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
-    submitted = [c for c in f.harness._dispatch_calls if c[0] == 'submit_task']
-    flipped = [c for c in f.harness._dispatch_calls if c[0] == 'set_task_status']
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
+    flipped = [c for c in f.submit_calls if c[0] == 'set_task_status']
     assert len(submitted) == 1
     assert len(flipped) == 0  # status flip not called
     assert f.harness._auto_eval_redo_task_ids == set()

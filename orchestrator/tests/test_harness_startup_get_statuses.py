@@ -51,7 +51,6 @@ def startup_harness(tmp_path: Path, mock_orch_config) -> Harness:
     h._tag_task_modules = AsyncMock()
     h._recover_crashed_tasks = AsyncMock()
     h._reconcile_stranded_in_progress = AsyncMock()
-    h._populate_tasks = AsyncMock()
     h._tag_prd_metadata = AsyncMock()
 
     # Scheduler mock: get_tasks is seeded with a non-empty list as a trap value.
