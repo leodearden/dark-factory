@@ -1861,7 +1861,7 @@ class TestFairness:
     def test_install_and_block_non_owner(self):
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         lt = ModuleLockTable(config)
-        lt.install_parks('owner', ['backend'], deadline=time.monotonic() + 60)
+        lt.install_parks('owner', ['backend'], priority='medium')
         assert not lt.try_acquire('other', ['backend'])
         # Owner can still acquire its own park.
         assert lt.try_acquire('owner', ['backend'])
@@ -1870,7 +1870,7 @@ class TestFairness:
         """A park on a parent module blocks acquire of any child."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         lt = ModuleLockTable(config)
-        lt.install_parks('A', ['autopilot/analyze'], deadline=time.monotonic() + 60)
+        lt.install_parks('A', ['autopilot/analyze'], priority='medium')
         assert not lt.try_acquire('B', ['autopilot/analyze/asr'])
 
     def test_park_hierarchical_blocks_parent(self):
@@ -1878,7 +1878,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         lt = ModuleLockTable(config)
         lt.install_parks(
-            'A', ['autopilot/analyze/asr'], deadline=time.monotonic() + 60
+            'A', ['autopilot/analyze/asr'], priority='medium'
         )
         assert not lt.try_acquire('B', ['autopilot/analyze'])
 
@@ -1886,14 +1886,14 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         lt = ModuleLockTable(config)
         lt.install_parks(
-            'A', ['autopilot/analyze/asr'], deadline=time.monotonic() + 60
+            'A', ['autopilot/analyze/asr'], priority='medium'
         )
         assert lt.try_acquire('B', ['autopilot/analyze/speech'])
 
     def test_clear_parks_for_owner(self):
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         lt = ModuleLockTable(config)
-        lt.install_parks('A', ['backend', 'frontend'], deadline=time.monotonic() + 60)
+        lt.install_parks('A', ['backend', 'frontend'], priority='medium')
         assert lt.has_parks('A')
         lt.clear_parks_for('A')
         assert not lt.has_parks('A')
@@ -1992,7 +1992,7 @@ class TestFairness:
         scheduler.lock_table.install_parks(
             'A',
             ['compiler/src', 'eval/src'],
-            deadline=time.monotonic() + 300,
+            priority='medium',
         )
         # B wants compiler/src only — should be blocked by A's park.
         assert not scheduler.lock_table.try_acquire('B', ['compiler/src'])
@@ -2004,7 +2004,7 @@ class TestFairness:
         """The park owner can still acquire its own reserved modules."""
         scheduler = Scheduler(fair_config)
         scheduler.lock_table.install_parks(
-            'A', ['compiler/src', 'eval/src'], deadline=time.monotonic() + 300
+            'A', ['compiler/src', 'eval/src'], priority='medium'
         )
         a = self._broad_task()
         scheduler.get_tasks = AsyncMock(return_value=[a])
@@ -2013,26 +2013,6 @@ class TestFairness:
         assert result is not None and result.task_id == 'A'
         # Parks were cleared on successful acquire.
         assert not scheduler.lock_table.has_parks('A')
-
-    @pytest.mark.asyncio
-    async def test_reservation_expires_and_skip_count_resets(
-        self, fair_config, monkeypatch
-    ):
-        """When a lease expires without acquire, the park drops and the owner's
-        skip counter resets so they can re-accumulate instead of loop-parking."""
-        scheduler = Scheduler(fair_config)
-        # Install a park with a deadline already in the past.
-        scheduler.lock_table.install_parks(
-            'A', ['compiler/src', 'eval/src'], deadline=0.0
-        )
-        scheduler._skip_count['A'] = 5
-
-        # Tick the scheduler with no candidates — this triggers prune.
-        scheduler.get_tasks = AsyncMock(return_value=[])
-        await scheduler.acquire_next()
-
-        assert not scheduler.lock_table.has_parks('A')
-        assert 'A' not in scheduler._skip_count
 
     @pytest.mark.asyncio
     async def test_mode2_broad_task_eventually_wins(self, fair_config):
