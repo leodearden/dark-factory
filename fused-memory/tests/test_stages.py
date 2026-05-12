@@ -5251,13 +5251,15 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
 
     @pytest.mark.asyncio
     async def test_stale_fixc_markers_swept_stat_set_after_run(self, mock_deps):
-        """run() injects stale_fixc_markers_swept into report.stats after super().run()."""
-        from datetime import UTC, datetime
-        from types import SimpleNamespace
-        from unittest.mock import AsyncMock as AM, patch
+        """run() injects stale_fixc_markers_swept into report.stats after super().run().
 
-        from fused_memory.reconciliation.stages.base import BaseStage
-        from fused_memory.models.reconciliation import StageId, StageReport
+        Uses the run_stage_via_cli mock pattern (not BaseStage.run mock) so that
+        assemble_payload executes for real and _stale_fixc_markers_swept is populated
+        by the sweep before run() injects the count into report.stats.
+        """
+        from types import SimpleNamespace
+
+        from fused_memory.models.reconciliation import StageId
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
@@ -5278,20 +5280,23 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
                 metadata={'flag_for_stage2': True, 'task_id': '3'},
             ),
         ]
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
-        base_report = StageReport(
-            stage=StageId.task_knowledge_sync,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
+        # Fake LLM result — assemble_payload runs for real; only the CLI call is mocked.
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
             tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
         )
         watermark = Watermark(project_id='reify')
 
-        with patch.object(BaseStage, 'run', new=AM(return_value=base_report)):
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
             report = await stage.run(
                 events=[], watermark=watermark, prior_reports=[], run_id='test-run'
             )
