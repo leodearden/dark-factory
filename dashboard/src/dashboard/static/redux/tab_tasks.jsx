@@ -205,17 +205,6 @@ function fmtAge(t) {
   return `${t.started}m running`;
 }
 
-// Open links rendered from markdown in a new tab with safe rel attributes.
-// Registered once at module load; DOMPurify guard handles offline/CDN-fail cases.
-if (typeof DOMPurify !== 'undefined') {
-  DOMPurify.addHook('afterSanitizeAttributes', function(node) {
-    if (node.tagName === 'A') {
-      node.setAttribute('target', '_blank');
-      node.setAttribute('rel', 'noopener noreferrer');
-    }
-  });
-}
-
 function MarkdownText({ text, className, empty }) {
   // Memoize parse+sanitize so it only reruns when text changes, not on every
   // parent re-render (e.g. streaming status updates from another tab).
@@ -226,7 +215,19 @@ function MarkdownText({ text, className, empty }) {
   const html = uM_T(() => {
     if (!text || typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
     try {
-      return DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
+      const sanitized = DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
+      // Scoped anchor rewrite: mutate <a> attributes after sanitizing rather than
+      // registering a global DOMPurify hook. No future DOMPurify caller in the app
+      // silently inherits target=_blank, and dev-reload re-evaluation is harmless.
+      // <template> is inert (no script execution or resource loading), so walking
+      // already-sanitized HTML is safe.
+      const tpl = document.createElement('template');
+      tpl.innerHTML = sanitized;
+      tpl.content.querySelectorAll('a').forEach(a => {
+        a.setAttribute('target', '_blank');
+        a.setAttribute('rel', 'noopener noreferrer');
+      });
+      return tpl.innerHTML;
     } catch {
       // On any parse/sanitize error return null; the html===null branch below
       // degrades to plain pre-line text rather than unmounting TaskDetail.
