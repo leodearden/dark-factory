@@ -599,9 +599,9 @@ class Scheduler:
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
         self._task_start_times: dict[str, float] = {}  # task_id -> monotonic start
-        self._recent_durations: deque[float] = deque(
-            maxlen=config.fairness.median_window
-        )
+        # TODO(step-10): _recent_durations and _task_start_times are deleted
+        # with _compute_lease in step 10; fixed window until then.
+        self._recent_durations: deque[float] = deque(maxlen=50)
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
@@ -1128,21 +1128,11 @@ class Scheduler:
         return signal is not None
 
     def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
-        """Compute a reservation lease from the rolling duration window.
-
-        - Empty history → midpoint of ``[lease_min_secs, lease_max_secs]``
-        - Otherwise → ``median * lease_multiplier``, clamped to bounds.
-
-        The multiplier is resolved per-*tier* (critical/high parks carry a
-        longer lease than low/polish) via
-        :meth:`FairnessConfig.lease_multiplier_for`.
+        """Stub: lease fields removed from FairnessConfig in step 2.
+        Returns a constant 300 s until _bump_skip_and_maybe_park is
+        reworked in step 10 to pass priority instead of a deadline.
         """
-        f = self.config.fairness
-        if not self._recent_durations:
-            return (f.lease_min_secs + f.lease_max_secs) / 2
-        median = statistics.median(self._recent_durations)
-        lease = median * f.lease_multiplier_for(tier)
-        return max(f.lease_min_secs, min(lease, f.lease_max_secs))
+        return 300.0
 
     def _bump_skip_and_maybe_park(
         self,
@@ -1381,10 +1371,8 @@ class Scheduler:
         )
 
     def _allowed_by_tier_cap(self, tier: str) -> bool:
-        """Return False iff admitting a task at *tier* would exceed the
-        configured per-tier slot cap."""
-        limit = self.config.tier_slot_limit(tier)
-        return self._count_dispatched_at_or_below(tier) < limit
+        """Stub: tier_slot_caps removed in step 2; full deletion in step 10."""
+        return True
 
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.

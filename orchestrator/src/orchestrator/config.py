@@ -239,19 +239,34 @@ class ReviewConfig(BaseModel):
     reports_dir: str = Field(default='data/review-checkpoints')
 
 
+_DEFAULT_SKIP_THRESHOLD: dict[str, int] = {
+    'critical': 0,
+    'high': 1,
+    'medium': 2,
+    'low': 4,
+    'polish': 9999,
+}
+
+
 class FairnessConfig(BaseModel):
     """Scheduler fairness / anti-starvation configuration.
 
     When a broad-footprint task keeps losing the greedy lock race to narrow
     tasks, the scheduler increments a per-task skip counter.  Once the counter
-    reaches ``skip_threshold``, the scheduler installs a short-lived
-    reservation ("park") on every module the starved task wants; parked
-    modules refuse ``try_acquire`` from anyone else until the owner acquires
-    or the lease expires.
+    reaches ``skip_threshold`` for the task's tier, the scheduler installs a
+    reservation ("park") on every module the starved task wants.  Parks are
+    coupled to the owner's live state: they evaporate the moment the owner
+    completes, is cancelled, or has its dependencies un-satisfied — no
+    wall-clock lease needed.
+
+    Set ``scheduler_v2: true`` to enable the full v2 machinery (eager parks,
+    cross-tier preemption, owner-state GC).  When False (default) the skip
+    counter still increments and ``task_skipped`` still emits, but
+    ``install_parks`` is never called so anti-starvation is inert.
     """
 
     skip_threshold: int | dict[str, int] = Field(
-        default=4,
+        default_factory=lambda: dict(_DEFAULT_SKIP_THRESHOLD),
         description=(
             'Consecutive top-candidate skips before installing a reservation.  '
             'Accepts either an int (applies to every tier) or a '
@@ -260,26 +275,20 @@ class FairnessConfig(BaseModel):
             'rate-limited task_skipped emission.'
         ),
     )
-    lease_multiplier: float | dict[str, float] = Field(
-        default=5.0,
+    scheduler_v2: bool = Field(
+        default=False,
         description=(
-            'Lease duration = median(recent task durations) * multiplier.  '
-            'Accepts either a float or a dict[tier -> float] for per-tier '
-            'multipliers.'
+            'Enable the v2 anti-starvation machinery: eager parks on the full '
+            'module set, cross-tier preemption, and owner-state GC sweep.  '
+            'Default False for one burn-in cycle; flip to True after validation.'
         ),
-    )
-    lease_min_secs: float = Field(default=60.0)
-    lease_max_secs: float = Field(default=3600.0)
-    median_window: int = Field(
-        default=50,
-        description='Rolling window size for task-duration history.',
     )
 
     @field_validator('skip_threshold', mode='before')
     @classmethod
     def _validate_skip_threshold(cls, v: Any) -> Any:
         if v is None:
-            return 4
+            return dict(_DEFAULT_SKIP_THRESHOLD)
         if isinstance(v, int):
             return v
         if isinstance(v, dict):
@@ -295,45 +304,17 @@ class FairnessConfig(BaseModel):
             f'got {type(v).__name__}.'
         )
 
-    @field_validator('lease_multiplier', mode='before')
-    @classmethod
-    def _validate_lease_multiplier(cls, v: Any) -> Any:
-        if v is None:
-            return 5.0
-        if isinstance(v, int | float):
-            return float(v)
-        if isinstance(v, dict):
-            bad_keys = set(v) - set(PRIORITY_RANK)
-            if bad_keys:
-                raise ValueError(
-                    f'fairness.lease_multiplier has unknown priority tier(s): '
-                    f'{sorted(bad_keys)}.  Known tiers: {list(PRIORITY_RANK)}.'
-                )
-            return {k: float(val) for k, val in v.items()}
-        raise ValueError(
-            f'fairness.lease_multiplier must be number or dict[tier -> number]; '
-            f'got {type(v).__name__}.'
-        )
-
     def skip_threshold_for(self, tier: str) -> int:
         """Return the skip threshold that applies to *tier*."""
         tier = coerce_tier(tier)
         if isinstance(self.skip_threshold, dict):
             return int(
-                self.skip_threshold.get(tier, self.skip_threshold.get(DEFAULT_TIER, 4))
-            )
-        return int(self.skip_threshold)
-
-    def lease_multiplier_for(self, tier: str) -> float:
-        """Return the lease multiplier that applies to *tier*."""
-        tier = coerce_tier(tier)
-        if isinstance(self.lease_multiplier, dict):
-            return float(
-                self.lease_multiplier.get(
-                    tier, self.lease_multiplier.get(DEFAULT_TIER, 5.0)
+                self.skip_threshold.get(
+                    tier,
+                    self.skip_threshold.get(DEFAULT_TIER, _DEFAULT_SKIP_THRESHOLD.get(tier, 4)),
                 )
             )
-        return float(self.lease_multiplier)
+        return int(self.skip_threshold)
 
 
 class FusedMemoryConfig(BaseModel):
@@ -701,13 +682,6 @@ class OrchestratorConfig(BaseSettings):
             'this task (CPM proxy).'
         ),
     )
-    # Gentle per-tier slot caps (Fix 3).  Each entry restricts how much of
-    # ``max_concurrent_tasks`` can be held by tasks whose effective priority
-    # is at *that tier or lower*.  Missing tiers default to 1.0 (no cap).
-    # Parks (fairness reservations) override tier caps — once a park is
-    # installed, the owner dispatches regardless of cap.
-    tier_slot_caps: dict[str, float] = Field(default_factory=dict)
-
     # Git
     git: GitConfig = Field(default_factory=GitConfig)
 
@@ -727,47 +701,6 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
-
-    @field_validator('tier_slot_caps', mode='before')
-    @classmethod
-    def _validate_tier_slot_caps(cls, v: Any) -> dict[str, float]:
-        if v is None:
-            return {}
-        if not isinstance(v, dict):
-            raise ValueError(
-                f'tier_slot_caps must be dict[tier -> float]; got {type(v).__name__}.'
-            )
-        bad_keys = set(v) - set(PRIORITY_RANK)
-        if bad_keys:
-            raise ValueError(
-                f'tier_slot_caps has unknown priority tier(s): {sorted(bad_keys)}.  '
-                f'Known tiers: {list(PRIORITY_RANK)}.'
-            )
-        out: dict[str, float] = {}
-        for k, val in v.items():
-            fval = float(val)
-            if not 0.0 <= fval <= 1.0:
-                raise ValueError(
-                    f'tier_slot_caps[{k!r}] = {fval} out of range [0.0, 1.0].'
-                )
-            out[k] = fval
-        return out
-
-    def tier_slot_cap_for(self, tier: str) -> float:
-        """Return the fractional slot cap (0.0-1.0) for *tier*, 1.0 if unset."""
-        return self.tier_slot_caps.get(coerce_tier(tier), 1.0)
-
-    def tier_slot_limit(self, tier: str) -> int:
-        """Return the integer slot limit for tasks at *tier or lower*.
-
-        Computed as ``floor(tier_slot_cap_for(tier) * max_concurrent_tasks)``.
-        When the cap is 1.0 (the default) this equals ``max_concurrent_tasks``
-        and is never binding.
-        """
-        cap = self.tier_slot_cap_for(tier)
-        if cap >= 1.0:
-            return self.max_concurrent_tasks
-        return int(cap * self.max_concurrent_tasks)
 
     @model_validator(mode='after')
     def _validate_steward_timeout_invariant(self) -> 'OrchestratorConfig':
