@@ -907,6 +907,12 @@ class TaskKnowledgeSync(BaseStage):
     # loudly in that case so test authors are reminded to set this attribute.
     _current_run_id: str | None = None
 
+    # Count of stale fixc markers swept by _sweep_stale_fixc_markers in the
+    # current assemble_payload() call (task 1224).  Reset to 0 at the top of
+    # run() so cross-invocation contamination is impossible.  Written to
+    # report.stats['stale_fixc_markers_swept'] after super().run() returns.
+    _stale_fixc_markers_swept: int = 0
+
     # Set to True by assemble_payload() when the autopilot_video contamination
     # guardrail fires (task IDs above AUTOPILOT_VIDEO_TASK_CEILING detected).
     # get_disallowed_tools() then adds DISALLOW_TASK_WRITES to the disallowed list
@@ -1316,9 +1322,13 @@ class TaskKnowledgeSync(BaseStage):
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
-        # Stale-marker sweep is wired in step-8; for now we unpack and discard stale IDs.
-        active_flags, _stale_marker_ids = await _query_stage2_flags(
-            self.memory, self.project_id, self._current_run_id or ''
+        # Returns (current_flags, stale_marker_ids): stale partition contains markers
+        # whose metadata.run_id does not match the current run (or is absent — legacy
+        # markers pre-dating the run_id producer contract).  Stale markers are swept
+        # below by _sweep_stale_fixc_markers so they are never rendered to the LLM.
+        run_id_for_markers = self._current_run_id or ''
+        active_flags, stale_marker_ids = await _query_stage2_flags(
+            self.memory, self.project_id, run_id_for_markers
         )
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
@@ -1330,15 +1340,13 @@ class TaskKnowledgeSync(BaseStage):
         # Track how many cycles each surviving flag has survived without being
         # deleted.  Best-effort: _track_flag_persistence degrades gracefully.
         #
-        # run_id is only needed when there are surviving flags to persist; it
-        # is safe to skip the check when surviving is empty.  Raise before any
-        # marker writes so the failure is loud and attributable rather than
-        # tagging markers with an unattributable run_id.
+        # run_id is needed when there are surviving flags OR stale markers to sweep;
+        # raise before any marker writes so the failure is loud and attributable.
         # In tests: set `stage._current_run_id = 'test-run'` (or any non-empty
         # string) before calling assemble_payload() with non-empty Mem0 search
         # results.
         surviving_ids = [f['id'] for f in surviving]
-        if surviving_ids and not self._current_run_id:
+        if (surviving_ids or stale_marker_ids) and not self._current_run_id:
             raise RuntimeError(
                 'TaskKnowledgeSync.assemble_payload() called without a run_id: '
                 '_current_run_id is not set.  In production this is set '
@@ -1346,7 +1354,13 @@ class TaskKnowledgeSync(BaseStage):
                 'flags, assign stage._current_run_id = "test-run" before '
                 'calling assemble_payload() directly.'
             )
-        run_id_for_markers = self._current_run_id or ''
+
+        # Sweep stale markers (prior-cycle residue) in parallel.  Best-effort:
+        # individual failures log WARNING but are not re-raised.  The count is
+        # stored on the instance for reporting in run() via stats dict.
+        self._stale_fixc_markers_swept = await _sweep_stale_fixc_markers(
+            self.memory, self.project_id, stale_marker_ids, run_id_for_markers
+        )
         persistence_counts = await _track_flag_persistence(
             self.memory,
             self.project_id,
