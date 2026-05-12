@@ -4427,6 +4427,51 @@ class TestQueryStage2Flags:
             assert stale_marker_ids == ['test-id']
 
 
+class TestSweepStaleFixcMarkers:
+    """_sweep_stale_fixc_markers deletes stale fixc markers in parallel and returns count."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_each_id_in_parallel_and_returns_count(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        stale_ids = ['m1', 'm2', 'm3']
+
+        result = await _sweep_stale_fixc_markers(
+            memory_service, project_id='reify', stale_ids=stale_ids, run_id='r-current'
+        )
+
+        assert result == 3
+        assert memory_service.delete_memory.await_count == 3
+
+        # Verify each call carries the required kwargs
+        called_memory_ids = {
+            call.kwargs.get('memory_id') or call.args[0]
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert called_memory_ids == {'m1', 'm2', 'm3'}
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r-current'
+            assert kwargs.get('_source') == 'stage2_stale_fixc_sweep'
+
+    @pytest.mark.asyncio
+    async def test_empty_input_returns_zero_and_no_calls(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_fixc_markers(
+            memory_service, project_id='reify', stale_ids=[], run_id='r-current'
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
 
