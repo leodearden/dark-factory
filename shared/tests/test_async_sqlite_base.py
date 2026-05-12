@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -488,12 +489,66 @@ async def _swap_in_failing_close_mock(
     return mock_conn
 
 
-# Promotes PytestUnhandledThreadExceptionWarning into a hard test error for
-# tests inside this class.  A regression of the "close real conn before
-# swapping mock" pattern surfaces in the *next* test's setup phase.
-# test_z_sentinel_no_leaked_worker_thread runs last specifically to be that
-# setup phase for test_open_succeeds_after_failed_close (the last real test).
-# See _swap_in_failing_close_mock for the safe-swap helper used by each test.
+# Sentinel used by _ensure_real_conn_closed_at_exit to distinguish a missing
+# attribute from an attribute that is explicitly None.  A plain None check
+# cannot tell the difference, so we use a unique object as a fallback value.
+_MISSING = object()
+
+
+@contextmanager
+def _ensure_real_conn_closed_at_exit(store: AsyncSqliteBase):
+    """Capture the current aiosqlite connection and assert it was closed
+    before the guard exits.
+
+    Order-independent replacement for the deferred-warning ``_z_`` sentinel:
+    a test that replaces ``store._conn`` with a mock WITHOUT first awaiting
+    ``real_conn.close()`` leaks the worker thread.  Eventually the orphan's
+    GC-driven ``call_soon_threadsafe`` runs on a closed event loop and pytest
+    surfaces ``PytestUnhandledThreadExceptionWarning`` in another test's
+    setup — fragile under randomized collection.
+
+    This guard captures a strong reference to the original Connection at
+    entry (keeping it alive until exit) and inspects ``_connection`` at exit.
+    ``Connection.close()`` sets ``_connection = None`` synchronously in its
+    ``finally`` block, so the check is race-free: closed → None, leaked → set.
+    See ``_swap_in_failing_close_mock`` for the safe-swap pattern this guard
+    defends.
+
+    If aiosqlite renames ``_connection``, the guard raises ``AssertionError``
+    with a diagnostic message pointing here — so the failure is loud and
+    attributable rather than a silent ``AttributeError`` or degraded check.
+    """
+    real_conn = store._conn
+    assert real_conn is not None, (
+        'store must be open before entering the leak guard'
+    )
+    try:
+        yield
+    finally:
+        connection_val = getattr(real_conn, '_connection', _MISSING)
+        if connection_val is _MISSING:
+            raise AssertionError(
+                'aiosqlite.Connection no longer exposes ._connection — '
+                '_ensure_real_conn_closed_at_exit must be updated to use '
+                'the new attribute name (aiosqlite API change detected).'
+            )
+        if connection_val is not None:
+            raise AssertionError(
+                f'Leaked aiosqlite connection: {real_conn!r}._connection '
+                'is still set when the guard exited. The real connection '
+                'was not closed before being replaced/discarded — its '
+                'worker thread will eventually try call_soon_threadsafe on '
+                'a closed event loop. See _swap_in_failing_close_mock for '
+                'the safe-swap pattern.'
+            )
+
+
+# _ensure_real_conn_closed_at_exit is the primary order-independent leak
+# detector for tests in this class: it asserts that the real aiosqlite
+# Connection was properly closed before the test exits, regardless of
+# collection order.  The filterwarnings marker is kept as defense-in-depth —
+# it converts PytestUnhandledThreadExceptionWarning to a hard error for any
+# edge-case leak that the guard might miss.
 @pytest.mark.filterwarnings('error::pytest.PytestUnhandledThreadExceptionWarning')
 @pytest.mark.asyncio
 class TestAsyncSqliteBaseCloseExceptionSafety:
@@ -510,12 +565,13 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         await store.open()
         assert store._conn is not None
 
-        # Install the failing mock (closes real conn first to avoid worker-thread leak)
-        await _swap_in_failing_close_mock(store, OSError('disk failure'))
+        with _ensure_real_conn_closed_at_exit(store):
+            # Install the failing mock (closes real conn first to avoid worker-thread leak)
+            await _swap_in_failing_close_mock(store, OSError('disk failure'))
 
-        # The OSError must propagate (not be swallowed)
-        with pytest.raises(OSError, match='disk failure'):
-            await store.close()
+            # The OSError must propagate (not be swallowed)
+            with pytest.raises(OSError, match='disk failure'):
+                await store.close()
 
         # _conn must be None even though close() raised
         assert store._conn is None
@@ -530,12 +586,13 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
 
-        # Install the failing mock (closes real conn first to avoid worker-thread leak)
-        await _swap_in_failing_close_mock(store, OSError('disk failure'))
+        with _ensure_real_conn_closed_at_exit(store):
+            # Install the failing mock (closes real conn first to avoid worker-thread leak)
+            await _swap_in_failing_close_mock(store, OSError('disk failure'))
 
-        # close() raises but must clear _conn
-        with pytest.raises(OSError, match='disk failure'):
-            await store.close()
+            # close() raises but must clear _conn
+            with pytest.raises(OSError, match='disk failure'):
+                await store.close()
 
         # After the failed close, open() must succeed — not raise RuntimeError
         await store.open()
@@ -547,18 +604,6 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         assert row is not None and row[0] == 1
 
         await store.close()
-
-    async def test_z_sentinel_no_leaked_worker_thread(self) -> None:
-        """Sentinel: catches any thread leak from test_open_succeeds_after_failed_close.
-
-        The filterwarnings marker on this class converts
-        PytestUnhandledThreadExceptionWarning into a hard error only during tests
-        inside this class.  If the last real test leaks an aiosqlite worker thread,
-        pytest defers the warning to the *next* test's setup phase.  This no-op
-        sentinel is that next setup phase — same class, same marker — so the warning
-        surfaces here rather than escaping into a different test class that lacks
-        the filter.
-        """
 
 
 # ---------------------------------------------------------------------------
@@ -593,3 +638,54 @@ class TestWorkerThreadIsDaemon:
             )
         finally:
             await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _ensure_real_conn_closed_at_exit guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSwapLeakGuard:
+    """Unit tests for the _ensure_real_conn_closed_at_exit guard context manager."""
+
+    async def test_guard_raises_when_real_conn_was_not_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """Guard raises AssertionError when the real connection was never closed.
+
+        Simulates a buggy swap: store._conn is replaced with an AsyncMock but
+        the original aiosqlite Connection is never awaited-closed first.  The
+        guard captures real_conn at entry; at exit it finds _connection is
+        still set and raises AssertionError immediately — rather than leaking
+        an unfinished worker thread into a later test's setup phase.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+        real_conn = store._conn  # keep a reference for post-test cleanup
+
+        with pytest.raises(AssertionError, match=r'Leaked aiosqlite connection'):  # noqa: SIM117
+            with _ensure_real_conn_closed_at_exit(store):
+                # Buggy swap: replace _conn without closing real_conn first
+                store._conn = AsyncMock()  # type: ignore[assignment]
+                store._conn.close = AsyncMock(side_effect=OSError('boom'))
+                # real_conn is deliberately NOT closed here — guard must fire
+
+        # Clean up the leaked connection so it does not pollute subsequent tests
+        await real_conn.close()
+
+    async def test_guard_passes_when_safe_swap_was_used(
+        self, tmp_path: Path
+    ) -> None:
+        """Guard exits silently when the safe-swap helper was used.
+
+        _swap_in_failing_close_mock awaits real_conn.close() before installing
+        the mock, so real_conn._connection is None at guard exit.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+
+        with _ensure_real_conn_closed_at_exit(store):
+            await _swap_in_failing_close_mock(store, OSError('boom'))
+            with pytest.raises(OSError):
+                await store.close()
