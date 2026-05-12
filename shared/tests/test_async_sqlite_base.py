@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -486,6 +487,43 @@ async def _swap_in_failing_close_mock(
     mock_conn.close = AsyncMock(side_effect=exc)
     store._conn = mock_conn  # type: ignore[assignment]
     return mock_conn
+
+
+@contextmanager
+def _ensure_real_conn_closed_at_exit(store: AsyncSqliteBase):
+    """Capture the current aiosqlite connection and assert it was closed
+    before the guard exits.
+
+    Order-independent replacement for the deferred-warning ``_z_`` sentinel:
+    a test that replaces ``store._conn`` with a mock WITHOUT first awaiting
+    ``real_conn.close()`` leaks the worker thread.  Eventually the orphan's
+    GC-driven ``call_soon_threadsafe`` runs on a closed event loop and pytest
+    surfaces ``PytestUnhandledThreadExceptionWarning`` in another test's
+    setup — fragile under randomized collection.
+
+    This guard captures a strong reference to the original Connection at
+    entry (keeping it alive until exit) and inspects ``_connection`` at exit.
+    ``Connection.close()`` sets ``_connection = None`` synchronously in its
+    ``finally`` block, so the check is race-free: closed → None, leaked → set.
+    See ``_swap_in_failing_close_mock`` for the safe-swap pattern this guard
+    defends.
+    """
+    real_conn = store._conn
+    assert real_conn is not None, (
+        'store must be open before entering the leak guard'
+    )
+    try:
+        yield
+    finally:
+        if real_conn._connection is not None:
+            raise AssertionError(
+                f'Leaked aiosqlite connection: {real_conn!r}._connection '
+                'is still set when the guard exited. The real connection '
+                'was not closed before being replaced/discarded — its '
+                'worker thread will eventually try call_soon_threadsafe on '
+                'a closed event loop. See _swap_in_failing_close_mock for '
+                'the safe-swap pattern.'
+            )
 
 
 # Promotes PytestUnhandledThreadExceptionWarning into a hard test error for
