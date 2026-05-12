@@ -36,8 +36,7 @@ async def _probe_one(
             mcp_tool_call(client, base_url, 'get_merge_halt_status', {}),
             timeout=timeout,
         )
-    except (asyncio.TimeoutError, httpx.ConnectError, httpx.TimeoutException,
-            httpx.HTTPStatusError, ValueError, OSError) as exc:
+    except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:
         logger.debug('get_merge_halt_status failed for %s: %s', base_url, exc)
         return {'wired': False, 'halted': False, 'offline': True, 'error': str(exc)}
     return {

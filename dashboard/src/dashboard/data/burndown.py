@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import aiosqlite
 import httpx

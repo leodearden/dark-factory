@@ -62,7 +62,7 @@ class BackfillManager:
         curator: A TaskCurator instance (uses its backfill_corpus method).
     """
 
-    def __init__(self, config, taskmaster: 'TaskBackendProtocol', curator: TaskCurator) -> None:
+    def __init__(self, config, taskmaster: TaskBackendProtocol, curator: TaskCurator) -> None:
         self.config = config
         self.taskmaster = taskmaster
         self.curator = curator

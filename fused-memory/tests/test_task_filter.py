@@ -9,7 +9,7 @@ from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
     FilteredTaskTree,
     _flatten_with_subtasks,
-    _id_key,
+    id_key,
     _render_task_line,
     filter_task_tree,
     format_filtered_task_tree,
@@ -886,11 +886,11 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         assert result.cancelled_count == 0
 
     def test_done_and_cancelled_lists_sort_with_non_int_ids(self):
-        """_id_key covers both branches: string-digit ids coerce to int (happy path) and non-parseable ids fall back to 0.
+        """id_key covers both branches: string-digit ids coerce to int (happy path) and non-parseable ids fall back to 0.
 
-        String-digit id '4' exercises the int()-coercion branch of _id_key; it must sort between
+        String-digit id '4' exercises the int()-coercion branch of id_key; it must sort between
         int id=5 and int id=3 (i.e. 4 > 3) confirming coercion drives sort order, not input position.
-        Non-parseable ids 'abc' and 'def' exercise the ValueError-fallback branch (_id_key=0) and
+        Non-parseable ids 'abc' and 'def' exercise the ValueError-fallback branch (id_key=0) and
         sort last in descending order; the -index tiebreaker preserves their input order: abc before def.
         """
         tasks_data = {
@@ -903,7 +903,7 @@ class TestFilterTaskTreeDoneAndCancelledLists:
                 {'id': 3, 'title': 'Done 3', 'status': 'done', 'dependencies': []},
                 # id='4' is placed AFTER id=3 in input order so that a correct sort
                 # (4 > 3) cannot be confused with a no-op passthrough of input position.
-                # It exercises the int()-coercion (not fallback) path of _id_key.
+                # It exercises the int()-coercion (not fallback) path of id_key.
                 {'id': '4', 'title': 'Done 4', 'status': 'done', 'dependencies': []},
                 {'id': 'def', 'title': 'Done def', 'status': 'done', 'dependencies': []},
                 # cancelled: mix of int and non-int ids
@@ -917,20 +917,20 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         done_ids = [t['id'] for t in result.done_tasks]
         cancelled_ids = [t['id'] for t in result.cancelled_tasks]
 
-        # '4' has _id_key=4 via int() coercion (happy path), so it sorts between 5 and 3.
-        # 'abc' and 'def' both have _id_key=0 (int() fallback), so they sort last after
+        # '4' has id_key=4 via int() coercion (happy path), so it sorts between 5 and 3.
+        # 'abc' and 'def' both have id_key=0 (int() fallback), so they sort last after
         # all int ids (10 > 5 > 4 > 3 > 0). The -index tiebreaker preserves their input order: 'abc' before 'def'.
         assert done_ids == [10, 5, '4', 3, 'abc', 'def'], (
             f"Expected done_tasks id order [10, 5, '4', 3, 'abc', 'def'] — "
-            f"string-digit id '4' has _id_key=4 via successful int() coercion and sorts between 5 and 3; "
-            f"non-int ids 'abc' and 'def' both have _id_key=0 via the int() fallback, sort last "
+            f"string-digit id '4' has id_key=4 via successful int() coercion and sorts between 5 and 3; "
+            f"non-int ids 'abc' and 'def' both have id_key=0 via the int() fallback, sort last "
             f"(0 < 3 < 4 < 5 < 10 descending), and the -index tiebreaker preserves their input order "
             f"(abc before def). Got: {done_ids}"
         )
 
-        # 'xyz' has _id_key=0 (int() fallback), so it sorts last after 7, 2 (both > 0)
+        # 'xyz' has id_key=0 (int() fallback), so it sorts last after 7, 2 (both > 0)
         assert cancelled_ids == [7, 2, 'xyz'], (
-            f"Expected cancelled_tasks id order [7, 2, 'xyz'] — non-int 'xyz' has _id_key=0 "
+            f"Expected cancelled_tasks id order [7, 2, 'xyz'] — non-int 'xyz' has id_key=0 "
             f"via the int() fallback and sorts last (0 < 2 < 7 descending). Got: {cancelled_ids}"
         )
 
@@ -1295,39 +1295,39 @@ class TestFormatCancelledSection:
 
 
 class TestIdKey:
-    """Direct unit tests for the module-level _id_key() helper."""
+    """Direct unit tests for the module-level id_key() helper."""
 
     def test_int_id_returns_int(self):
-        """_id_key returns the int value when 'id' is already an int."""
-        assert _id_key({'id': 42}) == 42
+        """id_key returns the int value when 'id' is already an int."""
+        assert id_key({'id': 42}) == 42
 
     def test_string_parseable_id_returns_int(self):
-        """_id_key converts a string-encoded integer to int."""
-        assert _id_key({'id': '42'}) == 42
+        """id_key converts a string-encoded integer to int."""
+        assert id_key({'id': '42'}) == 42
 
     def test_non_parseable_string_returns_zero(self):
-        """_id_key returns 0 for a non-parseable string like 'abc'."""
-        assert _id_key({'id': 'abc'}) == 0
+        """id_key returns 0 for a non-parseable string like 'abc'."""
+        assert id_key({'id': 'abc'}) == 0
 
     def test_none_id_returns_zero(self):
-        """_id_key returns 0 when 'id' is explicitly None."""
-        assert _id_key({'id': None}) == 0
+        """id_key returns 0 when 'id' is explicitly None."""
+        assert id_key({'id': None}) == 0
 
-    def test_missing_id_key_returns_zero(self):
-        """_id_key returns 0 when the 'id' key is absent from the dict."""
-        assert _id_key({}) == 0
+    def test_missingid_key_returns_zero(self):
+        """id_key returns 0 when the 'id' key is absent from the dict."""
+        assert id_key({}) == 0
 
     def test_float_id_is_truncated_to_int(self):
-        """_id_key returns the int truncation of a float (int(3.9) == 3)."""
-        assert _id_key({'id': 3.9}) == 3
+        """id_key returns the int truncation of a float (int(3.9) == 3)."""
+        assert id_key({'id': 3.9}) == 3
 
     def test_dotted_subtask_id_returns_parent_component(self):
-        """_id_key returns the parent (first dot-segment) as int for '450.2'."""
-        assert _id_key({'id': '450.2'}) == 450
+        """id_key returns the parent (first dot-segment) as int for '450.2'."""
+        assert id_key({'id': '450.2'}) == 450
 
     def test_deep_dotted_id_returns_parent_component(self):
-        """_id_key returns the parent (first dot-segment) as int for '450.2.1'."""
-        assert _id_key({'id': '450.2.1'}) == 450
+        """id_key returns the parent (first dot-segment) as int for '450.2.1'."""
+        assert id_key({'id': '450.2.1'}) == 450
 
 
 class TestFlattenWithSubtasks:
@@ -1470,15 +1470,15 @@ class TestSortOrderWithSubtasks:
     """Sort order tests for filter_task_tree when subtasks are present."""
 
     def test_sort_order_with_mixed_parent_and_subtask_ids(self):
-        """Tasks with mixed parent and subtask IDs sort by _STATUS_PRIORITY then -_id_key.
+        """Tasks with mixed parent and subtask IDs sort by _STATUS_PRIORITY then -id_key.
 
-        All tasks are 'pending' (same priority), so sort is purely by -_id_key:
-          451 → _id_key=451 → sort position 0  (highest, first shown)
-          '450'  → _id_key=450 → sort position 1
-          '450.2' → _id_key=450 → sort position 2 (stable: same as parent)
-          '450.1' → _id_key=450 → sort position 3 (stable: same as parent)
+        All tasks are 'pending' (same priority), so sort is purely by -id_key:
+          451 → id_key=451 → sort position 0  (highest, first shown)
+          '450'  → id_key=450 → sort position 1
+          '450.2' → id_key=450 → sort position 2 (stable: same as parent)
+          '450.1' → id_key=450 → sort position 3 (stable: same as parent)
 
-        With Python's stable sort, tasks sharing _id_key=450 preserve input order
+        With Python's stable sort, tasks sharing id_key=450 preserve input order
         relative to each other: 450, 450.2, 450.1 (as given in input).
         """
         tasks_data = {
@@ -1494,7 +1494,7 @@ class TestSortOrderWithSubtasks:
         result = filter_task_tree(tasks_data)
 
         ids = [str(t['id']) for t in result.active_tasks]
-        # 451 must come before 450 group (higher _id_key → negated → lower sort value)
+        # 451 must come before 450 group (higher id_key → negated → lower sort value)
         assert ids.index('451') < ids.index('450')
         assert ids.index('451') < ids.index('450.2')
         assert ids.index('451') < ids.index('450.1')

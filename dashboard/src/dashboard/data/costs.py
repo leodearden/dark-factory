@@ -648,7 +648,7 @@ async def aggregate_cost_summary(
     # Compute p95 once per project from the merged run_costs list. Keep the
     # raw list in the dict so shape_costs can compute the global p95 by
     # concatenating across projects.
-    for pid, m in merged.items():
+    for m in merged.values():
         run_costs = sorted(m.get('run_costs') or [])
         m['run_costs'] = run_costs
         m['p95_run_cost'] = percentile(run_costs, 95) if run_costs else None

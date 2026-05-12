@@ -327,7 +327,7 @@ class TicketStore:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def mark_escalated(self, ticket_ids: 'list[str] | tuple[str, ...]') -> int:
+    async def mark_escalated(self, ticket_ids: list[str] | tuple[str, ...]) -> int:
         """Bulk-stamp ``escalated_at`` on the given tickets.
 
         Returns the number of rows updated. Caller is expected to pass an

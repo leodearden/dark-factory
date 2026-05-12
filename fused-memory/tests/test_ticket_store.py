@@ -209,6 +209,7 @@ async def test_flush_pending_on_startup_marks_all_pending_failed(store):
 async def _force_failed(store: TicketStore, ticket_id: str, *, reason: str) -> None:
     """Test helper: terminalise a ticket as failed with the given reason."""
     db = store._db
+    assert db is not None
     now = datetime.now(UTC).isoformat()
     await db.execute(
         "UPDATE tickets SET status = 'failed', reason = ?, resolved_at = ? "
@@ -332,6 +333,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     # Initialise — the migration must add escalated_at.
     store = TicketStore(db_path)
     await store.initialize()
+    assert store._db is not None
     cursor = await store._db.execute('PRAGMA table_info(tickets)')
     cols = {r[1] for r in await cursor.fetchall()}
     assert 'escalated_at' in cols
@@ -347,6 +349,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
 async def _force_created_at(store: TicketStore, ticket_id: str, when: datetime) -> None:
     """Test helper: rewrite a ticket's created_at so window filters can be exercised."""
     db = store._db
+    assert db is not None
     await db.execute(
         'UPDATE tickets SET created_at = ? WHERE ticket_id = ?',
         (when.isoformat(), ticket_id),

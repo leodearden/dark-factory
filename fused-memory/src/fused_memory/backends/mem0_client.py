@@ -264,7 +264,7 @@ class Mem0Backend:
 
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        must = [
+        must: list[qmodels.Condition] = [
             qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
             for k, v in filters.items()
         ]

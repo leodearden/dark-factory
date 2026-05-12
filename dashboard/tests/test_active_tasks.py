@@ -14,7 +14,6 @@ from dashboard.data.active_tasks import (
     collect_active_tasks,
 )
 
-
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator
 # ---------------------------------------------------------------------------

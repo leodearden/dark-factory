@@ -8,6 +8,7 @@ on_agent_complete, shutdown, and all properties.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -2266,7 +2267,5 @@ class TestAuthReprobeDemoteOnCapMessage:
         for t in (acct.resume_task, acct.auth_reprobe_task):
             if t is not None and not t.done():
                 t.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
-                except (asyncio.CancelledError, Exception):
-                    pass

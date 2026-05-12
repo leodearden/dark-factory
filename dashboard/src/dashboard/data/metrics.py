@@ -18,15 +18,14 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import aiosqlite
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.merge_queue import active_queued_merges
 from dashboard.data.memory import get_memory_status, get_queue_stats
+from dashboard.data.merge_queue import active_queued_merges
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,

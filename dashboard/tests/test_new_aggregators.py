@@ -19,7 +19,6 @@ from dashboard.data.burndown import compute_forecast_confidence
 from dashboard.data.costs import aggregate_cost_summary
 from dashboard.data.performance import aggregate_performance_history
 
-
 # ---------------------------------------------------------------------------
 # Forecast confidence
 # ---------------------------------------------------------------------------

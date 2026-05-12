@@ -35,6 +35,7 @@ import pytest  # noqa: E402
 from _dashboard_helpers import RECONCILIATION_SCHEMA  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 
+
 @pytest.fixture()
 def dashboard_config(tmp_path):
     """Create a DashboardConfig with tmp_path-based project_root."""

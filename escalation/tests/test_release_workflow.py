@@ -10,7 +10,6 @@ matching the pattern used by other MCP-tool unit tests in this repo.
 from __future__ import annotations
 
 import asyncio
-import tempfile
 from pathlib import Path
 from typing import Any
 

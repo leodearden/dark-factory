@@ -15,7 +15,6 @@ from typing import Any
 
 from dashboard.data.stats_utils import percentile
 
-
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
 # ---------------------------------------------------------------------------

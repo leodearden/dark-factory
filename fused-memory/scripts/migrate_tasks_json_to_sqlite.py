@@ -36,10 +36,10 @@ if _ROOT.exists() and str(_ROOT) not in sys.path:
 import aiosqlite  # noqa: E402
 
 from fused_memory.backends.sqlite_task_backend import (  # noqa: E402
-    DEFAULT_TAG,
-    SqliteTaskBackend,
     _SCHEMA_SQL,
     _TOP_LEVEL_SENTINEL,
+    DEFAULT_TAG,
+    SqliteTaskBackend,
 )
 
 logger = logging.getLogger('migrate_tasks_json_to_sqlite')
@@ -282,7 +282,7 @@ def _compare_task_lists(
             sorted(src_ids - db_ids), sorted(db_ids - src_ids),
         )
     else:
-        for src_t, db_t in zip(src_norm, db_norm):
+        for src_t, db_t in zip(src_norm, db_norm, strict=True):
             if src_t != db_t:
                 logger.error('first-mismatch id=%s src=%s db=%s', src_t['id'], src_t, db_t)
                 break

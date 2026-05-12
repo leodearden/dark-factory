@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dashboard.data import redux_api
 
-
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
 # ---------------------------------------------------------------------------
