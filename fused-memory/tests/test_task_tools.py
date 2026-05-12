@@ -1,5 +1,6 @@
 """Tests for MCP task-tool behavior (update_task, set_task_status, etc.)."""
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -171,7 +172,10 @@ async def test_update_task_forwards_dotted_subtask_id_to_interceptor(
     assert kwargs['task_id'] == '2696.1'
 
     # (c) Dict metadata is JSON-serialized before forwarding (standard coercion).
-    assert kwargs['metadata'] == '{"memory_hints": {"entities": ["X"]}}'
+    # Use json.loads for the comparison so key-order / spacing differences don't
+    # cause spurious failures (exact serialization form is covered by the dedicated
+    # test_update_task_metadata_dict_coerced_to_json_string test).
+    assert json.loads(kwargs['metadata']) == {'memory_hints': {'entities': ['X']}}
 
 
 # ------------------------------------------------------------------

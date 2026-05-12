@@ -133,7 +133,9 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int]) -> dict[str, Any]:
         try:
             metadata = json.loads(metadata_raw)
         except (TypeError, ValueError):
-            metadata = metadata_raw
+            # Malformed legacy row: discard and surface {} so downstream
+            # `(task.get('metadata') or {}).get(...)` callers never see a str.
+            metadata = {}
 
     if parent_id is None:
         # Top-level: ids surface as strings (matches live get_tasks wire shape
