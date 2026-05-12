@@ -485,7 +485,15 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         await store.open()
         assert store._conn is not None
 
-        # Replace the real connection with a mock whose close() raises OSError
+        # Close the real connection before swapping in a mock — otherwise the
+        # aiosqlite worker thread is left running with a reference to this
+        # test's event loop, and its eventual GC-triggered call_soon_threadsafe
+        # raises 'Event loop is closed' (surfacing as PytestUnhandledThreadExceptionWarning).
+        real_conn = store._conn
+        store._conn = None
+        await real_conn.close()
+
+        # Replace the (now-closed) slot with a mock whose close() raises OSError
         mock_conn = AsyncMock()
         mock_conn.close = AsyncMock(side_effect=OSError('disk failure'))
         store._conn = mock_conn  # type: ignore[assignment]
@@ -506,6 +514,14 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         """
         store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
+
+        # Close the real connection before swapping in a mock — otherwise the
+        # aiosqlite worker thread is left running with a reference to this
+        # test's event loop, and its eventual GC-triggered call_soon_threadsafe
+        # raises 'Event loop is closed' (surfacing as PytestUnhandledThreadExceptionWarning).
+        real_conn = store._conn
+        store._conn = None
+        await real_conn.close()
 
         # Inject a mock that raises on close()
         mock_conn = AsyncMock()
