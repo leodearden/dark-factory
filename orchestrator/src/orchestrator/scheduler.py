@@ -430,28 +430,56 @@ class ModuleLockTable:
         Returns ``(installed, evicted)`` where *installed* is the list of
         normalized modules actually parked and *evicted* is a list of
         ``(owner_id, modules_lost)`` for any lower-priority parks displaced.
-        Cross-tier preemption is implemented in step 6; this step skips any
-        module that already has a park owned by a different task and always
-        returns ``evicted=[]``.
+
+        Cross-tier preemption: a park with ``existing_rank > new_rank``
+        (i.e. *strictly* lower priority) is evicted. Same-tier or
+        higher-priority existing parks block installation of the new park on
+        that module (no eviction, no install for that module).
         """
         depth = self._config.lock_depth
         rank = PRIORITY_RANK[coerce_tier(priority)]
         installed: list[str] = []
+        # Accumulate evictions: victim_owner -> list of modules lost.
+        eviction_acc: dict[str, list[str]] = {}
+        # Track insertion order of evicted owners for stable output.
+        eviction_order: list[str] = []
         for m in modules:
             normalized = normalize_lock(m, depth)
             if not normalized:
                 continue
-            # Check for conflicting parks from other owners — same-tier does
-            # NOT preempt; cross-tier preemption is wired in step 6.
-            conflict = any(
-                owner != task_id and self._conflicts(parked_m, normalized)
-                for parked_m, (owner, _existing_rank) in self._parked.items()
-            )
-            if conflict:
+            # Find all conflicting parks from other owners.
+            to_evict: list[str] = []  # parked_module keys to pop
+            blocked = False
+            for parked_m, (owner, existing_rank) in list(self._parked.items()):
+                if owner == task_id:
+                    continue
+                if not self._conflicts(parked_m, normalized):
+                    continue
+                # Hierarchical conflict with a different owner.
+                if existing_rank > rank:
+                    # Strictly lower priority → evict.
+                    to_evict.append(parked_m)
+                else:
+                    # Same or higher priority → block our install.
+                    blocked = True
+                    break
+            if blocked:
                 continue
+            # Perform evictions for this module.
+            for parked_m in to_evict:
+                owner, _ = self._parked.pop(parked_m)
+                if owner not in eviction_acc:
+                    eviction_acc[owner] = []
+                    eviction_order.append(owner)
+                eviction_acc[owner].append(parked_m)
             self._parked[normalized] = (task_id, rank)
             installed.append(normalized)
-        return installed, []
+        # Build evicted list in first-seen owner order, modules sorted.
+        evicted = [
+            (owner, sorted(eviction_acc[owner]))
+            for owner in eviction_order
+        ]
+        return installed, evicted
 
     def clear_parks_for(self, task_id: str) -> None:
         """Remove every reservation owned by *task_id*."""
