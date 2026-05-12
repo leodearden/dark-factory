@@ -2904,6 +2904,7 @@ class TestPerTierSkipThreshold:
     def _config(self, thresholds: dict[str, int]) -> OrchestratorConfig:
         config = OrchestratorConfig(max_per_module=1)
         config.fairness.skip_threshold = thresholds
+        config.fairness.scheduler_v2 = True
         return config
 
     def test_skip_threshold_for_lookup(self):
