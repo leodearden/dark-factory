@@ -953,8 +953,18 @@ class TaskKnowledgeSync(BaseStage):
         ``memory_consolidator``, or Stage 1's ``items_flagged`` is empty.
         """
         self._current_run_id = run_id
+        # Reset per-run counters so cross-invocation contamination is impossible
+        # (mirrors _current_run_id overwrite pattern).
+        self._stale_fixc_markers_swept = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
+
+        # --- stale fixc marker sweep stat (task 1224) ---
+        # _stale_fixc_markers_swept is set by assemble_payload() during the
+        # super().run() call above.  Inject it into the report here so
+        # downstream consumers (Stage 3 prompt, observability) can see how
+        # many prior-cycle markers were swept (mirrors stage2_stage1_dups_suppressed).
+        report.stats['stale_fixc_markers_swept'] = self._stale_fixc_markers_swept
 
         # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
         # Guard on stage identity so a future reorder of prior_reports doesn't
