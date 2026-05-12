@@ -504,33 +504,54 @@ async def test_row_to_task_warns_on_malformed_metadata(backend, project_root, ca
     The warning must include the row's tag, id, parent_id (raw DB int), and a
     truncated preview of the bad metadata_raw value so an operator can locate
     and repair the offending row.  The {}-coercion contract must also hold.
-    """
-    # Create a top-level task so a real DB row exists.
-    await backend.add_task(project_root=project_root, title='parent')
 
-    # Directly corrupt the metadata column with a non-JSON string.
+    Both the top-level and subtask paths are exercised — _row_to_task is the
+    shared converter for both shapes, so the warning must fire regardless of
+    whether the corrupted row is a root task or a child.
+    """
+    # Create a top-level task and a subtask so both row shapes exist.
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='child')
+
+    # Directly corrupt both rows' metadata column with a non-JSON string.
     conn = await backend._get_connection(project_root)
     await conn.execute(
         "UPDATE tasks SET metadata = 'NOT_JSON_GARBAGE_xyz' WHERE parent_id = 0 AND id = 1"
     )
+    await conn.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON_GARBAGE_xyz' WHERE parent_id = 1 AND id = 1"
+    )
     await conn.commit()
 
-    # Capture WARNING-level records from the sqlite_task_backend logger.
+    # Capture WARNING-level records for both top-level and subtask reads.
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
         task = await backend.get_task('1', project_root=project_root)
+        sub = await backend.get_task('1.1', project_root=project_root)
 
-    # The {}-coercion contract still holds.
+    # The {}-coercion contract still holds for both shapes.
     assert task['metadata'] == {}
+    assert sub['metadata'] == {}
 
     # At least one WARNING record must mention tag, id, parent_id, and the payload preview.
+    # Use labeled tokens (e.g. 'id=1') rather than bare digits to prevent false positives
+    # from incidental numeric matches elsewhere in the log text.
     warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_msgs, 'Expected at least one WARNING log record; got none'
     combined = ' '.join(warning_msgs)
+
+    # Top-level row: tag=master, id=1, parent_id=0 (the top-level sentinel).
     assert 'master' in combined, f'Expected tag "master" in warning; got: {combined!r}'
-    assert '1' in combined, f'Expected id "1" in warning; got: {combined!r}'
-    assert '0' in combined, f'Expected parent_id "0" in warning; got: {combined!r}'
+    assert 'id=1' in combined, f'Expected labeled token "id=1" in warning; got: {combined!r}'
+    assert 'parent_id=0' in combined, (
+        f'Expected labeled token "parent_id=0" in warning; got: {combined!r}'
+    )
     assert 'NOT_JSON_GARBAGE' in combined, (
         f'Expected metadata_raw preview in warning; got: {combined!r}'
+    )
+
+    # Subtask row: parent_id=1 (the DB int of the parent, not the sentinel).
+    assert 'parent_id=1' in combined, (
+        f'Expected labeled token "parent_id=1" for subtask warning; got: {combined!r}'
     )
 
 
