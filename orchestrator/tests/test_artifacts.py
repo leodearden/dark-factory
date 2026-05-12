@@ -443,6 +443,39 @@ class TestPlanLock:
         assert lock_path.exists()
 
 
+class TestAgentSession:
+    """Sidecar marker for in-flight agent subprocesses (crash-recovery resume)."""
+
+    def test_write_read_roundtrip(self, artifacts: TaskArtifacts):
+        artifacts.write_agent_session(
+            'sess-abc', 'architect', '2026-05-12T10:00:00+00:00',
+        )
+        data = artifacts.read_agent_session()
+        assert data is not None
+        assert data['session_id'] == 'sess-abc'
+        assert data['role'] == 'architect'
+        assert data['started_at'] == '2026-05-12T10:00:00+00:00'
+        assert data['owner_pid'] == os.getpid()
+
+    def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
+        assert artifacts.read_agent_session() is None
+
+    def test_clear_removes_file(self, artifacts: TaskArtifacts):
+        artifacts.write_agent_session('sess-x', 'implementer', 'now')
+        assert (artifacts.root / 'agent_session.json').exists()
+        artifacts.clear_agent_session()
+        assert not (artifacts.root / 'agent_session.json').exists()
+
+    def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
+        # No file present
+        artifacts.clear_agent_session()  # must not raise
+        artifacts.clear_agent_session()  # still idempotent
+
+    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
+        (artifacts.root / 'agent_session.json').write_text('{not valid json')
+        assert artifacts.read_agent_session() is None
+
+
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):
         artifacts.write_review('test_analyst', {

@@ -211,6 +211,11 @@ class Harness:
         # _reconcile_stranded_in_progress sweep, which otherwise wipes any
         # worktree not in _recovered_plans.
         self._preserved_worktrees: set[str] = set()
+        # Worktrees whose agent_session.json sidecar survived a crash with
+        # no plan.json — the next workflow for that task resumes the prior
+        # Claude session via --resume rather than spawning fresh.  Keyed
+        # by task_id; value is the parsed sidecar dict.
+        self._recovered_sessions: dict[str, dict] = {}
 
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
@@ -895,6 +900,30 @@ Output JSON matching the schema. Every task must appear in the output.
             plan_path = entry / '.task' / 'plan.json'
 
             if not plan_path.exists():
+                # Mid-invocation crash: an agent subprocess was in flight when
+                # the prior orchestrator died (no plan was written yet).  The
+                # sidecar pins the Claude session UUID so the next workflow
+                # can --resume it with a "continue" prompt instead of spawning
+                # a fresh agent.
+                sidecar_path = entry / '.task' / 'agent_session.json'
+                if sidecar_path.exists():
+                    try:
+                        session_data = json.loads(sidecar_path.read_text())
+                        logger.info(
+                            f'Recovery: worktree {task_id} has agent session sidecar '
+                            f'(role={session_data.get("role")}, '
+                            f'session_id={session_data.get("session_id")}) '
+                            f'— preserving for resume'
+                        )
+                        self._preserved_worktrees.add(task_id)
+                        self._recovered_sessions[task_id] = session_data
+                        recovered += 1
+                        continue
+                    except (json.JSONDecodeError, OSError) as e:
+                        logger.warning(
+                            f'Recovery: worktree {task_id} sidecar unreadable, '
+                            f'falling back to cleanup: {e}'
+                        )
                 logger.info(
                     f'Recovery: worktree {task_id} has no plan — cleaning up'
                 )
@@ -957,6 +986,11 @@ Output JSON matching the schema. Every task must appear in the output.
                             f'Recovery: cleared stale plan.lock for '
                             f'preserved task {task_id}'
                         )
+                    # The architect already produced a stamped plan; any
+                    # sidecar present is from a later (post-plan) invocation
+                    # that crashed and isn't meaningful here — clear it to
+                    # avoid confusing the next workflow on this task.
+                    (entry / '.task' / 'agent_session.json').unlink(missing_ok=True)
                     self._preserved_worktrees.add(task_id)
                     recovered += 1
                     continue
@@ -1331,6 +1365,7 @@ Output JSON matching the schema. Every task must appear in the output.
             return
         worktree_path = self.git_ops.worktree_base / tid
         self._recovered_plans.pop(tid, None)
+        self._recovered_sessions.pop(tid, None)
         if worktree_path.exists():
             try:
                 await self.git_ops.cleanup_worktree(worktree_path, tid)
@@ -1468,6 +1503,7 @@ Output JSON matching the schema. Every task must appear in the output.
             self._workflow_cancel_events[assignment.task_id] = cancel_event
 
             recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
+            recovered_session = self._recovered_sessions.pop(assignment.task_id, None)
             # Drop any preserved-worktree marker once the slot picks the task up.
             self._preserved_worktrees.discard(assignment.task_id)
 
@@ -1509,6 +1545,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 event_store=self.event_store,
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
+                resume_session_id=recovered_session,
             )
 
             if self.event_store:

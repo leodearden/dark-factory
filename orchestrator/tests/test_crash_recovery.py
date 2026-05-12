@@ -287,6 +287,104 @@ class TestRecoverCrashedTasks:
         assert '369' not in harness._recovered_plans
         harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '369')  # type: ignore[attr-defined]
 
+    async def test_recover_sidecar_no_plan_preserved(self, harness: Harness):
+        """Worktree with agent_session.json sidecar but NO plan.json — preserved
+        for resume, session info recorded, worktree NOT cleaned up."""
+        wt = harness.git_ops.worktree_base / '88'
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True)
+        sidecar = {
+            'session_id': 'uuid-mid-flight',
+            'role': 'architect',
+            'started_at': '2026-05-12T10:00:00+00:00',
+            'owner_pid': 4242,
+        }
+        (task_dir / 'agent_session.json').write_text(json.dumps(sidecar))
+
+        await harness._recover_crashed_tasks()
+
+        # Worktree survives — no cleanup
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert wt.exists()
+        # Session captured for the next slot
+        assert '88' in harness._recovered_sessions
+        assert harness._recovered_sessions['88']['session_id'] == 'uuid-mid-flight'
+        assert harness._recovered_sessions['88']['role'] == 'architect'
+        # Preserved so the stranded sweep doesn't wipe it
+        assert '88' in harness._preserved_worktrees
+        # No plan was recovered (the architect never wrote one)
+        assert '88' not in harness._recovered_plans
+
+    async def test_recover_corrupt_sidecar_falls_back_to_cleanup(self, harness: Harness):
+        """Unreadable sidecar -> log warning and clean up like a planless worktree."""
+        wt = harness.git_ops.worktree_base / '89'
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True)
+        (task_dir / 'agent_session.json').write_text('{not json')
+
+        await harness._recover_crashed_tasks()
+
+        assert '89' not in harness._recovered_sessions
+        assert '89' not in harness._preserved_worktrees
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '89')  # type: ignore[attr-defined]
+
+    async def test_run_slot_passes_recovered_session(self, harness: Harness):
+        """A recovered session dict flows through to TaskWorkflow as resume_session_id."""
+        session_dict = {
+            'session_id': 'uuid-resume-me',
+            'role': 'implementer',
+            'started_at': '2026-05-12T10:00:00+00:00',
+            'owner_pid': 9999,
+        }
+        harness._recovered_sessions['55'] = session_dict
+        harness._preserved_worktrees.add('55')
+
+        assignment = MagicMock()
+        assignment.task_id = '55'
+        assignment.task = {'title': 'Resumable task'}
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = AsyncMock()
+            mock_wf.run.return_value = MagicMock(value='done')
+            mock_wf.metrics = MagicMock(
+                total_cost_usd=0.0,
+                total_duration_ms=0,
+                agent_invocations=0,
+            )
+            MockWorkflow.return_value = mock_wf
+
+            await harness._run_slot(assignment, sem)
+
+            call_kwargs = MockWorkflow.call_args.kwargs
+            assert call_kwargs['resume_session_id'] is session_dict
+
+        # Consumed by the slot
+        assert '55' not in harness._recovered_sessions
+        assert '55' not in harness._preserved_worktrees
+
+    async def test_recover_stamped_plan_clears_stale_sidecar(self, harness: Harness):
+        """A stamped plan path takes precedence; any sidecar is stale and cleared."""
+        plan = _make_plan(
+            steps_done=0, steps_total=2, task_id='66',
+            session_id='66-aaaabbbbcccc',
+        )
+        wt = _setup_worktree(harness.git_ops.worktree_base, '66', plan)
+        sidecar_path = wt / '.task' / 'agent_session.json'
+        sidecar_path.write_text(json.dumps({
+            'session_id': 'stale-uuid', 'role': 'reviewer',
+            'started_at': 'whenever', 'owner_pid': 1,
+        }))
+
+        await harness._recover_crashed_tasks()
+
+        # Stamped plan branch wins; sidecar cleared to avoid confusing next slot
+        assert '66' in harness._preserved_worktrees
+        assert not sidecar_path.exists()
+        assert '66' not in harness._recovered_sessions
+
     async def test_multiple_worktrees_mixed(self, harness: Harness):
         """Multiple worktrees: one recovered, one cleaned, one no-progress."""
         base = harness.git_ops.worktree_base

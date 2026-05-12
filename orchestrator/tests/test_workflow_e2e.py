@@ -182,6 +182,7 @@ class AgentStub:
         backend: str = 'claude',
         oauth_token: str | None = None,
         resume_session_id: str | None = None,
+        session_id: str | None = None,
         timeout_seconds: float | None = None,
         config_dir: Path | None = None,
         env_overrides: dict[str, str] | None = None,

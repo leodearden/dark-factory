@@ -62,6 +62,7 @@ async def invoke_agent(
     backend: str = 'claude',
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
+    session_id: str | None = None,
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
@@ -72,6 +73,8 @@ async def invoke_agent(
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
+    *session_id*, when set and *resume_session_id* is not, pre-allocates the
+    session UUID via ``--session-id``.
     *timeout_seconds*, when set, kills the subprocess after this many seconds.
     *env_overrides*, when set, are merged into the subprocess environment.
     """
@@ -84,6 +87,7 @@ async def invoke_agent(
             permission_mode=permission_mode, sandbox_modules=sandbox_modules,
             effort=effort, oauth_token=oauth_token,
             resume_session_id=resume_session_id,
+            session_id=session_id,
             timeout_seconds=timeout_seconds,
             config_dir=config_dir,
             env_overrides=env_overrides,
@@ -126,6 +130,7 @@ async def _invoke_claude_with_sandbox(
     effort: str | None,
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
+    session_id: str | None = None,
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
@@ -157,6 +162,8 @@ async def _invoke_claude_with_sandbox(
                     f.write(system_prompt)
                 temp_files.append(sysprompt_path)
                 cmd.extend(['--system-prompt-file', sysprompt_path])
+                if session_id:
+                    cmd.extend(['--session-id', session_id])
 
             cmd.extend(['--permission-mode', permission_mode])
             cmd.extend(['--max-turns', str(max_turns)])
@@ -204,6 +211,7 @@ async def _invoke_claude_with_sandbox(
         mcp_config=mcp_config, output_schema=output_schema,
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, resume_session_id=resume_session_id,
+        session_id=session_id,
         timeout_seconds=timeout_seconds, config_dir=config_dir,
         env_overrides=env_overrides,
     )

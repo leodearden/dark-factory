@@ -292,6 +292,7 @@ async def invoke_claude_agent(
     oauth_token: str | None = None,
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
+    session_id: str | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
@@ -304,6 +305,11 @@ async def invoke_claude_agent(
     ``--resume <id>`` instead of starting a new one.  The system prompt is
     skipped on resume (it was already set in the initial session).
 
+    *session_id*, when set and *resume_session_id* is not, pre-allocates the
+    session UUID via ``--session-id <id>`` so callers can resume the same
+    session later (orchestrator crash-recovery sidecar).  Mutually exclusive
+    with *resume_session_id* — when both are set, *resume_session_id* wins.
+
     *env_overrides*, when set, are merged into the subprocess environment.
     Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
     """
@@ -314,7 +320,8 @@ async def invoke_claude_agent(
         mcp_config=mcp_config, output_schema=output_schema,
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, timeout_seconds=timeout_seconds,
-        resume_session_id=resume_session_id, config_dir=config_dir,
+        resume_session_id=resume_session_id, session_id=session_id,
+        config_dir=config_dir,
         env_overrides=env_overrides,
     )
 
@@ -612,6 +619,7 @@ async def _invoke_claude(
     oauth_token: str | None = None,
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
+    session_id: str | None = None,
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
@@ -633,6 +641,10 @@ async def _invoke_claude(
             f.write(system_prompt)
         temp_files.append(sysprompt_path)
         cmd.extend(['--system-prompt-file', sysprompt_path])
+        # Pre-allocate the session UUID so future --resume can find it.
+        # --session-id and --resume are mutually exclusive at the CLI level.
+        if session_id:
+            cmd.extend(['--session-id', session_id])
 
     cmd.extend(['--permission-mode', permission_mode])
     cmd.extend(['--max-turns', str(max_turns)])

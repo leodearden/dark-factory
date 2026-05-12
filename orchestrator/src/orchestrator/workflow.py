@@ -254,6 +254,7 @@ class TaskWorkflow:
         event_store: EventStore | None = None,
         cost_store: CostStore | None = None,
         cancel_event: asyncio.Event | None = None,
+        resume_session_id: dict | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -332,6 +333,18 @@ class TaskWorkflow:
         # True on first _try_narrow_plan call regardless of outcome so
         # the workflow never loops the narrowing pass on the same task.
         self._plan_tightened: bool = False
+
+        # Crash-recovery resume: when the harness detected a surviving
+        # agent-session sidecar at startup, it injects the parsed dict
+        # here.  The next _invoke whose role matches will use --resume
+        # against the original Claude session and a "continue" prompt
+        # instead of spawning a fresh agent.  Consumed (set to None) on
+        # first use so subsequent invocations are fresh.
+        self._pending_resume_session_id: str | None = None
+        self._pending_resume_role: str | None = None
+        if resume_session_id:
+            self._pending_resume_session_id = resume_session_id.get('session_id')
+            self._pending_resume_role = resume_session_id.get('role')
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -461,7 +474,12 @@ class TaskWorkflow:
             stdout, _ = await proc.communicate()
             base_commit = stdout.decode().strip()
         self._base_commit = base_commit
-        self._config_dir = TaskConfigDir(self.task_id)
+        # Colocate the per-task Claude config dir inside the worktree so
+        # the session JSONL travels with the worktree.  Crash recovery
+        # needs both the sidecar and the session file together to resume.
+        self._config_dir = TaskConfigDir(
+            self.task_id, base_dir=self.worktree / '.task',
+        )
 
         if not self._worktree_external:
             await self._sync_worktree_venvs()
@@ -3573,33 +3591,69 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 ],
             }
 
+        # Session-resume lifecycle: if the harness recovered a sidecar that
+        # matches the role we're about to invoke, resume the prior session
+        # via --resume <uuid> with a "continue" prompt.  Otherwise, allocate
+        # a fresh UUID up-front via --session-id so a future restart can
+        # find and resume this session.  The sidecar is written before the
+        # subprocess starts and cleared in the finally below — its presence
+        # ⇔ "agent was in flight when the orchestrator exited".
+        invoke_prompt = prompt
+        resume_session_id: str | None = None
+        if (
+            self._pending_resume_session_id
+            and self._pending_resume_role == role.name
+        ):
+            session_id_val = self._pending_resume_session_id
+            resume_session_id = session_id_val
+            invoke_prompt = 'continue'
+            self._pending_resume_session_id = None
+            self._pending_resume_role = None
+            logger.info(
+                'Task %s [%s]: resuming prior session %s via --resume',
+                self.task_id, role.name, session_id_val,
+            )
+        else:
+            session_id_val = str(uuid.uuid4())
+
+        if self.artifacts is not None:
+            self.artifacts.write_agent_session(
+                session_id_val, role.name, datetime.now(UTC).isoformat(),
+            )
+
         started_at = datetime.now(UTC).isoformat()
-        result = await invoke_with_cap_retry(
-            usage_gate=self.usage_gate,
-            label=f'Task {self.task_id} [{role.name}]',
-            config_dir=self._config_dir,
-            invoke_fn=invoke_agent,
-            prompt=prompt,
-            system_prompt=role.system_prompt,
-            cwd=cwd,
-            model=model,
-            max_turns=max_turns_val,
-            max_budget_usd=budget,
-            allowed_tools=role.allowed_tools or None,
-            disallowed_tools=role.disallowed_tools or None,
-            mcp_config=mcp_config,
-            output_schema=output_schema,
-            sandbox_modules=sandbox_modules,
-            effort=effort_val,
-            backend=backend_val,
-            timeout_seconds=timeout_val,
-            # Judge always hits Claude API — propagating ANTHROPIC_BASE_URL
-            # routes it through vLLM where max_model_len causes
-            # ServerDisconnectedError after 2 tool-use rounds (3cd380a079).
-            # Cap hits on Claude API are handled by UsageGate account failover
-            # (wired in runner.py for eval mode).
-            env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
-        )
+        try:
+            result = await invoke_with_cap_retry(
+                usage_gate=self.usage_gate,
+                label=f'Task {self.task_id} [{role.name}]',
+                config_dir=self._config_dir,
+                invoke_fn=invoke_agent,
+                prompt=invoke_prompt,
+                system_prompt=role.system_prompt,
+                cwd=cwd,
+                model=model,
+                max_turns=max_turns_val,
+                max_budget_usd=budget,
+                allowed_tools=role.allowed_tools or None,
+                disallowed_tools=role.disallowed_tools or None,
+                mcp_config=mcp_config,
+                output_schema=output_schema,
+                sandbox_modules=sandbox_modules,
+                effort=effort_val,
+                backend=backend_val,
+                timeout_seconds=timeout_val,
+                session_id=session_id_val,
+                resume_session_id=resume_session_id,
+                # Judge always hits Claude API — propagating ANTHROPIC_BASE_URL
+                # routes it through vLLM where max_model_len causes
+                # ServerDisconnectedError after 2 tool-use rounds (3cd380a079).
+                # Cap hits on Claude API are handled by UsageGate account failover
+                # (wired in runner.py for eval mode).
+                env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
+            )
+        finally:
+            if self.artifacts is not None:
+                self.artifacts.clear_agent_session()
         completed_at = datetime.now(UTC).isoformat()
 
         # Record the last successfully-completed role (updated only on success,

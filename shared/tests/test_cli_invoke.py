@@ -837,6 +837,61 @@ class TestLargePayloadHandling:
         assert '--system-prompt' not in captured_cmd
 
 
+# ── session_id preallocation (crash-recovery resume) ──────────────────
+
+
+@pytest.mark.asyncio
+class TestSessionIdPreallocation:
+    """Pre-allocated session UUIDs let crash recovery resume the same session."""
+
+    async def _run_with_capture(self, tmp_path, **kwargs):
+        captured_cmd: list = []
+
+        async def fake_exec(*args, **kw):
+            captured_cmd.extend(args)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path, **kwargs,
+            )
+        return captured_cmd
+
+    async def test_session_id_emits_flag(self, tmp_path):
+        """When session_id is set and resume_session_id is not, --session-id <uuid> appears."""
+        cmd = await self._run_with_capture(tmp_path, session_id='uuid-fresh')
+        assert '--session-id' in cmd
+        idx = cmd.index('--session-id')
+        assert cmd[idx + 1] == 'uuid-fresh'
+        assert '--resume' not in cmd
+
+    async def test_resume_wins_over_session_id(self, tmp_path):
+        """When both resume_session_id and session_id are set, --resume wins."""
+        cmd = await self._run_with_capture(
+            tmp_path, session_id='uuid-fresh', resume_session_id='uuid-resume',
+        )
+        assert '--resume' in cmd
+        idx = cmd.index('--resume')
+        assert cmd[idx + 1] == 'uuid-resume'
+        # --session-id and --resume are mutually exclusive at the CLI level
+        assert '--session-id' not in cmd
+
+    async def test_no_flag_when_unset(self, tmp_path):
+        """Without session_id, neither --session-id nor --resume appears."""
+        cmd = await self._run_with_capture(tmp_path)
+        assert '--session-id' not in cmd
+        assert '--resume' not in cmd
+
+
 # ── env_overrides plumbing ────────────────────────────────────────────
 
 

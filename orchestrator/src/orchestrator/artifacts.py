@@ -590,6 +590,43 @@ class TaskArtifacts:
             )
             return False
 
+    # ──────────────────────────────────────────────────────────────────
+    # Agent-session sidecar — marker for "an agent subprocess is in flight".
+    #
+    # Written before _invoke spawns the subprocess and deleted in the
+    # invocation's finally block.  Presence after an orchestrator restart
+    # signals that the prior orchestrator died mid-invocation; the harness
+    # uses this to preserve the worktree and resume the same Claude session
+    # via --resume rather than spawning a fresh agent.
+    # ──────────────────────────────────────────────────────────────────
+
+    def write_agent_session(
+        self, session_id: str, role: str, started_at: str,
+    ) -> None:
+        """Write ``.task/agent_session.json`` with the in-flight session info."""
+        data = {
+            'session_id': session_id,
+            'role': role,
+            'started_at': started_at,
+            'owner_pid': os.getpid(),
+        }
+        self._write_json(self.root / 'agent_session.json', data)
+
+    def clear_agent_session(self) -> None:
+        """Remove ``.task/agent_session.json`` if present (idempotent)."""
+        (self.root / 'agent_session.json').unlink(missing_ok=True)
+
+    def read_agent_session(self) -> dict | None:
+        """Return parsed ``.task/agent_session.json``, or ``None`` if missing/corrupt."""
+        path = self.root / 'agent_session.json'
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Corrupt agent_session.json at %s: %s', path, exc)
+            return None
+
     def lock_plan(self, session_id: str) -> bool:
         """Atomically acquire the plan lock.
 
