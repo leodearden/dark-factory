@@ -1436,7 +1436,7 @@ class TestEnrichMergesWithTitles:
 class TestLoadTaskTitles:
     """Tests for merge_queue.load_task_titles (now MCP-backed with a TTL cache)."""
 
-    async def test_returns_str_keyed_dict_from_mcp(self, counted_fetch_tasks):
+    async def test_returns_str_keyed_dict_from_mcp(self, counted_fetch_tasks, dummy_client, dummy_config):
         """fetch_tasks rows are projected to {str(id): title}."""
         from dashboard.data.merge_queue import load_task_titles
 
@@ -1444,10 +1444,10 @@ class TestLoadTaskTitles:
             {'id': 1, 'title': 'A'},
             {'id': 2, 'title': 'B'},
         ])
-        result = await load_task_titles(client=None, config=None, project_root='/proj/A')
+        result = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/A')
         assert result == {'1': 'A', '2': 'B'}
 
-    async def test_offline_returns_empty_dict(self, monkeypatch):
+    async def test_offline_returns_empty_dict(self, monkeypatch, dummy_client, dummy_config):
         """An offline marker from fetch_tasks short-circuits to ``{}``."""
         import dashboard.data.merge_queue as _mq
         _mq._task_titles_cache_clear()
@@ -1456,10 +1456,10 @@ class TestLoadTaskTitles:
             return {'offline': True, 'error': 'connection refused'}
 
         monkeypatch.setattr(_mq, 'fetch_tasks', _offline)
-        result = await _mq.load_task_titles(client=None, config=None, project_root='/proj/B')
+        result = await _mq.load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/B')
         assert result == {}
 
-    async def test_none_title_is_omitted(self, counted_fetch_tasks):
+    async def test_none_title_is_omitted(self, counted_fetch_tasks, dummy_client, dummy_config):
         """Tasks with title=None are omitted from the result."""
         from dashboard.data.merge_queue import load_task_titles
 
@@ -1467,37 +1467,37 @@ class TestLoadTaskTitles:
             {'id': 1, 'title': None},
             {'id': 2, 'title': 'B'},
         ])
-        result = await load_task_titles(client=None, config=None, project_root='/proj/C')
+        result = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/C')
         assert '1' not in result
         assert result.get('2') == 'B'
 
-    async def test_repeat_calls_within_ttl_window_hit_cache(self, counted_fetch_tasks):
+    async def test_repeat_calls_within_ttl_window_hit_cache(self, counted_fetch_tasks, dummy_client, dummy_config):
         """Two calls inside the TTL window invoke fetch_tasks exactly once."""
         from dashboard.data.merge_queue import load_task_titles
 
         counted_fetch_tasks.set_response('/proj/D', [{'id': 1, 'title': 'A'}])
 
-        result1 = await load_task_titles(client=None, config=None, project_root='/proj/D')
-        result2 = await load_task_titles(client=None, config=None, project_root='/proj/D')
+        result1 = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/D')
+        result2 = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/D')
 
         assert counted_fetch_tasks.count == 1
         assert result1 == result2 == {'1': 'A'}
 
-    async def test_distinct_projects_cached_separately(self, counted_fetch_tasks):
+    async def test_distinct_projects_cached_separately(self, counted_fetch_tasks, dummy_client, dummy_config):
         """Different project_roots produce independent cache entries."""
         from dashboard.data.merge_queue import load_task_titles
 
         counted_fetch_tasks.set_response('/proj/E', [{'id': 1, 'title': 'Alpha'}])
         counted_fetch_tasks.set_response('/proj/F', [{'id': 2, 'title': 'Beta'}])
 
-        result_e = await load_task_titles(client=None, config=None, project_root='/proj/E')
-        result_f = await load_task_titles(client=None, config=None, project_root='/proj/F')
+        result_e = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/E')
+        result_f = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/F')
 
         assert result_e == {'1': 'Alpha'}
         assert result_f == {'2': 'Beta'}
         assert counted_fetch_tasks.count == 2
 
-    async def test_ttl_expiry_refetches(self, counted_fetch_tasks, monkeypatch):
+    async def test_ttl_expiry_refetches(self, counted_fetch_tasks, monkeypatch, dummy_client, dummy_config):
         """When the cached entry exceeds TTL the next call refetches."""
         import dashboard.data.merge_queue as _mq
 
@@ -1505,19 +1505,19 @@ class TestLoadTaskTitles:
         monkeypatch.setattr(_mq, '_TASK_TITLES_TTL_SECONDS', 0.0)
 
         counted_fetch_tasks.set_response('/proj/G', [{'id': 1, 'title': 'A'}])
-        await _mq.load_task_titles(client=None, config=None, project_root='/proj/G')
-        await _mq.load_task_titles(client=None, config=None, project_root='/proj/G')
+        await _mq.load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/G')
+        await _mq.load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/G')
 
         assert counted_fetch_tasks.count == 2
 
-    async def test_returned_dict_is_a_copy(self, counted_fetch_tasks):
+    async def test_returned_dict_is_a_copy(self, counted_fetch_tasks, dummy_client, dummy_config):
         """Mutating the returned dict must not poison the cached entry."""
         from dashboard.data.merge_queue import load_task_titles
 
         counted_fetch_tasks.set_response('/proj/H', [{'id': 1, 'title': 'A'}])
-        first = await load_task_titles(client=None, config=None, project_root='/proj/H')
+        first = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/H')
         first['hacked'] = 'oops'
-        second = await load_task_titles(client=None, config=None, project_root='/proj/H')
+        second = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/H')
         assert second == {'1': 'A'}
 
 

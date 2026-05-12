@@ -14,6 +14,9 @@ the caller turns that into a per-project skip plus a Tasks-tab banner.
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import Mapping
+from typing import Any
 
 import httpx
 
@@ -31,6 +34,8 @@ def _shape_task(task: dict) -> dict | None:
     drop the rest.
     """
     raw_id = task.get('id')
+    if raw_id is None:
+        return None
     try:
         tid = int(raw_id)
     except (TypeError, ValueError):
@@ -63,7 +68,7 @@ def _shape_task(task: dict) -> dict | None:
 async def fetch_tasks(
     client: httpx.AsyncClient,
     config: DashboardConfig,
-    project_root: str | bytes,
+    project_root: str | bytes | os.PathLike[str],
 ) -> list[dict] | dict:
     """Fetch the dashboard-shaped task list for *project_root* via MCP.
 
@@ -102,8 +107,8 @@ async def fetch_tasks(
 async def fetch_statuses(
     client: httpx.AsyncClient,
     config: DashboardConfig,
-    project_root: str | bytes,
-) -> dict[int, str] | dict:
+    project_root: str | bytes | os.PathLike[str],
+) -> Mapping[Any, Any]:
     """Fetch a compact ``{int(id): status}`` map for *project_root* via MCP.
 
     Used by the burndown collector — ~95% smaller than ``fetch_tasks``.

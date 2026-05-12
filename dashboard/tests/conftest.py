@@ -31,6 +31,7 @@ if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 import aiosqlite  # noqa: E402
+import httpx  # noqa: E402
 import pytest  # noqa: E402
 from _dashboard_helpers import RECONCILIATION_SCHEMA  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
@@ -39,6 +40,19 @@ from starlette.testclient import TestClient  # noqa: E402
 @pytest.fixture()
 def dashboard_config(tmp_path):
     """Create a DashboardConfig with tmp_path-based project_root."""
+    from dashboard.config import DashboardConfig
+
+    return DashboardConfig(project_root=tmp_path)
+
+
+@pytest.fixture()
+async def dummy_client():
+    async with httpx.AsyncClient() as c:
+        yield c
+
+
+@pytest.fixture()
+def dummy_config(tmp_path):
     from dashboard.config import DashboardConfig
 
     return DashboardConfig(project_root=tmp_path)

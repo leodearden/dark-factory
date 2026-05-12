@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import aiosqlite
 import httpx
@@ -59,7 +61,7 @@ _INSERT_SNAPSHOT_SQL = (
 )
 
 
-def _count_statuses(statuses: dict[int, str]) -> dict[str, int]:
+def _count_statuses(statuses: dict[int, str | None]) -> dict[str, int]:
     """Count statuses (id → status) by mapped display zone."""
     counts: dict[str, int] = {k: 0 for k in _ZONE_KEYS}
     for raw in statuses.values():
@@ -184,7 +186,7 @@ async def collect_snapshot(
             if result.get('offline'):
                 logger.debug('fetch_statuses offline for %s: %s', root_str, result.get('error'))
                 continue
-            statuses: dict[int, str] = {
+            statuses: dict[int, str | None] = {
                 k: v for k, v in result.items() if isinstance(k, int)
             }
             try:
@@ -352,7 +354,7 @@ async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
 _VELOCITY_FLOOR = 0.1  # tasks/day; prevents forecast from going to infinity
 
 
-def compute_forecast_confidence(series: dict) -> dict:
+def compute_forecast_confidence(series: Mapping[str, Any]) -> dict[str, Any]:
     """Return ``{forecast_low, forecast_high}`` days from a burndown series.
 
     Reads ``done`` and ``pending`` over the series' ``labels`` (each label

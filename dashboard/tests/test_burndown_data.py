@@ -197,7 +197,7 @@ class TestCountStatuses:
         }
 
     def test_standard_statuses(self):
-        statuses = {
+        statuses: dict[int, str | None] = {
             1: 'pending',
             2: 'pending',
             3: 'in-progress',
@@ -233,7 +233,7 @@ class TestCountStatuses:
 
 class TestCollectSnapshot:
     @pytest.mark.asyncio
-    async def test_inserts_main_project(self, burndown_env):
+    async def test_inserts_main_project(self, burndown_env, dummy_client):
         db_path, config, conn = burndown_env
 
         fake_tasks = [
@@ -247,7 +247,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn(_statuses(fake_tasks))),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = await cur.fetchall()
@@ -258,7 +258,7 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(row, pending=1, in_progress=1, done=2)
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path, burndown_conn_with_config):
+    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path, burndown_conn_with_config, dummy_client):
         """Symlinked project_root and orchestrator resolving to real path produce only 1 row."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
@@ -274,7 +274,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
                 patch('dashboard.data.burndown._resolve_project_root', return_value=real_dir.resolve()),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -291,7 +291,7 @@ class TestCollectSnapshot:
             assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
-    async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
+    async def test_deduplicates_main_project_from_orchestrators(self, burndown_env, dummy_client):
         """If an orchestrator targets the same root, only one row is inserted."""
         _, config, conn = burndown_env
 
@@ -302,7 +302,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._resolve_project_root', return_value=config.project_root),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
@@ -310,7 +310,7 @@ class TestCollectSnapshot:
             assert row[0] == 1
 
     @pytest.mark.asyncio
-    async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
+    async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env, dummy_client):
         """Known roots are snapshotted even when no orchestrators are running."""
         _, base_config, conn = burndown_env
 
@@ -338,7 +338,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.fetch_statuses', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = await cur.fetchall()
@@ -362,7 +362,7 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(autopilot_row, in_progress=1)
 
     @pytest.mark.asyncio
-    async def test_dedupes_known_root_against_main_project(self, burndown_env):
+    async def test_dedupes_known_root_against_main_project(self, burndown_env, dummy_client):
         """If known_project_roots includes main project_root, only one row is inserted."""
         _, base_config, conn = burndown_env
 
@@ -375,7 +375,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         # PRIMARY: exact-key invariant — this project_id has exactly one row.
         # Catches bugs where the main-project row is omitted while a differently-
@@ -397,7 +397,7 @@ class TestCollectSnapshot:
             assert row[0] == 1
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path, burndown_conn_with_config):
+    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path, burndown_conn_with_config, dummy_client):
         """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
@@ -410,7 +410,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -418,7 +418,7 @@ class TestCollectSnapshot:
                 assert row[0] == 1  # Only 1 row — symlink project_root and known real path deduplicate
 
     @pytest.mark.asyncio
-    async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env):
+    async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env, dummy_client):
         """If known_project_roots includes a root already discovered via orchestrator, no duplicate."""
         _, base_config, conn = burndown_env
 
@@ -452,7 +452,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
                                 (str(reify_root),)) as cur:
@@ -461,7 +461,7 @@ class TestCollectSnapshot:
             assert row[0] == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
-    async def test_main_project_id_is_resolved_path(self, tmp_path, burndown_conn_with_config):
+    async def test_main_project_id_is_resolved_path(self, tmp_path, burndown_conn_with_config, dummy_client):
         """project_id in snapshot must be the resolved path even when project_root is a symlink."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
@@ -473,7 +473,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.fetch_statuses', side_effect=_AsyncReturn({})),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -483,7 +483,7 @@ class TestCollectSnapshot:
         assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
-    async def test_discovers_config_flag_orchestrator(self, burndown_env):
+    async def test_discovers_config_flag_orchestrator(self, burndown_env, dummy_client):
         """Orchestrators launched with --config (no --prd) are snapshotted."""
         _, config, conn = burndown_env
 
@@ -505,7 +505,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT * FROM snapshots ORDER BY project_id') as cur:
             rows = await cur.fetchall()
@@ -519,7 +519,7 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(reify_row, pending=1, done=1)
 
     @pytest.mark.asyncio
-    async def test_continues_when_known_root_unreadable(self, burndown_conn_with_config):
+    async def test_continues_when_known_root_unreadable(self, burndown_conn_with_config, dummy_client):
         """PermissionError on one known root is skipped; other roots are still snapshotted."""
         root_a = Path('/fake/project/root_a')
         root_b = Path('/fake/project/root_b')
@@ -552,7 +552,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -567,7 +567,7 @@ class TestCollectSnapshot:
             assert str(root_b.resolve()) not in project_ids
 
     @pytest.mark.asyncio
-    async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog):
+    async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog, dummy_client):
         """A WARNING is logged naming the failing root when PermissionError occurs."""
         bad_root = Path('/fake/project/bad_root')
         bad_root_str = _root_key(bad_root)
@@ -587,7 +587,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
         # At least one WARNING record should name the failing root
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -598,7 +598,7 @@ class TestCollectSnapshot:
         assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio
-    async def test_first_root_failure_does_not_block_subsequent_inserts(self, burndown_conn_with_config):
+    async def test_first_root_failure_does_not_block_subsequent_inserts(self, burndown_conn_with_config, dummy_client):
         """If the very first known root fails, subsequent roots still get snapshotted."""
         bad_root = Path('/fake/project/bad_root')
         good_root = Path('/fake/project/good_root')
@@ -625,7 +625,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT project_id, done FROM snapshots ORDER BY project_id') as cur:
                 rows = list(await cur.fetchall())
@@ -640,7 +640,7 @@ class TestCollectSnapshot:
             assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
-    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path, burndown_conn_with_config):
+    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path, burndown_conn_with_config, dummy_client):
         """When _resolve_project_root falls back to the symlinked config.project_root, it still deduplicates."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
@@ -673,7 +673,7 @@ class TestCollectSnapshot:
                 # back to config.project_root (the symlink) because prd_path has no
                 # .taskmaster in its ancestor chain.
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -683,7 +683,7 @@ class TestCollectSnapshot:
                 assert row[0] == 1
 
     @pytest.mark.asyncio
-    async def test_load_task_tree_calls_run_concurrently(self, burndown_conn_with_config):
+    async def test_load_task_tree_calls_run_concurrently(self, burndown_conn_with_config, dummy_client):
         """All load_task_tree calls must run concurrently via asyncio.gather.
 
         Uses a threading.Barrier(N) to detect concurrency: all N threads must
@@ -721,7 +721,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
@@ -729,7 +729,7 @@ class TestCollectSnapshot:
                 assert row[0] == 3
 
     @pytest.mark.asyncio
-    async def test_gather_partial_failure_skips_bad_project(self, burndown_conn_with_config):
+    async def test_gather_partial_failure_skips_bad_project(self, burndown_conn_with_config, dummy_client):
         """One load_task_tree raises OSError; collect_snapshot skips the failing
         project and inserts healthy rows for the remaining projects.
 
@@ -762,7 +762,7 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.fetch_statuses', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -775,7 +775,7 @@ class TestCollectSnapshot:
             assert str(autopilot_root.resolve()) in project_ids
 
     @pytest.mark.asyncio
-    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, caplog):
+    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, caplog, dummy_client):
         """OSError on one known root is isolated; healthy projects are still snapshotted.
 
         Regression anchor for task 519: asyncio.gather(return_exceptions=True) +
@@ -813,7 +813,7 @@ class TestCollectSnapshot:
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
                 # Must NOT raise even though bad_root fails — return_exceptions=True absorbs it
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
 
             async with conn.execute('SELECT * FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
@@ -850,7 +850,7 @@ class TestCollectSnapshot:
             assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio
-    async def test_main_project_failure_skips_all_inserts(self, burndown_env, caplog):
+    async def test_main_project_failure_skips_all_inserts(self, burndown_env, caplog, dummy_client):
         """PermissionError on the main project's load_task_tree is isolated via return_exceptions=True.
 
         The main project is always the first entry in roots_to_snapshot. With no orchestrators
@@ -885,7 +885,7 @@ class TestCollectSnapshot:
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
         ):
             # Must NOT raise — return_exceptions=True absorbs the PermissionError.
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         assert unexpected_calls == [], f'Unexpected fetch_statuses calls: {unexpected_calls}'
 
@@ -921,7 +921,7 @@ class TestCollectSnapshot:
     )
     @pytest.mark.asyncio
     async def test_orchestrator_project_id_matches_helper_return(
-        self, burndown_env, orchestrator_dict, patch_target, canonical_root
+        self, burndown_env, orchestrator_dict, patch_target, canonical_root, dummy_client,
     ):
         """project_id stored for orchestrators matches str(helper_return) exactly.
 
@@ -942,7 +942,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[orchestrator_dict]),
             patch(patch_target, return_value=canonical_root),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute(
             'SELECT project_id FROM snapshots WHERE project_id = ?', (str(canonical_root),)
@@ -955,7 +955,7 @@ class TestCollectSnapshot:
         assert row[0] == str(canonical_root)
 
     @pytest.mark.asyncio
-    async def test_orchestrator_skipped_when_config_helper_returns_none(self, burndown_env):
+    async def test_orchestrator_skipped_when_config_helper_returns_none(self, burndown_env, dummy_client):
         """Orchestrators are silently skipped when _read_project_root_from_config returns None.
 
         Documents the guard at burndown.py lines 129-130: when the helper cannot
@@ -974,7 +974,7 @@ class TestCollectSnapshot:
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=None),
         ):
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         # Only the main project's snapshot row should exist; the orchestrator was skipped.
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
@@ -1270,7 +1270,7 @@ class TestAssertSnapshotCounts:
 
 class TestBurndownConnWithConfig:
     @pytest.mark.asyncio
-    async def test_factory_yields_valid_triple(self, burndown_conn_with_config):
+    async def test_factory_yields_valid_triple(self, burndown_conn_with_config, dummy_client):
         """Factory yields (db_path, config, conn) triple with a fresh burndown schema."""
         async with burndown_conn_with_config() as (db_path, config, conn):
             # (a) db_path is a Path and exists on disk
@@ -1341,6 +1341,7 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         secondary_target,
         secondary_kwargs,
         known_root_suffix,
+        dummy_client,
     ):
         """Orchestrator-discovery failure must degrade gracefully.
 
@@ -1373,7 +1374,7 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
             if secondary_target is not None:
                 stack.enter_context(patch(secondary_target, **secondary_kwargs))
             # Must NOT raise despite the injected failure
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT project_id FROM snapshots') as cur:
             rows = list(await cur.fetchall())
@@ -1394,7 +1395,7 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
 
     @pytest.mark.asyncio
     async def test_oserror_from_post_helper_resolve_emits_specific_warning(
-        self, burndown_env, caplog
+        self, burndown_env, caplog, dummy_client,
     ):
         """OSError from project_root.resolve() (line 134) after the helper returns
         must emit a warning specifically mentioning 'resolve', not the generic
@@ -1454,7 +1455,7 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
             patch('dashboard.data.burndown._resolve_project_root', side_effect=fake_resolve_project_root),
         ):
             # Must NOT raise despite the injected OSError from project_root.resolve()
-            await collect_snapshot(conn, config, client=None)
+            await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT project_id FROM snapshots') as cur:
             rows = list(await cur.fetchall())
@@ -1527,7 +1528,7 @@ class TestCollectSnapshotInsertFailureIsolation:
 
     @pytest.mark.asyncio
     async def test_db_error_on_extra_insert_preserves_main_snapshot(
-        self, burndown_env, caplog
+        self, burndown_env, caplog, dummy_client,
     ):
         """OperationalError on an extra's INSERT must not roll back the main row.
 
@@ -1560,7 +1561,7 @@ class TestCollectSnapshotInsertFailureIsolation:
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
                 # Must NOT raise despite the extra's INSERT failing
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
         finally:
             conn.execute = original_execute
 
@@ -1591,7 +1592,7 @@ class TestCollectSnapshotInsertFailureIsolation:
 
     @pytest.mark.asyncio
     async def test_db_error_on_extra_insert_preserves_other_extras(
-        self, burndown_env, caplog
+        self, burndown_env, caplog, dummy_client,
     ):
         """OperationalError on the middle extra must not affect main or flanking extras.
 
@@ -1629,7 +1630,7 @@ class TestCollectSnapshotInsertFailureIsolation:
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
         finally:
             conn.execute = original_execute
 
@@ -1663,7 +1664,7 @@ class TestCollectSnapshotInsertFailureIsolation:
 
     @pytest.mark.asyncio
     async def test_db_error_on_main_insert_preserves_extras(
-        self, burndown_env, caplog
+        self, burndown_env, caplog, dummy_client,
     ):
         """OperationalError on the main project's INSERT must not prevent extras from being committed.
 
@@ -1694,7 +1695,7 @@ class TestCollectSnapshotInsertFailureIsolation:
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
         finally:
             conn.execute = original_execute
 
@@ -1739,7 +1740,7 @@ class TestCollectSnapshotExplicitRollback:
     """
 
     @pytest.mark.asyncio
-    async def test_explicit_rollback_on_unexpected_error(self, burndown_env):
+    async def test_explicit_rollback_on_unexpected_error(self, burndown_env, dummy_client):
         """An unexpected exception inside collect_snapshot must trigger conn.rollback()
         and re-raise the original exception.
 
@@ -1778,7 +1779,7 @@ class TestCollectSnapshotExplicitRollback:
                 _patch('dashboard.data.burndown.datetime', _FakeDatetime),
                 pytest.raises(RuntimeError, match='clock failure'),
             ):
-                await collect_snapshot(conn, config, client=None)
+                await collect_snapshot(conn, config, client=dummy_client)
         finally:
             conn.rollback = original_rollback
 

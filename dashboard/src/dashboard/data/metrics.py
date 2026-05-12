@@ -140,7 +140,8 @@ def _split_queue_stats(qstats: dict) -> tuple[int | None, int | None, int | None
     """
     if not isinstance(qstats, dict) or qstats.get('offline'):
         return None, None, None
-    counts = qstats.get('counts') if isinstance(qstats.get('counts'), dict) else {}
+    counts_raw = qstats.get('counts')
+    counts = counts_raw if isinstance(counts_raw, dict) else {}
     return counts.get('pending'), counts.get('retry'), counts.get('dead')
 
 

@@ -58,7 +58,7 @@ def shape_orchestrators(
     *,
     known_project_roots: Iterable[str | Path] = (),
     running_spark: Mapping[str, list] | None = None,
-) -> dict[str, list]:
+) -> dict[str, Any]:
     """Return ``{ORCHESTRATORS: [...], PROJECTS: [...]}`` for the API.
 
     ``orchestrators`` is the raw list from

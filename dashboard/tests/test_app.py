@@ -20,13 +20,6 @@ from dashboard.app import _parse_window
 # ---------------------------------------------------------------------------
 
 
-class _FakeRequest:
-    """Minimal stand-in for FastAPI's Request.query_params used by _parse_window."""
-
-    def __init__(self, **params):
-        self.query_params = params
-
-
 @pytest.mark.parametrize('value, expected', [
     ('24h', 1),
     ('7d', 7),
@@ -36,10 +29,10 @@ class _FakeRequest:
     (None, 30),
 ])
 def test_parse_window_known_and_unknown(value, expected):
-    request = _FakeRequest()
+    query_params: dict[str, str] = {}
     if value is not None:
-        request.query_params['window'] = value
-    assert _parse_window(request) == expected
+        query_params['window'] = value
+    assert _parse_window(query_params) == expected
 
 
 # ---------------------------------------------------------------------------

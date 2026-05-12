@@ -12,7 +12,7 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -103,9 +103,9 @@ _BURNDOWN_WINDOWS: dict[str, int] = {
 }
 
 
-def _parse_window(request: Request, default: int = 30) -> int:
+def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
     """Parse the ``?window=`` query parameter and return the corresponding days int."""
-    window = request.query_params.get('window', f'{default}d')
+    window = query_params.get('window', f'{default}d')
     return _WINDOW_DAYS.get(window, default)
 
 
@@ -490,7 +490,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     """MERGE_QUEUE — per-project depth/outcomes/latency/recent/active/speculative."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    days = _parse_window(request)
+    days = _parse_window(request.query_params)
     hours = days * 24
     effective_now = datetime.now(UTC)
 
@@ -533,7 +533,7 @@ async def api_costs(request: Request) -> JSONResponse:
     """COSTS — flat summary, per-project / per-account / per-role / trend / events."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    days = _parse_window(request)
+    days = _parse_window(request.query_params)
     dbs = await _cost_dbs(config, pool)
     summary, by_project, by_account, by_role, trend, events = await asyncio.gather(
         aggregate_cost_summary(dbs, days=days),
@@ -560,7 +560,7 @@ async def api_performance(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
-    days = _parse_window(request, default=7)
+    days = _parse_window(request.query_params, default=7)
     paths_r, esc_r, hist_r, ttc_r, history_r = await asyncio.gather(
         aggregate_completion_paths(dbs, esc_dirs),
         aggregate_escalation_rates(dbs, esc_dirs),

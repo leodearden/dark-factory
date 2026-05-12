@@ -28,7 +28,7 @@ include = ["src", "tests"]
 extraPaths = ["src", "../escalation/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
-venvPath = "."
+venvPath = ".."
 venv = ".venv"
 
 [tool.ruff]
