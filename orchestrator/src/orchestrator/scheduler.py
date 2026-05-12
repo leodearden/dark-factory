@@ -383,8 +383,8 @@ class ModuleLockTable:
     ):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
-        # normalized_module -> (owner_task_id, deadline_monotonic)
-        self._parked: dict[str, tuple[str, float]] = {}
+        # normalized_module -> (owner_task_id, priority_rank)
+        self._parked: dict[str, tuple[str, int]] = {}
         self._config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
 
@@ -407,16 +407,12 @@ class ModuleLockTable:
 
     # --- Park (reservation) helpers ---
 
-    def _is_parked_blocks(self, module: str, task_id: str, now: float) -> bool:
+    def _is_parked_blocks(self, module: str, task_id: str) -> bool:
         """Return True iff any active park hierarchically conflicts with *module*
         and is owned by a different task.
-
-        Expired parks are ignored (they'll be cleaned up on the next prune).
         """
-        for parked_module, (owner, deadline) in self._parked.items():
+        for parked_module, (owner, _rank) in self._parked.items():
             if owner == task_id:
-                continue
-            if deadline <= now:
                 continue
             if self._conflicts(parked_module, module):
                 return True
@@ -427,42 +423,47 @@ class ModuleLockTable:
         return any(owner == task_id for owner, _ in self._parked.values())
 
     def install_parks(
-        self, task_id: str, modules: list[str], deadline: float
-    ) -> list[str]:
+        self, task_id: str, modules: list[str], priority: str
+    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Install reservations on the normalized form of *modules* for *task_id*.
 
-        Returns the list of normalized modules actually parked.
+        Returns ``(installed, evicted)`` where *installed* is the list of
+        normalized modules actually parked and *evicted* is a list of
+        ``(owner_id, modules_lost)`` for any lower-priority parks displaced.
+        Cross-tier preemption is implemented in step 6; this step skips any
+        module that already has a park owned by a different task and always
+        returns ``evicted=[]``.
         """
         depth = self._config.lock_depth
+        rank = PRIORITY_RANK[coerce_tier(priority)]
         installed: list[str] = []
         for m in modules:
             normalized = normalize_lock(m, depth)
             if not normalized:
                 continue
-            self._parked[normalized] = (task_id, deadline)
+            # Check for conflicting parks from other owners — same-tier does
+            # NOT preempt; cross-tier preemption is wired in step 6.
+            conflict = any(
+                owner != task_id and self._conflicts(parked_m, normalized)
+                for parked_m, (owner, _existing_rank) in self._parked.items()
+            )
+            if conflict:
+                continue
+            self._parked[normalized] = (task_id, rank)
             installed.append(normalized)
-        return installed
+        return installed, []
 
     def clear_parks_for(self, task_id: str) -> None:
         """Remove every reservation owned by *task_id*."""
         self._parked = {
-            m: (owner, deadline)
-            for m, (owner, deadline) in self._parked.items()
+            m: (owner, rank)
+            for m, (owner, rank) in self._parked.items()
             if owner != task_id
         }
 
     def prune_expired_parks(self, now: float) -> list[str]:
-        """Drop parks whose deadline has passed. Returns evicted owner task IDs
-        (deduplicated, preserving first-seen order)."""
-        expired_modules = [
-            m for m, (_, deadline) in self._parked.items() if deadline <= now
-        ]
-        evicted: list[str] = []
-        for m in expired_modules:
-            owner, _ = self._parked.pop(m)
-            if owner not in evicted:
-                evicted.append(owner)
-        return evicted
+        """Temporary no-op stub. Replaced by prune_owners in step 8."""
+        return []
 
     # --- Limit lookup (unchanged) ---
 
@@ -498,14 +499,13 @@ class ModuleLockTable:
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
-        now = self._time_source()
 
         # Check every requested module against all other tasks' held locks and
         # active reservations owned by other tasks.
         for module in normalized:
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
-            if self._is_parked_blocks(module, task_id, now):
+            if self._is_parked_blocks(module, task_id):
                 return False
 
         self._held[task_id] = set(normalized)
@@ -550,11 +550,10 @@ class ModuleLockTable:
         if not new_modules:
             return True
 
-        now = self._time_source()
         for module in new_modules:
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
-            if self._is_parked_blocks(module, task_id, now):
+            if self._is_parked_blocks(module, task_id):
                 return False
 
         self._held[task_id].update(new_modules)
@@ -1172,12 +1171,10 @@ class Scheduler:
                 },
             )
         if count >= threshold and not self.lock_table.has_parks(task_id):
-            lease = self._compute_lease(tier)
-            deadline = self._time_source() + lease
-            installed = self.lock_table.install_parks(task_id, modules, deadline)
+            installed, _evicted = self.lock_table.install_parks(task_id, modules, tier)
             logger.info(
-                'Task %s reserved modules %s (skip_count=%d, lease=%.1fs, tier=%s)',
-                task_id, installed, count, lease, tier,
+                'Task %s reserved modules %s (skip_count=%d, tier=%s)',
+                task_id, installed, count, tier,
             )
             if self.event_store:
                 self.event_store.emit(
@@ -1186,7 +1183,6 @@ class Scheduler:
                     data={
                         'modules': installed,
                         'skip_count': count,
-                        'lease_secs': lease,
                         'priority': tier,
                     },
                 )
