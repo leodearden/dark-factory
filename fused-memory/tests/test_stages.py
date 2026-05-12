@@ -4299,12 +4299,13 @@ class TestQueryStage2Flags:
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         memory_service.search.return_value = [
-            self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742'}),
+            self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'}),
             self._make_result('id-2', 'no flag', {}),
         ]
-        result = await _query_stage2_flags(memory_service, 'reify')
-        assert len(result) == 1
-        assert result[0]['id'] == 'id-1'
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert len(current_flags) == 1
+        assert current_flags[0]['id'] == 'id-1'
+        assert stale_marker_ids == []
 
     @pytest.mark.asyncio
     async def test_excludes_memories_without_either_marker(self):
@@ -4314,20 +4315,21 @@ class TestQueryStage2Flags:
             self._make_result('id-4', 'irrelevant', {'some_other_key': True}),
             self._make_result('id-5', 'also irrelevant', {}),
         ]
-        result = await _query_stage2_flags(memory_service, 'reify')
-        assert result == []
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert current_flags == []
+        assert stale_marker_ids == []
 
     @pytest.mark.asyncio
     async def test_preserves_fields_and_extracts_task_id(self):
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
-        meta = {'flag_for_stage2': True, 'task_id': '742', 'extra': 'x'}
+        meta = {'flag_for_stage2': True, 'task_id': '742', 'extra': 'x', 'run_id': 'r-current'}
         memory_service.search.return_value = [
             self._make_result('id-6', 'content here', meta),
         ]
-        result = await _query_stage2_flags(memory_service, 'reify')
-        assert len(result) == 1
-        flag = result[0]
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert len(current_flags) == 1
+        flag = current_flags[0]
         assert flag['id'] == 'id-6'
         assert flag['content'] == 'content here'
         assert flag['metadata'] == meta
@@ -4341,8 +4343,9 @@ class TestQueryStage2Flags:
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
         with caplog.at_level(logging.WARNING):
-            result = await _query_stage2_flags(memory_service, 'reify')
-        assert result == []
+            current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert current_flags == []
+        assert stale_marker_ids == []
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -4350,7 +4353,7 @@ class TestQueryStage2Flags:
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         memory_service.search.return_value = []
-        await _query_stage2_flags(memory_service, 'my_project')
+        await _query_stage2_flags(memory_service, 'my_project', 'r-current')
         call_kwargs = memory_service.search.call_args
         assert call_kwargs is not None
         # project_id must be passed as kwarg or positional
@@ -4358,6 +4361,70 @@ class TestQueryStage2Flags:
         args = call_kwargs.args
         all_args = list(args) + list(kwargs.values())
         assert 'my_project' in all_args or kwargs.get('project_id') == 'my_project'
+
+    @pytest.mark.asyncio
+    async def test_partitions_by_run_id(self):
+        """Markers with matching run_id go to current; mismatched or missing go to stale IDs."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'mem0-current',
+                'content for task 742',
+                {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'},
+            ),
+            self._make_result(
+                'mem0-prior',
+                'STALE content from prior run',
+                {'flag_for_stage2': True, 'task_id': '888', 'run_id': 'r-prior'},
+            ),
+            self._make_result(
+                'mem0-no-run-id',
+                'NO_RUN_ID legacy content',
+                {'flag_for_stage2': True, 'task_id': '999'},
+            ),
+        ]
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+
+        # Only the current-cycle marker should be in current_flags
+        assert len(current_flags) == 1
+        assert current_flags[0]['id'] == 'mem0-current'
+
+        # Stale partition contains only IDs (not dicts)
+        assert set(stale_marker_ids) == {'mem0-prior', 'mem0-no-run-id'}
+        assert len(stale_marker_ids) == 2
+        # Confirm stale_marker_ids contains strings, not dicts
+        assert all(isinstance(sid, str) for sid in stale_marker_ids)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('metadata_run_id,filter_run_id,expect_current', [
+        ('42', '42', True),   # both strings → current
+        (42, '42', True),     # int metadata coerced to str → current
+        ('42', 42, True),     # int filter coerced to str → current
+        (42, 42, True),       # both int → coerced str equality → current
+        ('43', '42', False),  # mismatch → stale
+        (None, '42', False),  # None → treated as missing → stale
+    ])
+    async def test_int_run_id_coerced_to_str(self, metadata_run_id, filter_run_id, expect_current):
+        """str() coercion is applied symmetrically so int run_ids match correctly."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        meta = {'flag_for_stage2': True, 'task_id': '1'}
+        if metadata_run_id is not None:
+            meta['run_id'] = metadata_run_id
+        memory_service.search.return_value = [
+            self._make_result('test-id', 'content', meta),
+        ]
+        current_flags, stale_marker_ids = await _query_stage2_flags(
+            memory_service, 'reify', filter_run_id
+        )
+        if expect_current:
+            assert len(current_flags) == 1
+            assert current_flags[0]['id'] == 'test-id'
+            assert stale_marker_ids == []
+        else:
+            assert current_flags == []
+            assert stale_marker_ids == ['test-id']
 
 
 class TestComputeStaleFlags:
