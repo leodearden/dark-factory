@@ -649,10 +649,6 @@ class Scheduler:
         self._requeue_history: dict[str, list[RequeueRecord]] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
-        self._task_start_times: dict[str, float] = {}  # task_id -> monotonic start
-        # TODO(step-10): _recent_durations and _task_start_times are deleted
-        # with _compute_lease in step 10; fixed window until then.
-        self._recent_durations: deque[float] = deque(maxlen=50)
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
@@ -1178,13 +1174,6 @@ class Scheduler:
 
         return signal is not None
 
-    def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
-        """Stub: lease fields removed from FairnessConfig in step 2.
-        Returns a constant 300 s until _bump_skip_and_maybe_park is
-        reworked in step 10 to pass priority instead of a deadline.
-        """
-        return 300.0
-
     def _bump_skip_and_maybe_park(
         self,
         task_id: str,
@@ -1222,8 +1211,12 @@ class Scheduler:
                     'threshold': threshold,
                 },
             )
-        if count >= threshold and not self.lock_table.has_parks(task_id):
-            installed, _evicted = self.lock_table.install_parks(task_id, modules, tier)
+        if (
+            count >= threshold
+            and self.config.fairness.scheduler_v2
+            and not self.lock_table.has_parks(task_id)
+        ):
+            installed, evicted_pairs = self.lock_table.install_parks(task_id, modules, tier)
             logger.info(
                 'Task %s reserved modules %s (skip_count=%d, tier=%s)',
                 task_id, installed, count, tier,
@@ -1238,6 +1231,17 @@ class Scheduler:
                         'priority': tier,
                     },
                 )
+                for victim, victim_modules in evicted_pairs:
+                    self.event_store.emit(
+                        EventType.reservation_evicted,
+                        task_id=task_id,
+                        data={
+                            'modules': victim_modules,
+                            'preempted_by': task_id,
+                            'preempted_by_priority': tier,
+                            'victim': victim,
+                        },
+                    )
 
     # --- Value/h scoring helpers (P1/P2/P3) -----------------------------
 
@@ -1407,21 +1411,6 @@ class Scheduler:
         bonus = min(age_bonus + cpm_bonus, float(TIER_WIDTH - 1))
         return float(base) + bonus
 
-    def _count_dispatched_at_or_below(self, tier: str) -> int:
-        """Count currently-dispatched tasks whose effective priority is at
-        *tier* or lower (i.e. same rank or larger rank value)."""
-        tier = coerce_tier(tier)
-        rank = PRIORITY_RANK[tier]
-        return sum(
-            1
-            for p in self._dispatched_priority.values()
-            if PRIORITY_RANK.get(coerce_tier(p), PRIORITY_RANK[DEFAULT_TIER]) >= rank
-        )
-
-    def _allowed_by_tier_cap(self, tier: str) -> bool:
-        """Stub: tier_slot_caps removed in step 2; full deletion in step 10."""
-        return True
-
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -1553,16 +1542,8 @@ class Scheduler:
         top_modules = self._get_modules(top_task)
         top_had_parks = self.lock_table.has_parks(top_id)
 
-        cap_blocked = 0
         for _score, task_id, task, pri in scored:
             modules = self._get_modules(task)
-            # Tier-cap filter: skip candidates that would exceed their tier's
-            # slot budget.  Parks override caps — once a fairness reservation
-            # is installed, the owner dispatches regardless.
-            has_park = self.lock_table.has_parks(task_id)
-            if not has_park and not self._allowed_by_tier_cap(pri):
-                cap_blocked += 1
-                continue
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
                 # arm cooldown gate — only for signal-bearing dispatches.
@@ -1573,7 +1554,6 @@ class Scheduler:
                 if candidate_signals.get(task_id) is not None:
                     self._last_dispatch_at[task_id] = self._time_source()
                 self._dispatched_priority[task_id] = pri
-                self._task_start_times[task_id] = self._time_source()
                 if task_id == top_id:
                     self._skip_count.pop(task_id, None)
                     if top_had_parks:
@@ -1594,19 +1574,6 @@ class Scheduler:
                         data={'modules': modules, 'priority': pri},
                     )
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
-
-        # No candidate acquired.  If at least one was blocked by a tier cap,
-        # emit a single idle-diagnostic event so "why are slots idle" is
-        # visible in the event store.
-        if cap_blocked and self.event_store:
-            self.event_store.emit(
-                EventType.scheduler_tier_cap_idle,
-                data={
-                    'candidates_skipped_by_cap': cap_blocked,
-                    'top_id': top_id,
-                    'top_priority': top_pri,
-                },
-            )
 
         # Loop exhausted with no acquire — top candidate was also skipped.
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
@@ -1683,10 +1650,6 @@ class Scheduler:
             self._requeue_until[task_id] = (
                 self._time_source() + self.config.requeue_cooldown_secs
             )
-        # Fairness: record duration for the rolling median used by _compute_lease.
-        start = self._task_start_times.pop(task_id, None)
-        if start is not None:
-            self._recent_durations.append(self._time_source() - start)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.

@@ -1904,9 +1904,10 @@ class TestFairness:
 
     @pytest.fixture
     def fair_config(self) -> OrchestratorConfig:
-        """OrchestratorConfig tuned for quick fairness testing."""
+        """OrchestratorConfig tuned for quick fairness testing (v2 enabled)."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.skip_threshold = 3
+        config.fairness.scheduler_v2 = True
         return config
 
     @staticmethod
