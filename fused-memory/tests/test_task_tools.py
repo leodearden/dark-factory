@@ -136,6 +136,45 @@ async def test_update_task_param_forwarding(
 
 
 # ------------------------------------------------------------------
+# update_task dotted-ID forwarding (post-SQLite-cutover regression lock)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_forwards_dotted_subtask_id_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Dotted subtask IDs pass through the MCP boundary to the interceptor unchanged.
+
+    Locks the post-SQLite-cutover contract: the stale Node Taskmaster MCP
+    wrapper used to reject dotted IDs with "taskId must be a positive integer".
+    That wrapper was removed in the SQLite cutover. This test ensures that a
+    future defence-in-depth integer-validation guard (analogous to
+    _reject_if_ticket_id) cannot silently re-introduce the same rejection.
+    """
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '2696.1',
+            'project_root': '/project',
+            'metadata': {'memory_hints': {'entities': ['X']}},
+        },
+    )
+    # (a) No ValidationError or numeric-id rejection.
+    assert isinstance(result, dict)
+    assert result.get('error_type') != 'ValidationError'
+    assert result == {'success': True}
+
+    # (b) The interceptor was called once with the dotted id unchanged.
+    task_interceptor.update_task.assert_called_once()
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['task_id'] == '2696.1'
+
+    # (c) Dict metadata is JSON-serialized before forwarding (standard coercion).
+    assert kwargs['metadata'] == '{"memory_hints": {"entities": ["X"]}}'
+
+
+# ------------------------------------------------------------------
 # update_task error handling
 # ------------------------------------------------------------------
 
