@@ -375,6 +375,34 @@ async def test_set_status_on_subtask_via_dotted_id(backend, project_root):
     assert parent['subtasks'][0]['status'] == 'done'
 
 
+# ── update_task on subtasks ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_persists_metadata_on_dotted_subtask_id(backend, project_root):
+    """metadata written to a subtask via update_task round-trips through get_task.
+
+    Regression: _row_to_task's subtask branch previously dropped the metadata
+    column. Both the direct get_task('1.1') path and the parent['subtasks'][0]
+    path must now return the persisted metadata dict.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='Sub')
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}),
+        append=True,
+    )
+
+    # (a) Direct get_task on the subtask must carry the metadata.
+    sub = await backend.get_task('1.1', project_root=project_root)
+    assert sub['metadata'] == {'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}
+
+    # (b) Parent's subtasks[0] must also carry the metadata.
+    parent = await backend.get_task('1', project_root=project_root)
+    assert parent['subtasks'][0]['metadata'] == {'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}
+
+
 # ── remove_tasks with cascade ──────────────────────────────────────
 
 
