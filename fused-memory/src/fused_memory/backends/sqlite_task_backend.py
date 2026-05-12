@@ -153,8 +153,11 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int]) -> dict[str, Any]:
         }
         return out
 
-    # Subtask: short integer id + parentTaskId, no testStrategy/priority/metadata
-    # in the Taskmaster file format.
+    # Subtask: short integer id + parentTaskId. testStrategy/priority are not
+    # surfaced (they follow the Taskmaster file-format shape). metadata IS
+    # surfaced so that memory_hints and other reconciliation data written via
+    # update_task('1.1', metadata=...) round-trip correctly to consumers like
+    # context_assembler.py that read `(task.get('metadata') or {}).get(...)`.
     return {
         'id': row['id'],
         'title': row['title'],
@@ -165,6 +168,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int]) -> dict[str, Any]:
         'parentTaskId': parent_id,
         'parentId': 'undefined',
         'updatedAt': row['updated_at'],
+        'metadata': metadata if metadata is not None else {},
     }
 
 
