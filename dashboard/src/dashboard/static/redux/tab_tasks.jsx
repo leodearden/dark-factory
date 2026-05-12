@@ -225,7 +225,13 @@ function MarkdownText({ text, className, empty }) {
   // dialect in pasted task descriptions).
   const html = uM_T(() => {
     if (!text || typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
-    return DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
+    try {
+      return DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
+    } catch {
+      // On any parse/sanitize error return null; the html===null branch below
+      // degrades to plain pre-line text rather than unmounting TaskDetail.
+      return null;
+    }
   }, [text]);
   // No content: render empty-prop placeholder or nothing.
   if (!text) return empty !== undefined ? <div className={className}>{empty}</div> : null;
