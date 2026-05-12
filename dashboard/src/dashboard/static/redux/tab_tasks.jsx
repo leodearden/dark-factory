@@ -217,7 +217,6 @@ function TaskDetail({ task, allTasks }) {
   }
   const deps = task.deps || [];
   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
-  const desc = task.description || '—';
   return (
     <div className="task-detail">
       <h4>{task.title}</h4>
@@ -232,11 +231,13 @@ function TaskDetail({ task, allTasks }) {
       </div>
 
       <div className="section-lbl">Description</div>
-      <div className="desc">{desc}</div>
+      {task.description
+        ? <MarkdownText text={task.description} className="desc" />
+        : <div className="desc">—</div>}
 
       {task.details && (<>
         <div className="section-lbl">Details</div>
-        <div className="desc">{task.details}</div>
+        <MarkdownText text={task.details} className="desc" />
       </>)}
 
       <div className="section-lbl">Depends on ({deps.length})</div>
