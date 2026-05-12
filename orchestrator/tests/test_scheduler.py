@@ -2053,6 +2053,95 @@ class TestFairness:
         # And A's park was cleaned up on successful acquire.
         assert not scheduler.lock_table.has_parks('A')
 
+    # ---- scheduler_v2 gate tests ----
+
+    @pytest.mark.asyncio
+    async def test_scheduler_v2_default_false_no_parks_installed(self):
+        """When scheduler_v2=False, parks are never installed even past threshold."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = 1  # fire fast
+        config.fairness.scheduler_v2 = False
+        scheduler = Scheduler(config)
+
+        # Seed compiler/src so A always fails.
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')
+
+        a = self._broad_task()
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # Run several ticks past the threshold.
+        for _ in range(5):
+            result = await scheduler.acquire_next()
+            if result:
+                scheduler.release(result.task_id)
+
+        # Skip counter should have climbed.
+        assert scheduler._skip_count.get('A', 0) >= 1
+        # But no parks should be installed when scheduler_v2=False.
+        assert not scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
+    async def test_scheduler_v2_true_installs_parks(self):
+        """When scheduler_v2=True, parks install after the per-tier threshold."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        # Use per-tier defaults: high -> threshold=1 (installs after first skip).
+        config.fairness.scheduler_v2 = True
+        scheduler = Scheduler(config)
+
+        # Seed compiler/src so A (high priority) is forced to skip.
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')
+
+        a = self._broad_task()  # high priority
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # One tick: high threshold=1, so A parks after this single skip.
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'B'
+
+        # A's parks should now be installed.
+        assert scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
+    async def test_eager_park_full_module_set(self):
+        """With scheduler_v2=True, parks install on ALL of A's modules at once.
+
+        Even modules not currently held by another task are covered — this
+        prevents racing lower-priority tasks from grabbing a free module
+        while A waits for a blocked one.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        # Per-tier defaults: high -> threshold=1.
+        scheduler = Scheduler(config)
+
+        # B holds compiler/src; C holds eval/src; tools/src is FREE.
+        scheduler.lock_table.try_acquire('B', ['compiler/src'])
+        scheduler.lock_table.try_acquire('C', ['eval/src'])
+        scheduler._dispatched.update(['B', 'C'])
+
+        a = {
+            'id': 'A',
+            'title': 'Broad task',
+            'status': 'pending',
+            'priority': 'high',
+            'dependencies': [],
+            'metadata': {'files': ['compiler/src', 'eval/src', 'tools/src']},
+        }
+        b = self._narrow_task('D', 'tools/src', priority='low')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # One tick — A skips, park fires on all three modules.
+        await scheduler.acquire_next()
+
+        # A's park covers all three modules.
+        assert scheduler.lock_table.has_parks('A')
+        # D cannot acquire tools/src (free slot) because A's park covers it.
+        assert not scheduler.lock_table.try_acquire('D', ['tools/src'])
+
 
 class TestGetStatus:
     """``Scheduler.get_status`` returns the fresh store value via MCP."""
