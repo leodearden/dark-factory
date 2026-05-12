@@ -82,7 +82,7 @@ class ContextAssembler:
     def __init__(
         self,
         memory_service: MemoryService,
-        taskmaster: 'TaskBackendProtocol | None',
+        taskmaster: TaskBackendProtocol | None,
         config: ReconciliationConfig,
         project_root: str = '',
     ):
