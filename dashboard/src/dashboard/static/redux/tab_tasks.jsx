@@ -205,13 +205,38 @@ function fmtAge(t) {
   return `${t.started}m running`;
 }
 
+// Open links rendered from markdown in a new tab with safe rel attributes.
+// Registered once at module load; DOMPurify guard handles offline/CDN-fail cases.
+if (typeof DOMPurify !== 'undefined') {
+  DOMPurify.addHook('afterSanitizeAttributes', function(node) {
+    if (node.tagName === 'A') {
+      node.setAttribute('target', '_blank');
+      node.setAttribute('rel', 'noopener noreferrer');
+    }
+  });
+}
+
+function MarkdownText({ text, className, empty }) {
+  // Memoize parse+sanitize so it only reruns when text changes, not on every
+  // parent re-render (e.g. streaming status updates from another tab).
+  const html = uM_T(() => {
+    if (!text || typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
+    return DOMPurify.sanitize(marked.parse(text));
+  }, [text]);
+  // No content: render empty-prop placeholder or nothing.
+  if (!text) return empty !== undefined ? <div className={className}>{empty}</div> : null;
+  // CDN libraries unavailable (network blip, ad-blocker, integrity-hash mismatch):
+  // degrade gracefully to plain text instead of throwing a ReferenceError.
+  if (html === null) return <div className={className} style={{whiteSpace: 'pre-line'}}>{text}</div>;
+  return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
 function TaskDetail({ task, allTasks }) {
   if (!task) {
     return <div className="placeholder">Click a task in the graph to see its full description, dependencies, and locks.</div>;
   }
   const deps = task.deps || [];
   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
-  const desc = task.description || '—';
   return (
     <div className="task-detail">
       <h4>{task.title}</h4>
@@ -226,11 +251,11 @@ function TaskDetail({ task, allTasks }) {
       </div>
 
       <div className="section-lbl">Description</div>
-      <div className="desc">{desc}</div>
+      <MarkdownText text={task.description} className="desc" empty="—" />
 
       {task.details && (<>
         <div className="section-lbl">Details</div>
-        <div className="desc">{task.details}</div>
+        <MarkdownText text={task.details} className="desc" />
       </>)}
 
       <div className="section-lbl">Depends on ({deps.length})</div>
