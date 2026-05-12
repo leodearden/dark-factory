@@ -1,6 +1,7 @@
 """Tests for the _graceful_shutdown helper in fused_memory.server.main."""
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -491,10 +492,8 @@ class TestRunShieldedCallerCancelledCompletesInner:
 
         # The outer task may itself raise CancelledError when awaited, but the
         # CONTRACT is that the inner cleanup runs to completion regardless.
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await outer_task
-        except asyncio.CancelledError:
-            pass
 
         assert inner_finished, (
             'inner cleanup task was abandoned when caller was cancelled — '
@@ -535,10 +534,8 @@ class TestRunShieldedCallerCancelledExceedsBudget:
         await inner_started.wait()
         outer_task.cancel()
 
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await outer_task
-        except asyncio.CancelledError:
-            pass
 
         # _run_shielded must have explicitly cancelled the inner task once
         # the deadline expired — otherwise the inner would still be running.
