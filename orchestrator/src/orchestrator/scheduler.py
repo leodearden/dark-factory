@@ -489,9 +489,33 @@ class ModuleLockTable:
             if owner != task_id
         }
 
-    def prune_expired_parks(self, now: float) -> list[str]:
-        """Temporary no-op stub. Replaced by prune_owners in step 8."""
-        return []
+    def prune_owners(self, predicate: Callable[[str], bool]) -> list[str]:
+        """Evict every park whose owner satisfies *predicate*.
+
+        Iterates unique owners (deduped, first-seen order), calls
+        ``predicate(owner_id)`` at most once per owner, and drops all
+        ``_parked`` entries owned by matching tasks.
+
+        Returns the list of evicted owner IDs in first-seen order.
+        """
+        # Collect unique owners in first-seen order.
+        seen: dict[str, bool] = {}
+        for owner, _rank in self._parked.values():
+            if owner not in seen:
+                seen[owner] = predicate(owner)
+        # Evict matching owners.
+        evicted: list[str] = []
+        for owner, should_evict in seen.items():
+            if should_evict:
+                evicted.append(owner)
+        if evicted:
+            evicted_set = set(evicted)
+            self._parked = {
+                m: (owner, rank)
+                for m, (owner, rank) in self._parked.items()
+                if owner not in evicted_set
+            }
+        return evicted
 
     # --- Limit lookup (unchanged) ---
 
@@ -1405,19 +1429,8 @@ class Scheduler:
         dominant, age + CPM bonuses order tasks within a tier, and
         per-tier slot caps reserve headroom for higher-value work.
         """
-        # Fairness: evict expired reservations and reset their owners' skip
-        # counts so they can re-accumulate instead of immediately re-parking.
-        now = self._time_source()
-        evicted = self.lock_table.prune_expired_parks(now)
-        for owner in evicted:
-            self._skip_count.pop(owner, None)
-            logger.info('Task %s reservation expired', owner)
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.reservation_expired,
-                    task_id=owner,
-                    data={},
-                )
+        # TODO(step-14): replace with prune_owners(predicate) owner-state GC sweep.
+        evicted: list[str] = []
 
         tasks = await self.get_tasks()
         if not tasks:
