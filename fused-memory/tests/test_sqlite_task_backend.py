@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -494,6 +495,43 @@ async def test_row_to_task_returns_empty_dict_for_malformed_metadata(backend, pr
 
     # Subtask (via parent['subtasks']): same contract.
     assert parent['subtasks'][0]['metadata'] == {}
+
+
+@pytest.mark.asyncio
+async def test_row_to_task_warns_on_malformed_metadata(backend, project_root, caplog):
+    """_row_to_task emits a WARNING when it coerces malformed metadata JSON to {}.
+
+    The warning must include the row's tag, id, parent_id (raw DB int), and a
+    truncated preview of the bad metadata_raw value so an operator can locate
+    and repair the offending row.  The {}-coercion contract must also hold.
+    """
+    # Create a top-level task so a real DB row exists.
+    await backend.add_task(project_root=project_root, title='parent')
+
+    # Directly corrupt the metadata column with a non-JSON string.
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON_GARBAGE_xyz' WHERE parent_id = 0 AND id = 1"
+    )
+    await conn.commit()
+
+    # Capture WARNING-level records from the sqlite_task_backend logger.
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        task = await backend.get_task('1', project_root=project_root)
+
+    # The {}-coercion contract still holds.
+    assert task['metadata'] == {}
+
+    # At least one WARNING record must mention tag, id, parent_id, and the payload preview.
+    warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning_msgs, 'Expected at least one WARNING log record; got none'
+    combined = ' '.join(warning_msgs)
+    assert 'master' in combined, f'Expected tag "master" in warning; got: {combined!r}'
+    assert '1' in combined, f'Expected id "1" in warning; got: {combined!r}'
+    assert '0' in combined, f'Expected parent_id "0" in warning; got: {combined!r}'
+    assert 'NOT_JSON_GARBAGE' in combined, (
+        f'Expected metadata_raw preview in warning; got: {combined!r}'
+    )
 
 
 # ── remove_tasks with cascade ──────────────────────────────────────
