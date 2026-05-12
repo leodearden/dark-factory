@@ -5232,6 +5232,116 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         assert mock_call
 
 
+class TestTaskKnowledgeSyncStaleFixcSweptStat:
+    """TaskKnowledgeSync.run() sets report.stats['stale_fixc_markers_swept'] after super().run()."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stale_fixc_markers_swept_stat_set_after_run(self, mock_deps):
+        """run() injects stale_fixc_markers_swept into report.stats after super().run()."""
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock as AM, patch
+
+        from fused_memory.reconciliation.stages.base import BaseStage
+        from fused_memory.models.reconciliation import StageId, StageReport
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # One current-cycle marker and two stale markers
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+            SimpleNamespace(
+                id='stale-1', content='stale 1',
+                metadata={'flag_for_stage2': True, 'task_id': '2', 'run_id': 'old-run'},
+            ),
+            SimpleNamespace(
+                id='stale-2', content='stale 2',
+                metadata={'flag_for_stage2': True, 'task_id': '3'},
+            ),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch.object(BaseStage, 'run', new=AM(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stale_fixc_markers_swept') == 2
+
+    @pytest.mark.asyncio
+    async def test_zero_stale_markers_stat_is_explicitly_set(self, mock_deps):
+        """When no stale markers exist, stat is 0 (explicitly set, not absent)."""
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock as AM, patch
+
+        from fused_memory.reconciliation.stages.base import BaseStage
+        from fused_memory.models.reconciliation import StageId, StageReport
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # All markers have matching run_id → zero stale
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch.object(BaseStage, 'run', new=AM(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # Stat must be present and == 0, not absent
+        assert 'stale_fixc_markers_swept' in report.stats
+        assert report.stats['stale_fixc_markers_swept'] == 0
+
+
 class TestStage3PayloadIncludesProjectRoot:
     """IntegrityCheck.assemble_payload() must emit a Use project_root="..." directive.
 
