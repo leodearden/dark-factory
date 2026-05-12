@@ -462,6 +462,39 @@ class TestAsyncSqliteBaseConcurrentClose:
 # ---------------------------------------------------------------------------
 
 
+async def _swap_in_failing_close_mock(
+    store: AsyncSqliteBase, exc: BaseException
+) -> AsyncMock:
+    """Close the real aiosqlite connection and inject a mock whose close() raises.
+
+    Both exception-safety tests need to replace store._conn with an AsyncMock
+    while keeping the real aiosqlite connection cleanly shut down.  Failing to
+    close the real connection first orphans the aiosqlite worker thread; the
+    orphan's GC-triggered call_soon_threadsafe raises 'Event loop is closed'
+    after test teardown, which pytest re-raises in the next test's setup as
+    PytestUnhandledThreadExceptionWarning.
+
+    Safe swap sequence:
+      1. Capture and close the real connection — worker thread exits cleanly.
+      2. Null out store._conn — prevents an accidental close during transition.
+      3. Install the AsyncMock — close() raises exc; tests then assert on _conn.
+    """
+    real_conn = store._conn
+    store._conn = None
+    await real_conn.close()
+    mock_conn = AsyncMock()
+    mock_conn.close = AsyncMock(side_effect=exc)
+    store._conn = mock_conn  # type: ignore[assignment]
+    return mock_conn
+
+
+# Promotes PytestUnhandledThreadExceptionWarning into a hard test error for
+# tests inside this class.  A regression of the "close real conn before
+# swapping mock" pattern surfaces in the *next* test's setup phase.
+# test_z_sentinel_no_leaked_worker_thread runs last specifically to be that
+# setup phase for test_open_succeeds_after_failed_close (the last real test).
+# See _swap_in_failing_close_mock for the safe-swap helper used by each test.
+@pytest.mark.filterwarnings('error::pytest.PytestUnhandledThreadExceptionWarning')
 @pytest.mark.asyncio
 class TestAsyncSqliteBaseCloseExceptionSafety:
     """Tests that close() clears _conn even when conn.close() raises."""
@@ -477,10 +510,8 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         await store.open()
         assert store._conn is not None
 
-        # Replace the real connection with a mock whose close() raises OSError
-        mock_conn = AsyncMock()
-        mock_conn.close = AsyncMock(side_effect=OSError('disk failure'))
-        store._conn = mock_conn  # type: ignore[assignment]
+        # Install the failing mock (closes real conn first to avoid worker-thread leak)
+        await _swap_in_failing_close_mock(store, OSError('disk failure'))
 
         # The OSError must propagate (not be swallowed)
         with pytest.raises(OSError, match='disk failure'):
@@ -499,10 +530,8 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
 
-        # Inject a mock that raises on close()
-        mock_conn = AsyncMock()
-        mock_conn.close = AsyncMock(side_effect=OSError('disk failure'))
-        store._conn = mock_conn  # type: ignore[assignment]
+        # Install the failing mock (closes real conn first to avoid worker-thread leak)
+        await _swap_in_failing_close_mock(store, OSError('disk failure'))
 
         # close() raises but must clear _conn
         with pytest.raises(OSError, match='disk failure'):
@@ -518,6 +547,18 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         assert row is not None and row[0] == 1
 
         await store.close()
+
+    async def test_z_sentinel_no_leaked_worker_thread(self) -> None:
+        """Sentinel: catches any thread leak from test_open_succeeds_after_failed_close.
+
+        The filterwarnings marker on this class converts
+        PytestUnhandledThreadExceptionWarning into a hard error only during tests
+        inside this class.  If the last real test leaks an aiosqlite worker thread,
+        pytest defers the warning to the *next* test's setup phase.  This no-op
+        sentinel is that next setup phase — same class, same marker — so the warning
+        surfaces here rather than escaping into a different test class that lacks
+        the filter.
+        """
 
 
 # ---------------------------------------------------------------------------
