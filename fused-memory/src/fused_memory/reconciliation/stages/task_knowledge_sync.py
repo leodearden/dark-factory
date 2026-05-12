@@ -643,6 +643,61 @@ def _compute_stale_flags(
 # semantic search, which can silently rank matches off the bottom of top-N).
 _STAGE2_PERSISTENCE_MARKER_SOURCE = 'stage2_persistence_marker'
 _STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
+_STAGE2_STALE_FIXC_SWEEP_SOURCE = 'stage2_stale_fixc_sweep'
+
+
+async def _sweep_stale_fixc_markers(
+    memory_service,
+    project_id: str,
+    stale_ids: list[str],
+    run_id: str,
+) -> int:
+    """Delete stale fixc markers in parallel and return the count of successful deletes.
+
+    Issues parallel ``delete_memory`` calls via ``asyncio.gather`` with
+    ``return_exceptions=True`` (mirrors :func:`_track_flag_persistence` /
+    :func:`_write_escalation_markers`).  Individual delete failures log WARNING
+    and are excluded from the returned count — best-effort contract.
+
+    Args:
+        memory_service: The fused-memory service (must support ``delete_memory``).
+        project_id: Project scope for the delete calls.
+        stale_ids: List of Mem0 memory IDs to delete.  Empty list → returns 0
+            immediately without issuing any calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            so the audit journal traces each delete back to the responsible cycle.
+
+    Returns:
+        Number of deletes that completed without raising (0 if *stale_ids* is empty).
+    """
+    if not stale_ids:
+        return 0
+
+    results = await asyncio.gather(
+        *(
+            memory_service.delete_memory(
+                memory_id=mid,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source=_STAGE2_STALE_FIXC_SWEEP_SOURCE,
+            )
+            for mid in stale_ids
+        ),
+        return_exceptions=True,
+    )
+
+    success_count = 0
+    for mid, result in zip(stale_ids, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._sweep_stale_fixc_markers: delete failed for memory_id=%s; not counted',
+                mid,
+                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
+            success_count += 1
+    return success_count
 
 
 async def _track_flag_persistence(
