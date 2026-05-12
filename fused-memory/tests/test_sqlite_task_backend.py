@@ -432,6 +432,35 @@ async def test_get_tasks_listing_surfaces_subtask_metadata(backend, project_root
     assert fresh_sub['metadata'] == {}
 
 
+@pytest.mark.asyncio
+async def test_update_task_memory_hints_union_on_subtask(backend, project_root):
+    """memory_hints union semantics (append=True) work end-to-end on subtasks.
+
+    Models the top-level test_update_task_memory_hints_union but for the
+    dotted-id subtask path. Locks the reconciliation behavior: stage2 attaches
+    hints across multiple cycles and the lists grow via union (no duplicates).
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='hinted')
+
+    # First cycle: write initial hints.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['A'], 'queries': ['q1']}}),
+        append=True,
+    )
+    # Second cycle: union new hints.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['B'], 'queries': ['q2']}}),
+        append=True,
+    )
+
+    sub = await backend.get_task('1.1', project_root=project_root)
+    hints = sub['metadata']['memory_hints']
+    assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
+
+
 # ── remove_tasks with cascade ──────────────────────────────────────
 
 
