@@ -375,6 +375,127 @@ async def test_set_status_on_subtask_via_dotted_id(backend, project_root):
     assert parent['subtasks'][0]['status'] == 'done'
 
 
+# ── update_task on subtasks ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_persists_metadata_on_dotted_subtask_id(backend, project_root):
+    """metadata written to a subtask via update_task round-trips through get_task.
+
+    Regression: _row_to_task's subtask branch previously dropped the metadata
+    column. Both the direct get_task('1.1') path and the parent['subtasks'][0]
+    path must now return the persisted metadata dict.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='Sub')
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}),
+        append=True,
+    )
+
+    # (a) Direct get_task on the subtask must carry the metadata.
+    sub = await backend.get_task('1.1', project_root=project_root)
+    assert sub['metadata'] == {'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}
+
+    # (b) Parent's subtasks[0] must also carry the metadata.
+    parent = await backend.get_task('1', project_root=project_root)
+    assert parent['subtasks'][0]['metadata'] == {'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_listing_surfaces_subtask_metadata(backend, project_root):
+    """get_tasks listing also surfaces metadata on subtask dicts.
+
+    Locks both the populated-metadata path and the None→{} default so
+    the reconciliation context_assembler (which reads via get_tasks) sees
+    the same metadata as the direct get_task path.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='Sub')
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['X']}}),
+        append=False,
+    )
+
+    listing = await backend.get_tasks(project_root=project_root)
+
+    # (a) Populated-metadata path: get_tasks listing carries the persisted value.
+    assert listing['tasks'][0]['subtasks'][0]['metadata'] == {'memory_hints': {'entities': ['X']}}
+
+    # (b) Empty-default path: a freshly added subtask (no update_task) has metadata={}.
+    await backend.add_subtask('1', project_root=project_root, title='Fresh')
+    listing2 = await backend.get_tasks(project_root=project_root)
+    fresh_sub = next(s for s in listing2['tasks'][0]['subtasks'] if s['title'] == 'Fresh')
+    assert 'metadata' in fresh_sub
+    assert fresh_sub['metadata'] == {}
+
+
+@pytest.mark.asyncio
+async def test_update_task_memory_hints_union_on_subtask(backend, project_root):
+    """memory_hints union semantics (append=True) work end-to-end on subtasks.
+
+    Models the top-level test_update_task_memory_hints_union but for the
+    dotted-id subtask path. Locks the reconciliation behavior: stage2 attaches
+    hints across multiple cycles and the lists grow via union (no duplicates).
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='hinted')
+
+    # First cycle: write initial hints.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['A'], 'queries': ['q1']}}),
+        append=True,
+    )
+    # Second cycle: union new hints.
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['B'], 'queries': ['q2']}}),
+        append=True,
+    )
+
+    sub = await backend.get_task('1.1', project_root=project_root)
+    hints = sub['metadata']['memory_hints']
+    assert hints == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
+
+
+@pytest.mark.asyncio
+async def test_row_to_task_returns_empty_dict_for_malformed_metadata(backend, project_root):
+    """_row_to_task coerces malformed metadata JSON to {} for both top-level and subtask rows.
+
+    Regression guard: if a legacy row holds a non-JSON string in the metadata
+    column, the except branch in _row_to_task must surface {} rather than the
+    raw string, so downstream `(task.get('metadata') or {}).get(...)` callers
+    never receive a str and raise AttributeError.
+    """
+    # Set up a parent task and a subtask via the normal API.
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='child')
+
+    # Directly corrupt both rows' metadata column with a non-JSON string.
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON' WHERE parent_id = 0 AND id = 1"
+    )
+    await conn.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON' WHERE parent_id = 1 AND id = 1"
+    )
+    await conn.commit()
+
+    # Top-level task: malformed metadata must surface as {}, not 'NOT_JSON'.
+    parent = await backend.get_task('1', project_root=project_root)
+    assert parent['metadata'] == {}
+
+    # Subtask (via direct get_task): same contract.
+    sub = await backend.get_task('1.1', project_root=project_root)
+    assert sub['metadata'] == {}
+
+    # Subtask (via parent['subtasks']): same contract.
+    assert parent['subtasks'][0]['metadata'] == {}
+
+
 # ── remove_tasks with cascade ──────────────────────────────────────
 
 
