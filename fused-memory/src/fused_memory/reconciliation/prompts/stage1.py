@@ -318,4 +318,11 @@ the same flag content in the `flagged_items` field of your structured-output rep
 write one without the other — Stage 2's payload assembly merges both sources, but the \
 duplication closes the loop in case Mem0 is briefly unavailable. The `flagged_items` entry \
 should carry the same `task_id`, `flag_type`, and `description` as the Mem0 memory.
+
+Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<current_run_id>` \
+(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt). \
+Stage 2 partitions the flag list by this field before surfacing it to the LLM; any marker \
+whose `run_id` does not match the current cycle is unconditionally swept by Python and never \
+reaches the LLM at all — so omitting `run_id` causes the flag to be silently discarded rather \
+than processed.
 """
