@@ -647,12 +647,11 @@ class TestSwapLeakGuard:
         await store.open()
         real_conn = store._conn  # keep a reference for post-test cleanup
 
-        with pytest.raises(AssertionError, match='not closed'):
-            with _ensure_real_conn_closed_at_exit(store):
-                # Buggy swap: replace _conn without closing real_conn first
-                store._conn = AsyncMock()  # type: ignore[assignment]
-                store._conn.close = AsyncMock(side_effect=OSError('boom'))
-                # real_conn is deliberately NOT closed here — guard must fire
+        with pytest.raises(AssertionError, match='not closed'), _ensure_real_conn_closed_at_exit(store):
+            # Buggy swap: replace _conn without closing real_conn first
+            store._conn = AsyncMock()  # type: ignore[assignment]
+            store._conn.close = AsyncMock(side_effect=OSError('boom'))
+            # real_conn is deliberately NOT closed here — guard must fire
 
         # Clean up the leaked connection so it does not pollute subsequent tests
         await real_conn.close()
