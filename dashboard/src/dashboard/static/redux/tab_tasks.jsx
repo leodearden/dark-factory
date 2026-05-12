@@ -205,6 +205,12 @@ function fmtAge(t) {
   return `${t.started}m running`;
 }
 
+function MarkdownText({ text, className }) {
+  if (!text) return null;
+  const html = DOMPurify.sanitize(marked.parse(text));
+  return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
 function TaskDetail({ task, allTasks }) {
   if (!task) {
     return <div className="placeholder">Click a task in the graph to see its full description, dependencies, and locks.</div>;
