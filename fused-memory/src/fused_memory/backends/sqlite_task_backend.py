@@ -135,6 +135,14 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int]) -> dict[str, Any]:
         except (TypeError, ValueError):
             # Malformed legacy row: discard and surface {} so downstream
             # `(task.get('metadata') or {}).get(...)` callers never see a str.
+            logger.warning(
+                'sqlite_task_backend: malformed metadata JSON — tag=%s id=%s parent_id=%s'
+                ' metadata_raw=%s; coerced to {}',
+                row['tag'],
+                row['id'],
+                row['parent_id'],
+                repr(metadata_raw)[:80],
+            )
             metadata = {}
 
     if parent_id is None:
