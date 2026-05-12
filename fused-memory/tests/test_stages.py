@@ -4772,13 +4772,12 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
     def watermark(self):
         return Watermark(project_id='reify')
 
-    def _make_mem0_flag(self, flag_id, content, task_id):
+    def _make_mem0_flag(self, flag_id, content, task_id, run_id=None):
         from types import SimpleNamespace
-        return SimpleNamespace(
-            id=flag_id,
-            content=content,
-            metadata={'flag_for_stage2': True, 'task_id': task_id},
-        )
+        meta: dict = {'flag_for_stage2': True, 'task_id': task_id}
+        if run_id is not None:
+            meta['run_id'] = run_id
+        return SimpleNamespace(id=flag_id, content=content, metadata=meta)
 
     @pytest.mark.asyncio
     async def test_payload_contains_both_stage1_and_mem0_flags(self, mock_deps, watermark):
@@ -4791,10 +4790,10 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         stage.project_root = '/home/leo/src/reify'
         stage._current_run_id = 'test-run'
 
-        # Mem0 active-query flags
+        # Mem0 active-query flags (both carry matching run_id so they are current)
         mock_deps['memory_service'].search.return_value = [
-            self._make_mem0_flag('mem0-flag-1', 'mem0 flag content for task 742', '742'),
-            self._make_mem0_flag('mem0-flag-2', 'mem0 flag content for task 888', '888'),
+            self._make_mem0_flag('mem0-flag-1', 'mem0 flag content for task 742', '742', run_id='test-run'),
+            self._make_mem0_flag('mem0-flag-2', 'mem0 flag content for task 888', '888', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -4870,6 +4869,54 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         )
         assert project_id_used == 'reify', \
             f'search must be called with project_id="reify", got: {project_id_used}'
+
+    @pytest.mark.asyncio
+    async def test_payload_excludes_stale_run_id_flags_and_sweeps_them(self, mock_deps, watermark):
+        """Stale markers (wrong/absent run_id) must be excluded from payload and swept via delete_memory."""
+        from types import SimpleNamespace
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
+
+        mock_deps['memory_service'].delete_memory = AsyncMock(return_value=None)
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-current',
+                content='content for task 742',
+                metadata={'flag_for_stage2': True, 'task_id': '742', 'run_id': 'test-run'},
+            ),
+            SimpleNamespace(
+                id='mem0-prior',
+                content='STALE content from prior run',
+                metadata={'flag_for_stage2': True, 'task_id': '888', 'run_id': 'r-old'},
+            ),
+            SimpleNamespace(
+                id='mem0-no-run-id',
+                content='NO_RUN_ID legacy content',
+                metadata={'flag_for_stage2': True, 'task_id': '999'},
+            ),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+
+        # Only current-cycle marker rendered to LLM
+        assert 'content for task 742' in section
+        assert 'STALE content from prior run' not in section
+        assert 'NO_RUN_ID legacy content' not in section
+
+        # Two stale markers swept via delete_memory
+        assert mock_deps['memory_service'].delete_memory.await_count == 2
+        swept_ids = {
+            call.kwargs.get('memory_id')
+            for call in mock_deps['memory_service'].delete_memory.call_args_list
+        }
+        assert swept_ids == {'mem0-prior', 'mem0-no-run-id'}
+        for call in mock_deps['memory_service'].delete_memory.call_args_list:
+            assert call.kwargs.get('store') == 'mem0'
+            assert call.kwargs.get('_source') == 'stage2_stale_fixc_sweep'
 
 
 class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
