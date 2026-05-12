@@ -219,9 +219,13 @@ if (typeof DOMPurify !== 'undefined') {
 function MarkdownText({ text, className, empty }) {
   // Memoize parse+sanitize so it only reruns when text changes, not on every
   // parent re-render (e.g. streaming status updates from another tab).
+  // breaks:true converts single newlines to <br>, matching the pre-line semantics
+  // that task descriptions were originally authored against; \n\n still produces
+  // paragraph breaks. gfm:true enables GitHub-Flavored Markdown (the dominant
+  // dialect in pasted task descriptions).
   const html = uM_T(() => {
     if (!text || typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
-    return DOMPurify.sanitize(marked.parse(text));
+    return DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
   }, [text]);
   // No content: render empty-prop placeholder or nothing.
   if (!text) return empty !== undefined ? <div className={className}>{empty}</div> : null;
