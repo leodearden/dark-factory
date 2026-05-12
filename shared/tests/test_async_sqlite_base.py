@@ -593,3 +593,54 @@ class TestWorkerThreadIsDaemon:
             )
         finally:
             await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _ensure_real_conn_closed_at_exit guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSwapLeakGuard:
+    """Unit tests for the _ensure_real_conn_closed_at_exit guard context manager."""
+
+    async def test_guard_raises_when_real_conn_was_not_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """Guard raises AssertionError when the real connection was never closed.
+
+        Simulates a buggy swap: store._conn is replaced with an AsyncMock but
+        the original aiosqlite Connection is never awaited-closed first.  The
+        guard captures real_conn at entry; at exit it finds _connection is
+        still set and raises AssertionError immediately — rather than leaking
+        an unfinished worker thread into a later test's setup phase.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+        real_conn = store._conn  # keep a reference for post-test cleanup
+
+        with pytest.raises(AssertionError, match='not closed'):
+            with _ensure_real_conn_closed_at_exit(store):
+                # Buggy swap: replace _conn without closing real_conn first
+                store._conn = AsyncMock()  # type: ignore[assignment]
+                store._conn.close = AsyncMock(side_effect=OSError('boom'))
+                # real_conn is deliberately NOT closed here — guard must fire
+
+        # Clean up the leaked connection so it does not pollute subsequent tests
+        await real_conn.close()
+
+    async def test_guard_passes_when_safe_swap_was_used(
+        self, tmp_path: Path
+    ) -> None:
+        """Guard exits silently when the safe-swap helper was used.
+
+        _swap_in_failing_close_mock awaits real_conn.close() before installing
+        the mock, so real_conn._connection is None at guard exit.
+        """
+        store = _SimpleStore(tmp_path / 'store.db')
+        await store.open()
+
+        with _ensure_real_conn_closed_at_exit(store):
+            await _swap_in_failing_close_mock(store, OSError('boom'))
+            with pytest.raises(OSError):
+                await store.close()
