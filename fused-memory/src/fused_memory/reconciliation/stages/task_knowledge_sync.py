@@ -550,13 +550,29 @@ def _check_flag_counter_completeness(
     }
 
 
-async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
-    """Query Mem0 for active Stage-2-destined flags and return them as dicts.
+async def _query_stage2_flags(
+    memory_service,
+    project_id: str,
+    current_run_id: str,
+) -> tuple[list[dict], list[str]]:
+    """Query Mem0 for active Stage-2-destined flags and partition by run_id.
 
     Searches for memories with ``metadata.flag_for_stage2=true`` (the only
     supported convention — the ``stage1_flag_marker`` key was a never-shipped
     alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
+
+    Results are partitioned into two groups:
+
+    * **current_flags** — full dict records whose ``metadata.run_id`` matches
+      ``current_run_id`` (after symmetric ``str()`` coercion).  These are
+      rendered to the Stage 2 LLM for FIX-C processing.
+    * **stale_marker_ids** — ``id`` strings only for records whose
+      ``metadata.run_id`` is absent or does not match ``current_run_id``.
+      Markers missing ``run_id`` are unconditionally classified as stale
+      (legacy disposition: they pre-date the run_id producer contract and
+      cannot be attributed to any specific run).  The caller is responsible
+      for sweeping these via :func:`_sweep_stale_fixc_markers`.
 
     .. warning::
         This function uses semantic search with a ``limit=100`` top-N cutoff.
@@ -567,7 +583,7 @@ async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
         detection.  The active-query path here still carries the top-N risk —
         see follow-up task for a proper ``scroll_by_metadata`` API on Mem0Backend.
 
-    Returns an empty list on search failure (best-effort; logs WARNING).
+    Returns ``([], [])`` on search failure (best-effort; logs WARNING).
     """
     try:
         results = await memory_service.search(
@@ -582,21 +598,26 @@ async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return []
+        return [], []
 
-    flags: list[dict] = []
+    current_flags: list[dict] = []
+    stale_marker_ids: list[str] = []
+    run_id_str = str(current_run_id)
     for r in results:
         meta = dict(r.metadata or {})
-        if meta.get('flag_for_stage2'):
-            flags.append(
-                {
-                    'id': r.id,
-                    'content': r.content,
-                    'metadata': meta,
-                    'task_id': str(meta.get('task_id', '')),
-                }
-            )
-    return flags
+        if not meta.get('flag_for_stage2'):
+            continue
+        flag_dict = {
+            'id': r.id,
+            'content': r.content,
+            'metadata': meta,
+            'task_id': str(meta.get('task_id', '')),
+        }
+        if str(meta.get('run_id', '')) == run_id_str:
+            current_flags.append(flag_dict)
+        else:
+            stale_marker_ids.append(r.id)
+    return current_flags, stale_marker_ids
 
 
 def _compute_stale_flags(
@@ -1239,8 +1260,11 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
-        # _query_stage2_flags is best-effort: search failures yield [] internally.
-        active_flags = await _query_stage2_flags(self.memory, self.project_id)
+        # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
+        # Stale-marker sweep is wired in step-8; for now we unpack and discard stale IDs.
+        active_flags, _stale_marker_ids = await _query_stage2_flags(
+            self.memory, self.project_id, self._current_run_id or ''
+        )
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
         # the active-query path ONLY.  Stage 1's structured-output flags are
