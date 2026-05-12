@@ -138,3 +138,50 @@ class TestInstallParksPreemption:
         assert evicted == [('L', ['backend'])]
         assert not lt.has_parks('L')
         assert lt.has_parks('H')
+
+
+class TestPruneOwners:
+    """prune_owners(predicate) owner-state GC and removal of prune_expired_parks."""
+
+    def test_prune_owners_drops_matching(self):
+        """prune_owners evicts owners for which the predicate returns True."""
+        lt = _lt()
+        lt.install_parks('A', ['m1'], 'medium')
+        lt.install_parks('B', ['m2'], 'medium')
+        evicted = lt.prune_owners(lambda tid: tid == 'A')
+        assert evicted == ['A']
+        assert not lt.has_parks('A')
+        assert lt.has_parks('B')
+
+    def test_prune_owners_returns_empty_when_no_match(self):
+        """prune_owners returns [] when the predicate never fires."""
+        lt = _lt()
+        lt.install_parks('A', ['m1'], 'medium')
+        evicted = lt.prune_owners(lambda tid: False)
+        assert evicted == []
+        assert lt.has_parks('A')
+
+    def test_prune_owners_dedups_owners_by_first_seen(self):
+        """Owner with multiple parks appears only once in the result."""
+        lt = _lt()
+        lt.install_parks('A', ['m1', 'm2'], 'medium')
+        evicted = lt.prune_owners(lambda tid: True)
+        assert evicted == ['A']
+
+    def test_prune_owners_predicate_called_per_owner_not_per_park(self):
+        """Predicate is called at most once per distinct owner (memoized)."""
+        lt = _lt()
+        lt.install_parks('A', ['m1', 'm2'], 'medium')
+        calls: list[str] = []
+
+        def predicate(tid: str) -> bool:
+            calls.append(tid)
+            return True
+
+        lt.prune_owners(predicate)
+        # A owns two parks but predicate should be called ≤ 1 time for 'A'.
+        assert calls.count('A') <= 1
+
+    def test_prune_expired_parks_does_not_exist(self):
+        """prune_expired_parks must be gone (replaced by prune_owners)."""
+        assert not hasattr(ModuleLockTable, 'prune_expired_parks')
