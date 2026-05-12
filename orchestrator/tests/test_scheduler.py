@@ -9,6 +9,7 @@ import pytest
 from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
+    FairnessConfig,
     ModuleConfig,
     OrchestratorConfig,
 )
@@ -1899,62 +1900,6 @@ class TestFairness:
         # Unrelated tasks can now acquire.
         assert lt.try_acquire('B', ['backend'])
 
-    def test_prune_expired_returns_owner_and_drops(self):
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        lt = ModuleLockTable(config)
-        lt.install_parks('A', ['backend'], deadline=0.0)  # already expired
-        lt.install_parks('B', ['frontend'], deadline=time.monotonic() + 60)
-        evicted = lt.prune_expired_parks(time.monotonic())
-        assert evicted == ['A']
-        # A's park is gone, B's remains.
-        assert not lt.has_parks('A')
-        assert lt.has_parks('B')
-
-    def test_expired_park_does_not_block(self):
-        """An expired park (not yet pruned) must not block acquires."""
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        lt = ModuleLockTable(config)
-        lt.install_parks('A', ['backend'], deadline=0.0)
-        # Lease expired; try_acquire from other should succeed without
-        # explicit pruning.
-        assert lt.try_acquire('B', ['backend'])
-
-    # ---- Scheduler lease computation ----
-
-    def test_compute_lease_midpoint_on_empty_history(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_min_secs = 100.0
-        config.fairness.lease_max_secs = 300.0
-        s = Scheduler(config)
-        assert s._compute_lease() == 200.0
-
-    def test_compute_lease_uses_median_and_multiplier(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = 5.0
-        config.fairness.lease_min_secs = 0.0
-        config.fairness.lease_max_secs = 10_000.0
-        s = Scheduler(config)
-        s._recent_durations.extend([10.0, 20.0, 30.0])  # median 20.0
-        assert s._compute_lease() == 100.0
-
-    def test_compute_lease_clamps_to_min(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = 1.0
-        config.fairness.lease_min_secs = 100.0
-        config.fairness.lease_max_secs = 1000.0
-        s = Scheduler(config)
-        s._recent_durations.append(5.0)  # 5s * 1.0 = 5s, below floor
-        assert s._compute_lease() == 100.0
-
-    def test_compute_lease_clamps_to_max(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = 5.0
-        config.fairness.lease_min_secs = 60.0
-        config.fairness.lease_max_secs = 1000.0
-        s = Scheduler(config)
-        s._recent_durations.append(500.0)  # 500 * 5 = 2500, above ceiling
-        assert s._compute_lease() == 1000.0
-
     # ---- Mode-2 integration: skip-count promotion ----
 
     @pytest.fixture
@@ -1962,8 +1907,6 @@ class TestFairness:
         """OrchestratorConfig tuned for quick fairness testing."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.skip_threshold = 3
-        config.fairness.lease_min_secs = 60.0
-        config.fairness.lease_max_secs = 600.0
         return config
 
     @staticmethod
@@ -2090,17 +2033,6 @@ class TestFairness:
 
         assert not scheduler.lock_table.has_parks('A')
         assert 'A' not in scheduler._skip_count
-
-    def test_release_records_duration(self, fair_config, monkeypatch):
-        """Scheduler.release() appends (end - start) to the rolling window."""
-        scheduler = Scheduler(fair_config)
-        # Seed as if acquire_next had recorded a start time.
-        scheduler._task_start_times['A'] = 100.0
-        monkeypatch.setattr(time, 'monotonic', lambda: 150.0)
-
-        scheduler.release('A')
-
-        assert list(scheduler._recent_durations) == [50.0]
 
     @pytest.mark.asyncio
     async def test_mode2_broad_task_eventually_wins(self, fair_config):
@@ -2896,79 +2828,6 @@ class TestAgeAnchor:
         assert age == 95
 
 
-class TestTierSlotCaps:
-    """Fix 3: per-tier slot caps reserve headroom for higher-value work."""
-
-    def _config(self, caps: dict[str, float]) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            max_concurrent_tasks=10,
-            max_per_module=1,
-            tier_slot_caps=caps,
-        )
-
-    def test_allowed_by_cap_under_limit(self):
-        s = Scheduler(self._config({'low': 0.5}))
-        # 0 dispatched → low allowed (limit = 5).
-        assert s._allowed_by_tier_cap('low') is True
-
-    def test_blocked_at_limit(self):
-        s = Scheduler(self._config({'low': 0.5}))
-        for i in range(5):  # fill 5 low slots
-            s._dispatched_priority[f't{i}'] = 'low'
-        assert s._allowed_by_tier_cap('low') is False
-        # Higher-priority tier still has room (cap 1.0).
-        assert s._allowed_by_tier_cap('high') is True
-
-    def test_lower_counts_toward_higher_budget(self):
-        """A 'low' slot counts against medium's cap too (at-or-below semantics)."""
-        s = Scheduler(self._config({'medium': 0.3}))  # 3 medium-or-below slots
-        for i in range(3):
-            s._dispatched_priority[f't{i}'] = 'low'
-        # Medium is blocked because low slots exhaust the medium-or-below budget.
-        assert s._allowed_by_tier_cap('medium') is False
-        # Critical/high remain unaffected (cap 1.0).
-        assert s._allowed_by_tier_cap('high') is True
-        assert s._allowed_by_tier_cap('critical') is True
-
-    @pytest.mark.asyncio
-    async def test_cap_emits_idle_event(self):
-        """If all candidates are cap-rejected, emit exactly one idle event."""
-        # Cap medium-or-below at 0 so even one medium candidate is rejected.
-        config = OrchestratorConfig(
-            max_concurrent_tasks=4,
-            max_per_module=1,
-            tier_slot_caps={'medium': 0.0, 'low': 0.0, 'polish': 0.0},
-        )
-        event_store = _RecordingEventStore()
-        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
-        tasks = [_pending_task('1', priority='medium')]
-        scheduler.get_tasks = AsyncMock(return_value=tasks)
-        result = await scheduler.acquire_next()
-        assert result is None
-        idle_events = [e for e in event_store.events
-                       if e[0] == EventType.scheduler_tier_cap_idle.value]
-        assert len(idle_events) == 1
-        assert idle_events[0][1]['data']['candidates_skipped_by_cap'] == 1
-
-    @pytest.mark.asyncio
-    async def test_park_overrides_tier_cap(self):
-        """A parked task dispatches even when its tier cap would reject."""
-        config = OrchestratorConfig(
-            max_concurrent_tasks=4,
-            max_per_module=1,
-            tier_slot_caps={'low': 0.0, 'polish': 0.0},  # 0 low slots
-        )
-        scheduler = Scheduler(config)
-        low_task = _pending_task('1', priority='low')
-        # Install a park for task 1 — this should let it through the cap gate.
-        scheduler.lock_table.install_parks(
-            '1', ['mod1'], deadline=time.monotonic() + 300,
-        )
-        scheduler.get_tasks = AsyncMock(return_value=[low_task])
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == '1'
-
-
 class TestPerTierSkipThreshold:
     """Fix 2: skip_threshold dict unlocks per-tier parking behaviour."""
 
@@ -3037,32 +2896,6 @@ class TestPerTierSkipThreshold:
         assert len(skip_events) == 3
 
 
-class TestLeaseMultiplierPerTier:
-    """Fix 2: lease_multiplier dict unlocks per-tier lease duration."""
-
-    def test_lease_multiplier_for_lookup(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = {
-            'critical': 8.0, 'high': 8.0, 'medium': 5.0,
-            'low': 2.0, 'polish': 2.0,
-        }
-        assert config.fairness.lease_multiplier_for('critical') == 8.0
-        assert config.fairness.lease_multiplier_for('low') == 2.0
-
-    def test_compute_lease_uses_tier_multiplier(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = {
-            'critical': 8.0, 'high': 8.0, 'medium': 5.0,
-            'low': 2.0, 'polish': 2.0,
-        }
-        config.fairness.lease_min_secs = 0.0
-        config.fairness.lease_max_secs = 10_000.0
-        scheduler = Scheduler(config)
-        scheduler._recent_durations.extend([10.0])  # median = 10
-        assert scheduler._compute_lease(tier='critical') == 80.0
-        assert scheduler._compute_lease(tier='low') == 20.0
-
-
 class TestLegacyOrderingPreserved:
     """With 3-tier data + default tier_slot_caps all 1.0 + no CPM + zero age,
     the new scheduler must match the legacy high>medium>low dispatch order.
@@ -3072,7 +2905,6 @@ class TestLegacyOrderingPreserved:
     async def test_legacy_three_tier_ordering_preserved(self):
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
         # Disable caps and fairness carve-outs for this test.
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='low', files=['modA']),
@@ -3087,7 +2919,6 @@ class TestLegacyOrderingPreserved:
     async def test_critical_beats_high(self):
         """New 5-tier: critical outranks high."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='high', files=['modA']),
@@ -3101,7 +2932,6 @@ class TestLegacyOrderingPreserved:
     async def test_polish_loses_to_low(self):
         """New 5-tier: polish ranks below low."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='polish', files=['modA']),
@@ -3115,7 +2945,6 @@ class TestLegacyOrderingPreserved:
     async def test_inheritance_lifts_dependency(self):
         """A medium task with a critical dependent is dispatched first."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         # Task 1 (medium, available) is needed by task 2 (critical, blocked).
         # Inheritance should lift task 1 above task 3 (high, available).
@@ -3147,7 +2976,6 @@ class TestDispatchPriorityBookkeeping:
     async def test_dispatched_priority_tracks_effective_not_own(self):
         """dispatched_priority reflects effective (inherited) priority."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='medium', files=['modA']),
@@ -3550,3 +3378,49 @@ class TestGetStatuses:
         assert not hasattr(sched, '_last_get_statuses_error'), (
             '_last_get_statuses_error attribute must be removed'
         )
+
+
+class TestSchedulerV2Config:
+    """Schema assertions for the v2 scheduler config changes."""
+
+    def test_scheduler_v2_default_false(self):
+        """FairnessConfig.scheduler_v2 defaults to False."""
+        assert FairnessConfig().scheduler_v2 is False
+
+    def test_skip_threshold_is_per_tier_dict(self):
+        """Default skip_threshold is a per-tier dict with the v2 values."""
+        cfg = OrchestratorConfig()
+        assert cfg.fairness.skip_threshold == {
+            'critical': 0,
+            'high': 1,
+            'medium': 2,
+            'low': 4,
+            'polish': 9999,
+        }
+
+    def test_lease_fields_removed_from_fairness_config(self):
+        """lease_min_secs, lease_max_secs, lease_multiplier, lease_multiplier_for,
+        and median_window must no longer exist on FairnessConfig."""
+        fc = FairnessConfig()
+        assert not hasattr(fc, 'lease_min_secs'), 'lease_min_secs must be removed'
+        assert not hasattr(fc, 'lease_max_secs'), 'lease_max_secs must be removed'
+        assert not hasattr(fc, 'lease_multiplier'), 'lease_multiplier must be removed'
+        assert not hasattr(fc, 'lease_multiplier_for'), (
+            'lease_multiplier_for must be removed'
+        )
+        assert not hasattr(fc, 'median_window'), 'median_window must be removed'
+
+    def test_tier_slot_caps_removed_from_orchestrator_config(self):
+        """tier_slot_caps, tier_slot_cap_for, and tier_slot_limit must not exist
+        on OrchestratorConfig."""
+        cfg = OrchestratorConfig()
+        assert not hasattr(cfg, 'tier_slot_caps'), 'tier_slot_caps must be removed'
+        assert not hasattr(cfg, 'tier_slot_cap_for'), (
+            'tier_slot_cap_for must be removed'
+        )
+        assert not hasattr(cfg, 'tier_slot_limit'), 'tier_slot_limit must be removed'
+
+    def test_reservation_evicted_event_type_exists(self):
+        """EventType.reservation_evicted must be defined for cross-tier preemption."""
+        assert hasattr(EventType, 'reservation_evicted')
+        assert EventType.reservation_evicted == 'reservation_evicted'
