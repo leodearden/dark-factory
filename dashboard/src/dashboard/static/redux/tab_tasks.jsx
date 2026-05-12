@@ -220,7 +220,8 @@ function MarkdownText({ text, className, empty }) {
       // registering a global DOMPurify hook. No future DOMPurify caller in the app
       // silently inherits target=_blank, and dev-reload re-evaluation is harmless.
       // <template> is inert (no script execution or resource loading), so walking
-      // already-sanitized HTML is safe.
+      // already-sanitized HTML is safe; tpl.innerHTML re-serializes the post-mutation
+      // DOM (the value React injects), preserving the sanitizer's guarantees.
       const tpl = document.createElement('template');
       tpl.innerHTML = sanitized;
       tpl.content.querySelectorAll('a').forEach(a => {
@@ -228,9 +229,10 @@ function MarkdownText({ text, className, empty }) {
         a.setAttribute('rel', 'noopener noreferrer');
       });
       return tpl.innerHTML;
-    } catch {
+    } catch (err) {
       // On any parse/sanitize error return null; the html===null branch below
       // degrades to plain pre-line text rather than unmounting TaskDetail.
+      console.warn('MarkdownText render failed', err);
       return null;
     }
   }, [text]);
