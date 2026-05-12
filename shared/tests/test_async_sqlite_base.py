@@ -489,6 +489,12 @@ async def _swap_in_failing_close_mock(
     return mock_conn
 
 
+# Sentinel used by _ensure_real_conn_closed_at_exit to distinguish a missing
+# attribute from an attribute that is explicitly None.  A plain None check
+# cannot tell the difference, so we use a unique object as a fallback value.
+_MISSING = object()
+
+
 @contextmanager
 def _ensure_real_conn_closed_at_exit(store: AsyncSqliteBase):
     """Capture the current aiosqlite connection and assert it was closed
@@ -507,6 +513,10 @@ def _ensure_real_conn_closed_at_exit(store: AsyncSqliteBase):
     ``finally`` block, so the check is race-free: closed → None, leaked → set.
     See ``_swap_in_failing_close_mock`` for the safe-swap pattern this guard
     defends.
+
+    If aiosqlite renames ``_connection``, the guard raises ``AssertionError``
+    with a diagnostic message pointing here — so the failure is loud and
+    attributable rather than a silent ``AttributeError`` or degraded check.
     """
     real_conn = store._conn
     assert real_conn is not None, (
@@ -515,7 +525,14 @@ def _ensure_real_conn_closed_at_exit(store: AsyncSqliteBase):
     try:
         yield
     finally:
-        if real_conn._connection is not None:
+        connection_val = getattr(real_conn, '_connection', _MISSING)
+        if connection_val is _MISSING:
+            raise AssertionError(
+                'aiosqlite.Connection no longer exposes ._connection — '
+                '_ensure_real_conn_closed_at_exit must be updated to use '
+                'the new attribute name (aiosqlite API change detected).'
+            )
+        if connection_val is not None:
             raise AssertionError(
                 f'Leaked aiosqlite connection: {real_conn!r}._connection '
                 'is still set when the guard exited. The real connection '
@@ -647,11 +664,12 @@ class TestSwapLeakGuard:
         await store.open()
         real_conn = store._conn  # keep a reference for post-test cleanup
 
-        with pytest.raises(AssertionError, match='not closed'), _ensure_real_conn_closed_at_exit(store):
-            # Buggy swap: replace _conn without closing real_conn first
-            store._conn = AsyncMock()  # type: ignore[assignment]
-            store._conn.close = AsyncMock(side_effect=OSError('boom'))
-            # real_conn is deliberately NOT closed here — guard must fire
+        with pytest.raises(AssertionError, match=r'Leaked aiosqlite connection'):  # noqa: SIM117
+            with _ensure_real_conn_closed_at_exit(store):
+                # Buggy swap: replace _conn without closing real_conn first
+                store._conn = AsyncMock()  # type: ignore[assignment]
+                store._conn.close = AsyncMock(side_effect=OSError('boom'))
+                # real_conn is deliberately NOT closed here — guard must fire
 
         # Clean up the leaked connection so it does not pollute subsequent tests
         await real_conn.close()
