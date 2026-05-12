@@ -187,7 +187,9 @@ class TestDismissStaleEscalationsFatal:
         )
         harness._stop_escalation_server = AsyncMock()
 
-        # run() catches the OSError internally; _populate_tasks (un-mocked) raises RuntimeError
+        # run() catches the OSError in its dismiss-stale-escalations try/except; the
+        # subsequent get_statuses() check finds no pending tasks (fixture seeds {}) and
+        # raises RuntimeError('No pending tasks found...').
         with pytest.raises(RuntimeError):
             await harness.run(prd_path, dry_run=True)
 
