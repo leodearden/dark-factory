@@ -4471,6 +4471,60 @@ class TestSweepStaleFixcMarkers:
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_individual_failure_logs_warning_and_skipped_from_count(self, caplog):
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        # Middle delete raises; first and last succeed
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[None, RuntimeError('boom'), None]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_fixc_markers(
+                memory_service,
+                project_id='reify',
+                stale_ids=['ok-1', 'bad', 'ok-2'],
+                run_id='r-current',
+            )
+
+        # Must not raise; successful deletes counted; failure excluded
+        assert result == 2
+        # Exactly one WARNING for the failing memory_id
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == 1
+        assert 'bad' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_all_failures_returns_zero_and_does_not_raise(self, caplog):
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom1'), RuntimeError('boom2'), RuntimeError('boom3')]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_fixc_markers(
+                memory_service,
+                project_id='reify',
+                stale_ids=['a', 'b', 'c'],
+                run_id='r-current',
+            )
+
+        assert result == 0
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == 3
+
 
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
