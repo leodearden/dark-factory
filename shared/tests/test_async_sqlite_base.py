@@ -462,6 +462,14 @@ class TestAsyncSqliteBaseConcurrentClose:
 # ---------------------------------------------------------------------------
 
 
+# Promotes the PytestUnhandledThreadExceptionWarning emitted by orphaned
+# aiosqlite worker threads into a hard test error.  Without the fix applied
+# in this class, test_close_clears_conn_even_on_exception leaks a worker
+# thread whose GC-triggered call_soon_threadsafe raises 'Event loop is closed'
+# on the already-closed test loop; pytest captures it and re-raises it here in
+# the next test's setup as this warning.  The marker ensures any regression of
+# the "close real conn before swapping mock" pattern is caught immediately.
+@pytest.mark.filterwarnings('error::pytest.PytestUnhandledThreadExceptionWarning')
 @pytest.mark.asyncio
 class TestAsyncSqliteBaseCloseExceptionSafety:
     """Tests that close() clears _conn even when conn.close() raises."""
