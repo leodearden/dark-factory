@@ -403,6 +403,35 @@ async def test_update_task_persists_metadata_on_dotted_subtask_id(backend, proje
     assert parent['subtasks'][0]['metadata'] == {'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}
 
 
+@pytest.mark.asyncio
+async def test_get_tasks_listing_surfaces_subtask_metadata(backend, project_root):
+    """get_tasks listing also surfaces metadata on subtask dicts.
+
+    Locks both the populated-metadata path and the None→{} default so
+    the reconciliation context_assembler (which reads via get_tasks) sees
+    the same metadata as the direct get_task path.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='Sub')
+    await backend.update_task(
+        '1.1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['X']}}),
+        append=False,
+    )
+
+    listing = await backend.get_tasks(project_root=project_root)
+
+    # (a) Populated-metadata path: get_tasks listing carries the persisted value.
+    assert listing['tasks'][0]['subtasks'][0]['metadata'] == {'memory_hints': {'entities': ['X']}}
+
+    # (b) Empty-default path: a freshly added subtask (no update_task) has metadata={}.
+    await backend.add_subtask('1', project_root=project_root, title='Fresh')
+    listing2 = await backend.get_tasks(project_root=project_root)
+    fresh_sub = next(s for s in listing2['tasks'][0]['subtasks'] if s['title'] == 'Fresh')
+    assert 'metadata' in fresh_sub
+    assert fresh_sub['metadata'] == {}
+
+
 # ── remove_tasks with cascade ──────────────────────────────────────
 
 
