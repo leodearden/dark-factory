@@ -883,6 +883,39 @@ class TestReconcileStrandedInProgress:
     # are covered by ``test_already_merged_skipped_when_main_lacks_task_citation``.
 
     # ------------------------------------------------------------------
+    # Guard 3 — branch-advanced check (is_ancestor fast-path)
+    # Guards 1 (open L1) and 2 (citation grep) already passed;
+    # Guard 3 structurally rejects zero-commit branches sitting on main.
+    # ------------------------------------------------------------------
+
+    async def test_already_merged_skipped_when_branch_never_advanced(
+        self, harness: Harness
+    ):
+        """Guard 3: branch tip == branch_base_sha → never advanced; veto flip.
+
+        Guards 1+2 would both pass (no open L1, citation grep hits), but the
+        branch base equals the current tip, proving no commits were ever pushed
+        on this incarnation.  The reconciler must NOT flip to done.
+        """
+        branch_tip = 'deadbeef' + 'a' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)
+        harness.git_ops.find_task_citation_commit = AsyncMock(
+            return_value='cafefeed' + 'b' * 32
+        )
+        # Branch tip equals base → branch never advanced past creation point
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '50', 'metadata': {'branch_base_sha': branch_tip}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'50': 'blocked'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Guard 3 must veto even though Guards 1+2 passed
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
     # find_merge_marker guard tests (deleted-branch fast-path)
     # ------------------------------------------------------------------
 
