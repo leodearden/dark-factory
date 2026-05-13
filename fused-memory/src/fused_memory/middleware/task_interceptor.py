@@ -1755,10 +1755,12 @@ class TaskInterceptor:
         row = await self._ticket_store.get(ticket_id)
         if row is None:
             return {'error': 'not_found', 'ticket_id': ticket_id}
-        # no_op and cancelled branches — to be filled in by subsequent impl steps.
+        if row['status'] != 'pending':
+            return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
+        # cancelled branch — to be filled in by step-6 impl.
         raise NotImplementedError(
-            f'cancel_ticket: branches for non-pending rows not yet implemented '
-            f'(ticket_id={ticket_id!r}, status={row["status"]!r})'
+            f'cancel_ticket: pending-cancel branch not yet implemented '
+            f'(ticket_id={ticket_id!r})'
         )
 
     def _start_worker_if_needed(self, project_id: str) -> None:
