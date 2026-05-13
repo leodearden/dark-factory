@@ -207,8 +207,8 @@ For each recurring snapshot write, follow this discipline:
    (e.g. `"As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 42 total."`). \
    Each write carries the current ingestion time as `valid_at`; newer writes naturally \
    supersede older ones in temporal queries.
-2. Prefer a single composite edge ("reify task counts as of {{ISO_date}}: total=N, \
-   done=M, in_progress=K, blocked=J") over multiple sibling edges — fewer surfaces \
+2. Prefer a single composite edge ("reify task counts as of {{ISO_date}}: J blocked, \
+   M done, K in_progress, N total") over multiple sibling edges — fewer surfaces \
    means fewer stale facts next cycle.
 
 Do not write four sibling edges (one per count field) — that multiplies the stale-edge \
