@@ -106,7 +106,7 @@ class _SchedulerLike(Protocol):
     async def get_status(self, task_id: str, /) -> str | None: ...
     async def get_task(self, task_id: str, /) -> dict | None: ...
     async def update_task(
-        self, task_id: str, metadata: str | dict,
+        self, task_id: str, metadata: str | dict, *, append: bool = ...,
     ) -> bool: ...
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
@@ -474,6 +474,26 @@ class TaskWorkflow:
             stdout, _ = await proc.communicate()
             base_commit = stdout.decode().strip()
         self._base_commit = base_commit
+        # Record branch_base_sha in task metadata immediately after branch
+        # creation so _reconcile_one_stranded (harness.py) can detect
+        # zero-commit branches that sit on a main ancestor (Guard 3 in
+        # the is_ancestor fast-path) and stale merge-markers from prior
+        # incarnations of the same task id (stale-marker check).
+        # Soft-fail: a transient update_task failure degrades gracefully
+        # to citation-grep alone (Guards 1+2) instead of crashing setup.
+        if base_commit:
+            try:
+                await self.scheduler.update_task(
+                    self.task_id,
+                    {'branch_base_sha': base_commit},
+                    append=True,
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: failed to record branch_base_sha=%s; '
+                    'reconciler will fall back to citation-grep guard',
+                    self.task_id, base_commit,
+                )
         # Colocate the per-task Claude config dir inside the worktree so
         # the session JSONL travels with the worktree.  Crash recovery
         # needs both the sidecar and the session file together to resume.
@@ -4143,18 +4163,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
            ``category='bypass_done'``, and return ``WorkflowOutcome.BLOCKED``.
         """
         task = await self.scheduler.get_task(self.task_id)
-        metadata: dict = {}
-        if isinstance(task, dict):
-            raw_meta = task.get('metadata')
-            if isinstance(raw_meta, dict):
-                metadata = raw_meta
-            elif isinstance(raw_meta, str) and raw_meta:
-                try:
-                    parsed = json.loads(raw_meta)
-                except (ValueError, TypeError):
-                    parsed = None
-                if isinstance(parsed, dict):
-                    metadata = parsed
+        # Scheduler.get_task normalises task['metadata'] to a dict at the
+        # boundary (via _normalize_task_metadata) so we can read it directly.
+        metadata: dict = (task.get('metadata') or {}) if isinstance(task, dict) else {}
 
         provenance = metadata.get('done_provenance') if metadata else None
         commit = ''

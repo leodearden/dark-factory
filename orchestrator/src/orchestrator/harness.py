@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
@@ -82,6 +82,47 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _is_valid_sha_40(s: object) -> TypeGuard[str]:
+    """Return True iff *s* is a well-formed 40-char lowercase hex SHA.
+
+    Used to validate ``branch_base_sha`` values read from task metadata
+    before comparing them against live git output.  Any non-conforming
+    value is treated as missing so the reconciler falls through to the
+    existing citation-grep guard rather than making a bogus comparison.
+    """
+    return (
+        isinstance(s, str)
+        and len(s) == 40
+        and all(c in '0123456789abcdef' for c in s)
+    )
+
+
+def _get_task_metadata_dict(task: dict | None) -> dict:
+    """Coerce raw ``task['metadata']`` from ``Scheduler.get_task`` to a dict.
+
+    ``Scheduler.get_task`` now normalises ``task['metadata']`` to a dict at
+    the boundary (via ``_normalize_task_metadata``) — consistent with
+    ``get_tasks`` / ``acquire_next``.  This helper is therefore defensive:
+    it handles the ``task is None`` and ``metadata`` absent/malformed cases
+    that can still occur for callers passing raw task dicts from other sources.
+
+    Returns an empty dict for any missing / malformed / non-dict result
+    so callers can always do ``.get('key')`` without further checks.
+    """
+    if task is None:
+        return {}
+    raw = task.get('metadata')
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
 
 
 def _acquire_project_lock(project_root: Path) -> IO:
@@ -1215,7 +1256,33 @@ Output JSON matching the schema. Every task must appear in the output.
                     self._escalate_reconcile_skip(tid, status, count)
                 return None
 
-            # Both guards passed — clear the skip counter and flip.
+            # Guard 3 — branch-advanced structural check.
+            # Guards 1 (open L1) and 2 (citation grep) are content
+            # heuristics.  This guard is structural: it rejects the
+            # false-positive shape where a zero-commit branch sits on a
+            # main ancestor (is_ancestor returns True trivially) even
+            # though no real implementation work was pushed.  We compare
+            # the live branch tip against the recorded branch_base_sha
+            # written by workflow._setup_worktree_and_artifacts at
+            # branch-creation time.
+            #
+            # Missing / malformed branch_base_sha → fall through (backward
+            # compat for tasks created before this guard was deployed, or
+            # if the metadata write failed transiently at creation time).
+            task = await self.scheduler.get_task(tid)
+            metadata = _get_task_metadata_dict(task)
+            branch_base_sha = metadata.get('branch_base_sha')
+            if _is_valid_sha_40(branch_base_sha):
+                branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+                if branch_tip_sha == branch_base_sha:
+                    logger.info(
+                        'Reconcile: task %s branch tip == branch_base_sha (%s); '
+                        'branch never advanced past creation — vetoing auto-flip',
+                        tid, branch_base_sha,
+                    )
+                    return None
+
+            # All guards passed — clear the skip counter and flip.
             self._reconcile_skip_counts.pop(tid, None)
             note = (
                 f'reconcile: branch on main while task was {status} '
@@ -1232,8 +1299,44 @@ Output JSON matching the schema. Every task must appear in the output.
         # is_ancestor returned False, but the branch may simply not exist
         # any more (cleanup_worktree ran after advance_main but before
         # set_task_status).
+        # Note: find_merge_marker already gates on branch-existence
+        # (git_ops.py:774) — it returns None when the branch ref is still
+        # live.  The stale-marker check below therefore only fires when the
+        # branch is gone and a commit on main mentions the task id in its
+        # merge message.
         marker_sha = await self.git_ops.find_merge_marker(branch)
         if marker_sha:
+            # Stale-marker check — re-opened-branch / prior-incarnation guard.
+            # A task can be re-queued (branch deleted + re-created) after a
+            # prior incarnation was merged.  In that case, the prior merge's
+            # commit lands on main with the same task id, and find_merge_marker
+            # would return its SHA — triggering a spurious done flip for the
+            # current incarnation.
+            #
+            # Reject the marker if it is an ancestor of branch_base_sha (i.e.
+            # it pre-dates the current incarnation's creation point).
+            # `find_merge_marker`'s branch-existence gate handles the orthogonal
+            # case where the branch ref still exists (returns None there);
+            # this check handles the case where the branch is gone but the
+            # stale marker from a *prior* incarnation under the same task id
+            # is already on main.
+            #
+            # Missing/malformed branch_base_sha → fall through (backward compat
+            # for tasks created before this guard was deployed).
+            task = await self.scheduler.get_task(tid)
+            metadata = _get_task_metadata_dict(task)
+            branch_base_sha = metadata.get('branch_base_sha')
+            if _is_valid_sha_40(branch_base_sha) and await self.git_ops.is_ancestor(
+                marker_sha, branch_base_sha
+            ):
+                logger.info(
+                    'Reconcile: task %s stale marker %s is ancestor of '
+                    'branch_base_sha %s — belongs to a prior incarnation; '
+                    'vetoing auto-flip',
+                    tid, marker_sha, branch_base_sha,
+                )
+                return None
+
             note = (
                 f'reconcile: merge marker found on main while task was {status}'
                 if status == 'blocked'

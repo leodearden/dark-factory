@@ -984,7 +984,14 @@ class Scheduler:
                         if isinstance(data.get('data'), dict)
                         else data
                     )
-                    return inner if isinstance(inner, dict) else None
+                    if isinstance(inner, dict):
+                        # Normalise metadata at the boundary so all callers
+                        # receive task['metadata'] as a dict — consistent with
+                        # get_tasks / acquire_next which already do this via
+                        # _normalize_task_metadata.
+                        self._normalize_task_metadata(inner)
+                        return inner
+                    return None
                 return None
         return None
 
@@ -1020,19 +1027,43 @@ class Scheduler:
             return {}, e
         return {}, None
 
-    async def update_task(self, task_id: str, metadata: str | dict) -> bool:
-        """Update task metadata via fused-memory. Returns True on success."""
+    async def update_task(
+        self,
+        task_id: str,
+        metadata: str | dict,
+        *,
+        append: bool = False,
+    ) -> bool:
+        """Update task metadata via fused-memory. Returns True on success.
+
+        Parameters
+        ----------
+        task_id:
+            The task whose metadata should be updated.
+        metadata:
+            New metadata as a dict or pre-serialised JSON string.
+        append:
+            When ``True`` the fused-memory backend uses recursive-merge
+            semantics (``_merge_metadata(append=True)``) so only the supplied
+            keys are touched and the rest of the metadata blob is preserved.
+            When ``False`` (default) the backend replaces the whole blob —
+            existing callers that supply the full metadata dict can leave this
+            at the default without behaviour change.
+        """
         # fused-memory update_task expects metadata as a JSON string
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
+        arguments: dict = {
+            'id': task_id,
+            'metadata': metadata,
+            'project_root': self._project_root,
+        }
+        if append:
+            arguments['append'] = True
         try:
             result = await self.dispatch_tool(
                 'update_task',
-                {
-                    'id': task_id,
-                    'metadata': metadata,
-                    'project_root': self._project_root,
-                },
+                arguments,
                 timeout=15,
             )
             # MCP tool errors return in the response body, not as exceptions
