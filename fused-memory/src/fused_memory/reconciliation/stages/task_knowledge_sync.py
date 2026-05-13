@@ -564,24 +564,34 @@ async def _query_stage2_flags(
 
     Results are partitioned into two groups:
 
-    * **current_flags** — full dict records whose ``metadata.run_id`` matches
-      ``current_run_id`` (after symmetric ``str()`` coercion).  These are
-      rendered to the Stage 2 LLM for FIX-C processing.
+    * **current_flags** — full dict records whose ``metadata.run_id`` is
+      present, non-empty, and matches ``current_run_id`` after ``str()``
+      coercion.  These are rendered to the Stage 2 LLM for FIX-C processing.
     * **stale_marker_ids** — ``id`` strings only for records whose
-      ``metadata.run_id`` is absent or does not match ``current_run_id``.
-      Markers missing ``run_id`` are unconditionally classified as stale
-      (legacy disposition: they pre-date the run_id producer contract and
-      cannot be attributed to any specific run).  The caller is responsible
-      for sweeping these via :func:`_sweep_stale_fixc_markers`.
+      ``metadata.run_id`` is absent, empty, or does not match
+      ``current_run_id``.  Markers missing or with an empty ``run_id`` are
+      unconditionally classified as stale (legacy disposition: they pre-date
+      the run_id producer contract and cannot be attributed to any specific
+      run).  The caller is responsible for sweeping these via
+      :func:`_sweep_stale_fixc_markers`.
+
+    .. note::
+        The partition check requires ``metadata.run_id`` to be **truthy**
+        before comparing — an empty-string ``run_id`` is treated as absent and
+        placed in the stale partition even when ``current_run_id`` is also
+        empty.  This prevents a falsy ``_current_run_id`` from silently
+        classifying all empty-string markers as "current".
 
     .. warning::
         This function uses semantic search with a ``limit=100`` top-N cutoff.
         In a busy Mem0 collection, flags with low embedding similarity to the
-        query can be pushed off the bottom and silently dropped.  FIX D's
-        persistence tracking (``_track_flag_persistence``) uses a deterministic
-        ``count_memories_by_metadata`` call to avoid this problem for staleness
-        detection.  The active-query path here still carries the top-N risk —
-        see follow-up task for a proper ``scroll_by_metadata`` API on Mem0Backend.
+        query can be pushed off the bottom and silently dropped.  When the
+        result count equals the limit a WARNING is logged to surface this
+        condition.  FIX D's persistence tracking (``_track_flag_persistence``)
+        uses a deterministic ``count_memories_by_metadata`` call to avoid this
+        problem for staleness detection.  The active-query path here still
+        carries the top-N risk — see follow-up task for a proper
+        ``scroll_by_metadata`` API on Mem0Backend.
 
     Returns ``([], [])`` on search failure (best-effort; logs WARNING).
     """
@@ -600,6 +610,15 @@ async def _query_stage2_flags(
         )
         return [], []
 
+    if len(results) == 100:
+        logger.warning(
+            'reconciliation._query_stage2_flags: search returned limit=100 '
+            'results — some markers may be beyond the top-N cutoff and will '
+            'not be swept or rendered this cycle.  Follow-up: migrate to '
+            'scroll_by_metadata for GC correctness.',
+            extra={'project_id': project_id},
+        )
+
     current_flags: list[dict] = []
     stale_marker_ids: list[str] = []
     run_id_str = str(current_run_id)
@@ -613,7 +632,9 @@ async def _query_stage2_flags(
             'metadata': meta,
             'task_id': str(meta.get('task_id', '')),
         }
-        if str(meta.get('run_id', '')) == run_id_str:
+        # Require run_id to be truthy before comparing; empty-string run_id is
+        # treated as absent and placed in the stale partition unconditionally.
+        if meta.get('run_id') and str(meta['run_id']) == run_id_str:
             current_flags.append(flag_dict)
         else:
             stale_marker_ids.append(r.id)
