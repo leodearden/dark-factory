@@ -12,6 +12,7 @@ append=True) immediately after self._base_commit is set.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -96,6 +97,97 @@ async def test_setup_worktree_writes_branch_base_sha_external_worktree(tmp_path:
         await wf._setup_worktree_and_artifacts('task/101')
 
     # branch_base_sha must be written with append=True
+    cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
+        '101', {'branch_base_sha': base_sha}, append=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_worktree_external_rev_parse_failure_logs_warning_and_falls_through(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """RED: external-worktree path with non-zero rev-parse exit must warn and fall through.
+
+    The current impl at workflow.py:469-475 ignores proc.returncode — this
+    test is RED until Step 4 adds returncode checking + warning logging.
+
+    After Step 4 the impl emits a WARNING that includes task_id, 'rev-parse',
+    and the captured stderr so operators can diagnose eval-mode misconfiguration.
+    base_commit falls through as '' so the existing `if base_commit:` gate at
+    line 484 skips the update_task write — same degradation as update_task soft-fail.
+    """
+    wf = _make_workflow(project_root=tmp_path)
+    wf.worktree = tmp_path  # trigger external-worktree path
+
+    fake_proc = MagicMock()
+    fake_proc.returncode = 128
+    fake_proc.communicate = AsyncMock(
+        return_value=(b'', b'fatal: not a git repository\n')
+    )
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+         patch('asyncio.create_subprocess_exec', new=AsyncMock(return_value=fake_proc)), \
+         patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
+        await wf._setup_worktree_and_artifacts('task/101')
+
+    # (a) must not raise — fall-through, not crash (no explicit assertion needed)
+    # (b) base_commit falls through as empty string
+    assert wf._base_commit == '', f'expected empty base_commit, got {wf._base_commit!r}'
+    # (c) update_task not called — `if base_commit:` gate skips it when falsy
+    cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
+    # (d) exactly one WARNING about the failure, surfacing task_id, rev-parse, and stderr
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f'expected 1 warning, got {len(warnings)}: {[r.getMessage() for r in warnings]}'
+    msg = warnings[0].getMessage()
+    assert '101' in msg, f'task_id not in warning: {msg!r}'
+    assert 'rev-parse' in msg, f"'rev-parse' not in warning: {msg!r}"
+    assert 'not a git repository' in msg, f'stderr not in warning: {msg!r}'
+
+
+@pytest.mark.asyncio
+async def test_setup_worktree_update_task_soft_fail_logs_and_continues(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """Soft-fail coverage: update_task exception must not propagate; warning must be logged.
+
+    The existing except-branch at workflow.py:491-496 swallows exceptions from
+    scheduler.update_task and logs a warning.  This test pins that behavior so
+    a future refactor cannot silently break the soft-fail contract.
+
+    Assertions:
+      (a) no exception propagates from _setup_worktree_and_artifacts
+      (b) wf._base_commit is set from create_worktree before update_task is called
+      (c) the WARNING log contains task_id, 'branch_base_sha', and 'citation-grep'
+      (d) update_task was awaited exactly once (proving the except branch was entered,
+          not short-circuited by `if base_commit:`)
+    """
+    wf = _make_workflow(project_root=tmp_path)
+    # Leave wf.worktree = None so the create_worktree branch fires
+    base_sha = 'c' * 40
+
+    wf.git_ops.create_worktree = AsyncMock(
+        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha, stale_commits=0)
+    )
+    wf._sync_worktree_venvs = AsyncMock()
+    wf.scheduler.update_task = AsyncMock(side_effect=Exception('mcp down'))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+         patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
+        await wf._setup_worktree_and_artifacts('task/101')
+
+    # (a) no exception propagated (test would have failed above if it raised)
+    # (b) _base_commit set from WorktreeInfo before update_task attempted
+    assert wf._base_commit == base_sha, (
+        f'expected _base_commit={base_sha!r}, got {wf._base_commit!r}'
+    )
+    # (c) one WARNING containing task_id, branch_base_sha keyword, and citation-grep
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f'expected 1 warning, got {len(warnings)}: {[r.getMessage() for r in warnings]}'
+    msg = warnings[0].getMessage()
+    assert '101' in msg, f'task_id not in warning: {msg!r}'
+    assert 'branch_base_sha' in msg, f"'branch_base_sha' not in warning: {msg!r}"
+    assert 'citation-grep' in msg, f"'citation-grep' not in warning: {msg!r}"
+    # (d) update_task was called (proving the except branch fired, not `if base_commit:` skip)
     cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
         '101', {'branch_base_sha': base_sha}, append=True
     )
