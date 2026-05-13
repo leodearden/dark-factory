@@ -480,3 +480,110 @@ class TestComputeOverlapMs:
         c2_end = now - timedelta(minutes=30)  # 30 min
         expected = self._sec(3600)  # 30 + 30 min
         assert compute_overlap_ms(start, end, [(c1_start, c1_end), (c2_start, c2_end)]) == expected
+
+
+# ---------------------------------------------------------------------------
+# Step-7 tests: bucketise_cap_sparkline
+# ---------------------------------------------------------------------------
+
+from dashboard.data.cap_history import bucketise_cap_sparkline  # noqa: E402
+
+
+class TestBucketiseCapSparkline:
+    def test_shape_default_params(self):
+        """labels and values have length == window_hours*3600//bucket_seconds."""
+        now = datetime.now(UTC)
+        result = bucketise_cap_sparkline([], window_hours=24, bucket_seconds=600, now=now)
+        expected_buckets = (24 * 3600) // 600  # 144
+        assert len(result['labels']) == expected_buckets
+        assert len(result['values']) == expected_buckets
+
+    def test_all_zeros_when_empty_capped(self):
+        """Empty capped list → all values zero."""
+        now = datetime.now(UTC)
+        result = bucketise_cap_sparkline([], window_hours=2, bucket_seconds=600, now=now)
+        assert all(v == 0 for v in result['values'])
+
+    def test_all_values_are_zero_or_one(self):
+        """All values are in {0, 1}."""
+        now = datetime.now(UTC)
+        capped = [(now - timedelta(hours=1), now - timedelta(minutes=30))]
+        result = bucketise_cap_sparkline(capped, window_hours=4, bucket_seconds=600, now=now)
+        assert all(v in (0, 1) for v in result['values'])
+
+    def test_labels_are_iso_parseable_utc(self):
+        """All labels can be parsed as UTC datetimes."""
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        result = bucketise_cap_sparkline([], window_hours=1, bucket_seconds=600, now=now)
+        for label in result['labels']:
+            dt = datetime.fromisoformat(label)
+            assert dt.tzinfo is not None
+
+    def test_last_label_equals_now(self):
+        """The last label is exactly `now` (right-edge of last bucket)."""
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        result = bucketise_cap_sparkline([], window_hours=2, bucket_seconds=600, now=now)
+        last_label_dt = datetime.fromisoformat(result['labels'][-1])
+        assert abs((last_label_dt - now).total_seconds()) < 1
+
+    def test_labels_monotonically_increasing_by_bucket_seconds(self):
+        """Consecutive labels differ by exactly bucket_seconds."""
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        bucket_seconds = 600
+        result = bucketise_cap_sparkline([], window_hours=2, bucket_seconds=bucket_seconds, now=now)
+        labels = [datetime.fromisoformat(lb) for lb in result['labels']]
+        for i in range(1, len(labels)):
+            diff = (labels[i] - labels[i - 1]).total_seconds()
+            assert abs(diff - bucket_seconds) < 0.001
+
+    def test_capped_window_marks_correct_buckets(self):
+        """Buckets whose right edge falls inside [now-1h, now-30min] → 1."""
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        c_start = now - timedelta(hours=1)
+        c_end = now - timedelta(minutes=30)
+        # 24h window, 10-min buckets. Buckets with right edge in [c_start, c_end]
+        # are those at offsets: -60, -50, -40, -30 min from now.
+        result = bucketise_cap_sparkline(
+            [(c_start, c_end)],
+            window_hours=24,
+            bucket_seconds=600,
+            now=now,
+        )
+        labels = [datetime.fromisoformat(lb) for lb in result['labels']]
+        values = result['values']
+        for label, value in zip(labels, values):
+            if c_start <= label <= c_end:
+                assert value == 1, f"Expected 1 at {label}"
+            else:
+                assert value == 0, f"Expected 0 at {label}"
+
+    def test_open_ended_cap_marks_all_buckets_after_start(self):
+        """Open-ended cap starting 2h ago → all buckets from 2h onwards are 1."""
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        c_start = now - timedelta(hours=2)
+        result = bucketise_cap_sparkline(
+            [(c_start, None)],
+            window_hours=4,
+            bucket_seconds=600,
+            now=now,
+        )
+        labels = [datetime.fromisoformat(lb) for lb in result['labels']]
+        values = result['values']
+        for label, value in zip(labels, values):
+            if label >= c_start:
+                assert value == 1, f"Expected 1 at {label} (open-ended)"
+            # (buckets before c_start should be 0 — but c_start might align
+            # with a bucket edge so we only assert the ≥ direction)
+
+    def test_cap_entirely_outside_window_all_zero(self):
+        """Cap interval entirely before the window → all zero."""
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        c_start = now - timedelta(hours=30)
+        c_end = now - timedelta(hours=25)
+        result = bucketise_cap_sparkline(
+            [(c_start, c_end)],
+            window_hours=24,
+            bucket_seconds=600,
+            now=now,
+        )
+        assert all(v == 0 for v in result['values'])
