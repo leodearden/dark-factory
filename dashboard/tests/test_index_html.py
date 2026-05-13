@@ -114,3 +114,48 @@ def test_cdn_script_has_sri_integrity(
         f'{lib_name} CDN tag integrity= is not a valid SRI hash '
         f'(expected sha256/384/512-<base64>): {integrity!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-1: Unit test for _find_script_position (helper-level, synthetic HTML)
+# ---------------------------------------------------------------------------
+
+_MARKED_TAG = '<script src="https://unpkg.com/marked@x/y.js"></script>'
+_TAB_TASKS_TAG = '<script src="/static/redux/tab_tasks.jsx?v=9"></script>'
+
+_FIND_SCRIPT_POSITION_CASES = [
+    # (a) marked-then-tab_tasks: correct load order
+    (_MARKED_TAG + _TAB_TASKS_TAG, 'https://unpkg.com/marked@', 0),
+    (_MARKED_TAG + _TAB_TASKS_TAG, '/static/redux/tab_tasks.jsx', 1),
+    # (b) tab_tasks-then-marked: reversed order (regression scenario)
+    (_TAB_TASKS_TAG + _MARKED_TAG, 'https://unpkg.com/marked@', 1),
+    (_TAB_TASKS_TAG + _MARKED_TAG, '/static/redux/tab_tasks.jsx', 0),
+    # (c) missing tag returns None
+    (_TAB_TASKS_TAG, 'https://unpkg.com/marked@', None),
+]
+
+
+@pytest.mark.parametrize(
+    'body, src_prefix, expected_position',
+    _FIND_SCRIPT_POSITION_CASES,
+    ids=[
+        'marked-first-marked-pos',
+        'marked-first-tab_tasks-pos',
+        'reversed-marked-pos',
+        'reversed-tab_tasks-pos',
+        'missing-tag-returns-none',
+    ],
+)
+def test_find_script_position_returns_document_order(
+    body: str, src_prefix: str, expected_position: int | None
+) -> None:
+    """_find_script_position returns the 0-indexed document position of the
+    first <script> tag whose src starts with src_prefix, or None if absent.
+
+    Exercises synthetic HTML so that a future bad ordering of the real
+    index.html would actually be caught (i.e. proves the helper distinguishes
+    good-order from bad-order).
+
+    RED until _find_script_position is implemented (Step 2).
+    """
+    assert _find_script_position(body, src_prefix) == expected_position
