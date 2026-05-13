@@ -4996,12 +4996,15 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
     def watermark(self):
         return Watermark(project_id='reify')
 
-    def _make_flag(self, flag_id, content, task_id):
+    def _make_flag(self, flag_id, content, task_id, run_id=None):
         from types import SimpleNamespace
+        meta: dict = {'flag_for_stage2': True, 'task_id': task_id}
+        if run_id is not None:
+            meta['run_id'] = run_id
         return SimpleNamespace(
             id=flag_id,
             content=content,
-            metadata={'flag_for_stage2': True, 'task_id': task_id},
+            metadata=meta,
         )
 
     @pytest.mark.asyncio
@@ -5011,8 +5014,8 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage.project_root = '/home/leo/src/reify'
         stage._current_run_id = 'test-run'
         mock_deps['memory_service'].search.return_value = [
-            self._make_flag('mem-742', 'legitimate finding for task 742', '742'),
-            self._make_flag('mem-1139', 'some flag for task 1139', '1139'),
+            self._make_flag('mem-742', 'legitimate finding for task 742', '742', run_id='test-run'),
+            self._make_flag('mem-1139', 'some flag for task 1139', '1139', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -5113,12 +5116,15 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
     def watermark(self):
         return Watermark(project_id='reify')
 
-    def _make_active_flag(self, flag_id, task_id='742'):
+    def _make_active_flag(self, flag_id, task_id='742', run_id=None):
         from types import SimpleNamespace
+        meta: dict = {'flag_for_stage2': True, 'task_id': task_id}
+        if run_id is not None:
+            meta['run_id'] = run_id
         return SimpleNamespace(
             id=flag_id,
             content=f'active flag content for {flag_id}',
-            metadata={'flag_for_stage2': True, 'task_id': task_id},
+            metadata=meta,
         )
 
     def _setup_persistence_count(self, mock_deps, *, prior_count: int, escalated_count: int = 0):
@@ -5150,7 +5156,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
         # search returns active flags; count returns 2 prior persistence markers.
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
@@ -5171,7 +5177,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
@@ -5196,7 +5202,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-B')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-B', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=0, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
@@ -5219,7 +5225,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-C')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-C', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         # No prior_reports → prior_reports=[] (no Stage 1 report)
@@ -5244,7 +5250,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='test-run')]
         # Persistence count >= threshold AND an escalation marker already exists.
         self._setup_persistence_count(mock_deps, prior_count=5, escalated_count=1)
 
@@ -5272,7 +5278,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': ['m1']}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='run-marker-test')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         await stage.assemble_payload([], watermark, [])
