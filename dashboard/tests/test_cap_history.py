@@ -256,3 +256,139 @@ class TestReadCapIntervals:
         """A None entry in dbs is skipped without raising."""
         result = await read_cap_intervals([None, cap_conn, None], days=7)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Step-3 tests: merge_all_accounts_capped
+# ---------------------------------------------------------------------------
+
+from dashboard.data.cap_history import merge_all_accounts_capped  # noqa: E402
+
+
+def _iv(account: str, start: datetime, end: datetime | None) -> CapInterval:
+    return CapInterval(account_name=account, start=start, end=end)
+
+
+class TestMergeAllAccountsCapped:
+    def test_empty_intervals_non_empty_accounts(self):
+        """Empty intervals with non-empty account_names → []."""
+        now = datetime.now(UTC)
+        result = merge_all_accounts_capped([], ['alpha', 'beta'])
+        assert result == []
+
+    def test_single_account_single_closed_interval(self):
+        """Single account, single closed interval → [(T1, T2)]."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        t2 = now - timedelta(hours=1)
+        intervals = [_iv('alpha', t1, t2)]
+        result = merge_all_accounts_capped(intervals, ['alpha'])
+        assert len(result) == 1
+        assert abs((result[0][0] - t1).total_seconds()) < 1
+        assert result[0][1] is not None
+        assert abs((result[0][1] - t2).total_seconds()) < 1
+
+    def test_two_accounts_full_overlap(self):
+        """Both accounts capped over [T1, T2] → [(T1, T2)]."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        t2 = now - timedelta(hours=1)
+        intervals = [
+            _iv('alpha', t1, t2),
+            _iv('beta', t1, t2),
+        ]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert len(result) == 1
+        assert abs((result[0][0] - t1).total_seconds()) < 1
+        assert result[0][1] is not None
+        assert abs((result[0][1] - t2).total_seconds()) < 1
+
+    def test_two_accounts_partial_overlap(self):
+        """A: T1..T3, B: T2..T4 → [(T2, T3)]."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=4)
+        t2 = now - timedelta(hours=3)
+        t3 = now - timedelta(hours=2)
+        t4 = now - timedelta(hours=1)
+        intervals = [
+            _iv('alpha', t1, t3),
+            _iv('beta', t2, t4),
+        ]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert len(result) == 1
+        assert abs((result[0][0] - t2).total_seconds()) < 1
+        assert result[0][1] is not None
+        assert abs((result[0][1] - t3).total_seconds()) < 1
+
+    def test_two_accounts_no_overlap(self):
+        """A: T1..T2, B: T3..T4 (non-overlapping) → []."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=4)
+        t2 = now - timedelta(hours=3)
+        t3 = now - timedelta(hours=2)
+        t4 = now - timedelta(hours=1)
+        intervals = [
+            _iv('alpha', t1, t2),
+            _iv('beta', t3, t4),
+        ]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert result == []
+
+    def test_one_open_ended_other_closed(self):
+        """A open-ended from T1, B closed T1..T3 → [(T1, T3)]."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t3 = now - timedelta(hours=1)
+        intervals = [
+            _iv('alpha', t1, None),  # open-ended
+            _iv('beta', t1, t3),
+        ]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert len(result) == 1
+        assert abs((result[0][0] - t1).total_seconds()) < 1
+        assert result[0][1] is not None
+        assert abs((result[0][1] - t3).total_seconds()) < 1
+
+    def test_both_accounts_open_ended(self):
+        """Both accounts open-ended from T1 → [(T1, None)]."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        intervals = [
+            _iv('alpha', t1, None),
+            _iv('beta', t1, None),
+        ]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert len(result) == 1
+        assert abs((result[0][0] - t1).total_seconds()) < 1
+        assert result[0][1] is None
+
+    def test_account_with_zero_intervals_short_circuits(self):
+        """account_names includes an account with zero intervals → []."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        t2 = now - timedelta(hours=1)
+        # Only alpha has intervals; beta has none
+        intervals = [_iv('alpha', t1, t2)]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert result == []
+
+    def test_three_accounts_partial_chain(self):
+        """Three accounts; only segment where all three overlap is returned."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=5)
+        t2 = now - timedelta(hours=4)
+        t3 = now - timedelta(hours=3)
+        t4 = now - timedelta(hours=2)
+        t5 = now - timedelta(hours=1)
+        # alpha: T1..T5, beta: T2..T5, gamma: T3..T4
+        # All three capped: T3..T4
+        intervals = [
+            _iv('alpha', t1, t5),
+            _iv('beta', t2, t5),
+            _iv('gamma', t3, t4),
+        ]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta', 'gamma'])
+        assert len(result) == 1
+        assert abs((result[0][0] - t3).total_seconds()) < 1
+        assert result[0][1] is not None
+        assert abs((result[0][1] - t4).total_seconds()) < 1
