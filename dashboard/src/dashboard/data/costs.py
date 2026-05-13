@@ -5,6 +5,11 @@ written by CostStore) to produce per-project and per-account cost statistics.
 
 When multiple project roots are configured, the ``aggregate_*`` functions
 query each project's runs.db in parallel and merge the results.
+
+Cross-reference: :mod:`dashboard.data.cap_history` provides the canonical
+``cap_hit``/``resumed``-pair reader for new callers (e.g. Curator tab).
+``get_cost_by_account`` retains its own CTE to avoid an extra DB round-trip
+and to fold ``auth_failed``/``auth_resumed`` tracking into a single query.
 """
 
 from __future__ import annotations
@@ -207,6 +212,13 @@ async def get_cost_by_account(
 
         # Per-account unavailability / recovery timestamps plus the latest
         # cap_hit and auth_failed details payloads (for resets_at extraction).
+        #
+        # NOTE: This CTE reads the same cap_hit/resumed rows that
+        # `cap_history.read_cap_intervals` surfaces. Curator-tab callers and
+        # any new consumer should prefer `read_cap_intervals` (the canonical
+        # shared reader). This CTE is kept here because it folds
+        # auth_failed/auth_resumed/resets_at into a single I/O — splitting it
+        # would double per-DB round-trips and risk subtle ordering differences.
         #
         # latest_cap / latest_auth_fail pick the newest cap_hit / auth_failed
         # row per account and carry the `details` field forward. The outer

@@ -2161,3 +2161,74 @@ class TestAggregateCostTrend:
         # Each project should have 7 days of data (gap-filled)
         assert len(result['dark_factory']) == 7
         assert len(result['reify']) == 7
+
+
+# ---------------------------------------------------------------------------
+# Contract-pin: costs API shape regression
+# ---------------------------------------------------------------------------
+
+class TestCostsAPIShapeRegression:
+    """Pin the public-surface key sets of get_cost_by_account and get_cost_summary.
+
+    These tests pass GREEN against unmodified costs.py and act as a loud gate:
+    if step-10's refactor accidentally drops or renames a field, exactly one of
+    these assertions will fail with a clear frozenset diff.
+    """
+
+    # Expected key sets — update only when the documented API changes intentionally.
+    _ACCOUNT_KEYS = frozenset({
+        'spend',
+        'invocations',
+        'cap_events',
+        'last_cap',
+        'last_resumed',
+        'last_auth_fail',
+        'last_auth_resumed',
+        'cap_resets_at',
+        'auth_resets_at',
+        'status',
+        'resets_at',
+    })
+    _PROJECT_KEYS = frozenset({
+        'total_spend',
+        'task_count',
+        'avg_cost_per_task',
+        'active_accounts',
+        'cap_events',
+        'tokens',
+        'run_costs',
+    })
+    _TOKEN_KEYS = frozenset({'input', 'output', 'cache_read', 'cache_create', 'total'})
+
+    @pytest.mark.asyncio
+    async def test_get_cost_by_account_keys_stable(self, costs_conn):
+        """Each account dict must have EXACTLY the documented key set."""
+        result = await get_cost_by_account(costs_conn)
+        assert result, "Expected non-empty result from populated costs_db"
+        for account_name, info in result.items():
+            actual = frozenset(info.keys())
+            assert actual == self._ACCOUNT_KEYS, (
+                f"get_cost_by_account[{account_name!r}] key mismatch: "
+                f"extra={actual - self._ACCOUNT_KEYS}, "
+                f"missing={self._ACCOUNT_KEYS - actual}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_cost_summary_keys_stable(self, costs_conn):
+        """Each project dict must have EXACTLY the documented key set,
+        and 'tokens' must have the documented sub-key set."""
+        result = await get_cost_summary(costs_conn)
+        assert result, "Expected non-empty result from populated costs_db"
+        for project_id, info in result.items():
+            actual = frozenset(info.keys())
+            assert actual == self._PROJECT_KEYS, (
+                f"get_cost_summary[{project_id!r}] key mismatch: "
+                f"extra={actual - self._PROJECT_KEYS}, "
+                f"missing={self._PROJECT_KEYS - actual}"
+            )
+            actual_tokens = frozenset(info['tokens'].keys())
+            assert actual_tokens == self._TOKEN_KEYS, (
+                f"get_cost_summary[{project_id!r}]['tokens'] key mismatch: "
+                f"extra={actual_tokens - self._TOKEN_KEYS}, "
+                f"missing={self._TOKEN_KEYS - actual_tokens}"
+            )
