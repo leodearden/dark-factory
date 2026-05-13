@@ -8,25 +8,59 @@ Guards against:
 
 from __future__ import annotations
 
+import html.parser
 import re
+
+import pytest
 
 _INDEX_URL = '/static/redux/index.html'
 
-_SCRIPT_TAG_RE = re.compile(r'<script\b[^>]*>', re.IGNORECASE)
-_SRC_ATTR_RE = re.compile(r'\bsrc="([^"]+)"', re.IGNORECASE)
-_INTEGRITY_ATTR_RE = re.compile(r'\bintegrity="([^"]*)"', re.IGNORECASE)
+# Matches well-formed SRI hashes: sha256/384/512 followed by a base64 payload.
+_SRI_HASH_RE = re.compile(r'^sha(256|384|512)-[A-Za-z0-9+/=]{20,}$')
 
 
-def _find_script_tag_with_src_prefix(body: str, src_prefix: str) -> str | None:
-    """Return the full opening ``<script ... >`` tag whose ``src`` starts with
-    ``src_prefix``, or ``None`` if no such tag exists.  Attribute order inside
-    the tag does not matter."""
-    for tag_match in _SCRIPT_TAG_RE.finditer(body):
-        tag = tag_match.group(0)
-        src_match = _SRC_ATTR_RE.search(tag)
-        if src_match and src_match.group(1).startswith(src_prefix):
-            return tag
+class _ScriptTagCollector(html.parser.HTMLParser):
+    """Collects the attribute dicts for every <script> start-tag encountered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.script_attrs: list[dict[str, str | None]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag == 'script':
+            self.script_attrs.append(dict(attrs))
+
+
+def _find_cdn_script_attrs(
+    body: str, src_prefix: str
+) -> dict[str, str | None] | None:
+    """Return the attribute dict for the first <script> whose ``src`` starts
+    with ``src_prefix``, or ``None`` if no such tag exists.
+
+    Uses ``html.parser.HTMLParser`` so attribute values containing ``>`` (e.g.
+    inline JSON configs) are handled correctly — the regex ``[^>]*`` shortcut
+    would truncate such tags and could miss attributes appearing after the ``>``.
+    """
+    collector = _ScriptTagCollector()
+    collector.feed(body)
+    for attrs in collector.script_attrs:
+        src = attrs.get('src') or ''
+        if src.startswith(src_prefix):
+            return attrs
     return None
+
+
+@pytest.fixture(scope='module')
+def index_html_body():
+    """Fetch /static/redux/index.html once for the whole test module."""
+    from starlette.testclient import TestClient
+
+    from dashboard.app import app
+
+    with TestClient(app) as c:
+        return c.get(_INDEX_URL).text
 
 
 def test_static_index_html_serves_200(client):
@@ -37,32 +71,46 @@ def test_static_index_html_serves_200(client):
     )
 
 
-def test_marked_cdn_script_has_sri_integrity(client):
-    """The marked CDN <script> tag is present with a non-empty SRI integrity hash."""
-    body = client.get(_INDEX_URL).text
-    tag = _find_script_tag_with_src_prefix(body, 'https://unpkg.com/marked@')
-    assert tag is not None, (
-        'No <script src="https://unpkg.com/marked@..."> tag found in index.html. '
+_CDN_SCRIPT_CASES = [
+    (
+        'https://unpkg.com/marked@',
+        'marked',
         'MarkdownText (tab_tasks.jsx) depends on the global `marked` symbol — '
-        'removing this tag breaks markdown rendering in Task Detail.'
-    )
-    integrity_match = _INTEGRITY_ATTR_RE.search(tag)
-    assert integrity_match is not None and integrity_match.group(1).strip(), (
-        f'marked CDN tag is missing or has empty integrity= attribute: {tag!r}'
-    )
-
-
-def test_dompurify_cdn_script_has_sri_integrity(client):
-    """The DOMPurify CDN <script> tag is present with a non-empty SRI integrity hash."""
-    body = client.get(_INDEX_URL).text
-    tag = _find_script_tag_with_src_prefix(body, 'https://unpkg.com/dompurify@')
-    assert tag is not None, (
-        'No <script src="https://unpkg.com/dompurify@..."> tag found in index.html. '
+        'removing this tag breaks markdown rendering in Task Detail.',
+    ),
+    (
+        'https://unpkg.com/dompurify@',
+        'DOMPurify',
         'MarkdownText (tab_tasks.jsx) depends on the global `DOMPurify` symbol — '
-        'removing this tag means rendered markdown bypasses sanitisation.'
-    )
-    integrity_match = _INTEGRITY_ATTR_RE.search(tag)
-    assert integrity_match is not None and integrity_match.group(1).strip(), (
-        f'dompurify CDN tag is missing or has empty integrity= attribute: {tag!r}'
-    )
+        'removing this tag means rendered markdown bypasses sanitisation.',
+    ),
+]
 
+
+@pytest.mark.parametrize(
+    'src_prefix, lib_name, consumer_note',
+    _CDN_SCRIPT_CASES,
+    ids=['marked', 'dompurify'],
+)
+def test_cdn_script_has_sri_integrity(
+    index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
+) -> None:
+    """Each CDN <script> tag is present with a well-formed SRI integrity hash.
+
+    Parametrised over marked and DOMPurify — both are required by the
+    MarkdownText component in tab_tasks.jsx.
+    """
+    attrs = _find_cdn_script_attrs(index_html_body, src_prefix)
+    assert attrs is not None, (
+        f'No <script src="{src_prefix}..."> tag found in index.html. '
+        f'{consumer_note}'
+    )
+    integrity = (attrs.get('integrity') or '').strip()
+    assert integrity, (
+        f'{lib_name} CDN tag has missing or empty integrity= attribute. '
+        f'src={attrs.get("src")!r}'
+    )
+    assert _SRI_HASH_RE.match(integrity), (
+        f'{lib_name} CDN tag integrity= is not a valid SRI hash '
+        f'(expected sha256/384/512-<base64>): {integrity!r}'
+    )
