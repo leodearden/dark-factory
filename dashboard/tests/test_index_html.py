@@ -170,42 +170,28 @@ def test_find_script_position_returns_document_order(
 _TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
 
 
-@pytest.mark.parametrize(
-    'src_prefix, lib_name, consumer_note',
-    _CDN_SCRIPT_CASES,
-    ids=['marked', 'dompurify'],
-)
-def test_cdn_script_loads_before_tab_tasks_jsx(
-    index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
+def _assert_cdn_loads_before_tab_tasks(
+    body: str,
+    cdn_src_prefix: str,
+    tab_tasks_src_prefix: str,
+    lib_name: str,
+    consumer_note: str = '',
 ) -> None:
-    """CDN scripts for marked/DOMPurify must appear BEFORE tab_tasks.jsx.
-
-    Regression guard: moving either CDN tag *after* tab_tasks.jsx means
-    MarkdownText's first render runs while ``marked`` / ``DOMPurify`` are still
-    undefined, so it falls back to null — the dashboard still loads, so the
-    regression can ship unnoticed (same silent-failure class the smoke test was
-    added to catch).
-
-    Naturally GREEN against the current correctly-ordered index.html; will fire
-    loudly if a future edit moves either CDN tag below the tab_tasks.jsx tag.
-
-    This test checks document order, which correctly predicts execution order
-    only when both scripts are classic synchronous scripts (no defer, async, or
-    type="module"). The test body asserts that assumption explicitly so that a
-    future edit adding those attributes fails loudly rather than silently passing
-    a check that no longer reflects execution order.
+    """Assert that the CDN script for ``cdn_src_prefix`` loads BEFORE the
+    tab_tasks.jsx script in ``body``.  Combines a defer/async/type=module
+    false-pass guard with the document-order position comparison.
     """
-    cdn_result = _find_script_position(index_html_body, src_prefix)
+    cdn_result = _find_script_position(body, cdn_src_prefix)
     assert cdn_result is not None, (
-        f'No <script src="{src_prefix}..."> tag found in index.html. '
+        f'No <script src="{cdn_src_prefix}..."> tag found in index.html. '
         f'{consumer_note}'
     )
     cdn_pos, cdn_attrs = cdn_result
     cdn_src = cdn_attrs.get('src')
 
-    tab_tasks_result = _find_script_position(index_html_body, _TAB_TASKS_PREFIX)
+    tab_tasks_result = _find_script_position(body, tab_tasks_src_prefix)
     assert tab_tasks_result is not None, (
-        f'<script src="{_TAB_TASKS_PREFIX}..."> not found in index.html — '
+        f'<script src="{tab_tasks_src_prefix}..."> not found in index.html — '
         f'cannot verify load-order invariant for {lib_name}.'
     )
     tab_tasks_pos, tab_tasks_attrs = tab_tasks_result
@@ -235,6 +221,40 @@ def test_cdn_script_loads_before_tab_tasks_jsx(
         f'If it loads after, MarkdownText renders before {lib_name} is defined '
         f'and falls back to null on first render — the silent-failure class the '
         f'smoke test was added to catch.'
+    )
+
+
+@pytest.mark.parametrize(
+    'src_prefix, lib_name, consumer_note',
+    _CDN_SCRIPT_CASES,
+    ids=['marked', 'dompurify'],
+)
+def test_cdn_script_loads_before_tab_tasks_jsx(
+    index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
+) -> None:
+    """CDN scripts for marked/DOMPurify must appear BEFORE tab_tasks.jsx.
+
+    Regression guard: moving either CDN tag *after* tab_tasks.jsx means
+    MarkdownText's first render runs while ``marked`` / ``DOMPurify`` are still
+    undefined, so it falls back to null — the dashboard still loads, so the
+    regression can ship unnoticed (same silent-failure class the smoke test was
+    added to catch).
+
+    Naturally GREEN against the current correctly-ordered index.html; will fire
+    loudly if a future edit moves either CDN tag below the tab_tasks.jsx tag.
+
+    This test checks document order, which correctly predicts execution order
+    only when both scripts are classic synchronous scripts (no defer, async, or
+    type="module"). The test body asserts that assumption explicitly so that a
+    future edit adding those attributes fails loudly rather than silently passing
+    a check that no longer reflects execution order.
+    """
+    _assert_cdn_loads_before_tab_tasks(
+        index_html_body,
+        src_prefix,
+        _TAB_TASKS_PREFIX,
+        lib_name=lib_name,
+        consumer_note=consumer_note,
     )
 
 
