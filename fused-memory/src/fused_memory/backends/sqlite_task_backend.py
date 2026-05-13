@@ -46,13 +46,18 @@ _TOP_LEVEL_SENTINEL = 0
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
 # DB with many corrupted rows would otherwise flood the log with duplicate
-# WARNINGs on every read.  Keyed by ``(tag, parent_id, id)`` because top-level
-# row ``(0, 1)`` and subtask ``(1, 1)`` share a short int id but must dedup
-# independently — operators repairing a botched migration need to see both.
-# Growth is bounded by the number of distinct (tag, parent_id, id) triples
-# across all project DBs opened in this process — a small, row-count-capped set
-# in practice.  No eviction is needed; a process restart re-emits.
-_warned_malformed_task_ids: set[tuple[str, int, int]] = set()
+# WARNINGs on every read.  Keyed by ``(project_root, tag, parent_id, id)``
+# because a single SqliteTaskBackend instance services all project_roots (its
+# class docstring and ``self._connections`` cache both use project_root as the
+# per-DB key), and the default first task in every project is ``(master, 0, 1)``
+# — without project_root in the key, a second project DB with the same corrupted
+# row silently swallows its WARN.  Top-level row ``(0, 1)`` and subtask ``(1, 1)``
+# within the same project still dedup independently via parent_id.
+# Growth is bounded by the number of distinct (project_root, tag, parent_id, id)
+# quadruples across all project DBs opened in this process — a small,
+# row-count-capped set in practice.  No eviction is needed; a process restart
+# re-emits.
+_warned_malformed_task_ids: set[tuple[str, str, int, int]] = set()
 
 
 _SCHEMA_SQL = """
@@ -127,7 +132,7 @@ def _format_task_id(task_id: int, parent_id: int | None) -> str:
     return f'{parent_id}.{task_id}' if parent_id is not None else str(task_id)
 
 
-def _row_to_task(row: aiosqlite.Row, dependencies: list[int]) -> dict[str, Any]:
+def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
     Top-level tasks emit string ``id`` ("292") and an empty ``subtasks``
@@ -146,14 +151,17 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int]) -> dict[str, Any]:
         except (TypeError, ValueError):
             # Malformed legacy row: discard and surface {} so downstream
             # `(task.get('metadata') or {}).get(...)` callers never see a str.
-            # WARN once per (tag, parent_id, id) per process so a corrupted-row
-            # batch doesn't fan out to one log line per row per get_tasks call.
-            dedup_key = (row['tag'], row['parent_id'], row['id'])
+            # WARN once per (project_root, tag, parent_id, id) per process so a
+            # corrupted-row batch doesn't fan out to one log line per row per
+            # get_tasks call.  project_root is the leading key element so that
+            # two project DBs sharing (master, 0, 1) each produce their own WARN.
+            dedup_key = (project_root, row['tag'], row['parent_id'], row['id'])
             if dedup_key not in _warned_malformed_task_ids:
                 _warned_malformed_task_ids.add(dedup_key)
                 logger.warning(
-                    'sqlite_task_backend: malformed metadata JSON — tag=%s id=%s parent_id=%s'
-                    ' metadata_raw=%s; coerced to {}',
+                    'sqlite_task_backend: malformed metadata JSON — project_root=%s'
+                    ' tag=%s id=%s parent_id=%s metadata_raw=%s; coerced to {}',
+                    project_root,
                     row['tag'],
                     row['id'],
                     row['parent_id'],
@@ -382,7 +390,7 @@ class SqliteTaskBackend:
         for row in rows:
             if row['parent_id'] == _TOP_LEVEL_SENTINEL:
                 key = (row['id'], _TOP_LEVEL_SENTINEL)
-                top_by_id[row['id']] = _row_to_task(row, deps.get(key, []))
+                top_by_id[row['id']] = _row_to_task(row, deps.get(key, []), project_root=project_root)
 
         for row in rows:
             if row['parent_id'] != _TOP_LEVEL_SENTINEL:
@@ -391,10 +399,10 @@ class SqliteTaskBackend:
                 if parent is None:
                     # Orphan subtask — surface as top-level so it isn't lost.
                     top_by_id[-row['parent_id']] = _row_to_task(
-                        row, deps.get(key, []),
+                        row, deps.get(key, []), project_root=project_root,
                     )
                 else:
-                    parent['subtasks'].append(_row_to_task(row, deps.get(key, [])))
+                    parent['subtasks'].append(_row_to_task(row, deps.get(key, []), project_root=project_root))
 
         return [top_by_id[k] for k in sorted(top_by_id)]
 
@@ -428,7 +436,7 @@ class SqliteTaskBackend:
             )
         deps = await self._fetch_dependencies(conn, tag)
 
-        out = _row_to_task(row, deps.get((row['id'], row['parent_id']), []))
+        out = _row_to_task(row, deps.get((row['id'], row['parent_id']), []), project_root=project_root)
         # get_task surfaces a single task — Taskmaster returns int id here
         # (asymmetric with get_tasks; mirror that quirk to keep wire-compat).
         if parent_id is None:
@@ -441,7 +449,7 @@ class SqliteTaskBackend:
             )
             sub_rows = await subtask_cursor.fetchall()
             out['subtasks'] = [
-                _row_to_task(r, deps.get((r['id'], r['parent_id']), []))
+                _row_to_task(r, deps.get((r['id'], r['parent_id']), []), project_root=project_root)
                 for r in sub_rows
             ]
         return out
@@ -682,7 +690,7 @@ class SqliteTaskBackend:
             )
         )
         updated_task = (
-            _row_to_task(refreshed, deps.get((refreshed['id'], refreshed['parent_id']), []))
+            _row_to_task(refreshed, deps.get((refreshed['id'], refreshed['parent_id']), []), project_root=project_root)
             if refreshed is not None else None
         )
         return {
@@ -754,7 +762,7 @@ class SqliteTaskBackend:
             refreshed = await refreshed_cursor.fetchone()
 
         subtask_dict = (
-            _row_to_task(refreshed, []) if refreshed is not None else {}
+            _row_to_task(refreshed, [], project_root=project_root) if refreshed is not None else {}
         )
         formatted_id = _format_task_id(next_id, parent_tid)
         return {
