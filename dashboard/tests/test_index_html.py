@@ -39,11 +39,10 @@ def _find_script_position(
     """Return ``(index, attrs)`` for the first <script> tag whose ``src``
     starts with ``src_prefix``, or ``None`` if no such tag exists.
 
-    Position-aware counterpart of ``_find_cdn_script_attrs``: position equals
-    the tag's index in ``_ScriptTagCollector.script_attrs``, which preserves
-    document order because it is a plain Python list. Returning attrs alongside
-    the index avoids a second parse when the caller also needs the src or other
-    attributes.
+    ``index`` is the tag's 0-based position in ``_ScriptTagCollector.script_attrs``
+    (document order, since the list preserves insertion order).  Returning attrs
+    alongside the position avoids a second parse when the caller also needs the
+    src or other attributes.
     """
     collector = _ScriptTagCollector()
     collector.feed(body)
@@ -52,21 +51,6 @@ def _find_script_position(
             return i, attrs
     return None
 
-
-def _find_cdn_script_attrs(
-    body: str, src_prefix: str
-) -> dict[str, str | None] | None:
-    """Return the attribute dict for the first <script> whose ``src`` starts
-    with ``src_prefix``, or ``None`` if no such tag exists.
-
-    Uses ``html.parser.HTMLParser`` so attribute values containing ``>`` (e.g.
-    inline JSON configs) are handled correctly — the regex ``[^>]*`` shortcut
-    would truncate such tags and could miss attributes appearing after the ``>``.
-
-    Thin wrapper around ``_find_script_position`` that discards the position.
-    """
-    result = _find_script_position(body, src_prefix)
-    return result[1] if result is not None else None
 
 
 @pytest.fixture(scope='module')
@@ -117,7 +101,8 @@ def test_cdn_script_has_sri_integrity(
     Parametrised over marked and DOMPurify — both are required by the
     MarkdownText component in tab_tasks.jsx.
     """
-    attrs = _find_cdn_script_attrs(index_html_body, src_prefix)
+    result = _find_script_position(index_html_body, src_prefix)
+    attrs = result[1] if result is not None else None
     assert attrs is not None, (
         f'No <script src="{src_prefix}..."> tag found in index.html. '
         f'{consumer_note}'
@@ -185,42 +170,28 @@ def test_find_script_position_returns_document_order(
 _TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
 
 
-@pytest.mark.parametrize(
-    'src_prefix, lib_name, consumer_note',
-    _CDN_SCRIPT_CASES,
-    ids=['marked', 'dompurify'],
-)
-def test_cdn_script_loads_before_tab_tasks_jsx(
-    index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
+def _assert_cdn_loads_before_tab_tasks(
+    body: str,
+    cdn_src_prefix: str,
+    tab_tasks_src_prefix: str,
+    lib_name: str,
+    consumer_note: str = '',
 ) -> None:
-    """CDN scripts for marked/DOMPurify must appear BEFORE tab_tasks.jsx.
-
-    Regression guard: moving either CDN tag *after* tab_tasks.jsx means
-    MarkdownText's first render runs while ``marked`` / ``DOMPurify`` are still
-    undefined, so it falls back to null — the dashboard still loads, so the
-    regression can ship unnoticed (same silent-failure class the smoke test was
-    added to catch).
-
-    Naturally GREEN against the current correctly-ordered index.html; will fire
-    loudly if a future edit moves either CDN tag below the tab_tasks.jsx tag.
-
-    This test checks document order, which correctly predicts execution order
-    only when both scripts are classic synchronous scripts (no defer, async, or
-    type="module"). The test body asserts that assumption explicitly so that a
-    future edit adding those attributes fails loudly rather than silently passing
-    a check that no longer reflects execution order.
+    """Assert that the CDN script for ``cdn_src_prefix`` loads BEFORE the
+    tab_tasks.jsx script in ``body``.  Combines a defer/async/type=module
+    false-pass guard with the document-order position comparison.
     """
-    cdn_result = _find_script_position(index_html_body, src_prefix)
+    cdn_result = _find_script_position(body, cdn_src_prefix)
     assert cdn_result is not None, (
-        f'No <script src="{src_prefix}..."> tag found in index.html. '
+        f'No <script src="{cdn_src_prefix}..."> tag found in index.html. '
         f'{consumer_note}'
     )
     cdn_pos, cdn_attrs = cdn_result
     cdn_src = cdn_attrs.get('src')
 
-    tab_tasks_result = _find_script_position(index_html_body, _TAB_TASKS_PREFIX)
+    tab_tasks_result = _find_script_position(body, tab_tasks_src_prefix)
     assert tab_tasks_result is not None, (
-        f'<script src="{_TAB_TASKS_PREFIX}..."> not found in index.html — '
+        f'<script src="{tab_tasks_src_prefix}..."> not found in index.html — '
         f'cannot verify load-order invariant for {lib_name}.'
     )
     tab_tasks_pos, tab_tasks_attrs = tab_tasks_result
@@ -250,4 +221,100 @@ def test_cdn_script_loads_before_tab_tasks_jsx(
         f'If it loads after, MarkdownText renders before {lib_name} is defined '
         f'and falls back to null on first render — the silent-failure class the '
         f'smoke test was added to catch.'
+    )
+
+
+@pytest.mark.parametrize(
+    'src_prefix, lib_name, consumer_note',
+    _CDN_SCRIPT_CASES,
+    ids=['marked', 'dompurify'],
+)
+def test_cdn_script_loads_before_tab_tasks_jsx(
+    index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
+) -> None:
+    """CDN scripts for marked/DOMPurify must appear BEFORE tab_tasks.jsx.
+
+    Regression guard: moving either CDN tag *after* tab_tasks.jsx means
+    MarkdownText's first render runs while ``marked`` / ``DOMPurify`` are still
+    undefined, so it falls back to null — the dashboard still loads, so the
+    regression can ship unnoticed (same silent-failure class the smoke test was
+    added to catch).
+
+    Naturally GREEN against the current correctly-ordered index.html; will fire
+    loudly if a future edit moves either CDN tag below the tab_tasks.jsx tag.
+
+    This test checks document order, which correctly predicts execution order
+    only when both scripts are classic synchronous scripts (no defer, async, or
+    type="module"). The test body asserts that assumption explicitly so that a
+    future edit adding those attributes fails loudly rather than silently passing
+    a check that no longer reflects execution order.
+    """
+    _assert_cdn_loads_before_tab_tasks(
+        index_html_body,
+        src_prefix,
+        _TAB_TASKS_PREFIX,
+        lib_name=lib_name,
+        consumer_note=consumer_note,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Guard-layer coverage: defer / async / type="module" must trigger an error
+# ---------------------------------------------------------------------------
+
+_DEFERRED_CDN_CASES = [
+    # (extra_attrs_on_cdn_tag, regex_to_match_in_AssertionError_message)
+    # Pinned to unique phrases in each guard's assertion message so that an
+    # unrelated mention of the word (e.g. "deferred" in the position-comparison
+    # failure message) cannot satisfy the match while the wrong guard fires.
+    ('defer', r'defer attribute'),
+    ('async', r'async attribute'),
+    ('type="module"', r'type="module".*deferred by default'),
+]
+
+
+@pytest.mark.parametrize(
+    'extra_attrs, match_pattern',
+    _DEFERRED_CDN_CASES,
+    ids=['defer', 'async', 'type-module'],
+)
+def test_load_order_assertion_fires_on_deferred_cdn(
+    extra_attrs: str, match_pattern: str
+) -> None:
+    """When the CDN tag carries defer / async / type="module", the
+    false-pass guard inside the load-order assertion must fire — document
+    order no longer implies execution order in those cases.
+    """
+    cdn_tag = (
+        f'<script src="https://unpkg.com/marked@x/y.js" '
+        f'{extra_attrs}></script>'
+    )
+    body = cdn_tag + _TAB_TASKS_TAG
+    with pytest.raises(AssertionError, match=match_pattern):
+        _assert_cdn_loads_before_tab_tasks(
+            body,
+            'https://unpkg.com/marked@',
+            _TAB_TASKS_PREFIX,
+            lib_name='marked',
+        )
+
+
+def test_load_order_assertion_passes_for_classic_scripts() -> None:
+    """_assert_cdn_loads_before_tab_tasks raises no exception when both scripts
+    are classic synchronous scripts placed in the correct document order.
+
+    Happy-path contract: a clean CDN tag (no defer/async/type=module) placed
+    before tab_tasks.jsx must pass both the false-pass guard and the position
+    comparison without raising.  This test ensures an accidental edit that makes
+    the guards always-fire (e.g. inverted assert conditions) is caught rather
+    than silently masked by the negative-only parametrised cases above.
+    """
+    cdn_tag = '<script src="https://unpkg.com/marked@x/y.js"></script>'
+    body = cdn_tag + _TAB_TASKS_TAG
+    # Must complete without raising — classic script, correct document order.
+    _assert_cdn_loads_before_tab_tasks(
+        body,
+        'https://unpkg.com/marked@',
+        _TAB_TASKS_PREFIX,
+        lib_name='marked',
     )
