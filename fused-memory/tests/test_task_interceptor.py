@@ -3144,6 +3144,58 @@ async def test_cancel_ticket_terminal_returns_noop(
     }, f'Expected no_op dict with status={terminal_status!r}, got: {result!r}'
 
 
+@pytest.mark.asyncio
+async def test_cancel_ticket_pending_marks_cancelled(
+    interceptor_with_store, ticket_store,
+):
+    """cancel_ticket marks a pending ticket as cancelled and returns the right shape.
+
+    RED in step-5: NotImplementedError from the pending-cancel placeholder.
+    """
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    result = await interceptor_with_store.cancel_ticket(ticket_id)
+
+    assert result == {'status': 'cancelled', 'ticket_id': ticket_id}, (
+        f'Expected cancelled dict, got: {result!r}'
+    )
+    # Confirm the row was actually updated in the store.
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'cancelled', f'Row status should be cancelled: {row!r}'
+    assert row['reason'] == 'user_cancelled', f'Row reason should be user_cancelled: {row!r}'
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_signals_resolve_ticket_waiter(
+    interceptor_with_store, ticket_store,
+):
+    """cancel_ticket wakes a concurrent resolve_ticket waiter so it exits promptly.
+
+    RED in step-5: the pending-cancel placeholder raises NotImplementedError,
+    which causes cancel_ticket to crash before calling _signal_ticket_event.
+    """
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    # Start a resolve_ticket waiter in the background.  It blocks on the
+    # asyncio.Event registered for this ticket.
+    waiter = asyncio.create_task(
+        interceptor_with_store.resolve_ticket(ticket_id, '/p', timeout_seconds=5.0),
+    )
+    # Yield control so resolve_ticket can register its Event before we cancel.
+    await asyncio.sleep(0)
+
+    # Cancel the ticket — this should signal the waiter's Event.
+    cancel_result = await interceptor_with_store.cancel_ticket(ticket_id)
+    assert cancel_result == {'status': 'cancelled', 'ticket_id': ticket_id}
+
+    # The waiter should wake and return the cancelled row within the timeout.
+    waiter_result = await asyncio.wait_for(waiter, timeout=3.0)
+    assert waiter_result.get('status') == 'cancelled', (
+        f'resolve_ticket waiter expected status=cancelled, got: {waiter_result!r}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Terminal-exit gate: server-side FSM that refuses done/cancelled -> non-same
 # without an explicit reopen_reason.
