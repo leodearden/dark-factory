@@ -7468,3 +7468,73 @@ class TestStage1SnapshotDisciplineAsyncQueueAcknowledgement:
         assert 'First, search for existing snapshot edges' not in section, (
             'Old mandatory pre-write search step must be removed from Snapshot Discipline'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3: format_snapshot_fact deterministic helper
+# ---------------------------------------------------------------------------
+
+
+class TestFormatSnapshotFact:
+    """Unit tests for the format_snapshot_fact helper in memory_consolidator."""
+
+    def _import_helper(self):
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            format_snapshot_fact,
+        )
+
+        return format_snapshot_fact
+
+    def test_canonical_format_with_iso_date_and_counts(self):
+        """Helper returns canonical text with ISO date, project_id, and all count values."""
+        format_snapshot_fact = self._import_helper()
+        result = format_snapshot_fact(
+            as_of=datetime(2026, 5, 13, tzinfo=UTC),
+            project_id='dark_factory',
+            counts={'total': 42, 'done': 18, 'blocked': 3, 'in_progress': 5},
+        )
+        assert result.startswith('As of 2026-05-13'), (
+            f'Expected result to start with "As of 2026-05-13", got: {result!r}'
+        )
+        assert 'project dark_factory' in result, (
+            f'Expected "project dark_factory" in result, got: {result!r}'
+        )
+        assert '42 total' in result, f'Expected "42 total" in result, got: {result!r}'
+        assert '18 done' in result, f'Expected "18 done" in result, got: {result!r}'
+        assert '3 blocked' in result, f'Expected "3 blocked" in result, got: {result!r}'
+        assert '5 in_progress' in result, (
+            f'Expected "5 in_progress" in result, got: {result!r}'
+        )
+
+    def test_keeps_all_fields_in_deterministic_order(self):
+        """Zero-value fields are included; output is stable across calls."""
+        format_snapshot_fact = self._import_helper()
+        result1 = format_snapshot_fact(
+            as_of=datetime(2026, 5, 13, tzinfo=UTC),
+            project_id='proj',
+            counts={'total': 10, 'done': 0, 'blocked': 0},
+        )
+        result2 = format_snapshot_fact(
+            as_of=datetime(2026, 5, 13, tzinfo=UTC),
+            project_id='proj',
+            counts={'total': 10, 'done': 0, 'blocked': 0},
+        )
+        # Idempotent
+        assert result1 == result2
+        # Zero values are included so cycle-over-cycle diffs are meaningful
+        assert '0 done' in result1, (
+            f'Zero-value fields must appear in output, got: {result1!r}'
+        )
+        assert '0 blocked' in result1, (
+            f'Zero-value fields must appear in output, got: {result1!r}'
+        )
+
+    def test_naive_datetime_raises_value_error(self):
+        """Tz-naive as_of must raise ValueError to prevent ambiguous timestamps."""
+        format_snapshot_fact = self._import_helper()
+        with pytest.raises(ValueError, match='tz-aware'):
+            format_snapshot_fact(
+                as_of=datetime(2026, 5, 13),  # naive — no tzinfo
+                project_id='proj',
+                counts={'total': 1},
+            )
