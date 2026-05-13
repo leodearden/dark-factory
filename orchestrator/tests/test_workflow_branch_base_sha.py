@@ -12,8 +12,8 @@ append=True) immediately after self._base_commit is set.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -74,7 +74,7 @@ async def test_setup_worktree_writes_branch_base_sha(tmp_path: Path):
 
     # branch_base_sha must be written with append=True so existing metadata
     # (prd, files, modules, etc.) is not clobbered.
-    wf.scheduler.update_task.assert_awaited_once_with(
+    cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
         '101', {'branch_base_sha': base_sha}, append=True
     )
 
@@ -96,6 +96,6 @@ async def test_setup_worktree_writes_branch_base_sha_external_worktree(tmp_path:
         await wf._setup_worktree_and_artifacts('task/101')
 
     # branch_base_sha must be written with append=True
-    wf.scheduler.update_task.assert_awaited_once_with(
+    cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
         '101', {'branch_base_sha': base_sha}, append=True
     )

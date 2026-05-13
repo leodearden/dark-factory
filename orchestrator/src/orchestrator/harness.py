@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
@@ -84,7 +84,7 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _is_valid_sha_40(s: object) -> bool:
+def _is_valid_sha_40(s: object) -> TypeGuard[str]:
     """Return True iff *s* is a well-formed 40-char lowercase hex SHA.
 
     Used to validate ``branch_base_sha`` values read from task metadata
