@@ -470,9 +470,22 @@ class TaskWorkflow:
                 'git', 'rev-parse', 'HEAD',
                 cwd=str(self.worktree),
                 stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await proc.communicate()
-            base_commit = stdout.decode().strip()
+            stdout, stderr = await proc.communicate()
+            # Soft-fail: mirror the update_task soft-fail below — log and fall
+            # through rather than raising, so a misconfigured eval-mode worktree
+            # degrades gracefully to citation-grep alone instead of crashing setup.
+            if proc.returncode != 0:
+                logger.warning(
+                    'Task %s: git rev-parse HEAD failed in external worktree '
+                    '(rc=%s); base_commit will be empty. stderr=%s',
+                    self.task_id, proc.returncode,
+                    stderr.decode(errors='replace').strip()[:200],
+                )
+                base_commit = ''
+            else:
+                base_commit = stdout.decode().strip()
         self._base_commit = base_commit
         # Record branch_base_sha in task metadata immediately after branch
         # creation so _reconcile_one_stranded (harness.py) can detect

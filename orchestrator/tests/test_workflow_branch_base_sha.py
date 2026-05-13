@@ -90,6 +90,7 @@ async def test_setup_worktree_writes_branch_base_sha_external_worktree(tmp_path:
 
     # Mock the git rev-parse HEAD subprocess
     fake_proc = MagicMock()
+    fake_proc.returncode = 0  # explicit 0 so the new returncode check doesn't misfire
     fake_proc.communicate = AsyncMock(return_value=(base_sha.encode() + b'\n', b''))
 
     with patch('asyncio.create_subprocess_exec', new=AsyncMock(return_value=fake_proc)), \
