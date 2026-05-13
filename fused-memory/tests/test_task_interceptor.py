@@ -3121,6 +3121,29 @@ async def test_cancel_ticket_missing_returns_not_found(interceptor_with_store):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_status', ['failed', 'cancelled', 'created'])
+async def test_cancel_ticket_terminal_returns_noop(
+    interceptor_with_store, ticket_store, terminal_status,
+):
+    """cancel_ticket returns no_op for a ticket already in a terminal status.
+
+    RED in step-3: the placeholder in step-2 raises NotImplementedError for
+    non-pending rows.
+    """
+    # Insert a pending ticket directly via the store.
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+    # Push it to the given terminal status.
+    await ticket_store.mark_resolved(ticket_id, status=terminal_status, reason='test')
+
+    result = await interceptor_with_store.cancel_ticket(ticket_id)
+    assert result == {
+        'status': terminal_status,
+        'ticket_id': ticket_id,
+        'no_op': True,
+    }, f'Expected no_op dict with status={terminal_status!r}, got: {result!r}'
+
+
 # ---------------------------------------------------------------------------
 # Terminal-exit gate: server-side FSM that refuses done/cancelled -> non-same
 # without an explicit reopen_reason.
