@@ -481,7 +481,7 @@ class TaskWorkflow:
                     'Task %s: git rev-parse HEAD failed in external worktree '
                     '(rc=%s); base_commit will be empty. stderr=%s',
                     self.task_id, proc.returncode,
-                    stderr.decode(errors='replace').strip()[:200],
+                    stderr.decode(errors='replace').strip()[:200] or '<empty>',
                 )
                 base_commit = ''
             else:

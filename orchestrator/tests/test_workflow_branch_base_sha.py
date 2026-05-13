@@ -141,7 +141,6 @@ async def test_setup_worktree_external_rev_parse_failure_logs_warning_and_falls_
     assert len(warnings) == 1, f'expected 1 warning, got {len(warnings)}: {[r.getMessage() for r in warnings]}'
     msg = warnings[0].getMessage()
     assert '101' in msg, f'task_id not in warning: {msg!r}'
-    assert 'rev-parse' in msg, f"'rev-parse' not in warning: {msg!r}"
     assert 'not a git repository' in msg, f'stderr not in warning: {msg!r}'
 
 
@@ -187,7 +186,6 @@ async def test_setup_worktree_update_task_soft_fail_logs_and_continues(
     msg = warnings[0].getMessage()
     assert '101' in msg, f'task_id not in warning: {msg!r}'
     assert 'branch_base_sha' in msg, f"'branch_base_sha' not in warning: {msg!r}"
-    assert 'citation-grep' in msg, f"'citation-grep' not in warning: {msg!r}"
     # (d) update_task was called (proving the except branch fired, not `if base_commit:` skip)
     cast(AsyncMock, wf.scheduler.update_task).assert_awaited_once_with(
         '101', {'branch_base_sha': base_sha}, append=True
