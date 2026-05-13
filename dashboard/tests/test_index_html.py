@@ -33,6 +33,26 @@ class _ScriptTagCollector(html.parser.HTMLParser):
             self.script_attrs.append(dict(attrs))
 
 
+def _find_script_position(
+    body: str, src_prefix: str
+) -> tuple[int, dict[str, str | None]] | None:
+    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
+    starts with ``src_prefix``, or ``None`` if no such tag exists.
+
+    Position-aware counterpart of ``_find_cdn_script_attrs``: position equals
+    the tag's index in ``_ScriptTagCollector.script_attrs``, which preserves
+    document order because it is a plain Python list. Returning attrs alongside
+    the index avoids a second parse when the caller also needs the src or other
+    attributes.
+    """
+    collector = _ScriptTagCollector()
+    collector.feed(body)
+    for i, attrs in enumerate(collector.script_attrs):
+        if (attrs.get('src') or '').startswith(src_prefix):
+            return i, attrs
+    return None
+
+
 def _find_cdn_script_attrs(
     body: str, src_prefix: str
 ) -> dict[str, str | None] | None:
@@ -42,14 +62,11 @@ def _find_cdn_script_attrs(
     Uses ``html.parser.HTMLParser`` so attribute values containing ``>`` (e.g.
     inline JSON configs) are handled correctly — the regex ``[^>]*`` shortcut
     would truncate such tags and could miss attributes appearing after the ``>``.
+
+    Thin wrapper around ``_find_script_position`` that discards the position.
     """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for attrs in collector.script_attrs:
-        src = attrs.get('src') or ''
-        if src.startswith(src_prefix):
-            return attrs
-    return None
+    result = _find_script_position(body, src_prefix)
+    return result[1] if result is not None else None
 
 
 @pytest.fixture(scope='module')
@@ -113,4 +130,124 @@ def test_cdn_script_has_sri_integrity(
     assert _SRI_HASH_RE.match(integrity), (
         f'{lib_name} CDN tag integrity= is not a valid SRI hash '
         f'(expected sha256/384/512-<base64>): {integrity!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper-level coverage for _find_script_position (synthetic HTML)
+# ---------------------------------------------------------------------------
+
+_MARKED_TAG = '<script src="https://unpkg.com/marked@x/y.js"></script>'
+_TAB_TASKS_TAG = '<script src="/static/redux/tab_tasks.jsx?v=9"></script>'
+
+_FIND_SCRIPT_POSITION_CASES = [
+    # (a) marked-then-tab_tasks: correct load order
+    (_MARKED_TAG + _TAB_TASKS_TAG, 'https://unpkg.com/marked@', 0),
+    (_MARKED_TAG + _TAB_TASKS_TAG, '/static/redux/tab_tasks.jsx', 1),
+    # (b) tab_tasks-then-marked: reversed order (regression scenario)
+    (_TAB_TASKS_TAG + _MARKED_TAG, 'https://unpkg.com/marked@', 1),
+    (_TAB_TASKS_TAG + _MARKED_TAG, '/static/redux/tab_tasks.jsx', 0),
+    # (c) missing tag returns None
+    (_TAB_TASKS_TAG, 'https://unpkg.com/marked@', None),
+]
+
+
+@pytest.mark.parametrize(
+    'body, src_prefix, expected_position',
+    _FIND_SCRIPT_POSITION_CASES,
+    ids=[
+        'marked-first-marked-pos',
+        'marked-first-tab_tasks-pos',
+        'reversed-marked-pos',
+        'reversed-tab_tasks-pos',
+        'missing-tag-returns-none',
+    ],
+)
+def test_find_script_position_returns_document_order(
+    body: str, src_prefix: str, expected_position: int | None
+) -> None:
+    """_find_script_position returns the 0-indexed document position of the
+    first <script> tag whose src starts with src_prefix, or None if absent.
+
+    Exercises synthetic HTML so that a future bad ordering of the real
+    index.html would actually be caught (i.e. proves the helper distinguishes
+    good-order from bad-order).
+    """
+    result = _find_script_position(body, src_prefix)
+    actual_pos = result[0] if result is not None else None
+    assert actual_pos == expected_position
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: CDN globals must be defined before tab_tasks.jsx runs
+# ---------------------------------------------------------------------------
+
+_TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
+
+
+@pytest.mark.parametrize(
+    'src_prefix, lib_name, consumer_note',
+    _CDN_SCRIPT_CASES,
+    ids=['marked', 'dompurify'],
+)
+def test_cdn_script_loads_before_tab_tasks_jsx(
+    index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
+) -> None:
+    """CDN scripts for marked/DOMPurify must appear BEFORE tab_tasks.jsx.
+
+    Regression guard: moving either CDN tag *after* tab_tasks.jsx means
+    MarkdownText's first render runs while ``marked`` / ``DOMPurify`` are still
+    undefined, so it falls back to null — the dashboard still loads, so the
+    regression can ship unnoticed (same silent-failure class the smoke test was
+    added to catch).
+
+    Naturally GREEN against the current correctly-ordered index.html; will fire
+    loudly if a future edit moves either CDN tag below the tab_tasks.jsx tag.
+
+    This test checks document order, which correctly predicts execution order
+    only when both scripts are classic synchronous scripts (no defer, async, or
+    type="module"). The test body asserts that assumption explicitly so that a
+    future edit adding those attributes fails loudly rather than silently passing
+    a check that no longer reflects execution order.
+    """
+    cdn_result = _find_script_position(index_html_body, src_prefix)
+    assert cdn_result is not None, (
+        f'No <script src="{src_prefix}..."> tag found in index.html. '
+        f'{consumer_note}'
+    )
+    cdn_pos, cdn_attrs = cdn_result
+    cdn_src = cdn_attrs.get('src')
+
+    tab_tasks_result = _find_script_position(index_html_body, _TAB_TASKS_PREFIX)
+    assert tab_tasks_result is not None, (
+        f'<script src="{_TAB_TASKS_PREFIX}..."> not found in index.html — '
+        f'cannot verify load-order invariant for {lib_name}.'
+    )
+    tab_tasks_pos, tab_tasks_attrs = tab_tasks_result
+
+    # Both tags must be classic synchronous scripts — otherwise document order
+    # diverges from execution order and the position comparison below is moot.
+    for _label, _attrs in [
+        (f'{lib_name} CDN', cdn_attrs),
+        ('tab_tasks.jsx', tab_tasks_attrs),
+    ]:
+        assert 'defer' not in _attrs, (
+            f'{_label} has a defer attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert 'async' not in _attrs, (
+            f'{_label} has an async attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert (_attrs.get('type') or '').lower() != 'module', (
+            f'{_label} has type="module"; ES modules are deferred by default, '
+            f'so document order no longer implies execution order.'
+        )
+
+    assert cdn_pos < tab_tasks_pos, (
+        f'{lib_name} CDN tag (position {cdn_pos}, src={cdn_src!r}) must load '
+        f'BEFORE tab_tasks.jsx (position {tab_tasks_pos}). '
+        f'If it loads after, MarkdownText renders before {lib_name} is defined '
+        f'and falls back to null on first render — the silent-failure class the '
+        f'smoke test was added to catch.'
     )
