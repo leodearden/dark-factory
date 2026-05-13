@@ -65,7 +65,7 @@ def test_anchor_rewrite_skips_in_page_and_same_origin_links(client):
 
     # (b) early-return guard: both startsWith('#') and startsWith('/') must be present
     starts_hash = re.compile(r"href\.startsWith\(\s*['\"]#['\"]\s*\)")
-    starts_slash = re.compile(r"href\.startsWith\(\s*['\"/]['\"]\s*\)")
+    starts_slash = re.compile(r"href\.startsWith\(\s*['\"][/]['\"]")
     m_hash = starts_hash.search(body)
     m_slash = starts_slash.search(body)
     assert m_hash is not None, (

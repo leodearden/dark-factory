@@ -228,6 +228,9 @@ function MarkdownText({ text, className, empty }) {
       const tpl = document.createElement('template');
       tpl.innerHTML = sanitized;
       tpl.content.querySelectorAll('a').forEach(a => {
+        // In-page fragment jumps and SPA-internal links should stay in the same tab.
+        const href = a.getAttribute('href') || '';
+        if (href.startsWith('#') || href.startsWith('/')) return;
         a.setAttribute('target', '_blank');
         a.setAttribute('rel', 'noopener noreferrer');
       });
