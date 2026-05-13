@@ -52,7 +52,6 @@ def _find_script_position(
     return None
 
 
-
 @pytest.fixture(scope='module')
 def index_html_body():
     """Fetch /static/redux/index.html once for the whole test module."""
