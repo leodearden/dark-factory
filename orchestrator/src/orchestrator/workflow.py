@@ -473,17 +473,22 @@ class TaskWorkflow:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate()
-            # Soft-fail: mirror the update_task soft-fail below — log and fall
-            # through rather than raising, so a misconfigured eval-mode worktree
-            # degrades gracefully to citation-grep alone instead of crashing setup.
+            # Soft-fail: log and fall through rather than raising, so a
+            # misconfigured eval-mode worktree degrades gracefully to
+            # citation-grep alone instead of crashing setup.
+            # NOTE: unlike the update_task soft-fail below (which keeps a valid
+            # SHA in memory because only the metadata write failed), this path
+            # has no SHA to record — _base_commit is left None so consumers
+            # gating on `is not None` (e.g. the merge-queue plan-files-touched
+            # check at line 3062) skip cleanly instead of receiving an empty-SHA.
             if proc.returncode != 0:
                 logger.warning(
                     'Task %s: git rev-parse HEAD failed in external worktree '
-                    '(rc=%s); base_commit will be empty. stderr=%s',
+                    '(rc=%s); base_commit will be None. stderr=%s',
                     self.task_id, proc.returncode,
                     stderr.decode(errors='replace').strip()[:200] or '<empty>',
                 )
-                base_commit = ''
+                base_commit = None
             else:
                 base_commit = stdout.decode().strip()
         self._base_commit = base_commit

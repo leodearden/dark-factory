@@ -107,15 +107,14 @@ async def test_setup_worktree_writes_branch_base_sha_external_worktree(tmp_path:
 async def test_setup_worktree_external_rev_parse_failure_logs_warning_and_falls_through(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ):
-    """RED: external-worktree path with non-zero rev-parse exit must warn and fall through.
+    """Rev-parse failure leaves _base_commit as None so consumers gate correctly.
 
-    The current impl at workflow.py:469-475 ignores proc.returncode — this
-    test is RED until Step 4 adds returncode checking + warning logging.
-
-    After Step 4 the impl emits a WARNING that includes task_id, 'rev-parse',
-    and the captured stderr so operators can diagnose eval-mode misconfiguration.
-    base_commit falls through as '' so the existing `if base_commit:` gate at
-    line 484 skips the update_task write — same degradation as update_task soft-fail.
+    Unlike the update_task soft-fail (which keeps a valid SHA in memory because
+    only the metadata write fails), this path has no SHA to record at all —
+    `_base_commit` is left None.  Downstream consumers gate safely:
+      - workflow.py `if self._merge_sha and self._base_commit:` (truthy, None is falsy)
+      - workflow.py `and self._base_commit is not None` (identity check, correctly skips)
+    The falsy `if base_commit:` gate at line 497 still skips the update_task write.
     """
     wf = _make_workflow(project_root=tmp_path)
     wf.worktree = tmp_path  # trigger external-worktree path
@@ -132,9 +131,9 @@ async def test_setup_worktree_external_rev_parse_failure_logs_warning_and_falls_
         await wf._setup_worktree_and_artifacts('task/101')
 
     # (a) must not raise — fall-through, not crash (no explicit assertion needed)
-    # (b) base_commit falls through as empty string
-    assert wf._base_commit == '', f'expected empty base_commit, got {wf._base_commit!r}'
-    # (c) update_task not called — `if base_commit:` gate skips it when falsy
+    # (b) base_commit is None — identity check distinguishes None from '' or other falsy values
+    assert wf._base_commit is None, f'expected _base_commit is None, got {wf._base_commit!r}'
+    # (c) update_task not called — `if base_commit:` gate skips it when falsy (None is falsy)
     cast(AsyncMock, wf.scheduler.update_task).assert_not_awaited()
     # (d) exactly one WARNING about the failure, surfacing task_id, rev-parse, and stderr
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
