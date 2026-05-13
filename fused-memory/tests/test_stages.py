@@ -4978,6 +4978,29 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         assert 'stale_fixc_markers_swept' in report.stats
         assert report.stats['stale_fixc_markers_swept'] == 0
 
+    @pytest.mark.asyncio
+    async def test_assemble_payload_raises_before_search_when_current_run_id_is_none(
+        self, mock_deps, watermark,
+    ):
+        """Guard must raise RuntimeError BEFORE _query_stage2_flags is awaited when
+        _current_run_id is not set, so callers get an early, attributable failure."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        # Intentionally NOT setting stage._current_run_id — that is the SUT condition.
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await stage.assemble_payload([], watermark, [])
+
+        # Guard must fire BEFORE the Mem0 search — no search round-trip on bad setup.
+        mock_deps['memory_service'].search.assert_not_awaited()
+
+        # Error message must name the attribute and point at the canonical fix.
+        msg = str(excinfo.value)
+        assert '_current_run_id' in msg
+        assert 'stage._current_run_id = "test-run"' in msg
+
 
 class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
     """Scope filter suppresses task-1139/bug-mechanics flags from Mem0 active-query path."""
