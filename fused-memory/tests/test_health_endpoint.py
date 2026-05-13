@@ -320,7 +320,7 @@ async def test_add_memory_mock_does_not_emit_unawaited_coroutine_warning(mcp_ser
     assert bad == [], (
         'add_memory emitted un-awaited-coroutine RuntimeWarning(s) — '
         'likely the fixture returned a bare AsyncMock() instead of MagicMock() '
-        f'for add_memory.return_value:\n'
+        'for add_memory.return_value:\n'
         + '\n'.join(f'  {w.filename}:{w.lineno}: {w.message}' for w in bad)
     )
 
