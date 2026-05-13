@@ -389,6 +389,7 @@ class TestTaskKnowledgeSyncPayload:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         await stage.assemble_payload([], watermark, [])
@@ -403,6 +404,7 @@ class TestTaskKnowledgeSyncPayload:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -416,6 +418,7 @@ class TestTaskKnowledgeSyncPayload:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'dark_factory'
         stage.project_root = '/home/leo/src/dark-factory'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         wm = Watermark(project_id='dark_factory')
 
@@ -429,6 +432,7 @@ class TestTaskKnowledgeSyncPayload:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -461,6 +465,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         stage.known_projects = {'reify': '/home/leo/src/reify'}
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -473,6 +478,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         # known_projects unset → empty dict from BaseStage default
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -486,6 +492,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         stage.known_projects = {
             'reify': '/home/leo/src/reify',
             'dark_factory': '/home/leo/src/dark-factory',
@@ -506,6 +513,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         stage.known_projects = {
             'reify': '/home/leo/src/reify',
             'dark_factory': '/home/leo/src/dark-factory',
@@ -534,6 +542,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         stage.known_projects = {
             'reify': '/home/leo/src/reify',
             'dark_factory': '/home/leo/src/dark-factory',
@@ -587,6 +596,7 @@ class TestDoneProvenanceSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'p'
         stage.project_root = str(tmp_path)
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{
                 'id': 7, 'status': 'done', 'title': 'Ship A+B',
@@ -607,6 +617,7 @@ class TestDoneProvenanceSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'p'
         stage.project_root = str(tmp_path)
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{
                 'id': 9, 'status': 'done', 'title': 'Covered by sibling',
@@ -628,6 +639,7 @@ class TestDoneProvenanceSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'p'
         stage.project_root = str(tmp_path)
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{'id': 11, 'status': 'done', 'title': 'Legacy'}],
         }
@@ -643,6 +655,7 @@ class TestDoneProvenanceSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'p'
         stage.project_root = str(tmp_path)
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{'id': 1, 'status': 'pending', 'title': 'WIP'}],
         }
@@ -658,6 +671,7 @@ class TestDoneProvenanceSection:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'p'
         stage.project_root = str(tmp_path)
+        stage._current_run_id = 'test-run'
         bad = 'deadbeef' * 5  # 40 chars but not a real SHA
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{
@@ -1018,6 +1032,7 @@ class TestProactiveSampling:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
                 self._make_task(1, 'in-progress'),
@@ -1087,6 +1102,7 @@ class TestProactiveSampling:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.remediation_mode = True
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
@@ -1193,6 +1209,7 @@ class TestProactiveSampling:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -1213,6 +1230,7 @@ class TestProactiveSampling:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
                 self._make_task(1, 'in-progress'),
@@ -1743,6 +1761,7 @@ class TestStagePayloadProjectIdGuideline:
             stage.memory_limit = 250
         elif extra_setup == 'taskmaster':
             stage.project_root = '/home/leo/src/test_proj'
+            stage._current_run_id = 'test-run'
             mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         watermark = Watermark(project_id=project_id)
@@ -1778,6 +1797,7 @@ class TestStagePayloadProjectIdGuideline:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_for_stage)
         stage.project_id = 'test_proj'
         stage.project_root = '/home/leo/src/test_proj'
+        stage._current_run_id = 'test-run'
         mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
         watermark = Watermark(project_id='test_proj')
 
@@ -1842,6 +1862,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
                 self._make_task(1, 'pending'),
@@ -1883,6 +1904,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
                 self._make_task(1, 'in-progress'),
@@ -1932,6 +1954,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [self._make_task(i, 'done') for i in range(1, n_tasks + 1)]
         }
@@ -1999,6 +2022,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
                 self._make_task(i, 'done')
@@ -2039,6 +2063,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
                 self._make_task(1, 'in-progress', 'Active Task'),
@@ -2209,6 +2234,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress'), self._make_task(20, 'pending')],
             done_count=0,
@@ -2235,6 +2261,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = None  # no harness-provided tree
 
         mock_deps['taskmaster'].get_tasks.return_value = {
@@ -2259,6 +2286,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = self._make_tree(
             [
                 self._make_task(1, 'in-progress'),
@@ -2289,6 +2317,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(1, 'in-progress')],  # only 1 active task
             done_count=5,
@@ -2319,6 +2348,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress')],
             done_count=1,
@@ -2345,6 +2375,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress')],
             done_count=3,
@@ -2369,6 +2400,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = None  # no harness-provided tree
 
         mock_deps['taskmaster'].get_tasks.return_value = {
@@ -2395,6 +2427,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         stage.filtered_task_tree = None  # trigger fallback self-fetch
 
         mock_deps['taskmaster'].get_tasks.return_value = {
@@ -2538,6 +2571,7 @@ class TestInvariantAfterTask643:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         # Construct invariant-violating tree: cancelled_count > 0 but cancelled_tasks is empty.
         # This state is impossible via filter_task_tree() but can arise from external
         # construction — exactly the case the task-828 defensive check guards against.
@@ -2594,6 +2628,7 @@ class TestInvariantAfterTask643:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
+        stage._current_run_id = 'test-run'
         # Construct invariant-violating tree: done_count > 0 but done_tasks is empty.
         # This state is impossible via filter_task_tree() but can arise from external
         # construction — exactly the case the task-782 defensive check guards against.
@@ -3188,6 +3223,7 @@ class TestStage2HandoffShortfallWarning:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         with caplog.at_level(
@@ -3240,6 +3276,7 @@ class TestStage2HandoffShortfallWarning:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         with caplog.at_level(
@@ -4832,6 +4869,7 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
 
         mock_deps['memory_service'].search.side_effect = RuntimeError('Mem0 unavailable')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -4857,6 +4895,7 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -5103,6 +5142,7 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 

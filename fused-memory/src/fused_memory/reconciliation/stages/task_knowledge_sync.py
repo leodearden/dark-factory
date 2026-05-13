@@ -1378,6 +1378,19 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
+        # Guard fires BEFORE the search so the run_id-dependent marker writes that
+        # follow (_sweep_stale_fixc_markers, _track_flag_persistence) cannot run
+        # with an empty run_id — defence-in-depth against a regression that the
+        # read-only _query_stage2_flags would have hidden.
+        if not self._current_run_id:
+            raise RuntimeError(
+                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
+                '_current_run_id is not set.  In production this is set '
+                'automatically by run().  In tests, assign '
+                'stage._current_run_id = "test-run" before calling '
+                'assemble_payload() directly.'
+            )
+
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
         # Returns (current_flags, stale_marker_ids): stale partition contains markers
@@ -1402,21 +1415,7 @@ class TaskKnowledgeSync(BaseStage):
         # (not active_flags); :func:`_sweep_stale_fixc_markers` (called below)
         # then deletes them from Mem0.  FIX D therefore only fires on Stage 1
         # re-flags surviving within the current run_id.
-        #
-        # run_id is needed when there are surviving flags OR stale markers to sweep;
-        # raise before any marker writes so the failure is loud and attributable.
-        # In tests: set `stage._current_run_id = 'test-run'` (or any non-empty
-        # string) before calling assemble_payload() with non-empty Mem0 search
-        # results.
         surviving_ids = [f['id'] for f in surviving]
-        if (surviving_ids or stale_marker_ids) and not self._current_run_id:
-            raise RuntimeError(
-                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
-                '_current_run_id is not set.  In production this is set '
-                'automatically by run().  In tests that return active Mem0 '
-                'flags, assign stage._current_run_id = "test-run" before '
-                'calling assemble_payload() directly.'
-            )
 
         # Sweep stale markers (prior-cycle residue) in parallel.  Best-effort:
         # individual failures log WARNING but are not re-raised.  The count is
