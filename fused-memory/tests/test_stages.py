@@ -32,6 +32,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsoli
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
+    Stage2FlagPartition,
     TaskKnowledgeSync,
     _check_flag_counter_completeness,
     _check_stall_guard_freshness,
@@ -4426,6 +4427,26 @@ class TestQueryStage2Flags:
         else:
             assert current_flags == []
             assert stale_marker_ids == ['test-id']
+
+
+class TestStage2FlagPartitionAnnotations:
+    """Pins the structural type contract promised by the Stage2FlagPartition docstring.
+
+    typing.get_type_hints() is used (rather than __annotations__ directly) because
+    task_knowledge_sync.py has ``from __future__ import annotations``, which stores
+    all annotations as ForwardRef strings at definition time.  get_type_hints()
+    evaluates those refs in the correct module namespace and returns the actual type
+    objects — the same view that static type checkers and runtime consumers see.
+    These assertions enforce that the field-level annotations match the contract
+    stated in the class docstring (list[dict] for current, list[str] for stale_ids)
+    and in the local-variable annotations already present in _query_stage2_flags.
+    """
+
+    def test_field_annotations_match_docstring_contract(self):
+        import typing
+        hints = typing.get_type_hints(Stage2FlagPartition)
+        assert hints['current'] == list[dict]
+        assert hints['stale_ids'] == list[str]
 
 
 class TestSweepStaleFixcMarkers:
