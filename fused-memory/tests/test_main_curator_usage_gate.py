@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
-from fused_memory.server.main import _resolve_curator_cost_store_path
+from fused_memory.server.main import _graceful_shutdown, _resolve_curator_cost_store_path
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.usage_gate import UsageGate
@@ -111,3 +111,54 @@ class TestResolveCuratorCostStorePath:
         path = _resolve_curator_cost_store_path(config)
 
         assert path == Path('./data/curator_events.db')
+
+
+# ---------------------------------------------------------------------------
+# step-5: _graceful_shutdown closes curator_cost_store
+# ---------------------------------------------------------------------------
+
+
+class TestGracefulShutdownClosesCuratorCostStore:
+    """step-5: _graceful_shutdown must await curator_cost_store.close() when provided."""
+
+    @pytest.mark.asyncio
+    async def test_curator_cost_store_closed_on_happy_path(self):
+        """curator_cost_store.close() must be awaited once on the happy path."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        curator_cost_store = MagicMock()
+        curator_cost_store.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=None,
+            curator_cost_store=curator_cost_store,
+        )
+
+        curator_cost_store.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_curator_cost_store_closed_even_when_memory_service_raises(self):
+        """curator_cost_store.close() must be awaited even if memory_service.close() raises.
+
+        Mirrors TestGracefulShutdownJournalClosedDespiteMemoryServiceError in
+        test_server_shutdown.py — each cleanup step runs under its own shield.
+        """
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock(side_effect=RuntimeError('memory close failed'))
+
+        curator_cost_store = MagicMock()
+        curator_cost_store.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=None,
+            curator_cost_store=curator_cost_store,
+        )
+
+        curator_cost_store.close.assert_awaited_once()
