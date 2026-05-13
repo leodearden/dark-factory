@@ -262,7 +262,7 @@ class TestReadCapIntervals:
 # Step-3 tests: merge_all_accounts_capped
 # ---------------------------------------------------------------------------
 
-from dashboard.data.cap_history import merge_all_accounts_capped  # noqa: E402
+from dashboard.data.cap_history import compute_overlap_ms, merge_all_accounts_capped  # noqa: E402
 
 
 def _iv(account: str, start: datetime, end: datetime | None) -> CapInterval:
@@ -392,3 +392,91 @@ class TestMergeAllAccountsCapped:
         assert abs((result[0][0] - t3).total_seconds()) < 1
         assert result[0][1] is not None
         assert abs((result[0][1] - t4).total_seconds()) < 1
+
+
+# ---------------------------------------------------------------------------
+# Step-5 tests: compute_overlap_ms
+# ---------------------------------------------------------------------------
+
+class TestComputeOverlapMs:
+    def _sec(self, s: float) -> int:
+        """Convert seconds to milliseconds."""
+        return int(s * 1000)
+
+    def test_empty_capped_returns_zero(self):
+        now = datetime.now(UTC)
+        assert compute_overlap_ms(now - timedelta(hours=1), now, []) == 0
+
+    def test_capped_entirely_before_window(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=2)
+        end = now - timedelta(hours=1)
+        # Capped interval ends before window starts
+        c_start = now - timedelta(hours=5)
+        c_end = now - timedelta(hours=3)
+        assert compute_overlap_ms(start, end, [(c_start, c_end)]) == 0
+
+    def test_capped_entirely_after_window(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=5)
+        end = now - timedelta(hours=4)
+        c_start = now - timedelta(hours=2)
+        c_end = now - timedelta(hours=1)
+        assert compute_overlap_ms(start, end, [(c_start, c_end)]) == 0
+
+    def test_capped_contains_full_window(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=2)
+        end = now - timedelta(hours=1)
+        c_start = now - timedelta(hours=3)
+        c_end = now
+        expected = self._sec(3600)  # 1 hour
+        assert compute_overlap_ms(start, end, [(c_start, c_end)]) == expected
+
+    def test_capped_starts_before_ends_inside(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=2)
+        end = now - timedelta(hours=1)
+        c_start = now - timedelta(hours=3)
+        c_end = now - timedelta(minutes=90)  # ends 30 min into window
+        expected = self._sec(1800)  # 30 min
+        assert compute_overlap_ms(start, end, [(c_start, c_end)]) == expected
+
+    def test_capped_starts_inside_ends_after(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=2)
+        end = now - timedelta(hours=1)
+        c_start = now - timedelta(minutes=90)  # starts 30 min into window
+        c_end = now
+        expected = self._sec(1800)  # 30 min
+        assert compute_overlap_ms(start, end, [(c_start, c_end)]) == expected
+
+    def test_capped_strictly_inside_window(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=3)
+        end = now - timedelta(hours=1)
+        c_start = now - timedelta(hours=2, minutes=30)
+        c_end = now - timedelta(hours=1, minutes=30)
+        expected = self._sec(3600)  # 1 hour
+        assert compute_overlap_ms(start, end, [(c_start, c_end)]) == expected
+
+    def test_capped_open_ended_starts_before_end(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=2)
+        end = now - timedelta(hours=1)
+        c_start = now - timedelta(hours=3)
+        # c_end = None → clamp to end
+        expected = self._sec(3600)  # full window
+        assert compute_overlap_ms(start, end, [(c_start, None)]) == expected
+
+    def test_multiple_capped_tuples_summed(self):
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=4)
+        end = now
+        # Two non-overlapping capped intervals: each 30 min
+        c1_start = now - timedelta(hours=3)
+        c1_end = now - timedelta(hours=2, minutes=30)  # 30 min
+        c2_start = now - timedelta(hours=1)
+        c2_end = now - timedelta(minutes=30)  # 30 min
+        expected = self._sec(3600)  # 30 + 30 min
+        assert compute_overlap_ms(start, end, [(c1_start, c1_end), (c2_start, c2_end)]) == expected
