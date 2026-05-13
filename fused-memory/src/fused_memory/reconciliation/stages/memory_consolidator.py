@@ -402,3 +402,43 @@ def _format_watermark(watermark: Watermark) -> str:
         f'Last full run: {watermark.last_full_run_id} '
         f'at {watermark.last_full_run_completed.isoformat()}'
     )
+
+
+def format_snapshot_fact(
+    *,
+    as_of: datetime,
+    project_id: str,
+    counts: dict[str, int],
+) -> str:
+    """Return a canonical temporal-fact snapshot string for task-count snapshots.
+
+    The returned string encodes the effective ISO date directly in the fact text
+    so the temporal anchor is human-readable even if ``valid_at`` metadata is not
+    surfaced by the search caller.  Example output::
+
+        As of 2026-05-13: project dark_factory has 42 total tasks, 18 done, 5 in_progress, 3 blocked.
+
+    Args:
+        as_of: Timezone-aware datetime representing the effective date of the snapshot.
+            Raises ``ValueError`` for tz-naive datetimes to prevent ambiguous timestamps.
+        project_id: Project identifier (e.g. ``"dark_factory"``).
+        counts: Mapping of label → count (e.g. ``{"total": 42, "done": 18}``).
+            All keys present in *counts* appear in the output in alphabetical order
+            so that cycle-over-cycle diffs are stable.  Zero values are included.
+
+    Returns:
+        Canonical fact string ending with a period.
+
+    Raises:
+        ValueError: If *as_of* is timezone-naive.
+    """
+    if as_of.tzinfo is None:
+        raise ValueError(
+            'format_snapshot_fact requires tz-aware as_of; got a naive datetime. '
+            'Pass e.g. datetime(..., tzinfo=UTC).'
+        )
+    iso_date = as_of.date().isoformat()
+    count_parts = ', '.join(
+        f'{v} {k}' for k, v in sorted(counts.items())
+    )
+    return f'As of {iso_date}: project {project_id} has {count_parts}.'
