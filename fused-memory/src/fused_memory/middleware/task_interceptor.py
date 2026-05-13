@@ -103,6 +103,7 @@ def _resolve_backend_label(taskmaster: Any) -> str:
         return 'sqlite_task_backend'
     return 'unknown'
 
+
 # Terminal statuses the server refuses to exit without a reopen_reason.
 # Duplicated from orchestrator.task_status.TERMINAL_STATUSES — the server
 # and orchestrator are independent modules, and the set is effectively
@@ -345,9 +346,7 @@ class TaskInterceptor:
         ji = self._write_journal
         write_op_id = str(uuid_mod.uuid4())
         backend_label = _resolve_backend_label(self.taskmaster)
-        project_id = (
-            resolve_project_id(project_root) if project_root else None
-        )
+        project_id = resolve_project_id(project_root) if project_root else None
         if ji is not None:
             try:
                 await ji.log_write_op(
@@ -493,9 +492,7 @@ class TaskInterceptor:
         # Cancel all per-project curator workers so they stop blocking on
         # curator.curate().  Gather all tasks regardless of done-state so we
         # can detect any task that raised unexpectedly.
-        running_workers = [
-            t for t in self._worker_tasks.values() if not t.done()
-        ]
+        running_workers = [t for t in self._worker_tasks.values() if not t.done()]
         for t in running_workers:
             t.cancel()
         if running_workers:
@@ -685,11 +682,14 @@ class TaskInterceptor:
                     # Read-modify-write so the audit fields don't clobber the
                     # row's pre-existing metadata (memory_hints, files, …).
                     # `before` was fetched at the top of this method.
-                    merged_meta = _merged_audit_metadata(before, {
-                        'reopen_reason': reason,
-                        'reopen_from': old_status,
-                        'reopen_at': datetime.now(UTC).isoformat(),
-                    })
+                    merged_meta = _merged_audit_metadata(
+                        before,
+                        {
+                            'reopen_reason': reason,
+                            'reopen_from': old_status,
+                            'reopen_at': datetime.now(UTC).isoformat(),
+                        },
+                    )
                     await tm.update_task(
                         task_id=task_id,
                         metadata=json.dumps(merged_meta),
@@ -698,7 +698,9 @@ class TaskInterceptor:
                     )
                 except Exception as e:
                     logger.warning(
-                        'Failed to persist reopen_reason for task %s: %s', task_id, e,
+                        'Failed to persist reopen_reason for task %s: %s',
+                        task_id,
+                        e,
                     )
 
             # 2b. Done-provenance gate: validate done_provenance first (kind +
@@ -715,7 +717,9 @@ class TaskInterceptor:
             # the original gate behaviour.
             if status == 'done':
                 validation_err, resolved_provenance = await _validate_done_provenance(
-                    task_id, done_provenance, project_root,
+                    task_id,
+                    done_provenance,
+                    project_root,
                     require=self._require_done_provenance(),
                 )
                 if validation_err is not None:
@@ -723,8 +727,10 @@ class TaskInterceptor:
 
                 _verified_provenance = (
                     isinstance(resolved_provenance, dict)
-                    and resolved_provenance.get('kind') in (
-                        'merged', 'found_on_main',
+                    and resolved_provenance.get('kind')
+                    in (
+                        'merged',
+                        'found_on_main',
                     )
                     and resolved_provenance.get('commit') is not None
                 )
@@ -734,7 +740,9 @@ class TaskInterceptor:
                         missing = _missing_files(project_root, declared)
                         if missing:
                             return _done_gate_error(
-                                task_id, declared, missing,
+                                task_id,
+                                declared,
+                                missing,
                             )
 
                 if resolved_provenance is not None:
@@ -742,7 +750,8 @@ class TaskInterceptor:
                         # Read-modify-write: preserve memory_hints / files /
                         # spawned_from instead of replacing the whole blob.
                         merged_meta = _merged_audit_metadata(
-                            before, {'done_provenance': resolved_provenance},
+                            before,
+                            {'done_provenance': resolved_provenance},
                         )
                         await tm.update_task(
                             task_id=task_id,
@@ -752,7 +761,9 @@ class TaskInterceptor:
                         )
                     except Exception as e:
                         logger.warning(
-                            'Failed to persist done_provenance for task %s: %s', task_id, e,
+                            'Failed to persist done_provenance for task %s: %s',
+                            task_id,
+                            e,
                         )
 
             # 3. Execute status change. Convert the typed DTO to a plain
@@ -768,7 +779,9 @@ class TaskInterceptor:
 
         # 5. Emit event
         payload: dict[str, Any] = {
-            'task_id': task_id, 'old_status': old_status, 'new_status': status,
+            'task_id': task_id,
+            'old_status': old_status,
+            'new_status': status,
         }
         if resolved_provenance is not None:
             payload['done_provenance'] = resolved_provenance
@@ -885,7 +898,8 @@ class TaskInterceptor:
             if count > 0:
                 logger.debug(
                     'task_curator: corpus for project %s has %d points — skipping auto-backfill',
-                    project_id, count,
+                    project_id,
+                    count,
                 )
                 return
 
@@ -897,7 +911,8 @@ class TaskInterceptor:
                 flat_tasks = flatten_task_tree(tasks_result)
             except Exception:
                 logger.warning(
-                    'task_curator: auto-backfill: get_tasks failed', exc_info=True,
+                    'task_curator: auto-backfill: get_tasks failed',
+                    exc_info=True,
                 )
                 return
 
@@ -907,13 +922,15 @@ class TaskInterceptor:
             try:
                 result = await curator.backfill_corpus(flat_tasks, project_id)
                 logger.info(
-                    'task_curator: auto-backfill complete — '
-                    'upserted=%d skipped=%d errors=%d',
-                    result.upserted, result.skipped, result.errors,
+                    'task_curator: auto-backfill complete — upserted=%d skipped=%d errors=%d',
+                    result.upserted,
+                    result.skipped,
+                    result.errors,
                 )
             except Exception:
                 logger.warning(
-                    'task_curator: auto-backfill failed', exc_info=True,
+                    'task_curator: auto-backfill failed',
+                    exc_info=True,
                 )
 
         except Exception:
@@ -1165,7 +1182,8 @@ class TaskInterceptor:
         except Exception as exc:
             logger.warning(
                 'combine-guard: get_task failed for target=%s: %s — aborting combine',
-                decision.target_id, exc,
+                decision.target_id,
+                exc,
             )
             return None
 
@@ -1182,7 +1200,8 @@ class TaskInterceptor:
             logger.warning(
                 'combine-guard: target %s has terminal status %r — aborting '
                 'combine to avoid silently losing candidate work',
-                decision.target_id, target_status,
+                decision.target_id,
+                target_status,
             )
             return None
 
@@ -1206,14 +1225,14 @@ class TaskInterceptor:
         # column; readers parse it back from the FILES_TO_MODIFY marker —
         # kept for compatibility with existing parsers).
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
-        details_with_files = (
-            f'FILES_TO_MODIFY:\n{files_block}\n\nDETAILS:\n{rt.details}'
+        details_with_files = f'FILES_TO_MODIFY:\n{files_block}\n\nDETAILS:\n{rt.details}'
+        combine_metadata = json.dumps(
+            {
+                'curator_action': 'combine',
+                'curator_justification': decision.justification[:500],
+                'combined_at': datetime.now(UTC).isoformat(),
+            }
         )
-        combine_metadata = json.dumps({
-            'curator_action': 'combine',
-            'curator_justification': decision.justification[:500],
-            'combined_at': datetime.now(UTC).isoformat(),
-        })
 
         # ── Audit: persist old-vs-new BEFORE the mutation so we can
         # recover if the write crashes mid-flight.
@@ -1229,20 +1248,23 @@ class TaskInterceptor:
         )
 
         try:
-            return dict(await tm.update_task(
-                task_id=decision.target_id,
-                project_root=project_root,
-                metadata=combine_metadata,
-                append=False,
-                title=rt.title,
-                description=rt.description,
-                details=details_with_files,
-                priority=rt.priority,
-            ))
+            return dict(
+                await tm.update_task(
+                    task_id=decision.target_id,
+                    project_root=project_root,
+                    metadata=combine_metadata,
+                    append=False,
+                    title=rt.title,
+                    description=rt.description,
+                    details=details_with_files,
+                    priority=rt.priority,
+                )
+            )
         except Exception as exc:
             logger.warning(
                 'task_curator: combine update failed for target=%s: %s',
-                decision.target_id, exc,
+                decision.target_id,
+                exc,
             )
             return None
 
@@ -1306,7 +1328,10 @@ class TaskInterceptor:
         return None
 
     async def _check_escalation_idempotency(
-        self, *, project_root: str, metadata,
+        self,
+        *,
+        project_root: str,
+        metadata,
     ) -> dict | None:
         """Return an existing task's identity if ``(escalation_id,
         suggestion_hash)`` in ``metadata`` matches a non-cancelled task.
@@ -1332,7 +1357,8 @@ class TaskInterceptor:
             tasks_result = await self.taskmaster.get_tasks(project_root)
         except Exception:
             logger.debug(
-                'r4: get_tasks failed during idempotency check', exc_info=True,
+                'r4: get_tasks failed during idempotency check',
+                exc_info=True,
             )
             return None
         for task in flatten_task_tree(tasks_result):
@@ -1351,7 +1377,9 @@ class TaskInterceptor:
             logger.warning(
                 'r4: idempotency hit — returning existing task %s for '
                 'escalation_id=%s suggestion_hash=%s',
-                tid, esc_id, sug_hash,
+                tid,
+                esc_id,
+                sug_hash,
             )
             return {
                 'id': tid,
@@ -1385,10 +1413,16 @@ class TaskInterceptor:
         retry.
         """
         if self._closed:
-            return {'error': 'TaskInterceptor is closed; cannot submit new tasks', 'error_type': 'ClosedError'}
+            return {
+                'error': 'TaskInterceptor is closed; cannot submit new tasks',
+                'error_type': 'ClosedError',
+            }
 
         if self._ticket_store is None:
-            return {'error': 'ticket_store not configured; cannot use submit_task', 'error_type': 'ConfigError'}
+            return {
+                'error': 'ticket_store not configured; cannot use submit_task',
+                'error_type': 'ConfigError',
+            }
 
         if err := await self._backlog_gate(project_root):
             return err
@@ -1422,11 +1456,13 @@ class TaskInterceptor:
         # ValidationError rather than silently storing a mangled blob that the
         # worker cannot faithfully execute.
         try:
-            blob = json.dumps({
-                'project_root': project_root,
-                'kwargs': kwargs,
-                'metadata': metadata,
-            })
+            blob = json.dumps(
+                {
+                    'project_root': project_root,
+                    'kwargs': kwargs,
+                    'metadata': metadata,
+                }
+            )
         except (TypeError, ValueError) as exc:
             return {
                 'error': f'submit_task: non-serialisable argument — {exc}',
@@ -1521,7 +1557,8 @@ class TaskInterceptor:
                 )
             except Exception as exc:
                 logger.exception(
-                    'submit_task[planning_mode]: tm.add_task failed for project=%s', project_id,
+                    'submit_task[planning_mode]: tm.add_task failed for project=%s',
+                    project_id,
                 )
                 return {'error': str(exc), 'error_type': type(exc).__name__}
 
@@ -1535,7 +1572,8 @@ class TaskInterceptor:
             except Exception as exc:
                 logger.warning(
                     'submit_task[planning_mode]: deferred-flip failed for task %s: %s',
-                    task_id_str, exc,
+                    task_id_str,
+                    exc,
                 )
                 # Task exists in pending — emit task_created so observers see it,
                 # then return with a warning so the planner can retry the flip.
@@ -1625,7 +1663,8 @@ class TaskInterceptor:
             except RuntimeError as exc:
                 logger.debug(
                     'resolve_ticket: ticket_store closed during initial read for %s: %s',
-                    ticket, exc,
+                    ticket,
+                    exc,
                 )
                 return ({'status': 'failed', 'reason': 'server_closed', 'task_id': None}, None)
             if row is None:
@@ -1653,7 +1692,8 @@ class TaskInterceptor:
             except RuntimeError as exc:
                 logger.debug(
                     'resolve_ticket: ticket_store closed during post_wake read for %s: %s',
-                    ticket, exc,
+                    ticket,
+                    exc,
                 )
                 return ({'status': 'failed', 'reason': 'server_closed', 'task_id': None}, None)
             if row is None:
@@ -1732,6 +1772,59 @@ class TaskInterceptor:
             'count': len(rows),
             'rows': rows,
         }
+
+    async def cancel_ticket(self, ticket_id: str) -> dict:
+        """Cancel a pending curator ticket by ticket_id.
+
+        Four outcomes:
+        - config_error: ticket store not configured (server misconfiguration) →
+                        ``{'error': 'ticket_store not configured',
+                           'error_type': 'ConfigError', 'ticket_id': ticket_id}``
+        - not_found:    ticket does not exist →
+                        ``{'error': 'not_found', 'ticket_id': ticket_id}``
+        - no_op:        ticket row exists but is already in a terminal/non-pending
+                        status (including TOCTOU race) →
+                        ``{'status': <current>, 'ticket_id': ticket_id,
+                        'no_op': True}``
+        - cancelled:    ticket was pending and we won the race → marks it
+                        cancelled, signals any resolve_ticket waiter, returns
+                        ``{'status': 'cancelled', 'ticket_id': ticket_id}``
+
+        v1 trade-off: in-flight curator/LLM calls are NOT interrupted.
+        ``_prepare_ticket`` drops non-pending rows when the worker dequeues
+        them, so queued-but-not-started tickets are cleaned up automatically.
+
+        Race handling: ``mark_resolved`` has a ``WHERE status='pending'`` guard
+        and returns ``False`` if a concurrent writer terminated the ticket
+        between our ``get`` and the ``UPDATE``.  In that case we re-fetch the
+        actual status and return the no_op shape so callers always see the
+        persisted truth.  We call ``_signal_ticket_event`` regardless; if the
+        race winner already signalled, it is a harmless no-op on an empty list.
+        """
+        if self._ticket_store is None:
+            return {
+                'error': 'ticket_store not configured',
+                'error_type': 'ConfigError',
+                'ticket_id': ticket_id,
+            }
+        row = await self._ticket_store.get(ticket_id)
+        if row is None:
+            return {'error': 'not_found', 'ticket_id': ticket_id}
+        if row['status'] != 'pending':
+            return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
+        did_cancel = await self._ticket_store.mark_resolved(
+            ticket_id, status='cancelled', reason='user_cancelled'
+        )
+        self._signal_ticket_event(ticket_id)
+        if not did_cancel:
+            # TOCTOU race: concurrent writer terminated the ticket between our
+            # get() and the UPDATE.  Re-fetch the actual status and return the
+            # no_op shape so callers see the persisted truth.
+            row = await self._ticket_store.get(ticket_id)
+            if row is None:
+                return {'error': 'not_found', 'ticket_id': ticket_id}
+            return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
+        return {'status': 'cancelled', 'ticket_id': ticket_id}
 
     def _start_worker_if_needed(self, project_id: str) -> None:
         """Lazily start the per-project curator worker asyncio.Task if not running.
@@ -1816,15 +1909,11 @@ class TaskInterceptor:
         # code path that runs in production.
         _raw = getattr(curator_cfg, 'batch_max', None)
         batch_max: int = (
-            _raw
-            if isinstance(_raw, int) and not isinstance(_raw, bool) and _raw >= 1
-            else 5
+            _raw if isinstance(_raw, int) and not isinstance(_raw, bool) and _raw >= 1 else 5
         )
         _tt = getattr(curator_cfg, 'batch_token_threshold', None)
         threshold_tokens: int = (
-            _tt
-            if isinstance(_tt, int) and not isinstance(_tt, bool) and _tt >= 1
-            else 50_000
+            _tt if isinstance(_tt, int) and not isinstance(_tt, bool) and _tt >= 1 else 50_000
         )
 
         # Carries one ticket between cycles when adding it would have pushed
@@ -1869,11 +1958,7 @@ class TaskInterceptor:
                             # accounting still needs the get to be balanced.
                             queue.task_done()
                             continue
-                        if (
-                            prepared_batch
-                            and batch_tokens + prep.prompt_tokens
-                            > threshold_tokens
-                        ):
+                        if prepared_batch and batch_tokens + prep.prompt_tokens > threshold_tokens:
                             # Park as lookahead; do NOT add to batch.  The
                             # corresponding queue.task_done() runs below in
                             # the success/finally branch only for tickets
@@ -1906,10 +1991,11 @@ class TaskInterceptor:
                         '_curator_worker: AllAccountsCappedException for '
                         'project %s (retries=%d, elapsed=%.1fs); deferring '
                         '%d batch tickets%s and waiting for cap reset',
-                        project_id, exc.retries, exc.elapsed_secs,
+                        project_id,
+                        exc.retries,
+                        exc.elapsed_secs,
                         len(batch_ticket_ids),
-                        ' (+1 lookahead held in worker)'
-                        if lookahead_ticket_id is not None else '',
+                        ' (+1 lookahead held in worker)' if lookahead_ticket_id is not None else '',
                     )
                     for tid in batch_ticket_ids:
                         queue.put_nowait(tid)
@@ -1919,7 +2005,8 @@ class TaskInterceptor:
                     logger.exception(
                         '_curator_worker: unhandled error processing batch '
                         'of %d tickets for project %s',
-                        len(batch_ticket_ids), project_id,
+                        len(batch_ticket_ids),
+                        project_id,
                     )
                     # Terminalise every ticket in the batch so they don't sit
                     # ``pending`` waiting for a wall-clock janitor sweep —
@@ -1973,7 +2060,8 @@ class TaskInterceptor:
         if row['status'] != 'pending':
             logger.warning(
                 '_prepare_ticket: ticket %s already terminal (%s), skipping',
-                ticket_id, row['status'],
+                ticket_id,
+                row['status'],
             )
             return None
 
@@ -1981,10 +2069,13 @@ class TaskInterceptor:
             blob = json.loads(row['candidate_json'])
         except Exception:
             logger.exception(
-                '_prepare_ticket: bad candidate_json for %s', ticket_id,
+                '_prepare_ticket: bad candidate_json for %s',
+                ticket_id,
             )
             await self._ticket_store.mark_resolved(
-                ticket_id, status='failed', reason='bad_candidate_json',
+                ticket_id,
+                status='failed',
+                reason='bad_candidate_json',
             )
             self._signal_ticket_event(ticket_id)
             return None
@@ -2005,7 +2096,9 @@ class TaskInterceptor:
             if curator is not None:
                 try:
                     prepared = await curator.prepare_candidate(
-                        candidate, project_id, project_root,
+                        candidate,
+                        project_id,
+                        project_root,
                     )
                 except Exception:
                     # prepare_candidate already swallows corpus-build failure
@@ -2014,8 +2107,8 @@ class TaskInterceptor:
                     # to a per-ticket curate() call inside the prepared
                     # variant of _process_add_tickets_batch.
                     logger.exception(
-                        '_prepare_ticket: curator.prepare_candidate failed '
-                        'for ticket %s', ticket_id,
+                        '_prepare_ticket: curator.prepare_candidate failed for ticket %s',
+                        ticket_id,
                     )
 
         return _PreparedTicket(
@@ -2074,7 +2167,9 @@ class TaskInterceptor:
                     rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
                     bg = asyncio.create_task(
                         curator.reembed_task(
-                            decision.target_id, rt_candidate, project_id,
+                            decision.target_id,
+                            rt_candidate,
+                            project_id,
                         ),
                         name=f'curator-reembed-{decision.target_id}',
                     )
@@ -2084,7 +2179,8 @@ class TaskInterceptor:
                     'id': decision.target_id,
                     'title': (
                         decision.rewritten_task.title
-                        if decision.rewritten_task else (candidate.title if candidate else '')
+                        if decision.rewritten_task
+                        else (candidate.title if candidate else '')
                     ),
                     'deduplicated': True,
                     'action': 'combine',
@@ -2108,9 +2204,7 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         metadata_json: str | None = None
         if metadata:
-            metadata_json = (
-                metadata if isinstance(metadata, str) else json.dumps(metadata)
-            )
+            metadata_json = metadata if isinstance(metadata, str) else json.dumps(metadata)
 
         async with self._write_lock(project_id):
             try:
@@ -2148,7 +2242,8 @@ class TaskInterceptor:
                 except Exception as e:
                     logger.warning(
                         '_dispatch_ticket_decision: metadata follow-up for %s failed: %s',
-                        task_id_str, e,
+                        task_id_str,
+                        e,
                     )
 
             # note_created + record_task under curator_lock + write_lock
@@ -2166,7 +2261,8 @@ class TaskInterceptor:
                 except Exception as exc:
                     logger.warning(
                         '_dispatch_ticket_decision: curator.note_created failed for %s: %s',
-                        task_id_str, exc,
+                        task_id_str,
+                        exc,
                     )
                     result_dict.setdefault('post_create_warnings', []).append(
                         {'stage': 'note_created', 'error': str(exc)}
@@ -2176,7 +2272,8 @@ class TaskInterceptor:
                 except Exception as exc:
                     logger.warning(
                         '_dispatch_ticket_decision: curator.record_task failed for %s',
-                        task_id_str, exc_info=True,
+                        task_id_str,
+                        exc_info=True,
                     )
                     result_dict.setdefault('post_create_warnings', []).append(
                         {'stage': 'record_task', 'error': str(exc)}
@@ -2211,7 +2308,8 @@ class TaskInterceptor:
         if row['status'] != 'pending':
             logger.warning(
                 '_process_add_ticket: ticket %s already terminal (%s), skipping',
-                ticket_id, row['status'],
+                ticket_id,
+                row['status'],
             )
             return
 
@@ -2220,7 +2318,9 @@ class TaskInterceptor:
         except Exception:
             logger.exception('_process_add_ticket: bad candidate_json for %s', ticket_id)
             await self._ticket_store.mark_resolved(
-                ticket_id, status='failed', reason='bad_candidate_json',
+                ticket_id,
+                status='failed',
+                reason='bad_candidate_json',
             )
             self._signal_ticket_event(ticket_id)
             return
@@ -2257,7 +2357,8 @@ class TaskInterceptor:
                 # metadata matches a non-cancelled existing task — avoids duplicate
                 # tasks when reconciliation retries an escalation suggestion.
                 idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=project_root, metadata=metadata,
+                    project_root=project_root,
+                    metadata=metadata,
                 )
                 if idempotency_hit is not None:
                     existing_task_id = str(idempotency_hit.get('id', ''))
@@ -2281,7 +2382,8 @@ class TaskInterceptor:
                         logger.warning(
                             '_process_add_ticket: curator.curate raised CuratorFailureError '
                             'for %s; degrading to create. reason=%s',
-                            ticket_id, exc,
+                            ticket_id,
+                            exc,
                         )
                         # Degrade gracefully to create — avoids losing the task on
                         # transient LLM failures.  Record the failure so the facade
@@ -2289,18 +2391,16 @@ class TaskInterceptor:
                         curator_degrade_reason = str(exc)
                         decision = CuratorDecision(action='create')
 
-                status, task_id, reason, result_dict, _ = (
-                    await self._dispatch_ticket_decision(
-                        ticket_id=ticket_id,
-                        project_root=project_root,
-                        project_id=project_id,
-                        candidate=candidate,
-                        decision=decision,
-                        kwargs=kwargs,
-                        metadata=metadata,
-                        curator=curator,
-                        curator_degrade_reason=curator_degrade_reason,
-                    )
+                status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
+                    ticket_id=ticket_id,
+                    project_root=project_root,
+                    project_id=project_id,
+                    candidate=candidate,
+                    decision=decision,
+                    kwargs=kwargs,
+                    metadata=metadata,
+                    curator=curator,
+                    curator_degrade_reason=curator_degrade_reason,
                 )
 
         except asyncio.CancelledError:
@@ -2314,7 +2414,8 @@ class TaskInterceptor:
             # already terminal), so calling it twice is harmless.
             logger.debug(
                 '_process_add_ticket: cancelled for ticket %s; persisting status=%s',
-                ticket_id, status,
+                ticket_id,
+                status,
             )
             try:
                 await asyncio.shield(
@@ -2322,12 +2423,10 @@ class TaskInterceptor:
                         ticket_id,
                         status=status,
                         task_id=task_id,
-                        reason=reason if reason else (
-                            'cancelled_during_write' if status != 'created' else None
-                        ),
-                        result_json=(
-                            json.dumps(result_dict) if result_dict is not None else None
-                        ),
+                        reason=reason
+                        if reason
+                        else ('cancelled_during_write' if status != 'created' else None),
+                        result_json=(json.dumps(result_dict) if result_dict is not None else None),
                     )
                 )
                 self._signal_ticket_event(ticket_id)
@@ -2342,7 +2441,8 @@ class TaskInterceptor:
 
         except Exception as exc:
             logger.exception(
-                '_process_add_ticket: unexpected error for ticket %s', ticket_id,
+                '_process_add_ticket: unexpected error for ticket %s',
+                ticket_id,
             )
             if status == 'created':
                 # Failure happened after tm.add_task succeeded — preserve the
@@ -2350,7 +2450,9 @@ class TaskInterceptor:
                 # facade and callers can surface it without losing the task.
                 logger.warning(
                     '_process_add_ticket: post-create error for ticket %s, task %s: %s',
-                    ticket_id, task_id, exc,
+                    ticket_id,
+                    task_id,
+                    exc,
                 )
                 if result_dict is None:
                     result_dict = {}
@@ -2409,7 +2511,8 @@ class TaskInterceptor:
             await self._process_add_tickets_batch_prepared(prepared)
 
     async def _process_add_tickets_batch_prepared(
-        self, prepared_tickets: list[_PreparedTicket],
+        self,
+        prepared_tickets: list[_PreparedTicket],
     ) -> None:
         """Run the full curator + write pipeline for a batch of pre-prepared tickets.
 
@@ -2444,17 +2547,16 @@ class TaskInterceptor:
         # invariant).  Reject mixed-project batches defensively.
         project_id = prepared_tickets[0].project_id
         project_root = prepared_tickets[0].project_root
-        ticket_data = [
-            t for t in prepared_tickets
-            if t.project_id == project_id
-        ]
+        ticket_data = [t for t in prepared_tickets if t.project_id == project_id]
         if len(ticket_data) != len(prepared_tickets):
             for t in prepared_tickets:
                 if t.project_id != project_id:
                     logger.warning(
                         '_process_add_tickets_batch_prepared: ticket %s has '
                         'project_id=%s, expected %s; skipping',
-                        t.ticket_id, t.project_id, project_id,
+                        t.ticket_id,
+                        t.project_id,
+                        project_id,
                     )
 
         # ── Curator + dispatch under a single curator_lock ─────────────────────
@@ -2467,7 +2569,8 @@ class TaskInterceptor:
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
                 idempotency_hit = await self._check_escalation_idempotency(
-                    project_root=t.project_root, metadata=t.metadata,
+                    project_root=t.project_root,
+                    metadata=t.metadata,
                 )
                 if idempotency_hit is not None:
                     existing_id = str(idempotency_hit.get('id', ''))
@@ -2490,11 +2593,13 @@ class TaskInterceptor:
             # already-prepared bundles so the curator skips the second
             # corpus build it would otherwise do inside curate_batch.
             non_none_prepared: list[PreparedCandidate] = [
-                t.prepared for t in ticket_data
+                t.prepared
+                for t in ticket_data
                 if t.candidate is not None and t.prepared is not None
             ]
             non_none_to_ticket_data = [
-                i for i, t in enumerate(ticket_data)
+                i
+                for i, t in enumerate(ticket_data)
                 if t.candidate is not None and t.prepared is not None
             ]
             # Tickets that have a candidate but no prepared bundle — usually
@@ -2505,7 +2610,8 @@ class TaskInterceptor:
             # decision for them instead of falling straight through to
             # ``tm.add_task`` (the latter would silently bypass the gate).
             unprepared_indices: list[int] = [
-                i for i, t in enumerate(ticket_data)
+                i
+                for i, t in enumerate(ticket_data)
                 if t.candidate is not None and t.prepared is None
             ]
             # Per-ticket curator degrade reason (populated on fallback path).
@@ -2516,7 +2622,9 @@ class TaskInterceptor:
             if curator is not None and non_none_prepared:
                 try:
                     batch_decisions = await curator.curate_batch_prepared(
-                        non_none_prepared, project_id, project_root,
+                        non_none_prepared,
+                        project_id,
+                        project_root,
                     )
                     # Map decisions back to ticket_data-space (some candidates
                     # are None).  batch_target_index emitted by the curator is
@@ -2531,9 +2639,7 @@ class TaskInterceptor:
                             decisions.append(None)
                             continue
                         bd = (
-                            batch_decisions[batch_idx]
-                            if batch_idx < len(batch_decisions)
-                            else None
+                            batch_decisions[batch_idx] if batch_idx < len(batch_decisions) else None
                         )
                         # Remap batch_target_index: non_none-space → ticket_data-space.
                         if bd is not None and bd.batch_target_index is not None:
@@ -2541,7 +2647,8 @@ class TaskInterceptor:
                             if 0 <= local_bti < len(non_none_to_ticket_data):
                                 remapped_bti = non_none_to_ticket_data[local_bti]
                                 bd = dataclasses.replace(
-                                    bd, batch_target_index=remapped_bti,
+                                    bd,
+                                    batch_target_index=remapped_bti,
                                 )
                             else:
                                 # Out-of-range in non_none-space: degrade to
@@ -2551,15 +2658,13 @@ class TaskInterceptor:
                                     'batch_target_index=%d out of non_none '
                                     'range [0, %d) for ticket %s; degrading '
                                     'to create',
-                                    local_bti, len(non_none_to_ticket_data),
+                                    local_bti,
+                                    len(non_none_to_ticket_data),
                                     t.ticket_id,
                                 )
                                 bd = CuratorDecision(
                                     action='create',
-                                    justification=(
-                                        f'batch-target-out-of-range: '
-                                        f'local={local_bti}'
-                                    ),
+                                    justification=(f'batch-target-out-of-range: local={local_bti}'),
                                 )
                         decisions.append(bd)
                         batch_idx += 1
@@ -2584,7 +2689,8 @@ class TaskInterceptor:
                         'curate_batch_prepared raised CuratorFailureError '
                         'for project %s; falling back to %d individual '
                         'curate() calls',
-                        project_id, len(non_none_prepared),
+                        project_id,
+                        len(non_none_prepared),
                     )
                     decisions = []
                     for i, t in enumerate(ticket_data):
@@ -2593,7 +2699,9 @@ class TaskInterceptor:
                             continue
                         try:
                             d = await curator.curate(
-                                t.candidate, project_id, project_root,
+                                t.candidate,
+                                project_id,
+                                project_root,
                             )
                             decisions.append(d)
                         except CuratorFailureError as e:
@@ -2606,7 +2714,8 @@ class TaskInterceptor:
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared failed for project %s; '
                         'degrading all %d candidates to create',
-                        project_id, len(non_none_prepared),
+                        project_id,
+                        len(non_none_prepared),
                     )
                     decisions = [None] * len(ticket_data)
             else:
@@ -2626,7 +2735,9 @@ class TaskInterceptor:
                         continue
                     try:
                         decisions[i] = await curator.curate(
-                            t.candidate, project_id, project_root,
+                            t.candidate,
+                            project_id,
+                            project_root,
                         )
                     except CuratorFailureError as exc:
                         decisions[i] = CuratorDecision(action='create')
@@ -2662,11 +2773,7 @@ class TaskInterceptor:
                     # Resolve the decision: if this is a within-batch drop, substitute
                     # the sibling's task_id (or degrade to create if sibling failed).
                     effective_decision = dec
-                    if (
-                        dec is not None
-                        and dec.action == 'drop'
-                        and batch_target is not None
-                    ):
+                    if dec is not None and dec.action == 'drop' and batch_target is not None:
                         sibling_task_id = resolved_task_ids.get(batch_target)
                         if sibling_task_id:
                             # Sibling created or combined — use its task_id.
@@ -2674,8 +2781,7 @@ class TaskInterceptor:
                                 action='drop',
                                 target_id=sibling_task_id,
                                 justification=(
-                                    f'batch_target_index={batch_target}: '
-                                    f'{dec.justification}'
+                                    f'batch_target_index={batch_target}: {dec.justification}'
                                 ),
                             )
                         else:
@@ -2684,7 +2790,8 @@ class TaskInterceptor:
                                 '_process_add_tickets_batch_prepared: '
                                 'batch_target_index=%d for ticket %s had no '
                                 'task_id; degrading to create',
-                                batch_target, ticket_data[i].ticket_id,
+                                batch_target,
+                                ticket_data[i].ticket_id,
                             )
                             effective_decision = CuratorDecision(
                                 action='create',
@@ -2698,29 +2805,33 @@ class TaskInterceptor:
                     result_dict: dict | None = None
 
                     try:
-                        status, task_id, reason, result_dict, _ = (
-                            await self._dispatch_ticket_decision(
-                                ticket_id=t.ticket_id,
-                                project_root=t.project_root,
-                                project_id=project_id,
-                                candidate=t.candidate,
-                                decision=effective_decision,
-                                kwargs=t.kwargs,
-                                metadata=t.metadata,
-                                curator=curator,
-                                curator_degrade_reason=(
-                                    curator_degrade_reasons[i]
-                                    if i < len(curator_degrade_reasons)
-                                    else None
-                                ),
-                            )
+                        (
+                            status,
+                            task_id,
+                            reason,
+                            result_dict,
+                            _,
+                        ) = await self._dispatch_ticket_decision(
+                            ticket_id=t.ticket_id,
+                            project_root=t.project_root,
+                            project_id=project_id,
+                            candidate=t.candidate,
+                            decision=effective_decision,
+                            kwargs=t.kwargs,
+                            metadata=t.metadata,
+                            curator=curator,
+                            curator_degrade_reason=(
+                                curator_degrade_reasons[i]
+                                if i < len(curator_degrade_reasons)
+                                else None
+                            ),
                         )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         logger.exception(
-                            '_process_add_tickets_batch_prepared: dispatch '
-                            'failed for ticket %s', t.ticket_id,
+                            '_process_add_tickets_batch_prepared: dispatch failed for ticket %s',
+                            t.ticket_id,
                         )
                         status = 'failed'
                         reason = str(exc)
@@ -2734,7 +2845,9 @@ class TaskInterceptor:
                             status=status,
                             task_id=task_id,
                             reason=reason,
-                            result_json=json.dumps(result_dict) if result_dict is not None else None,
+                            result_json=json.dumps(result_dict)
+                            if result_dict is not None
+                            else None,
                         )
                     )
 
@@ -2762,7 +2875,8 @@ class TaskInterceptor:
                         '_process_add_tickets_batch_prepared: cycle in '
                         'batch_target_index graph for project %s; coercing '
                         '%d items to create',
-                        project_id, len(pending_indices),
+                        project_id,
+                        len(pending_indices),
                     )
                     for i in pending_indices:
                         dec = decisions[i] if i < len(decisions) else None
@@ -2791,7 +2905,10 @@ class TaskInterceptor:
                 event.set()
 
     async def update_task(
-        self, task_id: str, project_root: str, **kwargs: Any,
+        self,
+        task_id: str,
+        project_root: str,
+        **kwargs: Any,
     ) -> dict:
         """Write task metadata through all interceptor gates.
 
@@ -2812,7 +2929,8 @@ class TaskInterceptor:
         if err := _reject_status_in_update_task(task_id, kwargs.get('status')):
             return err
         if err := _reject_done_provenance_in_update_metadata(
-            task_id, kwargs.get('metadata'),
+            task_id,
+            kwargs.get('metadata'),
         ):
             return err
         if err := await self._backlog_gate(project_root):
@@ -2822,14 +2940,18 @@ class TaskInterceptor:
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
         async with self._write_lock(project_id):
-            result: dict[str, Any] = dict(await self._journal_around(
-                'update_task',
-                project_root,
-                {'task_id': task_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
-                tm.update_task(
-                    task_id=task_id, project_root=project_root, **kwargs,
-                ),
-            ))
+            result: dict[str, Any] = dict(
+                await self._journal_around(
+                    'update_task',
+                    project_root,
+                    {'task_id': task_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
+                    tm.update_task(
+                        task_id=task_id,
+                        project_root=project_root,
+                        **kwargs,
+                    ),
+                )
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -2841,9 +2963,7 @@ class TaskInterceptor:
         # accepts a free-form ``prompt`` for AI-driven edits, so we can't know
         # exactly what changed without re-fetching. Re-embed unconditionally when
         # the caller passed any of these hints.
-        should_reembed = any(
-            k in kwargs for k in ('prompt', 'title', 'description', 'details')
-        )
+        should_reembed = any(k in kwargs for k in ('prompt', 'title', 'description', 'details'))
         if should_reembed:
             curator = await self._get_curator()
             if curator is not None:
@@ -2860,7 +2980,9 @@ class TaskInterceptor:
                         project_id = resolve_project_id(project_root)
                         bg = asyncio.create_task(
                             curator.reembed_task(
-                                task_id, candidate, project_id,
+                                task_id,
+                                candidate,
+                                project_id,
                             ),
                             name=f'curator-reembed-{task_id}',
                         )
@@ -2871,12 +2993,16 @@ class TaskInterceptor:
                 except Exception:
                     logger.debug(
                         'task_curator: reembed_task on update failed for %s',
-                        task_id, exc_info=True,
+                        task_id,
+                        exc_info=True,
                     )
         return result
 
     async def add_subtask(
-        self, parent_id: str, project_root: str, **kwargs: Any,
+        self,
+        parent_id: str,
+        project_root: str,
+        **kwargs: Any,
     ) -> dict:
         if err := await self._backlog_gate(project_root):
             return err
@@ -2921,7 +3047,8 @@ class TaskInterceptor:
                 logger.warning(
                     'task_curator: drop (subtask) — returning existing task %s '
                     'instead of creating duplicate: %s',
-                    decision.target_id, candidate.title[:80],
+                    decision.target_id,
+                    candidate.title[:80],
                 )
                 return {
                     'id': decision.target_id,
@@ -2944,7 +3071,8 @@ class TaskInterceptor:
                         'id': decision.target_id,
                         'title': (
                             decision.rewritten_task.title
-                            if decision.rewritten_task else candidate.title
+                            if decision.rewritten_task
+                            else candidate.title
                         ),
                         'deduplicated': True,
                         'action': 'combine',
@@ -2956,14 +3084,21 @@ class TaskInterceptor:
         # set_task_status / update_task on the same project see a consistent
         # tasks.json view.
         async with self._write_lock(project_id):
-            result = dict(await self._journal_around(
-                'add_subtask',
-                project_root,
-                {'parent_id': parent_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
-                tm.add_subtask(
-                    parent_id=parent_id, project_root=project_root, **kwargs,
-                ),
-            ))
+            result = dict(
+                await self._journal_around(
+                    'add_subtask',
+                    project_root,
+                    {
+                        'parent_id': parent_id,
+                        **{k: _journal_param_clip(v) for k, v in kwargs.items()},
+                    },
+                    tm.add_subtask(
+                        parent_id=parent_id,
+                        project_root=project_root,
+                        **kwargs,
+                    ),
+                )
+            )
         event = self._make_event(
             EventType.task_created,
             project_root,
@@ -2982,13 +3117,12 @@ class TaskInterceptor:
             except Exception:
                 logger.warning(
                     'add_subtask: curator.record_task awaited path failed for %s',
-                    new_id, exc_info=True,
+                    new_id,
+                    exc_info=True,
                 )
         return result
 
-    async def remove_tasks(
-        self, ids: list[str], project_root: str, tag: str | None = None
-    ) -> dict:
+    async def remove_tasks(self, ids: list[str], project_root: str, tag: str | None = None) -> dict:
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
@@ -3004,12 +3138,14 @@ class TaskInterceptor:
             self._curator_lock(project_id),
             self._write_lock(project_id),
         ):
-            result = dict(await self._journal_around(
-                'remove_tasks',
-                project_root,
-                {'ids': list(ids), 'tag': tag},
-                tm.remove_tasks(list(ids), project_root, tag),
-            ))
+            result = dict(
+                await self._journal_around(
+                    'remove_tasks',
+                    project_root,
+                    {'ids': list(ids), 'tag': tag},
+                    tm.remove_tasks(list(ids), project_root, tag),
+                )
+            )
         # One task_deleted event per requested id — clearer reconciliation
         # signal than a single batched event, and matches the existing
         # per-id semantics elsewhere in the journal.
@@ -3035,14 +3171,19 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
         async with self._write_lock(project_id):
-            result = dict(await self._journal_around(
-                'add_dependency',
-                project_root,
-                {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
-                tm.add_dependency(
-                    task_id, depends_on, project_root, tag,
-                ),
-            ))
+            result = dict(
+                await self._journal_around(
+                    'add_dependency',
+                    project_root,
+                    {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
+                    tm.add_dependency(
+                        task_id,
+                        depends_on,
+                        project_root,
+                        tag,
+                    ),
+                )
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -3064,14 +3205,19 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
         async with self._write_lock(project_id):
-            result = dict(await self._journal_around(
-                'remove_dependency',
-                project_root,
-                {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
-                tm.remove_dependency(
-                    task_id, depends_on, project_root, tag,
-                ),
-            ))
+            result = dict(
+                await self._journal_around(
+                    'remove_dependency',
+                    project_root,
+                    {'task_id': task_id, 'depends_on': depends_on, 'tag': tag},
+                    tm.remove_dependency(
+                        task_id,
+                        depends_on,
+                        project_root,
+                        tag,
+                    ),
+                )
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -3082,9 +3228,7 @@ class TaskInterceptor:
 
     # ── Pure reads (direct pass-through) ───────────────────────────────
 
-    async def get_tasks(
-        self, project_root: str, tag: str | None = None
-    ) -> dict:
+    async def get_tasks(self, project_root: str, tag: str | None = None) -> dict:
         tm = await self._ensure_taskmaster()
         return dict(await tm.get_tasks(project_root, tag))
 
@@ -3115,9 +3259,7 @@ class TaskInterceptor:
         raw = await tm.get_tasks(project_root, tag)
         task_list = raw.get('tasks', [])
 
-        ids_set: set[str] | None = (
-            {str(i) for i in ids} if ids is not None else None
-        )
+        ids_set: set[str] | None = {str(i) for i in ids} if ids is not None else None
         mapping: dict[str, str] = {}
         for t in task_list:
             tid = str(t.get('id', ''))
@@ -3131,9 +3273,7 @@ class TaskInterceptor:
 
         return mapping
 
-    async def get_task(
-        self, task_id: str, project_root: str, tag: str | None = None
-    ) -> dict:
+    async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)
 
@@ -3283,8 +3423,7 @@ async def _validate_done_provenance(
         return (
             _done_provenance_error(
                 task_id,
-                'done_provenance must be an object with keys "kind", '
-                '"commit", and/or "note"',
+                'done_provenance must be an object with keys "kind", "commit", and/or "note"',
             ),
             None,
         )
@@ -3316,8 +3455,7 @@ async def _validate_done_provenance(
     if kind not in _VALID_PROVENANCE_KINDS:
         return _done_provenance_error(
             task_id,
-            f'done_provenance.kind must be "merged" or "found_on_main" '
-            f'(got {kind!r})',
+            f'done_provenance.kind must be "merged" or "found_on_main" (got {kind!r})',
         ), None
 
     if kind == 'merged' and commit_input is None:
@@ -3364,8 +3502,7 @@ async def _validate_done_provenance(
         if ancestor_err is not None:
             return _done_provenance_error(
                 task_id,
-                f'kind={kind!r} but commit {sha_or_err} is not on main: '
-                f'{ancestor_err}.',
+                f'kind={kind!r} but commit {sha_or_err} is not on main: {ancestor_err}.',
             ), None
     if note is not None:
         resolved['note'] = note
@@ -3382,7 +3519,13 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> str | None:
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            'git', '-C', project_root, 'merge-base', '--is-ancestor', sha, 'main',
+            'git',
+            '-C',
+            project_root,
+            'merge-base',
+            '--is-ancestor',
+            sha,
+            'main',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -3417,7 +3560,11 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            'git', '-C', project_root, 'rev-parse', '--verify',
+            'git',
+            '-C',
+            project_root,
+            'rev-parse',
+            '--verify',
             f'{commit}^{{commit}}',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -3469,7 +3616,8 @@ def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
 
 
 def _reject_status_in_update_task(
-    task_id: str, status: object,
+    task_id: str,
+    status: object,
 ) -> dict | None:
     """Reject ``update_task(status=…)`` — defence-in-depth alongside ``server/tools.py``.
 
@@ -3496,7 +3644,8 @@ def _reject_status_in_update_task(
 
 
 def _reject_done_provenance_in_update_metadata(
-    task_id: str, metadata: object,
+    task_id: str,
+    metadata: object,
 ) -> dict | None:
     """Reject ``update_task`` calls that try to write ``metadata.done_provenance``.
 
@@ -3564,11 +3713,7 @@ def interceptor_write_succeeded(resp: object) -> bool:
         successful write. Production Taskmaster responses always include at least one
         of ``success`` or ``id``; if you see a ``{}`` in logs, investigate the caller.
     """
-    return (
-        isinstance(resp, dict)
-        and bool(resp.get('success', True))
-        and not resp.get('error')
-    )
+    return isinstance(resp, dict) and bool(resp.get('success', True)) and not resp.get('error')
 
 
 def _done_provenance_missing_error(task_id: str) -> dict:
@@ -3657,5 +3802,6 @@ def _append_combine_audit(
     except Exception as exc:
         logger.warning(
             'combine-audit: failed to append audit record for target=%s: %s',
-            target_id, exc,
+            target_id,
+            exc,
         )

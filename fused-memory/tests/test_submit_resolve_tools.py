@@ -24,6 +24,7 @@ def task_interceptor():
     ti = AsyncMock()
     ti.submit_task = AsyncMock(return_value={'ticket': 'tkt_ABCDEFGHIJKLMNOPQRSTUVWXYZ'})
     ti.resolve_ticket = AsyncMock(return_value={'status': 'created', 'task_id': '5'})
+    ti.cancel_ticket = AsyncMock(return_value={'status': 'cancelled', 'ticket_id': 'tkt_X'})
     return ti
 
 
@@ -127,3 +128,27 @@ async def test_resolve_ticket_mcp_tool_rejects_non_prefixed_id(mcp_server, task_
     )
     # Interceptor must NOT be called when the ticket id is invalid.
     task_interceptor.resolve_ticket.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# cancel_ticket MCP tool
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_mcp_tool_delegates_to_interceptor(mcp_server, task_interceptor):
+    """cancel_ticket MCP tool forwards ticket_id to interceptor.cancel_ticket
+    and the returned dict flows back unchanged.
+
+    RED in step-7: the MCP tool is not yet registered — call_tool raises ToolNotFound.
+    """
+    result = await mcp_server._tool_manager.call_tool(
+        'cancel_ticket',
+        {'ticket_id': 'tkt_X'},
+    )
+
+    task_interceptor.cancel_ticket.assert_called_once_with(ticket_id='tkt_X')
+    # Return value flows back unchanged.
+    assert result == {'status': 'cancelled', 'ticket_id': 'tkt_X'}, (
+        f'Expected cancelled dict, got: {result!r}'
+    )

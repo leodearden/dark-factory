@@ -3105,6 +3105,152 @@ async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
 
 
 # ---------------------------------------------------------------------------
+# cancel_ticket: interceptor-level contract tests (steps 1, 3, 5)
+# + amendment: ConfigError and TOCTOU race
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_no_store_returns_config_error(interceptor):
+    """cancel_ticket returns ConfigError when ticket_store is not configured.
+
+    amend: distinguish misconfigured-server from genuine missing-ticket so
+    callers can tell the difference between a stale ticket_id and a server
+    wiring failure.
+    """
+    result = await interceptor.cancel_ticket('tkt_ANY')
+    assert result == {
+        'error': 'ticket_store not configured',
+        'error_type': 'ConfigError',
+        'ticket_id': 'tkt_ANY',
+    }, f'Expected ConfigError dict, got: {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_missing_returns_not_found(interceptor_with_store):
+    """cancel_ticket returns not_found for a ticket_id that does not exist.
+
+    RED in step-1: TaskInterceptor.cancel_ticket does not yet exist.
+    """
+    result = await interceptor_with_store.cancel_ticket('tkt_DOES_NOT_EXIST')
+    assert result == {'error': 'not_found', 'ticket_id': 'tkt_DOES_NOT_EXIST'}, (
+        f'Expected not_found dict, got: {result!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_status', ['failed', 'cancelled', 'created'])
+async def test_cancel_ticket_terminal_returns_noop(
+    interceptor_with_store, ticket_store, terminal_status,
+):
+    """cancel_ticket returns no_op for a ticket already in a terminal status.
+
+    RED in step-3: the placeholder in step-2 raises NotImplementedError for
+    non-pending rows.
+    """
+    # Insert a pending ticket directly via the store.
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+    # Push it to the given terminal status.
+    await ticket_store.mark_resolved(ticket_id, status=terminal_status, reason='test')
+
+    result = await interceptor_with_store.cancel_ticket(ticket_id)
+    assert result == {
+        'status': terminal_status,
+        'ticket_id': ticket_id,
+        'no_op': True,
+    }, f'Expected no_op dict with status={terminal_status!r}, got: {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_pending_marks_cancelled(
+    interceptor_with_store, ticket_store,
+):
+    """cancel_ticket marks a pending ticket as cancelled and returns the right shape.
+
+    RED in step-5: NotImplementedError from the pending-cancel placeholder.
+    """
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    result = await interceptor_with_store.cancel_ticket(ticket_id)
+
+    assert result == {'status': 'cancelled', 'ticket_id': ticket_id}, (
+        f'Expected cancelled dict, got: {result!r}'
+    )
+    # Confirm the row was actually updated in the store.
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'cancelled', f'Row status should be cancelled: {row!r}'
+    assert row['reason'] == 'user_cancelled', f'Row reason should be user_cancelled: {row!r}'
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_signals_resolve_ticket_waiter(
+    interceptor_with_store, ticket_store,
+):
+    """cancel_ticket wakes a concurrent resolve_ticket waiter so it exits promptly.
+
+    RED in step-5: the pending-cancel placeholder raises NotImplementedError,
+    which causes cancel_ticket to crash before calling _signal_ticket_event.
+    """
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    # Start a resolve_ticket waiter in the background.  It blocks on the
+    # asyncio.Event registered for this ticket.
+    waiter = asyncio.create_task(
+        interceptor_with_store.resolve_ticket(ticket_id, '/p', timeout_seconds=5.0),
+    )
+    # Yield control so resolve_ticket can register its Event before we cancel.
+    await asyncio.sleep(0)
+
+    # Cancel the ticket — this should signal the waiter's Event.
+    cancel_result = await interceptor_with_store.cancel_ticket(ticket_id)
+    assert cancel_result == {'status': 'cancelled', 'ticket_id': ticket_id}
+
+    # The waiter should wake and return the cancelled row within the timeout.
+    waiter_result = await asyncio.wait_for(waiter, timeout=3.0)
+    assert waiter_result.get('status') == 'cancelled', (
+        f'resolve_ticket waiter expected status=cancelled, got: {waiter_result!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_race_returns_noop_with_actual_status(
+    interceptor_with_store, ticket_store,
+):
+    """cancel_ticket returns no_op with the real status on a TOCTOU race.
+
+    amend: mark_resolved returns False when a concurrent writer terminates the
+    ticket between cancel_ticket's get() and the UPDATE.  In that case the
+    method must re-fetch the actual status and return the no_op shape instead
+    of falsely reporting status='cancelled'.
+    """
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    # Intercept mark_resolved to simulate a concurrent worker that terminates
+    # the ticket (to 'created') *before* our cancel UPDATE lands.
+    original_mark_resolved = ticket_store.mark_resolved
+
+    async def racing_mark_resolved(tid: str, *, status: str, **kwargs):
+        if tid == ticket_id and status == 'cancelled':
+            # The racing writer wins first: force the row to terminal 'created'.
+            await original_mark_resolved(tid, status='created', reason='raced_first')
+        # Now our cancel UPDATE runs — it returns False because status != 'pending'.
+        return await original_mark_resolved(tid, status=status, **kwargs)
+
+    ticket_store.mark_resolved = racing_mark_resolved
+    try:
+        result = await interceptor_with_store.cancel_ticket(ticket_id)
+    finally:
+        ticket_store.mark_resolved = original_mark_resolved
+
+    assert result == {
+        'status': 'created',
+        'ticket_id': ticket_id,
+        'no_op': True,
+    }, f'Expected no_op with actual status=created, got: {result!r}'
+
+
+# ---------------------------------------------------------------------------
 # Terminal-exit gate: server-side FSM that refuses done/cancelled -> non-same
 # without an explicit reopen_reason.
 # ---------------------------------------------------------------------------
