@@ -566,8 +566,8 @@ class Stage2FlagPartition(NamedTuple):
             :func:`_sweep_stale_fixc_markers`.
     """
 
-    current: list
-    stale_ids: list
+    current: list[dict]
+    stale_ids: list[str]
 
 
 async def _query_stage2_flags(
