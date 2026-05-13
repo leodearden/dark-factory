@@ -264,9 +264,12 @@ def test_cdn_script_loads_before_tab_tasks_jsx(
 
 _DEFERRED_CDN_CASES = [
     # (extra_attrs_on_cdn_tag, regex_to_match_in_AssertionError_message)
-    ('defer', r'defer'),
-    ('async', r'async'),
-    ('type="module"', r'type="module"'),
+    # Pinned to unique phrases in each guard's assertion message so that an
+    # unrelated mention of the word (e.g. "deferred" in the position-comparison
+    # failure message) cannot satisfy the match while the wrong guard fires.
+    ('defer', r'defer attribute'),
+    ('async', r'async attribute'),
+    ('type="module"', r'type="module".*deferred by default'),
 ]
 
 
@@ -294,3 +297,24 @@ def test_load_order_assertion_fires_on_deferred_cdn(
             _TAB_TASKS_PREFIX,
             lib_name='marked',
         )
+
+
+def test_load_order_assertion_passes_for_classic_scripts() -> None:
+    """_assert_cdn_loads_before_tab_tasks raises no exception when both scripts
+    are classic synchronous scripts placed in the correct document order.
+
+    Happy-path contract: a clean CDN tag (no defer/async/type=module) placed
+    before tab_tasks.jsx must pass both the false-pass guard and the position
+    comparison without raising.  This test ensures an accidental edit that makes
+    the guards always-fire (e.g. inverted assert conditions) is caught rather
+    than silently masked by the negative-only parametrised cases above.
+    """
+    cdn_tag = '<script src="https://unpkg.com/marked@x/y.js"></script>'
+    body = cdn_tag + _TAB_TASKS_TAG
+    # Must complete without raising — classic script, correct document order.
+    _assert_cdn_loads_before_tab_tasks(
+        body,
+        'https://unpkg.com/marked@',
+        _TAB_TASKS_PREFIX,
+        lib_name='marked',
+    )
