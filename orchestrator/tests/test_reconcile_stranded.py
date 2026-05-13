@@ -1669,7 +1669,7 @@ class TestReconcileStrandedInProgress:
         # Hoisted fetch must have fired once, even though neither fast-path ran.
         assert harness.scheduler.get_task.await_count == 1, (  # type: ignore[attr-defined]
             f'Expected get_task awaited once; '
-            f'got {harness.scheduler.get_task.await_count}'
+            f'got {harness.scheduler.get_task.await_count}'  # type: ignore[attr-defined]
         )
         # Confirm the no-lock revert path still fires: task reverted to pending.
         harness.scheduler.set_task_status.assert_awaited_once_with('90', 'pending')  # type: ignore[attr-defined]
