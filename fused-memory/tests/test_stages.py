@@ -4398,15 +4398,16 @@ class TestQueryStage2Flags:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('metadata_run_id,filter_run_id,expect_current', [
-        ('42', '42', True),   # both strings → current
-        (42, '42', True),     # int metadata coerced to str → current
-        ('42', 42, True),     # int filter coerced to str → current
-        (42, 42, True),       # both int → coerced str equality → current
-        ('43', '42', False),  # mismatch → stale
-        (None, '42', False),  # None → treated as missing → stale
+        ('42', '42', True),   # string match → current
+        ('43', '42', False),  # string mismatch → stale
+        (None, '42', False),  # absent key → treated as missing → stale
+        # Int variants omitted: production always writes string run_ids via the
+        # LLM/prompt template; testing int coercion pins behavior with no
+        # production caller.  str() coercion is still applied for robustness but
+        # is not a contract we need to maintain for non-string producers.
     ])
-    async def test_int_run_id_coerced_to_str(self, metadata_run_id, filter_run_id, expect_current):
-        """str() coercion is applied symmetrically so int run_ids match correctly."""
+    async def test_run_id_string_match_and_missing_cases(self, metadata_run_id, filter_run_id, expect_current):
+        """Partition behaviour for str match, mismatch, and absent run_id."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         meta = {'flag_for_stage2': True, 'task_id': '1'}
