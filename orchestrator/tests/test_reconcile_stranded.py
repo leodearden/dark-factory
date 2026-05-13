@@ -921,6 +921,74 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_already_merged_flips_when_branch_advanced(
+        self, harness: Harness
+    ):
+        """Guard 3 positive case: branch tip != branch_base_sha → flip proceeds.
+
+        branch_base_sha records the creation-point; the current tip has advanced
+        (commits were pushed), so Guard 3 must NOT block the flip.
+        """
+        branch_tip = 'deadbeef' + 'a' * 32
+        branch_base = 'aaaa' * 10  # different SHA → branch advanced
+        citation_sha = 'cafefeed' + 'b' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '50', 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'50': 'blocked'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Branch advanced past base → Guard 3 must NOT block; flip to done
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '50', 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': citation_sha,
+                'note': 'reconcile: branch on main while task was blocked (out-of-band merge)',
+            },
+        )
+
+    async def test_already_merged_falls_through_when_branch_base_sha_missing_or_malformed(
+        self, harness: Harness
+    ):
+        """Guard 3 backward-compat: missing/malformed branch_base_sha → fall through.
+
+        Tasks created before branch_base_sha was introduced (or whose metadata
+        write failed) must still be flipped to done by Guards 1+2 alone.
+        Both the missing-key case and the malformed-value case are covered.
+        """
+        citation_sha = 'cafefeed' + 'b' * 32
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' + 'a' * 32)
+        harness.scheduler.get_statuses.return_value = ({'50': 'blocked'}, None)  # type: ignore[attr-defined]
+
+        for metadata_value in [
+            {},                              # missing key
+            {'branch_base_sha': 'short'},    # malformed — not 40 hex chars
+        ]:
+            harness.scheduler.get_task = AsyncMock(
+                return_value={'id': '50', 'metadata': metadata_value}
+            )
+            harness.scheduler.set_task_status.reset_mock()  # type: ignore[attr-defined]
+            harness.scheduler.mark_done.reset_mock()  # type: ignore[attr-defined]
+
+            await harness._reconcile_stranded_in_progress()
+
+            # Guard 3 must short-circuit and defer to Guards 1+2
+            harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+                '50', 'done',
+                done_provenance={
+                    'kind': 'found_on_main',
+                    'commit': citation_sha,
+                    'note': 'reconcile: branch on main while task was blocked (out-of-band merge)',
+                },
+            )
+
     # ------------------------------------------------------------------
     # find_merge_marker guard tests (deleted-branch fast-path)
     # ------------------------------------------------------------------
