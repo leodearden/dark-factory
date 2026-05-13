@@ -3105,6 +3105,23 @@ async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
 
 
 # ---------------------------------------------------------------------------
+# cancel_ticket: interceptor-level contract tests (steps 1, 3, 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_missing_returns_not_found(interceptor_with_store):
+    """cancel_ticket returns not_found for a ticket_id that does not exist.
+
+    RED in step-1: TaskInterceptor.cancel_ticket does not yet exist.
+    """
+    result = await interceptor_with_store.cancel_ticket('tkt_DOES_NOT_EXIST')
+    assert result == {'error': 'not_found', 'ticket_id': 'tkt_DOES_NOT_EXIST'}, (
+        f'Expected not_found dict, got: {result!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Terminal-exit gate: server-side FSM that refuses done/cancelled -> non-same
 # without an explicit reopen_reason.
 # ---------------------------------------------------------------------------
