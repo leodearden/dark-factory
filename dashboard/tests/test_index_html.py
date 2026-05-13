@@ -39,11 +39,10 @@ def _find_script_position(
     """Return ``(index, attrs)`` for the first <script> tag whose ``src``
     starts with ``src_prefix``, or ``None`` if no such tag exists.
 
-    Position-aware counterpart of ``_find_cdn_script_attrs``: position equals
-    the tag's index in ``_ScriptTagCollector.script_attrs``, which preserves
-    document order because it is a plain Python list. Returning attrs alongside
-    the index avoids a second parse when the caller also needs the src or other
-    attributes.
+    ``index`` is the tag's 0-based position in ``_ScriptTagCollector.script_attrs``
+    (document order, since the list preserves insertion order).  Returning attrs
+    alongside the position avoids a second parse when the caller also needs the
+    src or other attributes.
     """
     collector = _ScriptTagCollector()
     collector.feed(body)
@@ -52,21 +51,6 @@ def _find_script_position(
             return i, attrs
     return None
 
-
-def _find_cdn_script_attrs(
-    body: str, src_prefix: str
-) -> dict[str, str | None] | None:
-    """Return the attribute dict for the first <script> whose ``src`` starts
-    with ``src_prefix``, or ``None`` if no such tag exists.
-
-    Uses ``html.parser.HTMLParser`` so attribute values containing ``>`` (e.g.
-    inline JSON configs) are handled correctly — the regex ``[^>]*`` shortcut
-    would truncate such tags and could miss attributes appearing after the ``>``.
-
-    Thin wrapper around ``_find_script_position`` that discards the position.
-    """
-    result = _find_script_position(body, src_prefix)
-    return result[1] if result is not None else None
 
 
 @pytest.fixture(scope='module')
@@ -117,7 +101,8 @@ def test_cdn_script_has_sri_integrity(
     Parametrised over marked and DOMPurify — both are required by the
     MarkdownText component in tab_tasks.jsx.
     """
-    attrs = _find_cdn_script_attrs(index_html_body, src_prefix)
+    result = _find_script_position(index_html_body, src_prefix)
+    attrs = result[1] if result is not None else None
     assert attrs is not None, (
         f'No <script src="{src_prefix}..."> tag found in index.html. '
         f'{consumer_note}'
