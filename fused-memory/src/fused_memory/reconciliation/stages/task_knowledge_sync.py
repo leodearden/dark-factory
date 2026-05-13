@@ -1378,10 +1378,17 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
-        # Guard fires BEFORE the search so the run_id-dependent marker writes that
-        # follow (_sweep_stale_fixc_markers, _track_flag_persistence) cannot run
-        # with an empty run_id — defence-in-depth against a regression that the
-        # read-only _query_stage2_flags would have hidden.
+        # Guard fires BEFORE the search.  With an empty run_id,
+        # _query_stage2_flags would classify ALL existing Mem0 markers as stale
+        # (the partition treats an empty-string run_id as absent — see its
+        # docstring), so stale_marker_ids becomes non-empty even when no flags
+        # are active.  _sweep_stale_fixc_markers (called unconditionally
+        # whenever stale_marker_ids is non-empty) would then mass-delete all
+        # fixc markers, corrupting the marker store with causation_id=''.
+        # Short-circuiting before the search catches this case, avoids the
+        # Mem0 round-trip, and ensures _track_flag_persistence and
+        # _write_escalation_markers never write persistence/escalation records
+        # stamped with an empty run_id.
         if not self._current_run_id:
             raise RuntimeError(
                 'TaskKnowledgeSync.assemble_payload() called without a run_id: '

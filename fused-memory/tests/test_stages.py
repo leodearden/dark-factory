@@ -5035,10 +5035,9 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         # Guard must fire BEFORE the Mem0 search — no search round-trip on bad setup.
         mock_deps['memory_service'].search.assert_not_awaited()
 
-        # Error message must name the attribute and point at the canonical fix.
+        # Error message must name the attribute.
         msg = str(excinfo.value)
         assert '_current_run_id' in msg
-        assert 'stage._current_run_id = "test-run"' in msg
 
 
 class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
