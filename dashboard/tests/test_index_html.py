@@ -236,3 +236,41 @@ def test_cdn_script_loads_before_tab_tasks_jsx(
         f'and falls back to null on first render — the silent-failure class the '
         f'smoke test was added to catch.'
     )
+
+
+# ---------------------------------------------------------------------------
+# Guard-layer coverage: defer / async / type="module" must trigger an error
+# ---------------------------------------------------------------------------
+
+_DEFERRED_CDN_CASES = [
+    # (extra_attrs_on_cdn_tag, regex_to_match_in_AssertionError_message)
+    ('defer', r'defer'),
+    ('async', r'async'),
+    ('type="module"', r'type="module"'),
+]
+
+
+@pytest.mark.parametrize(
+    'extra_attrs, match_pattern',
+    _DEFERRED_CDN_CASES,
+    ids=['defer', 'async', 'type-module'],
+)
+def test_load_order_assertion_fires_on_deferred_cdn(
+    extra_attrs: str, match_pattern: str
+) -> None:
+    """When the CDN tag carries defer / async / type="module", the
+    false-pass guard inside the load-order assertion must fire — document
+    order no longer implies execution order in those cases.
+    """
+    cdn_tag = (
+        f'<script src="https://unpkg.com/marked@x/y.js" '
+        f'{extra_attrs}></script>'
+    )
+    body = cdn_tag + _TAB_TASKS_TAG
+    with pytest.raises(AssertionError, match=match_pattern):
+        _assert_cdn_loads_before_tab_tasks(
+            body,
+            'https://unpkg.com/marked@',
+            _TAB_TASKS_PREFIX,
+            lib_name='marked',
+        )
