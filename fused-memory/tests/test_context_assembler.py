@@ -693,7 +693,12 @@ class TestContextAssemblerCancellation:
         watermark = _make_watermark()
 
         async def _mock_gather(*args, **kwargs):
-            # Return KeyboardInterrupt() as a value — bypasses asyncio task re-raise
+            # Return KeyboardInterrupt() as a value — bypasses asyncio task re-raise.
+            # Close any coroutines passed in so they don't trigger
+            # "coroutine was never awaited" RuntimeWarnings at GC time.
+            for coro in args:
+                if hasattr(coro, 'close'):
+                    coro.close()
             return [KeyboardInterrupt()]
 
         with (
