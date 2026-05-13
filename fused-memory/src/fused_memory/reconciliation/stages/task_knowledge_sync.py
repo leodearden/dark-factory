@@ -1378,6 +1378,26 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
+        # Guard fires BEFORE the search.  With an empty run_id,
+        # _query_stage2_flags would classify ALL existing Mem0 markers as stale
+        # (the partition treats an empty-string run_id as absent — see its
+        # docstring), so stale_marker_ids becomes non-empty even when no flags
+        # are active.  _sweep_stale_fixc_markers (called unconditionally
+        # whenever stale_marker_ids is non-empty) would then mass-delete all
+        # fixc markers, corrupting the marker store with causation_id=''.
+        # Short-circuiting before the search catches this case, avoids the
+        # Mem0 round-trip, and ensures _track_flag_persistence and
+        # _write_escalation_markers never write persistence/escalation records
+        # stamped with an empty run_id.
+        if not self._current_run_id:
+            raise RuntimeError(
+                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
+                '_current_run_id is not set.  In production this is set '
+                'automatically by run().  In tests, assign '
+                'stage._current_run_id = "test-run" before calling '
+                'assemble_payload() directly.'
+            )
+
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
         # Returns (current_flags, stale_marker_ids): stale partition contains markers
@@ -1402,21 +1422,7 @@ class TaskKnowledgeSync(BaseStage):
         # (not active_flags); :func:`_sweep_stale_fixc_markers` (called below)
         # then deletes them from Mem0.  FIX D therefore only fires on Stage 1
         # re-flags surviving within the current run_id.
-        #
-        # run_id is needed when there are surviving flags OR stale markers to sweep;
-        # raise before any marker writes so the failure is loud and attributable.
-        # In tests: set `stage._current_run_id = 'test-run'` (or any non-empty
-        # string) before calling assemble_payload() with non-empty Mem0 search
-        # results.
         surviving_ids = [f['id'] for f in surviving]
-        if (surviving_ids or stale_marker_ids) and not self._current_run_id:
-            raise RuntimeError(
-                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
-                '_current_run_id is not set.  In production this is set '
-                'automatically by run().  In tests that return active Mem0 '
-                'flags, assign stage._current_run_id = "test-run" before '
-                'calling assemble_payload() directly.'
-            )
 
         # Sweep stale markers (prior-cycle residue) in parallel.  Best-effort:
         # individual failures log WARNING but are not re-raised.  The count is
