@@ -1163,6 +1163,38 @@ class TestReconcileStrandedInProgress:
             'worktree dir must be removed by cleanup_worktree'
         )
 
+    # ------------------------------------------------------------------
+    # Stale-marker check tests (find_merge_marker path)
+    # A marker that pre-dates the current branch incarnation must be
+    # rejected; a marker from this incarnation must flip the task.
+    # ------------------------------------------------------------------
+
+    async def test_marker_skipped_when_marker_predates_branch_base_sha(
+        self, harness: Harness
+    ):
+        """Stale-marker check: marker is_ancestor of branch_base_sha → prior incarnation.
+
+        The branch was deleted and re-created.  A merge-marker on main from the
+        *prior* incarnation (marker_sha is an ancestor of branch_base_sha) must
+        NOT cause a spurious done flip for the current incarnation.
+        """
+        marker_sha = 'cafebabe' + 'd' * 32
+        branch_base = 'beef0000' + '9' * 32
+        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor call: stale-marker check → True (marker predates base)
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '80', 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'80': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Stale marker from prior incarnation — must NOT flip to done
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
     async def test_find_merge_marker_not_invoked_when_is_ancestor_true(
         self, harness: Harness
     ):
