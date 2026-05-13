@@ -33,6 +33,22 @@ class _ScriptTagCollector(html.parser.HTMLParser):
             self.script_attrs.append(dict(attrs))
 
 
+def _find_script_position(body: str, src_prefix: str) -> int | None:
+    """Return the 0-indexed document position of the first <script> tag whose
+    ``src`` starts with ``src_prefix``, or ``None`` if no such tag exists.
+
+    Position-aware counterpart of ``_find_cdn_script_attrs``: position equals
+    the tag's index in ``_ScriptTagCollector.script_attrs``, which preserves
+    document order because it is a plain Python list.
+    """
+    collector = _ScriptTagCollector()
+    collector.feed(body)
+    for i, attrs in enumerate(collector.script_attrs):
+        if (attrs.get('src') or '').startswith(src_prefix):
+            return i
+    return None
+
+
 def _find_cdn_script_attrs(
     body: str, src_prefix: str
 ) -> dict[str, str | None] | None:
