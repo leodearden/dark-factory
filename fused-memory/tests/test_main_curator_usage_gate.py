@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
+from fused_memory.server.main import _resolve_curator_cost_store_path
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.usage_gate import UsageGate
@@ -81,3 +82,31 @@ class TestCuratorCapEventPersisted:
         assert details['reason'] == 'test cap reason', (
             f'reason mismatch: {details["reason"]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3: _resolve_curator_cost_store_path helper
+# ---------------------------------------------------------------------------
+
+
+class TestResolveCuratorCostStorePath:
+    """step-3: Path helper returns correct db path based on reconciliation config."""
+
+    def test_returns_data_dir_path_when_reconciliation_configured(self):
+        """With reconciliation config, path is <data_dir>/curator_events.db."""
+        config = MagicMock()
+        config.reconciliation = MagicMock()
+        config.reconciliation.data_dir = '/tmp/recon'
+
+        path = _resolve_curator_cost_store_path(config)
+
+        assert path == Path('/tmp/recon/curator_events.db')
+
+    def test_returns_fallback_path_when_no_reconciliation(self):
+        """Without reconciliation config, path falls back to ./data/curator_events.db."""
+        config = MagicMock()
+        config.reconciliation = None
+
+        path = _resolve_curator_cost_store_path(config)
+
+        assert path == Path('./data/curator_events.db')
