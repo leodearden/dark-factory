@@ -1195,6 +1195,34 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_marker_skipped_when_marker_predates_branch_base_sha_blocked(
+        self, harness: Harness
+    ):
+        """Stale-marker guard is status-agnostic: blocked task with stale marker must NOT flip.
+
+        The stale-marker veto at harness.py:1329-1338 fires based on the is_ancestor
+        result, not on task status.  The blocked-flavor message
+        ('reconcile: merge marker found on main while task was blocked') at
+        harness.py:1340-1344 must NOT fire for vetoed markers — the veto
+        short-circuits before reaching the note construction.
+        """
+        marker_sha = 'cafebabe' + 'd' * 32
+        branch_base = 'beef0000' + '9' * 32
+        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor call: stale-marker check → True (marker predates base)
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '80b', 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'80b': 'blocked'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Stale marker from prior incarnation — must NOT flip to done even for blocked tasks
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
     async def test_marker_accepted_when_marker_postdates_branch_base_sha(
         self, harness: Harness
     ):
@@ -1223,6 +1251,43 @@ class TestReconcileStrandedInProgress:
                 'kind': 'found_on_main',
                 'commit': marker_sha,
                 'note': 'reconcile: branch deleted but merge marker found on main',
+            },
+        )
+
+    async def test_marker_accepted_when_marker_postdates_branch_base_sha_blocked(
+        self, harness: Harness
+    ):
+        """Blocked arm of harness.py:1340-1344: marker postdates base → flip with blocked note.
+
+        This exercises the blocked arm of the status-aware note conditional at
+        harness.py:1340-1344.  Unlike test_blocked_with_merge_marker_marked_done
+        (line 2150), which has no branch_base_sha metadata, this test activates the
+        stale-marker guard so the note is constructed through the conditional.
+
+        The 'reconcile: merge marker found on main while task was blocked' string is
+        the verbatim f-string output for status=='blocked' and is pinned here to catch
+        any future regression in the conditional.
+        """
+        marker_sha = 'cafebabe' + 'd' * 32
+        branch_base = 'beef0000' + '9' * 32
+        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor call: stale-marker check → False (marker postdates base)
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, False])
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '81b', 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'81b': 'blocked'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Marker is from this incarnation — must flip to done with the blocked-flavor note
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '81b', 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': marker_sha,
+                'note': 'reconcile: merge marker found on main while task was blocked',
             },
         )
 
