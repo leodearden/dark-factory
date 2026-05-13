@@ -1195,6 +1195,77 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_marker_accepted_when_marker_postdates_branch_base_sha(
+        self, harness: Harness
+    ):
+        """Stale-marker check positive case: marker is NOT ancestor of base → accept.
+
+        The marker was produced by the *current* incarnation (it post-dates
+        branch creation), so the task must be flipped to done.
+        """
+        marker_sha = 'cafebabe' + 'd' * 32
+        branch_base = 'beef0000' + '9' * 32
+        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor call: stale-marker check → False (marker postdates base)
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, False])
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '81', 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'81': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Marker is from this incarnation — must flip to done
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '81', 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': marker_sha,
+                'note': 'reconcile: branch deleted but merge marker found on main',
+            },
+        )
+
+    async def test_marker_falls_through_when_branch_base_sha_missing(
+        self, harness: Harness
+    ):
+        """Stale-marker backward-compat: missing branch_base_sha → accept marker.
+
+        Tasks created before branch_base_sha was introduced must still be
+        flipped to done by the existing marker guard.  The new stale-marker
+        check must short-circuit on missing metadata and NOT run a bogus
+        is_ancestor call against None.
+        """
+        marker_sha = 'cafebabe' + 'd' * 32
+        # is_ancestor: first call → False (branch check); must NOT be called again
+        is_ancestor_mock = AsyncMock(return_value=False)
+        harness.git_ops.is_ancestor = is_ancestor_mock
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+        # No branch_base_sha in metadata
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '82', 'metadata': {}}
+        )
+        harness.scheduler.get_statuses.return_value = ({'82': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Existing marker-flip must happen
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '82', 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': marker_sha,
+                'note': 'reconcile: branch deleted but merge marker found on main',
+            },
+        )
+
+        # is_ancestor must only have been called once (branch check), NOT for
+        # the stale-marker check (no valid SHA to compare against)
+        assert is_ancestor_mock.await_count == 1, (
+            'is_ancestor must not be called for stale-marker check when '
+            'branch_base_sha is missing'
+        )
+
     async def test_find_merge_marker_not_invoked_when_is_ancestor_true(
         self, harness: Harness
     ):
