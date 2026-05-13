@@ -4918,6 +4918,63 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
             assert call.kwargs.get('store') == 'mem0'
             assert call.kwargs.get('_source') == 'stage2_stale_fixc_sweep'
 
+    @pytest.mark.asyncio
+    async def test_search_failure_yields_zero_swept_and_no_stale_partition(
+        self, mock_deps, watermark,
+    ):
+        """On Mem0 search failure, assemble_payload must not raise, not sweep, and
+        stage.run() must record stale_fixc_markers_swept=0 (not absent)."""
+        from datetime import UTC, datetime
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
+        mock_deps['memory_service'].delete_memory = AsyncMock(return_value=None)
+        mock_deps['memory_service'].search.side_effect = RuntimeError('Mem0 unavailable')
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[{'task_id': '77', 'description': 'stage1 only flag'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        # (a) assemble_payload must not raise
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        # (b) payload renders normally — Stage 1 section still present
+        assert '### Stage 1 Flagged Items' in payload
+
+        # (c) no sweep on search failure
+        mock_deps['memory_service'].delete_memory.assert_not_awaited()
+
+        # (d) stage.run() records stale_fixc_markers_swept=0 explicitly (not absent)
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
+        )
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run',
+            )
+
+        assert 'stale_fixc_markers_swept' in report.stats
+        assert report.stats['stale_fixc_markers_swept'] == 0
+
 
 class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
     """Scope filter suppresses task-1139/bug-mechanics flags from Mem0 active-query path."""
