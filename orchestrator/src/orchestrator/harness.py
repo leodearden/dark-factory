@@ -1299,8 +1299,44 @@ Output JSON matching the schema. Every task must appear in the output.
         # is_ancestor returned False, but the branch may simply not exist
         # any more (cleanup_worktree ran after advance_main but before
         # set_task_status).
+        # Note: find_merge_marker already gates on branch-existence
+        # (git_ops.py:774) — it returns None when the branch ref is still
+        # live.  The stale-marker check below therefore only fires when the
+        # branch is gone and a commit on main mentions the task id in its
+        # merge message.
         marker_sha = await self.git_ops.find_merge_marker(branch)
         if marker_sha:
+            # Stale-marker check — re-opened-branch / prior-incarnation guard.
+            # A task can be re-queued (branch deleted + re-created) after a
+            # prior incarnation was merged.  In that case, the prior merge's
+            # commit lands on main with the same task id, and find_merge_marker
+            # would return its SHA — triggering a spurious done flip for the
+            # current incarnation.
+            #
+            # Reject the marker if it is an ancestor of branch_base_sha (i.e.
+            # it pre-dates the current incarnation's creation point).
+            # `find_merge_marker`'s branch-existence gate handles the orthogonal
+            # case where the branch ref still exists (returns None there);
+            # this check handles the case where the branch is gone but the
+            # stale marker from a *prior* incarnation under the same task id
+            # is already on main.
+            #
+            # Missing/malformed branch_base_sha → fall through (backward compat
+            # for tasks created before this guard was deployed).
+            task = await self.scheduler.get_task(tid)
+            metadata = _get_task_metadata_dict(task)
+            branch_base_sha = metadata.get('branch_base_sha')
+            if _is_valid_sha_40(branch_base_sha) and await self.git_ops.is_ancestor(
+                marker_sha, branch_base_sha
+            ):
+                logger.info(
+                    'Reconcile: task %s stale marker %s is ancestor of '
+                    'branch_base_sha %s — belongs to a prior incarnation; '
+                    'vetoing auto-flip',
+                    tid, marker_sha, branch_base_sha,
+                )
+                return None
+
             note = (
                 f'reconcile: merge marker found on main while task was {status}'
                 if status == 'blocked'
