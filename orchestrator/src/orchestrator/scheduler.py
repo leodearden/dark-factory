@@ -984,7 +984,14 @@ class Scheduler:
                         if isinstance(data.get('data'), dict)
                         else data
                     )
-                    return inner if isinstance(inner, dict) else None
+                    if isinstance(inner, dict):
+                        # Normalise metadata at the boundary so all callers
+                        # receive task['metadata'] as a dict — consistent with
+                        # get_tasks / acquire_next which already do this via
+                        # _normalize_task_metadata.
+                        self._normalize_task_metadata(inner)
+                        return inner
+                    return None
                 return None
         return None
 

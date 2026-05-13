@@ -1174,6 +1174,33 @@ class TestUpdateTaskMetadataSerialization:
             f'Expected append=True in MCP arguments, got: {arguments}'
         )
 
+    @pytest.mark.asyncio
+    async def test_update_task_default_omits_append_key(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Default update_task call must NOT include 'append' in MCP arguments.
+
+        Existing callers omit the append kwarg and rely on full-replacement
+        semantics (append=False default).  A regression that always sets
+        append=True would silently flip every caller to merge-mode without
+        test failure — this test locks in the default replace-semantics.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', {'files': ['backend']})
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert 'append' not in arguments, (
+            f"Default call must not include 'append' key; got: {arguments}"
+        )
+
 
 class TestRequeueCooldown:
     """Tests for the requeue cooldown that prevents ghost loops."""

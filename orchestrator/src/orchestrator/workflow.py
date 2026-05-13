@@ -4163,18 +4163,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
            ``category='bypass_done'``, and return ``WorkflowOutcome.BLOCKED``.
         """
         task = await self.scheduler.get_task(self.task_id)
-        metadata: dict = {}
-        if isinstance(task, dict):
-            raw_meta = task.get('metadata')
-            if isinstance(raw_meta, dict):
-                metadata = raw_meta
-            elif isinstance(raw_meta, str) and raw_meta:
-                try:
-                    parsed = json.loads(raw_meta)
-                except (ValueError, TypeError):
-                    parsed = None
-                if isinstance(parsed, dict):
-                    metadata = parsed
+        # Scheduler.get_task normalises task['metadata'] to a dict at the
+        # boundary (via _normalize_task_metadata) so we can read it directly.
+        metadata: dict = (task.get('metadata') or {}) if isinstance(task, dict) else {}
 
         provenance = metadata.get('done_provenance') if metadata else None
         commit = ''

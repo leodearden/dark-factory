@@ -102,11 +102,11 @@ def _is_valid_sha_40(s: object) -> TypeGuard[str]:
 def _get_task_metadata_dict(task: dict | None) -> dict:
     """Coerce raw ``task['metadata']`` from ``Scheduler.get_task`` to a dict.
 
-    ``Scheduler.get_task`` does NOT normalise metadata — unlike
-    ``get_tasks`` / ``acquire_next`` it returns the raw inner dict, so
-    ``task['metadata']`` may be a JSON string, a dict, or absent.
-    This helper mirrors the inline ``isinstance`` ladder at
-    workflow.py:4145-4157 but as a reusable free function.
+    ``Scheduler.get_task`` now normalises ``task['metadata']`` to a dict at
+    the boundary (via ``_normalize_task_metadata``) — consistent with
+    ``get_tasks`` / ``acquire_next``.  This helper is therefore defensive:
+    it handles the ``task is None`` and ``metadata`` absent/malformed cases
+    that can still occur for callers passing raw task dicts from other sources.
 
     Returns an empty dict for any missing / malformed / non-dict result
     so callers can always do ``.get('key')`` without further checks.

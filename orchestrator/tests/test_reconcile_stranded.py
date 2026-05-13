@@ -1266,6 +1266,45 @@ class TestReconcileStrandedInProgress:
             'branch_base_sha is missing'
         )
 
+    async def test_stale_marker_veto_leaves_inprogress_without_lock_revert(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Stale-marker veto returns None early — lock-state revert path skipped.
+
+        When status='in-progress', branch is gone, and the stale-marker check
+        rejects the marker (it predates branch_base_sha), the reconciler must
+        return None immediately.  The lock-state classification path that would
+        normally revert a task with no lock to 'pending' must NOT fire — it is
+        only reached when there is no on-main evidence at all.
+
+        Pinning this behaviour is intentional (see reviewer suggestion #4): the
+        task will be re-evaluated on the next sweep with the same stale-marker
+        rejection; the no-lock revert is a separate concern for tasks that have
+        no evidence either way.
+        """
+        tid = '83'
+        marker_sha = 'deadc0de' + 'f' * 32
+        branch_base = 'babe0000' + '9' * 32
+        # is_ancestor: first call (branch check) → False; second call
+        # (stale-marker check) → True (marker predates branch creation)
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        # No worktree directory → if the revert path fired it would call
+        # set_task_status(tid, 'pending') for the no-lock orphan case.
+
+        changed = await harness._reconcile_stranded_in_progress()
+
+        # Stale-marker veto returns None early → changed == 0, no status
+        # mutation of any kind.
+        assert changed == 0
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
     async def test_find_merge_marker_not_invoked_when_is_ancestor_true(
         self, harness: Harness
     ):
