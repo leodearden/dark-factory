@@ -272,7 +272,6 @@ def _iv(account: str, start: datetime, end: datetime | None) -> CapInterval:
 class TestMergeAllAccountsCapped:
     def test_empty_intervals_non_empty_accounts(self):
         """Empty intervals with non-empty account_names → []."""
-        now = datetime.now(UTC)
         result = merge_all_accounts_capped([], ['alpha', 'beta'])
         assert result == []
 
@@ -507,7 +506,7 @@ class TestBucketiseCapSparkline:
     def test_all_values_are_zero_or_one(self):
         """All values are in {0, 1}."""
         now = datetime.now(UTC)
-        capped = [(now - timedelta(hours=1), now - timedelta(minutes=30))]
+        capped: list[tuple[datetime, datetime | None]] = [(now - timedelta(hours=1), now - timedelta(minutes=30))]
         result = bucketise_cap_sparkline(capped, window_hours=4, bucket_seconds=600, now=now)
         assert all(v in (0, 1) for v in result['values'])
 
@@ -551,7 +550,7 @@ class TestBucketiseCapSparkline:
         )
         labels = [datetime.fromisoformat(lb) for lb in result['labels']]
         values = result['values']
-        for label, value in zip(labels, values):
+        for label, value in zip(labels, values, strict=False):
             if c_start <= label <= c_end:
                 assert value == 1, f"Expected 1 at {label}"
             else:
@@ -569,7 +568,7 @@ class TestBucketiseCapSparkline:
         )
         labels = [datetime.fromisoformat(lb) for lb in result['labels']]
         values = result['values']
-        for label, value in zip(labels, values):
+        for label, value in zip(labels, values, strict=False):
             if label >= c_start:
                 assert value == 1, f"Expected 1 at {label} (open-ended)"
             # (buckets before c_start should be 0 — but c_start might align
