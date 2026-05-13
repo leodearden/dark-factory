@@ -414,9 +414,9 @@ def format_snapshot_fact(
 
     The returned string encodes the effective ISO date directly in the fact text
     so the temporal anchor is human-readable even if ``valid_at`` metadata is not
-    surfaced by the search caller.  Example output::
+    surfaced by the search caller.  Example output (keys alphabetised)::
 
-        As of 2026-05-13: project dark_factory has 42 total tasks, 18 done, 5 in_progress, 3 blocked.
+        As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 5 in_progress, 42 total.
 
     Args:
         as_of: Timezone-aware datetime representing the effective date of the snapshot.
@@ -431,6 +431,13 @@ def format_snapshot_fact(
 
     Raises:
         ValueError: If *as_of* is timezone-naive.
+
+    Note:
+        This helper has no in-tree caller yet — it is exported for future harness-side
+        snapshot writers (e.g. a MemoryConsolidator post-cycle hook) and keeps the LLM
+        prompt and downstream readers aligned on fact-text format.
+        TODO(task-1225): wire into the snapshot-emit code path once a deterministic
+        harness-side writer is added to MemoryConsolidator.
     """
     if as_of.tzinfo is None:
         raise ValueError(

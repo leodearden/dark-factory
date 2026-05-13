@@ -7469,26 +7469,34 @@ class TestFormatSnapshotFact:
         )
 
     def test_keeps_all_fields_in_deterministic_order(self):
-        """Zero-value fields are included; output is stable across calls."""
+        """Zero-value fields are included; output is alphabetically ordered and stable."""
         format_snapshot_fact = self._import_helper()
-        result1 = format_snapshot_fact(
+        # Same logical mapping, different insertion order — output must be identical
+        result_abc = format_snapshot_fact(
+            as_of=datetime(2026, 5, 13, tzinfo=UTC),
+            project_id='proj',
+            counts={'blocked': 0, 'done': 0, 'total': 10},
+        )
+        result_cba = format_snapshot_fact(
             as_of=datetime(2026, 5, 13, tzinfo=UTC),
             project_id='proj',
             counts={'total': 10, 'done': 0, 'blocked': 0},
         )
-        result2 = format_snapshot_fact(
-            as_of=datetime(2026, 5, 13, tzinfo=UTC),
-            project_id='proj',
-            counts={'total': 10, 'done': 0, 'blocked': 0},
+        assert result_abc == result_cba, (
+            f'Different insertion orders must produce identical output.\n'
+            f'  abc order: {result_abc!r}\n'
+            f'  cba order: {result_cba!r}'
         )
-        # Idempotent
-        assert result1 == result2
         # Zero values are included so cycle-over-cycle diffs are meaningful
-        assert '0 done' in result1, (
-            f'Zero-value fields must appear in output, got: {result1!r}'
+        assert '0 done' in result_abc, (
+            f'Zero-value fields must appear in output, got: {result_abc!r}'
         )
-        assert '0 blocked' in result1, (
-            f'Zero-value fields must appear in output, got: {result1!r}'
+        assert '0 blocked' in result_abc, (
+            f'Zero-value fields must appear in output, got: {result_abc!r}'
+        )
+        # Alphabetical ordering: 'blocked' < 'done' < 'total'
+        assert result_abc.index('blocked') < result_abc.index('done') < result_abc.index('total'), (
+            f'Keys must appear in alphabetical order, got: {result_abc!r}'
         )
 
     def test_naive_datetime_raises_value_error(self):

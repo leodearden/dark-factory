@@ -180,8 +180,11 @@ should always use both to fully prevent temporal contamination.
 
 ## Snapshot Discipline
 Recurring temporal-fact snapshots (task-count, task-status, run summaries, system stats) \
-are written every reconciliation cycle. Every cycle the values change, but prior snapshot \
-edges from older episodes stay valid and accumulate as contradictions.
+are written every reconciliation cycle. Every cycle the values change; prior snapshot \
+edges from older episodes stay valid in storage, but **accumulation is acceptable**: \
+Graphiti's `valid_at`-descending search ordering guarantees every downstream reader \
+(`search`, `get_entity`) sees the most recent snapshot first, so older edges are \
+naturally superseded without you invalidating them.
 
 **Async-queue indexing latency**: snapshot writes via `add_memory(category='temporal_facts')` \
 are async-enqueued through the durable queue (see `## Graphiti Queued Writes` for the \
@@ -201,7 +204,7 @@ For each recurring snapshot write, follow this discipline:
 
 1. Call `add_memory(category='temporal_facts')` directly with the new fact text. \
    Encode the effective ISO date in the fact text itself \
-   (e.g. `"As of 2026-05-13: project dark_factory has 42 total tasks, 18 done, 3 blocked."`). \
+   (e.g. `"As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 42 total."`). \
    Each write carries the current ingestion time as `valid_at`; newer writes naturally \
    supersede older ones in temporal queries.
 2. Prefer a single composite edge ("reify task counts as of {{ISO_date}}: total=N, \
@@ -233,7 +236,7 @@ Task 1145 Guard 3 is shipped):
 `add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \
 fact text itself so the temporal anchor is human-readable even if `valid_at` metadata \
 is not surfaced by the search caller. Example fact text: \
-`"As of 2026-05-09: project dark_factory has 42 total tasks, 18 done, 3 blocked."` \
+`"As of 2026-05-09: project dark_factory has 3 blocked, 18 done, 42 total."` \
 This is especially important for task-count, task-status, run summary, and system-stat \
 snapshots where the date of the reading is part of the fact's meaning.
 
