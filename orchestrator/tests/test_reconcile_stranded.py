@@ -1648,6 +1648,32 @@ class TestReconcileStrandedInProgress:
             tid, 'done', done_provenance=expected_provenance
         )
 
+    async def test_get_task_fetched_once_when_neither_fastpath_fires(
+        self, harness: Harness
+    ):
+        """Regression: scheduler.get_task is awaited exactly once per stranded
+        task even when neither the is_ancestor nor the find_merge_marker
+        fast-path fires (e.g. the lock-state revert path).
+
+        With the two per-branch get_task calls (current code), count==0 when
+        neither fast-path reaches its local ``task = await self.scheduler.get_task``
+        line.  After the hoist, get_task is called unconditionally at the top of
+        _reconcile_one_stranded, so count==1 for every stranded task.
+        """
+        # Fixture defaults: is_ancestor=False, find_merge_marker=None
+        # → neither fast-path fires; task '90' has no worktree → no-lock revert.
+        harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Hoisted fetch must have fired once, even though neither fast-path ran.
+        assert harness.scheduler.get_task.await_count == 1, (  # type: ignore[attr-defined]
+            f'Expected get_task awaited once; '
+            f'got {harness.scheduler.get_task.await_count}'
+        )
+        # Confirm the no-lock revert path still fires: task reverted to pending.
+        harness.scheduler.set_task_status.assert_awaited_once_with('90', 'pending')  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
