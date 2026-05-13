@@ -2143,6 +2143,210 @@ class TestFairness:
         # D cannot acquire tools/src (free slot) because A's park covers it.
         assert not scheduler.lock_table.try_acquire('D', ['tools/src'])
 
+    @pytest.mark.asyncio
+    async def test_cross_tier_preemption(self):
+        """A high-tier skip-bump preempts an overlapping low-tier park.
+
+        Setup: low-priority L is already parked on m1+m2 with skip_count=3
+        (mimicking an accumulated count). A high-priority H wants m1 and is
+        also forced to skip.  When H's _bump_skip_and_maybe_park fires, it
+        evicts L's park on m1 only (m2 survives), preserves L's _skip_count,
+        and emits both reservation_installed and reservation_evicted events.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        scheduler = Scheduler(config)
+        scheduler.event_store = _RecordingEventStore()
+
+        # Pre-install L's low-tier park on m1 + m2 and seed its skip_count.
+        scheduler.lock_table.install_parks('L', ['m1', 'm2'], priority='low')
+        scheduler._skip_count['L'] = 3
+
+        # Trigger H's skip-bump-and-park directly; high threshold=1 fires
+        # parking on the first call.
+        scheduler._bump_skip_and_maybe_park('H', ['m1'], tier='high')
+
+        # H now holds a park on m1; L's park on m1 is gone, but m2 survives.
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+        assert not scheduler.lock_table.try_acquire('X', ['m1'])  # H's park
+        assert not scheduler.lock_table.try_acquire('Y', ['m2'])  # L's park
+
+        # L's skip_count was NOT cleared by preemption.
+        assert scheduler._skip_count['L'] == 3
+
+        # Recording event store has exactly one reservation_installed (for H)
+        # and one reservation_evicted (for L).
+        installed_events = [
+            e for e in scheduler.event_store.events
+            if 'reservation_installed' in e[0]
+        ]
+        evicted_events = [
+            e for e in scheduler.event_store.events
+            if 'reservation_evicted' in e[0]
+        ]
+        assert len(installed_events) == 1
+        assert installed_events[0][1]['task_id'] == 'H'
+        assert len(evicted_events) == 1
+        evicted_payload = evicted_events[0][1]
+        assert evicted_payload['task_id'] == 'H'
+        assert evicted_payload['data']['modules'] == ['m1']
+        assert evicted_payload['data']['preempted_by'] == 'H'
+        assert evicted_payload['data']['preempted_by_priority'] == 'high'
+        assert evicted_payload['data']['victim'] == 'L'
+
+    # ---- Owner-state park-GC (step-14) ----
+
+    @pytest.mark.asyncio
+    async def test_park_gc_on_terminal_owner(self):
+        """A park owned by a terminal task is reaped on the next tick."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        scheduler = Scheduler(config)
+        scheduler.event_store = _RecordingEventStore()
+
+        scheduler.lock_table.install_parks('A', ['m1', 'm2'], priority='high')
+        scheduler._skip_count['A'] = 5
+
+        # A is cancelled; B is a separate pending task.
+        a = {
+            'id': 'A', 'title': 'a', 'status': 'cancelled',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        b = {
+            'id': 'B', 'title': 'b', 'status': 'pending',
+            'priority': 'medium', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        await scheduler.acquire_next()
+
+        # A's parks gone, skip_count cleared.
+        assert not scheduler.lock_table.has_parks('A')
+        assert 'A' not in scheduler._skip_count
+        # B (or any unrelated task) can now acquire m1.
+        assert scheduler.lock_table.try_acquire('B', ['m1'])
+        # reservation_expired event emitted with terminal reason.
+        expired = [
+            e for e in scheduler.event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 1
+        assert expired[0][1]['task_id'] == 'A'
+        assert 'terminal' in expired[0][1]['data']['reason']
+
+    @pytest.mark.asyncio
+    async def test_park_gc_on_missing_owner(self):
+        """A park whose owner is no longer in the task list is reaped."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        scheduler = Scheduler(config)
+        scheduler.event_store = _RecordingEventStore()
+
+        scheduler.lock_table.install_parks('X', ['m1'], priority='high')
+        scheduler._skip_count['X'] = 2
+
+        # X is NOT in the task list — reconciliation removed it.
+        b = {
+            'id': 'B', 'title': 'b', 'status': 'pending',
+            'priority': 'medium', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[b])
+
+        await scheduler.acquire_next()
+
+        assert not scheduler.lock_table.has_parks('X')
+        assert 'X' not in scheduler._skip_count
+        expired = [
+            e for e in scheduler.event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 1
+        assert expired[0][1]['task_id'] == 'X'
+        assert 'missing' in expired[0][1]['data']['reason']
+
+    @pytest.mark.asyncio
+    async def test_park_gc_on_deps_unsatisfied(self):
+        """A park whose owner has un-satisfied deps is reaped."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        scheduler = Scheduler(config)
+        scheduler.event_store = _RecordingEventStore()
+
+        scheduler.lock_table.install_parks('A', ['m1'], priority='high')
+
+        # A depends on '7' which is in-progress (not satisfied).
+        a = {
+            'id': 'A', 'title': 'a', 'status': 'pending',
+            'priority': 'high',
+            'dependencies': [{'id': '7'}],
+            'metadata': {'files': ['m1']},
+        }
+        seven = {
+            'id': '7', 'title': 'seven', 'status': 'in-progress',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[a, seven])
+
+        await scheduler.acquire_next()
+
+        assert not scheduler.lock_table.has_parks('A')
+        expired = [
+            e for e in scheduler.event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 1
+        assert expired[0][1]['task_id'] == 'A'
+        assert 'deps' in expired[0][1]['data']['reason']
+
+    @pytest.mark.asyncio
+    async def test_park_gc_skips_eligible_owner(self):
+        """Control: an owner whose deps ARE satisfied keeps its park.
+
+        Seed a real holder on m1 so A cannot acquire its own park this tick;
+        we only want to verify that the GC sweep doesn't reap an eligible
+        owner's park between sweep and dispatch.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        scheduler = Scheduler(config)
+        scheduler.event_store = _RecordingEventStore()
+
+        # Block m1 with a seed so A can't acquire its own park.
+        scheduler.lock_table.try_acquire('seed', ['m1'])
+        scheduler._dispatched.add('seed')
+
+        scheduler.lock_table.install_parks('A', ['m1'], priority='high')
+
+        # A depends on '7' which is done — deps satisfied.
+        a = {
+            'id': 'A', 'title': 'a', 'status': 'pending',
+            'priority': 'high',
+            'dependencies': [{'id': '7'}],
+            'metadata': {'files': ['m1']},
+        }
+        seven = {
+            'id': '7', 'title': 'seven', 'status': 'done',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[a, seven])
+
+        await scheduler.acquire_next()
+
+        # A's park survives (GC didn't reap it; m1 still blocked so A couldn't
+        # acquire-and-clear).
+        assert scheduler.lock_table.has_parks('A')
+        expired = [
+            e for e in scheduler.event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 0
+
 
 class TestGetStatus:
     """``Scheduler.get_status`` returns the fresh store value via MCP."""
