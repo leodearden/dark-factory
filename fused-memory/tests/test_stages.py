@@ -4401,6 +4401,8 @@ class TestQueryStage2Flags:
         ('42', '42', True),   # string match → current
         ('43', '42', False),  # string mismatch → stale
         (None, '42', False),  # absent key → treated as missing → stale
+        ('', '42', False),    # empty marker run_id → falsy guard → stale
+        ('', '', False),      # both empty → still stale (truthy guard prevents matching)
         # Int variants omitted: production always writes string run_ids via the
         # LLM/prompt template; testing int coercion pins behavior with no
         # production caller.  str() coercion is still applied for robustness but
