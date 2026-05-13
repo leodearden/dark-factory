@@ -257,6 +257,15 @@ Within the same iteration, emit an action record in your structured report:
 Do NOT delete the flag before acting — deletion is the acknowledgement that the \
 flag has been processed.
 
+**Important — the flag list is already run-scoped.** The Python layer partitions \
+`flag_for_stage2` markers by `metadata.run_id` before assembling this payload: only \
+markers whose `run_id` matches the current reconciliation run appear in the \
+"Stage 1 Flagged Items" section above. Any markers left over from prior cycles that \
+failed FIX C deletion are swept automatically by Python (their count is recorded in \
+`stats.stale_fixc_markers_swept`). You do NOT need to search for, re-process, or \
+count prior-cycle markers — every flag in this section is current-cycle and is your \
+responsibility to process and delete.
+
 ## Stale Flag Escalation (FIX D)
 If the payload contains a `### Stale Flags Requiring Escalation` section, the Python \
 layer has detected flags that have survived three or more reconciliation cycles without \

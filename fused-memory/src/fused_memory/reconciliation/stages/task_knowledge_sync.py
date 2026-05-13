@@ -11,7 +11,7 @@ import logging
 import sys
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -550,24 +550,70 @@ def _check_flag_counter_completeness(
     }
 
 
-async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
-    """Query Mem0 for active Stage-2-destined flags and return them as dicts.
+class Stage2FlagPartition(NamedTuple):
+    """Partition result from :func:`_query_stage2_flags`.
+
+    Using a NamedTuple makes both return values self-documenting at call sites
+    and avoids positional-index surprises when the return shape evolves.
+    Positional unpacking (``current, stale_ids = await _query_stage2_flags(...)``)
+    continues to work unchanged since NamedTuple is a tuple subclass.
+
+    Attributes:
+        current: Full dict records whose ``metadata.run_id`` matches the active
+            run.  Rendered to the Stage 2 LLM for FIX-C processing.
+        stale_ids: ``id`` strings for records whose ``metadata.run_id`` is
+            absent, empty, or mismatched.  Caller sweeps these via
+            :func:`_sweep_stale_fixc_markers`.
+    """
+
+    current: list
+    stale_ids: list
+
+
+async def _query_stage2_flags(
+    memory_service,
+    project_id: str,
+    current_run_id: str,
+) -> Stage2FlagPartition:
+    """Query Mem0 for active Stage-2-destined flags and partition by run_id.
 
     Searches for memories with ``metadata.flag_for_stage2=true`` (the only
     supported convention — the ``stage1_flag_marker`` key was a never-shipped
     alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
 
+    Results are partitioned into two groups:
+
+    * **current_flags** — full dict records whose ``metadata.run_id`` is
+      present, non-empty, and matches ``current_run_id`` after ``str()``
+      coercion.  These are rendered to the Stage 2 LLM for FIX-C processing.
+    * **stale_marker_ids** — ``id`` strings only for records whose
+      ``metadata.run_id`` is absent, empty, or does not match
+      ``current_run_id``.  Markers missing or with an empty ``run_id`` are
+      unconditionally classified as stale (legacy disposition: they pre-date
+      the run_id producer contract and cannot be attributed to any specific
+      run).  The caller is responsible for sweeping these via
+      :func:`_sweep_stale_fixc_markers`.
+
+    .. note::
+        The partition check requires ``metadata.run_id`` to be **truthy**
+        before comparing — an empty-string ``run_id`` is treated as absent and
+        placed in the stale partition even when ``current_run_id`` is also
+        empty.  This prevents a falsy ``_current_run_id`` from silently
+        classifying all empty-string markers as "current".
+
     .. warning::
         This function uses semantic search with a ``limit=100`` top-N cutoff.
         In a busy Mem0 collection, flags with low embedding similarity to the
-        query can be pushed off the bottom and silently dropped.  FIX D's
-        persistence tracking (``_track_flag_persistence``) uses a deterministic
-        ``count_memories_by_metadata`` call to avoid this problem for staleness
-        detection.  The active-query path here still carries the top-N risk —
-        see follow-up task for a proper ``scroll_by_metadata`` API on Mem0Backend.
+        query can be pushed off the bottom and silently dropped.  When the
+        result count equals the limit a WARNING is logged to surface this
+        condition.  FIX D's persistence tracking (``_track_flag_persistence``)
+        uses a deterministic ``count_memories_by_metadata`` call to avoid this
+        problem for staleness detection.  The active-query path here still
+        carries the top-N risk — see follow-up task for a proper
+        ``scroll_by_metadata`` API on Mem0Backend.
 
-    Returns an empty list on search failure (best-effort; logs WARNING).
+    Returns ``([], [])`` on search failure (best-effort; logs WARNING).
     """
     try:
         results = await memory_service.search(
@@ -582,21 +628,37 @@ async def _query_stage2_flags(memory_service, project_id: str) -> list[dict]:
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return []
+        return Stage2FlagPartition([], [])
 
-    flags: list[dict] = []
+    if len(results) == 100:
+        logger.warning(
+            'reconciliation._query_stage2_flags: search returned limit=100 '
+            'results — some markers may be beyond the top-N cutoff and will '
+            'not be swept or rendered this cycle.  Follow-up: migrate to '
+            'scroll_by_metadata for GC correctness.',
+            extra={'project_id': project_id},
+        )
+
+    current_flags: list[dict] = []
+    stale_marker_ids: list[str] = []
+    run_id_str = str(current_run_id)
     for r in results:
         meta = dict(r.metadata or {})
-        if meta.get('flag_for_stage2'):
-            flags.append(
-                {
-                    'id': r.id,
-                    'content': r.content,
-                    'metadata': meta,
-                    'task_id': str(meta.get('task_id', '')),
-                }
-            )
-    return flags
+        if not meta.get('flag_for_stage2'):
+            continue
+        flag_dict = {
+            'id': r.id,
+            'content': r.content,
+            'metadata': meta,
+            'task_id': str(meta.get('task_id', '')),
+        }
+        # Require run_id to be truthy before comparing; empty-string run_id is
+        # treated as absent and placed in the stale partition unconditionally.
+        if meta.get('run_id') and str(meta['run_id']) == run_id_str:
+            current_flags.append(flag_dict)
+        else:
+            stale_marker_ids.append(r.id)
+    return Stage2FlagPartition(current_flags, stale_marker_ids)
 
 
 def _compute_stale_flags(
@@ -622,6 +684,61 @@ def _compute_stale_flags(
 # semantic search, which can silently rank matches off the bottom of top-N).
 _STAGE2_PERSISTENCE_MARKER_SOURCE = 'stage2_persistence_marker'
 _STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
+_STAGE2_STALE_FIXC_SWEEP_SOURCE = 'stage2_stale_fixc_sweep'
+
+
+async def _sweep_stale_fixc_markers(
+    memory_service,
+    project_id: str,
+    stale_ids: list[str],
+    run_id: str,
+) -> int:
+    """Delete stale fixc markers in parallel and return the count of successful deletes.
+
+    Issues parallel ``delete_memory`` calls via ``asyncio.gather`` with
+    ``return_exceptions=True`` (mirrors :func:`_track_flag_persistence` /
+    :func:`_write_escalation_markers`).  Individual delete failures log WARNING
+    and are excluded from the returned count — best-effort contract.
+
+    Args:
+        memory_service: The fused-memory service (must support ``delete_memory``).
+        project_id: Project scope for the delete calls.
+        stale_ids: List of Mem0 memory IDs to delete.  Empty list → returns 0
+            immediately without issuing any calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            so the audit journal traces each delete back to the responsible cycle.
+
+    Returns:
+        Number of deletes that completed without raising (0 if *stale_ids* is empty).
+    """
+    if not stale_ids:
+        return 0
+
+    results = await asyncio.gather(
+        *(
+            memory_service.delete_memory(
+                memory_id=mid,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source=_STAGE2_STALE_FIXC_SWEEP_SOURCE,
+            )
+            for mid in stale_ids
+        ),
+        return_exceptions=True,
+    )
+
+    success_count = 0
+    for mid, result in zip(stale_ids, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._sweep_stale_fixc_markers: delete failed for memory_id=%s; not counted',
+                mid,
+                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
+            success_count += 1
+    return success_count
 
 
 async def _track_flag_persistence(
@@ -831,6 +948,12 @@ class TaskKnowledgeSync(BaseStage):
     # loudly in that case so test authors are reminded to set this attribute.
     _current_run_id: str | None = None
 
+    # Count of stale fixc markers swept by _sweep_stale_fixc_markers in the
+    # current assemble_payload() call (task 1224).  Reset to 0 at the top of
+    # run() so cross-invocation contamination is impossible.  Written to
+    # report.stats['stale_fixc_markers_swept'] after super().run() returns.
+    _stale_fixc_markers_swept: int = 0
+
     # Set to True by assemble_payload() when the autopilot_video contamination
     # guardrail fires (task IDs above AUTOPILOT_VIDEO_TASK_CEILING detected).
     # get_disallowed_tools() then adds DISALLOW_TASK_WRITES to the disallowed list
@@ -871,8 +994,18 @@ class TaskKnowledgeSync(BaseStage):
         ``memory_consolidator``, or Stage 1's ``items_flagged`` is empty.
         """
         self._current_run_id = run_id
+        # Reset per-run counters so cross-invocation contamination is impossible
+        # (mirrors _current_run_id overwrite pattern).
+        self._stale_fixc_markers_swept = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
+
+        # --- stale fixc marker sweep stat (task 1224) ---
+        # _stale_fixc_markers_swept is set by assemble_payload() during the
+        # super().run() call above.  Inject it into the report here so
+        # downstream consumers (Stage 3 prompt, observability) can see how
+        # many prior-cycle markers were swept (mirrors stage2_stage1_dups_suppressed).
+        report.stats['stale_fixc_markers_swept'] = self._stale_fixc_markers_swept
 
         # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
         # Guard on stage identity so a future reorder of prior_reports doesn't
@@ -1239,8 +1372,15 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
-        # _query_stage2_flags is best-effort: search failures yield [] internally.
-        active_flags = await _query_stage2_flags(self.memory, self.project_id)
+        # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
+        # Returns (current_flags, stale_marker_ids): stale partition contains markers
+        # whose metadata.run_id does not match the current run (or is absent — legacy
+        # markers pre-dating the run_id producer contract).  Stale markers are swept
+        # below by _sweep_stale_fixc_markers so they are never rendered to the LLM.
+        run_id_for_markers = self._current_run_id or ''
+        active_flags, stale_marker_ids = await _query_stage2_flags(
+            self.memory, self.project_id, run_id_for_markers
+        )
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
         # the active-query path ONLY.  Stage 1's structured-output flags are
@@ -1251,15 +1391,13 @@ class TaskKnowledgeSync(BaseStage):
         # Track how many cycles each surviving flag has survived without being
         # deleted.  Best-effort: _track_flag_persistence degrades gracefully.
         #
-        # run_id is only needed when there are surviving flags to persist; it
-        # is safe to skip the check when surviving is empty.  Raise before any
-        # marker writes so the failure is loud and attributable rather than
-        # tagging markers with an unattributable run_id.
+        # run_id is needed when there are surviving flags OR stale markers to sweep;
+        # raise before any marker writes so the failure is loud and attributable.
         # In tests: set `stage._current_run_id = 'test-run'` (or any non-empty
         # string) before calling assemble_payload() with non-empty Mem0 search
         # results.
         surviving_ids = [f['id'] for f in surviving]
-        if surviving_ids and not self._current_run_id:
+        if (surviving_ids or stale_marker_ids) and not self._current_run_id:
             raise RuntimeError(
                 'TaskKnowledgeSync.assemble_payload() called without a run_id: '
                 '_current_run_id is not set.  In production this is set '
@@ -1267,7 +1405,13 @@ class TaskKnowledgeSync(BaseStage):
                 'flags, assign stage._current_run_id = "test-run" before '
                 'calling assemble_payload() directly.'
             )
-        run_id_for_markers = self._current_run_id or ''
+
+        # Sweep stale markers (prior-cycle residue) in parallel.  Best-effort:
+        # individual failures log WARNING but are not re-raised.  The count is
+        # stored on the instance for reporting in run() via stats dict.
+        self._stale_fixc_markers_swept = await _sweep_stale_fixc_markers(
+            self.memory, self.project_id, stale_marker_ids, run_id_for_markers
+        )
         persistence_counts = await _track_flag_persistence(
             self.memory,
             self.project_id,

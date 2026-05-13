@@ -314,8 +314,19 @@ compute a signature.
 
 ## Stage 2 Flag Relay (FIX B)
 When you write a flag to Mem0 with `metadata.flag_for_stage2=true`, you MUST ALSO include \
-the same flag content in the `flagged_items` field of your structured-output report. Do not \
-write one without the other — Stage 2's payload assembly merges both sources, but the \
-duplication closes the loop in case Mem0 is briefly unavailable. The `flagged_items` entry \
-should carry the same `task_id`, `flag_type`, and `description` as the Mem0 memory.
+the same flag content in the `flagged_items` field of your structured-output report. \
+The `flagged_items` structured-output entry is the **durable** delivery channel — the Mem0 \
+marker is scoped to a single cycle (see `run_id` requirement below). If Stage 2 crashes \
+after your Mem0 write but before processing the marker, the marker will be swept by Python \
+in the next cycle rather than retried. Always emit both; the `flagged_items` entry should \
+carry the same `task_id`, `flag_type`, and `description` as the Mem0 memory.
+
+Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<current_run_id>` \
+(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt). \
+Stage 2 partitions the flag list by this field before surfacing it to the LLM; any marker \
+whose `run_id` does not match the current cycle — including markers from a prior cycle whose \
+Stage 2 run crashed before processing — is unconditionally swept by Python and never reaches \
+the LLM. Omitting `run_id` (or writing an empty `run_id`) causes the marker to be silently \
+discarded rather than processed. The Mem0 marker channel is intentionally single-cycle; \
+the `flagged_items` field carries the durable delivery guarantee.
 """

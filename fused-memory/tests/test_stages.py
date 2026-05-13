@@ -4299,12 +4299,13 @@ class TestQueryStage2Flags:
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         memory_service.search.return_value = [
-            self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742'}),
+            self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'}),
             self._make_result('id-2', 'no flag', {}),
         ]
-        result = await _query_stage2_flags(memory_service, 'reify')
-        assert len(result) == 1
-        assert result[0]['id'] == 'id-1'
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert len(current_flags) == 1
+        assert current_flags[0]['id'] == 'id-1'
+        assert stale_marker_ids == []
 
     @pytest.mark.asyncio
     async def test_excludes_memories_without_either_marker(self):
@@ -4314,20 +4315,21 @@ class TestQueryStage2Flags:
             self._make_result('id-4', 'irrelevant', {'some_other_key': True}),
             self._make_result('id-5', 'also irrelevant', {}),
         ]
-        result = await _query_stage2_flags(memory_service, 'reify')
-        assert result == []
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert current_flags == []
+        assert stale_marker_ids == []
 
     @pytest.mark.asyncio
     async def test_preserves_fields_and_extracts_task_id(self):
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
-        meta = {'flag_for_stage2': True, 'task_id': '742', 'extra': 'x'}
+        meta = {'flag_for_stage2': True, 'task_id': '742', 'extra': 'x', 'run_id': 'r-current'}
         memory_service.search.return_value = [
             self._make_result('id-6', 'content here', meta),
         ]
-        result = await _query_stage2_flags(memory_service, 'reify')
-        assert len(result) == 1
-        flag = result[0]
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert len(current_flags) == 1
+        flag = current_flags[0]
         assert flag['id'] == 'id-6'
         assert flag['content'] == 'content here'
         assert flag['metadata'] == meta
@@ -4341,8 +4343,9 @@ class TestQueryStage2Flags:
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
         with caplog.at_level(logging.WARNING):
-            result = await _query_stage2_flags(memory_service, 'reify')
-        assert result == []
+            current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        assert current_flags == []
+        assert stale_marker_ids == []
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -4350,7 +4353,7 @@ class TestQueryStage2Flags:
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         memory_service.search.return_value = []
-        await _query_stage2_flags(memory_service, 'my_project')
+        await _query_stage2_flags(memory_service, 'my_project', 'r-current')
         call_kwargs = memory_service.search.call_args
         assert call_kwargs is not None
         # project_id must be passed as kwarg or positional
@@ -4358,6 +4361,170 @@ class TestQueryStage2Flags:
         args = call_kwargs.args
         all_args = list(args) + list(kwargs.values())
         assert 'my_project' in all_args or kwargs.get('project_id') == 'my_project'
+
+    @pytest.mark.asyncio
+    async def test_partitions_by_run_id(self):
+        """Markers with matching run_id go to current; mismatched or missing go to stale IDs."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'mem0-current',
+                'content for task 742',
+                {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'},
+            ),
+            self._make_result(
+                'mem0-prior',
+                'STALE content from prior run',
+                {'flag_for_stage2': True, 'task_id': '888', 'run_id': 'r-prior'},
+            ),
+            self._make_result(
+                'mem0-no-run-id',
+                'NO_RUN_ID legacy content',
+                {'flag_for_stage2': True, 'task_id': '999'},
+            ),
+        ]
+        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+
+        # Only the current-cycle marker should be in current_flags
+        assert len(current_flags) == 1
+        assert current_flags[0]['id'] == 'mem0-current'
+
+        # Stale partition contains only IDs (not dicts)
+        assert set(stale_marker_ids) == {'mem0-prior', 'mem0-no-run-id'}
+        assert len(stale_marker_ids) == 2
+        # Confirm stale_marker_ids contains strings, not dicts
+        assert all(isinstance(sid, str) for sid in stale_marker_ids)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('metadata_run_id,filter_run_id,expect_current', [
+        ('42', '42', True),   # string match → current
+        ('43', '42', False),  # string mismatch → stale
+        (None, '42', False),  # absent key → treated as missing → stale
+        # Int variants omitted: production always writes string run_ids via the
+        # LLM/prompt template; testing int coercion pins behavior with no
+        # production caller.  str() coercion is still applied for robustness but
+        # is not a contract we need to maintain for non-string producers.
+    ])
+    async def test_run_id_string_match_and_missing_cases(self, metadata_run_id, filter_run_id, expect_current):
+        """Partition behaviour for str match, mismatch, and absent run_id."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        meta = {'flag_for_stage2': True, 'task_id': '1'}
+        if metadata_run_id is not None:
+            meta['run_id'] = metadata_run_id
+        memory_service.search.return_value = [
+            self._make_result('test-id', 'content', meta),
+        ]
+        current_flags, stale_marker_ids = await _query_stage2_flags(
+            memory_service, 'reify', filter_run_id
+        )
+        if expect_current:
+            assert len(current_flags) == 1
+            assert current_flags[0]['id'] == 'test-id'
+            assert stale_marker_ids == []
+        else:
+            assert current_flags == []
+            assert stale_marker_ids == ['test-id']
+
+
+class TestSweepStaleFixcMarkers:
+    """_sweep_stale_fixc_markers deletes stale fixc markers in parallel and returns count."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_each_id_in_parallel_and_returns_count(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        stale_ids = ['m1', 'm2', 'm3']
+
+        result = await _sweep_stale_fixc_markers(
+            memory_service, project_id='reify', stale_ids=stale_ids, run_id='r-current'
+        )
+
+        assert result == 3
+        assert memory_service.delete_memory.await_count == 3
+
+        # Verify each call carries the required kwargs
+        called_memory_ids = {
+            call.kwargs.get('memory_id') or call.args[0]
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert called_memory_ids == {'m1', 'm2', 'm3'}
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r-current'
+            assert kwargs.get('_source') == 'stage2_stale_fixc_sweep'
+
+    @pytest.mark.asyncio
+    async def test_empty_input_returns_zero_and_no_calls(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_fixc_markers(
+            memory_service, project_id='reify', stale_ids=[], run_id='r-current'
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_individual_failure_logs_warning_and_skipped_from_count(self, caplog):
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        # Middle delete raises; first and last succeed
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[None, RuntimeError('boom'), None]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_fixc_markers(
+                memory_service,
+                project_id='reify',
+                stale_ids=['ok-1', 'bad', 'ok-2'],
+                run_id='r-current',
+            )
+
+        # Must not raise; successful deletes counted; failure excluded
+        assert result == 2
+        # Exactly one WARNING for the failing memory_id
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == 1
+        assert 'bad' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_all_failures_returns_zero_and_does_not_raise(self, caplog):
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _sweep_stale_fixc_markers
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom1'), RuntimeError('boom2'), RuntimeError('boom3')]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_fixc_markers(
+                memory_service,
+                project_id='reify',
+                stale_ids=['a', 'b', 'c'],
+                run_id='r-current',
+            )
+
+        assert result == 0
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == 3
 
 
 class TestComputeStaleFlags:
@@ -4606,13 +4773,12 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
     def watermark(self):
         return Watermark(project_id='reify')
 
-    def _make_mem0_flag(self, flag_id, content, task_id):
+    def _make_mem0_flag(self, flag_id, content, task_id, run_id=None):
         from types import SimpleNamespace
-        return SimpleNamespace(
-            id=flag_id,
-            content=content,
-            metadata={'flag_for_stage2': True, 'task_id': task_id},
-        )
+        meta: dict = {'flag_for_stage2': True, 'task_id': task_id}
+        if run_id is not None:
+            meta['run_id'] = run_id
+        return SimpleNamespace(id=flag_id, content=content, metadata=meta)
 
     @pytest.mark.asyncio
     async def test_payload_contains_both_stage1_and_mem0_flags(self, mock_deps, watermark):
@@ -4625,10 +4791,10 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         stage.project_root = '/home/leo/src/reify'
         stage._current_run_id = 'test-run'
 
-        # Mem0 active-query flags
+        # Mem0 active-query flags (both carry matching run_id so they are current)
         mock_deps['memory_service'].search.return_value = [
-            self._make_mem0_flag('mem0-flag-1', 'mem0 flag content for task 742', '742'),
-            self._make_mem0_flag('mem0-flag-2', 'mem0 flag content for task 888', '888'),
+            self._make_mem0_flag('mem0-flag-1', 'mem0 flag content for task 742', '742', run_id='test-run'),
+            self._make_mem0_flag('mem0-flag-2', 'mem0 flag content for task 888', '888', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -4705,6 +4871,111 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         assert project_id_used == 'reify', \
             f'search must be called with project_id="reify", got: {project_id_used}'
 
+    @pytest.mark.asyncio
+    async def test_payload_excludes_stale_run_id_flags_and_sweeps_them(self, mock_deps, watermark):
+        """Stale markers (wrong/absent run_id) must be excluded from payload and swept via delete_memory."""
+        from types import SimpleNamespace
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
+
+        mock_deps['memory_service'].delete_memory = AsyncMock(return_value=None)
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-current',
+                content='content for task 742',
+                metadata={'flag_for_stage2': True, 'task_id': '742', 'run_id': 'test-run'},
+            ),
+            SimpleNamespace(
+                id='mem0-prior',
+                content='STALE content from prior run',
+                metadata={'flag_for_stage2': True, 'task_id': '888', 'run_id': 'r-old'},
+            ),
+            SimpleNamespace(
+                id='mem0-no-run-id',
+                content='NO_RUN_ID legacy content',
+                metadata={'flag_for_stage2': True, 'task_id': '999'},
+            ),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        payload = await stage.assemble_payload([], watermark, [])
+        section = _extract_section(payload, '### Stage 1 Flagged Items')
+
+        # Only current-cycle marker rendered to LLM
+        assert 'content for task 742' in section
+        assert 'STALE content from prior run' not in section
+        assert 'NO_RUN_ID legacy content' not in section
+
+        # Two stale markers swept via delete_memory
+        assert mock_deps['memory_service'].delete_memory.await_count == 2
+        swept_ids = {
+            call.kwargs.get('memory_id')
+            for call in mock_deps['memory_service'].delete_memory.call_args_list
+        }
+        assert swept_ids == {'mem0-prior', 'mem0-no-run-id'}
+        for call in mock_deps['memory_service'].delete_memory.call_args_list:
+            assert call.kwargs.get('store') == 'mem0'
+            assert call.kwargs.get('_source') == 'stage2_stale_fixc_sweep'
+
+    @pytest.mark.asyncio
+    async def test_search_failure_yields_zero_swept_and_no_stale_partition(
+        self, mock_deps, watermark,
+    ):
+        """On Mem0 search failure, assemble_payload must not raise, not sweep, and
+        stage.run() must record stale_fixc_markers_swept=0 (not absent)."""
+        from datetime import UTC, datetime
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        stage._current_run_id = 'test-run'
+        mock_deps['memory_service'].delete_memory = AsyncMock(return_value=None)
+        mock_deps['memory_service'].search.side_effect = RuntimeError('Mem0 unavailable')
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[{'task_id': '77', 'description': 'stage1 only flag'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        # (a) assemble_payload must not raise
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        # (b) payload renders normally — Stage 1 section still present
+        assert '### Stage 1 Flagged Items' in payload
+
+        # (c) no sweep on search failure
+        mock_deps['memory_service'].delete_memory.assert_not_awaited()
+
+        # (d) stage.run() records stale_fixc_markers_swept=0 explicitly (not absent)
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
+        )
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run',
+            )
+
+        assert 'stale_fixc_markers_swept' in report.stats
+        assert report.stats['stale_fixc_markers_swept'] == 0
+
 
 class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
     """Scope filter suppresses task-1139/bug-mechanics flags from Mem0 active-query path."""
@@ -4726,12 +4997,15 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
     def watermark(self):
         return Watermark(project_id='reify')
 
-    def _make_flag(self, flag_id, content, task_id):
+    def _make_flag(self, flag_id, content, task_id, run_id=None):
         from types import SimpleNamespace
+        meta: dict = {'flag_for_stage2': True, 'task_id': task_id}
+        if run_id is not None:
+            meta['run_id'] = run_id
         return SimpleNamespace(
             id=flag_id,
             content=content,
-            metadata={'flag_for_stage2': True, 'task_id': task_id},
+            metadata=meta,
         )
 
     @pytest.mark.asyncio
@@ -4741,8 +5015,8 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage.project_root = '/home/leo/src/reify'
         stage._current_run_id = 'test-run'
         mock_deps['memory_service'].search.return_value = [
-            self._make_flag('mem-742', 'legitimate finding for task 742', '742'),
-            self._make_flag('mem-1139', 'some flag for task 1139', '1139'),
+            self._make_flag('mem-742', 'legitimate finding for task 742', '742', run_id='test-run'),
+            self._make_flag('mem-1139', 'some flag for task 1139', '1139', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -4757,8 +5031,11 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        # run_id must match _current_run_id so the marker enters the current
+        # partition and the 1139 scope filter (not just stale sweep) suppresses it.
+        stage._current_run_id = 'test-run'
         mock_deps['memory_service'].search.return_value = [
-            self._make_flag('mem-1139', 'some flag for task 1139', '1139'),
+            self._make_flag('mem-1139', 'some flag for task 1139', '1139', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -4773,12 +5050,15 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        # run_id must match _current_run_id so the marker enters the current
+        # partition and the content-marker scope filter suppresses it.
+        stage._current_run_id = 'test-run'
         bug_content = (
             'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2 '
             'but does NOT include them in flagged_items'
         )
         mock_deps['memory_service'].search.return_value = [
-            self._make_flag('mem-bug', bug_content, ''),
+            self._make_flag('mem-bug', bug_content, '', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -4843,12 +5123,15 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
     def watermark(self):
         return Watermark(project_id='reify')
 
-    def _make_active_flag(self, flag_id, task_id='742'):
+    def _make_active_flag(self, flag_id, task_id='742', run_id=None):
         from types import SimpleNamespace
+        meta: dict = {'flag_for_stage2': True, 'task_id': task_id}
+        if run_id is not None:
+            meta['run_id'] = run_id
         return SimpleNamespace(
             id=flag_id,
             content=f'active flag content for {flag_id}',
-            metadata={'flag_for_stage2': True, 'task_id': task_id},
+            metadata=meta,
         )
 
     def _setup_persistence_count(self, mock_deps, *, prior_count: int, escalated_count: int = 0):
@@ -4880,7 +5163,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
         # search returns active flags; count returns 2 prior persistence markers.
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
@@ -4901,7 +5184,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
@@ -4926,7 +5209,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-B')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-B', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=0, escalated_count=0)
 
         with caplog.at_level(logging.WARNING):
@@ -4949,7 +5232,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-C')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-C', run_id='test-run')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         # No prior_reports → prior_reports=[] (no Stage 1 report)
@@ -4974,7 +5257,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='test-run')]
         # Persistence count >= threshold AND an escalation marker already exists.
         self._setup_persistence_count(mock_deps, prior_count=5, escalated_count=1)
 
@@ -5002,7 +5285,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': ['m1']}
 
-        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A')]
+        mock_deps['memory_service'].search.return_value = [self._make_active_flag('flag-A', run_id='run-marker-test')]
         self._setup_persistence_count(mock_deps, prior_count=2, escalated_count=0)
 
         await stage.assemble_payload([], watermark, [])
@@ -5017,6 +5300,122 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         assert 'stage2_escalation_marker' in sources_written
         # Sanity: avoid lint warning on unused import
         assert mock_call
+
+
+class TestTaskKnowledgeSyncStaleFixcSweptStat:
+    """TaskKnowledgeSync.run() sets report.stats['stale_fixc_markers_swept'] after super().run()."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stale_fixc_markers_swept_stat_set_after_run(self, mock_deps):
+        """run() injects stale_fixc_markers_swept into report.stats after super().run().
+
+        Uses the run_stage_via_cli mock pattern (not BaseStage.run mock) so that
+        assemble_payload executes for real and _stale_fixc_markers_swept is populated
+        by the sweep before run() injects the count into report.stats.
+        """
+        from types import SimpleNamespace
+
+        from fused_memory.models.reconciliation import StageId
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # One current-cycle marker and two stale markers
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+            SimpleNamespace(
+                id='stale-1', content='stale 1',
+                metadata={'flag_for_stage2': True, 'task_id': '2', 'run_id': 'old-run'},
+            ),
+            SimpleNamespace(
+                id='stale-2', content='stale 2',
+                metadata={'flag_for_stage2': True, 'task_id': '3'},
+            ),
+        ]
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        # Fake LLM result — assemble_payload runs for real; only the CLI call is mocked.
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stale_fixc_markers_swept') == 2
+
+    @pytest.mark.asyncio
+    async def test_zero_stale_markers_stat_is_explicitly_set(self, mock_deps):
+        """When no stale markers exist, stat is 0 (explicitly set, not absent)."""
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # All markers have matching run_id → zero stale
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+        ]
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch.object(BaseStage, 'run', new=AM(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # Stat must be present and == 0, not absent
+        assert 'stale_fixc_markers_swept' in report.stats
+        assert report.stats['stale_fixc_markers_swept'] == 0
 
 
 class TestStage3PayloadIncludesProjectRoot:
