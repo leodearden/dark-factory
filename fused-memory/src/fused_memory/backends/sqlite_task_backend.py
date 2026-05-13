@@ -43,6 +43,17 @@ logger = logging.getLogger(__name__)
 # index are treated as distinct, which would let duplicate top-levels slip in.
 _TOP_LEVEL_SENTINEL = 0
 
+# Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
+# is invoked once per row on every `get_tasks` / `get_task` call, so a project
+# DB with many corrupted rows would otherwise flood the log with duplicate
+# WARNINGs on every read.  Keyed by ``(tag, parent_id, id)`` because top-level
+# row ``(0, 1)`` and subtask ``(1, 1)`` share a short int id but must dedup
+# independently — operators repairing a botched migration need to see both.
+# Growth is bounded by the number of distinct (tag, parent_id, id) triples
+# across all project DBs opened in this process — a small, row-count-capped set
+# in practice.  No eviction is needed; a process restart re-emits.
+_warned_malformed_task_ids: set[tuple[str, int, int]] = set()
+
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -135,14 +146,19 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int]) -> dict[str, Any]:
         except (TypeError, ValueError):
             # Malformed legacy row: discard and surface {} so downstream
             # `(task.get('metadata') or {}).get(...)` callers never see a str.
-            logger.warning(
-                'sqlite_task_backend: malformed metadata JSON — tag=%s id=%s parent_id=%s'
-                ' metadata_raw=%s; coerced to {}',
-                row['tag'],
-                row['id'],
-                row['parent_id'],
-                repr(metadata_raw)[:80],
-            )
+            # WARN once per (tag, parent_id, id) per process so a corrupted-row
+            # batch doesn't fan out to one log line per row per get_tasks call.
+            dedup_key = (row['tag'], row['parent_id'], row['id'])
+            if dedup_key not in _warned_malformed_task_ids:
+                _warned_malformed_task_ids.add(dedup_key)
+                logger.warning(
+                    'sqlite_task_backend: malformed metadata JSON — tag=%s id=%s parent_id=%s'
+                    ' metadata_raw=%s; coerced to {}',
+                    row['tag'],
+                    row['id'],
+                    row['parent_id'],
+                    repr(metadata_raw)[:80],
+                )
             metadata = {}
 
     if parent_id is None:

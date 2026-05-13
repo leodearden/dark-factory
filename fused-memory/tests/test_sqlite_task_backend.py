@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,17 @@ async def backend(tmp_path):
 @pytest_asyncio.fixture
 async def project_root(tmp_path):
     return str(tmp_path / 'proj')
+
+
+@pytest.fixture(autouse=True)
+def _clear_malformed_metadata_warning_dedup():
+    """Reset the module-level dedup set so each test sees a clean WARN gate."""
+    from fused_memory.backends import sqlite_task_backend as _sb
+    if hasattr(_sb, '_warned_malformed_task_ids'):
+        _sb._warned_malformed_task_ids.clear()
+    yield
+    if hasattr(_sb, '_warned_malformed_task_ids'):
+        _sb._warned_malformed_task_ids.clear()
 
 
 # ── ID parsing ──────────────────────────────────────────────────────
@@ -541,7 +553,10 @@ async def test_row_to_task_warns_on_malformed_metadata(backend, project_root, ca
 
     # Top-level row: tag=master, id=1, parent_id=0 (the top-level sentinel).
     assert 'master' in combined, f'Expected tag "master" in warning; got: {combined!r}'
-    assert 'id=1' in combined, f'Expected labeled token "id=1" in warning; got: {combined!r}'
+    assert re.search(r'\bid=1\b', combined), (
+        f'Expected word-bounded labeled token "id=1" in warning (not the substring '
+        f'inside "parent_id=1"); got: {combined!r}'
+    )
     assert 'parent_id=0' in combined, (
         f'Expected labeled token "parent_id=0" in warning; got: {combined!r}'
     )
@@ -552,6 +567,88 @@ async def test_row_to_task_warns_on_malformed_metadata(backend, project_root, ca
     # Subtask row: parent_id=1 (the DB int of the parent, not the sentinel).
     assert 'parent_id=1' in combined, (
         f'Expected labeled token "parent_id=1" for subtask warning; got: {combined!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_row_to_task_warning_deduplicated_per_id_per_process(
+    backend, project_root, caplog,
+):
+    """Repeated reads of the same malformed-metadata row emit at most one WARNING.
+
+    `_get_tasks_internal` invokes `_row_to_task` on every row of every `get_tasks`
+    call. A project DB with many corrupted rows would otherwise flood the log
+    with one WARNING per row per call. The dedup gate caches `(tag, parent_id,
+    id)` triples already warned about and skips subsequent emissions for the
+    lifetime of the process.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON_DEDUP' "
+        "WHERE parent_id = 0 AND id = 1"
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        first = await backend.get_task('1', project_root=project_root)
+        second = await backend.get_task('1', project_root=project_root)
+        listing = await backend.get_tasks(project_root=project_root)
+
+    # Coercion contract still holds for every read.
+    assert first['metadata'] == {}
+    assert second['metadata'] == {}
+    assert listing['tasks'][0]['metadata'] == {}
+
+    malformed_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and 'malformed metadata' in r.message
+    ]
+    assert len(malformed_msgs) == 1, (
+        f'Expected exactly one malformed-metadata WARNING across three reads '
+        f'of the same row; got {len(malformed_msgs)}: {malformed_msgs}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_row_to_task_warning_dedup_key_includes_parent_id(
+    backend, project_root, caplog,
+):
+    """Top-level (parent_id=0, id=1) and subtask (parent_id=1, id=1) dedup independently.
+
+    They share the short int id but represent different rows; the WARNING gate
+    must key on the full (tag, parent_id, id) triple so both surface once.
+    """
+    await backend.add_task(project_root=project_root, title='parent')
+    await backend.add_subtask('1', project_root=project_root, title='child')
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON_KEYS' "
+        "WHERE parent_id = 0 AND id = 1"
+    )
+    await conn.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON_KEYS' "
+        "WHERE parent_id = 1 AND id = 1"
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        await backend.get_task('1', project_root=project_root)
+        await backend.get_task('1.1', project_root=project_root)
+
+    malformed_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and 'malformed metadata' in r.message
+    ]
+    assert len(malformed_msgs) == 2, (
+        f'Expected two distinct dedup keys (top-level vs subtask); got '
+        f'{len(malformed_msgs)}: {malformed_msgs}'
     )
 
 
