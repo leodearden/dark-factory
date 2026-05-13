@@ -52,7 +52,6 @@ def _find_script_position(
     return None
 
 
-
 @pytest.fixture(scope='module')
 def index_html_body():
     """Fetch /static/redux/index.html once for the whole test module."""
@@ -272,6 +271,17 @@ _DEFERRED_CDN_CASES = [
     ('type="module"', r'type="module".*deferred by default'),
 ]
 
+_DEFERRED_TAB_TASKS_CASES = [
+    # (extra_attrs_on_tab_tasks_tag, regex_to_match_in_AssertionError_message)
+    # Regex patterns are pinned to include 'tab_tasks.jsx' so that a CDN-branch
+    # fire (which would produce a message referencing the CDN tag label) cannot
+    # satisfy the match — same defensive unique-phrase approach used in
+    # _DEFERRED_CDN_CASES.
+    ('defer', r'tab_tasks\.jsx has a defer attribute'),
+    ('async', r'tab_tasks\.jsx has an async attribute'),
+    ('type="module"', r'tab_tasks\.jsx has type="module".*deferred by default'),
+]
+
 
 @pytest.mark.parametrize(
     'extra_attrs, match_pattern',
@@ -290,6 +300,40 @@ def test_load_order_assertion_fires_on_deferred_cdn(
         f'{extra_attrs}></script>'
     )
     body = cdn_tag + _TAB_TASKS_TAG
+    with pytest.raises(AssertionError, match=match_pattern):
+        _assert_cdn_loads_before_tab_tasks(
+            body,
+            'https://unpkg.com/marked@',
+            _TAB_TASKS_PREFIX,
+            lib_name='marked',
+        )
+
+
+@pytest.mark.parametrize(
+    'extra_attrs, match_pattern',
+    _DEFERRED_TAB_TASKS_CASES,
+    ids=['defer', 'async', 'type-module'],
+)
+def test_load_order_assertion_fires_on_deferred_tab_tasks(
+    extra_attrs: str, match_pattern: str
+) -> None:
+    """When the tab_tasks.jsx tag carries defer / async / type="module", the
+    false-pass guard inside the load-order assertion must fire.
+
+    Covers the tab_tasks.jsx iteration of the for-loop in
+    _assert_cdn_loads_before_tab_tasks, mirroring
+    test_load_order_assertion_fires_on_deferred_cdn which covers the CDN branch.
+    A clean CDN tag is placed first so the loop advances past the CDN iteration
+    before raising on the tab_tasks.jsx tag.  The match regex is pinned to
+    'tab_tasks.jsx' so a future regression that fires the CDN branch instead
+    cannot satisfy the match and give a false pass.
+    """
+    cdn_tag = '<script src="https://unpkg.com/marked@x/y.js"></script>'
+    bad_tab_tasks_tag = (
+        f'<script src="/static/redux/tab_tasks.jsx?v=9" '
+        f'{extra_attrs}></script>'
+    )
+    body = cdn_tag + bad_tab_tasks_tag
     with pytest.raises(AssertionError, match=match_pattern):
         _assert_cdn_loads_before_tab_tasks(
             body,
