@@ -162,20 +162,27 @@ def merge_all_accounts_capped(
         return []
 
     # Build sweep events: (timestamp, kind, account)
-    # kind: +1 = interval starts, -1 = interval ends
-    # Sentinel for open-ended intervals: datetime.max (UTC)
-    _MAX_DT = datetime.max.replace(tzinfo=UTC)
+    # kind: +1 = interval starts, -1 = interval ends.
+    # Open-ended intervals (end=None) only emit a start event; their end is
+    # treated as "infinity" so they never contribute a -1 event to the sweep.
+    # After the sweep we check whether active intervals keep the merged window
+    # open and whether those intervals are open-ended.
 
     events: list[tuple[datetime, int, str]] = []
-    open_ended_accounts: set[str] = set()
+
+    # Track per-account whether any open-ended interval is currently
+    # "active" (i.e. started but no matching end event will close it).
+    open_ended_by_account: dict[str, bool] = {a: False for a in account_set}
 
     for account_name, ivs in per_account.items():
         for iv in ivs:
             events.append((iv.start, 1, account_name))
-            end = iv.end if iv.end is not None else _MAX_DT
-            if iv.end is None:
-                open_ended_accounts.add(account_name)
-            events.append((end, -1, account_name))
+            if iv.end is not None:
+                events.append((iv.end, -1, account_name))
+            else:
+                # Mark that this account has an open-ended interval starting
+                # at iv.start; it will never emit a -1 event.
+                open_ended_by_account[account_name] = True
 
     # Sort: at equal timestamps process starts (+1) before ends (-1)
     events.sort(key=lambda e: (e[0], -e[1]))
@@ -195,30 +202,28 @@ def merge_all_accounts_capped(
             window_start = ts
             currently_all_capped = True
         elif not all_capped and currently_all_capped:
-            # Merged window closes — ts is the end of the closing interval
-            # The window ends when coverage drops, i.e. at this timestamp
-            # (right edge exclusive-style; use ts as the endpoint)
+            # Merged window closes at this timestamp
             assert window_start is not None
             merged.append((window_start, ts))
             currently_all_capped = False
             window_start = None
 
-    # If still inside a merged window after all events, determine end
+    # If still inside a merged window after all real events, determine end.
+    # The window is open-ended iff every account currently active in it has
+    # at least one open-ended interval (meaning their coverage extends to
+    # infinity beyond our event list).
     if currently_all_capped and window_start is not None:
-        # All accounts' remaining intervals: check if they're all open-ended
-        # An open-ended merged window is possible only if every account
-        # contributed an open-ended interval covering the window start.
-        # Simple heuristic: if every account is in open_ended_accounts,
-        # the merged window is open-ended.
-        if account_set <= open_ended_accounts:
+        # All accounts must still be active (count > 0) and have an
+        # open-ended interval for the merged end to be None.
+        all_open = all(open_ended_by_account[a] for a in account_set)
+        if all_open:
             merged.append((window_start, None))
         else:
-            # At least one account's last interval was closed at _MAX_DT
-            # sentinel — treat the window as ending there (then discard
-            # because it's the sentinel, not a real end).
-            # The sweep will have processed the -1 sentinel before we exit.
-            # If we're still here it means something weird happened; emit
-            # with None to be safe.
+            # Some account's last interval was closed — but because we don't
+            # emit -1 events for finite intervals that ended after the last
+            # sweep event, this path only triggers if the sweep didn't close
+            # the window (shouldn't happen with correct event emission). Emit
+            # None conservatively.
             merged.append((window_start, None))
 
     return merged
