@@ -17,6 +17,10 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from dashboard.data.cap_history import (  # noqa: F401  -- canonical shared cap-interval reader; see notes in get_cost_by_account
+    CapInterval,
+    read_cap_intervals,
+)
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
 
@@ -207,6 +211,13 @@ async def get_cost_by_account(
 
         # Per-account unavailability / recovery timestamps plus the latest
         # cap_hit and auth_failed details payloads (for resets_at extraction).
+        #
+        # NOTE: This CTE reads the same cap_hit/resumed rows that
+        # `cap_history.read_cap_intervals` surfaces. Curator-tab callers and
+        # any new consumer should prefer `read_cap_intervals` (the canonical
+        # shared reader). This CTE is kept here because it folds
+        # auth_failed/auth_resumed/resets_at into a single I/O — splitting it
+        # would double per-DB round-trips and risk subtle ordering differences.
         #
         # latest_cap / latest_auth_fail pick the newest cap_hit / auth_failed
         # row per account and carry the `details` field forward. The outer
