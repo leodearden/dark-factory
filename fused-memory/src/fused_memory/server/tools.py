@@ -118,9 +118,7 @@ def _summarise_ticket_row(row: dict) -> dict:
     }
 
 
-def _extract_causation(
-    metadata: dict | None, agent_id: str | None
-) -> tuple[str, str, dict | None]:
+def _extract_causation(metadata: dict | None, agent_id: str | None) -> tuple[str, str, dict | None]:
     """Extract or generate causation_id, determine source, clean metadata.
 
     Returns (causation_id, source, cleaned_metadata).
@@ -308,7 +306,7 @@ def create_mcp_server(
     from starlette.requests import Request
     from starlette.responses import JSONResponse
 
-    @mcp.custom_route("/health", methods=["GET"])
+    @mcp.custom_route('/health', methods=['GET'])
     async def health_check(request: Request) -> JSONResponse:
         import asyncio
 
@@ -328,8 +326,7 @@ def create_mcp_server(
             pass
 
         ok = graphiti_ok and mem0_ok
-        body = {"status": "ok" if ok else "degraded",
-                "graphiti": graphiti_ok, "mem0": mem0_ok}
+        body = {'status': 'ok' if ok else 'degraded', 'graphiti': graphiti_ok, 'mem0': mem0_ok}
         return JSONResponse(body, status_code=200 if ok else 503)
 
     # ------------------------------------------------------------------
@@ -337,9 +334,17 @@ def create_mcp_server(
     # ------------------------------------------------------------------
 
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
-    _VALID_TASK_STATUSES = frozenset({
-        'pending', 'done', 'in-progress', 'review', 'deferred', 'cancelled', 'blocked',
-    })
+    _VALID_TASK_STATUSES = frozenset(
+        {
+            'pending',
+            'done',
+            'in-progress',
+            'review',
+            'deferred',
+            'cancelled',
+            'blocked',
+        }
+    )
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
 
@@ -655,9 +660,7 @@ def create_mcp_server(
         if last_n > 1000:
             last_n = 1000
         try:
-            episodes = await memory_service.get_episodes(
-                project_id=project_id, last_n=last_n
-            )
+            episodes = await memory_service.get_episodes(project_id=project_id, last_n=last_n)
             await _log_read(
                 operation='get_episodes',
                 project_id=project_id,
@@ -719,18 +722,19 @@ def create_mcp_server(
             return err
         if store not in _VALID_STORES:
             return {
-                'error': (
-                    f'Invalid store {store!r}. '
-                    f'Must be one of {sorted(_VALID_STORES)}.'
-                ),
+                'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
                 'error_type': 'ValidationError',
             }
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.delete_memory(
-                memory_id=memory_id, store=store, project_id=project_id,
-                agent_id=agent_id, session_id=session_id,
-                causation_id=causation_id, _source=source,
+                memory_id=memory_id,
+                store=store,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -768,9 +772,13 @@ def create_mcp_server(
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.delete_episode(
-                episode_id=episode_id, project_id=project_id, cascade=cascade,
-                agent_id=agent_id, session_id=session_id,
-                causation_id=causation_id, _source=source,
+                episode_id=episode_id,
+                project_id=project_id,
+                cascade=cascade,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -823,27 +831,37 @@ def create_mcp_server(
         normalised_fact: str | None = None
         if fact is not None:
             if not fact.strip():
-                return {'error': 'fact text must be non-empty when provided',
-                        'error_type': 'ValidationError'}
+                return {
+                    'error': 'fact text must be non-empty when provided',
+                    'error_type': 'ValidationError',
+                }
             normalised_fact = fact
         parsed_invalid_at: datetime | None = None
         if invalid_at is not None:
             try:
                 parsed_invalid_at = datetime.fromisoformat(invalid_at)
             except ValueError as e:
-                return {'error': f'invalid_at must be ISO 8601: {e}',
-                        'error_type': 'ValidationError'}
+                return {
+                    'error': f'invalid_at must be ISO 8601: {e}',
+                    'error_type': 'ValidationError',
+                }
             if parsed_invalid_at.tzinfo is None:
                 parsed_invalid_at = parsed_invalid_at.replace(tzinfo=UTC)
         if normalised_fact is None and parsed_invalid_at is None:
-            return {'error': 'update_edge requires fact or invalid_at',
-                    'error_type': 'ValidationError'}
+            return {
+                'error': 'update_edge requires fact or invalid_at',
+                'error_type': 'ValidationError',
+            }
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.update_edge(
-                edge_uuid=edge_uuid, fact=normalised_fact, project_id=project_id,
-                agent_id=agent_id, session_id=session_id,
-                causation_id=causation_id, _source=source,
+                edge_uuid=edge_uuid,
+                fact=normalised_fact,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
                 invalid_at=parsed_invalid_at,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -900,8 +918,10 @@ def create_mcp_server(
                 entity_uuid=entity_uuid or None,
                 entity_name=entity_name or None,
                 project_id=project_id,
-                agent_id=agent_id, session_id=session_id,
-                causation_id=causation_id, _source=source,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -941,11 +961,20 @@ def create_mcp_server(
         if err := validate_project_id(project_id):
             return err
         if not deprecated_uuid or not deprecated_uuid.strip():
-            return {'error': 'deprecated_uuid must be a non-empty string', 'error_type': 'ValidationError'}
+            return {
+                'error': 'deprecated_uuid must be a non-empty string',
+                'error_type': 'ValidationError',
+            }
         if not surviving_uuid or not surviving_uuid.strip():
-            return {'error': 'surviving_uuid must be a non-empty string', 'error_type': 'ValidationError'}
+            return {
+                'error': 'surviving_uuid must be a non-empty string',
+                'error_type': 'ValidationError',
+            }
         if deprecated_uuid.strip() == surviving_uuid.strip():
-            return {'error': 'deprecated_uuid and surviving_uuid must be different', 'error_type': 'ValidationError'}
+            return {
+                'error': 'deprecated_uuid and surviving_uuid must be different',
+                'error_type': 'ValidationError',
+            }
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.merge_entities(
@@ -1043,7 +1072,9 @@ def create_mcp_server(
                 if isinstance(result, dict):
                     result.setdefault('queue', {})
                     result['queue']['dead_letters'] = {
-                        'durable_queue': 0, 'event_queue': 0, 'total': 0,
+                        'durable_queue': 0,
+                        'event_queue': 0,
+                        'total': 0,
                     }
             elif 'error' not in queue_section:
                 # Skip enrichment for error queue sections (e.g. {'error': '...'}).
@@ -1170,7 +1201,8 @@ def create_mcp_server(
             # --- durable write queue ---
             if memory_service.durable_queue is not None:
                 dead = await memory_service.durable_queue.get_dead_items(
-                    group_id=project_id, limit=limit,
+                    group_id=project_id,
+                    limit=limit,
                 )
                 for row in dead:
                     payload, truncated = _truncate_payload(row.get('payload'))
@@ -1196,7 +1228,8 @@ def create_mcp_server(
                     # thread so the event loop is not blocked on large files.
                     records = await asyncio.to_thread(
                         event_queue.read_dead_letters,
-                        limit=remaining, project_id=project_id,
+                        limit=remaining,
+                        project_id=project_id,
                     )
                     for rec in records:
                         ev = rec.get('event') or {}
@@ -1290,7 +1323,8 @@ def create_mcp_server(
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
             result = await memory_service.durable_queue.delete_dead(
-                group_id=project_id, ids=ids,
+                group_id=project_id,
+                ids=ids,
             )
             return result
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -1418,7 +1452,8 @@ def create_mcp_server(
         return None
 
     def _reject_status_in_update_task(
-        task_id: str, status: str | None,
+        task_id: str,
+        status: str | None,
     ) -> dict | None:
         """Return a rejection dict if ``update_task`` was called with ``status``.
 
@@ -1555,9 +1590,7 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
         try:
-            return await task_interceptor.get_task(
-                task_id=id, project_root=project_root, tag=tag
-            )
+            return await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
@@ -1611,14 +1644,16 @@ def create_mcp_server(
         if status not in _VALID_TASK_STATUSES:
             return {
                 'error': (
-                    f'Invalid status {status!r}. '
-                    f'Must be one of {sorted(_VALID_TASK_STATUSES)}.'
+                    f'Invalid status {status!r}. Must be one of {sorted(_VALID_TASK_STATUSES)}.'
                 ),
                 'error_type': 'ValidationError',
             }
         try:
             return await task_interceptor.set_task_status(
-                task_id=id, status=status, project_root=project_root, tag=tag,
+                task_id=id,
+                status=status,
+                project_root=project_root,
+                tag=tag,
                 done_provenance=done_provenance,
                 reopen_reason=reopen_reason,
             )
@@ -1791,9 +1826,7 @@ def create_mcp_server(
                 parsed = datetime.fromisoformat(since)
             except ValueError:
                 return {
-                    'error': (
-                        f'list_tickets: invalid ISO-8601 timestamp for "since": {since!r}'
-                    ),
+                    'error': (f'list_tickets: invalid ISO-8601 timestamp for "since": {since!r}'),
                     'error_type': 'ValidationError',
                 }
             since_dt = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
@@ -1812,6 +1845,32 @@ def create_mcp_server(
         rows = result.pop('rows', [])
         result['tickets'] = [_summarise_ticket_row(r) for r in rows]
         return result
+
+    @mcp.tool()
+    async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
+        """Cancel a pending curator ticket by its ticket_id.
+
+        Three outcome shapes (v1 contract):
+
+        * **not_found** — ticket does not exist:
+          ``{'error': 'not_found', 'ticket_id': ticket_id}``
+        * **no_op** — ticket is already in a terminal/non-pending status:
+          ``{'status': <current>, 'ticket_id': ticket_id, 'no_op': True}``
+        * **cancelled** — ticket was pending and has been cancelled:
+          ``{'status': 'cancelled', 'ticket_id': ticket_id}``
+
+        v1 trade-off: in-flight curator/LLM calls are NOT interrupted.
+        Queued-but-not-started tickets are dropped cleanly when the worker
+        dequeues them and finds the row no longer pending.
+
+        Args:
+            ticket_id: The ``tkt_…`` ticket identifier returned by ``submit_task``.
+        """
+        try:
+            return await task_interceptor.cancel_ticket(ticket_id=ticket_id)
+        except Exception as e:
+            logger.exception(f'cancel_ticket error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
     async def commit_planning(
@@ -2062,9 +2121,7 @@ def create_mcp_server(
                 'message': 'no ids supplied',
             }
         try:
-            return await task_interceptor.remove_tasks(
-                ids=ids, project_root=project_root, tag=tag
-            )
+            return await task_interceptor.remove_tasks(ids=ids, project_root=project_root, tag=tag)
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
