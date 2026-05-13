@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import math
-import statistics
 import time
 from collections import deque
 from collections.abc import Callable
@@ -1418,9 +1417,6 @@ class Scheduler:
         dominant, age + CPM bonuses order tasks within a tier, and
         per-tier slot caps reserve headroom for higher-value work.
         """
-        # TODO(step-14): replace with prune_owners(predicate) owner-state GC sweep.
-        evicted: list[str] = []
-
         tasks = await self.get_tasks()
         if not tasks:
             return None
@@ -1440,6 +1436,34 @@ class Scheduler:
 
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._update_age_anchors(tasks, max_id)
+
+        # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
+        # a park whose owner is terminal / missing / deps-unsatisfied has no
+        # reason to keep blocking other tasks, so it's evicted now.
+        def _park_gc(tid: str) -> bool:
+            status = status_map.get(tid)
+            if status in TERMINAL_STATUSES:
+                return True
+            if tid not in tasks_by_id:
+                return True
+            return not self._deps_satisfied(tasks_by_id[tid], status_map)
+
+        gc_evicted = self.lock_table.prune_owners(_park_gc)
+        for owner in gc_evicted:
+            self._skip_count.pop(owner, None)
+            if self.event_store:
+                owner_status = status_map.get(owner)
+                if owner_status in TERMINAL_STATUSES:
+                    reason = f'terminal:{owner_status}'
+                elif owner not in tasks_by_id:
+                    reason = 'missing'
+                else:
+                    reason = 'deps_unsatisfied'
+                self.event_store.emit(
+                    EventType.reservation_expired,
+                    task_id=owner,
+                    data={'reason': reason},
+                )
 
         # Drop _last_dispatch_at entries for tasks now in a terminal status so
         # a future legitimate re-dispatch (e.g. cancelled -> pending re-architect,
