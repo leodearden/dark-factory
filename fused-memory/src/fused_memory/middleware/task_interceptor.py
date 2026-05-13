@@ -1733,6 +1733,34 @@ class TaskInterceptor:
             'rows': rows,
         }
 
+    async def cancel_ticket(self, ticket_id: str) -> dict:
+        """Cancel a pending curator ticket by ticket_id.
+
+        Three branches (v1 contract):
+        - not_found:  ticket does not exist (or ticket store not wired) →
+                      ``{'error': 'not_found', 'ticket_id': ticket_id}``
+        - no_op:      ticket row exists but is already in a terminal/non-pending
+                      status → ``{'status': <current>, 'ticket_id': ticket_id,
+                      'no_op': True}``
+        - cancelled:  ticket was pending → marks it cancelled, signals any
+                      resolve_ticket waiter, returns
+                      ``{'status': 'cancelled', 'ticket_id': ticket_id}``
+
+        v1 trade-off: in-flight curator/LLM calls are NOT interrupted.
+        ``_prepare_ticket`` drops non-pending rows when the worker dequeues
+        them, so queued-but-not-started tickets are cleaned up automatically.
+        """
+        if self._ticket_store is None:
+            return {'error': 'not_found', 'ticket_id': ticket_id}
+        row = await self._ticket_store.get(ticket_id)
+        if row is None:
+            return {'error': 'not_found', 'ticket_id': ticket_id}
+        # no_op and cancelled branches — to be filled in by subsequent impl steps.
+        raise NotImplementedError(
+            f'cancel_ticket: branches for non-pending rows not yet implemented '
+            f'(ticket_id={ticket_id!r}, status={row["status"]!r})'
+        )
+
     def _start_worker_if_needed(self, project_id: str) -> None:
         """Lazily start the per-project curator worker asyncio.Task if not running.
 
