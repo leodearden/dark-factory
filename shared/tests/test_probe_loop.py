@@ -730,9 +730,13 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(returncode=0, stdout=b'ok')
 
+        async def fake_wait_for(coro, *args, **kwargs):
+            coro.close()
+            raise TimeoutError()
+
         with (
             patch('asyncio.create_subprocess_exec', return_value=proc),
-            patch('shared.usage_gate.asyncio.wait_for', side_effect=TimeoutError),
+            patch('shared.usage_gate.asyncio.wait_for', side_effect=fake_wait_for),
         ):
             result = await gate._run_probe(acct)
 
