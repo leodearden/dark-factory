@@ -183,32 +183,39 @@ Recurring temporal-fact snapshots (task-count, task-status, run summaries, syste
 are written every reconciliation cycle. Every cycle the values change, but prior snapshot \
 edges from older episodes stay valid and accumulate as contradictions.
 
+**Async-queue indexing latency**: snapshot writes via `add_memory(category='temporal_facts')` \
+are async-enqueued through the durable queue (see `## Graphiti Queued Writes` for the \
+`memory_ids: []` invariant). Graphiti embedding indexing trails Stage 1's search window, \
+so a pre-write `search()` CANNOT return the current cycle's own snapshot writes. Searching \
+for your own snapshot before writing it is a provable no-op — do not do it. Rely instead \
+on temporal supersession: each fresh snapshot carries a newer `valid_at`, so readers \
+querying by `valid_at` desc always see the most recent value without you needing to \
+invalidate prior edges.
+
 **Never use `add_episode` for recurring temporal-fact snapshot writes.** `add_episode` \
 triggers Graphiti's extraction pipeline, which produces 4 identical edges per write that \
 dedup loops must clean up next cycle. Do not use `add_episode` for task-count, task-status, \
-run summary, or system-stat snapshots. Use the mandatory two-step workaround below instead.
+run summary, or system-stat snapshots.
 
-If you write any recurring temporal-fact snapshot (task counts, task status, run summaries, \
-system stats), follow this discipline for each snapshot fact:
+For each recurring snapshot write, follow this discipline:
 
-1. First, search for existing snapshot edges for this project \
-   (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)` or \
-   `search(query="task status in_progress blocked", project_id=..., limit=5)`).
-2. To update the snapshot, use the **mandatory two-step workaround** (see \
-   `## update_edge Temporal Limitation` below): (a) call `update_edge(invalid_at=now)` \
-   on the old edge to mark it superseded, then (b) call \
-   `add_memory(category='temporal_facts')` with the new fact text. Do NOT use `update_edge` \
-   alone to overwrite snapshot fact text — the edge's `valid_at` stays pinned at its \
-   original creation date, creating misleading temporal provenance.
-3. When several stale edges exist from a single older snapshot episode, either:
-   (a) `delete_memory` each stale edge UUID and call `refresh_entity_summary` on the \
-       affected project entity, OR
-   (b) prefer a single composite edge ("reify task counts as of {{ISO_date}}: total=N, \
-       done=M, in_progress=K, blocked=J") over multiple sibling edges — fewer surfaces \
-       means fewer stale facts next cycle.
+1. Call `add_memory(category='temporal_facts')` directly with the new fact text. \
+   Encode the effective ISO date in the fact text itself \
+   (e.g. `"As of 2026-05-13: project dark_factory has 42 total tasks, 18 done, 3 blocked."`). \
+   Each write carries the current ingestion time as `valid_at`; newer writes naturally \
+   supersede older ones in temporal queries.
+2. Prefer a single composite edge ("reify task counts as of {{ISO_date}}: total=N, \
+   done=M, in_progress=K, blocked=J") over multiple sibling edges — fewer surfaces \
+   means fewer stale facts next cycle.
 
 Do not write four sibling edges (one per count field) — that multiplies the stale-edge \
 surface you or a later cycle will have to clean up.
+
+**Note**: the `## update_edge Temporal Limitation` two-step workaround (invalidate + \
+add_memory) still applies to NON-snapshot temporal edge updates (status flips, decision \
+retractions, etc.) where you are updating a specific known edge. The snapshot simplification \
+above (write-fresh, skip pre-search) applies only to recurring snapshot writes where \
+temporal supersession via `valid_at` is sufficient.
 
 ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
 `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
