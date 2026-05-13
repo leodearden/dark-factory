@@ -569,6 +569,12 @@ async def test_row_to_task_warns_on_malformed_metadata(backend, project_root, ca
         f'Expected labeled token "parent_id=1" for subtask warning; got: {combined!r}'
     )
 
+    # The warning must carry a labeled project_root= token so an operator can
+    # identify which DB is corrupt (added by task 1263).
+    assert 'project_root=' in combined, (
+        f'Expected labeled token "project_root=" in warning; got: {combined!r}'
+    )
+
 
 @pytest.mark.asyncio
 async def test_row_to_task_warning_deduplicated_per_id_per_process(
@@ -650,6 +656,79 @@ async def test_row_to_task_warning_dedup_key_includes_parent_id(
         f'Expected two distinct dedup keys (top-level vs subtask); got '
         f'{len(malformed_msgs)}: {malformed_msgs}'
     )
+
+
+@pytest.mark.asyncio
+async def test_row_to_task_warning_dedup_distinguishes_project_roots(
+    backend, tmp_path, caplog,
+):
+    """Two project_roots sharing the same (tag, parent_id, id) row emit distinct WARNs.
+
+    A single SqliteTaskBackend instance services all project_roots.  Before the
+    fix, the dedup key was (tag, parent_id, id), so both project_roots' corrupted
+    (master, 0, 1) rows collided on the same key — the second WARN was silently
+    swallowed.  The fix prepends project_root to the tuple, making each project
+    DB's WARNING independent.  Each WARNING must also carry a ``project_root=``
+    labeled token so an operator can pin the WARN to its DB.
+    """
+    proj_a = str(tmp_path / 'proj_a')
+    proj_b = str(tmp_path / 'proj_b')
+
+    # Each project_root gets a canonical (tag=master, parent_id=0, id=1) row.
+    await backend.add_task(project_root=proj_a, title='parent_a')
+    await backend.add_task(project_root=proj_b, title='parent_b')
+
+    # Corrupt both DBs' metadata column with a non-JSON string.
+    conn_a = await backend._get_connection(proj_a)
+    await conn_a.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE parent_id = 0 AND id = 1"
+    )
+    await conn_a.commit()
+
+    conn_b = await backend._get_connection(proj_b)
+    await conn_b.execute(
+        "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE parent_id = 0 AND id = 1"
+    )
+    await conn_b.commit()
+
+    # Read from both project_roots and capture warnings.
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        task_a = await backend.get_task('1', project_root=proj_a)
+        task_b = await backend.get_task('1', project_root=proj_b)
+
+    # The {}-coercion contract holds for both.
+    assert task_a['metadata'] == {}
+    assert task_b['metadata'] == {}
+
+    # Both project_roots must produce their own WARNING — the dedup tuple
+    # now distinguishes (proj_a, master, 0, 1) from (proj_b, master, 0, 1).
+    malformed_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and 'malformed metadata' in r.message
+    ]
+    assert len(malformed_msgs) == 2, (
+        f'Expected exactly two malformed-metadata WARNs (one per project_root); '
+        f'got {len(malformed_msgs)}: {malformed_msgs}'
+    )
+
+    # Each individual warning must contain its respective project_root path.
+    msgs_containing_proj_a = [m for m in malformed_msgs if proj_a in m]
+    msgs_containing_proj_b = [m for m in malformed_msgs if proj_b in m]
+    assert msgs_containing_proj_a, (
+        f'Expected a WARNING containing {proj_a!r}; messages: {malformed_msgs}'
+    )
+    assert msgs_containing_proj_b, (
+        f'Expected a WARNING containing {proj_b!r}; messages: {malformed_msgs}'
+    )
+
+    # Every WARNING must carry the labeled project_root= token.
+    for msg in malformed_msgs:
+        assert 'project_root=' in msg, (
+            f'Expected "project_root=" token in WARNING message; got: {msg!r}'
+        )
 
 
 # ── remove_tasks with cascade ──────────────────────────────────────
