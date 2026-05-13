@@ -217,20 +217,26 @@ function MarkdownText({ text, className, empty }) {
     try {
       const sanitized = DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
       // Short-circuit: skip the <template> reparse on the common no-link path.
-      // DOMPurify always emits '<a ' (with trailing space) for any anchor it keeps.
-      if (!sanitized.includes('<a ')) return sanitized;
+      // /<a[\s>]/i matches '<a ' (attributed) and bare '<a>' so no anchor is missed.
+      if (!/<a[\s>]/i.test(sanitized)) return sanitized;
       // Scoped anchor rewrite: mutate <a> attributes after sanitizing rather than
       // registering a global DOMPurify hook. No future DOMPurify caller in the app
       // silently inherits target=_blank, and dev-reload re-evaluation is harmless.
       // <template> is inert (no script execution or resource loading), so walking
       // already-sanitized HTML is safe; tpl.innerHTML re-serializes the post-mutation
       // DOM (the value React injects), preserving the sanitizer's guarantees.
+      // Behavioral invariants (no JS test runner; verified manually per task spec):
+      //   a) no-anchor input short-circuits above, returning sanitized unchanged.
+      //   b) https://… external links get target=_blank + rel=noopener noreferrer.
+      //   c) #fragment and /path links stay in the same tab (in-page / SPA-internal).
+      //   d) //host protocol-relative links are treated as external — see (b).
       const tpl = document.createElement('template');
       tpl.innerHTML = sanitized;
       tpl.content.querySelectorAll('a').forEach(a => {
-        // In-page fragment jumps and SPA-internal links should stay in the same tab.
+        // In-page fragment and SPA-relative links stay in the same tab.
+        // '//' is protocol-relative (external) and must NOT be skipped.
         const href = a.getAttribute('href') || '';
-        if (href.startsWith('#') || href.startsWith('/')) return;
+        if (href.startsWith('#') || (href.startsWith('/') && !href.startsWith('//'))) return;
         a.setAttribute('target', '_blank');
         a.setAttribute('rel', 'noopener noreferrer');
       });
