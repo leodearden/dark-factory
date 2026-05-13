@@ -11,7 +11,7 @@ import logging
 import sys
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -550,11 +550,31 @@ def _check_flag_counter_completeness(
     }
 
 
+class Stage2FlagPartition(NamedTuple):
+    """Partition result from :func:`_query_stage2_flags`.
+
+    Using a NamedTuple makes both return values self-documenting at call sites
+    and avoids positional-index surprises when the return shape evolves.
+    Positional unpacking (``current, stale_ids = await _query_stage2_flags(...)``)
+    continues to work unchanged since NamedTuple is a tuple subclass.
+
+    Attributes:
+        current: Full dict records whose ``metadata.run_id`` matches the active
+            run.  Rendered to the Stage 2 LLM for FIX-C processing.
+        stale_ids: ``id`` strings for records whose ``metadata.run_id`` is
+            absent, empty, or mismatched.  Caller sweeps these via
+            :func:`_sweep_stale_fixc_markers`.
+    """
+
+    current: list
+    stale_ids: list
+
+
 async def _query_stage2_flags(
     memory_service,
     project_id: str,
     current_run_id: str,
-) -> tuple[list[dict], list[str]]:
+) -> Stage2FlagPartition:
     """Query Mem0 for active Stage-2-destined flags and partition by run_id.
 
     Searches for memories with ``metadata.flag_for_stage2=true`` (the only
@@ -608,7 +628,7 @@ async def _query_stage2_flags(
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return [], []
+        return Stage2FlagPartition([], [])
 
     if len(results) == 100:
         logger.warning(
@@ -638,7 +658,7 @@ async def _query_stage2_flags(
             current_flags.append(flag_dict)
         else:
             stale_marker_ids.append(r.id)
-    return current_flags, stale_marker_ids
+    return Stage2FlagPartition(current_flags, stale_marker_ids)
 
 
 def _compute_stale_flags(

@@ -5030,8 +5030,11 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        # run_id must match _current_run_id so the marker enters the current
+        # partition and the 1139 scope filter (not just stale sweep) suppresses it.
+        stage._current_run_id = 'test-run'
         mock_deps['memory_service'].search.return_value = [
-            self._make_flag('mem-1139', 'some flag for task 1139', '1139'),
+            self._make_flag('mem-1139', 'some flag for task 1139', '1139', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -5046,12 +5049,15 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
+        # run_id must match _current_run_id so the marker enters the current
+        # partition and the content-marker scope filter suppresses it.
+        stage._current_run_id = 'test-run'
         bug_content = (
             'Stage 1 LLM writes flags to Mem0 with metadata.flag_for_stage2 '
             'but does NOT include them in flagged_items'
         )
         mock_deps['memory_service'].search.return_value = [
-            self._make_flag('mem-bug', bug_content, ''),
+            self._make_flag('mem-bug', bug_content, '', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
