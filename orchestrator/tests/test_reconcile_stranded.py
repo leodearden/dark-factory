@@ -137,6 +137,12 @@ def harness(tmp_path: Path, mock_orch_config):
         return_value='deadbeef' + 'a' * 32,
     )
 
+    # Default: get_task returns None (no branch_base_sha metadata) so Guard 3
+    # falls through and existing is_ancestor tests keep their prior semantics.
+    # Individual tests may override with AsyncMock(return_value={'metadata': {...}})
+    # to exercise the Guard 3 branch-advanced check.
+    h.scheduler.get_task = AsyncMock(return_value=None)
+
     return h
 
 

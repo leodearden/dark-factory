@@ -84,6 +84,47 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _is_valid_sha_40(s: object) -> bool:
+    """Return True iff *s* is a well-formed 40-char lowercase hex SHA.
+
+    Used to validate ``branch_base_sha`` values read from task metadata
+    before comparing them against live git output.  Any non-conforming
+    value is treated as missing so the reconciler falls through to the
+    existing citation-grep guard rather than making a bogus comparison.
+    """
+    return (
+        isinstance(s, str)
+        and len(s) == 40
+        and all(c in '0123456789abcdef' for c in s)
+    )
+
+
+def _get_task_metadata_dict(task: dict | None) -> dict:
+    """Coerce raw ``task['metadata']`` from ``Scheduler.get_task`` to a dict.
+
+    ``Scheduler.get_task`` does NOT normalise metadata — unlike
+    ``get_tasks`` / ``acquire_next`` it returns the raw inner dict, so
+    ``task['metadata']`` may be a JSON string, a dict, or absent.
+    This helper mirrors the inline ``isinstance`` ladder at
+    workflow.py:4145-4157 but as a reusable free function.
+
+    Returns an empty dict for any missing / malformed / non-dict result
+    so callers can always do ``.get('key')`` without further checks.
+    """
+    if task is None:
+        return {}
+    raw = task.get('metadata')
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
@@ -1215,7 +1256,33 @@ Output JSON matching the schema. Every task must appear in the output.
                     self._escalate_reconcile_skip(tid, status, count)
                 return None
 
-            # Both guards passed — clear the skip counter and flip.
+            # Guard 3 — branch-advanced structural check.
+            # Guards 1 (open L1) and 2 (citation grep) are content
+            # heuristics.  This guard is structural: it rejects the
+            # false-positive shape where a zero-commit branch sits on a
+            # main ancestor (is_ancestor returns True trivially) even
+            # though no real implementation work was pushed.  We compare
+            # the live branch tip against the recorded branch_base_sha
+            # written by workflow._setup_worktree_and_artifacts at
+            # branch-creation time.
+            #
+            # Missing / malformed branch_base_sha → fall through (backward
+            # compat for tasks created before this guard was deployed, or
+            # if the metadata write failed transiently at creation time).
+            task = await self.scheduler.get_task(tid)
+            metadata = _get_task_metadata_dict(task)
+            branch_base_sha = metadata.get('branch_base_sha')
+            if _is_valid_sha_40(branch_base_sha):
+                branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
+                if branch_tip_sha == branch_base_sha:
+                    logger.info(
+                        'Reconcile: task %s branch tip == branch_base_sha (%s); '
+                        'branch never advanced past creation — vetoing auto-flip',
+                        tid, branch_base_sha,
+                    )
+                    return None
+
+            # All guards passed — clear the skip counter and flip.
             self._reconcile_skip_counts.pop(tid, None)
             note = (
                 f'reconcile: branch on main while task was {status} '
