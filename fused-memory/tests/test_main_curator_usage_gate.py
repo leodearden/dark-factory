@@ -18,22 +18,23 @@ from fused_memory.server.main import _graceful_shutdown, _resolve_curator_cost_s
 
 # ---------------------------------------------------------------------------
 # step-1: end-to-end — cap_hit event reaches the account_events table
+#
+# This exercises the UsageGate ↔ CostStore interface (shared-package behaviour)
+# via the same constructor kwarg used in run_server after suggestion-1 amendment.
+# Moving the test to shared/tests/ is out of scope (locked module boundary).
 # ---------------------------------------------------------------------------
 
 
 class TestCuratorCapEventPersisted:
-    """step-1: UsageGate + real CostStore integration — cap_hit written to DB."""
+    """UsageGate + real CostStore integration — cap_hit written to DB."""
 
     @pytest.mark.asyncio
     async def test_cap_hit_written_to_cost_store(self, tmp_path):
         """_handle_cap_detected must persist a cap_hit row to account_events.
 
-        This test confirms the UsageGate → CostStore plumbing works end-to-end
-        before it is wired into run_server in step-2.
-
         Real aiosqlite writes involve thread-pool I/O and need more than 2
-        asyncio.sleep(0) ticks to complete. We loop until _background_tasks
-        drains (the done-callback calls discard()) to avoid flakiness.
+        asyncio.sleep(0) ticks to complete. We gather on _background_tasks
+        directly so the assertion never races against the background write.
         wait_for_reset=False avoids creating a long-lived probe task that
         would linger past the test boundary.
         """
@@ -89,27 +90,19 @@ class TestCuratorCapEventPersisted:
 # ---------------------------------------------------------------------------
 
 
-class TestResolveCuratorCostStorePath:
-    """step-3: Path helper returns correct db path based on reconciliation config."""
-
-    def test_returns_data_dir_path_when_reconciliation_configured(self):
-        """With reconciliation config, path is <data_dir>/curator_events.db."""
-        config = MagicMock()
-        config.reconciliation = MagicMock()
-        config.reconciliation.data_dir = '/tmp/recon'
-
-        path = _resolve_curator_cost_store_path(config)
-
-        assert path == Path('/tmp/recon/curator_events.db')
-
-    def test_returns_fallback_path_when_no_reconciliation(self):
-        """Without reconciliation config, path falls back to ./data/curator_events.db."""
-        config = MagicMock()
-        config.reconciliation = None
-
-        path = _resolve_curator_cost_store_path(config)
-
-        assert path == Path('./data/curator_events.db')
+@pytest.mark.parametrize(
+    ('reconciliation_cfg', 'expected'),
+    [
+        (None, Path('./data/curator_events.db')),
+        (MagicMock(data_dir='/tmp/recon'), Path('/tmp/recon/curator_events.db')),
+    ],
+    ids=['fallback', 'with_data_dir'],
+)
+def test_resolve_curator_cost_store_path(reconciliation_cfg, expected):
+    """Path helper returns correct db path based on reconciliation config."""
+    config = MagicMock()
+    config.reconciliation = reconciliation_cfg
+    assert _resolve_curator_cost_store_path(config) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -161,3 +154,89 @@ class TestGracefulShutdownClosesCuratorCostStore:
         )
 
         curator_cost_store.close.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# amendment: _graceful_shutdown quiesces curator gate before closing the store
+# ---------------------------------------------------------------------------
+
+
+class TestGracefulShutdownQuiescesCuratorGate:
+    """curator_usage_gate.shutdown() must be awaited before curator_cost_store.close().
+
+    Fixes the race where a 429-driven cap event fires just before shutdown
+    and its background save_account_event task writes to an already-closed
+    aiosqlite connection (reviewer suggestion 2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_gate_shutdown_called_when_provided(self):
+        """curator_usage_gate.shutdown() is awaited once when the gate is provided."""
+        memory_service = MagicMock(close=AsyncMock())
+        curator_usage_gate = MagicMock(shutdown=AsyncMock())
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=None,
+            curator_usage_gate=curator_usage_gate,
+        )
+
+        curator_usage_gate.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gate_shutdown_before_cost_store_close(self):
+        """curator_usage_gate.shutdown() must complete before curator_cost_store.close().
+
+        Ordering is critical: gate.shutdown() cancels/drains background tasks
+        that may still be writing to the CostStore's SQLite connection.
+        Closing the store first would leave those tasks writing to a closed
+        connection, causing silent failures or aiosqlite errors.
+        """
+        call_order: list[str] = []
+        memory_service = MagicMock(close=AsyncMock())
+
+        curator_usage_gate = MagicMock(
+            shutdown=AsyncMock(side_effect=lambda: call_order.append('gate_shutdown'))
+        )
+        curator_cost_store = MagicMock(
+            close=AsyncMock(side_effect=lambda: call_order.append('store_close'))
+        )
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=None,
+            curator_usage_gate=curator_usage_gate,
+            curator_cost_store=curator_cost_store,
+        )
+
+        assert call_order == ['gate_shutdown', 'store_close'], (
+            f'Expected gate_shutdown before store_close, got: {call_order}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_shutdown_called_even_when_task_interceptor_raises(self):
+        """curator_usage_gate.shutdown() runs even if task_interceptor steps raise.
+
+        Each step is shielded, so a failure in task_interceptor.drain/close
+        must not prevent the gate from being quiesced.
+        """
+        memory_service = MagicMock(close=AsyncMock())
+        task_interceptor = MagicMock(
+            drain=AsyncMock(side_effect=RuntimeError('drain failed')),
+            close=AsyncMock(),
+        )
+        curator_usage_gate = MagicMock(shutdown=AsyncMock())
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=None,
+            curator_usage_gate=curator_usage_gate,
+        )
+
+        curator_usage_gate.shutdown.assert_awaited_once()

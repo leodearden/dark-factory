@@ -23,6 +23,7 @@ from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.middleware.ticket_store import TicketStore
@@ -399,18 +400,18 @@ async def run_server():
         from shared.cost_store import CostStore
         from shared.usage_gate import UsageGate
 
-        curator_usage_gate = UsageGate(config.usage_cap)
+        # Build the CostStore first so it can be passed via the public
+        # constructor kwarg — avoids mutating the private _cost_store attr.
+        db_path = _resolve_curator_cost_store_path(config)
+        curator_cost_store = CostStore(db_path)
+        await curator_cost_store.open()
+        logger.info(f'  Curator cost store: {db_path}')
+
+        curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',
         )
-
-        # Wire a CostStore so cap events are persisted to SQLite.
-        db_path = _resolve_curator_cost_store_path(config)
-        curator_cost_store = CostStore(db_path)
-        await curator_cost_store.open()
-        curator_usage_gate._cost_store = curator_cost_store
-        logger.info(f'  Curator cost store: {db_path}')
 
     event_queue = None
     sqlite_watchdog = None
@@ -739,6 +740,7 @@ async def run_server():
             sqlite_watchdog=sqlite_watchdog,
             taskmaster=taskmaster,
             curator_cost_store=curator_cost_store,
+            curator_usage_gate=curator_usage_gate,
         )
 
 
@@ -919,25 +921,29 @@ async def _graceful_shutdown(
     sqlite_watchdog: 'SqliteWatchdog | None' = None,
     taskmaster: Any = None,
     curator_cost_store: 'CostStore | None' = None,
+    curator_usage_gate: 'UsageGate | None' = None,
 ) -> None:
     """Perform an ordered, exception-resilient server shutdown.
 
     Shutdown order:
     1. Drain task_interceptor (flush pending commits / targeted reconciliation).
     2. Close task_interceptor (release curator's Qdrant client).
-    3. Close curator_cost_store (independent SQLite connection; slotted near
-       task_interceptor to keep curator-lifecycle cleanup together).
-    4. Cancel SQLite watchdog (purely observational; close before drainer so
+    3. Shutdown curator_usage_gate (cancel resume-probe + drain background
+       cost-event tasks, so no write lands on a closed connection).
+    4. Close curator_cost_store (independent SQLite connection; slotted near
+       task_interceptor to keep curator-lifecycle cleanup together; only safe
+       after gate.shutdown() has drained all in-flight save_account_event tasks).
+    5. Cancel SQLite watchdog (purely observational; close before drainer so
        the wedge-detection logic doesn't trip during a legitimate shutdown drain).
-    5. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
+    6. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
        Must happen BEFORE memory_service.close(), because the drainer writes
        into the SQLite event buffer that memory_service owns.
-    6. Cancel harness loop task (stops background reconciliation + escalation server).
-    7. Close Taskmaster supervisor (cleanly tears down the Node child after
+    7. Cancel harness loop task (stops background reconciliation + escalation server).
+    8. Close Taskmaster supervisor (cleanly tears down the Node child after
        harness/interceptor stop generating new requests). Done before
        memory_service.close() because MemoryService still holds a reference.
-    8. Close memory_service (backends, durable queue, write journal, event buffer).
-    9. Close reconciliation journal (separate SQLite connection).
+    9. Close memory_service (backends, durable queue, write journal, event buffer).
+    10. Close reconciliation journal (separate SQLite connection).
 
     Each step runs under asyncio.shield with a bounded timeout so cleanup
     makes progress even when this coroutine itself is being cancelled, and
@@ -953,6 +959,9 @@ async def _graceful_shutdown(
     if task_interceptor is not None:
         await _run_shielded('task_interceptor.drain', task_interceptor.drain)
         await _run_shielded('task_interceptor.close', task_interceptor.close)
+
+    if curator_usage_gate is not None:
+        await _run_shielded('curator_usage_gate.shutdown', curator_usage_gate.shutdown)
 
     if curator_cost_store is not None:
         await _run_shielded('curator_cost_store.close', curator_cost_store.close)
