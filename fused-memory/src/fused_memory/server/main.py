@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from shared.cost_store import CostStore
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -404,14 +405,7 @@ async def run_server():
         )
 
         # Wire a CostStore so cap events are persisted to SQLite.
-        # Path mirrors the WriteJournal fallback convention:
-        # <reconciliation.data_dir>/curator_events.db when reconciliation is
-        # configured, ./data/curator_events.db otherwise.
-        db_path = (
-            Path(config.reconciliation.data_dir) / 'curator_events.db'
-            if config.reconciliation
-            else Path('./data/curator_events.db')
-        )
+        db_path = _resolve_curator_cost_store_path(config)
         curator_cost_store = CostStore(db_path)
         await curator_cost_store.open()
         curator_usage_gate._cost_store = curator_cost_store
@@ -773,6 +767,21 @@ async def _build_ticket_store(data_dir: Path) -> 'TicketStore':
     store = TicketStore(data_dir / 'tickets.db')
     await store.initialize()
     return store
+
+
+def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
+    """Return the SQLite path for the curator CostStore.
+
+    Mirrors the WriteJournal fallback convention at run_server:317-318:
+    ``<reconciliation.data_dir>/curator_events.db`` when reconciliation is
+    configured, ``./data/curator_events.db`` otherwise.
+
+    Extracted as a module-level helper so it can be tested in isolation
+    without spinning up a full server.
+    """
+    if config.reconciliation:
+        return Path(config.reconciliation.data_dir) / 'curator_events.db'
+    return Path('./data/curator_events.db')
 
 
 def _install_safe_tool_wrapper(mcp: Any) -> None:

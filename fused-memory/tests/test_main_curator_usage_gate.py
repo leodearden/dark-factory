@@ -57,12 +57,13 @@ class TestCuratorCapEventPersisted:
             # Fire the cap event.
             gate._handle_cap_detected('test cap reason', None, gate._accounts[0].token)
 
-            # Drain: yield until all fire-and-forget write tasks complete.
-            # Real aiosqlite involves thread I/O so needs more than 2 ticks.
-            for _ in range(50):
-                if not gate._background_tasks:
-                    break
-                await asyncio.sleep(0)
+            # Drain: gather on the background tasks captured synchronously
+            # right after the fire.  asyncio.gather waits until all tasks
+            # complete (including their aiosqlite thread-pool I/O rounds),
+            # which is more reliable than a fixed sleep(0) loop.
+            pending = list(gate._background_tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
             # Verify via raw aiosqlite read (independent connection).
             async with aiosqlite.connect(db_path) as conn:
