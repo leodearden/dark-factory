@@ -5371,10 +5371,11 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
         """When no stale markers exist, stat is 0 (explicitly set, not absent)."""
         from datetime import UTC, datetime
         from types import SimpleNamespace
-        from unittest.mock import AsyncMock as AM, patch
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
 
-        from fused_memory.reconciliation.stages.base import BaseStage
         from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
