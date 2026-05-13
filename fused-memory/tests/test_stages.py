@@ -7431,3 +7431,40 @@ class TestPropagateEscalationQueueHelper:
                 'Helper must not overwrite _escalation_url when harness has no URL'
             )
 
+
+# ---------------------------------------------------------------------------
+# step-1: STAGE1_SYSTEM_PROMPT Snapshot Discipline acknowledges async-queue latency
+# ---------------------------------------------------------------------------
+
+
+class TestStage1SnapshotDisciplineAsyncQueueAcknowledgement:
+    """Snapshot Discipline section must document async-queue indexing latency.
+
+    Mirrors the TestStage1PromptMentionsRefreshEntitySummary pattern in
+    test_refresh_entity_summary.py:851-864.
+    """
+
+    def _get_snapshot_discipline_section(self) -> str:
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        return _extract_section(STAGE1_SYSTEM_PROMPT, '## Snapshot Discipline')
+
+    def test_snapshot_section_documents_async_queue_indexing_latency(self):
+        """Snapshot Discipline section acknowledges async-queue / indexing-latency root cause."""
+        section = self._get_snapshot_discipline_section()
+        assert section, 'Expected ## Snapshot Discipline section in STAGE1_SYSTEM_PROMPT'
+        section_lower = section.lower()
+        # Must acknowledge the async / queued write path and the indexing latency
+        assert 'async' in section_lower and (
+            'queue' in section_lower or 'indexing' in section_lower
+        ), (
+            'Snapshot Discipline section must mention async-queue / indexing latency '
+            f'(got: {section[:300]!r})'
+        )
+
+    def test_snapshot_section_drops_mandatory_pre_write_search(self):
+        """Old mandatory first-search step must be absent; it was provably a no-op."""
+        section = self._get_snapshot_discipline_section()
+        assert 'First, search for existing snapshot edges' not in section, (
+            'Old mandatory pre-write search step must be removed from Snapshot Discipline'
+        )
