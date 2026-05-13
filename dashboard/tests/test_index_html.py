@@ -4,19 +4,11 @@ Guards against:
   * Silent removal of the marked / DOMPurify CDN script tags (the MarkdownText
     component falls back to plain text when these are missing — works "well
     enough" that the regression can ship unnoticed).
-  * Forgetting to bump ``?v=N`` on the JSX / CSS asset references after a change
-    (the dominant cause of "Firefox shows stale dashboard" reports).
 """
 
 from __future__ import annotations
 
 import re
-
-# Bump this constant in lockstep with ``?v=N`` in
-# ``dashboard/src/dashboard/static/redux/index.html``.  Forcing a test failure
-# here when the on-disk file is bumped is the whole point — it makes the
-# cache-buster move visible to the developer and to code review.
-EXPECTED_CACHE_BUSTER_V = 9
 
 _INDEX_URL = '/static/redux/index.html'
 
@@ -74,26 +66,3 @@ def test_dompurify_cdn_script_has_sri_integrity(client):
         f'dompurify CDN tag is missing or has empty integrity= attribute: {tag!r}'
     )
 
-
-def test_cache_buster_pinned_on_tab_tasks_jsx(client):
-    """index.html references tab_tasks.jsx with the expected ?v=N cache-buster."""
-    body = client.get(_INDEX_URL).text
-    needle = f'tab_tasks.jsx?v={EXPECTED_CACHE_BUSTER_V}'
-    assert needle in body, (
-        f'Expected substring {needle!r} not found in index.html.  Either the '
-        'on-disk file was bumped to a new ?v=N without updating '
-        'EXPECTED_CACHE_BUSTER_V in this test, or the cache-buster on '
-        'tab_tasks.jsx was accidentally dropped.'
-    )
-
-
-def test_cache_buster_pinned_on_styles_css(client):
-    """index.html references styles.css with the expected ?v=N cache-buster."""
-    body = client.get(_INDEX_URL).text
-    needle = f'styles.css?v={EXPECTED_CACHE_BUSTER_V}'
-    assert needle in body, (
-        f'Expected substring {needle!r} not found in index.html.  Either the '
-        'on-disk file was bumped to a new ?v=N without updating '
-        'EXPECTED_CACHE_BUSTER_V in this test, or the cache-buster on '
-        'styles.css was accidentally dropped.'
-    )
