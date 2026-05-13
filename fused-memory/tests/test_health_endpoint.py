@@ -1,6 +1,6 @@
 """Tests for the /health endpoint, ServerConfig, and memory/search/episodes validation."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from starlette.testclient import TestClient
@@ -9,17 +9,33 @@ from fused_memory.config.schema import ServerConfig
 from fused_memory.server.tools import create_mcp_server
 
 
+def _make_mock_service() -> AsyncMock:
+    """Build an AsyncMock MemoryService whose awaited results expose sync
+    ``.model_dump()`` (the production return type is a Pydantic model).
+
+    Without this, awaiting ``mock_service.add_memory(...)`` yields an AsyncMock,
+    and the tool's ``result.model_dump()`` call returns an un-awaited coroutine —
+    surfacing as ``RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call'
+    was never awaited`` (see task 1238).
+    """
+    mock_service = AsyncMock()
+    # Production add_memory returns AddMemoryResponse (Pydantic). Use a
+    # plain MagicMock so its attributes — including ``.model_dump()`` —
+    # are sync mocks, not AsyncMock children.
+    mock_service.add_memory.return_value = MagicMock()
+    return mock_service
+
+
 @pytest.fixture
 def mcp_server():
     """Create an MCP server with a mocked MemoryService."""
-    mock_service = AsyncMock()
-    return create_mcp_server(mock_service)
+    return create_mcp_server(_make_mock_service())
 
 
 @pytest.fixture
 def mcp_server_with_service():
     """Create an MCP server exposing both the server and service mock."""
-    mock_service = AsyncMock()
+    mock_service = _make_mock_service()
     mock_service.search = AsyncMock(return_value=[])
     mock_service.get_episodes = AsyncMock(return_value=[])
     server = create_mcp_server(mock_service)
