@@ -775,6 +775,13 @@ async def _track_flag_persistence(
     in ``flag_dedup.py``).  FIX C's prompt-driven deletion ensures healthy flags
     never reach threshold; the monotonic growth is bounded to failure cases.
     Manual GC is acceptable — see design decision in plan.json.
+
+    Note (task 1256): since :func:`_sweep_stale_fixc_markers` was introduced,
+    this function receives only *surviving_ids* — flags identified as prior-cycle
+    stale-marker residue are stripped upstream before this call.  The counter
+    therefore no longer observes Stage 2 delete failures from previous cycles;
+    it only counts Stage 1 re-flags that survive within the current cycle's
+    ``run_id``.
     """
     if not flag_ids:
         return {}
@@ -1390,6 +1397,9 @@ class TaskKnowledgeSync(BaseStage):
         # FIX D — stale-flag persistence tracking.
         # Track how many cycles each surviving flag has survived without being
         # deleted.  Best-effort: _track_flag_persistence degrades gracefully.
+        # Note (task 1256): :func:`_sweep_stale_fixc_markers` (called below)
+        # strips prior-cycle delete-failure residue before this point, so FIX D
+        # now only fires on Stage 1 re-flags surviving within the current run_id.
         #
         # run_id is needed when there are surviving flags OR stale markers to sweep;
         # raise before any marker writes so the failure is loud and attributable.
