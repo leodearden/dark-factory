@@ -392,7 +392,9 @@ async def run_server():
     # accounts file the orchestrator / eval runner use. Protects the curator
     # from silent outages when its default account caps.
     curator_usage_gate = None
+    curator_cost_store = None
     if config.usage_cap is not None and config.usage_cap.enabled:
+        from shared.cost_store import CostStore
         from shared.usage_gate import UsageGate
 
         curator_usage_gate = UsageGate(config.usage_cap)
@@ -400,6 +402,20 @@ async def run_server():
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',
         )
+
+        # Wire a CostStore so cap events are persisted to SQLite.
+        # Path mirrors the WriteJournal fallback convention:
+        # <reconciliation.data_dir>/curator_events.db when reconciliation is
+        # configured, ./data/curator_events.db otherwise.
+        db_path = (
+            Path(config.reconciliation.data_dir) / 'curator_events.db'
+            if config.reconciliation
+            else Path('./data/curator_events.db')
+        )
+        curator_cost_store = CostStore(db_path)
+        await curator_cost_store.open()
+        curator_usage_gate._cost_store = curator_cost_store
+        logger.info(f'  Curator cost store: {db_path}')
 
     event_queue = None
     sqlite_watchdog = None

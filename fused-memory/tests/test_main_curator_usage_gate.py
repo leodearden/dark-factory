@@ -31,9 +31,11 @@ class TestCuratorCapEventPersisted:
         This test confirms the UsageGate → CostStore plumbing works end-to-end
         before it is wired into run_server in step-2.
 
-        Drain pattern (two asyncio.sleep(0) yields) matches
-        test_task_removed_after_completion in shared/tests/test_usage_gate.py —
-        enough ticks for the fire-and-forget task to run to completion.
+        Real aiosqlite writes involve thread-pool I/O and need more than 2
+        asyncio.sleep(0) ticks to complete. We loop until _background_tasks
+        drains (the done-callback calls discard()) to avoid flakiness.
+        wait_for_reset=False avoids creating a long-lived probe task that
+        would linger past the test boundary.
         """
         db_path = tmp_path / 'curator_events.db'
 
@@ -41,8 +43,9 @@ class TestCuratorCapEventPersisted:
         await store.open()
         try:
             # Build UsageGate with the real store; inject fake token env var.
+            # wait_for_reset=False prevents a long-lived resume probe task.
             acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
-            config = UsageCapConfig(accounts=[acct_cfg])
+            config = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
 
             with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token-acct-a'}):
                 gate = UsageGate(config, cost_store=store)
@@ -53,9 +56,12 @@ class TestCuratorCapEventPersisted:
             # Fire the cap event.
             gate._handle_cap_detected('test cap reason', None, gate._accounts[0].token)
 
-            # Drain: two yields so the fire-and-forget task completes.
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            # Drain: yield until all fire-and-forget write tasks complete.
+            # Real aiosqlite involves thread I/O so needs more than 2 ticks.
+            for _ in range(50):
+                if not gate._background_tasks:
+                    break
+                await asyncio.sleep(0)
 
             # Verify via raw aiosqlite read (independent connection).
             async with aiosqlite.connect(db_path) as conn:
