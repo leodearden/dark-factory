@@ -216,6 +216,9 @@ function MarkdownText({ text, className, empty }) {
     if (!text || typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
     try {
       const sanitized = DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
+      // Short-circuit: skip the <template> reparse on the common no-link path.
+      // DOMPurify always emits '<a ' (with trailing space) for any anchor it keeps.
+      if (!sanitized.includes('<a ')) return sanitized;
       // Scoped anchor rewrite: mutate <a> attributes after sanitizing rather than
       // registering a global DOMPurify hook. No future DOMPurify caller in the app
       // silently inherits target=_blank, and dev-reload re-evaluation is harmless.
