@@ -14,6 +14,15 @@ Public API
 - :func:`merge_all_accounts_capped` — intersect intervals across all accounts.
 - :func:`compute_overlap_ms` — sum capped-overlap milliseconds for a window.
 - :func:`bucketise_cap_sparkline` — produce a 0/1 :class:`ChartData` sparkline.
+
+Interval convention
+-------------------
+All interval bounds use **half-open semantics**: ``[start, end)`` — the start
+instant is included, the end instant is excluded.  An ``end=None`` interval
+extends indefinitely (equivalent to ``[start, ∞)``).  This convention is
+applied consistently in :func:`merge_all_accounts_capped` (sweep events at
+equal timestamps are processed as ends-before-starts) and
+:func:`bucketise_cap_sparkline` (right-edge sampling uses ``right_edge < end``).
 """
 
 from __future__ import annotations
@@ -22,16 +31,11 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
-
-if TYPE_CHECKING:
-    pass
-
 
 # ---------------------------------------------------------------------------
 # CapInterval dataclass
@@ -133,7 +137,9 @@ def merge_all_accounts_capped(
 
     Uses a sweep-line over interval starts and ends.  A merged window opens
     when every account in *account_names* has at least one active interval;
-    it closes when any account's coverage drops to zero.
+    it closes when any account's coverage drops to zero.  Intervals are
+    treated as half-open ``[start, end)`` — adjacent intervals that merely
+    touch at a single timestamp produce no merged window.
 
     Args:
         intervals: All known cap intervals (may include accounts not in
@@ -144,6 +150,15 @@ def merge_all_accounts_capped(
         List of ``(start, end)`` tuples where ``end=None`` means the merged
         cap window was still open at the end of the input.  Empty list when
         no such window exists.
+
+    Precondition:
+        *intervals* must be **exhaustive** for the time window the caller
+        cares about.  :func:`read_cap_intervals` only returns intervals whose
+        ``cap_hit`` event falls within the look-back window, so an account
+        that was already capped *before* the window began will appear to have
+        zero intervals and trigger the early-exit ``[]`` return.  Callers
+        should extend ``days`` to ensure any active cap is captured, or model
+        pre-window caps explicitly.
     """
     account_set = set(account_names)
     n = len(account_set)
@@ -208,25 +223,22 @@ def merge_all_accounts_capped(
             currently_all_capped = False
             window_start = None
 
-    # If still inside a merged window after all real events, determine end.
-    # The window is open-ended iff every account currently active in it has
-    # at least one open-ended interval (meaning their coverage extends to
-    # infinity beyond our event list).
+    # If still inside a merged window after all real events, the window is
+    # open-ended.  Because every closed interval emits a matching -1 event,
+    # any account still active (count > 0) at this point MUST have at least
+    # one open-ended interval — so open_ended_by_account[a] is True for every
+    # account.  The assert catches bugs in event-emission logic.
     if currently_all_capped and window_start is not None:
-        # All accounts must still be active (count > 0) and have an
-        # open-ended interval for the merged end to be None.
         all_open = all(open_ended_by_account[a] for a in account_set)
-        if all_open:
-            merged.append((window_start, None))
-        else:
-            # Some account's last interval was closed — but because we don't
-            # emit -1 events for finite intervals that ended after the last
-            # sweep event, this path only triggers if the sweep didn't close
-            # the window (shouldn't happen with correct event emission). Emit
-            # None conservatively.
-            merged.append((window_start, None))
+        assert all_open, (
+            "BUG: all accounts active at sweep end but not all have open-ended "
+            "intervals — event-emission invariant violated"
+        )
+        merged.append((window_start, None))
 
-    return merged
+    # Filter zero-width windows: adjacent intervals that merely touch at a
+    # single timestamp produce start == end under half-open semantics.
+    return [(s, e) for s, e in merged if e is None or s != e]
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +286,9 @@ def bucketise_cap_sparkline(
     Generates buckets from ``now - window_hours`` to ``now`` at
     ``bucket_seconds`` resolution.  Each bucket is sampled at its *right edge*:
     ``1`` if any interval in *capped* is active at that timestamp, ``0``
-    otherwise.
+    otherwise.  Intervals are treated as half-open ``[start, end)`` — a cap
+    that ends exactly at a bucket right-edge does **not** mark that bucket as
+    ``1``.
 
     Args:
         capped: List of ``(start, end)`` tuples (``end=None`` = still open).
@@ -297,7 +311,7 @@ def bucketise_cap_sparkline(
         right_edge = start_at + timedelta(seconds=bucket_seconds * (i + 1))
         label = right_edge.isoformat()
         value = 1 if any(
-            c_start <= right_edge and (c_end is None or right_edge <= c_end)
+            c_start <= right_edge and (c_end is None or right_edge < c_end)
             for c_start, c_end in capped
         ) else 0
         labels.append(label)

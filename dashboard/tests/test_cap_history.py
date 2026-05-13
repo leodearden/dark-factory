@@ -536,12 +536,16 @@ class TestBucketiseCapSparkline:
             assert abs(diff - bucket_seconds) < 0.001
 
     def test_capped_window_marks_correct_buckets(self):
-        """Buckets whose right edge falls inside [now-1h, now-30min] → 1."""
+        """Buckets whose right edge falls inside [now-1h, now-30min) → 1.
+
+        Intervals are half-open [start, end): the bucket at right-edge = c_end
+        is NOT marked 1 (end is exclusive).
+        """
         now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         c_start = now - timedelta(hours=1)
         c_end = now - timedelta(minutes=30)
-        # 24h window, 10-min buckets. Buckets with right edge in [c_start, c_end]
-        # are those at offsets: -60, -50, -40, -30 min from now.
+        # 24h window, 10-min buckets. Buckets with right edge in [c_start, c_end)
+        # are those at offsets: -60, -50, -40 min from now (c_end = -30min excluded).
         result = bucketise_cap_sparkline(
             [(c_start, c_end)],
             window_hours=24,
@@ -551,13 +555,18 @@ class TestBucketiseCapSparkline:
         labels = [datetime.fromisoformat(lb) for lb in result['labels']]
         values = result['values']
         for label, value in zip(labels, values, strict=False):
-            if c_start <= label <= c_end:
+            if c_start <= label < c_end:  # half-open: c_end boundary excluded
                 assert value == 1, f"Expected 1 at {label}"
             else:
                 assert value == 0, f"Expected 0 at {label}"
 
     def test_open_ended_cap_marks_all_buckets_after_start(self):
-        """Open-ended cap starting 2h ago → all buckets from 2h onwards are 1."""
+        """Open-ended cap starting 2h ago → all buckets from 2h onwards are 1.
+
+        Buckets strictly before c_start must be 0 — asserting both directions
+        guards against an over-eager open-ended check that marks the whole
+        sparkline as 1.
+        """
         now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         c_start = now - timedelta(hours=2)
         result = bucketise_cap_sparkline(
@@ -571,8 +580,8 @@ class TestBucketiseCapSparkline:
         for label, value in zip(labels, values, strict=False):
             if label >= c_start:
                 assert value == 1, f"Expected 1 at {label} (open-ended)"
-            # (buckets before c_start should be 0 — but c_start might align
-            # with a bucket edge so we only assert the ≥ direction)
+            else:
+                assert value == 0, f"Expected 0 at {label} (before cap started)"
 
     def test_cap_entirely_outside_window_all_zero(self):
         """Cap interval entirely before the window → all zero."""

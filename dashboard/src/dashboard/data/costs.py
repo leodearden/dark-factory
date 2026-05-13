@@ -5,6 +5,11 @@ written by CostStore) to produce per-project and per-account cost statistics.
 
 When multiple project roots are configured, the ``aggregate_*`` functions
 query each project's runs.db in parallel and merge the results.
+
+Cross-reference: :mod:`dashboard.data.cap_history` provides the canonical
+``cap_hit``/``resumed``-pair reader for new callers (e.g. Curator tab).
+``get_cost_by_account`` retains its own CTE to avoid an extra DB round-trip
+and to fold ``auth_failed``/``auth_resumed`` tracking into a single query.
 """
 
 from __future__ import annotations
@@ -17,10 +22,6 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
-from dashboard.data.cap_history import (  # noqa: F401  -- canonical shared cap-interval reader; see notes in get_cost_by_account
-    CapInterval,
-    read_cap_intervals,
-)
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
 
