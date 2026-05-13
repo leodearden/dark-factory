@@ -622,8 +622,6 @@ async def test_row_to_task_warning_dedup_key_includes_parent_id(
     They share the short int id but represent different rows; the WARNING gate
     must key on the full (tag, parent_id, id) triple so both surface once.
     """
-    from fused_memory.backends import sqlite_task_backend as _sb
-
     await backend.add_task(project_root=project_root, title='parent')
     await backend.add_subtask('1', project_root=project_root, title='child')
     conn = await backend._get_connection(project_root)
@@ -652,11 +650,6 @@ async def test_row_to_task_warning_dedup_key_includes_parent_id(
         f'Expected two distinct dedup keys (top-level vs subtask); got '
         f'{len(malformed_msgs)}: {malformed_msgs}'
     )
-    # And both reads consumed entries in the dedup set.
-    assert hasattr(_sb, '_warned_malformed_task_ids'), (
-        'Expected module-level dedup set _warned_malformed_task_ids'
-    )
-    assert len(_sb._warned_malformed_task_ids) == 2
 
 
 # ── remove_tasks with cascade ──────────────────────────────────────

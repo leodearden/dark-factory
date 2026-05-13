@@ -49,6 +49,9 @@ _TOP_LEVEL_SENTINEL = 0
 # WARNINGs on every read.  Keyed by ``(tag, parent_id, id)`` because top-level
 # row ``(0, 1)`` and subtask ``(1, 1)`` share a short int id but must dedup
 # independently — operators repairing a botched migration need to see both.
+# Growth is bounded by the number of distinct (tag, parent_id, id) triples
+# across all project DBs opened in this process — a small, row-count-capped set
+# in practice.  No eviction is needed; a process restart re-emits.
 _warned_malformed_task_ids: set[tuple[str, int, int]] = set()
 
 
