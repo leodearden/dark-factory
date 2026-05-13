@@ -724,6 +724,7 @@ class TestRunProbe:
 
         assert result is False
 
+    @pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
     async def test_timeout_returns_false(self):
         """Timeout (asyncio.wait_for raises TimeoutError) -> returns False."""
         gate, acct = await self._make_probing_gate()
