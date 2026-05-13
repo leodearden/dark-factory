@@ -40,3 +40,52 @@ def test_short_circuit_when_sanitized_has_no_anchors(client):
         "Short-circuit guard must appear before document.createElement('template') "
         f"(guard at {m.start()}, template at {tpl_pos})"
     )
+
+
+def test_anchor_rewrite_skips_in_page_and_same_origin_links(client):
+    """The forEach over querySelectorAll('a') guards fragment (#) and relative (/) hrefs.
+
+    Asserts inside the forEach body (by string-index ordering in the file):
+    - ``a.getAttribute('href')`` is read to obtain the href.
+    - An early ``return`` is guarded by both ``href.startsWith('#')`` and
+      ``href.startsWith('/')``.
+    - ``setAttribute('target', '_blank')`` appears AFTER the startsWith guards
+      (i.e. the existing rewrite only runs for external links).
+    """
+    resp = client.get(_JSX_URL)
+    assert resp.status_code == 200
+    body = resp.text
+
+    # (a) href is read via getAttribute
+    href_read = re.compile(r"getAttribute\(\s*['\"]href['\"]\s*\)")
+    m_href = href_read.search(body)
+    assert m_href is not None, (
+        "Expected `a.getAttribute('href')` inside the forEach body"
+    )
+
+    # (b) early-return guard: both startsWith('#') and startsWith('/') must be present
+    starts_hash = re.compile(r"href\.startsWith\(\s*['\"]#['\"]\s*\)")
+    starts_slash = re.compile(r"href\.startsWith\(\s*['\"/]['\"]\s*\)")
+    m_hash = starts_hash.search(body)
+    m_slash = starts_slash.search(body)
+    assert m_hash is not None, (
+        "Expected `href.startsWith('#')` guard in the forEach body"
+    )
+    assert m_slash is not None, (
+        "Expected `href.startsWith('/')` guard in the forEach body"
+    )
+
+    # (c) setAttribute('target', '_blank') must appear AFTER both guards
+    set_blank = re.compile(r"setAttribute\(\s*['\"]target['\"]")
+    m_blank = set_blank.search(body)
+    assert m_blank is not None, (
+        "Expected `setAttribute('target', ...)` in the forEach body"
+    )
+    assert m_hash.start() < m_blank.start(), (
+        "startsWith('#') guard must precede setAttribute('target', '_blank') "
+        f"(hash guard at {m_hash.start()}, setAttribute at {m_blank.start()})"
+    )
+    assert m_slash.start() < m_blank.start(), (
+        "startsWith('/') guard must precede setAttribute('target', '_blank') "
+        f"(slash guard at {m_slash.start()}, setAttribute at {m_blank.start()})"
+    )
