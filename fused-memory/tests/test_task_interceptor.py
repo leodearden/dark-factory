@@ -3106,7 +3106,24 @@ async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
 
 # ---------------------------------------------------------------------------
 # cancel_ticket: interceptor-level contract tests (steps 1, 3, 5)
+# + amendment: ConfigError and TOCTOU race
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_no_store_returns_config_error(interceptor):
+    """cancel_ticket returns ConfigError when ticket_store is not configured.
+
+    amend: distinguish misconfigured-server from genuine missing-ticket so
+    callers can tell the difference between a stale ticket_id and a server
+    wiring failure.
+    """
+    result = await interceptor.cancel_ticket('tkt_ANY')
+    assert result == {
+        'error': 'ticket_store not configured',
+        'error_type': 'ConfigError',
+        'ticket_id': 'tkt_ANY',
+    }, f'Expected ConfigError dict, got: {result!r}'
 
 
 @pytest.mark.asyncio
@@ -3194,6 +3211,43 @@ async def test_cancel_ticket_signals_resolve_ticket_waiter(
     assert waiter_result.get('status') == 'cancelled', (
         f'resolve_ticket waiter expected status=cancelled, got: {waiter_result!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_race_returns_noop_with_actual_status(
+    interceptor_with_store, ticket_store,
+):
+    """cancel_ticket returns no_op with the real status on a TOCTOU race.
+
+    amend: mark_resolved returns False when a concurrent writer terminates the
+    ticket between cancel_ticket's get() and the UPDATE.  In that case the
+    method must re-fetch the actual status and return the no_op shape instead
+    of falsely reporting status='cancelled'.
+    """
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    # Intercept mark_resolved to simulate a concurrent worker that terminates
+    # the ticket (to 'created') *before* our cancel UPDATE lands.
+    original_mark_resolved = ticket_store.mark_resolved
+
+    async def racing_mark_resolved(tid: str, *, status: str, **kwargs):
+        if tid == ticket_id and status == 'cancelled':
+            # The racing writer wins first: force the row to terminal 'created'.
+            await original_mark_resolved(tid, status='created', reason='raced_first')
+        # Now our cancel UPDATE runs — it returns False because status != 'pending'.
+        return await original_mark_resolved(tid, status=status, **kwargs)
+
+    ticket_store.mark_resolved = racing_mark_resolved
+    try:
+        result = await interceptor_with_store.cancel_ticket(ticket_id)
+    finally:
+        ticket_store.mark_resolved = original_mark_resolved
+
+    assert result == {
+        'status': 'created',
+        'ticket_id': ticket_id,
+        'no_op': True,
+    }, f'Expected no_op with actual status=created, got: {result!r}'
 
 
 # ---------------------------------------------------------------------------

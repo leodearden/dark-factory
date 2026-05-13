@@ -1776,31 +1776,54 @@ class TaskInterceptor:
     async def cancel_ticket(self, ticket_id: str) -> dict:
         """Cancel a pending curator ticket by ticket_id.
 
-        Three branches (v1 contract):
-        - not_found:  ticket does not exist (or ticket store not wired) →
-                      ``{'error': 'not_found', 'ticket_id': ticket_id}``
-        - no_op:      ticket row exists but is already in a terminal/non-pending
-                      status → ``{'status': <current>, 'ticket_id': ticket_id,
-                      'no_op': True}``
-        - cancelled:  ticket was pending → marks it cancelled, signals any
-                      resolve_ticket waiter, returns
-                      ``{'status': 'cancelled', 'ticket_id': ticket_id}``
+        Four outcomes:
+        - config_error: ticket store not configured (server misconfiguration) →
+                        ``{'error': 'ticket_store not configured',
+                           'error_type': 'ConfigError', 'ticket_id': ticket_id}``
+        - not_found:    ticket does not exist →
+                        ``{'error': 'not_found', 'ticket_id': ticket_id}``
+        - no_op:        ticket row exists but is already in a terminal/non-pending
+                        status (including TOCTOU race) →
+                        ``{'status': <current>, 'ticket_id': ticket_id,
+                        'no_op': True}``
+        - cancelled:    ticket was pending and we won the race → marks it
+                        cancelled, signals any resolve_ticket waiter, returns
+                        ``{'status': 'cancelled', 'ticket_id': ticket_id}``
 
         v1 trade-off: in-flight curator/LLM calls are NOT interrupted.
         ``_prepare_ticket`` drops non-pending rows when the worker dequeues
         them, so queued-but-not-started tickets are cleaned up automatically.
+
+        Race handling: ``mark_resolved`` has a ``WHERE status='pending'`` guard
+        and returns ``False`` if a concurrent writer terminated the ticket
+        between our ``get`` and the ``UPDATE``.  In that case we re-fetch the
+        actual status and return the no_op shape so callers always see the
+        persisted truth.  We call ``_signal_ticket_event`` regardless; if the
+        race winner already signalled, it is a harmless no-op on an empty list.
         """
         if self._ticket_store is None:
-            return {'error': 'not_found', 'ticket_id': ticket_id}
+            return {
+                'error': 'ticket_store not configured',
+                'error_type': 'ConfigError',
+                'ticket_id': ticket_id,
+            }
         row = await self._ticket_store.get(ticket_id)
         if row is None:
             return {'error': 'not_found', 'ticket_id': ticket_id}
         if row['status'] != 'pending':
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
-        await self._ticket_store.mark_resolved(
+        did_cancel = await self._ticket_store.mark_resolved(
             ticket_id, status='cancelled', reason='user_cancelled'
         )
         self._signal_ticket_event(ticket_id)
+        if not did_cancel:
+            # TOCTOU race: concurrent writer terminated the ticket between our
+            # get() and the UPDATE.  Re-fetch the actual status and return the
+            # no_op shape so callers see the persisted truth.
+            row = await self._ticket_store.get(ticket_id)
+            if row is None:
+                return {'error': 'not_found', 'ticket_id': ticket_id}
+            return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
         return {'status': 'cancelled', 'ticket_id': ticket_id}
 
     def _start_worker_if_needed(self, project_id: str) -> None:
