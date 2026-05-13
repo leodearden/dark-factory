@@ -22,13 +22,14 @@ from fused_memory.server.tools import create_mcp_server  # noqa: E402
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
+
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
-    from shared.cost_store import CostStore
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

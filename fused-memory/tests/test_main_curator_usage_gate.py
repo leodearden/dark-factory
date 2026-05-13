@@ -10,12 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
-
-from fused_memory.server.main import _graceful_shutdown, _resolve_curator_cost_store_path
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.usage_gate import UsageGate
 
+from fused_memory.server.main import _graceful_shutdown, _resolve_curator_cost_store_path
 
 # ---------------------------------------------------------------------------
 # step-1: end-to-end — cap_hit event reaches the account_events table
@@ -70,7 +69,7 @@ class TestCuratorCapEventPersisted:
                 cursor = await conn.execute(
                     'SELECT account_name, event_type, details FROM account_events'
                 )
-                rows = await cursor.fetchall()
+                rows = list(await cursor.fetchall())
         finally:
             await store.close()
 
