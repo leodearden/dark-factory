@@ -2155,8 +2155,8 @@ class TestFairness:
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.scheduler_v2 = True
-        scheduler = Scheduler(config)
-        scheduler.event_store = _RecordingEventStore()
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
         # Pre-install L's low-tier park on m1 + m2 and seed its skip_count.
         scheduler.lock_table.install_parks('L', ['m1', 'm2'], priority='low')
@@ -2178,11 +2178,11 @@ class TestFairness:
         # Recording event store has exactly one reservation_installed (for H)
         # and one reservation_evicted (for L).
         installed_events = [
-            e for e in scheduler.event_store.events
+            e for e in event_store.events
             if 'reservation_installed' in e[0]
         ]
         evicted_events = [
-            e for e in scheduler.event_store.events
+            e for e in event_store.events
             if 'reservation_evicted' in e[0]
         ]
         assert len(installed_events) == 1
@@ -2202,8 +2202,8 @@ class TestFairness:
         """A park owned by a terminal task is reaped on the next tick."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.scheduler_v2 = True
-        scheduler = Scheduler(config)
-        scheduler.event_store = _RecordingEventStore()
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
         scheduler.lock_table.install_parks('A', ['m1', 'm2'], priority='high')
         scheduler._skip_count['A'] = 5
@@ -2230,7 +2230,7 @@ class TestFairness:
         assert scheduler.lock_table.try_acquire('B', ['m1'])
         # reservation_expired event emitted with terminal reason.
         expired = [
-            e for e in scheduler.event_store.events
+            e for e in event_store.events
             if 'reservation_expired' in e[0]
         ]
         assert len(expired) == 1
@@ -2242,8 +2242,8 @@ class TestFairness:
         """A park whose owner is no longer in the task list is reaped."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.scheduler_v2 = True
-        scheduler = Scheduler(config)
-        scheduler.event_store = _RecordingEventStore()
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
         scheduler.lock_table.install_parks('X', ['m1'], priority='high')
         scheduler._skip_count['X'] = 2
@@ -2261,7 +2261,7 @@ class TestFairness:
         assert not scheduler.lock_table.has_parks('X')
         assert 'X' not in scheduler._skip_count
         expired = [
-            e for e in scheduler.event_store.events
+            e for e in event_store.events
             if 'reservation_expired' in e[0]
         ]
         assert len(expired) == 1
@@ -2273,8 +2273,8 @@ class TestFairness:
         """A park whose owner has un-satisfied deps is reaped."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.scheduler_v2 = True
-        scheduler = Scheduler(config)
-        scheduler.event_store = _RecordingEventStore()
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
         scheduler.lock_table.install_parks('A', ['m1'], priority='high')
 
@@ -2296,7 +2296,7 @@ class TestFairness:
 
         assert not scheduler.lock_table.has_parks('A')
         expired = [
-            e for e in scheduler.event_store.events
+            e for e in event_store.events
             if 'reservation_expired' in e[0]
         ]
         assert len(expired) == 1
@@ -2313,8 +2313,8 @@ class TestFairness:
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.scheduler_v2 = True
-        scheduler = Scheduler(config)
-        scheduler.event_store = _RecordingEventStore()
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
 
         # Block m1 with a seed so A can't acquire its own park.
         scheduler.lock_table.try_acquire('seed', ['m1'])
@@ -2342,7 +2342,7 @@ class TestFairness:
         # acquire-and-clear).
         assert scheduler.lock_table.has_parks('A')
         expired = [
-            e for e in scheduler.event_store.events
+            e for e in event_store.events
             if 'reservation_expired' in e[0]
         ]
         assert len(expired) == 0
