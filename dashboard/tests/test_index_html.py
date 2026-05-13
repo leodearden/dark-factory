@@ -175,3 +175,52 @@ def test_find_script_position_returns_document_order(
     RED until _find_script_position is implemented (Step 2).
     """
     assert _find_script_position(body, src_prefix) == expected_position
+
+
+# ---------------------------------------------------------------------------
+# Step-3: Regression-guard — CDN tags must load BEFORE tab_tasks.jsx
+# ---------------------------------------------------------------------------
+
+_TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
+
+
+@pytest.mark.parametrize(
+    'src_prefix, lib_name, consumer_note',
+    _CDN_SCRIPT_CASES,
+    ids=['marked', 'dompurify'],
+)
+def test_cdn_script_loads_before_tab_tasks_jsx(
+    index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
+) -> None:
+    """CDN scripts for marked/DOMPurify must appear BEFORE tab_tasks.jsx.
+
+    Regression guard for the silent-failure class described in reviewer note
+    esc-1234-4 (suggestion 3): moving either CDN tag *after* tab_tasks.jsx
+    means MarkdownText's first render runs while ``marked`` / ``DOMPurify``
+    are still undefined, so it falls back to null — the dashboard still loads,
+    so the regression can ship unnoticed (same failure class the smoke test was
+    added to catch).
+
+    Naturally GREEN against the current correctly-ordered index.html; will fire
+    loudly if a future edit moves either CDN tag below the tab_tasks.jsx tag.
+    """
+    cdn_pos = _find_script_position(index_html_body, src_prefix)
+    assert cdn_pos is not None, (
+        f'No <script src="{src_prefix}..."> tag found in index.html. '
+        f'{consumer_note}'
+    )
+
+    tab_tasks_pos = _find_script_position(index_html_body, _TAB_TASKS_PREFIX)
+    assert tab_tasks_pos is not None, (
+        f'<script src="{_TAB_TASKS_PREFIX}..."> not found in index.html — '
+        f'cannot verify load-order invariant for {lib_name}.'
+    )
+
+    cdn_src = (_find_cdn_script_attrs(index_html_body, src_prefix) or {}).get('src')
+    assert cdn_pos < tab_tasks_pos, (
+        f'{lib_name} CDN tag (position {cdn_pos}, src={cdn_src!r}) must load '
+        f'BEFORE tab_tasks.jsx (position {tab_tasks_pos}). '
+        f'If it loads after, MarkdownText renders before {lib_name} is defined '
+        f'and falls back to null on first render — the silent-failure class the '
+        f'smoke test was added to catch.'
+    )
