@@ -9,6 +9,7 @@ import pytest
 from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
+    FairnessConfig,
     ModuleConfig,
     OrchestratorConfig,
 )
@@ -1860,7 +1861,7 @@ class TestFairness:
     def test_install_and_block_non_owner(self):
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         lt = ModuleLockTable(config)
-        lt.install_parks('owner', ['backend'], deadline=time.monotonic() + 60)
+        lt.install_parks('owner', ['backend'], priority='medium')
         assert not lt.try_acquire('other', ['backend'])
         # Owner can still acquire its own park.
         assert lt.try_acquire('owner', ['backend'])
@@ -1869,7 +1870,7 @@ class TestFairness:
         """A park on a parent module blocks acquire of any child."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         lt = ModuleLockTable(config)
-        lt.install_parks('A', ['autopilot/analyze'], deadline=time.monotonic() + 60)
+        lt.install_parks('A', ['autopilot/analyze'], priority='medium')
         assert not lt.try_acquire('B', ['autopilot/analyze/asr'])
 
     def test_park_hierarchical_blocks_parent(self):
@@ -1877,7 +1878,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         lt = ModuleLockTable(config)
         lt.install_parks(
-            'A', ['autopilot/analyze/asr'], deadline=time.monotonic() + 60
+            'A', ['autopilot/analyze/asr'], priority='medium'
         )
         assert not lt.try_acquire('B', ['autopilot/analyze'])
 
@@ -1885,85 +1886,28 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         lt = ModuleLockTable(config)
         lt.install_parks(
-            'A', ['autopilot/analyze/asr'], deadline=time.monotonic() + 60
+            'A', ['autopilot/analyze/asr'], priority='medium'
         )
         assert lt.try_acquire('B', ['autopilot/analyze/speech'])
 
     def test_clear_parks_for_owner(self):
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         lt = ModuleLockTable(config)
-        lt.install_parks('A', ['backend', 'frontend'], deadline=time.monotonic() + 60)
+        lt.install_parks('A', ['backend', 'frontend'], priority='medium')
         assert lt.has_parks('A')
         lt.clear_parks_for('A')
         assert not lt.has_parks('A')
         # Unrelated tasks can now acquire.
         assert lt.try_acquire('B', ['backend'])
 
-    def test_prune_expired_returns_owner_and_drops(self):
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        lt = ModuleLockTable(config)
-        lt.install_parks('A', ['backend'], deadline=0.0)  # already expired
-        lt.install_parks('B', ['frontend'], deadline=time.monotonic() + 60)
-        evicted = lt.prune_expired_parks(time.monotonic())
-        assert evicted == ['A']
-        # A's park is gone, B's remains.
-        assert not lt.has_parks('A')
-        assert lt.has_parks('B')
-
-    def test_expired_park_does_not_block(self):
-        """An expired park (not yet pruned) must not block acquires."""
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        lt = ModuleLockTable(config)
-        lt.install_parks('A', ['backend'], deadline=0.0)
-        # Lease expired; try_acquire from other should succeed without
-        # explicit pruning.
-        assert lt.try_acquire('B', ['backend'])
-
-    # ---- Scheduler lease computation ----
-
-    def test_compute_lease_midpoint_on_empty_history(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_min_secs = 100.0
-        config.fairness.lease_max_secs = 300.0
-        s = Scheduler(config)
-        assert s._compute_lease() == 200.0
-
-    def test_compute_lease_uses_median_and_multiplier(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = 5.0
-        config.fairness.lease_min_secs = 0.0
-        config.fairness.lease_max_secs = 10_000.0
-        s = Scheduler(config)
-        s._recent_durations.extend([10.0, 20.0, 30.0])  # median 20.0
-        assert s._compute_lease() == 100.0
-
-    def test_compute_lease_clamps_to_min(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = 1.0
-        config.fairness.lease_min_secs = 100.0
-        config.fairness.lease_max_secs = 1000.0
-        s = Scheduler(config)
-        s._recent_durations.append(5.0)  # 5s * 1.0 = 5s, below floor
-        assert s._compute_lease() == 100.0
-
-    def test_compute_lease_clamps_to_max(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = 5.0
-        config.fairness.lease_min_secs = 60.0
-        config.fairness.lease_max_secs = 1000.0
-        s = Scheduler(config)
-        s._recent_durations.append(500.0)  # 500 * 5 = 2500, above ceiling
-        assert s._compute_lease() == 1000.0
-
     # ---- Mode-2 integration: skip-count promotion ----
 
     @pytest.fixture
     def fair_config(self) -> OrchestratorConfig:
-        """OrchestratorConfig tuned for quick fairness testing."""
+        """OrchestratorConfig tuned for quick fairness testing (v2 enabled)."""
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         config.fairness.skip_threshold = 3
-        config.fairness.lease_min_secs = 60.0
-        config.fairness.lease_max_secs = 600.0
+        config.fairness.scheduler_v2 = True
         return config
 
     @staticmethod
@@ -2049,7 +1993,7 @@ class TestFairness:
         scheduler.lock_table.install_parks(
             'A',
             ['compiler/src', 'eval/src'],
-            deadline=time.monotonic() + 300,
+            priority='medium',
         )
         # B wants compiler/src only — should be blocked by A's park.
         assert not scheduler.lock_table.try_acquire('B', ['compiler/src'])
@@ -2061,7 +2005,7 @@ class TestFairness:
         """The park owner can still acquire its own reserved modules."""
         scheduler = Scheduler(fair_config)
         scheduler.lock_table.install_parks(
-            'A', ['compiler/src', 'eval/src'], deadline=time.monotonic() + 300
+            'A', ['compiler/src', 'eval/src'], priority='medium'
         )
         a = self._broad_task()
         scheduler.get_tasks = AsyncMock(return_value=[a])
@@ -2070,37 +2014,6 @@ class TestFairness:
         assert result is not None and result.task_id == 'A'
         # Parks were cleared on successful acquire.
         assert not scheduler.lock_table.has_parks('A')
-
-    @pytest.mark.asyncio
-    async def test_reservation_expires_and_skip_count_resets(
-        self, fair_config, monkeypatch
-    ):
-        """When a lease expires without acquire, the park drops and the owner's
-        skip counter resets so they can re-accumulate instead of loop-parking."""
-        scheduler = Scheduler(fair_config)
-        # Install a park with a deadline already in the past.
-        scheduler.lock_table.install_parks(
-            'A', ['compiler/src', 'eval/src'], deadline=0.0
-        )
-        scheduler._skip_count['A'] = 5
-
-        # Tick the scheduler with no candidates — this triggers prune.
-        scheduler.get_tasks = AsyncMock(return_value=[])
-        await scheduler.acquire_next()
-
-        assert not scheduler.lock_table.has_parks('A')
-        assert 'A' not in scheduler._skip_count
-
-    def test_release_records_duration(self, fair_config, monkeypatch):
-        """Scheduler.release() appends (end - start) to the rolling window."""
-        scheduler = Scheduler(fair_config)
-        # Seed as if acquire_next had recorded a start time.
-        scheduler._task_start_times['A'] = 100.0
-        monkeypatch.setattr(time, 'monotonic', lambda: 150.0)
-
-        scheduler.release('A')
-
-        assert list(scheduler._recent_durations) == [50.0]
 
     @pytest.mark.asyncio
     async def test_mode2_broad_task_eventually_wins(self, fair_config):
@@ -2140,6 +2053,299 @@ class TestFairness:
         assert result is not None and result.task_id == 'A'
         # And A's park was cleaned up on successful acquire.
         assert not scheduler.lock_table.has_parks('A')
+
+    # ---- scheduler_v2 gate tests ----
+
+    @pytest.mark.asyncio
+    async def test_scheduler_v2_default_false_no_parks_installed(self):
+        """When scheduler_v2=False, parks are never installed even past threshold."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = 1  # fire fast
+        config.fairness.scheduler_v2 = False
+        scheduler = Scheduler(config)
+
+        # Seed compiler/src so A always fails.
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')
+
+        a = self._broad_task()
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # Run several ticks past the threshold.
+        for _ in range(5):
+            result = await scheduler.acquire_next()
+            if result:
+                scheduler.release(result.task_id)
+
+        # Skip counter should have climbed.
+        assert scheduler._skip_count.get('A', 0) >= 1
+        # But no parks should be installed when scheduler_v2=False.
+        assert not scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
+    async def test_scheduler_v2_true_installs_parks(self):
+        """When scheduler_v2=True, parks install after the per-tier threshold."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        # Use per-tier defaults: high -> threshold=1 (installs after first skip).
+        config.fairness.scheduler_v2 = True
+        scheduler = Scheduler(config)
+
+        # Seed compiler/src so A (high priority) is forced to skip.
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')
+
+        a = self._broad_task()  # high priority
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # One tick: high threshold=1, so A parks after this single skip.
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'B'
+
+        # A's parks should now be installed.
+        assert scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
+    async def test_eager_park_full_module_set(self):
+        """With scheduler_v2=True, parks install on ALL of A's modules at once.
+
+        Even modules not currently held by another task are covered — this
+        prevents racing lower-priority tasks from grabbing a free module
+        while A waits for a blocked one.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        # Per-tier defaults: high -> threshold=1.
+        scheduler = Scheduler(config)
+
+        # B holds compiler/src; C holds eval/src; tools/src is FREE.
+        scheduler.lock_table.try_acquire('B', ['compiler/src'])
+        scheduler.lock_table.try_acquire('C', ['eval/src'])
+        scheduler._dispatched.update(['B', 'C'])
+
+        a = {
+            'id': 'A',
+            'title': 'Broad task',
+            'status': 'pending',
+            'priority': 'high',
+            'dependencies': [],
+            'metadata': {'files': ['compiler/src', 'eval/src', 'tools/src']},
+        }
+        b = self._narrow_task('D', 'tools/src', priority='low')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # One tick — A skips, park fires on all three modules.
+        await scheduler.acquire_next()
+
+        # A's park covers all three modules.
+        assert scheduler.lock_table.has_parks('A')
+        # D cannot acquire tools/src (free slot) because A's park covers it.
+        assert not scheduler.lock_table.try_acquire('D', ['tools/src'])
+
+    @pytest.mark.asyncio
+    async def test_cross_tier_preemption(self):
+        """A high-tier skip-bump preempts an overlapping low-tier park.
+
+        Setup: low-priority L is already parked on m1+m2 with skip_count=3
+        (mimicking an accumulated count). A high-priority H wants m1 and is
+        also forced to skip.  When H's _bump_skip_and_maybe_park fires, it
+        evicts L's park on m1 only (m2 survives), preserves L's _skip_count,
+        and emits both reservation_installed and reservation_evicted events.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # Pre-install L's low-tier park on m1 + m2 and seed its skip_count.
+        scheduler.lock_table.install_parks('L', ['m1', 'm2'], priority='low')
+        scheduler._skip_count['L'] = 3
+
+        # Trigger H's skip-bump-and-park directly; high threshold=1 fires
+        # parking on the first call.
+        scheduler._bump_skip_and_maybe_park('H', ['m1'], tier='high')
+
+        # H now holds a park on m1; L's park on m1 is gone, but m2 survives.
+        assert scheduler.lock_table.has_parks('H')
+        assert scheduler.lock_table.has_parks('L')
+        assert not scheduler.lock_table.try_acquire('X', ['m1'])  # H's park
+        assert not scheduler.lock_table.try_acquire('Y', ['m2'])  # L's park
+
+        # L's skip_count was NOT cleared by preemption.
+        assert scheduler._skip_count['L'] == 3
+
+        # Recording event store has exactly one reservation_installed (for H)
+        # and one reservation_evicted (for L).
+        installed_events = [
+            e for e in event_store.events
+            if 'reservation_installed' in e[0]
+        ]
+        evicted_events = [
+            e for e in event_store.events
+            if 'reservation_evicted' in e[0]
+        ]
+        assert len(installed_events) == 1
+        assert installed_events[0][1]['task_id'] == 'H'
+        assert len(evicted_events) == 1
+        evicted_payload = evicted_events[0][1]
+        assert evicted_payload['task_id'] == 'H'
+        assert evicted_payload['data']['modules'] == ['m1']
+        assert evicted_payload['data']['preempted_by'] == 'H'
+        assert evicted_payload['data']['preempted_by_priority'] == 'high'
+        assert evicted_payload['data']['victim'] == 'L'
+
+    # ---- Owner-state park-GC (step-14) ----
+
+    @pytest.mark.asyncio
+    async def test_park_gc_on_terminal_owner(self):
+        """A park owned by a terminal task is reaped on the next tick."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        scheduler.lock_table.install_parks('A', ['m1', 'm2'], priority='high')
+        scheduler._skip_count['A'] = 5
+
+        # A is cancelled; B is a separate pending task.
+        a = {
+            'id': 'A', 'title': 'a', 'status': 'cancelled',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['m1']},
+        }
+        b = {
+            'id': 'B', 'title': 'b', 'status': 'pending',
+            'priority': 'medium', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        await scheduler.acquire_next()
+
+        # A's parks gone, skip_count cleared.
+        assert not scheduler.lock_table.has_parks('A')
+        assert 'A' not in scheduler._skip_count
+        # B (or any unrelated task) can now acquire m1.
+        assert scheduler.lock_table.try_acquire('B', ['m1'])
+        # reservation_expired event emitted with terminal reason.
+        expired = [
+            e for e in event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 1
+        assert expired[0][1]['task_id'] == 'A'
+        assert 'terminal' in expired[0][1]['data']['reason']
+
+    @pytest.mark.asyncio
+    async def test_park_gc_on_missing_owner(self):
+        """A park whose owner is no longer in the task list is reaped."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        scheduler.lock_table.install_parks('X', ['m1'], priority='high')
+        scheduler._skip_count['X'] = 2
+
+        # X is NOT in the task list — reconciliation removed it.
+        b = {
+            'id': 'B', 'title': 'b', 'status': 'pending',
+            'priority': 'medium', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[b])
+
+        await scheduler.acquire_next()
+
+        assert not scheduler.lock_table.has_parks('X')
+        assert 'X' not in scheduler._skip_count
+        expired = [
+            e for e in event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 1
+        assert expired[0][1]['task_id'] == 'X'
+        assert 'missing' in expired[0][1]['data']['reason']
+
+    @pytest.mark.asyncio
+    async def test_park_gc_on_deps_unsatisfied(self):
+        """A park whose owner has un-satisfied deps is reaped."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        scheduler.lock_table.install_parks('A', ['m1'], priority='high')
+
+        # A depends on '7' which is in-progress (not satisfied).
+        a = {
+            'id': 'A', 'title': 'a', 'status': 'pending',
+            'priority': 'high',
+            'dependencies': [{'id': '7'}],
+            'metadata': {'files': ['m1']},
+        }
+        seven = {
+            'id': '7', 'title': 'seven', 'status': 'in-progress',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[a, seven])
+
+        await scheduler.acquire_next()
+
+        assert not scheduler.lock_table.has_parks('A')
+        expired = [
+            e for e in event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 1
+        assert expired[0][1]['task_id'] == 'A'
+        assert 'deps' in expired[0][1]['data']['reason']
+
+    @pytest.mark.asyncio
+    async def test_park_gc_skips_eligible_owner(self):
+        """Control: an owner whose deps ARE satisfied keeps its park.
+
+        Seed a real holder on m1 so A cannot acquire its own park this tick;
+        we only want to verify that the GC sweep doesn't reap an eligible
+        owner's park between sweep and dispatch.
+        """
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.scheduler_v2 = True
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+
+        # Block m1 with a seed so A can't acquire its own park.
+        scheduler.lock_table.try_acquire('seed', ['m1'])
+        scheduler._dispatched.add('seed')
+
+        scheduler.lock_table.install_parks('A', ['m1'], priority='high')
+
+        # A depends on '7' which is done — deps satisfied.
+        a = {
+            'id': 'A', 'title': 'a', 'status': 'pending',
+            'priority': 'high',
+            'dependencies': [{'id': '7'}],
+            'metadata': {'files': ['m1']},
+        }
+        seven = {
+            'id': '7', 'title': 'seven', 'status': 'done',
+            'priority': 'high', 'dependencies': [],
+            'metadata': {'files': ['other/src']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[a, seven])
+
+        await scheduler.acquire_next()
+
+        # A's park survives (GC didn't reap it; m1 still blocked so A couldn't
+        # acquire-and-clear).
+        assert scheduler.lock_table.has_parks('A')
+        expired = [
+            e for e in event_store.events
+            if 'reservation_expired' in e[0]
+        ]
+        assert len(expired) == 0
 
 
 class TestGetStatus:
@@ -2896,85 +3102,13 @@ class TestAgeAnchor:
         assert age == 95
 
 
-class TestTierSlotCaps:
-    """Fix 3: per-tier slot caps reserve headroom for higher-value work."""
-
-    def _config(self, caps: dict[str, float]) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            max_concurrent_tasks=10,
-            max_per_module=1,
-            tier_slot_caps=caps,
-        )
-
-    def test_allowed_by_cap_under_limit(self):
-        s = Scheduler(self._config({'low': 0.5}))
-        # 0 dispatched → low allowed (limit = 5).
-        assert s._allowed_by_tier_cap('low') is True
-
-    def test_blocked_at_limit(self):
-        s = Scheduler(self._config({'low': 0.5}))
-        for i in range(5):  # fill 5 low slots
-            s._dispatched_priority[f't{i}'] = 'low'
-        assert s._allowed_by_tier_cap('low') is False
-        # Higher-priority tier still has room (cap 1.0).
-        assert s._allowed_by_tier_cap('high') is True
-
-    def test_lower_counts_toward_higher_budget(self):
-        """A 'low' slot counts against medium's cap too (at-or-below semantics)."""
-        s = Scheduler(self._config({'medium': 0.3}))  # 3 medium-or-below slots
-        for i in range(3):
-            s._dispatched_priority[f't{i}'] = 'low'
-        # Medium is blocked because low slots exhaust the medium-or-below budget.
-        assert s._allowed_by_tier_cap('medium') is False
-        # Critical/high remain unaffected (cap 1.0).
-        assert s._allowed_by_tier_cap('high') is True
-        assert s._allowed_by_tier_cap('critical') is True
-
-    @pytest.mark.asyncio
-    async def test_cap_emits_idle_event(self):
-        """If all candidates are cap-rejected, emit exactly one idle event."""
-        # Cap medium-or-below at 0 so even one medium candidate is rejected.
-        config = OrchestratorConfig(
-            max_concurrent_tasks=4,
-            max_per_module=1,
-            tier_slot_caps={'medium': 0.0, 'low': 0.0, 'polish': 0.0},
-        )
-        event_store = _RecordingEventStore()
-        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
-        tasks = [_pending_task('1', priority='medium')]
-        scheduler.get_tasks = AsyncMock(return_value=tasks)
-        result = await scheduler.acquire_next()
-        assert result is None
-        idle_events = [e for e in event_store.events
-                       if e[0] == EventType.scheduler_tier_cap_idle.value]
-        assert len(idle_events) == 1
-        assert idle_events[0][1]['data']['candidates_skipped_by_cap'] == 1
-
-    @pytest.mark.asyncio
-    async def test_park_overrides_tier_cap(self):
-        """A parked task dispatches even when its tier cap would reject."""
-        config = OrchestratorConfig(
-            max_concurrent_tasks=4,
-            max_per_module=1,
-            tier_slot_caps={'low': 0.0, 'polish': 0.0},  # 0 low slots
-        )
-        scheduler = Scheduler(config)
-        low_task = _pending_task('1', priority='low')
-        # Install a park for task 1 — this should let it through the cap gate.
-        scheduler.lock_table.install_parks(
-            '1', ['mod1'], deadline=time.monotonic() + 300,
-        )
-        scheduler.get_tasks = AsyncMock(return_value=[low_task])
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == '1'
-
-
 class TestPerTierSkipThreshold:
     """Fix 2: skip_threshold dict unlocks per-tier parking behaviour."""
 
     def _config(self, thresholds: dict[str, int]) -> OrchestratorConfig:
         config = OrchestratorConfig(max_per_module=1)
         config.fairness.skip_threshold = thresholds
+        config.fairness.scheduler_v2 = True
         return config
 
     def test_skip_threshold_for_lookup(self):
@@ -3037,32 +3171,6 @@ class TestPerTierSkipThreshold:
         assert len(skip_events) == 3
 
 
-class TestLeaseMultiplierPerTier:
-    """Fix 2: lease_multiplier dict unlocks per-tier lease duration."""
-
-    def test_lease_multiplier_for_lookup(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = {
-            'critical': 8.0, 'high': 8.0, 'medium': 5.0,
-            'low': 2.0, 'polish': 2.0,
-        }
-        assert config.fairness.lease_multiplier_for('critical') == 8.0
-        assert config.fairness.lease_multiplier_for('low') == 2.0
-
-    def test_compute_lease_uses_tier_multiplier(self):
-        config = OrchestratorConfig(max_per_module=1)
-        config.fairness.lease_multiplier = {
-            'critical': 8.0, 'high': 8.0, 'medium': 5.0,
-            'low': 2.0, 'polish': 2.0,
-        }
-        config.fairness.lease_min_secs = 0.0
-        config.fairness.lease_max_secs = 10_000.0
-        scheduler = Scheduler(config)
-        scheduler._recent_durations.extend([10.0])  # median = 10
-        assert scheduler._compute_lease(tier='critical') == 80.0
-        assert scheduler._compute_lease(tier='low') == 20.0
-
-
 class TestLegacyOrderingPreserved:
     """With 3-tier data + default tier_slot_caps all 1.0 + no CPM + zero age,
     the new scheduler must match the legacy high>medium>low dispatch order.
@@ -3072,7 +3180,6 @@ class TestLegacyOrderingPreserved:
     async def test_legacy_three_tier_ordering_preserved(self):
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
         # Disable caps and fairness carve-outs for this test.
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='low', files=['modA']),
@@ -3087,7 +3194,6 @@ class TestLegacyOrderingPreserved:
     async def test_critical_beats_high(self):
         """New 5-tier: critical outranks high."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='high', files=['modA']),
@@ -3101,7 +3207,6 @@ class TestLegacyOrderingPreserved:
     async def test_polish_loses_to_low(self):
         """New 5-tier: polish ranks below low."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='polish', files=['modA']),
@@ -3115,7 +3220,6 @@ class TestLegacyOrderingPreserved:
     async def test_inheritance_lifts_dependency(self):
         """A medium task with a critical dependent is dispatched first."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         # Task 1 (medium, available) is needed by task 2 (critical, blocked).
         # Inheritance should lift task 1 above task 3 (high, available).
@@ -3147,7 +3251,6 @@ class TestDispatchPriorityBookkeeping:
     async def test_dispatched_priority_tracks_effective_not_own(self):
         """dispatched_priority reflects effective (inherited) priority."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
-        config.tier_slot_caps = {}
         scheduler = Scheduler(config)
         tasks = [
             _pending_task('1', priority='medium', files=['modA']),
@@ -3550,3 +3653,49 @@ class TestGetStatuses:
         assert not hasattr(sched, '_last_get_statuses_error'), (
             '_last_get_statuses_error attribute must be removed'
         )
+
+
+class TestSchedulerV2Config:
+    """Schema assertions for the v2 scheduler config changes."""
+
+    def test_scheduler_v2_default_false(self):
+        """FairnessConfig.scheduler_v2 defaults to False."""
+        assert FairnessConfig().scheduler_v2 is False
+
+    def test_skip_threshold_is_per_tier_dict(self):
+        """Default skip_threshold is a per-tier dict with the v2 values."""
+        cfg = OrchestratorConfig()
+        assert cfg.fairness.skip_threshold == {
+            'critical': 0,
+            'high': 1,
+            'medium': 2,
+            'low': 4,
+            'polish': 9999,
+        }
+
+    def test_lease_fields_removed_from_fairness_config(self):
+        """lease_min_secs, lease_max_secs, lease_multiplier, lease_multiplier_for,
+        and median_window must no longer exist on FairnessConfig."""
+        fc = FairnessConfig()
+        assert not hasattr(fc, 'lease_min_secs'), 'lease_min_secs must be removed'
+        assert not hasattr(fc, 'lease_max_secs'), 'lease_max_secs must be removed'
+        assert not hasattr(fc, 'lease_multiplier'), 'lease_multiplier must be removed'
+        assert not hasattr(fc, 'lease_multiplier_for'), (
+            'lease_multiplier_for must be removed'
+        )
+        assert not hasattr(fc, 'median_window'), 'median_window must be removed'
+
+    def test_tier_slot_caps_removed_from_orchestrator_config(self):
+        """tier_slot_caps, tier_slot_cap_for, and tier_slot_limit must not exist
+        on OrchestratorConfig."""
+        cfg = OrchestratorConfig()
+        assert not hasattr(cfg, 'tier_slot_caps'), 'tier_slot_caps must be removed'
+        assert not hasattr(cfg, 'tier_slot_cap_for'), (
+            'tier_slot_cap_for must be removed'
+        )
+        assert not hasattr(cfg, 'tier_slot_limit'), 'tier_slot_limit must be removed'
+
+    def test_reservation_evicted_event_type_exists(self):
+        """EventType.reservation_evicted must be defined for cross-tier preemption."""
+        assert hasattr(EventType, 'reservation_evicted')
+        assert EventType.reservation_evicted == 'reservation_evicted'

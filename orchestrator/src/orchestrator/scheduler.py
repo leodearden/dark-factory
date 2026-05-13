@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import math
-import statistics
 import time
 from collections import deque
 from collections.abc import Callable
@@ -383,8 +382,8 @@ class ModuleLockTable:
     ):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
-        # normalized_module -> (owner_task_id, deadline_monotonic)
-        self._parked: dict[str, tuple[str, float]] = {}
+        # normalized_module -> (owner_task_id, priority_rank)
+        self._parked: dict[str, tuple[str, int]] = {}
         self._config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
 
@@ -407,16 +406,12 @@ class ModuleLockTable:
 
     # --- Park (reservation) helpers ---
 
-    def _is_parked_blocks(self, module: str, task_id: str, now: float) -> bool:
+    def _is_parked_blocks(self, module: str, task_id: str) -> bool:
         """Return True iff any active park hierarchically conflicts with *module*
         and is owned by a different task.
-
-        Expired parks are ignored (they'll be cleaned up on the next prune).
         """
-        for parked_module, (owner, deadline) in self._parked.items():
+        for parked_module, (owner, _rank) in self._parked.items():
             if owner == task_id:
-                continue
-            if deadline <= now:
                 continue
             if self._conflicts(parked_module, module):
                 return True
@@ -427,41 +422,98 @@ class ModuleLockTable:
         return any(owner == task_id for owner, _ in self._parked.values())
 
     def install_parks(
-        self, task_id: str, modules: list[str], deadline: float
-    ) -> list[str]:
+        self, task_id: str, modules: list[str], priority: str
+    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Install reservations on the normalized form of *modules* for *task_id*.
 
-        Returns the list of normalized modules actually parked.
+        Returns ``(installed, evicted)`` where *installed* is the list of
+        normalized modules actually parked and *evicted* is a list of
+        ``(owner_id, modules_lost)`` for any lower-priority parks displaced.
+
+        Cross-tier preemption: a park with ``existing_rank > new_rank``
+        (i.e. *strictly* lower priority) is evicted. Same-tier or
+        higher-priority existing parks block installation of the new park on
+        that module (no eviction, no install for that module).
         """
         depth = self._config.lock_depth
+        rank = PRIORITY_RANK[coerce_tier(priority)]
         installed: list[str] = []
+        # Accumulate evictions: victim_owner -> list of modules lost.
+        eviction_acc: dict[str, list[str]] = {}
+        # Track insertion order of evicted owners for stable output.
+        eviction_order: list[str] = []
         for m in modules:
             normalized = normalize_lock(m, depth)
             if not normalized:
                 continue
-            self._parked[normalized] = (task_id, deadline)
+            # Find all conflicting parks from other owners.
+            to_evict: list[str] = []  # parked_module keys to pop
+            blocked = False
+            for parked_m, (owner, existing_rank) in list(self._parked.items()):
+                if owner == task_id:
+                    continue
+                if not self._conflicts(parked_m, normalized):
+                    continue
+                # Hierarchical conflict with a different owner.
+                if existing_rank > rank:
+                    # Strictly lower priority → evict.
+                    to_evict.append(parked_m)
+                else:
+                    # Same or higher priority → block our install.
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            # Perform evictions for this module.
+            for parked_m in to_evict:
+                owner, _ = self._parked.pop(parked_m)
+                if owner not in eviction_acc:
+                    eviction_acc[owner] = []
+                    eviction_order.append(owner)
+                eviction_acc[owner].append(parked_m)
+            self._parked[normalized] = (task_id, rank)
             installed.append(normalized)
-        return installed
+        # Build evicted list in first-seen owner order, modules sorted.
+        evicted = [
+            (owner, sorted(eviction_acc[owner]))
+            for owner in eviction_order
+        ]
+        return installed, evicted
 
     def clear_parks_for(self, task_id: str) -> None:
         """Remove every reservation owned by *task_id*."""
         self._parked = {
-            m: (owner, deadline)
-            for m, (owner, deadline) in self._parked.items()
+            m: (owner, rank)
+            for m, (owner, rank) in self._parked.items()
             if owner != task_id
         }
 
-    def prune_expired_parks(self, now: float) -> list[str]:
-        """Drop parks whose deadline has passed. Returns evicted owner task IDs
-        (deduplicated, preserving first-seen order)."""
-        expired_modules = [
-            m for m, (_, deadline) in self._parked.items() if deadline <= now
-        ]
+    def prune_owners(self, predicate: Callable[[str], bool]) -> list[str]:
+        """Evict every park whose owner satisfies *predicate*.
+
+        Iterates unique owners (deduped, first-seen order), calls
+        ``predicate(owner_id)`` at most once per owner, and drops all
+        ``_parked`` entries owned by matching tasks.
+
+        Returns the list of evicted owner IDs in first-seen order.
+        """
+        # Collect unique owners in first-seen order.
+        seen: dict[str, bool] = {}
+        for owner, _rank in self._parked.values():
+            if owner not in seen:
+                seen[owner] = predicate(owner)
+        # Evict matching owners.
         evicted: list[str] = []
-        for m in expired_modules:
-            owner, _ = self._parked.pop(m)
-            if owner not in evicted:
+        for owner, should_evict in seen.items():
+            if should_evict:
                 evicted.append(owner)
+        if evicted:
+            evicted_set = set(evicted)
+            self._parked = {
+                m: (owner, rank)
+                for m, (owner, rank) in self._parked.items()
+                if owner not in evicted_set
+            }
         return evicted
 
     # --- Limit lookup (unchanged) ---
@@ -498,14 +550,13 @@ class ModuleLockTable:
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
-        now = self._time_source()
 
         # Check every requested module against all other tasks' held locks and
         # active reservations owned by other tasks.
         for module in normalized:
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
-            if self._is_parked_blocks(module, task_id, now):
+            if self._is_parked_blocks(module, task_id):
                 return False
 
         self._held[task_id] = set(normalized)
@@ -550,11 +601,10 @@ class ModuleLockTable:
         if not new_modules:
             return True
 
-        now = self._time_source()
         for module in new_modules:
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
-            if self._is_parked_blocks(module, task_id, now):
+            if self._is_parked_blocks(module, task_id):
                 return False
 
         self._held[task_id].update(new_modules)
@@ -598,10 +648,6 @@ class Scheduler:
         self._requeue_history: dict[str, list[RequeueRecord]] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
-        self._task_start_times: dict[str, float] = {}  # task_id -> monotonic start
-        self._recent_durations: deque[float] = deque(
-            maxlen=config.fairness.median_window
-        )
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
@@ -1127,23 +1173,6 @@ class Scheduler:
 
         return signal is not None
 
-    def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
-        """Compute a reservation lease from the rolling duration window.
-
-        - Empty history → midpoint of ``[lease_min_secs, lease_max_secs]``
-        - Otherwise → ``median * lease_multiplier``, clamped to bounds.
-
-        The multiplier is resolved per-*tier* (critical/high parks carry a
-        longer lease than low/polish) via
-        :meth:`FairnessConfig.lease_multiplier_for`.
-        """
-        f = self.config.fairness
-        if not self._recent_durations:
-            return (f.lease_min_secs + f.lease_max_secs) / 2
-        median = statistics.median(self._recent_durations)
-        lease = median * f.lease_multiplier_for(tier)
-        return max(f.lease_min_secs, min(lease, f.lease_max_secs))
-
     def _bump_skip_and_maybe_park(
         self,
         task_id: str,
@@ -1181,13 +1210,15 @@ class Scheduler:
                     'threshold': threshold,
                 },
             )
-        if count >= threshold and not self.lock_table.has_parks(task_id):
-            lease = self._compute_lease(tier)
-            deadline = self._time_source() + lease
-            installed = self.lock_table.install_parks(task_id, modules, deadline)
+        if (
+            count >= threshold
+            and self.config.fairness.scheduler_v2
+            and not self.lock_table.has_parks(task_id)
+        ):
+            installed, evicted_pairs = self.lock_table.install_parks(task_id, modules, tier)
             logger.info(
-                'Task %s reserved modules %s (skip_count=%d, lease=%.1fs, tier=%s)',
-                task_id, installed, count, lease, tier,
+                'Task %s reserved modules %s (skip_count=%d, tier=%s)',
+                task_id, installed, count, tier,
             )
             if self.event_store:
                 self.event_store.emit(
@@ -1196,10 +1227,20 @@ class Scheduler:
                     data={
                         'modules': installed,
                         'skip_count': count,
-                        'lease_secs': lease,
                         'priority': tier,
                     },
                 )
+                for victim, victim_modules in evicted_pairs:
+                    self.event_store.emit(
+                        EventType.reservation_evicted,
+                        task_id=task_id,
+                        data={
+                            'modules': victim_modules,
+                            'preempted_by': task_id,
+                            'preempted_by_priority': tier,
+                            'victim': victim,
+                        },
+                    )
 
     # --- Value/h scoring helpers (P1/P2/P3) -----------------------------
 
@@ -1369,23 +1410,6 @@ class Scheduler:
         bonus = min(age_bonus + cpm_bonus, float(TIER_WIDTH - 1))
         return float(base) + bonus
 
-    def _count_dispatched_at_or_below(self, tier: str) -> int:
-        """Count currently-dispatched tasks whose effective priority is at
-        *tier* or lower (i.e. same rank or larger rank value)."""
-        tier = coerce_tier(tier)
-        rank = PRIORITY_RANK[tier]
-        return sum(
-            1
-            for p in self._dispatched_priority.values()
-            if PRIORITY_RANK.get(coerce_tier(p), PRIORITY_RANK[DEFAULT_TIER]) >= rank
-        )
-
-    def _allowed_by_tier_cap(self, tier: str) -> bool:
-        """Return False iff admitting a task at *tier* would exceed the
-        configured per-tier slot cap."""
-        limit = self.config.tier_slot_limit(tier)
-        return self._count_dispatched_at_or_below(tier) < limit
-
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -1393,20 +1417,6 @@ class Scheduler:
         dominant, age + CPM bonuses order tasks within a tier, and
         per-tier slot caps reserve headroom for higher-value work.
         """
-        # Fairness: evict expired reservations and reset their owners' skip
-        # counts so they can re-accumulate instead of immediately re-parking.
-        now = self._time_source()
-        evicted = self.lock_table.prune_expired_parks(now)
-        for owner in evicted:
-            self._skip_count.pop(owner, None)
-            logger.info('Task %s reservation expired', owner)
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.reservation_expired,
-                    task_id=owner,
-                    data={},
-                )
-
         tasks = await self.get_tasks()
         if not tasks:
             return None
@@ -1426,6 +1436,34 @@ class Scheduler:
 
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._update_age_anchors(tasks, max_id)
+
+        # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
+        # a park whose owner is terminal / missing / deps-unsatisfied has no
+        # reason to keep blocking other tasks, so it's evicted now.
+        def _park_gc(tid: str) -> bool:
+            status = status_map.get(tid)
+            if status in TERMINAL_STATUSES:
+                return True
+            if tid not in tasks_by_id:
+                return True
+            return not self._deps_satisfied(tasks_by_id[tid], status_map)
+
+        gc_evicted = self.lock_table.prune_owners(_park_gc)
+        for owner in gc_evicted:
+            self._skip_count.pop(owner, None)
+            if self.event_store:
+                owner_status = status_map.get(owner)
+                if owner_status in TERMINAL_STATUSES:
+                    reason = f'terminal:{owner_status}'
+                elif owner not in tasks_by_id:
+                    reason = 'missing'
+                else:
+                    reason = 'deps_unsatisfied'
+                self.event_store.emit(
+                    EventType.reservation_expired,
+                    task_id=owner,
+                    data={'reason': reason},
+                )
 
         # Drop _last_dispatch_at entries for tasks now in a terminal status so
         # a future legitimate re-dispatch (e.g. cancelled -> pending re-architect,
@@ -1528,16 +1566,8 @@ class Scheduler:
         top_modules = self._get_modules(top_task)
         top_had_parks = self.lock_table.has_parks(top_id)
 
-        cap_blocked = 0
         for _score, task_id, task, pri in scored:
             modules = self._get_modules(task)
-            # Tier-cap filter: skip candidates that would exceed their tier's
-            # slot budget.  Parks override caps — once a fairness reservation
-            # is installed, the owner dispatches regardless.
-            has_park = self.lock_table.has_parks(task_id)
-            if not has_park and not self._allowed_by_tier_cap(pri):
-                cap_blocked += 1
-                continue
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
                 # arm cooldown gate — only for signal-bearing dispatches.
@@ -1548,7 +1578,6 @@ class Scheduler:
                 if candidate_signals.get(task_id) is not None:
                     self._last_dispatch_at[task_id] = self._time_source()
                 self._dispatched_priority[task_id] = pri
-                self._task_start_times[task_id] = self._time_source()
                 if task_id == top_id:
                     self._skip_count.pop(task_id, None)
                     if top_had_parks:
@@ -1569,19 +1598,6 @@ class Scheduler:
                         data={'modules': modules, 'priority': pri},
                     )
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
-
-        # No candidate acquired.  If at least one was blocked by a tier cap,
-        # emit a single idle-diagnostic event so "why are slots idle" is
-        # visible in the event store.
-        if cap_blocked and self.event_store:
-            self.event_store.emit(
-                EventType.scheduler_tier_cap_idle,
-                data={
-                    'candidates_skipped_by_cap': cap_blocked,
-                    'top_id': top_id,
-                    'top_priority': top_pri,
-                },
-            )
 
         # Loop exhausted with no acquire — top candidate was also skipped.
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
@@ -1658,10 +1674,6 @@ class Scheduler:
             self._requeue_until[task_id] = (
                 self._time_source() + self.config.requeue_cooldown_secs
             )
-        # Fairness: record duration for the rolling median used by _compute_lease.
-        start = self._task_start_times.pop(task_id, None)
-        if start is not None:
-            self._recent_durations.append(self._time_source() - start)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
