@@ -474,6 +474,26 @@ class TaskWorkflow:
             stdout, _ = await proc.communicate()
             base_commit = stdout.decode().strip()
         self._base_commit = base_commit
+        # Record branch_base_sha in task metadata immediately after branch
+        # creation so _reconcile_one_stranded (harness.py) can detect
+        # zero-commit branches that sit on a main ancestor (Guard 3 in
+        # the is_ancestor fast-path) and stale merge-markers from prior
+        # incarnations of the same task id (stale-marker check).
+        # Soft-fail: a transient update_task failure degrades gracefully
+        # to citation-grep alone (Guards 1+2) instead of crashing setup.
+        if base_commit:
+            try:
+                await self.scheduler.update_task(
+                    self.task_id,
+                    {'branch_base_sha': base_commit},
+                    append=True,
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: failed to record branch_base_sha=%s; '
+                    'reconciler will fall back to citation-grep guard',
+                    self.task_id, base_commit,
+                )
         # Colocate the per-task Claude config dir inside the worktree so
         # the session JSONL travels with the worktree.  Crash recovery
         # needs both the sidecar and the session file together to resume.
