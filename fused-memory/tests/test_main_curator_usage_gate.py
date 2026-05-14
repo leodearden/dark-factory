@@ -104,3 +104,70 @@ def test_resolve_curator_cost_store_path(reconciliation_cfg, expected):
     config.reconciliation = reconciliation_cfg
     assert _resolve_curator_cost_store_path(config) == expected
 
+
+# ---------------------------------------------------------------------------
+# step-1 / step-3: TestCuratorUsageGateLeakGuard
+#
+# Tests for the extracted _setup_curator_usage_gate helper that guards the
+# open CostStore against a UsageGate construction failure.
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorUsageGateLeakGuard:
+    """Leak-guard: CostStore.close() must be awaited when UsageGate init raises."""
+
+    @pytest.mark.asyncio
+    async def test_setup_closes_cost_store_when_gate_init_raises(self, tmp_path):
+        """If UsageGate.__init__ raises, the open CostStore must be closed cleanly.
+
+        This is the primary regression test for the leak bug: before the fix,
+        a UsageGate construction failure left the open aiosqlite connection alive
+        because _graceful_shutdown never had a chance to run.
+        """
+        # Lazy import — ImportError here until step-2 adds the helper; that is
+        # the expected "red" state for this TDD step.
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
+        usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
+        config = MagicMock()
+        config.usage_cap = usage_cap_cfg
+        config.reconciliation = MagicMock(data_dir=str(tmp_path))
+
+        # Spy on open() to capture the store instance created inside the helper.
+        opened_stores: list[CostStore] = []
+        original_open = CostStore.open
+
+        async def capturing_open(self_store: CostStore) -> None:
+            opened_stores.append(self_store)
+            return await original_open(self_store)
+
+        # Spy on close() to count how many times it was awaited.
+        close_count: list[int] = [0]
+        original_close = CostStore.close
+
+        async def spy_close(self_store: CostStore) -> None:
+            close_count[0] += 1
+            return await original_close(self_store)
+
+        with (
+            patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}),
+            patch.object(CostStore, 'open', capturing_open),
+            patch.object(CostStore, 'close', spy_close),
+            patch.object(
+                UsageGate,
+                '__init__',
+                side_effect=RuntimeError('synthetic init failure'),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match='synthetic init failure'):
+                await _setup_curator_usage_gate(config)
+
+        assert len(opened_stores) == 1, 'CostStore.open() was not called'
+        assert close_count[0] == 1, (
+            f'Expected CostStore.close() to be awaited exactly once, got {close_count[0]}'
+        )
+        assert opened_stores[0]._conn is None, (
+            'CostStore connection was not closed (._conn is not None after failure)'
+        )
+
