@@ -112,7 +112,12 @@ async def fan_out_list_tickets(
                     for r in result.get('tickets', [])
                 )
                 break  # first success wins; avoid double-counting across failover URLs
-            except (httpx.HTTPError, TimeoutError, ValueError):
+            except TimeoutError:
+                logger.warning(
+                    'list_tickets timed out for project_root=%s url=%s after %.1fs',
+                    root_str, url, timeout,
+                )
+            except (httpx.HTTPError, ValueError):
                 logger.debug(
                     'list_tickets failed for %s / %s', url, root_str, exc_info=True,
                 )
