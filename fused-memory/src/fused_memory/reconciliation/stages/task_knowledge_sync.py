@@ -1927,6 +1927,28 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     return heapq.nsmallest(n, tasks, key=sort_key)
 
 
+def _needs_hint_conversion(task: dict) -> bool:
+    """Classify whether *task*'s ``metadata.memory_hints`` needs conversion to the
+    canonical ``{entities: [...], queries: [...]}`` dict shape (task 1275).
+
+    Three branches matching the pseudo-code in the task spec:
+
+    1. ``isinstance(task_hints, list)`` → True (legacy list-of-dict format
+       ``[{entity: ..., query: ...}, ...]`` — treat as conversion target).
+    2. ``not task_hints`` (missing key or empty dict) → True (existing falsy path).
+    3. otherwise (truthy, non-list — assumed already-structured dict) → False (skip).
+
+    Per Mem0 memory ``0b0eeb8d``: Stage 2's ``append=True`` merge silently discards
+    list-format hints under old-wins semantics, so list-format must be re-classified
+    as a conversion target so the LLM uses read-modify-write with ``append=False``.
+    """
+    metadata = task.get('metadata')
+    task_hints = metadata.get('memory_hints') if isinstance(metadata, dict) else None
+    if isinstance(task_hints, list):
+        return True
+    return not task_hints
+
+
 async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | None:
     """Run reify's refresh_briefing_known_gaps.py in --json mode.
 

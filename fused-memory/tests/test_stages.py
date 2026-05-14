@@ -37,6 +37,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _check_stall_guard_freshness,
     _classify_terminal_state_violations,
     _format_flagged,
+    _needs_hint_conversion,
     _queue_briefing_refresh_tasks,
     _resolve_live_status,
     _run_briefing_known_gaps_script,
@@ -1281,6 +1282,85 @@ class TestProactiveSampling:
         """
         assert _select_proactive_sample(iter([]), 5) == []
         assert _select_proactive_sample(iter([]), 0) == []
+
+
+class TestNeedsHintConversion:
+    """Tests for _needs_hint_conversion helper.
+
+    Verifies the three-branch classification from the task 1275 pseudo-code:
+      1. list memory_hints  -> True  (legacy list-of-dict format, conversion target)
+      2. falsy memory_hints -> True  (missing key or empty dict, existing falsy path)
+      3. truthy non-list   -> False (assumed already-structured dict, skip)
+    """
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _make_task(memory_hints) -> dict:
+        return {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': {'memory_hints': memory_hints}}
+
+    @staticmethod
+    def _make_task_no_hints() -> dict:
+        return {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': {}}
+
+    # ------------------------------------------------------------------ branch 1: list
+
+    def test_list_memory_hints_classified_as_conversion_target(self):
+        """Non-empty list-of-dict memory_hints returns True (NEW branch — legacy format)."""
+        task = self._make_task([{'entity': 'Foo', 'query': 'what is Foo'}])
+        assert _needs_hint_conversion(task) is True
+
+    def test_empty_list_memory_hints_classified_as_conversion_target(self):
+        """Empty list memory_hints returns True via the list branch (not the falsy branch)."""
+        task = self._make_task([])
+        assert _needs_hint_conversion(task) is True
+
+    # ------------------------------------------------------------------ branch 2: falsy
+
+    def test_missing_memory_hints_classified_as_conversion_target(self):
+        """Task with metadata dict that has no memory_hints key returns True."""
+        task = self._make_task_no_hints()
+        assert _needs_hint_conversion(task) is True
+
+    def test_empty_dict_memory_hints_classified_as_conversion_target(self):
+        """Empty dict memory_hints returns True (existing falsy path)."""
+        task = self._make_task({})
+        assert _needs_hint_conversion(task) is True
+
+    # ------------------------------------------------------------------ branch 3: already-valid dict
+
+    def test_structured_dict_memory_hints_not_flagged(self):
+        """Task with {entities: [...], queries: [...]} dict returns False (already valid)."""
+        task = self._make_task({'entities': ['Foo'], 'queries': ['what is Foo']})
+        assert _needs_hint_conversion(task) is False
+
+    def test_truthy_non_dict_non_list_memory_hints_not_flagged(self):
+        """Truthy non-list, non-dict values (string, int) return False — pins branch-3 contract.
+
+        Per design decision 4 in plan 1275: the three-branch pseudo-code's 'else' clause is
+        unconditional for any truthy non-list value; adding an isinstance(task_hints, dict) guard
+        to flag malformed scalars is a separable robustness concern deferred to a follow-up task.
+        This test documents the current contract so future narrowing is a deliberate, visible change.
+        """
+        assert _needs_hint_conversion(self._make_task('oops')) is False
+        assert _needs_hint_conversion(self._make_task(42)) is False
+
+    # ------------------------------------------------------------------ defensive edge cases
+
+    def test_task_without_metadata_key_classified_as_conversion_target(self):
+        """Task dict with no 'metadata' key at all returns True (treated as no hints attached)."""
+        task = {'id': 1, 'title': 'T', 'status': 'pending'}
+        assert _needs_hint_conversion(task) is True
+
+    def test_task_with_none_metadata_classified_as_conversion_target(self):
+        """Task with metadata=None returns True (malformed metadata can't carry valid hints)."""
+        task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': None}
+        assert _needs_hint_conversion(task) is True
+
+    def test_task_with_non_dict_metadata_string_classified_as_conversion_target(self):
+        """Task with metadata as a string returns True (defensive: non-dict metadata treated as no hints)."""
+        task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': 'not-a-dict'}
+        assert _needs_hint_conversion(task) is True
 
 
 class TestRunIdValidation(BaseStageValidationTest):
