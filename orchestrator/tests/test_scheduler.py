@@ -4216,3 +4216,75 @@ class TestOverrideEventEmission:
         )
         ev3 = override_events_after_tick3[0]
         assert ev3[1]['task_id'] == 'A'
+
+    @pytest.mark.asyncio
+    async def test_pin_unpin_and_reorder_events(self, tmp_path):
+        """Diff-detect fires task_pinned, task_unpinned, and pin_queue_reordered events.
+
+        Tick 1: pin A → task_pinned for A (pin_order=1).
+        Tick 2: pin B → task_pinned for B (pin_order=2).
+        Tick 3: reorder [B, A] → pin_queue_reordered with new_order=['B','A'].
+        Tick 4: unpin A → task_unpinned for A.
+        """
+        from orchestrator.overrides import OverrideStore
+        from orchestrator.event_store import EventType
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        # Pre-hold all modules so no task can dispatch (focus is purely on events).
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending',
+            'dependencies': [], 'metadata': {'files': ['a/src']}, 'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B', 'title': 'Task B', 'status': 'pending',
+            'dependencies': [], 'metadata': {'files': ['b/src']}, 'priority': 'medium',
+        }
+
+        def events_of_type(et):
+            return [e for e in event_store.events if e[0] == et.value]
+
+        # Tick 1: pin A (auto pin_order=1)
+        store.set_override('/proj', 'A', pinned=True)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        await scheduler.acquire_next()
+
+        pinned_after_t1 = events_of_type(EventType.task_pinned)
+        assert len(pinned_after_t1) == 1, f'Expected 1 task_pinned after tick 1, got {pinned_after_t1}'
+        assert pinned_after_t1[0][1]['task_id'] == 'A'
+        assert pinned_after_t1[0][1]['data'].get('pin_order') == 1
+
+        # Tick 2: pin B (auto pin_order=2)
+        store.set_override('/proj', 'B', pinned=True)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+
+        pinned_after_t2 = events_of_type(EventType.task_pinned)
+        assert len(pinned_after_t2) == 2, f'Expected 2 task_pinned events after tick 2, got {pinned_after_t2}'
+        b_pinned = [e for e in pinned_after_t2 if e[1]['task_id'] == 'B']
+        assert len(b_pinned) == 1
+        assert b_pinned[0][1]['data'].get('pin_order') == 2
+
+        # Tick 3: reorder to [B, A]
+        store.reorder_pin_queue('/proj', ['B', 'A'])
+        await scheduler.acquire_next()
+
+        reorder_events = events_of_type(EventType.pin_queue_reordered)
+        assert len(reorder_events) == 1, f'Expected 1 pin_queue_reordered event, got {reorder_events}'
+        assert reorder_events[0][1]['data'].get('new_order') == ['B', 'A']
+
+        # Tick 4: unpin A
+        store.clear_override('/proj', 'A', field='pinned')
+        await scheduler.acquire_next()
+
+        unpinned_events = events_of_type(EventType.task_unpinned)
+        assert len(unpinned_events) == 1, f'Expected 1 task_unpinned event, got {unpinned_events}'
+        assert unpinned_events[0][1]['task_id'] == 'A'
