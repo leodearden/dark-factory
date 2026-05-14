@@ -782,10 +782,25 @@ class Scheduler:
           3. Callback not wired — no-op.
           4. Count < threshold — not yet.
 
-        When all guards pass, formats a human-readable reason string, logs a
-        WARNING, and schedules the callback via asyncio.ensure_future() (we are
-        always inside an async context because set_task_status is an async
-        method).  Fire-and-forget so the status write is never delayed.
+        When all guards pass, this method:
+          a. SYNCHRONOUSLY calls self.pause(reason) — the latch step.  This
+             immediately sets _paused=True so any concurrent coroutine that has
+             already appended its timestamp but hasn't yet called
+             _maybe_fire_park_stop_trip will see _paused=True and return at
+             guard 1 without scheduling a duplicate callback.  This prevents the
+             race where N concurrent set_task_status('blocked') calls each
+             observe _paused=False (the async callback hasn't run yet) and each
+             schedule their own ensure_future — resulting in N-threshold+1
+             duplicate callbacks and an equal number of duplicate
+             run_store.save_scheduler_pause / scheduler_paused event writes.
+          b. Formats a human-readable reason string and logs a WARNING.
+          c. Schedules the full callback (harness.pause_scheduler) via
+             asyncio.ensure_future() — fire-and-forget so the status write is
+             never delayed.  The callback's own scheduler.pause(reason) call
+             becomes a no-op because _paused is already True (idempotent).
+             Persistence (run_store) and event emission still fire exactly once.
+
+        The synchronous latch is the key invariant: pause() BEFORE ensure_future.
         """
         if self._paused:
             return
@@ -802,6 +817,11 @@ class Scheduler:
             f'park-stop: {n} tasks transitioned to blocked within '
             f'{window_hours}h (threshold={threshold})'
         )
+        # SYNCHRONOUS LATCH: set _paused=True immediately so concurrent
+        # coroutines see the paused state before the async callback runs.
+        # This must happen before asyncio.ensure_future to close the race
+        # window between "trip detected" and "callback sets _paused".
+        self.pause(reason)
         logger.warning('Park-stop trip: %s — pausing scheduler', reason)
         try:
             asyncio.ensure_future(self._on_park_stop_trip(reason))
