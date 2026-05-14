@@ -207,6 +207,16 @@ git:
   remote: "origin"
   worktree_dir: ".worktrees"
 
+# Autonomous dry-run unblock hook
+unblock_auto:
+  enabled: true
+  budget_usd: 5.0
+  timeout_seconds: 600.0
+  model: "sonnet"
+  max_turns: 50
+  effort: "high"
+  backend: "claude"
+
 # Usage cap handling — multi-account failover
 usage_cap:
   enabled: true
