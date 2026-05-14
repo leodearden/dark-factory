@@ -932,14 +932,7 @@ async def test_fan_out_list_tickets_warns_when_count_at_limit(tmp_path: Path, ca
     - at least one WARNING log record on the dashboard.data.metrics logger whose
       message mentions both 'list_tickets' and '2000'
 
-    Layer-shift note: this test targets fan_out_list_tickets directly with
-    mcp_tool_call mocked, intentionally replacing the prior
-    test_sample_curator_saturation_warning_at_cap integration test that
-    exercised the same warning via _sample_curator + httpx.MockTransport +
-    _ListTicketsHandler (~40 lines of JSON-RPC scaffolding). The layer shift is
-    intentional — pending_total propagation through _sample_curator is covered
-    indirectly by test_sample_curator_http_timeout_partial_pending_total. Do
-    not re-introduce an integration-level saturation warning test.
+    Replaces a prior integration-level _sample_curator saturation test; pending_total propagation is now covered by test_sample_curator_http_timeout_partial_pending_total.
     """
     from dashboard.data.metrics import fan_out_list_tickets
 

@@ -74,8 +74,7 @@ def test_curator_endpoint_returns_envelope_shape(client):
     because no DB is seeded in this test.
 
     Also pins state.paused_reason to None (the current placeholder value until
-    the follow-up MCP tool lands — see app.py paused_reason TODO). When that
-    feature ships, update the assertion on line ~96 in place.
+    the follow-up MCP tool lands — see app.py paused_reason TODO).
     """
     mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
     with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
