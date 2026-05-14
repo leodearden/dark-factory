@@ -206,7 +206,8 @@ class OverrideStore:
                 ON CONFLICT(project_root, task_id) DO UPDATE SET
                     boost_tier  = COALESCE(?, boost_tier),
                     pinned      = COALESCE(?, pinned),
-                    pin_order   = COALESCE(?, pin_order),
+                    pin_order   = CASE WHEN ?=0 THEN NULL
+                                       ELSE COALESCE(?, pin_order) END,
                     reserve_now = COALESCE(?, reserve_now),
                     ttl_until   = COALESCE(?, ttl_until),
                     updated_at  = ?
@@ -218,7 +219,8 @@ class OverrideStore:
                     reserve_now_int, ttl_iso,
                     now_iso, now_iso,
                     # UPDATE SET values
-                    boost_tier, pinned_int, pin_order,
+                    boost_tier, pinned_int,
+                    pinned_int, pin_order,   # CASE WHEN pinned_int=0 THEN NULL ELSE COALESCE(pin_order, pin_order)
                     reserve_now_int, ttl_iso,
                     now_iso,
                 ),
