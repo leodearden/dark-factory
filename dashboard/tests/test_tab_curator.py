@@ -50,6 +50,36 @@ def app_jsx_body(_client):
 
 
 # ---------------------------------------------------------------------------
+# Helper: extract the CURATOR_STATE: { ... } seed block from data.js
+# ---------------------------------------------------------------------------
+
+def _extract_curator_state_block(data_js: str) -> str:
+    """Return the body of the ``CURATOR_STATE: { ... }`` seed object, braces included.
+
+    Locates ``CURATOR_STATE:`` followed by ``{`` (allowing arbitrary whitespace),
+    then walks forward counting ``{``/``}`` to find the matching close brace.
+    This is brace-aware: a simple regex ``[^}]*`` would stop at the first nested
+    ``}`` (e.g. the one closing ``latency_spark: { ... }``) and miss later keys.
+    Returns the empty string if no CURATOR_STATE block is found.
+    """
+    import re
+    m = re.search(r'CURATOR_STATE\s*:\s*\{', data_js)
+    if m is None:
+        return ''
+    start = m.end() - 1  # index of the opening `{`
+    depth = 0
+    for i in range(start, len(data_js)):
+        c = data_js[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return data_js[start:i + 1]
+    return ''
+
+
+# ---------------------------------------------------------------------------
 # step-1 test: charts.jsx exports StepSpark
 # ---------------------------------------------------------------------------
 
@@ -89,10 +119,20 @@ def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
         "data.js does not reference 'CURATOR_STATE' — add it as the mapped key "
         "for '/api/v2/dashboard/curator' in endpointsFor."
     )
+    import re
+
+    seed_block = _extract_curator_state_block(data_js_body)
+    assert seed_block, (
+        "data.js does not contain a `CURATOR_STATE: { ... }` seed block — "
+        "add the initializer to the window.DF_DATA assignment so applyKey has "
+        "something to replace on each poll."
+    )
     for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
-        assert key in data_js_body, (
-            f"data.js CURATOR_STATE default does not include key '{key}' — "
-            f"add it to the CURATOR_STATE seed in the window.DF_DATA initializer."
+        assert re.search(rf'\b{key}\s*:', seed_block), (
+            f"data.js CURATOR_STATE seed does not include key '{key}:' — "
+            f"add it to the CURATOR_STATE seed in the window.DF_DATA initializer. "
+            f"(Bare-substring check against the full data.js body would pass "
+            f"because '{key}' appears elsewhere; this scoped check is the test.)"
         )
 
 
