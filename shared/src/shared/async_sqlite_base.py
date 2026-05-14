@@ -143,3 +143,25 @@ class AsyncSqliteBase(abc.ABC):
         if self._conn is None:
             raise RuntimeError(f'{type(self).__name__} not opened')
         return self._conn
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
+        checkpointed)``.
+
+        Returns:
+            A 3-tuple ``(busy, log, checkpointed)`` where:
+            - ``busy``: 1 if one or more frames could not be checkpointed because
+              they are in use by a reader, 0 otherwise.
+            - ``log``: total number of frames in the WAL file.
+            - ``checkpointed``: total number of checkpointed frames.
+            Returns ``(-1, -1, -1)`` if the PRAGMA returns no rows.
+
+        Raises:
+            RuntimeError: If the store has not been opened.
+        """
+        conn = self._require_conn()
+        cursor = await conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        row = await cursor.fetchone()
+        if row is None:
+            return (-1, -1, -1)
+        return int(row[0]), int(row[1]), int(row[2])

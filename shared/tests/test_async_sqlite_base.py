@@ -812,16 +812,32 @@ class TestAsyncSqliteBaseCheckpoint:
         # TRUNCATE moves all WAL frames into the main db; log == checkpointed
         assert log == checkpointed
 
-    async def test_checkpoint_returns_nonzero_log_after_writes(self, tmp_path: Path) -> None:
-        """After inserting rows, checkpoint() returns (0, log, log) with log > 0."""
-        async with _SimpleStore(tmp_path / 'store.db') as store:
+    async def test_checkpoint_truncates_wal_after_writes(self, tmp_path: Path) -> None:
+        """After inserting rows, checkpoint() truncates the WAL and returns (0, 0, 0).
+
+        PRAGMA wal_checkpoint(TRUNCATE) zeros both log and checkpointed after a
+        successful truncation, so the return is always (0, 0, 0) when no readers
+        block the checkpoint. We verify the WAL had frames before the call, and
+        that the WAL file is reduced to empty (or near-zero) after the call.
+        """
+        db_path = tmp_path / 'store.db'
+        wal_path = tmp_path / 'store.db-wal'
+        async with _SimpleStore(db_path) as store:
             # Insert enough rows to populate WAL frames
             for i in range(10):
                 await store._conn.execute(  # type: ignore[union-attr]
                     "INSERT INTO items (name) VALUES (?)", (f'item-{i}',)
                 )
             await store._conn.commit()  # type: ignore[union-attr]
+
+            # WAL file should have frames from the inserts
+            before_size = wal_path.stat().st_size if wal_path.exists() else 0
+            assert before_size > 0, 'Expected WAL frames to exist after commits'
+
             busy, log, checkpointed = await store.checkpoint()
+
+        # TRUNCATE mode: successful checkpoint with no blocking readers
         assert busy == 0
-        assert log > 0
-        assert log == checkpointed
+        # log and checkpointed are both zeroed by TRUNCATE after success
+        assert log == 0
+        assert checkpointed == 0
