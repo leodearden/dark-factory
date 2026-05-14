@@ -631,7 +631,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             errors.append(f'{url}: {type(exc).__name__}')
             # Invalidate the cached MCP session so the next caller retries
             # session initialisation — mirrors get_memory_status/get_queue_stats.
-            memory_data._sessions.pop(url.rstrip('/'), None)
+            memory_data.invalidate_session(url)
             continue
         if result.get('error') == 'not_found':
             return JSONResponse(result, status_code=404)
