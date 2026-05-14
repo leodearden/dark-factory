@@ -37,6 +37,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _check_stall_guard_freshness,
     _classify_terminal_state_violations,
     _format_flagged,
+    _needs_hint_conversion,
     _queue_briefing_refresh_tasks,
     _resolve_live_status,
     _run_briefing_known_gaps_script,
@@ -1281,6 +1282,57 @@ class TestProactiveSampling:
         """
         assert _select_proactive_sample(iter([]), 5) == []
         assert _select_proactive_sample(iter([]), 0) == []
+
+
+class TestNeedsHintConversion:
+    """Tests for _needs_hint_conversion helper.
+
+    Verifies the three-branch classification from the task 1275 pseudo-code:
+      1. list memory_hints  -> True  (legacy list-of-dict format, conversion target)
+      2. falsy memory_hints -> True  (missing key or empty dict, existing falsy path)
+      3. truthy non-list   -> False (assumed already-structured dict, skip)
+    """
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _make_task(memory_hints) -> dict:
+        return {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': {'memory_hints': memory_hints}}
+
+    @staticmethod
+    def _make_task_no_hints() -> dict:
+        return {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': {}}
+
+    # ------------------------------------------------------------------ branch 1: list
+
+    def test_list_memory_hints_classified_as_conversion_target(self):
+        """Non-empty list-of-dict memory_hints returns True (NEW branch — legacy format)."""
+        task = self._make_task([{'entity': 'Foo', 'query': 'what is Foo'}])
+        assert _needs_hint_conversion(task) is True
+
+    def test_empty_list_memory_hints_classified_as_conversion_target(self):
+        """Empty list memory_hints returns True via the list branch (not the falsy branch)."""
+        task = self._make_task([])
+        assert _needs_hint_conversion(task) is True
+
+    # ------------------------------------------------------------------ branch 2: falsy
+
+    def test_missing_memory_hints_classified_as_conversion_target(self):
+        """Task with metadata dict that has no memory_hints key returns True."""
+        task = self._make_task_no_hints()
+        assert _needs_hint_conversion(task) is True
+
+    def test_empty_dict_memory_hints_classified_as_conversion_target(self):
+        """Empty dict memory_hints returns True (existing falsy path)."""
+        task = self._make_task({})
+        assert _needs_hint_conversion(task) is True
+
+    # ------------------------------------------------------------------ branch 3: already-valid dict
+
+    def test_structured_dict_memory_hints_not_flagged(self):
+        """Task with {entities: [...], queries: [...]} dict returns False (already valid)."""
+        task = self._make_task({'entities': ['Foo'], 'queries': ['what is Foo']})
+        assert _needs_hint_conversion(task) is False
 
 
 class TestRunIdValidation(BaseStageValidationTest):
