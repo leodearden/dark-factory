@@ -369,18 +369,7 @@ class TestSnapshotPerformance:
     """
 
     def test_read_scheduler_state_under_50ms_for_1500_tasks(self, tmp_path):
-        """Median latency for a 1500-task snapshot is < 50ms (acceptance criterion).
-
-        This test times ``read_scheduler_state`` (the sync helper) directly
-        rather than routing through
-        ``mcp_server._tool_manager.call_tool('get_scheduler_state', ...)``.
-        The async MCP path adds two CI-load-sensitive latency contributors —
-        ``asyncio.to_thread`` handoff and FastMCP dispatch — that are not part
-        of the orchestrator-promised 50ms snapshot-read budget.  Timing them
-        produces a flaky test under ``pytest-xdist -n auto`` with 32 workers.
-        The contract is: the JSON read+parse itself must be fast; this test is
-        the regression canary for exactly that. (task 1335)
-        """
+        """Median latency for a 1500-task snapshot is < 50ms (task 1230 acceptance criterion)."""
         n = 1500
         snapshot = {
             'skip_counts': {f'T{i}': i % 5 for i in range(n)},
@@ -402,6 +391,9 @@ class TestSnapshotPerformance:
 
         result: dict = {}
         samples: list[float] = []
+        # NOTE: We deliberately measure the warm-cache path (no page-cache eviction between
+        # samples) because the orchestrator reads this snapshot many times per cycle in steady
+        # state, so warm-cache cost is what the 50ms budget is actually about.
         # 2 warm-up samples (discarded) + 20 measured samples.
         # Two warm-ups absorb OS page-cache warm-up and CPU cache warm-up on
         # the file buffer.  20 measured samples make the median robust against
@@ -437,7 +429,10 @@ class TestSnapshotPerformance:
         # any reasonable disk, leaving large headroom.  Do NOT loosen this to
         # 150-250ms — that silently inflates the contract.  Do NOT confuse this
         # with an MCP-layer perf bound; this test specifically times the sync
-        # helper to remove asyncio/FastMCP overhead from the measurement.
+        # helper (not mcp_server._tool_manager.call_tool) because the
+        # asyncio.to_thread handoff + FastMCP dispatch are CI-load-sensitive and
+        # flaky under pytest-xdist -n auto with 32 workers, making them
+        # unsuitable for a tight latency canary.
         assert median_ms < 50, (
             f'Median latency {median_ms:.1f}ms exceeds 50ms acceptance criterion '
             f'(regression canary for orchestrator snapshot-read budget, task 1230)'
