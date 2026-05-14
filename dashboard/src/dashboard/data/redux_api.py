@@ -783,8 +783,11 @@ def shape_scheduler(
 ) -> dict:
     """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects}}``.
 
-    Pure, I/O-free — mirrors ``shape_curator`` style.  Deep-copies list/dict
-    inputs to prevent aliasing between the caller and the JSON response.
+    Pure, I/O-free — mirrors ``shape_curator`` style.  Shallow-copies top-level
+    containers only (``list(rows)``, ``dict(events_by_task)``); inner dicts and
+    sparkline lists are still aliased to the caller's objects.  This is benign
+    because the collector builds fresh dicts, but callers must not mutate the
+    inner objects if they need the originals to remain unchanged.
     """
     return {
         'SCHEDULER': {

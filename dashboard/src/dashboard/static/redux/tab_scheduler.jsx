@@ -378,7 +378,7 @@ function SchedulerTab({ projectFilter = [] }) {
           <SchedulerDrawer
             task={selectedTask}
             modules={modules}
-            eventsForTask={events_by_task[selectedTask.task_id] || null}
+            eventsForTask={events_by_task[`${selectedTask.project}/${selectedTask.task_id}`] || null}
             allRows={visibleRows}
             onClose={() => setSelectedTask(null)}
             onSubmitOverride={handleSubmitOverride}

@@ -306,10 +306,12 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
     assert len(pin_queue) == 1
     assert pin_queue[0]['task_id'] == '1'
 
-    # events_by_task for task '1' has a sparkline
-    assert '1' in events_by_task
-    assert 'labels' in events_by_task['1']
-    assert 'values' in events_by_task['1']
+    # events_by_task is keyed by composite '{project}/{task_id}' to avoid
+    # silent overwrite when the same numeric task_id appears in two project roots.
+    composite_key = f'{project}/1'
+    assert composite_key in events_by_task
+    assert 'labels' in events_by_task[composite_key]
+    assert 'values' in events_by_task[composite_key]
 
 
 # ---------------------------------------------------------------------------
@@ -445,18 +447,23 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
 _PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
 
 _OVERRIDE_INVALID_BODIES = [
-    pytest.param(None, id='non-dict-body'),
-    pytest.param({}, id='missing-task_id'),
-    pytest.param({'task_id': 123}, id='task_id-not-string'),
-    pytest.param({'task_id': ''}, id='task_id-empty'),
-    pytest.param({'task_id': 'T1', 'boost_tier': 'invalid_tier'}, id='bad-boost_tier'),
-    pytest.param({'task_id': 'T1', 'pin_order': 5}, id='pin_order-without-pinned'),
+    pytest.param(None, None, id='non-dict-body'),
+    pytest.param({}, None, id='missing-task_id'),
+    pytest.param({'task_id': 123}, None, id='task_id-not-string'),
+    pytest.param({'task_id': ''}, None, id='task_id-empty'),
+    # project_root must be present so validation reaches the named branches below
+    pytest.param({'task_id': 'T1', 'project_root': '/proj', 'boost_tier': 'invalid_tier'}, 'invalid_boost_tier', id='bad-boost_tier'),
+    pytest.param({'task_id': 'T1', 'project_root': '/proj', 'pin_order': 5}, 'invalid_pin_order', id='pin_order-without-pinned'),
 ]
 
 
-@pytest.mark.parametrize('body', _OVERRIDE_INVALID_BODIES)
-def test_override_endpoint_rejects_invalid_body(client, body):
-    """Invalid body → 400 with no MCP call."""
+@pytest.mark.parametrize('body,expected_error', _OVERRIDE_INVALID_BODIES)
+def test_override_endpoint_rejects_invalid_body(client, body, expected_error):
+    """Invalid body → 400 with no MCP call.
+
+    For cases that reach named validation branches (boost_tier, pin_order),
+    also assert the specific error code so the branch is actually exercised.
+    """
     from unittest.mock import AsyncMock, patch
 
     with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
@@ -471,6 +478,8 @@ def test_override_endpoint_rejects_invalid_body(client, body):
 
     assert resp.status_code == 400
     assert mock_mcp.call_count == 0
+    if expected_error is not None:
+        assert resp.json().get('error') == expected_error
 
 
 # ---------------------------------------------------------------------------

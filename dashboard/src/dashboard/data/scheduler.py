@@ -37,6 +37,7 @@ Shape contract (returned by collect_scheduler_state):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -251,21 +252,35 @@ async def collect_scheduler_state(
     # Fetch active tasks (for lock sets and titles)
     all_active, _file_locks, active_offline = await collect_active_tasks(client, config)
 
-    all_rows: list[dict] = []
-    all_modules: list[dict] = []
-    all_pin_queue: list[dict] = []
-    all_events_by_task: dict[str, dict] = {}
     offline_projects: list[str] = list(active_offline)
 
-    for root in _all_project_roots(config):
-        label = _project_label(root)
-        if label in offline_projects:
-            continue  # already failed during collect_active_tasks
+    # Determine which project roots still need querying
+    roots_to_query = [
+        root for root in _all_project_roots(config)
+        if _project_label(root) not in offline_projects
+    ]
 
+    async def _one_project(root) -> tuple[str, dict, list[dict]]:
+        """Fetch snapshot + events for one project root; return (label, snapshot, events).
+
+        URLs are tried sequentially (first-success wins).  Each URL iteration
+        resets snapshot/events to prevent a partial-success on url1 from bleeding
+        into a failed url2 attempt (robustness guard: snapshot from one URL must
+        not be paired with events fetched from a different URL attempt).
+
+        Returns ``(label, {}, [])`` when every URL fails (caller detects offline
+        via ``not snapshot``).
+        """
+        label = _project_label(root)
         snapshot: dict = {}
         events: list[dict] = []
 
         for url in config.fused_memory_urls:
+            # Reset per-URL so a partial success on a prior URL doesn't bleed
+            # into this attempt — e.g. snapshot from url1 paired with empty
+            # events because url1's get_scheduler_events raised.
+            snapshot = {}
+            events = []
             try:
                 snapshot = await mcp_tool_call(
                     client,
@@ -285,11 +300,10 @@ async def collect_scheduler_state(
                 )
                 if isinstance(events_raw, list):
                     events = events_raw
-                    break
-                # events may be wrapped: {'events': [...]}
-                if isinstance(events_raw, dict):
+                elif isinstance(events_raw, dict):
+                    # events may be wrapped: {'events': [...]}
                     events = events_raw.get('events') or []
-                break
+                break  # first-success wins; don't try remaining URLs
             except (
                 httpx.ConnectError,
                 httpx.TimeoutException,
@@ -300,8 +314,40 @@ async def collect_scheduler_state(
                 invalidate_session(url)
                 continue
 
+        return label, snapshot, events
+
+    # Fan out to all project roots concurrently (mirrors metrics.py pattern)
+    per_project_results = await asyncio.gather(
+        *(_one_project(root) for root in roots_to_query),
+        return_exceptions=True,
+    )
+
+    all_rows: list[dict] = []
+    all_modules: list[dict] = []
+    all_pin_queue: list[dict] = []
+    # NOTE: events_by_task is keyed by composite '{label}/{task_id}' to prevent
+    # silent overwrite when the same numeric task_id exists in two project roots
+    # (Taskmaster numbers are project-scoped, so collisions are expected in
+    # multi-project dashboards).  The React lookup in tab_scheduler.jsx uses
+    # `${row.project}/${row.task_id}` to match this key.
+    all_events_by_task: dict[str, dict] = {}
+
+    for result in per_project_results:
+        if isinstance(result, BaseException):
+            logger.warning('_one_project raised unexpectedly: %s', result)
+            continue
+        label, snapshot, events = result
+
         if not snapshot:
             offline_projects.append(label)
+            continue
+
+        # Find the matching project root for this label
+        root = next(
+            (r for r in roots_to_query if _project_label(r) == label),
+            None,
+        )
+        if root is None:
             continue
 
         # Build task lookup from active_tasks for this project
@@ -340,14 +386,17 @@ async def collect_scheduler_state(
         pin_queue_raw = snapshot.get('pin_queue') or []
         all_pin_queue.extend(pin_queue_raw)
 
-        # Per-task event sparklines
+        # Per-task event sparklines — keyed by composite '{label}/{tid}' to
+        # avoid silent overwrite when the same numeric task_id appears in two
+        # project roots (see NOTE above).
         events_list = events if isinstance(events, list) else []
         by_task: dict[str, list] = {}
         for ev in events_list:
             tid = str(ev.get('task_id') or '')
             by_task.setdefault(tid, []).append(ev)
         for tid, task_events in by_task.items():
-            all_events_by_task[tid] = _skip_event_sparkline(task_events, since=since)
+            composite_key = f'{label}/{tid}'
+            all_events_by_task[composite_key] = _skip_event_sparkline(task_events, since=since)
 
     return all_rows, all_modules, all_pin_queue, all_events_by_task, offline_projects
 
