@@ -726,10 +726,18 @@ class Scheduler:
         # --- Park-and-stop pause state (task 1322) ---
         self._paused: bool = False
         self._pause_reason: str | None = None
-        # Rolling deque of wall-clock timestamps for each successful blocked
-        # transition.  Entries older than park_stop_parked_window_hours * 3600s
-        # are lazily evicted on each _record_blocked_transition() call.
-        self._blocked_transitions: deque[float] = deque()
+        # Rolling deque of (task_id, monotonic_timestamp) pairs for each
+        # successful blocked transition.  Entries older than
+        # park_stop_parked_window_hours * 3600s are lazily evicted on each
+        # _record_blocked_transition() call.  Storing task_id alongside the
+        # timestamp enables per-task de-duplication: idempotent re-sets
+        # (blocked→blocked, e.g. from a recovery loop or post-restart replay)
+        # count as ONE transition per task within the window rather than N.
+        self._blocked_transitions: deque[tuple[str, float]] = deque()
+        # Companion set for O(1) de-dup lookup: contains the task_ids of all
+        # entries currently in _blocked_transitions.  Kept in sync with the
+        # deque — entries are added/removed together.
+        self._blocked_task_ids_in_window: set[str] = set()
         # Callback installed by the Harness so trip → persistence + event.
         self._on_park_stop_trip: Callable[[str], Any] | None = None
 
@@ -783,6 +791,7 @@ class Scheduler:
         self._paused = False
         self._pause_reason = None
         self._blocked_transitions.clear()
+        self._blocked_task_ids_in_window.clear()
         logger.info('Scheduler resumed')
 
     def _maybe_fire_park_stop_trip(self) -> None:
@@ -858,18 +867,37 @@ class Scheduler:
                 'park-stop trip: no running event loop; callback not scheduled'
             )
 
-    def _record_blocked_transition(self) -> None:
+    def _record_blocked_transition(self, task_id: str) -> None:
         """Record a successful blocked transition in the rolling deque.
 
-        Appends the current wall-clock timestamp then evicts entries older than
-        ``park_stop_parked_window_hours * 3600`` seconds from the left side.
-        O(k) where k is the number of expired entries (typically tiny).
+        De-duplicates by *task_id*: if the same task is already counted within
+        the rolling window (e.g. from an idempotent re-set or post-restart
+        replay), this call is a no-op.  This prevents a single task being
+        marked blocked multiple times from artificially inflating the trip
+        counter — the design intent is "N *distinct* tasks transition to
+        blocked", not "N writes that resolve to blocked".
+
+        Evicts (task_id, timestamp) pairs older than
+        ``park_stop_parked_window_hours * 3600`` seconds from the left of
+        the deque.  O(k) where k is the number of expired entries (typically
+        tiny).  The companion ``_blocked_task_ids_in_window`` set is kept in
+        sync so de-dup checks remain O(1).
         """
         now = self._park_stop_clock()
-        self._blocked_transitions.append(now)
         cutoff = now - self.config.park_stop_parked_window_hours * 3600
-        while self._blocked_transitions and self._blocked_transitions[0] <= cutoff:
-            self._blocked_transitions.popleft()
+
+        # Evict expired (task_id, ts) pairs from the front of the deque,
+        # keeping _blocked_task_ids_in_window consistent.
+        while self._blocked_transitions and self._blocked_transitions[0][1] <= cutoff:
+            evicted_id, _ = self._blocked_transitions.popleft()
+            self._blocked_task_ids_in_window.discard(evicted_id)
+
+        # De-dup: if this task is already counted in the window, skip.
+        if task_id in self._blocked_task_ids_in_window:
+            return
+
+        self._blocked_transitions.append((task_id, now))
+        self._blocked_task_ids_in_window.add(task_id)
 
     async def dispatch_tool(
         self,
@@ -1040,7 +1068,7 @@ class Scheduler:
                 # fire the park-stop trip check.  These must run before return
                 # so that every confirmed write is counted exactly once.
                 if status == 'blocked':
-                    self._record_blocked_transition()
+                    self._record_blocked_transition(task_id)
                     self._maybe_fire_park_stop_trip()
                 return  # success
             last_rejection = rejection

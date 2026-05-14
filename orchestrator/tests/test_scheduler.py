@@ -4808,7 +4808,7 @@ class TestSchedulerBlockedTransitionTracking:
         return Scheduler(config, wall_clock_source=lambda: now)
 
     def test_record_blocked_transition_appends_timestamp(self):
-        """_record_blocked_transition() adds entries matching the wall-clock source."""
+        """_record_blocked_transition() adds entries matching the clock source."""
         timestamps = [1_000_000.0, 1_000_001.0, 1_000_002.0]
         idx = [0]
 
@@ -4820,12 +4820,14 @@ class TestSchedulerBlockedTransitionTracking:
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
         scheduler = Scheduler(config, wall_clock_source=time_source)
 
-        scheduler._record_blocked_transition()
-        scheduler._record_blocked_transition()
-        scheduler._record_blocked_transition()
+        # Three distinct task IDs → three entries in the deque.
+        scheduler._record_blocked_transition('t1')
+        scheduler._record_blocked_transition('t2')
+        scheduler._record_blocked_transition('t3')
 
         assert len(scheduler._blocked_transitions) == 3
-        assert list(scheduler._blocked_transitions) == timestamps
+        # Each entry is a (task_id, timestamp) tuple.
+        assert [ts for _, ts in scheduler._blocked_transitions] == timestamps
 
     def test_record_evicts_entries_older_than_window(self):
         """Entries older than the rolling window are evicted on each record call."""
@@ -4838,23 +4840,61 @@ class TestSchedulerBlockedTransitionTracking:
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
         scheduler = Scheduler(config, wall_clock_source=time_source)
 
-        # Seed three entries: two outside the 3600s window, one inside.
+        # Seed three (task_id, timestamp) entries: two outside the 3600s window, one inside.
         from collections import deque
         scheduler._blocked_transitions = deque([
-            now - 7200,   # 2h ago — expired
-            now - 3600,   # exactly at cutoff boundary — expired (strictly older)
-            now - 100,    # 100s ago — within window
+            ('task-a', now - 7200),   # 2h ago — expired
+            ('task-b', now - 3600),   # exactly at cutoff boundary — expired (strictly older)
+            ('task-c', now - 100),    # 100s ago — within window
         ])
+        scheduler._blocked_task_ids_in_window = {'task-a', 'task-b', 'task-c'}
 
         # Record a new transition at `now`.
-        scheduler._record_blocked_transition()
+        scheduler._record_blocked_transition('task-d')
 
-        entries = list(scheduler._blocked_transitions)
-        assert (now - 7200) not in entries, 'Entry 2h old must be evicted'
-        assert (now - 3600) not in entries, 'Entry at boundary must be evicted'
-        assert (now - 100) in entries, 'Entry 100s old must survive'
-        assert now in entries, 'New entry must be present'
-        assert len(entries) == 2, f'Expected 2 entries; got {len(entries)}: {entries}'
+        timestamps_in_deque = [ts for _, ts in scheduler._blocked_transitions]
+        task_ids_in_deque = [tid for tid, _ in scheduler._blocked_transitions]
+        assert (now - 7200) not in timestamps_in_deque, 'Entry 2h old must be evicted'
+        assert (now - 3600) not in timestamps_in_deque, 'Entry at boundary must be evicted'
+        assert (now - 100) in timestamps_in_deque, 'Entry 100s old must survive'
+        assert now in timestamps_in_deque, 'New entry must be present'
+        assert len(scheduler._blocked_transitions) == 2, (
+            f'Expected 2 entries; got {len(scheduler._blocked_transitions)}: '
+            f'{list(scheduler._blocked_transitions)}'
+        )
+        # task-a and task-b must also be removed from the companion set.
+        assert 'task-a' not in scheduler._blocked_task_ids_in_window
+        assert 'task-b' not in scheduler._blocked_task_ids_in_window
+        assert 'task-c' in scheduler._blocked_task_ids_in_window
+        assert 'task-d' in scheduler._blocked_task_ids_in_window
+        assert 'task-d' in task_ids_in_deque
+
+    def test_same_task_id_not_double_counted(self):
+        """Idempotent re-sets of the same task must count as one transition.
+
+        This guards against recovery loops, post-restart replays, or retry
+        code paths re-marking the same already-blocked task and artificially
+        inflating the trip counter beyond threshold.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        scheduler = Scheduler(config, wall_clock_source=lambda: now)
+
+        # Block the same task three times.
+        scheduler._record_blocked_transition('task-1')
+        scheduler._record_blocked_transition('task-1')
+        scheduler._record_blocked_transition('task-1')
+
+        # Only the first one should be counted.
+        assert len(scheduler._blocked_transitions) == 1, (
+            f'Same task blocked 3× must count as 1; got {len(scheduler._blocked_transitions)}'
+        )
+        assert scheduler._blocked_task_ids_in_window == {'task-1'}
+
+        # A different task must still be counted separately.
+        scheduler._record_blocked_transition('task-2')
+        assert len(scheduler._blocked_transitions) == 2
+        assert scheduler._blocked_task_ids_in_window == {'task-1', 'task-2'}
 
 
 class TestSetTaskStatusBlockedRecording:
@@ -4874,7 +4914,8 @@ class TestSetTaskStatusBlockedRecording:
         await scheduler.set_task_status('42', 'blocked')
 
         assert len(scheduler._blocked_transitions) == 1
-        assert list(scheduler._blocked_transitions) == [now]
+        # Each entry is a (task_id, timestamp) tuple.
+        assert list(scheduler._blocked_transitions) == [('42', now)]
 
     @pytest.mark.asyncio
     async def test_set_task_status_non_blocked_does_not_record(self, monkeypatch):
