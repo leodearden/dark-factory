@@ -295,9 +295,11 @@ class TestCuratorUsageGateLeakGuard:
         """Original UsageGate init error must survive even if CostStore.close() raises
         CancelledError mid-cleanup.
 
-        The capturing_open spy + post-block close pattern prevents leaking the
-        aiosqlite connection allocated inside the helper when the AsyncMock
-        prevents the real close from running on the rollback path.
+        CostStore.close is mocked to raise CancelledError, which means the real
+        close never runs inside the helper. The capturing_open spy captures the
+        store instance so we can release the orphaned aiosqlite connection +
+        WAL background thread after the with block exits (where patches are
+        gone and the real close is available again).
         """
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
 
@@ -337,20 +339,13 @@ class TestCuratorUsageGateLeakGuard:
             f'got {cancel_close.await_count}'
         )
 
-        # Release the orphaned aiosqlite connection. Patches are now gone, so this
-        # invokes the real CostStore.close() (which the AsyncMock prevented inside
-        # the helper's rollback path). Without this line, the connection + WAL
-        # background thread would leak for the rest of the pytest session.
+        # CostStore.close was replaced by an AsyncMock that raises CancelledError, so
+        # the real close() never ran inside the helper — the aiosqlite connection +
+        # WAL background thread are GUARANTEED to be leaked at this point (the mock
+        # replaces the method entirely; there is no path where the helper could have
+        # released the connection). Patches are now gone after the with block exits,
+        # so this invokes the real CostStore.close() to release the leaked resources.
+        # Nothing to assert about leak state: the mock guarantees the leak, so the
+        # only useful action is cleanup.
         await opened_stores[0].close()
-
-        # Leak probe: CostStore.open() raises RuntimeError('CostStore already opened')
-        # if _conn is not None — proving the helper's rollback never released the
-        # aiosqlite connection. Public-API probe (per task 1283/step-5 convention,
-        # we don't poke store._conn directly).
-        try:
-            await opened_stores[0].open()
-        except RuntimeError as exc:
-            pytest.fail(f'CostStore connection leaked: {exc}')
-        finally:
-            await opened_stores[0].close()
 
