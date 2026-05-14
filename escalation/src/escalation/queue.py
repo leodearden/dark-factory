@@ -26,6 +26,14 @@ _SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
 
 def _max_severity(a: str, b: str) -> str:
     """Return the higher-urgency severity string between *a* and *b*."""
+    for val in (a, b):
+        if val not in _SEVERITY_RANK:
+            logger.warning(
+                '_max_severity: unrecognised severity %r — treating as info-level '
+                '(rank 0). Known values: %s',
+                val,
+                ', '.join(_SEVERITY_RANK),
+            )
     return a if _SEVERITY_RANK.get(a, 0) >= _SEVERITY_RANK.get(b, 0) else b
 
 
@@ -356,15 +364,16 @@ class EscalationQueue:
     ) -> Escalation | None:
         """Append *child_id* to the pending parent's dedupe_children list.
 
-        **Not concurrency-safe.**  The read-modify-write of ``dedupe_count``
-        and ``dedupe_children`` is *not* atomic: two concurrent callers for
-        the same parent each read the same pre-mutation snapshot, both append
-        once and both write with the same incremented count, and the second
-        rewrite silently clobbers the first — losing a child.  The caller must
-        serialize concurrent attaches against the same parent.  Today this
-        invariant holds because the MCP server is single-writer; any
-        multi-writer migration must add explicit serialization before calling
-        this function.
+        **Not concurrency-safe.**  The read-modify-write of ``dedupe_count``,
+        ``dedupe_children``, and ``severity`` is *not* atomic: two concurrent
+        callers for the same parent each read the same pre-mutation snapshot,
+        both append once and both write with the same incremented count, and
+        the second rewrite silently clobbers the first — losing a child and
+        potentially reverting a severity promotion.  The caller must serialize
+        concurrent attaches against the same parent.  Today this invariant
+        holds because the MCP server is single-writer; any multi-writer
+        migration must add explicit serialization for all three fields before
+        calling this function.
 
         Loads the parent directly from ``queue_dir/{parent_id}.json`` — it does
         NOT fall back to the archive.  This ensures that resolved / dismissed

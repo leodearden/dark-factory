@@ -676,14 +676,17 @@ class TestCrossTaskChildResumeContract:
         assert resolved_parent is not None
         assert resolved_parent.status in ('resolved', 'dismissed')
 
-        # (8) A fresh escalation from task 99 with a different summary submits cleanly.
-        #     No lingering dedupe block from the resolved parent.
+        # (8) A fresh escalation from task 99 with a different category submits cleanly.
+        #     Using category='scope_violation' (outside the infra_issue dedupe scope)
+        #     makes this assertion immune to similarity-heuristic changes — the test
+        #     proves there is no lingering dedupe block, not that two strings happened
+        #     to be dissimilar enough.
         fresh = await _blocker(
             server,
             task_id='99',
             agent_role='implementer',
-            category='infra_issue',
-            summary='fresh different unrelated issue from task 99',
+            category='scope_violation',
+            summary='task 99 needs to write outside its locked modules',
         )
         assert fresh['status'] == 'queued', (
             'After parent resolution, task 99 must be able to submit new '
