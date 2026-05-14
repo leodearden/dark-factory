@@ -8,6 +8,7 @@ from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
     MAX_CANCELLED_TASKS_RETAINED,
     FilteredTaskTree,
+    _build_surrounding,
     _flatten_with_subtasks,
     _render_task_line,
     filter_task_tree,
@@ -890,6 +891,50 @@ class TestFormatFilteredTaskTree:
                 f'Task {tid} must NOT appear when stub limits visible window to 3.\n'
                 f'Output: {output!r}'
             )
+
+    def test_build_surrounding_invoked_once_per_format_call(self, monkeypatch):
+        """format_filtered_task_tree must invoke _build_surrounding exactly once
+        (eliminate the duplicate _build_surrounding call in format_filtered_task_tree
+        (task 1311)).
+
+        Pre-fix failure: format_filtered_task_tree calls _build_surrounding
+        directly AND _select_visible_active_with_body also calls it internally —
+        observed count == 2.  Post-fix: the worker owns the single call, the
+        formatter consumes header/cancelled_section/summary_line from the worker's
+        return tuple — count == 1.
+
+        Uses the same module-level monkeypatch pattern as
+        test_budget_lazy_loop_handles_7_digit_trimmed_count (line ~643).
+        """
+        call_count = [0]
+
+        def _counting_build_surrounding(tree, max_tasks):
+            call_count[0] += 1
+            return _build_surrounding(tree, max_tasks)
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._build_surrounding',
+            _counting_build_surrounding,
+        )
+
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 4)]
+        cancelled = [_make_task(10 + i, 'cancelled', f'Cancelled {i}') for i in range(1, 3)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=5,
+            cancelled_count=2,
+            cancelled_tasks=cancelled,
+            other_count=0,
+            total_count=10,
+        )
+
+        format_filtered_task_tree(tree)
+
+        assert call_count[0] == 1, (
+            f'_build_surrounding was called {call_count[0]} time(s); expected exactly 1. '
+            f'Eliminate the duplicate _build_surrounding call in '
+            f'format_filtered_task_tree (task 1311).'
+        )
 
 
 class TestFilterTaskTreeDoneAndCancelledLists:
