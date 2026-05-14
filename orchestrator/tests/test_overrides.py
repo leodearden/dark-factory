@@ -45,3 +45,37 @@ class TestSchema:
             assert mode == 'wal'
         finally:
             conn.close()
+
+
+class TestSetGet:
+    def test_set_boost_then_get_overrides_returns_row(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideRow, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'task-A', boost_tier='high')
+
+        result = store.get_overrides('proj')
+        assert result == {
+            'task-A': OverrideRow(
+                boost_tier='high',
+                pinned=False,
+                pin_order=None,
+                reserve_now=False,
+                ttl_until=None,
+            )
+        }
+
+    def test_get_overrides_does_not_return_other_projects(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj-A', 'task-1', boost_tier='low')
+        store.set_override('proj-B', 'task-2', boost_tier='critical')
+
+        result_a = store.get_overrides('proj-A')
+        assert 'task-1' in result_a
+        assert 'task-2' not in result_a
+
+        result_b = store.get_overrides('proj-B')
+        assert 'task-2' in result_b
+        assert 'task-1' not in result_b
