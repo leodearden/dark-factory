@@ -732,7 +732,7 @@ async def api_curator(request: Request) -> JSONResponse:
         capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
     except Exception:
         logger.debug('curator/capped_now_and_spark computation failed', exc_info=True)
-        capped_now = 0
+        capped_now = 1 if any(iv.end is None for iv in intervals) else 0
         capped_spark = _empty_capped
 
     return JSONResponse(redux_api.shape_curator(

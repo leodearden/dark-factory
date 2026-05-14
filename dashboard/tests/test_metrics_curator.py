@@ -976,8 +976,8 @@ async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
 ):
     """_LIST_TICKETS_LIMIT constant must flow into the outgoing request limit.
 
-    Monkeypatches _LIST_TICKETS_LIMIT to 50 (raising=False since the constant
-    doesn't exist yet) and calls fan_out_list_tickets WITHOUT a limit kwarg so
+    Monkeypatches _LIST_TICKETS_LIMIT to 50 and calls fan_out_list_tickets
+    WITHOUT a limit kwarg so
     the function default is exercised.  count=50 == limit=50 triggers the
     saturation WARNING.
 
@@ -996,7 +996,7 @@ async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
     from dashboard.data.memory import reset_sessions
     from dashboard.data.metrics import fan_out_list_tickets
 
-    monkeypatch.setattr(_metrics_mod, '_LIST_TICKETS_LIMIT', 50, raising=False)
+    monkeypatch.setattr(_metrics_mod, '_LIST_TICKETS_LIMIT', 50)
 
     cfg = DashboardConfig(
         project_root=tmp_path,

@@ -15,7 +15,7 @@ Public API
 - :func:`compute_overlap_ms` — sum capped-overlap milliseconds for a window.
 - :func:`bucketise_cap_sparkline` — produce a 0/1 :class:`ChartData` sparkline.
 - :func:`compute_capped_now_and_windows` — derive ``(capped_now, capped_windows)``
-  from a single intervals iterable; shared by ``api_curator`` and ``_sample_curator``.
+  from a list of :class:`CapInterval`; shared by ``api_curator`` and ``_sample_curator``.
 
 Interval convention
 -------------------
@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -341,9 +340,9 @@ def bucketise_cap_sparkline(
 # ---------------------------------------------------------------------------
 
 def compute_capped_now_and_windows(
-    intervals: Iterable[CapInterval],
+    intervals: list[CapInterval],
 ) -> tuple[int, list[tuple[datetime, datetime | None]]]:
-    """Derive (capped_now, capped_windows) from a single intervals input.
+    """Derive (capped_now, capped_windows) from a single intervals list.
 
     Consolidates logic that was previously duplicated in api_curator and
     _sample_curator.  Uses asymmetric semantics intentionally:
@@ -356,15 +355,17 @@ def compute_capped_now_and_windows(
       for deterministic merge-event ordering across reruns.
 
     Args:
-        intervals: Iterable of :class:`CapInterval` objects (list or generator).
-            Consumed once; stored internally as a list to allow two passes.
+        intervals: List of :class:`CapInterval` objects.  Both call sites
+            (``api_curator``, ``_sample_curator``) already hold a
+            ``list[CapInterval]`` from :func:`read_cap_intervals`; the
+            ``list`` annotation matches reality and avoids the overhead of
+            a redundant materialisation pass.
 
     Returns:
         ``(capped_now, capped_windows)`` where ``capped_now`` is 0 or 1 and
         ``capped_windows`` is the output of :func:`merge_all_accounts_capped`.
     """
-    intervals_list = list(intervals)
-    capped_now = 1 if any(iv.end is None for iv in intervals_list) else 0
-    account_names = sorted({iv.account_name for iv in intervals_list})
-    capped_windows = merge_all_accounts_capped(intervals_list, account_names)
+    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+    account_names = sorted({iv.account_name for iv in intervals})
+    capped_windows = merge_all_accounts_capped(intervals, account_names)
     return capped_now, capped_windows

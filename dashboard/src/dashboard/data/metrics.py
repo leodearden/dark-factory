@@ -302,7 +302,8 @@ async def _sample_curator(
         capped_now, capped_windows = compute_capped_now_and_windows(intervals)
     except Exception:
         logger.debug('compute_capped_now_and_windows failed', exc_info=True)
-        capped_now, capped_windows = 0, []
+        capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+        capped_windows = []
 
     # 4. Terminal tickets resolved in the last hour.
     # NOTE: centiles use a 1-hour rolling window, not the 10-minute sampling
