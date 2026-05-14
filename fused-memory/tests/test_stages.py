@@ -7519,17 +7519,8 @@ class TestFormatSnapshotFact:
             project_id='dark_factory',
             counts={'total': 42, 'done': 18, 'blocked': 3, 'in_progress': 5},
         )
-        assert result.startswith('As of 2026-05-13'), (
-            f'Expected result to start with "As of 2026-05-13", got: {result!r}'
-        )
-        assert 'project dark_factory' in result, (
-            f'Expected "project dark_factory" in result, got: {result!r}'
-        )
-        assert '42 total' in result, f'Expected "42 total" in result, got: {result!r}'
-        assert '18 done' in result, f'Expected "18 done" in result, got: {result!r}'
-        assert '3 blocked' in result, f'Expected "3 blocked" in result, got: {result!r}'
-        assert '5 in_progress' in result, (
-            f'Expected "5 in_progress" in result, got: {result!r}'
+        assert result == 'As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 5 in_progress, 42 total.', (
+            f'Full canonical string mismatch, got: {result!r}'
         )
 
     def test_keeps_all_fields_in_deterministic_order(self):
@@ -7571,4 +7562,18 @@ class TestFormatSnapshotFact:
                 as_of=datetime(2026, 5, 13),  # naive — no tzinfo
                 project_id='proj',
                 counts={'total': 1},
+            )
+
+    def test_raises_on_empty_counts(self):
+        """Empty counts mapping must raise ValueError to prevent malformed output.
+
+        Without this guard, an empty dict produces 'As of YYYY-MM-DD: project proj has .'
+        — a dangling space before the period.  The guard keeps every emitted fact parseable.
+        """
+        format_snapshot_fact = self._import_helper()
+        with pytest.raises(ValueError, match='non-empty counts'):
+            format_snapshot_fact(
+                as_of=datetime(2026, 5, 13, tzinfo=UTC),
+                project_id='proj',
+                counts={},
             )
