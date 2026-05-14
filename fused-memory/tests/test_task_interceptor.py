@@ -5437,3 +5437,36 @@ async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
 
     # (c) tm.add_task was called once — the task is live in tasks.json
     taskmaster.add_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_clean_win_logs_info(
+    interceptor_with_store, ticket_store, caplog,
+):
+    """cancel_ticket emits an INFO log when it successfully cancels a pending ticket.
+
+    RED: cancel_ticket currently emits no log on the clean-cancel path.
+    """
+    import logging
+
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor_with_store.cancel_ticket(ticket_id)
+
+    # (a) Existing contract is preserved
+    assert result == {'status': 'cancelled', 'ticket_id': ticket_id}, (
+        f'Expected cancelled result, got: {result!r}'
+    )
+
+    # (b) Exactly one INFO record with ticket_id and 'cancelled'
+    info_records = [
+        r for r in caplog.records
+        if r.levelno == logging.INFO
+        and ticket_id in r.message
+        and 'cancelled' in r.message
+    ]
+    assert info_records, (
+        f'Expected an INFO record containing ticket_id={ticket_id!r} and "cancelled"; '
+        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
