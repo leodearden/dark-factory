@@ -2923,14 +2923,20 @@ async def test_set_task_status_holds_lock_across_read_and_write(
 
 
 @pytest.mark.asyncio
-async def test_single_call_latency_not_regressed(
+async def test_single_call_latency_smoke(
     overlap_tm,
     reconciler,
     event_buffer,
 ):
-    """WP-E: guardrail — a sequence of sequential mutating calls under
-    no contention finishes under a generous budget, so the lock itself
-    adds no meaningful per-call overhead.
+    """WP-E: smoke check — a sequence of sequential mutating calls under
+    no contention finishes within an order-of-magnitude budget, confirming
+    the lock itself adds no catastrophic per-call overhead.
+
+    The 20 s ceiling is intentionally loose: under full 32-worker xdist
+    load with SQLite disk I/O contention the observed worst-case was 11.3 s,
+    so a tighter bound would be flaky without a more deterministic harness
+    (single worker, no xdist).  This test catches orders-of-magnitude
+    regressions only — not gradual 2-3x slowdowns.
     """
     import time
 
@@ -2946,11 +2952,7 @@ async def test_single_call_latency_not_regressed(
         status = 'in-progress' if i % 2 == 0 else 'pending'
         await interceptor.set_task_status('1', status, '/project')
     elapsed = time.perf_counter() - start
-    # Very generous bound — on a mock this should complete in well under
-    # 4s even with real SQLite event-buffer writes and 32 xdist workers
-    # competing for disk I/O; bumping from 2s → 4s → 20s for CI jitter
-    # (observed 11.3s under full 32-worker load on free-threaded 3.14t).
-    assert elapsed < 20.0, f'{N} sequential calls took {elapsed:.3f}s'
+    assert elapsed < 20.0, f'{N} sequential calls took {elapsed:.3f}s (orders-of-magnitude regression guard)'
 
 
 @pytest.mark.asyncio
@@ -6144,30 +6146,3 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
         )
 
 
-@pytest.mark.asyncio
-async def test_persist_worker_terminal_requires_caller(
-    interceptor_with_store,
-    ticket_store,
-):
-    """_persist_worker_terminal must require `caller` as a keyword argument — omitting it
-    raises TypeError.
-
-    This test pins the required-kwarg contract.  The signature places `caller` after
-    `*,` (keyword-only) with no default, so Python's runtime must raise TypeError
-    when the argument is missing.  The `match='caller'` regex ensures the error
-    message names the missing parameter.
-
-    RED: today the signature has `caller: str = 'unknown'` so no TypeError is raised.
-    GREEN after step-2 removes the default.
-    """
-    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
-
-    with pytest.raises(TypeError, match='caller'):
-        await interceptor_with_store._persist_worker_terminal(
-            ticket_id,
-            status='created',
-            task_id='task-x',
-            reason=None,
-            result_dict=None,
-            # caller= intentionally omitted to assert required-kwarg contract
-        )

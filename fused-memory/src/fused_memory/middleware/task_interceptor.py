@@ -2341,10 +2341,6 @@ class TaskInterceptor:
             )
         )
         if not resolved and status == 'created' and task_id is not None:
-            # Operator note: WARNING prefix changed in task 1316 —
-            #   pre:  `_process_add_ticket: orphan-race for ticket X ...`
-            #   post: `orphan-race: ticket X ... [caller=Y]`
-            # External alerting / grep patterns must be updated accordingly.
             logger.warning(
                 'orphan-race: ticket %s — '
                 'tm.add_task created task %s but ticket row was terminalized '
