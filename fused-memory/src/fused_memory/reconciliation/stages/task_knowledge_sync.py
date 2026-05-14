@@ -673,7 +673,9 @@ async def _query_stage2_flags(
         if meta.get('run_id') and str(meta['run_id']) == run_id_str:
             current_flags.append(flag_dict)
         elif meta.get('run_id') in (None, ''):
-            # Absent or empty run_id — Stage 1 producer drift (producer contract requires a non-empty string)
+            # None or empty-string only; other non-string types (0, False, [], {}) fall through to
+            # the mismatched bucket where the type-violation warning at line ~683 fires.
+            # Producer drift = missing-bucket warning; protocol violation = mismatched-bucket type warning.
             stale_missing_run_id_ids.append(r.id)
         else:
             # Present but does not match current run_id — prior-cycle residue (or unexpected type).
