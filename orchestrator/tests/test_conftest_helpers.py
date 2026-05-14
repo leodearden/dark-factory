@@ -25,6 +25,11 @@ and are NOT already covered by other tests:
    BaseModel-inherited properties (``model_extra``, ``model_fields_set``, …)
    and BaseModel methods (``model_dump``, …) must remain excluded.
 
+5. **``mock_orch_config.overrides_db_path`` is a real ``Path``** — the
+   fixture must set a concrete ``Path`` under ``tmp_path`` for
+   ``overrides_db_path`` so ``OverrideStore.from_config(config)`` can call
+   ``.parent.mkdir()`` and ``sqlite3.connect(str(...))`` without crashing.
+
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
 ``conftest.py`` two lines away.
@@ -151,3 +156,27 @@ def test_pydantic_spec_excludes_basemodel_inherited_members():
         _ = m.model_extra           # BaseModel @property
     with pytest.raises(AttributeError):
         _ = m.model_fields_set      # BaseModel @property
+
+
+def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
+    """mock_orch_config seeds overrides_db_path with a real Path under tmp_path.
+
+    Guards the fixture-level cleanup (step-4): ``Harness.__init__`` calls
+    ``OverrideStore.from_config(config)`` unconditionally, which does
+    ``self.db_path.parent.mkdir(...)`` and ``sqlite3.connect(str(self.db_path))``.
+    A child ``MagicMock`` value for ``overrides_db_path`` would let ``.parent``
+    and ``.mkdir()`` silently no-op but then cause ``sqlite3.connect`` to open a
+    file named ``'<MagicMock …>'`` under cwd, leaking filesystem state in CI.
+
+    This test FAILS on pre-fix conftest.py (no default set for overrides_db_path).
+    """
+    db_path = mock_orch_config.overrides_db_path
+    assert isinstance(db_path, Path), (
+        f'expected overrides_db_path to be a Path, got {type(db_path).__name__!r}'
+    )
+    assert db_path.is_relative_to(tmp_path), (
+        f'expected overrides_db_path under tmp_path={tmp_path}, got {db_path}'
+    )
+    assert db_path.suffix == '.db', (
+        f'expected overrides_db_path to have .db suffix, got {db_path.name!r}'
+    )
