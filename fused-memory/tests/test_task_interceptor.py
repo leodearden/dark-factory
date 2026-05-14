@@ -5157,3 +5157,20 @@ class TestInterceptorWriteSucceeded:
     def test_list_response_is_failure(self):
         """[] → False."""
         assert self._fn()([]) is False
+
+
+# ── Tests for pre-done hook gate ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_skips_predone_hook_when_env_unset(
+    taskmaster, reconciler, event_buffer, monkeypatch
+):
+    """When FUSED_MEMORY_PREDONE_HOOK_PROJECT is unset, done transition succeeds normally."""
+    monkeypatch.delenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', raising=False)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
