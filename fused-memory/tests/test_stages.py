@@ -7846,3 +7846,63 @@ class TestStage2HintConversionDetection:
             assert f'[{tid}]' not in active_section, (
                 f'Task {tid} must NOT appear in Active Task Tree section.'
             )
+
+    @pytest.mark.asyncio
+    async def test_hint_section_subset_of_active_tree_under_max_chars_clamp(
+        self, mock_deps, watermark
+    ):
+        """Every task ID in the hint section must also appear in the rendered Active Task Tree.
+
+        When 50 verbose active tasks push the rendered tree past the 50_000-char
+        max_chars clamp, format_filtered_task_tree drops tail tasks from the body.
+        The hint section must mirror this: it must NOT reference task IDs that were
+        dropped from the tree.
+
+        With the current raw-slice code (filtered.active_tasks[:MAX_ACTIVE_TASKS_RENDERED])
+        in assemble_payload, hint_ids = {1..50} but active_tree_ids = {1..N} for some
+        N < 50 — so this test FAILS until step-4 replaces the slice with
+        _select_visible_active.
+        """
+        # 50 tasks, each with a ~1100-char title so that 50 * 1100 = 55_000 > 50_000,
+        # forcing format_filtered_task_tree to drop tail tasks.  All tasks have
+        # list-format hints so every task qualifies for the hint section.
+        pad = 'x' * 1100
+        tasks = [
+            self._make_task_with_hints(
+                i, 'pending', [{'entity': f'E{i}', 'query': 'q'}]
+            )
+            for i in range(1, 51)
+        ]
+        # Overwrite titles with padded versions (make_task_with_hints uses f'Task {tid}').
+        for t in tasks:
+            t['title'] = pad
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree(tasks)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        active_section = _extract_section(payload, '### Active Task Tree')
+        hint_section = _extract_section(payload, self._SECTION_HEADER)
+
+        # Precondition: the max_chars clamp must have actually fired; otherwise the
+        # test is vacuous.  The truncation notice appears when lines were dropped.
+        assert 'truncated for budget' in active_section, (
+            'Precondition failed: max_chars clamp did not fire — increase title length '
+            'or task count so the rendered tree exceeds 50_000 chars.\n'
+            f'Active section length: {len(active_section)}'
+        )
+
+        import re
+
+        active_tree_ids = set(re.findall(r'\[(\d+)\]', active_section))
+        hint_ids = set(re.findall(r'\[(\d+)\]', hint_section))
+
+        # Main assertion: hint section must only reference tasks visible in the tree.
+        orphaned = hint_ids - active_tree_ids
+        assert not orphaned, (
+            f'Hint section references task IDs absent from the Active Task Tree: {sorted(orphaned)}\n'
+            f'hint_ids={sorted(hint_ids)}, active_tree_ids={sorted(active_tree_ids)}'
+        )
