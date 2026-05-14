@@ -15,7 +15,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from starlette.testclient import TestClient
 
 from dashboard.data.metrics import METRICS_SCHEMA
@@ -200,8 +199,11 @@ def test_curator_capped_spark_from_runs_db(tmp_path: Path):
               state.capped_now == 0 (interval is closed).
     """
     now = datetime.now(UTC)
-    cap_hit_time = now - timedelta(minutes=5)
-    resumed_time = now - timedelta(minutes=1)
+    # Use 12-min ago → 3-min ago so the bucket right-edge at now-10min falls
+    # within [start, end): bucketise_cap_sparkline samples at 600s right-edges
+    # and the [start, end) condition requires start <= right_edge < end.
+    cap_hit_time = now - timedelta(minutes=12)
+    resumed_time = now - timedelta(minutes=3)
 
     # seed runs.db
     runs_dir = tmp_path / 'data' / 'orchestrator'

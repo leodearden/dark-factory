@@ -36,6 +36,12 @@ from dashboard.data.burndown import (
     collect_snapshot,
     downsample,
 )
+from dashboard.data.cap_history import (
+    CapInterval,
+    bucketise_cap_sparkline,
+    merge_all_accounts_capped,
+    read_cap_intervals,
+)
 from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
 from dashboard.data.costs import (
     aggregate_account_events,
@@ -56,6 +62,7 @@ from dashboard.data.metrics import (
     METRICS_SCHEMA,
     collect_metrics_snapshot,
     downsample_metrics,
+    get_curator_sparks,
     get_memory_24h_ago,
     get_memory_sparks,
     get_merge_active_series,
@@ -634,21 +641,104 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     )
 
 
+_CURATOR_ENDPOINT_TIMEOUT_SECONDS = 5.0
+
+
 @app.get('/api/v2/dashboard/curator')
 async def api_curator(request: Request) -> JSONResponse:
     """CURATOR_STATE — pending tickets, latency centiles, capped sparkline."""
+    config: DashboardConfig = request.app.state.config
+    pool: DbPool = request.app.state.db
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    now = datetime.now(UTC)
+
+    # 1. Fan-out list_tickets across all project roots (de-duped).
+    #    First-success-per-root semantics — mirrors _sample_curator's loop.
+    pending: list[dict] = []
+    pending_total = 0
+    seen_roots: set[str] = set()
+    all_roots: list[str] = []
+    for root in [config.project_root, *config.known_project_roots]:
+        key = str(root)
+        if key not in seen_roots:
+            seen_roots.add(key)
+            all_roots.append(key)
+
+    for root_str in all_roots:
+        for url in config.fused_memory_urls:
+            try:
+                result = await asyncio.wait_for(
+                    memory_data.mcp_tool_call(
+                        http_client, url, 'list_tickets',
+                        {'project_root': root_str, 'status': 'pending', 'limit': 200},
+                    ),
+                    timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+                )
+                project_id = result.get('project_id', '')
+                pending_total += result.get('count', 0) or 0
+                for r in result.get('tickets', []):
+                    created_at_str = r.get('created_at', '')
+                    age_seconds: int | None = None
+                    if created_at_str:
+                        try:
+                            created_dt = datetime.fromisoformat(created_at_str)
+                            if created_dt.tzinfo is None:
+                                created_dt = created_dt.replace(tzinfo=UTC)
+                            age_seconds = int((now - created_dt).total_seconds())
+                        except (ValueError, TypeError):
+                            age_seconds = None
+                    pending.append({
+                        'ticket_id': r.get('ticket_id', ''),
+                        'project_id': project_id,
+                        'title': r.get('candidate_title') or '',
+                        'files': r.get('files', []),
+                        'created_at': created_at_str,
+                        'age_seconds': age_seconds,
+                    })
+                break  # first success wins per root
+            except Exception:
+                logger.debug(
+                    'curator/list_tickets failed for %s / %s', url, root_str, exc_info=True,
+                )
+
+    # 2. Latency sparks from metrics.db (pass empty sparks on failure).
+    _empty_sparks: dict[str, dict[str, list]] = {
+        'pending': {'labels': [], 'values': []},
+        'p50': {'labels': [], 'values': []},
+        'p90': {'labels': [], 'values': []},
+        'p99': {'labels': [], 'values': []},
+    }
+    metrics_db = await pool.get(config.metrics_db)
+    sparks_r, = await asyncio.gather(
+        get_curator_sparks(metrics_db, days=1),
+        return_exceptions=True,
+    )
+    curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
+
+    # 3. Capped sparkline + capped_now from runs.db(s).
+    _empty_capped: ChartData = {'labels': [], 'values': []}
+    cost_dbs_raw = await _cost_dbs(config, pool)
+    intervals_r, = await asyncio.gather(
+        read_cap_intervals(cost_dbs_raw, days=1),
+        return_exceptions=True,
+    )
+    intervals: list[CapInterval] = safe_gather_result(intervals_r, [], 'curator/intervals')
+    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+    try:
+        account_names = sorted({iv.account_name for iv in intervals})
+        capped_windows = merge_all_accounts_capped(intervals, account_names)
+        capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
+    except Exception:
+        logger.debug('curator/capped_spark computation failed', exc_info=True)
+        capped_spark = _empty_capped
+
     return JSONResponse(redux_api.shape_curator(
-        pending=[],
-        curator_sparks={
-            'p50': {'labels': [], 'values': []},
-            'p90': {'labels': [], 'values': []},
-            'p99': {'labels': [], 'values': []},
-            'pending': {'labels': [], 'values': []},
-        },
-        capped_spark={'labels': [], 'values': []},
-        capped_now=0,
+        pending=pending,
+        curator_sparks=curator_sparks,
+        capped_spark=cast(dict, capped_spark),
+        capped_now=capped_now,
         paused_reason=None,
-        pending_total=0,
+        pending_total=pending_total,
     ))
 
 
