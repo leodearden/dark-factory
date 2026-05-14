@@ -634,6 +634,24 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     )
 
 
+@app.get('/api/v2/dashboard/curator')
+async def api_curator(request: Request) -> JSONResponse:
+    """CURATOR_STATE — pending tickets, latency centiles, capped sparkline."""
+    return JSONResponse(redux_api.shape_curator(
+        pending=[],
+        curator_sparks={
+            'p50': {'labels': [], 'values': []},
+            'p90': {'labels': [], 'values': []},
+            'p99': {'labels': [], 'values': []},
+            'pending': {'labels': [], 'values': []},
+        },
+        capped_spark={'labels': [], 'values': []},
+        capped_now=0,
+        paused_reason=None,
+        pending_total=0,
+    ))
+
+
 @app.get('/api/v2/dashboard/burndown')
 async def api_burndown(request: Request) -> JSONResponse:
     """BURNDOWN + BURNDOWN_BY_PROJECT — per-project status time series."""
