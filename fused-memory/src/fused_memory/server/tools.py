@@ -2290,11 +2290,6 @@ def create_mcp_server(
     # See test_set_task_status_done_does_not_clear_override_row.
     # ------------------------------------------------------------------
 
-    def _overrides_db_path(project_root: str) -> Path:
-        """Return the Path to the scheduler_overrides.db for project_root."""
-        from pathlib import Path as _Path
-        return _Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
-
     async def _open_overrides_db(project_root: str) -> aiosqlite.Connection:
         """Open (and initialise) the scheduler_overrides.db for project_root.
 

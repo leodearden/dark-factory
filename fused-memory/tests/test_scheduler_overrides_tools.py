@@ -544,3 +544,127 @@ async def test_reorder_pin_queue_rejects_mismatched_set(
     assert orders == {'A': 1, 'B': 2, 'C': 3}, f'{label}: pin_orders changed unexpectedly'
 
     memory_service.add_memory.assert_not_called()
+
+
+# ===========================================================================
+# get_pin_queue — full coverage
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_pin_queue_returns_pinned_rows_in_pin_order_asc(
+    tmp_path, mcp_server, memory_service,
+):
+    """get_pin_queue returns only pinned rows, sorted ASC by pin_order."""
+    # Populate via direct sqlite3 insert to set non-sequential pin_orders.
+    db_p = _db_path(tmp_path)
+    db_p.parent.mkdir(parents=True, exist_ok=True)
+    # First touch the DB via the tool so the schema is created.
+    await mcp_server._tool_manager.call_tool('get_pin_queue', {'project_root': str(tmp_path)})
+    now = datetime.now(UTC).isoformat()
+    conn = _open_db(tmp_path)
+    try:
+        for task_id, pinned, pin_order, boost_tier in [
+            ('A', 1, 3, 'high'),
+            ('B', 1, 1, None),
+            ('C', 1, 2, 'low'),
+            ('D', 0, None, 'critical'),  # unpinned
+        ]:
+            conn.execute(
+                'INSERT INTO overrides '
+                '(project_root, task_id, boost_tier, pinned, pin_order, '
+                'reserve_now, ttl_until, created_at, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)',
+                (str(tmp_path), task_id, boost_tier, pinned, pin_order, now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    memory_service.add_memory.reset_mock()
+    result = await mcp_server._tool_manager.call_tool(
+        'get_pin_queue', {'project_root': str(tmp_path)},
+    )
+
+    pq = result['pin_queue']
+    assert [r['task_id'] for r in pq] == ['B', 'C', 'A']
+    assert all(r['task_id'] != 'D' for r in pq)
+    for r in pq:
+        for key in ('task_id', 'boost_tier', 'pinned', 'pin_order', 'reserve_now', 'ttl_until'):
+            assert key in r, f'row missing key {key!r}'
+
+    memory_service.add_memory.assert_not_called()
+
+
+# ===========================================================================
+# Regression: all tools reject empty project_root
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool_name,extra_args', [
+    ('get_pin_queue', {}),
+    ('set_task_priority_override', {'task_id': '1'}),
+    ('clear_task_priority_override', {'task_id': '1'}),
+    ('reorder_pin_queue', {'ordered_task_ids': ['1']}),
+])
+async def test_all_tools_reject_empty_project_root(
+    tmp_path, mcp_server, memory_service, tool_name, extra_args,
+):
+    """All four tools return ValidationError for empty project_root."""
+    memory_service.add_memory.reset_mock()
+    result = await mcp_server._tool_manager.call_tool(
+        tool_name,
+        {'project_root': '', **extra_args},
+    )
+    assert result.get('error_type') == 'ValidationError', (
+        f'{tool_name}: expected ValidationError, got {result!r}'
+    )
+    # No DB file should have been created
+    assert not _db_path('').exists() if '' != str(tmp_path) else True
+    if tool_name != 'get_pin_queue':
+        memory_service.add_memory.assert_not_called()
+
+
+# ===========================================================================
+# Regression: set_task_status(done) does NOT clear override row
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_does_not_clear_override_row(
+    tmp_path, mcp_server, memory_service,
+):
+    """set_task_status('done') leaves the override row untouched.
+
+    The two SQLite stores are physically separate files — this test pins
+    that structural invariant so a future refactor that would couple them
+    has a visible reason to think twice.
+    """
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high', 'pinned': True},
+    )
+
+    # set_task_status goes to task_interceptor, not the overrides DB.
+    await mcp_server._tool_manager.call_tool(
+        'set_task_status',
+        {
+            'id': '5',
+            'status': 'done',
+            'project_root': str(tmp_path),
+            'done_provenance': {'commit': 'a' * 40},
+        },
+    )
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT boost_tier, pinned FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), '5'),
+        ).fetchone()
+        assert row is not None, 'override row was unexpectedly deleted'
+        assert row[0] == 'high'
+        assert row[1] == 1
+    finally:
+        conn.close()
