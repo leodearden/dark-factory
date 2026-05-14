@@ -4921,3 +4921,93 @@ class TestSetTaskStatusBlockedRecording:
         assert len(scheduler._blocked_transitions) == 0, (
             'Rejected (non-successful) transition must not be recorded in _blocked_transitions'
         )
+
+
+class TestParkStopTrip:
+    """Tests for the park-stop trip detection and callback invocation."""
+
+    @pytest.mark.asyncio
+    async def test_trip_fires_callback_at_threshold(self, monkeypatch):
+        """Callback is invoked exactly once when threshold is reached."""
+        import re
+
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
+        )
+        scheduler = Scheduler(config)
+
+        callback_args: list[str] = []
+
+        async def recording_callback(reason: str) -> None:
+            callback_args.append(reason)
+
+        scheduler._on_park_stop_trip = recording_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('1', 'blocked')
+        await scheduler.set_task_status('2', 'blocked')
+        await scheduler.set_task_status('3', 'blocked')
+
+        assert len(callback_args) == 1, (
+            f'Expected callback called once; got {len(callback_args)}'
+        )
+        # Reason must reference the trip parameters.
+        reason = callback_args[0]
+        assert re.search(r'3', reason), f'Reason must mention threshold count: {reason!r}'
+        assert re.search(r'1\.0', reason), f'Reason must mention window hours: {reason!r}'
+
+    @pytest.mark.asyncio
+    async def test_trip_does_not_re_fire_when_paused(self, monkeypatch):
+        """Once paused, additional blocked transitions must not fire the callback again."""
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+        )
+        scheduler = Scheduler(config)
+
+        callback_count = [0]
+
+        async def counting_callback(reason: str) -> None:
+            callback_count[0] += 1
+
+        scheduler._on_park_stop_trip = counting_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Pause manually before the third transition reaches the threshold.
+        await scheduler.set_task_status('1', 'blocked')
+        await scheduler.set_task_status('2', 'blocked')
+        scheduler.pause('manual')  # already paused; trip check should be suppressed
+        await scheduler.set_task_status('3', 'blocked')
+
+        assert callback_count[0] == 0, (
+            f'Callback must not fire while already paused; fired {callback_count[0]} time(s)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_trip_below_threshold_does_not_fire(self, monkeypatch):
+        """Below-threshold transitions must never invoke the callback."""
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=5,
+        )
+        scheduler = Scheduler(config)
+
+        callback_count = [0]
+
+        async def counting_callback(reason: str) -> None:
+            callback_count[0] += 1
+
+        scheduler._on_park_stop_trip = counting_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        for i in range(4):
+            await scheduler.set_task_status(str(i), 'blocked')
+
+        assert callback_count[0] == 0, (
+            f'Expected 0 callback invocations (only 4 of 5 threshold); got {callback_count[0]}'
+        )
