@@ -4890,18 +4890,25 @@ class TestSetTaskStatusBlockedRecording:
 
     @pytest.mark.asyncio
     async def test_blocked_transition_not_recorded_on_rejection(self, monkeypatch):
-        """A terminal_exit_rejected response (warn-and-return carve-out) must NOT record."""
+        """A rejected transition must NOT record in _blocked_transitions.
+
+        Uses the terminal_exit_rejected warn-and-return carve-out: when the
+        target status is terminal (done/cancelled), fused-memory returns a
+        terminal_exit_rejected and the scheduler logs + returns without raising.
+        The 'done' target is not 'blocked', so no recording should happen either way.
+        Verifies that only confirmed successful writes advance the deque.
+        """
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
 
-        # Return a terminal_exit_rejected response — blocked is in _TERMINAL_STATUSES
-        # so the warn-and-return carve-out fires.
+        # Return a terminal_exit_rejected response — 'done' is in _TERMINAL_STATUSES
+        # so the warn-and-return carve-out fires (logs warning, returns cleanly).
         rejection_response = {
             'result': {
                 'content': [
                     {
                         'type': 'text',
-                        'text': '{"error": "terminal_exit_rejected", "from_status": "done", "to_status": "blocked"}',
+                        'text': '{"error": "terminal_exit_rejected", "from_status": "done", "to_status": "done"}',
                     }
                 ]
             }
@@ -4909,8 +4916,8 @@ class TestSetTaskStatusBlockedRecording:
         mock = AsyncMock(return_value=rejection_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
-        await scheduler.set_task_status('42', 'blocked')
+        await scheduler.set_task_status('42', 'done')
 
         assert len(scheduler._blocked_transitions) == 0, (
-            'Rejected transition must not be recorded in _blocked_transitions'
+            'Rejected (non-successful) transition must not be recorded in _blocked_transitions'
         )

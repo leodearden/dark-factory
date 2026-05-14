@@ -773,6 +773,13 @@ class Scheduler:
         self._pause_reason = None
         logger.info('Scheduler resumed')
 
+    def _maybe_fire_park_stop_trip(self) -> None:
+        """Check if the park-stop trip threshold is met and fire the callback.
+
+        Implemented fully in step-12; this stub satisfies the step-8 call site
+        so tests can pass without the full trip logic wired.
+        """
+
     def _record_blocked_transition(self) -> None:
         """Record a successful blocked transition in the rolling deque.
 
@@ -951,6 +958,12 @@ class Scheduler:
 
             rejection = extract_rejection(response)
             if rejection is None:
+                # Success — record the blocked transition if applicable and
+                # fire the park-stop trip check.  These must run before return
+                # so that every confirmed write is counted exactly once.
+                if status == 'blocked':
+                    self._record_blocked_transition()
+                    self._maybe_fire_park_stop_trip()
                 return  # success
             last_rejection = rejection
             if not is_transient_rejection(rejection):
