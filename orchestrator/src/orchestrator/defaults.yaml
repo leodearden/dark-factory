@@ -225,3 +225,31 @@ usage_cap:
   probe_interval_secs: 300
   max_probe_interval_secs: 1800
   accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"
+
+# Scheduler park-and-stop (AFK hardening, task 1322)
+#
+# When N tasks transition to 'blocked' within a rolling M-hour window, the
+# scheduler is automatically paused so no new tasks are dispatched.  In-flight
+# workflows finish naturally; the merge queue keeps draining.  Resume is
+# human-driven via Harness.resume_scheduler().
+#
+# Pause state persists across orchestrator restart via runs.db (scheduler_state
+# table, PK=project_id) — Harness.run() reloads and re-applies it on startup.
+# The persisted row is written by Harness.pause_scheduler() and cleared by
+# Harness.resume_scheduler().
+#
+# Sibling tasks:
+#   task 1323 — cost-ceiling watcher (calls Harness.pause_scheduler directly)
+#   task 1327 — EWA escalation/done digest (calls Harness.pause_scheduler directly)
+#
+# park_stop_enabled: set to false to disable trip detection entirely.  Blocked
+#   transitions are still recorded in the in-process deque so flipping back to
+#   true at runtime reflects accurate state immediately (no warm-up delay).
+#
+# park_stop_parked_threshold: number of blocked transitions in the window to
+#   trip the pause (ge=1; default 5).
+#
+# park_stop_parked_window_hours: rolling-window length in hours (gt=0; default 1.0).
+park_stop_enabled: true
+park_stop_parked_threshold: 5
+park_stop_parked_window_hours: 1.0
