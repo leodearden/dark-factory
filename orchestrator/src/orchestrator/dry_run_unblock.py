@@ -259,7 +259,11 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
 
 
 # Stable subtype values emitted by the CLI when the cost cap fires.
-_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget'})
+# Mirrors the canonical value used in shared/src/shared/usage_gate.py and
+# fused-memory/src/fused_memory/middleware/task_curator.py — the Claude CLI
+# emits ``error_max_budget_usd`` (with the ``_usd`` suffix) on cost-cap
+# exhaustion, not ``error_max_budget``.
+_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
 
 
 def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001

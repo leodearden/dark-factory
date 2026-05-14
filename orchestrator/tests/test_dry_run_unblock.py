@@ -286,7 +286,7 @@ class TestBudgetExhaustedFallback:
         agent_result = _make_agent_result(
             success=False,
             cost_usd=5.0,
-            subtype='error_max_budget',
+            subtype='error_max_budget_usd',
             output='',
             structured_output=None,
         )
