@@ -1788,19 +1788,19 @@ class TaskInterceptor:
     async def cancel_ticket(self, ticket_id: str) -> dict:
         """Cancel a pending curator ticket by ticket_id.
 
-        Four outcomes:
-        - config_error: ticket store not configured (server misconfiguration) →
-                        ``{'error': 'ticket_store not configured',
-                           'error_type': 'ConfigError', 'ticket_id': ticket_id}``
-        - not_found:    ticket does not exist →
-                        ``{'error': 'not_found', 'ticket_id': ticket_id}``
-        - no_op:        ticket row exists but is already in a terminal/non-pending
-                        status (including TOCTOU race) →
-                        ``{'status': <current>, 'ticket_id': ticket_id,
-                        'no_op': True}``
-        - cancelled:    ticket was pending and we won the race → marks it
-                        cancelled, signals any resolve_ticket waiter, returns
-                        ``{'status': 'cancelled', 'ticket_id': ticket_id}``
+        Four outcome shapes (v1 contract):
+
+        * **config_error** — ticket store not configured (server misconfiguration):
+                             ``{'error': 'ticket_store not configured',
+                                'error_type': 'ConfigError', 'ticket_id': ticket_id}``
+        * **not_found** — ticket does not exist:
+                          ``{'error': 'not_found', 'ticket_id': ticket_id}``
+        * **no_op** — ticket row exists but is already in a terminal/non-pending
+                      status (including TOCTOU race):
+                      ``{'status': <current>, 'ticket_id': ticket_id, 'no_op': True}``
+        * **cancelled** — ticket was pending and we won the race → marks it
+                          cancelled, signals any resolve_ticket waiter, returns
+                          ``{'status': 'cancelled', 'ticket_id': ticket_id}``
 
         v1 trade-off: in-flight curator/LLM calls are NOT interrupted.
         ``_prepare_ticket`` drops non-pending rows when the worker dequeues
@@ -1835,7 +1835,13 @@ class TaskInterceptor:
             row = await self._ticket_store.get(ticket_id)
             if row is None:
                 return {'error': 'not_found', 'ticket_id': ticket_id}
+            logger.info(
+                'cancel_ticket: lost race for ticket %s, current status=%s',
+                ticket_id,
+                row['status'],
+            )
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
+        logger.info('cancel_ticket: cancelled pending ticket %s', ticket_id)
         return {'status': 'cancelled', 'ticket_id': ticket_id}
 
     def _start_worker_if_needed(self, project_id: str) -> None:
@@ -2293,6 +2299,52 @@ class TaskInterceptor:
 
         return (status, task_id, reason, result_dict, curator_degrade_reason)
 
+    async def _persist_worker_terminal(
+        self,
+        ticket_id: str,
+        *,
+        status: str,
+        task_id: str | None,
+        reason: str | None,
+        result_dict: dict | None,
+    ) -> bool:
+        """Persist a worker's terminal status via asyncio.shield and warn on orphan-race.
+
+        Wraps ``asyncio.shield(self._ticket_store.mark_resolved(...))`` and
+        logs a WARNING when the call returns ``False`` AND ``status == 'created'``
+        AND ``task_id`` is non-None.  That combination indicates an orphan-race:
+        ``tm.add_task`` succeeded (the task is live in tasks.json) but a
+        concurrent ``cancel_ticket`` call won the row-level race and the ticket
+        is now ``cancelled`` with ``task_id=NULL``.
+
+        Returns:
+            The ``bool`` returned by ``mark_resolved`` (``True`` if the row was
+            still pending and the UPDATE landed; ``False`` if a concurrent writer
+            already terminalized it).
+        """
+        # Both callers (_process_add_ticket and _process_add_tickets_batch_prepared)
+        # guard against _ticket_store being None before reaching this helper.
+        assert self._ticket_store is not None
+        resolved = await asyncio.shield(
+            self._ticket_store.mark_resolved(
+                ticket_id,
+                status=status,
+                task_id=task_id,
+                reason=reason,
+                result_json=json.dumps(result_dict) if result_dict is not None else None,
+            )
+        )
+        if not resolved and status == 'created' and task_id is not None:
+            logger.warning(
+                '_process_add_ticket: orphan-race for ticket %s — '
+                'tm.add_task created task %s but ticket row was terminalized '
+                'by a concurrent writer (likely cancel_ticket); task is live '
+                'in tasks.json, recover via journal task_created event',
+                ticket_id,
+                task_id,
+            )
+        return resolved
+
     async def _process_add_ticket(self, ticket_id: str) -> None:
         """Run the full curator + write pipeline for a single ticket.
 
@@ -2480,14 +2532,12 @@ class TaskInterceptor:
         # Shield from cancellation so that a close()-triggered CancelledError
         # that arrives here (after the try/except block) does not prevent the
         # ticket from reaching a terminal state.
-        await asyncio.shield(
-            self._ticket_store.mark_resolved(
-                ticket_id,
-                status=status,
-                task_id=task_id,
-                reason=reason,
-                result_json=json.dumps(result_dict) if result_dict is not None else None,
-            )
+        await self._persist_worker_terminal(
+            ticket_id,
+            status=status,
+            task_id=task_id,
+            reason=reason,
+            result_dict=result_dict,
         )
 
         # ── Emit journal event and schedule commit (create path only) ────
@@ -2851,16 +2901,12 @@ class TaskInterceptor:
                         result_dict = None
 
                     # Persist terminal state.
-                    await asyncio.shield(
-                        self._ticket_store.mark_resolved(
-                            t.ticket_id,
-                            status=status,
-                            task_id=task_id,
-                            reason=reason,
-                            result_json=json.dumps(result_dict)
-                            if result_dict is not None
-                            else None,
-                        )
+                    await self._persist_worker_terminal(
+                        t.ticket_id,
+                        status=status,
+                        task_id=task_id,
+                        reason=reason,
+                        result_dict=result_dict,
                     )
 
                     # Emit journal event and schedule commit (create path only).

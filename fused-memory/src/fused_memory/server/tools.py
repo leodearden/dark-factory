@@ -1216,6 +1216,7 @@ def create_mcp_server(
         ``docs/task-recovery-2026-05-13/`` for forensic detail.
         """
         from fused_memory.server.wal_status import CHECKPOINT_STATUS
+
         # Defensive copy so concurrent updates from the periodic loop
         # don't tear the wire payload mid-serialise.
         return {'stores': {name: dict(row) for name, row in CHECKPOINT_STATUS.items()}}
@@ -1924,8 +1925,11 @@ def create_mcp_server(
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
         """Cancel a pending curator ticket by its ticket_id.
 
-        Three outcome shapes (v1 contract):
+        Four outcome shapes (v1 contract):
 
+        * **config_error** — ticket store not configured (server misconfiguration):
+          ``{'error': 'ticket_store not configured', 'error_type': 'ConfigError',
+          'ticket_id': ticket_id}``
         * **not_found** — ticket does not exist:
           ``{'error': 'not_found', 'ticket_id': ticket_id}``
         * **no_op** — ticket is already in a terminal/non-pending status:
@@ -2293,7 +2297,9 @@ def create_mcp_server(
     # ------------------------------------------------------------------
 
     async def _open_overrides_db(
-        project_root: str, *, autocommit: bool = False,
+        project_root: str,
+        *,
+        autocommit: bool = False,
     ) -> aiosqlite.Connection:
         """Open (and initialise) the scheduler_overrides.db for project_root.
 
@@ -2309,11 +2315,14 @@ def create_mcp_server(
         why ``set_override`` MUST use this pattern.
         """
         from pathlib import Path as _Path
+
         db_path = _Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
         db_path.parent.mkdir(parents=True, exist_ok=True)
         if autocommit:
             db = await aiosqlite.connect(
-                str(db_path), timeout=30, isolation_level=None,
+                str(db_path),
+                timeout=30,
+                isolation_level=None,
             )
         else:
             db = await aiosqlite.connect(str(db_path))
@@ -2350,7 +2359,9 @@ def create_mcp_server(
         except Exception as audit_exc:
             logger.warning(
                 'override audit emit failed (tool=%s task_id=%s): %s',
-                tool_name, task_id, audit_exc,
+                tool_name,
+                task_id,
+                audit_exc,
             )
 
     @mcp.tool()
@@ -2404,6 +2415,7 @@ def create_mcp_server(
             ttl_until_iso: str | None = None
             if ttl_secs is not None:
                 from datetime import timedelta
+
                 ttl_until_iso = (datetime.now(UTC) + timedelta(seconds=ttl_secs)).isoformat()
 
             db = await _open_overrides_db(project_root, autocommit=True)
@@ -2421,30 +2433,36 @@ def create_mcp_server(
                     # Auto-assign or preserve pin_order when pinning without an
                     # explicit order. Mirrors orchestrator/src/orchestrator/overrides.py:160-180.
                     if pinned is True and pin_order is None:
-                        already = await (await db.execute(
-                            'SELECT pin_order FROM overrides '
-                            'WHERE project_root=? AND task_id=? AND pinned=1',
-                            (project_root, task_id),
-                        )).fetchone()
+                        already = await (
+                            await db.execute(
+                                'SELECT pin_order FROM overrides '
+                                'WHERE project_root=? AND task_id=? AND pinned=1',
+                                (project_root, task_id),
+                            )
+                        ).fetchone()
                         if already is not None:
                             pin_order = already[0]
                         else:
-                            row = await (await db.execute(
-                                'SELECT COALESCE(MAX(pin_order), 0) + 1 '
-                                'FROM overrides WHERE project_root=? AND pinned=1',
-                                (project_root,),
-                            )).fetchone()
+                            row = await (
+                                await db.execute(
+                                    'SELECT COALESCE(MAX(pin_order), 0) + 1 '
+                                    'FROM overrides WHERE project_root=? AND pinned=1',
+                                    (project_root,),
+                                )
+                            ).fetchone()
                             # Aggregate query always returns a row; assert for pyright.
                             assert row is not None
                             pin_order = row[0]
 
                     # Collision check for explicit or auto-assigned pin_order.
                     if pin_order is not None:
-                        existing = await (await db.execute(
-                            'SELECT task_id FROM overrides '
-                            'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
-                            (project_root, pin_order, task_id),
-                        )).fetchone()
+                        existing = await (
+                            await db.execute(
+                                'SELECT task_id FROM overrides '
+                                'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
+                                (project_root, pin_order, task_id),
+                            )
+                        ).fetchone()
                         if existing:
                             await db.execute('ROLLBACK')
                             collision_response = {
@@ -2479,14 +2497,22 @@ def create_mcp_server(
                             """,
                             (
                                 # INSERT values
-                                project_root, task_id,
-                                boost_tier, pinned_int, pin_order,
-                                reserve_now_int, ttl_until_iso,
-                                now_iso, now_iso,
+                                project_root,
+                                task_id,
+                                boost_tier,
+                                pinned_int,
+                                pin_order,
+                                reserve_now_int,
+                                ttl_until_iso,
+                                now_iso,
+                                now_iso,
                                 # UPDATE SET values
-                                boost_tier, pinned_int,
-                                pinned_int, pin_order,
-                                reserve_now_int, ttl_until_iso,
+                                boost_tier,
+                                pinned_int,
+                                pinned_int,
+                                pin_order,
+                                reserve_now_int,
+                                ttl_until_iso,
                                 now_iso,
                             ),
                         )
@@ -2558,8 +2584,7 @@ def create_mcp_server(
         if field is not None and field not in _VALID_CLEAR_FIELDS:
             return {
                 'error': (
-                    f'field must be one of {sorted(_VALID_CLEAR_FIELDS)} or None; '
-                    f'got {field!r}'
+                    f'field must be one of {sorted(_VALID_CLEAR_FIELDS)} or None; got {field!r}'
                 ),
                 'error_type': 'ValidationError',
             }

@@ -56,6 +56,7 @@ def interceptor(taskmaster, reconciler, event_buffer):
 async def interceptor_facade(taskmaster, reconciler, event_buffer, tmp_path):
     """Interceptor variant wired with a real TicketStore for facade tests."""
     from fused_memory.middleware.ticket_store import TicketStore
+
     store = TicketStore(tmp_path / 'facade_tickets.db')
     await store.initialize()
     ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=store)
@@ -74,14 +75,14 @@ def test_task_interceptor_has_no_add_task_method():
     This test is RED until step-4 deletes the method from task_interceptor.py.
     """
     assert not hasattr(TaskInterceptor, 'add_task'), (
-        'TaskInterceptor.add_task must be removed; migrate callers to '
-        'submit_task + resolve_ticket'
+        'TaskInterceptor.add_task must be removed; migrate callers to submit_task + resolve_ticket'
     )
 
 
 @pytest.mark.asyncio
 async def test_submit_and_resolve_helper_returns_legacy_shape(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """_submit_and_resolve returns the same dict shape the old add_task facade returned.
 
@@ -113,7 +114,9 @@ async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, 
 
 
 @pytest.mark.asyncio
-async def test_set_task_status_done_triggers_async_reconciliation(interceptor, reconciler, event_buffer):
+async def test_set_task_status_done_triggers_async_reconciliation(
+    interceptor, reconciler, event_buffer
+):
     """Done status triggers async targeted reconciliation."""
     result = await interceptor.set_task_status('1', 'done', '/project')
     assert 'reconciliation' in result
@@ -179,7 +182,9 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     import json
 
     metadata = {'source': 'review-cycle', 'files': ['my-project/src']}
-    result = await _submit_and_resolve(interceptor_facade, '/project', prompt='Test', metadata=metadata)
+    result = await _submit_and_resolve(
+        interceptor_facade, '/project', prompt='Test', metadata=metadata
+    )
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -193,8 +198,11 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
 async def test_add_task_metadata_string_passed_through(interceptor_facade, taskmaster):
     """Pre-serialised metadata JSON is forwarded unchanged."""
     metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
-    await _submit_and_resolve(interceptor_facade, 
-        '/project', prompt='Test', metadata=metadata_json,
+    await _submit_and_resolve(
+        interceptor_facade,
+        '/project',
+        prompt='Test',
+        metadata=metadata_json,
     )
     kwargs = taskmaster.add_task.call_args.kwargs
     assert kwargs.get('metadata') == metadata_json
@@ -233,9 +241,7 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer, tmp_pa
         if 'metadata' in kwargs:
             # First attempt: simulate old-signature backend rejecting
             # the unknown kwarg.
-            raise TypeError(
-                "add_task() got an unexpected keyword argument 'metadata'"
-            )
+            raise TypeError("add_task() got an unexpected keyword argument 'metadata'")
         return {'id': '7', 'title': 'Legacy'}
 
     tm.add_task = add_task
@@ -399,12 +405,18 @@ def curator_enabled_config():
 
 
 @pytest_asyncio.fixture
-async def curator_interceptor(taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path):
+async def curator_interceptor(
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path
+):
     from fused_memory.middleware.ticket_store import TicketStore
+
     store = TicketStore(tmp_path / 'curator_tickets.db')
     await store.initialize()
     ti = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     yield ti
@@ -420,12 +432,14 @@ def _mock_curator(decision: CuratorDecision) -> MagicMock:
     """Mock TaskCurator returning a fixed decision."""
     curator = MagicMock()
     curator.curate = AsyncMock(return_value=decision)
+
     # curate_batch delegates to curate() per candidate so that assertions on
     # curator.curate (e.g. assert_called_once) continue to pass for tests that
     # use the batch worker path.  The inner curate call uses the same AsyncMock,
     # so call counts accumulate correctly.
     async def _curate_batch(candidates, *a, **kw):
         return [await curator.curate(c, *a, **kw) for c in candidates]
+
     curator.curate_batch = AsyncMock(side_effect=_curate_batch)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
@@ -444,19 +458,21 @@ def _seed_existing_r4_task(
     status: str = 'pending',
 ) -> None:
     """Seed taskmaster.get_tasks with a single pending task carrying R4 idempotency keys."""
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {
-                'id': task_id,
-                'title': title,
-                'status': status,
-                'metadata': {
-                    'escalation_id': escalation_id,
-                    'suggestion_hash': suggestion_hash,
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {
+                    'id': task_id,
+                    'title': title,
+                    'status': status,
+                    'metadata': {
+                        'escalation_id': escalation_id,
+                        'suggestion_hash': suggestion_hash,
+                    },
                 },
-            },
-        ],
-    })
+            ],
+        }
+    )
 
 
 def _assert_r4_common(curator_mock, taskmaster) -> None:
@@ -471,16 +487,19 @@ def _assert_r4_common(curator_mock, taskmaster) -> None:
 
 @pytest.mark.asyncio
 async def test_curator_drop_short_circuits_add_task(
-    curator_interceptor, taskmaster,
+    curator_interceptor,
+    taskmaster,
 ):
     """A drop decision returns the target_id without calling tm.add_task."""
     decision = CuratorDecision(
-        action='drop', target_id='99',
+        action='drop',
+        target_id='99',
         justification='already covered by task 99',
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await _submit_and_resolve(curator_interceptor, 
+    result = await _submit_and_resolve(
+        curator_interceptor,
         '/project',
         title='Fix parser bug',
         description='The parser explodes on empty input',
@@ -494,7 +513,8 @@ async def test_curator_drop_short_circuits_add_task(
 
 @pytest.mark.asyncio
 async def test_curator_combine_updates_target_and_returns_id(
-    curator_interceptor, taskmaster,
+    curator_interceptor,
+    taskmaster,
 ):
     """A combine decision updates the target via update_task and returns its id."""
     rewritten = RewrittenTask(
@@ -513,7 +533,8 @@ async def test_curator_combine_updates_target_and_returns_id(
     )
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await _submit_and_resolve(curator_interceptor, 
+    result = await _submit_and_resolve(
+        curator_interceptor,
         '/project',
         title='Fix parser on empty input',
         description='Parser panics on empty string',
@@ -534,14 +555,17 @@ async def test_curator_combine_updates_target_and_returns_id(
 
 @pytest.mark.asyncio
 async def test_curator_create_proceeds_with_add_task(
-    curator_interceptor, taskmaster,
+    curator_interceptor,
+    taskmaster,
 ):
     """A create decision forwards to tm.add_task normally."""
     decision = CuratorDecision(action='create', justification='genuinely new')
     curator_interceptor._curator = _mock_curator(decision)
 
-    result = await _submit_and_resolve(curator_interceptor, 
-        '/project', title='Novel unrelated work',
+    result = await _submit_and_resolve(
+        curator_interceptor,
+        '/project',
+        title='Novel unrelated work',
     )
 
     assert result == {'id': '2', 'title': 'New Task'}
@@ -550,15 +574,20 @@ async def test_curator_create_proceeds_with_add_task(
 
 @pytest.mark.asyncio
 async def test_curator_combine_failure_falls_through_to_create(
-    curator_interceptor, taskmaster,
+    curator_interceptor,
+    taskmaster,
 ):
     """If tm.update_task raises during combine, fall back to creating the task."""
     rewritten = RewrittenTask(
-        title='x', description='', details='d',
-        files_to_modify=[], priority='medium',
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50',
+        action='combine',
+        target_id='50',
         target_fingerprint='Test Task',  # matches fixture — guard passes
         rewritten_task=rewritten,
         justification='...',
@@ -566,8 +595,10 @@ async def test_curator_combine_failure_falls_through_to_create(
     curator_interceptor._curator = _mock_curator(decision)
     taskmaster.update_task.side_effect = RuntimeError('taskmaster failed')
 
-    result = await _submit_and_resolve(curator_interceptor, 
-        '/project', title='Fix x',
+    result = await _submit_and_resolve(
+        curator_interceptor,
+        '/project',
+        title='Fix x',
     )
 
     # Fell through to create path
@@ -577,16 +608,21 @@ async def test_curator_combine_failure_falls_through_to_create(
 
 @pytest.mark.asyncio
 async def test_curator_drop_short_circuits_add_subtask(
-    curator_interceptor, taskmaster,
+    curator_interceptor,
+    taskmaster,
 ):
     """add_subtask also runs the curator gate — previously bypassed."""
     decision = CuratorDecision(
-        action='drop', target_id='88', justification='duplicate of sibling',
+        action='drop',
+        target_id='88',
+        justification='duplicate of sibling',
     )
     curator_interceptor._curator = _mock_curator(decision)
 
     result = await curator_interceptor.add_subtask(
-        '1', '/project', title='Duplicate subtask work',
+        '1',
+        '/project',
+        title='Duplicate subtask work',
     )
 
     assert result['id'] == '88'
@@ -604,10 +640,9 @@ def _combine_audit_lines(audit_dir):
     path = audit_dir / 'combine_audit.jsonl'
     if not path.exists():
         return []
-    lines = [
-        ln for ln in path.read_text(encoding='utf-8').splitlines() if ln.strip()
-    ]
+    lines = [ln for ln in path.read_text(encoding='utf-8').splitlines() if ln.strip()]
     import json as _json
+
     return [_json.loads(ln) for ln in lines]
 
 
@@ -620,7 +655,9 @@ def audit_dir(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_curator_combine_fingerprint_match_proceeds(
-    curator_interceptor, taskmaster, audit_dir,
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
 ):
     """Fingerprint matches the live target → combine proceeds + audit written."""
     # Taskmaster fixture returns title='Test Task' for any get_task.
@@ -632,7 +669,8 @@ async def test_curator_combine_fingerprint_match_proceeds(
         priority='high',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50',
+        action='combine',
+        target_id='50',
         target_fingerprint='Test Task',
         rewritten_task=rewritten,
         justification='same concern',
@@ -657,17 +695,24 @@ async def test_curator_combine_fingerprint_match_proceeds(
 
 @pytest.mark.asyncio
 async def test_curator_combine_fingerprint_mismatch_aborts(
-    curator_interceptor, taskmaster, audit_dir,
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
 ):
     """Fingerprint doesn't match live target → abort, fall through to create."""
     rewritten = RewrittenTask(
-        title='x', description='', details='d',
-        files_to_modify=[], priority='medium',
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50',
+        action='combine',
+        target_id='50',
         target_fingerprint='Wrong Title',  # fixture returns 'Test Task'
-        rewritten_task=rewritten, justification='...',
+        rewritten_task=rewritten,
+        justification='...',
     )
     curator_interceptor._curator = _mock_curator(decision)
 
@@ -682,17 +727,24 @@ async def test_curator_combine_fingerprint_mismatch_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_missing_fingerprint_aborts(
-    curator_interceptor, taskmaster, audit_dir,
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
 ):
     """Decision with no fingerprint (LLM skipped the field) → abort."""
     rewritten = RewrittenTask(
-        title='x', description='', details='d',
-        files_to_modify=[], priority='medium',
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50',
+        action='combine',
+        target_id='50',
         target_fingerprint=None,
-        rewritten_task=rewritten, justification='...',
+        rewritten_task=rewritten,
+        justification='...',
     )
     curator_interceptor._curator = _mock_curator(decision)
 
@@ -705,20 +757,31 @@ async def test_curator_combine_missing_fingerprint_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_target_done_aborts(
-    curator_interceptor, taskmaster, audit_dir,
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
 ):
     """Target with status=done → abort (would silently drop candidate work)."""
-    taskmaster.get_task = AsyncMock(return_value={
-        'id': '50', 'status': 'done', 'title': 'Done Task',
-    })
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'done',
+            'title': 'Done Task',
+        }
+    )
     rewritten = RewrittenTask(
-        title='x', description='', details='d',
-        files_to_modify=[], priority='medium',
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50',
+        action='combine',
+        target_id='50',
         target_fingerprint='Done Task',  # fingerprint matches
-        rewritten_task=rewritten, justification='...',
+        rewritten_task=rewritten,
+        justification='...',
     )
     curator_interceptor._curator = _mock_curator(decision)
 
@@ -731,20 +794,31 @@ async def test_curator_combine_target_done_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_target_cancelled_aborts(
-    curator_interceptor, taskmaster, audit_dir,
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
 ):
     """Target with status=cancelled → abort, same reasoning as done."""
-    taskmaster.get_task = AsyncMock(return_value={
-        'id': '50', 'status': 'cancelled', 'title': 'Cancelled Task',
-    })
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'cancelled',
+            'title': 'Cancelled Task',
+        }
+    )
     rewritten = RewrittenTask(
-        title='x', description='', details='d',
-        files_to_modify=[], priority='medium',
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50',
+        action='combine',
+        target_id='50',
         target_fingerprint='Cancelled Task',
-        rewritten_task=rewritten, justification='...',
+        rewritten_task=rewritten,
+        justification='...',
     )
     curator_interceptor._curator = _mock_curator(decision)
 
@@ -757,22 +831,32 @@ async def test_curator_combine_target_cancelled_aborts(
 
 @pytest.mark.asyncio
 async def test_curator_combine_fingerprint_normalization(
-    curator_interceptor, taskmaster, audit_dir,
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
 ):
     """Case / whitespace drift on the title is tolerated by the guard."""
-    taskmaster.get_task = AsyncMock(return_value={
-        'id': '50', 'status': 'pending',
-        'title': 'Harden Parser for Empty Input',
-    })
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Harden Parser for Empty Input',
+        }
+    )
     rewritten = RewrittenTask(
-        title='Harden parser', description='', details='d',
-        files_to_modify=[], priority='medium',
+        title='Harden parser',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50',
+        action='combine',
+        target_id='50',
         # extra whitespace + different case — should still match
         target_fingerprint='   harden  parser   for empty INPUT   ',
-        rewritten_task=rewritten, justification='normalize',
+        rewritten_task=rewritten,
+        justification='normalize',
     )
     curator_interceptor._curator = _mock_curator(decision)
 
@@ -784,7 +868,11 @@ async def test_curator_combine_fingerprint_normalization(
 
 @pytest.mark.asyncio
 async def test_concurrent_add_task_produces_single_task(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """Two concurrent add_task calls for identical candidates produce
     exactly one new task. The second is caught by the pre-LLM
@@ -820,10 +908,14 @@ async def test_concurrent_add_task_produces_single_task(
     real_curator._call_llm = fake_call_llm  # type: ignore[method-assign]
 
     from fused_memory.middleware.ticket_store import TicketStore
+
     store = TicketStore(tmp_path / 'concurrent_tickets.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     interceptor._curator = real_curator
@@ -905,7 +997,9 @@ async def test_pre_llm_exact_match_via_note_created(curator_enabled_config, task
         return_value={'id': '1922', 'status': 'pending', 'title': 'x'},
     )
     decision = await curator._pre_llm_exact_match(
-        candidate, project_id='proj', project_root='/x',
+        candidate,
+        project_id='proj',
+        project_root='/x',
     )
     assert decision is not None
     assert decision.action == 'drop'
@@ -918,7 +1012,9 @@ async def test_pre_llm_exact_match_via_note_created(curator_enabled_config, task
     )
     curator.note_created('proj', candidate, '1922')  # re-seed
     decision2 = await curator._pre_llm_exact_match(
-        candidate, project_id='proj', project_root='/x',
+        candidate,
+        project_id='proj',
+        project_root='/x',
     )
     assert decision2 is None
 
@@ -930,7 +1026,11 @@ async def test_pre_llm_exact_match_via_note_created(curator_enabled_config, task
 
 @pytest.mark.asyncio
 async def test_r4_idempotency_hit_add_task(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """R4: idempotency hit short-circuits the add_task entry path.
 
@@ -950,7 +1050,10 @@ async def test_r4_idempotency_hit_add_task(
     store = TicketStore(tmp_path / 'idemp_hit_add_task.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     interceptor._curator = curator_mock
@@ -961,7 +1064,8 @@ async def test_r4_idempotency_hit_add_task(
         'files': ['fused-memory/src'],
     }
     try:
-        result = await _submit_and_resolve(interceptor,
+        result = await _submit_and_resolve(
+            interceptor,
             # Use /dark-factory so the path-scope guard (which rejects fused-memory/
             # paths filed under non-dark-factory projects) does not block the ticket.
             '/dark-factory',
@@ -985,7 +1089,11 @@ async def test_r4_idempotency_hit_add_task(
 
 @pytest.mark.asyncio
 async def test_r4_idempotency_hit_submit_task(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """R4: idempotency hit short-circuits the submit_task/resolve_ticket entry path.
 
@@ -1006,7 +1114,10 @@ async def test_r4_idempotency_hit_submit_task(
     store = TicketStore(tmp_path / 'idemp_hit_submit_task.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     interceptor._curator = curator_mock
@@ -1044,7 +1155,7 @@ async def test_r4_idempotency_hit_submit_task(
         f"resolve_ticket should return status='combined' on R4 hit, got {result!r}"
     )
     assert result.get('task_id') == '555', (
-        f"resolve_ticket should return task_id of existing task, got {result!r}"
+        f'resolve_ticket should return task_id of existing task, got {result!r}'
     )
     assert result.get('reason') == 'idempotency_hit', (
         f"resolve_ticket should return reason='idempotency_hit', got {result!r}"
@@ -1054,31 +1165,40 @@ async def test_r4_idempotency_hit_submit_task(
 
 @pytest.mark.asyncio
 async def test_idempotency_accepts_metadata_as_json_string(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """Metadata that arrives as a pre-serialised JSON string also dedupes."""
     import json
 
     from fused_memory.middleware.ticket_store import TicketStore
 
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {
-                'id': '555',
-                'status': 'pending',
-                'title': 'T',
-                'metadata': {
-                    'escalation_id': 'esc-x',
-                    'suggestion_hash': 'hash1',
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {
+                    'id': '555',
+                    'status': 'pending',
+                    'title': 'T',
+                    'metadata': {
+                        'escalation_id': 'esc-x',
+                        'suggestion_hash': 'hash1',
+                    },
                 },
-            },
-        ],
-    })
+            ],
+        }
+    )
 
     store = TicketStore(tmp_path / 'idemp_str_tickets.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     interceptor._curator = _mock_curator(CuratorDecision(action='create'))
@@ -1099,37 +1219,48 @@ async def test_idempotency_accepts_metadata_as_json_string(
 
 @pytest.mark.asyncio
 async def test_idempotency_miss_falls_through_to_curator(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """No matching (escalation_id, suggestion_hash) → curator runs normally."""
     from fused_memory.middleware.ticket_store import TicketStore
 
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {
-                'id': '500',
-                'status': 'pending',
-                'title': 'Unrelated',
-                'metadata': {
-                    'escalation_id': 'esc-zzz',
-                    'suggestion_hash': 'different',
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {
+                    'id': '500',
+                    'status': 'pending',
+                    'title': 'Unrelated',
+                    'metadata': {
+                        'escalation_id': 'esc-zzz',
+                        'suggestion_hash': 'different',
+                    },
                 },
-            },
-        ],
-    })
+            ],
+        }
+    )
 
     curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
     store = TicketStore(tmp_path / 'idemp_miss_tickets.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     interceptor._curator = curator_mock
 
     try:
-        await _submit_and_resolve(interceptor, 
-            '/project', title='New',
+        await _submit_and_resolve(
+            interceptor,
+            '/project',
+            title='New',
             metadata={'escalation_id': 'esc-new', 'suggestion_hash': 'fresh'},
         )
     finally:
@@ -1145,37 +1276,48 @@ async def test_idempotency_miss_falls_through_to_curator(
 
 @pytest.mark.asyncio
 async def test_idempotency_skips_cancelled_match(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """A cancelled task with matching metadata must not win the dedupe."""
     from fused_memory.middleware.ticket_store import TicketStore
 
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {
-                'id': '500',
-                'status': 'cancelled',
-                'title': 'Was the dupe',
-                'metadata': {
-                    'escalation_id': 'esc-y',
-                    'suggestion_hash': 'hash-y',
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {
+                    'id': '500',
+                    'status': 'cancelled',
+                    'title': 'Was the dupe',
+                    'metadata': {
+                        'escalation_id': 'esc-y',
+                        'suggestion_hash': 'hash-y',
+                    },
                 },
-            },
-        ],
-    })
+            ],
+        }
+    )
 
     curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
     store = TicketStore(tmp_path / 'idemp_cancel_tickets.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     interceptor._curator = curator_mock
 
     try:
-        await _submit_and_resolve(interceptor, 
-            '/project', title='Retry',
+        await _submit_and_resolve(
+            interceptor,
+            '/project',
+            title='Retry',
             metadata={'escalation_id': 'esc-y', 'suggestion_hash': 'hash-y'},
         )
     finally:
@@ -1190,7 +1332,11 @@ async def test_idempotency_skips_cancelled_match(
 
 @pytest.mark.asyncio
 async def test_idempotency_requires_both_keys(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """Metadata without escalation_id+suggestion_hash skips the R4 check."""
     from fused_memory.middleware.ticket_store import TicketStore
@@ -1199,15 +1345,21 @@ async def test_idempotency_requires_both_keys(
     store = TicketStore(tmp_path / 'idemp_both_tickets.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
     interceptor._curator = curator_mock
 
     try:
         # Only escalation_id, no suggestion_hash → not eligible.
-        await _submit_and_resolve(interceptor, 
-            '/project', title='T', metadata={'escalation_id': 'esc-x'},
+        await _submit_and_resolve(
+            interceptor,
+            '/project',
+            title='T',
+            metadata={'escalation_id': 'esc-x'},
         )
     finally:
         await store.close()
@@ -1234,7 +1386,9 @@ async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buff
     cfg.curator = CuratorConfig(enabled=False)
     store = TicketStore(tmp_path / 'disabled_curator_tickets.db')
     await store.initialize()
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg, ticket_store=store)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=cfg, ticket_store=store
+    )
 
     try:
         result = await _submit_and_resolve(interceptor, '/project', title='T')
@@ -1252,18 +1406,24 @@ async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buff
 
 @pytest.mark.asyncio
 async def test_update_task_reembeds_on_title_change(
-    curator_interceptor, taskmaster,
+    curator_interceptor,
+    taskmaster,
 ):
     """update_task triggers fire-and-forget reembed when title/details change."""
     curator_mock = _mock_curator(CuratorDecision(action='create'))
     curator_interceptor._curator = curator_mock
     taskmaster.get_task.return_value = {
-        'id': '7', 'status': 'pending', 'title': 'Updated title',
-        'description': 'desc', 'details': 'details',
+        'id': '7',
+        'status': 'pending',
+        'title': 'Updated title',
+        'description': 'desc',
+        'details': 'details',
     }
 
     await curator_interceptor.update_task(
-        '7', '/project', prompt='rename title to updated',
+        '7',
+        '/project',
+        prompt='rename title to updated',
     )
     await asyncio.sleep(0)  # let fire-and-forget run
     await curator_interceptor.drain()
@@ -1290,7 +1450,8 @@ async def test_remove_tasks_emits_event_per_id(interceptor, event_buffer):
 
 @pytest.mark.asyncio
 async def test_remove_tasks_multi_id_emits_one_event_per_id(
-    interceptor, event_buffer,
+    interceptor,
+    event_buffer,
 ):
     await interceptor.remove_tasks(['1', '2', '3'], '/project')
     stats = await event_buffer.get_buffer_stats('project')
@@ -1404,13 +1565,15 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_
 @pytest.mark.asyncio
 async def test_get_statuses_returns_all_id_to_status_mapping(taskmaster, event_buffer):
     """get_statuses returns {id_str: status_str} for every task; no events emitted."""
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {'id': 1, 'status': 'pending'},
-            {'id': 2, 'status': 'done'},
-            {'id': 3, 'status': 'in-progress'},
-        ]
-    })
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'done'},
+                {'id': 3, 'status': 'in-progress'},
+            ]
+        }
+    )
     # Spy on the canonical add path (EventBuffer.push at event_buffer.py:201).
     # AsyncMock(wraps=...) preserves real behaviour while recording calls, so a
     # rogue push attempt would still flow through to the buffer (caught by the
@@ -1434,13 +1597,15 @@ async def test_get_statuses_returns_all_id_to_status_mapping(taskmaster, event_b
 @pytest.mark.asyncio
 async def test_get_statuses_filters_by_ids_list(taskmaster, event_buffer):
     """When ids=['1', '3'], only those two keys appear in the result."""
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {'id': 1, 'status': 'pending'},
-            {'id': 2, 'status': 'done'},
-            {'id': 3, 'status': 'in-progress'},
-        ]
-    })
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'done'},
+                {'id': 3, 'status': 'in-progress'},
+            ]
+        }
+    )
     interceptor = TaskInterceptor(taskmaster, None, event_buffer)
 
     result = await interceptor.get_statuses('/project', ids=['1', '3'])
@@ -1451,11 +1616,13 @@ async def test_get_statuses_filters_by_ids_list(taskmaster, event_buffer):
 @pytest.mark.asyncio
 async def test_get_statuses_omits_unknown_ids(taskmaster, event_buffer):
     """Unknown ids in the filter list are silently omitted (no error, no key)."""
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {'id': 1, 'status': 'pending'},
-        ]
-    })
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+            ]
+        }
+    )
     interceptor = TaskInterceptor(taskmaster, None, event_buffer)
 
     result = await interceptor.get_statuses('/project', ids=['1', '9999'])
@@ -1485,9 +1652,7 @@ async def test_get_statuses_calls_ensure_connected(event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_get_statuses_missing_status_key_defaults_to_unknown(
-    taskmaster, event_buffer
-):
+async def test_get_statuses_missing_status_key_defaults_to_unknown(taskmaster, event_buffer):
     """A task dict without a 'status' key is included with status='unknown'.
 
     Contract: the sentinel 'unknown' is the documented default when the raw
@@ -1495,12 +1660,14 @@ async def test_get_statuses_missing_status_key_defaults_to_unknown(
     'unknown' status from a missing field should treat any 'unknown' as
     indeterminate.
     """
-    taskmaster.get_tasks = AsyncMock(return_value={
-        'tasks': [
-            {'id': 1},              # no 'status' key
-            {'id': 2, 'status': 'done'},
-        ]
-    })
+    taskmaster.get_tasks = AsyncMock(
+        return_value={
+            'tasks': [
+                {'id': 1},  # no 'status' key
+                {'id': 2, 'status': 'done'},
+            ]
+        }
+    )
     interceptor = TaskInterceptor(taskmaster, None, event_buffer)
 
     result = await interceptor.get_statuses('/project')
@@ -1549,14 +1716,19 @@ async def test_ensure_taskmaster_error_propagates(event_buffer):
 
 @pytest.mark.asyncio
 async def test_set_task_status_allows_done_to_blocked_with_reopen_reason(
-    taskmaster, reconciler, event_buffer,
+    taskmaster,
+    reconciler,
+    event_buffer,
 ):
     """done->blocked is allowed when an explicit reopen_reason is passed."""
     taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'blocked', '/project', reopen_reason='manual re-scope',
+        '1',
+        'blocked',
+        '/project',
+        reopen_reason='manual re-scope',
     )
 
     taskmaster.set_task_status.assert_called_once()
@@ -1581,9 +1753,7 @@ async def test_set_task_status_allows_done_to_done(taskmaster, reconciler, event
 @pytest.mark.asyncio
 async def test_set_task_status_allows_inprogress_to_blocked(taskmaster, reconciler, event_buffer):
     """Normal in-progress->blocked transitions pass through."""
-    taskmaster.get_task = AsyncMock(
-        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'}
-    )
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'in-progress', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status('1', 'blocked', '/project')
@@ -1619,9 +1789,7 @@ async def test_set_task_status_done_to_done_noop(taskmaster, reconciler, event_b
 @pytest.mark.asyncio
 async def test_set_task_status_cancelled_to_cancelled_noop(taskmaster, reconciler, event_buffer):
     """cancelled->cancelled is a no-op: early return, no taskmaster call, no event, no reconciliation."""
-    taskmaster.get_task = AsyncMock(
-        return_value={'id': '2', 'status': 'cancelled', 'title': 'T'}
-    )
+    taskmaster.get_task = AsyncMock(return_value={'id': '2', 'status': 'cancelled', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status('2', 'cancelled', '/project')
@@ -1672,9 +1840,7 @@ async def test_done_gate_rejects_when_declared_files_missing(
 
 
 @pytest.mark.asyncio
-async def test_done_gate_passes_when_files_exist(
-    taskmaster, reconciler, event_buffer, tmp_path
-):
+async def test_done_gate_passes_when_files_exist(taskmaster, reconciler, event_buffer, tmp_path):
     """status=done succeeds when every declared file exists under project_root."""
     (tmp_path / 'src').mkdir()
     (tmp_path / 'src' / 'mod.rs').write_text('// shipped')
@@ -1695,9 +1861,7 @@ async def test_done_gate_passes_when_files_exist(
 
 
 @pytest.mark.asyncio
-async def test_done_gate_noop_without_metadata_files(
-    taskmaster, reconciler, event_buffer
-):
+async def test_done_gate_noop_without_metadata_files(taskmaster, reconciler, event_buffer):
     """Gate does not fire when metadata.files is absent — back-compat for legacy tasks."""
     # default taskmaster fixture returns {'id':'1','status':'pending','title':'Test Task'} — no metadata
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
@@ -1709,9 +1873,7 @@ async def test_done_gate_noop_without_metadata_files(
 
 
 @pytest.mark.asyncio
-async def test_done_gate_reports_partial_missing(
-    taskmaster, reconciler, event_buffer, tmp_path
-):
+async def test_done_gate_reports_partial_missing(taskmaster, reconciler, event_buffer, tmp_path):
     """When some declared files exist and others don't, only the missing ones are reported."""
     (tmp_path / 'exists.rs').write_text('')
     taskmaster.get_task = AsyncMock(
@@ -1728,9 +1890,7 @@ async def test_done_gate_reports_partial_missing(
 
     assert result['success'] is False
     assert sorted(result['missing_files']) == ['also_missing.ts', 'missing.rs']
-    assert sorted(result['files_checked']) == sorted(
-        ['exists.rs', 'missing.rs', 'also_missing.ts']
-    )
+    assert sorted(result['files_checked']) == sorted(['exists.rs', 'missing.rs', 'also_missing.ts'])
     taskmaster.set_task_status.assert_not_called()
 
 
@@ -1758,7 +1918,9 @@ async def test_done_gate_skipped_when_verified_provenance_supplied(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1746', 'done', str(tmp_path),
+        '1746',
+        'done',
+        str(tmp_path),
         done_provenance={'kind': 'merged', 'commit': sha},
     )
 
@@ -1785,7 +1947,9 @@ async def test_done_gate_still_fires_without_provenance(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1747', 'done', str(tmp_path),
+        '1747',
+        'done',
+        str(tmp_path),
     )
 
     assert result['success'] is False
@@ -1820,21 +1984,27 @@ async def test_done_gate_does_not_fire_for_non_done_transitions(
 def _init_git_repo(path) -> str:
     """Create a minimal git repo at path with one commit; return full SHA."""
     import subprocess
+
     subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
     subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'], check=True,
+        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
+        check=True,
     )
     subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.name', 'T'], check=True,
+        ['git', '-C', str(path), 'config', 'user.name', 'T'],
+        check=True,
     )
     (path / 'seed.txt').write_text('seed\n')
     subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
     subprocess.run(
-        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'], check=True,
+        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
+        check=True,
     )
     return subprocess.run(
         ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -1867,7 +2037,10 @@ async def test_done_provenance_rejects_missing_when_required(
 ):
     """With the gate enabled, a missing payload is rejected with a structured error."""
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=config_with_strict_provenance,
     )
 
     result = await interceptor.set_task_status('1', 'done', '/project')
@@ -1883,11 +2056,17 @@ async def test_done_provenance_rejects_empty_payload(
 ):
     """An object with empty commit AND empty note is invalid even with gate on."""
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=config_with_strict_provenance,
     )
 
     result = await interceptor.set_task_status(
-        '1', 'done', '/project', done_provenance={'commit': '', 'note': ''},
+        '1',
+        'done',
+        '/project',
+        done_provenance={'commit': '', 'note': ''},
     )
 
     assert result['success'] is False
@@ -1904,7 +2083,9 @@ async def test_done_provenance_rejects_invalid_commit_ref(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={
             'kind': 'merged',
             'commit': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
@@ -1925,7 +2106,9 @@ async def test_done_provenance_resolves_short_sha_and_persists(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={'kind': 'merged', 'commit': sha[:7]},
     )
 
@@ -1947,9 +2130,13 @@ async def test_done_provenance_commit_plus_note_both_persisted(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={
-            'kind': 'merged', 'commit': sha, 'note': 'ff-merged after review',
+            'kind': 'merged',
+            'commit': sha,
+            'note': 'ff-merged after review',
         },
     )
 
@@ -1974,11 +2161,17 @@ async def test_done_provenance_reopen_does_not_require_provenance(
         return_value={'id': '1', 'status': 'done', 'title': 'T'},
     )
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=config_with_strict_provenance,
     )
 
     result = await interceptor.set_task_status(
-        '1', 'in-progress', '/project', reopen_reason='resuming after investigation',
+        '1',
+        'in-progress',
+        '/project',
+        reopen_reason='resuming after investigation',
     )
 
     assert 'error' not in result, result
@@ -1993,7 +2186,10 @@ async def test_done_provenance_malformed_shape_errors_even_warn_only(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', '/project', done_provenance=['not', 'a', 'dict'],  # type: ignore[arg-type]
+        '1',
+        'done',
+        '/project',
+        done_provenance=['not', 'a', 'dict'],  # type: ignore[arg-type]
     )
 
     assert result['success'] is False
@@ -2009,7 +2205,9 @@ async def test_done_provenance_included_in_event_payload(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={'kind': 'merged', 'commit': sha},
     )
 
@@ -2025,15 +2223,16 @@ async def test_done_provenance_included_in_event_payload(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_rejects_missing_kind(
-    taskmaster, reconciler, event_buffer, tmp_path
-):
+async def test_done_provenance_rejects_missing_kind(taskmaster, reconciler, event_buffer, tmp_path):
     """A payload without `kind` is rejected with a helpful pointer."""
     sha = _init_git_repo(tmp_path)
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path), done_provenance={'commit': sha},
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={'commit': sha},
     )
 
     assert result['success'] is False
@@ -2043,15 +2242,15 @@ async def test_done_provenance_rejects_missing_kind(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_rejects_unknown_kind(
-    taskmaster, reconciler, event_buffer, tmp_path
-):
+async def test_done_provenance_rejects_unknown_kind(taskmaster, reconciler, event_buffer, tmp_path):
     """Only `merged` and `found_on_main` are accepted as kinds."""
     sha = _init_git_repo(tmp_path)
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={'kind': 'cherry_picked', 'commit': sha},
     )
 
@@ -2062,14 +2261,14 @@ async def test_done_provenance_rejects_unknown_kind(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_merged_requires_commit(
-    taskmaster, reconciler, event_buffer
-):
+async def test_done_provenance_merged_requires_commit(taskmaster, reconciler, event_buffer):
     """kind="merged" without a commit is rejected even with a note."""
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', '/project',
+        '1',
+        'done',
+        '/project',
         done_provenance={'kind': 'merged', 'note': 'merged via the queue'},
     )
 
@@ -2088,7 +2287,9 @@ async def test_done_provenance_found_on_main_requires_note(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={'kind': 'found_on_main', 'commit': sha},
     )
 
@@ -2099,14 +2300,14 @@ async def test_done_provenance_found_on_main_requires_note(
 
 
 @pytest.mark.asyncio
-async def test_done_provenance_found_on_main_requires_commit(
-    taskmaster, reconciler, event_buffer
-):
+async def test_done_provenance_found_on_main_requires_commit(taskmaster, reconciler, event_buffer):
     """kind='found_on_main' without a commit is rejected (post-3092 hardening)."""
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', '/project',
+        '1',
+        'done',
+        '/project',
         done_provenance={
             'kind': 'found_on_main',
             'note': 'covered by parent task 1745',
@@ -2130,6 +2331,7 @@ async def test_done_provenance_merged_rejects_branch_only_sha(
     the source of truth.
     """
     import subprocess
+
     _init_git_repo(tmp_path)
     # Create a branch commit that is NOT on main
     subprocess.run(
@@ -2144,16 +2346,21 @@ async def test_done_provenance_merged_rejects_branch_only_sha(
     )
     branch_sha = subprocess.run(
         ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     # Switch back to main so HEAD on the worktree is on main
     subprocess.run(
-        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'], check=True,
+        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'],
+        check=True,
     )
 
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={'kind': 'merged', 'commit': branch_sha},
     )
 
@@ -2172,6 +2379,7 @@ async def test_done_provenance_found_on_main_rejects_branch_only_sha(
     A branch-only SHA is rejected the same way as kind='merged'.
     """
     import subprocess
+
     _init_git_repo(tmp_path)
     # Create a branch commit that is NOT on main
     subprocess.run(
@@ -2186,16 +2394,21 @@ async def test_done_provenance_found_on_main_rejects_branch_only_sha(
     )
     branch_sha = subprocess.run(
         ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     # Switch back to main so HEAD on the worktree is on main
     subprocess.run(
-        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'], check=True,
+        ['git', '-C', str(tmp_path), 'checkout', '-q', 'main'],
+        check=True,
     )
 
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={
             'kind': 'found_on_main',
             'commit': branch_sha,
@@ -2218,7 +2431,9 @@ async def test_done_provenance_found_on_main_with_on_main_commit_passes(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={
             'kind': 'found_on_main',
             'commit': sha,
@@ -2246,7 +2461,9 @@ async def test_done_provenance_found_on_main_short_sha_resolved(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '1', 'done', str(tmp_path),
+        '1',
+        'done',
+        str(tmp_path),
         done_provenance={
             'kind': 'found_on_main',
             'commit': sha[:7],
@@ -2257,14 +2474,12 @@ async def test_done_provenance_found_on_main_short_sha_resolved(
     assert 'error' not in result
     persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
     dp = persisted['done_provenance']
-    assert dp['commit'] == sha           # resolved to full SHA
+    assert dp['commit'] == sha  # resolved to full SHA
     assert dp['commit_input'] == sha[:7]  # original short ref preserved
 
 
 @pytest.mark.asyncio
-async def test_update_task_rejects_metadata_done_provenance(
-    taskmaster, reconciler, event_buffer
-):
+async def test_update_task_rejects_metadata_done_provenance(taskmaster, reconciler, event_buffer):
     """update_task must NOT be a side door for writing done_provenance.
 
     The 2026-04-27 incident had a workflow agent stamp self-contradicting
@@ -2274,7 +2489,8 @@ async def test_update_task_rejects_metadata_done_provenance(
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.update_task(
-        '1', '/project',
+        '1',
+        '/project',
         metadata=json.dumps(
             {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
         ),
@@ -2286,15 +2502,14 @@ async def test_update_task_rejects_metadata_done_provenance(
 
 
 @pytest.mark.asyncio
-async def test_update_task_allows_other_metadata(
-    taskmaster, reconciler, event_buffer
-):
+async def test_update_task_allows_other_metadata(taskmaster, reconciler, event_buffer):
     """The done_provenance block does not affect other metadata writes."""
     taskmaster.update_task.return_value = {'success': True}
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.update_task(
-        '1', '/project',
+        '1',
+        '/project',
         metadata=json.dumps({'files': ['orchestrator/']}),
     )
 
@@ -2313,7 +2528,9 @@ def test_background_tasks_set_exists(taskmaster, reconciler, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_background_tasks_retained_during_reconciliation(taskmaster, reconciler, event_buffer):
+async def test_background_tasks_retained_during_reconciliation(
+    taskmaster, reconciler, event_buffer
+):
     """Background task should be in _background_tasks while running, removed after completion."""
     # Use a future to control when reconcile_task finishes
     started = asyncio.Event()
@@ -2373,7 +2590,8 @@ class _OverlapTracker:
             self.in_flight[project_key] = self.in_flight.get(project_key, 0) + 1
             self._global_in_flight += 1
             self.peak[project_key] = max(
-                self.peak.get(project_key, 0), self.in_flight[project_key],
+                self.peak.get(project_key, 0),
+                self.in_flight[project_key],
             )
             self.total_peak = max(self.total_peak, self._global_in_flight)
             try:
@@ -2381,10 +2599,7 @@ class _OverlapTracker:
                 # — a zero-sleep await is enough to surface lock violations.
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
-                return (
-                    return_value(*args, **kwargs)
-                    if callable(return_value) else return_value
-                )
+                return return_value(*args, **kwargs) if callable(return_value) else return_value
             finally:
                 self.in_flight[project_key] -= 1
                 self._global_in_flight -= 1
@@ -2409,7 +2624,10 @@ def overlap_tm():
 
 @pytest.mark.asyncio
 async def test_concurrent_add_task_burst_all_distinct(
-    overlap_tm, reconciler, event_buffer, tmp_path,
+    overlap_tm,
+    reconciler,
+    event_buffer,
+    tmp_path,
 ):
     """WP-E: 20 concurrent add_task calls to the same project serialise
     through the per-project lock — every task gets a distinct id and the
@@ -2436,7 +2654,8 @@ async def test_concurrent_add_task_burst_all_distinct(
     async def instrumented(**kwargs):
         tracker.in_flight['p'] = tracker.in_flight.get('p', 0) + 1
         tracker.peak['p'] = max(
-            tracker.peak.get('p', 0), tracker.in_flight['p'],
+            tracker.peak.get('p', 0),
+            tracker.in_flight['p'],
         )
         try:
             return await original(**kwargs)
@@ -2451,10 +2670,9 @@ async def test_concurrent_add_task_burst_all_distinct(
 
     try:
         N = 20
-        results = await asyncio.gather(*[
-            _submit_and_resolve(interceptor, '/project', title=f'Task {i}')
-            for i in range(N)
-        ])
+        results = await asyncio.gather(
+            *[_submit_and_resolve(interceptor, '/project', title=f'Task {i}') for i in range(N)]
+        )
     finally:
         await store.close()
         for _wt in list(interceptor._worker_tasks.values()):
@@ -2473,7 +2691,9 @@ async def test_concurrent_add_task_burst_all_distinct(
 
 @pytest.mark.asyncio
 async def test_mixed_op_concurrency_serialises_on_one_project(
-    overlap_tm, reconciler, event_buffer,
+    overlap_tm,
+    reconciler,
+    event_buffer,
 ):
     """WP-E: add + set_task_status + update_task concurrent on the same
     project all serialise through the per-project lock. The backend never
@@ -2489,12 +2709,14 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
         async def side_effect(*args, **kwargs):
             tracker.in_flight['p'] = tracker.in_flight.get('p', 0) + 1
             tracker.peak['p'] = max(
-                tracker.peak.get('p', 0), tracker.in_flight['p'],
+                tracker.peak.get('p', 0),
+                tracker.in_flight['p'],
             )
             try:
                 return await _delay(return_value)
             finally:
                 tracker.in_flight['p'] -= 1
+
         return side_effect
 
     overlap_tm.add_task = AsyncMock(
@@ -2509,7 +2731,8 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
     # get_task also counts — set_task_status holds the lock across it.
     overlap_tm.get_task = AsyncMock(
         side_effect=instrument(
-            'get_task', {'id': '1', 'status': 'pending', 'title': 'T'},
+            'get_task',
+            {'id': '1', 'status': 'pending', 'title': 'T'},
         ),
     )
     overlap_tm.remove_tasks = AsyncMock(
@@ -2546,7 +2769,10 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
 
 @pytest.mark.asyncio
 async def test_two_projects_do_not_serialise(
-    overlap_tm, reconciler, event_buffer, tmp_path,
+    overlap_tm,
+    reconciler,
+    event_buffer,
+    tmp_path,
 ):
     """WP-E: per-project ticket queues serialise within each project but allow
     cross-project concurrency.
@@ -2588,9 +2814,9 @@ async def test_two_projects_do_not_serialise(
                     await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
                 except TimeoutError:
                     pytest.fail(
-                        f"project A entered but B never did — "
-                        f"projA_entered={projA_entered.is_set()} "
-                        f"projB_entered={projB_entered.is_set()}"
+                        f'project A entered but B never did — '
+                        f'projA_entered={projA_entered.is_set()} '
+                        f'projB_entered={projB_entered.is_set()}'
                     )
             else:
                 projB_entered.set()
@@ -2598,9 +2824,9 @@ async def test_two_projects_do_not_serialise(
                     await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
                 except TimeoutError:
                     pytest.fail(
-                        f"project B entered but A never did — "
-                        f"projA_entered={projA_entered.is_set()} "
-                        f"projB_entered={projB_entered.is_set()}"
+                        f'project B entered but A never did — '
+                        f'projA_entered={projA_entered.is_set()} '
+                        f'projB_entered={projB_entered.is_set()}'
                     )
             return {'id': '1', 'title': kwargs.get('title', '')}
         finally:
@@ -2629,9 +2855,7 @@ async def test_two_projects_do_not_serialise(
     # Per-project peak is 1 (each project worker serialises same-project ops).
     peak_a = tracker.peak.get(resolve_project_id('/projA'), 0)
     peak_b = tracker.peak.get(resolve_project_id('/projB'), 0)
-    assert peak_a <= 1 and peak_b <= 1, (
-        f'same-project overlap: {tracker.peak}'
-    )
+    assert peak_a <= 1 and peak_b <= 1, f'same-project overlap: {tracker.peak}'
     # With per-project workers, projA and projB can run concurrently;
     # total_peak must equal the number of active projects (2), confirming
     # cross-project parallelism is achieved.
@@ -2642,7 +2866,9 @@ async def test_two_projects_do_not_serialise(
 
 @pytest.mark.asyncio
 async def test_set_task_status_holds_lock_across_read_and_write(
-    overlap_tm, reconciler, event_buffer,
+    overlap_tm,
+    reconciler,
+    event_buffer,
 ):
     """WP-E: two concurrent set_task_status calls on the same project see
     a consistent before-state. Without the lock, both could read
@@ -2691,16 +2917,16 @@ async def test_set_task_status_holds_lock_across_read_and_write(
         second_from, second_to = call_log[1].split(':')[1].split('->')
         assert first_from == 'pending'
         # With the lock, second read sees the first write.
-        assert second_from == first_to, (
-            f'stale before-state observed: {call_log}'
-        )
+        assert second_from == first_to, f'stale before-state observed: {call_log}'
     assert r1.get('success') or r1.get('no_op')
     assert r2.get('success') or r2.get('no_op')
 
 
 @pytest.mark.asyncio
 async def test_single_call_latency_not_regressed(
-    overlap_tm, reconciler, event_buffer,
+    overlap_tm,
+    reconciler,
+    event_buffer,
 ):
     """WP-E: guardrail — a sequence of sequential mutating calls under
     no contention finishes under a generous budget, so the lock itself
@@ -2728,7 +2954,11 @@ async def test_single_call_latency_not_regressed(
 
 @pytest.mark.asyncio
 async def test_set_task_status_does_not_block_during_add_task_curator(
-    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    curator_enabled_config,
+    tmp_path,
 ):
     """Split-lock regression (2026-04-20): a long-running curator.curate()
     inside add_task MUST NOT block a concurrent set_task_status on the
@@ -2749,7 +2979,10 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
     store = TicketStore(tmp_path / 'split_lock_tickets.db')
     await store.initialize()
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        taskmaster,
+        reconciler,
+        event_buffer,
+        config=curator_enabled_config,
         ticket_store=store,
     )
 
@@ -2759,15 +2992,18 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         await asyncio.sleep(CURATOR_LATENCY_S)
         # action='create' so the flow falls through to tm.add_task
         return CuratorDecision(
-            action='create', justification='ok',
+            action='create',
+            justification='ok',
         )
 
     curator = MagicMock()
     curator.curate = AsyncMock(side_effect=slow_curate)
+
     # curate_batch delegates to curate() so slow_curate is still invoked
     # and the latency-based assertion holds.
     async def _slow_curate_batch(candidates, pid, project_root):
         return [await curator.curate(c, pid, project_root) for c in candidates]
+
     curator.curate_batch = AsyncMock(side_effect=_slow_curate_batch)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
@@ -2782,7 +3018,9 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         await asyncio.sleep(0.05)
         t0 = asyncio.get_event_loop().time()
         result = await interceptor.set_task_status(
-            '1', 'in-progress', '/project',
+            '1',
+            'in-progress',
+            '/project',
         )
         return result, asyncio.get_event_loop().time() - t0
 
@@ -2838,10 +3076,12 @@ def test_is_ticket_id_recognises_tkt_prefix():
 # step-19: submit_task persists a pending ticket and returns its id
 # ---------------------------------------------------------------------------
 
+
 @pytest_asyncio.fixture
 async def ticket_store(tmp_path):
     """A real TicketStore backed by a temporary SQLite file."""
     from fused_memory.middleware.ticket_store import TicketStore
+
     store = TicketStore(tmp_path / 'tickets.db')
     await store.initialize()
     yield store
@@ -2857,7 +3097,9 @@ async def interceptor_with_store(taskmaster, reconciler, event_buffer, ticket_st
 
 @pytest.mark.asyncio
 async def test_submit_task_persists_ticket_and_returns_id(
-    interceptor_with_store, ticket_store, taskmaster,
+    interceptor_with_store,
+    ticket_store,
+    taskmaster,
 ):
     """submit_task enqueues a ticket immediately and returns {'ticket': 'tkt_...'}.
 
@@ -2890,7 +3132,10 @@ async def test_submit_task_persists_ticket_and_returns_id(
 
 @pytest.mark.asyncio
 async def test_start_flushes_prior_pending_tickets(
-    taskmaster, reconciler, event_buffer, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
 ):
     """interceptor.start() flushes tickets left pending by a previous run.
 
@@ -2941,7 +3186,10 @@ async def test_start_flushes_prior_pending_tickets(
 
 @pytest.mark.asyncio
 async def test_main_wires_ticket_store_into_interceptor(
-    taskmaster, reconciler, event_buffer, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
 ):
     """_build_ticket_store (server.main helper) constructs and initialises a
     TicketStore that main.py wires into TaskInterceptor.
@@ -2978,7 +3226,8 @@ async def test_main_wires_ticket_store_into_interceptor(
 
 @pytest.mark.asyncio
 async def test_add_task_worker_takes_curator_lock_for_r3(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """R3 invariant: the add_task worker path must acquire _curator_lock so
     it is mutually exclusive with add_subtask / remove_task curator calls.
@@ -3035,7 +3284,8 @@ async def test_add_task_worker_takes_curator_lock_for_r3(
 
 @pytest.mark.asyncio
 async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
-    interceptor_with_store, ticket_store,
+    interceptor_with_store,
+    ticket_store,
 ):
     """Regression: worker completing between the initial row-read and event
     registration must NOT cause resolve_ticket to hang.
@@ -3096,12 +3346,8 @@ async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
     finally:
         ticket_store.get = original_get
 
-    assert result.get('status') == 'created', (
-        f'Expected status=created but got: {result!r}'
-    )
-    assert result.get('task_id') == '42', (
-        f'Expected task_id=42 but got: {result!r}'
-    )
+    assert result.get('status') == 'created', f'Expected status=created but got: {result!r}'
+    assert result.get('task_id') == '42', f'Expected task_id=42 but got: {result!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -3141,7 +3387,9 @@ async def test_cancel_ticket_missing_returns_not_found(interceptor_with_store):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('terminal_status', ['failed', 'cancelled', 'created'])
 async def test_cancel_ticket_terminal_returns_noop(
-    interceptor_with_store, ticket_store, terminal_status,
+    interceptor_with_store,
+    ticket_store,
+    terminal_status,
 ):
     """cancel_ticket returns no_op for a ticket already in a terminal status.
 
@@ -3163,7 +3411,8 @@ async def test_cancel_ticket_terminal_returns_noop(
 
 @pytest.mark.asyncio
 async def test_cancel_ticket_pending_marks_cancelled(
-    interceptor_with_store, ticket_store,
+    interceptor_with_store,
+    ticket_store,
 ):
     """cancel_ticket marks a pending ticket as cancelled and returns the right shape.
 
@@ -3185,7 +3434,8 @@ async def test_cancel_ticket_pending_marks_cancelled(
 
 @pytest.mark.asyncio
 async def test_cancel_ticket_signals_resolve_ticket_waiter(
-    interceptor_with_store, ticket_store,
+    interceptor_with_store,
+    ticket_store,
 ):
     """cancel_ticket wakes a concurrent resolve_ticket waiter so it exits promptly.
 
@@ -3215,7 +3465,8 @@ async def test_cancel_ticket_signals_resolve_ticket_waiter(
 
 @pytest.mark.asyncio
 async def test_cancel_ticket_race_returns_noop_with_actual_status(
-    interceptor_with_store, ticket_store,
+    interceptor_with_store,
+    ticket_store,
 ):
     """cancel_ticket returns no_op with the real status on a TOCTOU race.
 
@@ -3258,7 +3509,8 @@ async def test_cancel_ticket_race_returns_noop_with_actual_status(
 
 @pytest.mark.asyncio
 async def test_terminal_exit_rejects_done_to_pending_without_reason(
-    interceptor, taskmaster,
+    interceptor,
+    taskmaster,
 ):
     """done -> pending with no reopen_reason returns terminal_exit_rejected."""
     taskmaster.get_task = AsyncMock(
@@ -3274,7 +3526,8 @@ async def test_terminal_exit_rejects_done_to_pending_without_reason(
 
 @pytest.mark.asyncio
 async def test_terminal_exit_rejects_cancelled_to_pending_without_reason(
-    interceptor, taskmaster,
+    interceptor,
+    taskmaster,
 ):
     taskmaster.get_task = AsyncMock(
         return_value={'id': '1', 'status': 'cancelled', 'title': 'T'},
@@ -3286,14 +3539,18 @@ async def test_terminal_exit_rejects_cancelled_to_pending_without_reason(
 
 @pytest.mark.asyncio
 async def test_terminal_exit_accepts_with_reopen_reason(
-    interceptor, taskmaster,
+    interceptor,
+    taskmaster,
 ):
     """done -> pending with a non-empty reopen_reason succeeds and persists reason."""
     taskmaster.get_task = AsyncMock(
         return_value={'id': '1', 'status': 'done', 'title': 'T'},
     )
     result = await interceptor.set_task_status(
-        '1', 'pending', '/project', reopen_reason='un-defer script',
+        '1',
+        'pending',
+        '/project',
+        reopen_reason='un-defer script',
     )
     assert result.get('success') or 'error' not in result, result
     taskmaster.set_task_status.assert_called_once()
@@ -3319,7 +3576,10 @@ async def test_terminal_exit_rejects_empty_string_reason(interceptor, taskmaster
         return_value={'id': '1', 'status': 'done', 'title': 'T'},
     )
     result = await interceptor.set_task_status(
-        '1', 'pending', '/project', reopen_reason='   ',
+        '1',
+        'pending',
+        '/project',
+        reopen_reason='   ',
     )
     assert result.get('error') == 'terminal_exit_rejected'
 
@@ -3337,14 +3597,19 @@ async def test_terminal_same_status_is_noop(interceptor, taskmaster):
 
 @pytest.mark.asyncio
 async def test_terminal_exit_event_payload_includes_reopen_reason(
-    interceptor, taskmaster, event_buffer,
+    interceptor,
+    taskmaster,
+    event_buffer,
 ):
     """Emitted event carries reopen_reason and reopen_from for audit."""
     taskmaster.get_task = AsyncMock(
         return_value={'id': '1', 'status': 'cancelled', 'title': 'T'},
     )
     await interceptor.set_task_status(
-        '1', 'pending', '/project', reopen_reason='manual re-scope',
+        '1',
+        'pending',
+        '/project',
+        reopen_reason='manual re-scope',
     )
     events = await event_buffer.peek_buffered('project', limit=10)
     assert events, 'expected a task_status_changed event'
@@ -3369,7 +3634,9 @@ async def test_csv_set_task_status_runs_per_id_gates(interceptor, taskmaster):
     taskmaster.get_task.side_effect = get_task
 
     result = await interceptor.set_task_status(
-        '1,2,3', 'pending', '/project',
+        '1,2,3',
+        'pending',
+        '/project',
     )
     assert 'results' in result
     per_id = {r['task_id']: r['result'] for r in result['results']}
@@ -3385,7 +3652,8 @@ async def test_csv_set_task_status_runs_per_id_gates(interceptor, taskmaster):
 
 @pytest.mark.asyncio
 async def test_csv_set_task_status_mixed_statuses_partial_success(
-    interceptor, taskmaster,
+    interceptor,
+    taskmaster,
 ):
     """CSV input where some ids succeed and others hit the gate."""
     statuses = {'1': 'done', '2': 'in-progress'}
@@ -3407,6 +3675,7 @@ async def test_csv_set_task_status_mixed_statuses_partial_success(
 # step-21 / step-23: BulkResetGuard integration tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def bulk_reset_guard():
     """BulkResetGuard with test-friendly thresholds.
@@ -3416,6 +3685,7 @@ def bulk_reset_guard():
     guard with a 4-task CSV, matching the original single-threshold=3 behaviour.
     """
     from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
+
     return BulkResetGuard(
         done_threshold=3,
         in_progress_threshold=3,
@@ -3432,9 +3702,12 @@ def interceptor_with_guard(taskmaster, reconciler, event_buffer, bulk_reset_guar
 
 @pytest.mark.asyncio
 async def test_set_task_status_csv_done_to_pending_tripping_guard_rejects_and_escalates(
-    interceptor_with_guard, taskmaster, tmp_path,
+    interceptor_with_guard,
+    taskmaster,
+    tmp_path,
 ):
     """CSV done→pending: first 3 apply, tasks 4 and 5 are rejected by the guard."""
+
     async def get_task_done(task_id, project_root, tag=None):
         return {'id': task_id, 'status': 'done', 'title': f'Task {task_id}'}
 
@@ -3488,13 +3761,16 @@ async def test_set_task_status_csv_done_to_pending_tripping_guard_rejects_and_es
 
 @pytest.mark.asyncio
 async def test_set_task_status_csv_in_progress_to_pending_trips_guard(
-    interceptor_with_guard, taskmaster, tmp_path,
+    interceptor_with_guard,
+    taskmaster,
+    tmp_path,
 ):
     """CSV in-progress→pending: first 3 apply, task 4 is rejected by the guard.
 
     in-progress→pending does not hit the terminal-exit gate, so no reopen_reason
     needed. This exercises the non-terminal reversal path.
     """
+
     async def get_task_in_progress(task_id, project_root, tag=None):
         return {'id': task_id, 'status': 'in-progress', 'title': f'Task {task_id}'}
 
@@ -3558,7 +3834,10 @@ class TestSubmitTaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_submit_task_rejects_dark_factory_paths_in_wrong_project(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
     ):
         """Filing a task referencing orchestrator/ under a non-dark-factory project
         returns a DarkFactoryPathScopeViolation error and does NOT persist a ticket.
@@ -3595,7 +3874,9 @@ class TestSubmitTaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_submit_task_allows_dark_factory_paths_in_dark_factory_project(
-        self, interceptor_with_store, taskmaster,
+        self,
+        interceptor_with_store,
+        taskmaster,
     ):
         """Filing the same task content under /dark-factory is allowed (project_id
         resolves to dark_factory and the guard no-ops).
@@ -3613,16 +3894,17 @@ class TestSubmitTaskGuardrail:
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
-        assert ticket_id.startswith('tkt_'), (
-            f'Expected ticket id starting with tkt_, got: {result}'
-        )
+        assert ticket_id.startswith('tkt_'), f'Expected ticket id starting with tkt_, got: {result}'
         assert 'error_type' not in result, (
             f'Should not have error_type for correctly-filed task: {result}'
         )
 
     @pytest.mark.asyncio
     async def test_submit_task_skips_build_candidate_for_dark_factory_project(
-        self, interceptor_with_store, taskmaster, monkeypatch,
+        self,
+        interceptor_with_store,
+        taskmaster,
+        monkeypatch,
     ):
         """Hoist optimisation: _build_candidate is not invoked for the dark_factory
         project_id, since the path guard short-circuits to 'ok' anyway.
@@ -3662,7 +3944,10 @@ class TestSubmitTaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_submit_task_persists_canonical_blob(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
     ):
         """Persistence contract: submit_task for /dark-factory stores a row whose
         project_id is 'dark_factory' and whose candidate_json blob contains the
@@ -3697,9 +3982,7 @@ class TestSubmitTaskGuardrail:
             (result['ticket'],),
         )
         row = await cursor.fetchone()
-        assert row is not None, (
-            f'Expected persisted ticket row for ticket_id={result["ticket"]!r}'
-        )
+        assert row is not None, f'Expected persisted ticket row for ticket_id={result["ticket"]!r}'
         assert row['project_id'] == 'dark_factory', (
             f"Expected project_id 'dark_factory', got: {row['project_id']!r}"
         )
@@ -3708,18 +3991,20 @@ class TestSubmitTaskGuardrail:
             f"Expected project_root '/dark-factory' in blob, got: {blob['project_root']!r}"
         )
         assert blob['kwargs']['title'] == 'Investigate orchestrator/harness.py deadlock', (
-            f"Expected title in blob kwargs un-mutated, got: {blob['kwargs'].get('title')!r}"
+            f'Expected title in blob kwargs un-mutated, got: {blob["kwargs"].get("title")!r}'
         )
         assert blob['kwargs']['description'] == 'harness deadlock', (
-            f"Expected description in blob kwargs un-mutated, got: {blob['kwargs'].get('description')!r}"
+            f'Expected description in blob kwargs un-mutated, got: {blob["kwargs"].get("description")!r}'
         )
         assert blob['metadata'] is None, (
-            f"Expected metadata=None in blob (no metadata was passed), got: {blob['metadata']!r}"
+            f'Expected metadata=None in blob (no metadata was passed), got: {blob["metadata"]!r}'
         )
 
     @pytest.mark.asyncio
     async def test_submit_task_allows_clean_task_in_other_project(
-        self, interceptor_with_store, taskmaster,
+        self,
+        interceptor_with_store,
+        taskmaster,
     ):
         """A task with no dark-factory paths in a non-dark-factory project proceeds
         normally (returns a ticket id).
@@ -3737,14 +4022,15 @@ class TestSubmitTaskGuardrail:
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
-        assert ticket_id.startswith('tkt_'), (
-            f'Expected ticket id starting with tkt_, got: {result}'
-        )
+        assert ticket_id.startswith('tkt_'), f'Expected ticket id starting with tkt_, got: {result}'
         assert 'error_type' not in result
 
     @pytest.mark.asyncio
     async def test_submit_task_rejects_prompt_only_dark_factory_paths_in_wrong_project(
-        self, interceptor_with_store, ticket_store, taskmaster,
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
     ):
         """A prompt-only submit_task (no title) referencing orchestrator/ under a
         non-dark-factory project returns a DarkFactoryPathScopeViolation error,
@@ -3780,7 +4066,9 @@ class TestSubmitTaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_submit_task_allows_prompt_only_dark_factory_paths_in_dark_factory_project(
-        self, interceptor_with_store, taskmaster,
+        self,
+        interceptor_with_store,
+        taskmaster,
     ):
         """Prompt-only submit_task filed under /dark-factory is always allowed.
 
@@ -3800,16 +4088,16 @@ class TestSubmitTaskGuardrail:
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
-        assert ticket_id.startswith('tkt_'), (
-            f'Expected ticket id starting with tkt_, got: {result}'
-        )
+        assert ticket_id.startswith('tkt_'), f'Expected ticket id starting with tkt_, got: {result}'
         assert 'error_type' not in result, (
             f'Should not have error_type for dark_factory project: {result}'
         )
 
     @pytest.mark.asyncio
     async def test_submit_task_allows_clean_prompt_only_in_other_project(
-        self, interceptor_with_store, taskmaster,
+        self,
+        interceptor_with_store,
+        taskmaster,
     ):
         """Prompt-only submit_task with no dark-factory paths in a non-dark-factory
         project must not be rejected (returns a 'tkt_'-prefixed ticket).
@@ -3827,17 +4115,17 @@ class TestSubmitTaskGuardrail:
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
-        assert ticket_id.startswith('tkt_'), (
-            f'Expected ticket id starting with tkt_, got: {result}'
-        )
-        assert 'error_type' not in result, (
-            f'Should not have error_type for clean prompt: {result}'
-        )
+        assert ticket_id.startswith('tkt_'), f'Expected ticket id starting with tkt_, got: {result}'
+        assert 'error_type' not in result, f'Should not have error_type for clean prompt: {result}'
 
     @pytest.mark.parametrize('field', ['prompt', 'description', 'details'])
     @pytest.mark.asyncio
     async def test_submit_task_rejects_dark_factory_path_in_any_fallback_field(
-        self, field, interceptor_with_store, ticket_store, taskmaster,
+        self,
+        field,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
     ):
         """The fallback text guard scans prompt, description, AND details — not just
         prompt.
@@ -3879,7 +4167,9 @@ class TestAddSubtaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_add_subtask_rejects_dark_factory_paths_in_wrong_project(
-        self, interceptor, taskmaster,
+        self,
+        interceptor,
+        taskmaster,
     ):
         """add_subtask referencing fused-memory/ under a non-dark-factory project
         returns a DarkFactoryPathScopeViolation error and does NOT call taskmaster.
@@ -3895,17 +4185,18 @@ class TestAddSubtaskGuardrail:
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
             f'Expected DarkFactoryPathScopeViolation error, got: {result}'
         )
-        assert 'fused-memory/' in result.get('matched_paths', []) or \
-               'fused_memory/' in result.get('matched_paths', []), (
-            f'Expected fused-memory/ or fused_memory/ in matched_paths: {result}'
-        )
+        assert 'fused-memory/' in result.get('matched_paths', []) or 'fused_memory/' in result.get(
+            'matched_paths', []
+        ), f'Expected fused-memory/ or fused_memory/ in matched_paths: {result}'
 
         # Taskmaster backend must never have been called
         taskmaster.add_subtask.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_subtask_allows_dark_factory_paths_in_dark_factory_project(
-        self, interceptor, taskmaster,
+        self,
+        interceptor,
+        taskmaster,
     ):
         """add_subtask with dark-factory paths filed under /dark-factory proceeds
         normally (project_id resolves to dark_factory and the guard no-ops).
@@ -3927,7 +4218,9 @@ class TestAddSubtaskGuardrail:
 
     @pytest.mark.asyncio
     async def test_add_subtask_rejects_prompt_only_dark_factory_paths_in_wrong_project(
-        self, interceptor, taskmaster,
+        self,
+        interceptor,
+        taskmaster,
     ):
         """A prompt-only add_subtask (no title) referencing fused-memory/ under a
         non-dark-factory project returns a DarkFactoryPathScopeViolation error
@@ -3955,7 +4248,10 @@ class TestAddSubtaskGuardrail:
     @pytest.mark.parametrize('field', ['prompt', 'description', 'details'])
     @pytest.mark.asyncio
     async def test_add_subtask_rejects_dark_factory_path_in_any_fallback_field(
-        self, field, interceptor, taskmaster,
+        self,
+        field,
+        interceptor,
+        taskmaster,
     ):
         """The fallback text guard scans prompt, description, AND details in add_subtask.
 
@@ -4004,10 +4300,12 @@ class TestExtractMetaFiles:
 
     def test_dict_metadata_both_keys_prefers_files(self):
         """dict metadata with BOTH keys → returns files (precedence over files_to_modify)."""
-        kwargs = {'metadata': {
-            'files': ['a.py'],
-            'files_to_modify': ['legacy.py'],
-        }}
+        kwargs = {
+            'metadata': {
+                'files': ['a.py'],
+                'files_to_modify': ['legacy.py'],
+            }
+        }
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['a.py']
 
@@ -4020,6 +4318,7 @@ class TestExtractMetaFiles:
     def test_json_string_metadata_parsed(self):
         """JSON string metadata → parsed and files_to_modify extracted."""
         import json as _json
+
         meta_str = _json.dumps({'files_to_modify': ['orchestrator/harness.py']})
         kwargs = {'metadata': meta_str}
         result = TaskInterceptor._extract_meta_files(kwargs)
@@ -4110,7 +4409,11 @@ class TestPathGuardFallbackMetadataFiles:
     @pytest.mark.parametrize('meta_key', ['files', 'files_to_modify'])
     @pytest.mark.asyncio
     async def test_submit_task_fallback_rejects_dark_factory_path_in_metadata(
-        self, meta_key, interceptor_with_store, ticket_store, taskmaster,
+        self,
+        meta_key,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
     ):
         """prompt-only submit_task with dark-factory path ONLY in metadata[meta_key]
         must be rejected even though all free-text fields are clean.
@@ -4118,7 +4421,7 @@ class TestPathGuardFallbackMetadataFiles:
         try:
             result = await interceptor_with_store.submit_task(
                 project_root='/some-other-project',
-                prompt='Generic refactor',            # no dark-factory path here
+                prompt='Generic refactor',  # no dark-factory path here
                 # Deliberately NO title — forces _build_candidate → None → fallback
                 metadata={meta_key: ['orchestrator/harness.py']},
             )
@@ -4138,9 +4441,7 @@ class TestPathGuardFallbackMetadataFiles:
         assert db is not None
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
-        assert row[0] == 0, (
-            f'meta_key={meta_key!r}: expected 0 tickets in store, found {row[0]}'
-        )
+        assert row[0] == 0, f'meta_key={meta_key!r}: expected 0 tickets in store, found {row[0]}'
 
         # Taskmaster backend must never have been called
         taskmaster.add_task.assert_not_called()
@@ -4148,7 +4449,10 @@ class TestPathGuardFallbackMetadataFiles:
     @pytest.mark.parametrize('meta_key', ['files', 'files_to_modify'])
     @pytest.mark.asyncio
     async def test_add_subtask_fallback_rejects_dark_factory_path_in_metadata(
-        self, meta_key, interceptor, taskmaster,
+        self,
+        meta_key,
+        interceptor,
+        taskmaster,
     ):
         """prompt-only add_subtask with dark-factory path ONLY in metadata[meta_key]
         must be rejected even though all free-text fields are clean.
@@ -4156,7 +4460,7 @@ class TestPathGuardFallbackMetadataFiles:
         result = await interceptor.add_subtask(
             parent_id='1',
             project_root='/some-other-project',
-            prompt='Generic refactor',            # no dark-factory path here
+            prompt='Generic refactor',  # no dark-factory path here
             # Deliberately NO title — forces _build_candidate → None → fallback
             metadata={meta_key: ['orchestrator/harness.py']},
         )
@@ -4174,7 +4478,9 @@ class TestPathGuardFallbackMetadataFiles:
 
     @pytest.mark.asyncio
     async def test_path_guard_detects_dark_factory_path_in_multi_entry_metadata_list(
-        self, interceptor, taskmaster,
+        self,
+        interceptor,
+        taskmaster,
     ):
         """Dark-factory path in the SECOND entry of a multi-entry metadata list
         must still trigger the guard.
@@ -4217,7 +4523,9 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
 
     @pytest.mark.asyncio
     async def test_submit_task_allows_clean_metadata_files_in_other_project(
-        self, interceptor_with_store, taskmaster,
+        self,
+        interceptor_with_store,
+        taskmaster,
     ):
         """prompt-only submit_task with non-dark-factory paths in metadata
         must NOT be rejected — only dark-factory paths should trigger the guard.
@@ -4234,16 +4542,16 @@ class TestPathGuardFallbackMetadataFilesNegativeControl:
 
         assert isinstance(result, dict)
         ticket_id = result.get('ticket', '')
-        assert ticket_id.startswith('tkt_'), (
-            f'Expected ticket id starting with tkt_, got: {result}'
-        )
+        assert ticket_id.startswith('tkt_'), f'Expected ticket id starting with tkt_, got: {result}'
         assert 'error_type' not in result, (
             f'Should not have error_type for clean metadata files: {result}'
         )
 
     @pytest.mark.asyncio
     async def test_add_subtask_allows_clean_metadata_files_in_other_project(
-        self, interceptor, taskmaster,
+        self,
+        interceptor,
+        taskmaster,
     ):
         """prompt-only add_subtask with non-dark-factory paths in metadata
         must NOT be rejected — only dark-factory paths should trigger the guard.
@@ -4276,7 +4584,9 @@ class TestPathGuardOrSkip:
 
     # -- Case 1 -----------------------------------------------------------
     def test_path_guard_or_skip_returns_none_for_dark_factory_project(
-        self, interceptor, monkeypatch,
+        self,
+        interceptor,
+        monkeypatch,
     ):
         """dark_factory short-circuit (back-compat: no registry configured):
         returns None without calling _build_candidate or _path_guard_check.
@@ -4309,7 +4619,9 @@ class TestPathGuardOrSkip:
 
     # -- Case 2 -----------------------------------------------------------
     def test_path_guard_or_skip_lazy_builds_candidate_when_unset(
-        self, interceptor, monkeypatch,
+        self,
+        interceptor,
+        monkeypatch,
     ):
         """When no candidate is supplied and project is non-dark_factory, the
         helper builds a candidate via _build_candidate and passes it to
@@ -4319,8 +4631,11 @@ class TestPathGuardOrSkip:
         from fused_memory.middleware.task_curator import CandidateTask
 
         built = CandidateTask(
-            title='Generic refactor', description='', details='',
-            files_to_modify=[], priority='medium',
+            title='Generic refactor',
+            description='',
+            details='',
+            files_to_modify=[],
+            priority='medium',
         )
         build_calls: list = []
         guard_calls: list = []
@@ -4338,7 +4653,9 @@ class TestPathGuardOrSkip:
 
         kwargs = {'title': 'Generic refactor'}
         result = interceptor._path_guard_or_skip(
-            kwargs, '/some/project_root', 'some_other_project',
+            kwargs,
+            '/some/project_root',
+            'some_other_project',
         )
 
         assert result is None
@@ -4353,7 +4670,9 @@ class TestPathGuardOrSkip:
 
     # -- Case 3 -----------------------------------------------------------
     def test_path_guard_or_skip_uses_provided_candidate(
-        self, interceptor, monkeypatch,
+        self,
+        interceptor,
+        monkeypatch,
     ):
         """When a pre-built candidate is supplied, _build_candidate is NOT called;
         _path_guard_check is called with the supplied candidate.
@@ -4362,8 +4681,11 @@ class TestPathGuardOrSkip:
         from fused_memory.middleware.task_curator import CandidateTask
 
         sentinel = CandidateTask(
-            title='Sentinel', description='', details='',
-            files_to_modify=[], priority='medium',
+            title='Sentinel',
+            description='',
+            details='',
+            files_to_modify=[],
+            priority='medium',
         )
         build_calls: list = []
         guard_calls: list = []
@@ -4381,7 +4703,10 @@ class TestPathGuardOrSkip:
 
         kwargs = {'title': 'Generic refactor'}
         result = interceptor._path_guard_or_skip(
-            kwargs, '/some/project_root', 'some_other_project', candidate=sentinel,
+            kwargs,
+            '/some/project_root',
+            'some_other_project',
+            candidate=sentinel,
         )
 
         assert result is None
@@ -4393,7 +4718,9 @@ class TestPathGuardOrSkip:
 
     # -- Case 4 -----------------------------------------------------------
     def test_path_guard_or_skip_propagates_rejection(
-        self, interceptor, monkeypatch,
+        self,
+        interceptor,
+        monkeypatch,
     ):
         """When _path_guard_check returns a rejection verdict, the helper
         returns its to_error_dict() output.
@@ -4417,7 +4744,9 @@ class TestPathGuardOrSkip:
         monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
 
         result = interceptor._path_guard_or_skip(
-            {'prompt': 'something'}, '/some/project_root', 'some_other_project',
+            {'prompt': 'something'},
+            '/some/project_root',
+            'some_other_project',
         )
         assert result is not None
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
@@ -4437,7 +4766,10 @@ class TestMultiProjectRoutingWiring:
     """
 
     def test_registry_supersedes_dark_factory_short_circuit(
-        self, interceptor, monkeypatch, tmp_path,
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
     ):
         """With a registry configured, dark_factory submissions are also
         guarded — a reify path landing in dark_factory triggers rejection."""
@@ -4451,10 +4783,12 @@ class TestMultiProjectRoutingWiring:
         (tmp_path / 'reify' / 'crates').mkdir()
         (tmp_path / 'dark-factory').mkdir()
         (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
-        registry = ProjectPrefixRegistry.from_roots([
-            str(tmp_path / 'reify'),
-            str(tmp_path / 'dark-factory'),
-        ])
+        registry = ProjectPrefixRegistry.from_roots(
+            [
+                str(tmp_path / 'reify'),
+                str(tmp_path / 'dark-factory'),
+            ]
+        )
         interceptor._prefix_registry = registry
 
         check_calls: list = []
@@ -4475,7 +4809,10 @@ class TestMultiProjectRoutingWiring:
         assert check_calls == ['dark_factory']
 
     def test_rejection_fires_scope_violation_escalator(
-        self, interceptor, monkeypatch, tmp_path,
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
     ):
         """A path-guard rejection invokes scope_violation_escalator.report_rejection
         with project_root, matched_paths, and suggested_project from the verdict.
@@ -4490,10 +4827,12 @@ class TestMultiProjectRoutingWiring:
         (tmp_path / 'reify' / 'crates').mkdir()
         (tmp_path / 'dark-factory').mkdir()
         (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
-        registry = ProjectPrefixRegistry.from_roots([
-            str(tmp_path / 'reify'),
-            str(tmp_path / 'dark-factory'),
-        ])
+        registry = ProjectPrefixRegistry.from_roots(
+            [
+                str(tmp_path / 'reify'),
+                str(tmp_path / 'dark-factory'),
+            ]
+        )
         interceptor._prefix_registry = registry
 
         # Spy escalator.
@@ -4514,7 +4853,8 @@ class TestMultiProjectRoutingWiring:
             suggested_project='dark_factory',
         )
         monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_check',
+            TaskInterceptor,
+            '_path_guard_check',
             lambda self, c, k, p: verdict,
         )
 
@@ -4537,7 +4877,10 @@ class TestMultiProjectRoutingWiring:
         assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
 
     def test_escalator_failure_swallowed(
-        self, interceptor, monkeypatch, tmp_path,
+        self,
+        interceptor,
+        monkeypatch,
+        tmp_path,
     ):
         """An escalator that raises must NOT turn the rejection into an exception."""
         from fused_memory.middleware.path_scope_guard import PathGuardVerdict
@@ -4562,13 +4905,16 @@ class TestMultiProjectRoutingWiring:
             suggested_project='reify',
         )
         monkeypatch.setattr(
-            TaskInterceptor, '_path_guard_check',
+            TaskInterceptor,
+            '_path_guard_check',
             lambda self, c, k, p: verdict,
         )
 
         # Must not raise.
         result = interceptor._path_guard_or_skip(
-            {'title': 'crates/widget'}, '/foo', 'other',
+            {'title': 'crates/widget'},
+            '/foo',
+            'other',
         )
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
@@ -4581,11 +4927,14 @@ class TestMultiProjectRoutingWiring:
 
 @pytest.mark.asyncio
 async def test_planning_mode_returns_task_id_synchronously(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """planning_mode=True returns task_id directly with status=deferred — no ticket."""
     result = await interceptor_facade.submit_task(
-        '/project', title='Decomposed task', planning_mode=True,
+        '/project',
+        title='Decomposed task',
+        planning_mode=True,
     )
     assert result == {
         'task_id': '2',
@@ -4594,17 +4943,23 @@ async def test_planning_mode_returns_task_id_synchronously(
     }
     taskmaster.add_task.assert_called_once()
     taskmaster.set_task_status.assert_called_once_with(
-        '2', 'deferred', '/project', None,
+        '2',
+        'deferred',
+        '/project',
+        None,
     )
 
 
 @pytest.mark.asyncio
 async def test_planning_mode_persists_human_decomposed_metadata(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """planning_mode injects human_decomposed=True into the metadata sent to tm.add_task."""
     await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True,
+        '/project',
+        title='X',
+        planning_mode=True,
     )
     metadata_arg = taskmaster.add_task.call_args.kwargs.get('metadata')
     assert metadata_arg is not None
@@ -4613,11 +4968,14 @@ async def test_planning_mode_persists_human_decomposed_metadata(
 
 @pytest.mark.asyncio
 async def test_planning_mode_merges_caller_metadata(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """Caller-supplied metadata is preserved alongside human_decomposed=True."""
     await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True,
+        '/project',
+        title='X',
+        planning_mode=True,
         metadata={'source': 'planning-session', 'files': ['m1', 'm2']},
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
@@ -4630,11 +4988,14 @@ async def test_planning_mode_merges_caller_metadata(
 
 @pytest.mark.asyncio
 async def test_planning_mode_accepts_metadata_json_string(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """JSON-string metadata is decoded, merged, and re-encoded."""
     await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True,
+        '/project',
+        title='X',
+        planning_mode=True,
         metadata='{"escalation_id": "esc-1"}',
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
@@ -4647,7 +5008,10 @@ async def test_planning_mode_rejects_invalid_metadata_string(
 ):
     """Non-JSON metadata string returns a structured ValidationError."""
     result = await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True, metadata='{not json',
+        '/project',
+        title='X',
+        planning_mode=True,
+        metadata='{not json',
     )
     assert result.get('error_type') == 'ValidationError'
     assert 'JSON-decode' in result['error']
@@ -4659,7 +5023,10 @@ async def test_planning_mode_rejects_non_object_metadata(
 ):
     """JSON metadata that decodes to a non-dict is rejected."""
     result = await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True, metadata='[1,2,3]',
+        '/project',
+        title='X',
+        planning_mode=True,
+        metadata='[1,2,3]',
     )
     assert result.get('error_type') == 'ValidationError'
     assert 'object' in result['error']
@@ -4667,11 +5034,14 @@ async def test_planning_mode_rejects_non_object_metadata(
 
 @pytest.mark.asyncio
 async def test_planning_mode_emits_task_created_event(
-    interceptor_facade, event_buffer,
+    interceptor_facade,
+    event_buffer,
 ):
     """planning_mode emits a task_created event into the buffer."""
     await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True,
+        '/project',
+        title='X',
+        planning_mode=True,
     )
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
@@ -4679,7 +5049,8 @@ async def test_planning_mode_emits_task_created_event(
 
 @pytest.mark.asyncio
 async def test_planning_mode_skips_curator_worker(
-    interceptor_facade, monkeypatch,
+    interceptor_facade,
+    monkeypatch,
 ):
     """planning_mode never triggers the per-project curator worker."""
     started: list[str] = []
@@ -4692,7 +5063,9 @@ async def test_planning_mode_skips_curator_worker(
     monkeypatch.setattr(TaskInterceptor, '_start_worker_if_needed', spy)
 
     await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True,
+        '/project',
+        title='X',
+        planning_mode=True,
     )
     assert started == [], (
         f'planning_mode must not start the curator worker; got starts for {started}'
@@ -4711,7 +5084,8 @@ async def test_planning_mode_default_false_preserves_two_phase(
 
 @pytest.mark.asyncio
 async def test_planning_mode_deferred_flip_failure_returns_warning(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """If tm.set_task_status fails after tm.add_task succeeded, return task_id + warning.
 
@@ -4721,7 +5095,9 @@ async def test_planning_mode_deferred_flip_failure_returns_warning(
     """
     taskmaster.set_task_status.side_effect = RuntimeError('Taskmaster process died')
     result = await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True,
+        '/project',
+        title='X',
+        planning_mode=True,
     )
     assert result['task_id'] == '2'
     assert result['status'] == 'pending'
@@ -4732,12 +5108,15 @@ async def test_planning_mode_deferred_flip_failure_returns_warning(
 
 @pytest.mark.asyncio
 async def test_planning_mode_add_task_failure_returns_error(
-    interceptor_facade, taskmaster,
+    interceptor_facade,
+    taskmaster,
 ):
     """If tm.add_task itself fails, planning_mode returns a structured error dict."""
     taskmaster.add_task.side_effect = RuntimeError('add_task wire failure')
     result = await interceptor_facade.submit_task(
-        '/project', title='X', planning_mode=True,
+        '/project',
+        title='X',
+        planning_mode=True,
     )
     assert result.get('error_type') == 'RuntimeError'
     assert 'add_task wire failure' in result['error']
@@ -4751,6 +5130,7 @@ async def test_planning_mode_add_task_failure_returns_error(
 
 def test_looks_like_task_id_accepts_numeric_strings():
     from fused_memory.middleware.task_interceptor import _looks_like_task_id
+
     assert _looks_like_task_id('42')
     assert _looks_like_task_id('  42  ')
     assert _looks_like_task_id('0')
@@ -4758,18 +5138,21 @@ def test_looks_like_task_id_accepts_numeric_strings():
 
 def test_looks_like_task_id_accepts_int():
     from fused_memory.middleware.task_interceptor import _looks_like_task_id
+
     assert _looks_like_task_id(42)
     assert _looks_like_task_id(0)
 
 
 def test_looks_like_task_id_rejects_bool():
     from fused_memory.middleware.task_interceptor import _looks_like_task_id
+
     assert not _looks_like_task_id(True)
     assert not _looks_like_task_id(False)
 
 
 def test_looks_like_task_id_rejects_negative_and_non_numeric():
     from fused_memory.middleware.task_interceptor import _looks_like_task_id
+
     assert not _looks_like_task_id(-1)
     assert not _looks_like_task_id('-1')
     assert not _looks_like_task_id('abc')
@@ -4841,7 +5224,9 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
         task_ids: list[str] = []
         for i in range(5):
             result = await interceptor.submit_task(
-                '/project', title=f'sibling-{i}', planning_mode=True,
+                '/project',
+                title=f'sibling-{i}',
+                planning_mode=True,
             )
             assert result['planning_mode'] is True, result
             assert result['status'] == 'deferred', result
@@ -4858,7 +5243,9 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
 
         # Commit the batch: deferred → pending via the CSV bulk path.
         commit_result = await interceptor.set_task_status(
-            ','.join(task_ids), 'pending', '/project',
+            ','.join(task_ids),
+            'pending',
+            '/project',
         )
         assert commit_result['success'] is True
         # All 5 results report no error.
@@ -4872,9 +5259,7 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
 
         # No tickets were persisted in planning mode — the store's submit()
         # was never called (verified by tracking the call count via wrapper).
-        assert submit_calls == [], (
-            f'planning_mode must not persist tickets; got: {submit_calls}'
-        )
+        assert submit_calls == [], f'planning_mode must not persist tickets; got: {submit_calls}'
     finally:
         await store.close()
         for t in list(interceptor._worker_tasks.values()):
@@ -4892,7 +5277,10 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
 
 @pytest.mark.asyncio
 async def test_journaled_write_emits_write_op_and_backend_op(
-    taskmaster, reconciler, event_buffer, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
 ):
     """A write through the interceptor with a journal wired must leave
     one ``write_op`` row and at least one ``backend_op`` row, both tagged
@@ -4918,7 +5306,7 @@ async def test_journaled_write_emits_write_op_and_backend_op(
         write_op_id = wo_rows[0][0]
 
         async with journal._db.execute(
-            "SELECT backend, success FROM backend_ops "
+            'SELECT backend, success FROM backend_ops '
             "WHERE write_op_id = ? AND operation = 'update_task'",
             (write_op_id,),
         ) as cur:
@@ -4934,7 +5322,9 @@ async def test_journaled_write_emits_write_op_and_backend_op(
 
 @pytest.mark.asyncio
 async def test_journaled_write_logs_failure_row(
-    reconciler, event_buffer, tmp_path,
+    reconciler,
+    event_buffer,
+    tmp_path,
 ):
     """A failing tm.* call still produces a write_op row plus a failed
     backend_op row — never silently disappears."""
@@ -4942,9 +5332,12 @@ async def test_journaled_write_logs_failure_row(
     from fused_memory.services.write_journal import WriteJournal
 
     failing_tm = AsyncMock()
-    failing_tm.update_task = AsyncMock(side_effect=TaskmasterError(
-        'TASKMASTER_TOOL_ERROR', 'simulated',
-    ))
+    failing_tm.update_task = AsyncMock(
+        side_effect=TaskmasterError(
+            'TASKMASTER_TOOL_ERROR',
+            'simulated',
+        )
+    )
 
     journal = WriteJournal(tmp_path / 'wj_fail')
     await journal.initialize()
@@ -4980,7 +5373,9 @@ async def test_journaled_write_logs_failure_row(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('bad_status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked'])
 async def test_update_task_rejects_status_kwarg(
-    interceptor, taskmaster, bad_status,
+    interceptor,
+    taskmaster,
+    bad_status,
 ):
     """The interceptor's update_task path also rejects status=…
 
@@ -4989,7 +5384,9 @@ async def test_update_task_rejects_status_kwarg(
     through the terminal-exit, phantom-done, and done-provenance gates.
     """
     result = await interceptor.update_task(
-        task_id='1', project_root='/project', status=bad_status,
+        task_id='1',
+        project_root='/project',
+        status=bad_status,
     )
     assert isinstance(result, dict)
     assert result.get('error') == 'status_via_update_task'
@@ -5002,7 +5399,10 @@ async def test_update_task_rejects_status_kwarg(
 async def test_update_task_status_none_passes_through(interceptor, taskmaster):
     """status=None (the metadata-only path) is unchanged — the gate only blocks non-None."""
     await interceptor.update_task(
-        task_id='1', project_root='/project', status=None, details='x',
+        task_id='1',
+        project_root='/project',
+        status=None,
+        details='x',
     )
     taskmaster.update_task.assert_called_once()
 
@@ -5012,7 +5412,9 @@ async def test_update_task_status_none_passes_through(interceptor, taskmaster):
 
 @pytest.mark.asyncio
 async def test_set_task_status_with_reopen_reason_preserves_metadata(
-    taskmaster, reconciler, event_buffer,
+    taskmaster,
+    reconciler,
+    event_buffer,
 ):
     """Reopening a done task must NOT clobber existing metadata (files, memory_hints).
 
@@ -5021,20 +5423,25 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     overwrites the entire metadata blob, dropping memory_hints and files.
     Fix: read-modify-write so audit fields merge with existing metadata.
     """
-    taskmaster.get_task = AsyncMock(return_value={
-        'id': '7',
-        'status': 'done',
-        'title': 'T',
-        'metadata': {
-            'files': ['a.py', 'b.py'],
-            'memory_hints': {'queries': ['ctx']},
-            'spawned_from': '5',
-        },
-    })
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '7',
+            'status': 'done',
+            'title': 'T',
+            'metadata': {
+                'files': ['a.py', 'b.py'],
+                'memory_hints': {'queries': ['ctx']},
+                'spawned_from': '5',
+            },
+        }
+    )
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '7', 'pending', '/project', reopen_reason='manual reopen',
+        '7',
+        'pending',
+        '/project',
+        reopen_reason='manual reopen',
     )
 
     assert 'error' not in result
@@ -5052,25 +5459,32 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
 
 @pytest.mark.asyncio
 async def test_set_task_status_done_with_provenance_preserves_metadata(
-    taskmaster, reconciler, event_buffer, tmp_path,
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
 ):
     """Marking done with done_provenance must NOT clobber existing metadata."""
     sha = _init_git_repo(tmp_path)
     # Create the declared file so the phantom-done gate doesn't trip on it.
     (tmp_path / 'x.py').write_text('# shipped\n')
-    taskmaster.get_task = AsyncMock(return_value={
-        'id': '9',
-        'status': 'in-progress',
-        'title': 'T',
-        'metadata': {
-            'files': ['x.py'],
-            'memory_hints': {'queries': ['hint']},
-        },
-    })
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '9',
+            'status': 'in-progress',
+            'title': 'T',
+            'metadata': {
+                'files': ['x.py'],
+                'memory_hints': {'queries': ['hint']},
+            },
+        }
+    )
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
     result = await interceptor.set_task_status(
-        '9', 'done', str(tmp_path),
+        '9',
+        'done',
+        str(tmp_path),
         done_provenance={'kind': 'merged', 'commit': sha},
     )
 
@@ -5100,6 +5514,7 @@ class TestInterceptorWriteSucceeded:
 
     def _fn(self):
         from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
         return interceptor_write_succeeded
 
     def test_explicit_success_true(self):
@@ -5228,14 +5643,18 @@ async def test_predone_hook_only_fires_on_done_transition(
         return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
     )
     result_blocked = await interceptor.set_task_status('1', 'blocked', str(tmp_path))
-    assert 'error' not in result_blocked, f'blocked transition should not be rejected: {result_blocked}'
+    assert 'error' not in result_blocked, (
+        f'blocked transition should not be rejected: {result_blocked}'
+    )
 
     # in-progress: go pending→in-progress (no reset_mock — count accumulates)
     taskmaster.get_task = AsyncMock(
         return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
     )
     result_inprog = await interceptor.set_task_status('1', 'in-progress', str(tmp_path))
-    assert 'error' not in result_inprog, f'in-progress transition should not be rejected: {result_inprog}'
+    assert 'error' not in result_inprog, (
+        f'in-progress transition should not be rejected: {result_inprog}'
+    )
 
     # taskmaster.set_task_status must have been called for both transitions
     assert taskmaster.set_task_status.call_count == 2
@@ -5363,7 +5782,222 @@ async def test_predone_hook_per_project_isolation(
     # project-b: no hook, transition succeeds
     taskmaster.set_task_status.reset_mock()
     result_b = await interceptor.set_task_status('2', 'done', str(project_b))
-    assert 'error' not in result_b, (
-        f'project-b should succeed without hook, got: {result_b}'
-    )
+    assert 'error' not in result_b, f'project-b should succeed without hook, got: {result_b}'
     taskmaster.set_task_status.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 1272: orphan-race observability + cancel_ticket logs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
+    interceptor_with_store,
+    ticket_store,
+    taskmaster,
+    caplog,
+):
+    """_process_add_ticket emits a WARNING when the terminal mark_resolved returns
+    False because cancel_ticket won the TOCTOU race.
+
+    Setup: a racing_mark_resolved wrapper simulates cancel_ticket winning the
+    race by persisting status='cancelled' BEFORE forwarding the worker's
+    mark_resolved(status='created') call.  The worker's call therefore returns
+    False.  We assert that a WARNING record exists whose message contains both
+    the ticket_id and the task_id returned by tm.add_task (fixture default
+    '2').
+
+    RED: no such WARNING is currently emitted.
+    """
+    import logging
+
+    ticket_id = await ticket_store.submit(
+        project_id='project',
+        candidate_json=json.dumps(
+            {
+                'project_root': '/project',
+                'kwargs': {'title': 'T', 'description': 'D'},
+                'metadata': None,
+            }
+        ),
+    )
+
+    original_mark_resolved = ticket_store.mark_resolved
+
+    async def racing_mark_resolved(tid: str, *, status: str, **kwargs):
+        if tid == ticket_id and status == 'created':
+            # Simulate cancel_ticket winning the race: flip the row to
+            # 'cancelled' BEFORE the worker's mark_resolved lands.
+            await original_mark_resolved(tid, status='cancelled', reason='user_cancelled')
+        # Forward the worker's call — returns False because row is no longer pending.
+        return await original_mark_resolved(tid, status=status, **kwargs)
+
+    ticket_store.mark_resolved = racing_mark_resolved
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            await interceptor_with_store._process_add_ticket(ticket_id)
+    finally:
+        ticket_store.mark_resolved = original_mark_resolved
+
+    # (a) WARNING record must contain both ticket_id and orphan task_id '2'
+    warning_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and ticket_id in r.message and '2' in r.message
+    ]
+    assert warning_records, (
+        f'Expected a WARNING containing ticket_id={ticket_id!r} and task_id="2"; '
+        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
+
+    # (b) Row status is 'cancelled' (cancel_ticket won the race)
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'cancelled', f'Expected cancelled, got {row["status"]!r}'
+
+    # (c) tm.add_task was called once — the task is live in tasks.json
+    taskmaster.add_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_clean_win_logs_info(
+    interceptor_with_store,
+    ticket_store,
+    caplog,
+):
+    """cancel_ticket emits an INFO log when it successfully cancels a pending ticket.
+
+    RED: cancel_ticket currently emits no log on the clean-cancel path.
+    """
+    import logging
+
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor_with_store.cancel_ticket(ticket_id)
+
+    # (a) Existing contract is preserved
+    assert result == {'status': 'cancelled', 'ticket_id': ticket_id}, (
+        f'Expected cancelled result, got: {result!r}'
+    )
+
+    # (b) Exactly one INFO record with ticket_id and 'cancelled'
+    info_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and ticket_id in r.message and 'cancelled' in r.message
+    ]
+    assert info_records, (
+        f'Expected an INFO record containing ticket_id={ticket_id!r} and "cancelled"; '
+        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_race_loss_logs_info_with_status(
+    interceptor_with_store,
+    ticket_store,
+    caplog,
+):
+    """cancel_ticket emits an INFO log when it loses the TOCTOU race to a concurrent worker.
+
+    Reuses the racing_mark_resolved pattern from
+    test_cancel_ticket_race_returns_noop_with_actual_status: a concurrent
+    worker terminalizes the row to 'created' between cancel's get() and the
+    UPDATE.  After the race, cancel_ticket re-fetches and returns the no_op
+    shape.  We assert an INFO record exists containing the ticket_id, the
+    actual recovered status ('created'), and a race indicator.
+
+    Level is INFO (not WARNING) because not every race-loss implies an orphan:
+    if the worker finished normally the race is benign.  The authoritative
+    orphan WARNING lives in _persist_worker_terminal.
+    """
+    import logging
+
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    original_mark_resolved = ticket_store.mark_resolved
+
+    async def racing_mark_resolved(tid: str, *, status: str, **kwargs):
+        if tid == ticket_id and status == 'cancelled':
+            # The racing writer wins first: force the row to terminal 'created'.
+            await original_mark_resolved(tid, status='created', reason='raced_first')
+        # Now our cancel UPDATE runs — returns False because status != 'pending'.
+        return await original_mark_resolved(tid, status=status, **kwargs)
+
+    ticket_store.mark_resolved = racing_mark_resolved
+    try:
+        with caplog.at_level(logging.INFO, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor_with_store.cancel_ticket(ticket_id)
+    finally:
+        ticket_store.mark_resolved = original_mark_resolved
+
+    # (a) Existing contract is preserved
+    assert result == {'status': 'created', 'ticket_id': ticket_id, 'no_op': True}, (
+        f'Expected no_op with actual status=created, got: {result!r}'
+    )
+
+    # (b) INFO record with ticket_id, actual status, and a race indicator
+    info_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO
+        and ticket_id in r.message
+        and 'created' in r.message
+        and any(kw in r.message for kw in ('race', 'raced', 'lost'))
+    ]
+    assert info_records, (
+        f'Expected an INFO record containing ticket_id={ticket_id!r}, "created", and a '
+        f'race indicator; got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_worker_terminal_orphan_race_emits_warning(
+    interceptor_with_store,
+    ticket_store,
+    caplog,
+):
+    """_persist_worker_terminal emits a WARNING when mark_resolved returns False
+    while status='created' and task_id is non-None.
+
+    This is a focused unit test for the helper itself.  We pre-terminate the
+    ticket row to 'cancelled' so that the subsequent mark_resolved(status='created')
+    returns False, and verify the orphan-race WARNING is emitted with both the
+    ticket_id and the orphan task_id.
+
+    The authoritative orphan-WARNING lives here — not in cancel_ticket — because
+    only the worker knows whether a live task was created before the race was lost.
+    """
+    import logging
+
+    # Submit a ticket and immediately terminate it to 'cancelled', simulating
+    # cancel_ticket winning the race before the worker reaches mark_resolved.
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+    await ticket_store.mark_resolved(ticket_id, status='cancelled', reason='pre_cancelled')
+
+    orphan_task_id = 'task-orphan-42'
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor_with_store._persist_worker_terminal(
+            ticket_id,
+            status='created',
+            task_id=orphan_task_id,
+            reason='worker_completed',
+            result_dict=None,
+        )
+
+    # mark_resolved returned False because the row was no longer pending
+    assert result is False, f'Expected False (row was pre-cancelled), got {result!r}'
+
+    # A WARNING must be emitted containing both ticket_id and orphan task_id
+    warning_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and ticket_id in r.message and orphan_task_id in r.message
+    ]
+    assert warning_records, (
+        f'Expected a WARNING containing ticket_id={ticket_id!r} and '
+        f'task_id={orphan_task_id!r}; '
+        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
