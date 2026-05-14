@@ -1609,6 +1609,17 @@ class Scheduler:
                 if prev_order != cur_order:
                     pin_queue_changed = True
 
+            # --- reserve_now diffs (False→True only; True→False is handled by
+            # --- reserve_now_consumed at the short-circuit emit site)
+            prev_rn = prev_row.reserve_now if prev_row else False
+            cur_rn = cur_row.reserve_now if cur_row else False
+            if not prev_rn and cur_rn:
+                self.event_store.emit(
+                    EventType.reserve_now_armed,
+                    task_id=tid,
+                    data={},
+                )
+
         # One ``pin_queue_reordered`` event per tick for any pin_order change.
         # Derive the new order from the in-memory ``cur`` snapshot (no second
         # SQLite round-trip — the post-GC snapshot is already authoritative).
@@ -1723,6 +1734,13 @@ class Scheduler:
             for tid in expired_overrides:
                 current_overrides.pop(tid, None)
 
+        # Snapshot pre-short-circuit overrides for diff-detection.  The
+        # short-circuit below mutates current_overrides (clears reserve_now) so
+        # the diff would otherwise never see a False→True transition for
+        # reserve_now.  The next tick's prev snapshot uses the post-short-circuit
+        # state (current_overrides), keeping the per-tick diff semantics correct.
+        overrides_for_diff = dict(current_overrides)
+
         # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
         # install parks on its modules then clear the flag.  This is single-tick
         # fire-and-forget — the parks will survive until the owner-GC sweep evicts
@@ -1804,8 +1822,9 @@ class Scheduler:
                     continue
 
         # Diff-detect override changes and emit priority_override_* events.
-        # The diff runs AFTER all in-memory mutations (GC + reserve_now clearing)
-        # so that the snapshot captures the true post-tick state.
+        # Uses the pre-short-circuit override snapshot (overrides_for_diff) so
+        # reserve_now False→True transitions are visible even though the
+        # short-circuit already cleared the flag in current_overrides.
         #
         # On the first tick after a scheduler restart the snapshot starts empty.
         # Diffing against {} would emit spurious priority_override_set / task_pinned
@@ -1813,7 +1832,7 @@ class Scheduler:
         # that interpret them as fresh user actions.  We skip the diff on the
         # first tick and seed the snapshot so subsequent ticks diff correctly.
         if self._overrides_initialized:
-            self._emit_override_diff_events(self._prev_overrides_snapshot, current_overrides)
+            self._emit_override_diff_events(self._prev_overrides_snapshot, overrides_for_diff)
         else:
             self._overrides_initialized = True
         self._prev_overrides_snapshot = dict(current_overrides)
