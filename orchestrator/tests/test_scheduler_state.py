@@ -7,8 +7,7 @@ together for future maintenance.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
-from pathlib import Path
+from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -17,7 +16,6 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.overrides import OverrideStore
 from orchestrator.scheduler import ModuleLockTable, Scheduler
-
 
 # ---------------------------------------------------------------------------
 # Reuse the _RecordingEventStore test double from test_scheduler.py
@@ -469,8 +467,6 @@ class TestWriteStateSnapshot:
         # First write: inject a sentinel skip count.
         scheduler._skip_count['first'] = 1
         scheduler.write_state_snapshot(path)
-        first_content = json.loads(path.read_text())
-
         # Second write: clear skip_count and add a different sentinel.
         scheduler._skip_count.clear()
         scheduler._skip_count['second'] = 2

@@ -347,6 +347,7 @@ class TestSnapshotPerformance:
         }
         _write_snapshot(tmp_path, snapshot)
 
+        result: dict = {}
         samples = []
         for _ in range(10):
             t0 = time.perf_counter()
