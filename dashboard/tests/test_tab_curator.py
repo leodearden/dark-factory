@@ -136,7 +136,7 @@ def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
     # CURATOR_STATE block only.  A bare-substring check against the full data.js
     # body would pass even if this block were deleted (e.g. 'pending' appears in
     # MEMORY_STATUS and BURNDOWN; 'state' appears in MEMORY_STATUS.burst_state).
-    for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
+    for key in ('pending', 'latency_spark', 'pending_spark', 'capped_spark', 'state'):
         assert re.search(rf'\b{key}\s*:', seed_block), (
             f"CURATOR_STATE seed missing key '{key}:' — "
             f"add it to the window.DF_DATA initializer in data.js."
