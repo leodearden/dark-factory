@@ -8,6 +8,7 @@ the same process.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Sequence
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,13 +25,32 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     The returned proxy has each field name as a class attribute, so MagicMock
     sees them and rejects typos on both get and set.
 
+    User-defined ``@property`` descriptors (e.g. ``OrchestratorConfig.overrides_db_path``)
+    are also included in the proxy so ``spec_set`` accepts both read and write.
+    BaseModel-inherited properties (``model_extra``, ``model_fields_set``, …) are
+    excluded to preserve the invariant that BaseModel API surface is NOT exposed.
+
     Pydantic methods (model_dump, model_validate, …) are intentionally NOT
     exposed; if a test needs them, mock them explicitly.
     """
+    members: dict[str, None] = {f: None for f in model.model_fields}
+    # @property descriptors declared on the user's class (e.g.
+    # OrchestratorConfig.overrides_db_path) — exclude properties inherited
+    # from BaseModel (model_extra, model_fields_set, __fields_set__) so the
+    # existing "BaseModel API is not exposed" invariant is preserved.
+    _basemodel_props = {
+        name
+        for name, value in inspect.getmembers(BaseModel)
+        if isinstance(value, property)
+    }
+    for name, _ in inspect.getmembers(model, lambda v: isinstance(v, property)):
+        if name in _basemodel_props:
+            continue
+        members[name] = None
     return type(
         f'_{model.__name__}Spec',
         (),
-        {f: None for f in model.model_fields},
+        members,
     )
 
 
