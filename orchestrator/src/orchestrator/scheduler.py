@@ -1764,6 +1764,16 @@ class Scheduler:
                             rid,
                             exc_info=True,
                         )
+                        # Restore failed — DB still holds reserve_now=False (cleared
+                        # above).  Mirror that in memory so the diff-layer doesn't
+                        # fabricate a spurious priority_override_cleared event next tick.
+                        current_overrides[rid] = OverrideRow(
+                            boost_tier=rrow.boost_tier,
+                            pinned=rrow.pinned,
+                            pin_order=rrow.pin_order,
+                            reserve_now=False,
+                            ttl_until=rrow.ttl_until,
+                        )
                     continue
 
         # Diff-detect override changes and emit priority_override_* events.
