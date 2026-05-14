@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -594,7 +595,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     """
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         body = None
 
     ticket_id = body.get('ticket_id') if isinstance(body, dict) else None
@@ -608,6 +609,10 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
     errors: list[str] = []
+    # Assumption: cancel_ticket is idempotent and each ticket lives on exactly
+    # one fused-memory instance.  First-success-or-not_found semantics are
+    # correct; we do NOT fan out past a successful response to avoid
+    # double-cancelling.  Only network/transport errors trigger fallthrough.
     for url in config.fused_memory_urls:
         try:
             result = await memory_data.mcp_tool_call(
@@ -615,7 +620,10 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             )
         except (httpx.ConnectError, httpx.TimeoutException,
                 httpx.HTTPStatusError, ValueError) as exc:
-            errors.append(f'{url}: {exc}')
+            errors.append(f'{url}: {type(exc).__name__}')
+            # Invalidate the cached MCP session so the next caller retries
+            # session initialisation — mirrors get_memory_status/get_queue_stats.
+            memory_data._sessions.pop(url.rstrip('/'), None)
             continue
         if result.get('error') == 'not_found':
             return JSONResponse(result, status_code=404)

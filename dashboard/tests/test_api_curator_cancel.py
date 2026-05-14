@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -86,8 +87,9 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     _client_arg, url_arg, tool_arg, args_arg = mock_mcp.call_args.args
     assert tool_arg == 'cancel_ticket'
     assert args_arg == {'ticket_id': 'tkt_abc'}
-    # The URL must come from the app's default fused_memory_urls[0]
-    assert 'localhost' in url_arg
+    # The URL must be exactly the first entry in the default config
+    from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+    assert url_arg == DEFAULT_FUSED_MEMORY_URLS[0]
 
 
 # ---------------------------------------------------------------------------
@@ -131,3 +133,96 @@ def test_all_servers_unreachable_returns_502(client):
     assert isinstance(data['detail'], str)
     # Default config has exactly one URL → exactly one MCP attempt
     assert mock_mcp.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Two-URL fan-out tests (suggestion 3): fallback and short-circuit
+# ---------------------------------------------------------------------------
+
+
+def _two_url_client(two_url_config):
+    """Return a TestClient with the two-URL config overriding app.state.config."""
+    from dashboard.app import app
+
+    ctx = TestClient(app)
+    ctx.__enter__()
+    app.state.config = two_url_config
+    return ctx
+
+
+def test_two_url_fallback_url0_fails_url1_succeeds(two_url_config):
+    """URL[0] raises ConnectError; URL[1] returns cancelled → overall 200.
+
+    Verifies that the for-loop actually falls through to the next server on a
+    transport error (rather than short-circuiting and returning 502 too early).
+    """
+    mcp_result = {'status': 'cancelled', 'ticket_id': 'tkt_abc'}
+    side_effects = [httpx.ConnectError('refused'), mcp_result]
+
+    ctx = _two_url_client(two_url_config)
+    try:
+        with patch(_PATCH_TARGET, new=AsyncMock(side_effect=side_effects)) as mock_mcp:
+            resp = ctx.post(
+                '/api/v2/dashboard/curator/cancel',
+                json={'ticket_id': 'tkt_abc'},
+            )
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert resp.status_code == 200
+    assert resp.json() == mcp_result
+    # Both URLs must have been tried
+    assert mock_mcp.call_count == 2
+    urls_called = [call.args[1] for call in mock_mcp.call_args_list]
+    assert urls_called == ['http://localhost:9000', 'http://localhost:9001']
+
+
+def test_two_url_not_found_short_circuits_loop(two_url_config):
+    """URL[0] returns not_found → 404 immediately; URL[1] is never called.
+
+    Verifies the first-success-or-not_found semantics: an authoritative MCP
+    response (including not_found) stops the loop, so we don't incorrectly
+    report 404 when the ticket might live on a different server.
+    """
+    mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
+
+    ctx = _two_url_client(two_url_config)
+    try:
+        with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+            resp = ctx.post(
+                '/api/v2/dashboard/curator/cancel',
+                json={'ticket_id': 'tkt_missing'},
+            )
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert resp.status_code == 404
+    assert resp.json() == mcp_result
+    # Only URL[0] must have been called; URL[1] must be skipped
+    assert mock_mcp.call_count == 1
+    assert mock_mcp.call_args.args[1] == 'http://localhost:9000'
+
+
+def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_config):
+    """Both URLs raise ConnectError → 502 with detail mentioning both URLs."""
+    ctx = _two_url_client(two_url_config)
+    try:
+        with patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        ) as mock_mcp:
+            resp = ctx.post(
+                '/api/v2/dashboard/curator/cancel',
+                json={'ticket_id': 'tkt_xyz'},
+            )
+    finally:
+        ctx.__exit__(None, None, None)
+
+    assert resp.status_code == 502
+    data = resp.json()
+    assert data.get('error') == 'fused_memory_unreachable'
+    detail = data.get('detail', '')
+    # Both server URLs must appear in the error detail
+    assert 'localhost:9000' in detail
+    assert 'localhost:9001' in detail
+    assert mock_mcp.call_count == 2
