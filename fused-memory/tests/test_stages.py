@@ -1334,6 +1334,23 @@ class TestNeedsHintConversion:
         task = self._make_task({'entities': ['Foo'], 'queries': ['what is Foo']})
         assert _needs_hint_conversion(task) is False
 
+    # ------------------------------------------------------------------ defensive edge cases
+
+    def test_task_without_metadata_key_classified_as_conversion_target(self):
+        """Task dict with no 'metadata' key at all returns True (treated as no hints attached)."""
+        task = {'id': 1, 'title': 'T', 'status': 'pending'}
+        assert _needs_hint_conversion(task) is True
+
+    def test_task_with_none_metadata_classified_as_conversion_target(self):
+        """Task with metadata=None returns True (malformed metadata can't carry valid hints)."""
+        task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': None}
+        assert _needs_hint_conversion(task) is True
+
+    def test_task_with_non_dict_metadata_string_classified_as_conversion_target(self):
+        """Task with metadata as a string returns True (defensive: non-dict metadata treated as no hints)."""
+        task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': 'not-a-dict'}
+        assert _needs_hint_conversion(task) is True
+
 
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
