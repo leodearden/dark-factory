@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+import threading
+import time
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -177,6 +179,82 @@ class TestPinning:
         # Store is clean — no rows created
         assert store.get_overrides('proj') == {}
 
+    def test_concurrent_auto_pin_assigns_distinct_pin_orders(self, tmp_path: Path) -> None:
+        """Two concurrent set_override(pinned=True) calls must produce {1,2}.
+
+        Pre-fix (no BEGIN IMMEDIATE): both threads can read MAX=0 simultaneously
+        and both compute pin_order=1, producing a PinOrderCollision or duplicate
+        pin_order values.  Post-fix (BEGIN IMMEDIATE): SQLite serializes the two
+        write transactions so they assign 1 and 2 respectively.
+
+        The ``_after_max_select`` hook injects a 50 ms pause between the MAX
+        SELECT and the UPSERT.  Post-fix the pause is inside the locked
+        transaction, so the second thread blocks at its BEGIN IMMEDIATE until
+        the first commits.  Pre-fix (no BEGIN IMMEDIATE) the pause would let
+        the second thread read the same MAX=0 and produce duplicate pin_orders.
+        This makes the race deterministic rather than a probabilistic smoke test.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        # Inject a pause between MAX read and UPSERT to expose the race pre-fix.
+        store._after_max_select = lambda: time.sleep(0.05)
+
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def pin_task(task_id: str) -> None:
+            try:
+                barrier.wait()  # both threads enter set_override at the same time
+                store.set_override('proj', task_id, pinned=True)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = threading.Thread(target=pin_task, args=('A',))
+        t2 = threading.Thread(target=pin_task, args=('B',))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == [], f'Unexpected exceptions: {errors}'
+
+        overrides = store.get_overrides('proj')
+        assert 'A' in overrides, 'Task A must be present after concurrent pin'
+        assert 'B' in overrides, 'Task B must be present after concurrent pin'
+
+        pin_orders = {overrides['A'].pin_order, overrides['B'].pin_order}
+        assert pin_orders == {1, 2}, (
+            f'Expected distinct pin_orders {{1, 2}}; got {pin_orders}'
+        )
+
+    def test_set_override_pinned_false_clears_pin_order(self, tmp_path: Path) -> None:
+        """set_override(pinned=False) must also zero out pin_order.
+
+        Docstring contract: 'Passing pinned=False is an explicit write that
+        zeroes pinned AND pin_order.'  Pre-fix the COALESCE leaves a stale
+        pin_order on the row when no pin_order kwarg is supplied.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+
+        # Setup: pin A with an explicit pin_order
+        store.set_override('proj', 'A', pinned=True, pin_order=2)
+        overrides = store.get_overrides('proj')
+        assert overrides['A'].pinned is True
+        assert overrides['A'].pin_order == 2
+
+        # Action: un-pin without supplying a pin_order
+        store.set_override('proj', 'A', pinned=False)
+
+        # Assertion: pinned=False AND pin_order=None
+        overrides = store.get_overrides('proj')
+        assert overrides['A'].pinned is False
+        assert overrides['A'].pin_order is None, (
+            'pin_order must be cleared when pinned=False is set explicitly'
+        )
+
 
 class TestPinQueue:
     def test_get_pin_queue_returns_pinned_rows_in_pin_order_asc(
@@ -244,6 +322,20 @@ class TestClear:
         result = store.clear_override('proj', 'nonexistent')
         assert result is False
 
+    def test_clear_override_invalid_field_raises_value_error(self, tmp_path: Path) -> None:
+        """Regression: clear_override(field='bogus') must raise ValueError.
+
+        The ValueError path at overrides.py:257-260 was previously uncovered.
+        This test characterizes existing correct behavior — no impl change needed.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', boost_tier='high')
+
+        with pytest.raises(ValueError, match='field must be one of'):
+            store.clear_override('proj', 'A', field='bogus')
+
 
 class TestReorder:
     def test_reorder_pin_queue_rewrites_pin_order(self, tmp_path: Path) -> None:
@@ -290,6 +382,34 @@ class TestReorder:
         with pytest.raises(ValueError):
             store.reorder_pin_queue('proj', ['C', 'A', 'B', 'D'])
 
+    def test_reorder_pin_queue_rejects_duplicate_ids(self, tmp_path: Path) -> None:
+        """Duplicate task IDs in the input must raise ValueError before writing.
+
+        Pre-fix: ['A', 'A', 'B'] passes set-equality against {A,B} (wrong set)
+        and writes A→1, A→2 silently.  The duplicate check must fire BEFORE the
+        set-equality check so the error message clearly says 'duplicate'.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=1)
+        store.set_override('proj', 'B', pinned=True, pin_order=2)
+        store.set_override('proj', 'C', pinned=True, pin_order=3)
+
+        # List form: duplicate A, only 3 elements so set-equality would be
+        # {A,B} != {A,B,C} — but the duplicate check must fire first
+        with pytest.raises(ValueError, match='duplicate'):
+            store.reorder_pin_queue('proj', ['A', 'A', 'B'])
+
+        # CSV form: same check via string path
+        with pytest.raises(ValueError, match='duplicate'):
+            store.reorder_pin_queue('proj', 'A,A,B')
+
+        # After both raises, pin_order values must be unchanged
+        queue = store.get_pin_queue('proj')
+        task_ids = [tid for tid, _ in queue]
+        assert task_ids == ['A', 'B', 'C'], 'pin_order must be unchanged after rejected reorder'
+
 
 class TestSweeps:
     def test_clear_terminal_deletes_named_owners(self, tmp_path: Path) -> None:
@@ -325,6 +445,38 @@ class TestSweeps:
         assert 'A' not in remaining
         assert 'B' in remaining
         assert 'C' in remaining
+
+    def test_clear_expired_handles_non_utc_ttl(self, tmp_path: Path) -> None:
+        """TTLs stored with non-UTC offsets must still expire correctly.
+
+        Pre-fix: ttl_until is stored verbatim as ISO string, so lexicographic
+        compare of "2026-05-14T05:00:00+05:00" vs "2026-05-14T01:00:00+00:00"
+        incorrectly puts the TTL *after* now (05 > 01).
+
+        Post-fix: set_override normalises to UTC before storing, so the stored
+        value is "2026-05-14T00:00:00+00:00" and clear_expired correctly sees
+        it has expired when now = 01:00 UTC.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        # +05:00 time that is 00:00 UTC absolute (i.e. already expired vs 01:00 UTC)
+        ttl_plus5 = datetime(2026, 5, 14, 5, 0, tzinfo=timezone(timedelta(hours=5)))
+        now_utc = datetime(2026, 5, 14, 1, 0, tzinfo=UTC)  # 1 hour later in absolute time
+
+        store.set_override('proj', 'A', ttl_until=ttl_plus5)
+        cleared = store.clear_expired('proj', now_utc)
+        assert cleared == ['A'], (
+            'Entry with ttl_plus5 (==00:00 UTC absolute) must be cleared when now=01:00 UTC'
+        )
+
+    def test_set_override_rejects_naive_ttl(self, tmp_path: Path) -> None:
+        """set_override must reject naive (tz-unaware) ttl_until datetimes."""
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        with pytest.raises(ValueError, match='timezone'):
+            store.set_override('proj', 'B', ttl_until=datetime(2026, 5, 14))
 
 
 class TestSeparateDB:

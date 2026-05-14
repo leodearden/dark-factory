@@ -23,6 +23,7 @@ them at read-time.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -98,6 +99,10 @@ class OverrideStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Debug hook: called between the MAX(pin_order) SELECT and the UPSERT
+        # inside set_override.  Set to a callable in tests to inject an
+        # artificial pause and make the auto-assign race condition observable.
+        self._after_max_select: Callable[[], None] | None = None
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -154,76 +159,100 @@ class OverrideStore:
                 f'got pin_order={pin_order!r} with pinned={pinned!r}'
             )
 
-        now_iso = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            # Resolve auto-assigned pin_order when pinning without an explicit order.
-            if pinned is True and pin_order is None:
-                # If this task is already pinned, preserve its existing pin_order
-                # so that re-pinning (e.g. set_override(pinned=True, boost_tier='high'))
-                # is idempotent with respect to queue position.  Without this
-                # guard the MAX query would include the task's OWN row and produce
-                # MAX+1, silently shifting an already-pinned task to the back.
-                already_pinned = conn.execute(
-                    'SELECT pin_order FROM overrides '
-                    'WHERE project_root=? AND task_id=? AND pinned=1',
-                    (project_root, task_id),
-                ).fetchone()
-                if already_pinned is not None:
-                    pin_order = already_pinned[0]  # preserve; no re-assignment
-                else:
-                    row = conn.execute(
-                        'SELECT COALESCE(MAX(pin_order), 0) + 1 '
-                        'FROM overrides WHERE project_root=? AND pinned=1',
-                        (project_root,),
-                    ).fetchone()
-                    pin_order = row[0]
-
-            # Collision check for explicit or auto-assigned pin_order.
-            if pin_order is not None:
-                existing = conn.execute(
-                    'SELECT task_id FROM overrides '
-                    'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
-                    (project_root, pin_order, task_id),
-                ).fetchone()
-                if existing:
-                    raise PinOrderCollision(
-                        f'pin_order={pin_order} already in use by task '
-                        f'{existing[0]}; cannot pin task {task_id}'
-                    )
-
-            # Convert Python types to SQLite-friendly values.
-            pinned_int = int(pinned) if pinned is not None else None
-            reserve_now_int = int(reserve_now) if reserve_now is not None else None
-            ttl_iso = ttl_until.isoformat() if ttl_until is not None else None
-
-            conn.execute(
-                """
-                INSERT INTO overrides
-                    (project_root, task_id, boost_tier, pinned, pin_order,
-                     reserve_now, ttl_until, created_at, updated_at)
-                VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
-                ON CONFLICT(project_root, task_id) DO UPDATE SET
-                    boost_tier  = COALESCE(?, boost_tier),
-                    pinned      = COALESCE(?, pinned),
-                    pin_order   = COALESCE(?, pin_order),
-                    reserve_now = COALESCE(?, reserve_now),
-                    ttl_until   = COALESCE(?, ttl_until),
-                    updated_at  = ?
-                """,
-                (
-                    # INSERT values
-                    project_root, task_id,
-                    boost_tier, pinned_int, pin_order,
-                    reserve_now_int, ttl_iso,
-                    now_iso, now_iso,
-                    # UPDATE SET values
-                    boost_tier, pinned_int, pin_order,
-                    reserve_now_int, ttl_iso,
-                    now_iso,
-                ),
+        if ttl_until is not None and ttl_until.tzinfo is None:
+            raise ValueError(
+                'ttl_until must be timezone-aware; got a naive datetime'
             )
-            conn.commit()
+
+        now_iso = datetime.now(UTC).isoformat()
+        # timeout=30: when BEGIN IMMEDIATE blocks (another writer holds the lock)
+        # SQLite will retry for up to 30 s before raising OperationalError.  The
+        # default 5 s is tight for MCP override tools that could drive concurrent
+        # writes from multiple sessions.
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
+        try:
+            # Acquire a write lock up-front (IMMEDIATE) so that the MAX(pin_order)
+            # read and the subsequent UPSERT are serialized with respect to
+            # concurrent set_override calls.  Without this, two concurrent
+            # callers can both read MAX=N and both attempt to write N+1, causing
+            # a PinOrderCollision or silent duplicate pin_order values.
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+
+                # Resolve auto-assigned pin_order when pinning without an explicit order.
+                if pinned is True and pin_order is None:
+                    # If this task is already pinned, preserve its existing pin_order
+                    # so that re-pinning (e.g. set_override(pinned=True, boost_tier='high'))
+                    # is idempotent with respect to queue position.  Without this
+                    # guard the MAX query would include the task's OWN row and produce
+                    # MAX+1, silently shifting an already-pinned task to the back.
+                    already_pinned = conn.execute(
+                        'SELECT pin_order FROM overrides '
+                        'WHERE project_root=? AND task_id=? AND pinned=1',
+                        (project_root, task_id),
+                    ).fetchone()
+                    if already_pinned is not None:
+                        pin_order = already_pinned[0]  # preserve; no re-assignment
+                    else:
+                        row = conn.execute(
+                            'SELECT COALESCE(MAX(pin_order), 0) + 1 '
+                            'FROM overrides WHERE project_root=? AND pinned=1',
+                            (project_root,),
+                        ).fetchone()
+                        pin_order = row[0]
+                        # Debug hook: tests may inject a sleep here to expose
+                        # the race between reading MAX and writing the UPSERT.
+                        # Post-fix (BEGIN IMMEDIATE), the sleep holds the write
+                        # lock so the other thread blocks at its BEGIN IMMEDIATE.
+                        if self._after_max_select is not None:
+                            self._after_max_select()
+
+                # Collision check for explicit or auto-assigned pin_order.
+                if pin_order is not None:
+                    existing = conn.execute(
+                        'SELECT task_id FROM overrides '
+                        'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
+                        (project_root, pin_order, task_id),
+                    ).fetchone()
+                    if existing:
+                        raise PinOrderCollision(
+                            f'pin_order={pin_order} already in use by task '
+                            f'{existing[0]}; cannot pin task {task_id}'
+                        )
+
+                # Convert Python types to SQLite-friendly values.
+                pinned_int = int(pinned) if pinned is not None else None
+                reserve_now_int = int(reserve_now) if reserve_now is not None else None
+                ttl_iso = ttl_until.astimezone(UTC).isoformat() if ttl_until is not None else None
+
+                conn.execute(
+                    """
+                    INSERT INTO overrides
+                        (project_root, task_id, boost_tier, pinned, pin_order,
+                         reserve_now, ttl_until, created_at, updated_at)
+                    VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                    ON CONFLICT(project_root, task_id) DO UPDATE SET
+                        boost_tier  = COALESCE(?, boost_tier),
+                        pinned      = COALESCE(?, pinned),
+                        pin_order   = CASE WHEN ?=0 THEN NULL
+                                           ELSE COALESCE(?, pin_order) END,
+                        reserve_now = COALESCE(?, reserve_now),
+                        ttl_until   = COALESCE(?, ttl_until),
+                        updated_at  = ?
+                    """,
+                    (
+                        # INSERT values
+                        project_root, task_id,
+                        boost_tier, pinned_int, pin_order,
+                        reserve_now_int, ttl_iso,
+                        now_iso, now_iso,
+                        # UPDATE SET values
+                        boost_tier, pinned_int,
+                        pinned_int, pin_order,   # CASE WHEN new_pinned=0 THEN NULL ELSE COALESCE(new_pin_order, existing_pin_order) END
+                        reserve_now_int, ttl_iso,
+                        now_iso,
+                    ),
+                )
         finally:
             conn.close()
 
@@ -299,6 +328,11 @@ class OverrideStore:
         """
         if isinstance(ordered_task_ids, str):
             ordered_task_ids = [t.strip() for t in ordered_task_ids.split(',')]
+
+        if len(ordered_task_ids) != len(set(ordered_task_ids)):
+            raise ValueError(
+                f'reorder_pin_queue: duplicate task ids in input: {ordered_task_ids!r}'
+            )
 
         current_pairs = self.get_pin_queue(project_root)
         current_ids = {tid for tid, _ in current_pairs}
@@ -377,7 +411,11 @@ class OverrideStore:
                 'DELETE FROM overrides '
                 'WHERE project_root=? AND ttl_until IS NOT NULL AND ttl_until < ? '
                 'RETURNING task_id',
-                (project_root, now.isoformat()),
+                # Normalise to UTC so the ISO-string comparison is invariant
+                # under caller-supplied tzinfo.  Stored TTLs are also UTC-
+                # normalised (set_override guarantees this since step-6), so
+                # the lexicographic comparison produces correct results.
+                (project_root, now.astimezone(UTC).isoformat()),
             ).fetchall()
             conn.commit()
             return sorted(r[0] for r in rows)
