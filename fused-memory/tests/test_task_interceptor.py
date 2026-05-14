@@ -6093,7 +6093,14 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
         @asynccontextmanager
         async def _ctx():
             yield
-            await asyncio.sleep(0)  # Deliver pending cancellation from fake_dispatch
+            # Suspension-point invariant: this sleep is the FIRST yield after
+            # fake_dispatch's `task.cancel()`, so the pending CancelledError is
+            # delivered HERE — still inside `_process_add_ticket`'s try block with
+            # status='created' and task_id already set.  See the surrounding
+            # docstring for the full timing chain.  Do NOT reorder or remove
+            # without also auditing the cancellation-timing contract documented
+            # in the test docstring above.
+            await asyncio.sleep(0)
 
         return _ctx()
 
