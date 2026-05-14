@@ -2293,6 +2293,49 @@ class TaskInterceptor:
 
         return (status, task_id, reason, result_dict, curator_degrade_reason)
 
+    async def _persist_worker_terminal(
+        self,
+        ticket_id: str,
+        *,
+        status: str,
+        task_id: str | None,
+        reason: str | None,
+        result_dict: dict | None,
+    ) -> bool:
+        """Persist a worker's terminal status via asyncio.shield and warn on orphan-race.
+
+        Wraps ``asyncio.shield(self._ticket_store.mark_resolved(...))`` and
+        logs a WARNING when the call returns ``False`` AND ``status == 'created'``
+        AND ``task_id`` is non-None.  That combination indicates an orphan-race:
+        ``tm.add_task`` succeeded (the task is live in tasks.json) but a
+        concurrent ``cancel_ticket`` call won the row-level race and the ticket
+        is now ``cancelled`` with ``task_id=NULL``.
+
+        Returns:
+            The ``bool`` returned by ``mark_resolved`` (``True`` if the row was
+            still pending and the UPDATE landed; ``False`` if a concurrent writer
+            already terminalized it).
+        """
+        resolved = await asyncio.shield(
+            self._ticket_store.mark_resolved(
+                ticket_id,
+                status=status,
+                task_id=task_id,
+                reason=reason,
+                result_json=json.dumps(result_dict) if result_dict is not None else None,
+            )
+        )
+        if not resolved and status == 'created' and task_id is not None:
+            logger.warning(
+                '_process_add_ticket: orphan-race for ticket %s — '
+                'tm.add_task created task %s but ticket row was terminalized '
+                'by a concurrent writer (likely cancel_ticket); task is live '
+                'in tasks.json, recover via journal task_created event',
+                ticket_id,
+                task_id,
+            )
+        return resolved
+
     async def _process_add_ticket(self, ticket_id: str) -> None:
         """Run the full curator + write pipeline for a single ticket.
 
@@ -2480,14 +2523,12 @@ class TaskInterceptor:
         # Shield from cancellation so that a close()-triggered CancelledError
         # that arrives here (after the try/except block) does not prevent the
         # ticket from reaching a terminal state.
-        await asyncio.shield(
-            self._ticket_store.mark_resolved(
-                ticket_id,
-                status=status,
-                task_id=task_id,
-                reason=reason,
-                result_json=json.dumps(result_dict) if result_dict is not None else None,
-            )
+        await self._persist_worker_terminal(
+            ticket_id,
+            status=status,
+            task_id=task_id,
+            reason=reason,
+            result_dict=result_dict,
         )
 
         # ── Emit journal event and schedule commit (create path only) ────
@@ -2851,16 +2892,12 @@ class TaskInterceptor:
                         result_dict = None
 
                     # Persist terminal state.
-                    await asyncio.shield(
-                        self._ticket_store.mark_resolved(
-                            t.ticket_id,
-                            status=status,
-                            task_id=task_id,
-                            reason=reason,
-                            result_json=json.dumps(result_dict)
-                            if result_dict is not None
-                            else None,
-                        )
+                    await self._persist_worker_terminal(
+                        t.ticket_id,
+                        status=status,
+                        task_id=task_id,
+                        reason=reason,
+                        result_dict=result_dict,
                     )
 
                     # Emit journal event and schedule commit (create path only).
