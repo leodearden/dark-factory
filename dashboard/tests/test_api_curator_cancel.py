@@ -27,11 +27,11 @@ _PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
 def _tool_name(c):
     """Return the tool_name argument from an mcp_tool_call mock call.
 
-    Handles both positional-arg (c.args[2]) and keyword-arg
-    (c.kwargs['tool_name']) invocations so call-list filters continue to work
-    correctly if a future refactor switches the handler to keyword-argument
-    style (at which point c.args would be shorter and positional indexing
-    would silently produce 0 matches).
+    Reads c.args[2] when the call was made positionally (the current handler
+    convention) with a c.kwargs.get('tool_name') fallback so that the
+    call-list filter still works if a background task happens to use keyword
+    arguments.  This only covers the filter step; the positional destructure
+    immediately after filtering still assumes positional invocation.
     """
     if len(c.args) > 2:
         return c.args[2]
@@ -103,8 +103,8 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     # args.  Background tasks (metrics loop) may also call mcp_tool_call for
     # get_status / get_queue_stats probes during the test window; filter those
     # out so the assertion targets only the handler's own MCP call.
-    # _tool_name() handles both positional and keyword invocations so the
-    # filter is not broken by a future switch to kwargs.
+    # _tool_name() filters the call list by tool name; the positional
+    # destructure below still assumes positional invocation.
     cancel_calls = [c for c in mock_mcp.call_args_list if _tool_name(c) == 'cancel_ticket']
     assert len(cancel_calls) == 1, (
         f'Expected exactly 1 cancel_ticket call, got {len(cancel_calls)}: {cancel_calls}'
