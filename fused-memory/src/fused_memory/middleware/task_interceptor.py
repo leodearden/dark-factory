@@ -2472,26 +2472,24 @@ class TaskInterceptor:
             # Ensure the ticket reaches a terminal state even if mark_resolved wasn't
             # reached yet — cancellation may have interrupted the flow AFTER
             # tm.add_task already mutated tasks.json (status latched to 'created').
-            # asyncio.shield() protects the mark_resolved call itself from being
-            # interrupted by the propagated CancelledError.
-            # TicketStore.mark_resolved() is idempotent (returns False when row is
-            # already terminal), so calling it twice is harmless.
+            # _persist_worker_terminal wraps mark_resolved in asyncio.shield internally
+            # and emits the orphan-race WARNING when status='created' and task_id is
+            # non-None (race detected), giving uniform observability across all three
+            # worker terminal-write paths.
             logger.debug(
                 '_process_add_ticket: cancelled for ticket %s; persisting status=%s',
                 ticket_id,
                 status,
             )
             try:
-                await asyncio.shield(
-                    self._ticket_store.mark_resolved(
-                        ticket_id,
-                        status=status,
-                        task_id=task_id,
-                        reason=reason
-                        if reason
-                        else ('cancelled_during_write' if status != 'created' else None),
-                        result_json=(json.dumps(result_dict) if result_dict is not None else None),
-                    )
+                await self._persist_worker_terminal(
+                    ticket_id,
+                    status=status,
+                    task_id=task_id,
+                    reason=reason
+                    if reason
+                    else ('cancelled_during_write' if status != 'created' else None),
+                    result_dict=result_dict,
                 )
                 self._signal_ticket_event(ticket_id)
             except Exception:
