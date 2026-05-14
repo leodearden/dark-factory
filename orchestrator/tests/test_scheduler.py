@@ -3932,6 +3932,74 @@ class TestSchedulerOverrideStoreInjection:
         assert result.task_id == 'A'
 
 
+class TestSchedulerOverrideRestartSemantics:
+    """First-tick snapshot seeding: no spurious events on scheduler restart."""
+
+    @pytest.mark.asyncio
+    async def test_first_tick_does_not_emit_spurious_events_for_preexisting_overrides(
+        self, tmp_path
+    ):
+        """On scheduler restart with pre-existing overrides, the first tick must not
+        emit priority_override_set / task_pinned events for already-persisted rows.
+
+        Those rows represent state that was already known before the restart — not
+        fresh user actions.  Emitting them would spam downstream consumers and
+        confuse them into treating a restart as a batch of new user commands.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        # Simulate state that existed BEFORE the scheduler started (e.g. written
+        # by a previous process or by the MCP tool while the scheduler was down).
+        store.set_override('/proj', 'A', boost_tier='high')
+        store.set_override('/proj', 'B', pinned=True)
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        task_a = _pending_task('A', priority='medium', files=['a/src'])
+        task_b = _pending_task('B', priority='medium', files=['b/src'])
+
+        # Lock both modules so no task can dispatch (focus on event semantics).
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()  # first tick — snapshot seeded
+
+        override_event_types = {
+            EventType.priority_override_set.value,
+            EventType.priority_override_cleared.value,
+            EventType.task_pinned.value,
+            EventType.task_unpinned.value,
+            EventType.pin_queue_reordered.value,
+        }
+        spurious = [e for e in event_store.events if e[0] in override_event_types]
+        assert spurious == [], (
+            f'First tick must not emit override events for pre-existing rows; '
+            f'got: {spurious}'
+        )
+
+        # Second tick: change a boost → that change MUST emit an event.
+        store.set_override('/proj', 'A', boost_tier='critical')
+        await scheduler.acquire_next()
+
+        set_events = [
+            e for e in event_store.events
+            if e[0] == EventType.priority_override_set.value
+        ]
+        assert len(set_events) == 1, (
+            f'Second tick after a boost change should emit priority_override_set; '
+            f'got: {set_events}'
+        )
+        assert set_events[0][1]['task_id'] == 'A'
+        assert set_events[0][1]['data']['boost_tier'] == 'critical'
+
+
 class TestPinDispatch:
     """Pinned tasks dispatch ahead of all scored candidates, bypassing fairness."""
 
@@ -4252,6 +4320,14 @@ class TestOverrideEventEmission:
 
         def events_of_type(et):
             return [e for e in event_store.events if e[0] == et.value]
+
+        # Seed tick: initialise the override snapshot so that the subsequent
+        # ticks can diff-detect changes.  On the very first tick the scheduler
+        # skips diff-emit (Suggestion 3 — restart semantics) and seeds the
+        # snapshot as empty.  All real assertions start from tick 1 onwards.
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+        assert events_of_type(EventType.task_pinned) == [], 'Seed tick must emit no events'
 
         # Tick 1: pin A (auto pin_order=1)
         store.set_override('/proj', 'A', pinned=True)

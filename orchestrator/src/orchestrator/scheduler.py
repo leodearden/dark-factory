@@ -665,6 +665,12 @@ class Scheduler:
         # Snapshot from the previous tick, used to diff-detect override changes
         # and emit the priority_override_* / task_pinned / pin_queue_reordered events.
         self._prev_overrides_snapshot: dict[str, OverrideRow] = {}
+        # Whether the snapshot has been seeded from the store on the first tick.
+        # On scheduler restart, pre-existing overrides must NOT fire spurious
+        # priority_override_set / task_pinned events — they represent state that
+        # was already known, not fresh user actions.  The first tick seeds the
+        # snapshot without emitting events; subsequent ticks diff-emit normally.
+        self._overrides_initialized: bool = False
 
     async def dispatch_tool(
         self,
@@ -1212,6 +1218,54 @@ class Scheduler:
 
         return signal is not None
 
+    def _eligible_for_dispatch(
+        self,
+        task: dict,
+        tid: str,
+        status_map: dict[str, str],
+    ) -> tuple[bool, str | None]:
+        """Check whether *task* passes all eligibility gates for dispatch.
+
+        Consolidates the duplicate gate logic that previously existed in both
+        the scored-candidate loop and the pin-dispatch loop.  A single source
+        of truth ensures that future gate additions (e.g. a new suppression
+        signal) apply to both dispatch paths automatically.
+
+        Returns ``(True, signal_label)`` when all gates pass.
+        Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
+        the dispatch-cooldown signal for the task (or None), forwarded so the
+        caller can pass it to post-dispatch bookkeeping without a second
+        evaluation.
+        """
+        if task.get('status') != 'pending':
+            return False, None
+        if tid in self._dispatched:
+            return False, None
+        cooldown_deadline = self._requeue_until.get(tid)
+        if cooldown_deadline is not None:
+            if self._time_source() < cooldown_deadline:
+                return False, None
+            # Deadline has passed — clean up the stale entry.
+            del self._requeue_until[tid]
+        if not self._deps_satisfied(task, status_map):
+            return False, None
+        signal_label = self._dispatch_cooldown_signal(task)
+        if self._dispatch_cooldown_active(tid, signal_label):
+            remaining_secs = (
+                self.config.dispatch_cooldown_secs
+                - (self._time_source() - self._last_dispatch_at.get(tid, 0.0))
+            )
+            metadata = task.get('metadata') or {}
+            logger.info(
+                'Task %s dispatch suppressed by cooldown: signal=%s=%r, remaining=%.1fs',
+                tid,
+                signal_label,
+                metadata.get(signal_label),
+                remaining_secs,
+            )
+            return False, None
+        return True, signal_label
+
     def _bump_skip_and_maybe_park(
         self,
         task_id: str,
@@ -1527,10 +1581,15 @@ class Scheduler:
                     pin_queue_changed = True
 
         # One ``pin_queue_reordered`` event per tick for any pin_order change.
-        if pin_queue_changed and self._override_store:
+        # Derive the new order from the in-memory ``cur`` snapshot (no second
+        # SQLite round-trip — the post-GC snapshot is already authoritative).
+        if pin_queue_changed:
             new_order = [
                 tid
-                for tid, _ in self._override_store.get_pin_queue(self._project_root)
+                for tid, _ in sorted(
+                    ((t, r) for t, r in cur.items() if r.pinned),
+                    key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
+                )
             ]
             self.event_store.emit(
                 EventType.pin_queue_reordered,
@@ -1644,6 +1703,15 @@ class Scheduler:
                 r_task = tasks_by_id[rid]
                 r_modules = self._get_modules(r_task)
                 r_tier = coerce_tier(r_task.get('priority'))
+                # Clear the flag BEFORE installing parks.  install_parks is
+                # naturally idempotent (duplicate parks are a no-op), so if the
+                # process crashes between clear and install, the next tick re-runs
+                # install harmlessly.  The opposite order risks a duplicate
+                # reservation_installed event if the clear fails after a
+                # successful install.
+                self._override_store.clear_override(
+                    self._project_root, rid, field='reserve_now'
+                )
                 installed, _evicted = self.lock_table.install_parks(
                     rid, r_modules, r_tier
                 )
@@ -1657,9 +1725,6 @@ class Scheduler:
                             'reason': 'reserve_now',
                         },
                     )
-                self._override_store.clear_override(
-                    self._project_root, rid, field='reserve_now'
-                )
                 # Reflect the cleared flag in the in-memory snapshot so downstream
                 # diff-detection doesn't spuriously re-emit for this tick.
                 current_overrides[rid] = OverrideRow(
@@ -1673,7 +1738,16 @@ class Scheduler:
         # Diff-detect override changes and emit priority_override_* events.
         # The diff runs AFTER all in-memory mutations (GC + reserve_now clearing)
         # so that the snapshot captures the true post-tick state.
-        self._emit_override_diff_events(self._prev_overrides_snapshot, current_overrides)
+        #
+        # On the first tick after a scheduler restart the snapshot starts empty.
+        # Diffing against {} would emit spurious priority_override_set / task_pinned
+        # events for every pre-existing override, confusing downstream consumers
+        # that interpret them as fresh user actions.  We skip the diff on the
+        # first tick and seed the snapshot so subsequent ticks diff correctly.
+        if self._overrides_initialized:
+            self._emit_override_diff_events(self._prev_overrides_snapshot, current_overrides)
+        else:
+            self._overrides_initialized = True
         self._prev_overrides_snapshot = dict(current_overrides)
 
         # Build reverse index + compute effective priorities + CPM counts
@@ -1694,47 +1768,24 @@ class Scheduler:
 
         # Filter to pending tasks whose deps are all done and that aren't
         # dispatched or in their post-requeue cooldown window.
+        # _eligible_for_dispatch encapsulates all gates so the pin-dispatch
+        # loop below uses the same logic (single source of truth).
         candidates: list[dict] = []
         candidate_signals: dict[str, str | None] = {}
         for t in tasks:
-            if t.get('status') != 'pending':
-                continue
             tid_str = str(t.get('id', ''))
-            if tid_str in self._dispatched:
+            if not tid_str:
                 continue
-            cooldown_deadline = self._requeue_until.get(tid_str)
-            if cooldown_deadline is not None:
-                if self._time_source() < cooldown_deadline:
-                    continue
-                del self._requeue_until[tid_str]
-            if not self._deps_satisfied(t, status_map):
+            eligible, signal_label = self._eligible_for_dispatch(t, tid_str, status_map)
+            if not eligible:
                 continue
-            # Evaluate the cooldown signal once here; the result is stashed in
-            # candidate_signals and reused at the arm site (avoiding a second
-            # call to _dispatch_cooldown_signal for the dispatched task).
-            signal_label = self._dispatch_cooldown_signal(t)
-            # Dispatch cooldown gate: if the task was recently dispatched and
-            # carries a reconciliation/steward signal, suppress re-dispatch
-            # until the settle window elapses.  Both gates must pass.
+            # signal_label is stashed and reused at the dispatch arm site so
+            # _dispatch_cooldown_signal is not called a second time.
             # Note: cooldown-suppressed tasks intentionally bypass the fairness
             # skip-bookkeeping machinery for the duration of the settle window.
             # They are invisible to skip counters and parking logic until the
             # window elapses, at which point they re-enter the normal candidate
             # pool and can accumulate skips like any other task.
-            if self._dispatch_cooldown_active(tid_str, signal_label):
-                remaining_secs = (
-                    self.config.dispatch_cooldown_secs
-                    - (self._time_source() - self._last_dispatch_at.get(tid_str, 0.0))
-                )
-                metadata = t.get('metadata') or {}
-                logger.info(
-                    'Task %s dispatch suppressed by cooldown: signal=%s=%r, remaining=%.1fs',
-                    tid_str,
-                    signal_label,
-                    metadata.get(signal_label),
-                    remaining_secs,
-                )
-                continue
             candidates.append(t)
             candidate_signals[tid_str] = signal_label
 
@@ -1746,23 +1797,26 @@ class Scheduler:
         # availability and eligibility checks (status, deps, cooldown).
         # On lock conflict, fall through to the next pinned candidate without
         # touching skip counters or arming parks (pins bypass fairness).
+        #
+        # The pin queue is derived from the in-memory current_overrides snapshot
+        # (already loaded above) so we avoid a second SQLite round-trip on every
+        # tick.  The post-GC snapshot is already authoritative.
         if self._override_store:
-            pin_queue = self._override_store.get_pin_queue(self._project_root)
+            pin_queue: list[tuple[str, OverrideRow]] = sorted(
+                ((tid, row) for tid, row in current_overrides.items() if row.pinned),
+                key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
+            )
             for pin_tid, _pin_row in pin_queue:
                 if pin_tid not in tasks_by_id:
                     continue
                 pin_task = tasks_by_id[pin_tid]
-                if pin_task.get('status') != 'pending':
-                    continue
-                if pin_tid in self._dispatched:
-                    continue
-                pin_cooldown = self._requeue_until.get(pin_tid)
-                if pin_cooldown is not None and self._time_source() < pin_cooldown:
-                    continue
-                if not self._deps_satisfied(pin_task, status_map):
-                    continue
-                pin_signal = self._dispatch_cooldown_signal(pin_task)
-                if self._dispatch_cooldown_active(pin_tid, pin_signal):
+                # Re-use the same eligibility helper as the scored-candidate
+                # loop to keep both paths in sync.  A future gate addition only
+                # needs to be added to _eligible_for_dispatch.
+                eligible, pin_signal = self._eligible_for_dispatch(
+                    pin_task, pin_tid, status_map
+                )
+                if not eligible:
                     continue
                 # Eligible pinned candidate — try to acquire its modules.
                 pin_modules = self._get_modules(pin_task)
