@@ -1532,6 +1532,48 @@ class Scheduler:
             else {}
         )
 
+        # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
+        # install parks on its modules then clear the flag.  This is single-tick
+        # fire-and-forget — the parks will survive until the owner-GC sweep evicts
+        # them (or the task completes).  Only pending tasks with satisfied deps are
+        # processed so a reserve on a blocked or terminal task is a no-op.
+        if self._override_store:
+            for rid, rrow in list(current_overrides.items()):
+                if not rrow.reserve_now:
+                    continue
+                if rid not in tasks_by_id:
+                    continue
+                if status_map.get(rid) in TERMINAL_STATUSES:
+                    continue
+                r_task = tasks_by_id[rid]
+                r_modules = self._get_modules(r_task)
+                r_tier = coerce_tier(r_task.get('priority'))
+                installed, _evicted = self.lock_table.install_parks(
+                    rid, r_modules, r_tier
+                )
+                if self.event_store and installed:
+                    self.event_store.emit(
+                        EventType.reservation_installed,
+                        task_id=rid,
+                        data={
+                            'modules': installed,
+                            'priority': r_tier,
+                            'reason': 'reserve_now',
+                        },
+                    )
+                self._override_store.clear_override(
+                    self._project_root, rid, field='reserve_now'
+                )
+                # Reflect the cleared flag in the in-memory snapshot so downstream
+                # diff-detection doesn't spuriously re-emit for this tick.
+                current_overrides[rid] = OverrideRow(
+                    boost_tier=rrow.boost_tier,
+                    pinned=rrow.pinned,
+                    pin_order=rrow.pin_order,
+                    reserve_now=False,
+                    ttl_until=rrow.ttl_until,
+                )
+
         # Build reverse index + compute effective priorities + CPM counts
         # once per tick (O(N+E)).
         reverse_index = self._build_reverse_index(tasks)

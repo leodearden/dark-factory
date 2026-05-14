@@ -3823,7 +3823,13 @@ class TestReserveNowShortCircuit:
 
     @pytest.mark.asyncio
     async def test_reserve_now_installs_parks_and_clears_field(self, tmp_path):
-        """reserve_now fires install_parks for the task then clears the flag."""
+        """reserve_now fires install_parks for the task then clears the flag.
+
+        A's modules are pre-held by a 'seed' task so A cannot be dispatched in
+        the normal scored loop, ensuring parks survive the tick (they would
+        otherwise be cleared when A dispatches successfully as top candidate).
+        B uses different modules and IS dispatched.
+        """
         from orchestrator.overrides import OverrideStore
 
         config = OrchestratorConfig(max_per_module=1)
@@ -3832,6 +3838,10 @@ class TestReserveNowShortCircuit:
 
         scheduler = Scheduler(config, override_store=store)
         scheduler._project_root = '/proj'
+
+        # Pre-hold A's modules so A cannot acquire them this tick.
+        scheduler.lock_table._held['seed'] = {'compiler/src', 'eval/src'}
+        scheduler._dispatched.add('seed')  # seed is treated as already dispatched
 
         task_a = {
             'id': 'A',
@@ -3853,7 +3863,7 @@ class TestReserveNowShortCircuit:
 
         result = await scheduler.acquire_next()
 
-        # (a) A must have parks installed in the lock table.
+        # (a) A must have parks installed — A was blocked so parks were NOT cleared.
         assert scheduler.lock_table.has_parks('A')
 
         # (b) The parks must cover A's modules (look inside _parked).
@@ -3870,8 +3880,9 @@ class TestReserveNowShortCircuit:
         if 'A' in overrides:
             assert overrides['A'].reserve_now is False
 
-        # (d) Something was dispatched (A's own parks don't block it).
+        # (d) B was dispatched since A's modules were locked out.
         assert result is not None
+        assert result.task_id == 'B'
 
 
 class TestSchedulerOverrideStoreInjection:
