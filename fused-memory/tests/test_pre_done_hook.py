@@ -103,3 +103,20 @@ async def test_run_hook_substitutes_task_id_in_argv(monkeypatch, tmp_path):
     # Marker file should contain the task_id
     assert marker.exists(), 'Script did not write marker file'
     assert marker.read_text().strip() == '4242'
+
+
+@pytest.mark.asyncio
+async def test_run_hook_fails_closed_on_timeout(monkeypatch, tmp_path):
+    """run_hook returns a timeout error and kills the process when it exceeds timeout."""
+    # Script that would sleep forever (or long enough) but we give it 0.5s
+    marker = tmp_path / 'completed.txt'
+    cmd = f"sh -c 'sleep 5; touch {marker}; exit 0'"
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_TMP', cmd)
+    result = await run_hook('1', '/tmp', timeout=0.5)
+    assert result is not None
+    assert result['success'] is False
+    assert result['error'] == 'pre_done_hook_timeout'
+    assert result['timeout_seconds'] == 0.5
+    assert result['task_id'] == '1'
+    # The subprocess should have been killed — the marker file should NOT exist
+    assert not marker.exists(), 'Subprocess was not killed (marker file exists)'
