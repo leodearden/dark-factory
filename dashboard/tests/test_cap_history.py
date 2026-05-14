@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -103,7 +104,7 @@ class TestCapInterval:
 
     def test_frozen_immutable(self):
         iv = CapInterval(account_name='x', start=datetime.now(UTC), end=None)
-        with pytest.raises((AttributeError, TypeError)):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             iv.account_name = 'y'  # type: ignore[misc]
 
 
@@ -257,6 +258,18 @@ class TestReadCapIntervals:
         result = await read_cap_intervals([None, cap_conn, None], days=7)
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_days_zero_raises_value_error(self, cap_conn):
+        """days=0 must raise ValueError with message containing 'positive'."""
+        with pytest.raises(ValueError, match="positive"):
+            await read_cap_intervals([cap_conn], days=0)
+
+    @pytest.mark.asyncio
+    async def test_days_negative_raises_value_error(self, cap_conn):
+        """days=-1 must raise ValueError with message containing 'positive'."""
+        with pytest.raises(ValueError, match="positive"):
+            await read_cap_intervals([cap_conn], days=-1)
+
 
 # ---------------------------------------------------------------------------
 # Step-3 tests: merge_all_accounts_capped
@@ -368,6 +381,26 @@ class TestMergeAllAccountsCapped:
         t2 = now - timedelta(hours=1)
         # Only alpha has intervals; beta has none
         intervals = [_iv('alpha', t1, t2)]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert result == []
+
+    def test_touching_intervals_produce_no_window(self):
+        """A:[t1,t2) and B:[t2,t3) merely touch at t2 → no merged window.
+
+        Under half-open semantics, touching intervals share a single boundary
+        point but have no common interior.  The zero-width filter at the end of
+        merge_all_accounts_capped drops any merged window where start == end,
+        so this correctly returns [].  This characterization test pins that
+        behaviour: if the filter or sort is changed, this test will fail loudly.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=2)
+        t3 = now - timedelta(hours=1)
+        intervals = [
+            _iv('alpha', t1, t2),
+            _iv('beta', t2, t3),
+        ]
         result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
         assert result == []
 

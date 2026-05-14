@@ -21,7 +21,8 @@ All interval bounds use **half-open semantics**: ``[start, end)`` — the start
 instant is included, the end instant is excluded.  An ``end=None`` interval
 extends indefinitely (equivalent to ``[start, ∞)``).  This convention is
 applied consistently in :func:`merge_all_accounts_capped` (sweep events at
-equal timestamps are processed as ends-before-starts) and
+equal timestamps are processed as starts-before-ends, with zero-width merged
+windows filtered out) and
 :func:`bucketise_cap_sparkline` (right-edge sampling uses ``right_edge < end``).
 """
 
@@ -73,11 +74,14 @@ async def read_cap_intervals(
 
     Args:
         dbs: List of aiosqlite connections (``None`` entries are skipped).
-        days: Look-back window in days.
+        days: Look-back window in days.  Must be > 0; raises
+            :exc:`ValueError` otherwise.
 
     Returns:
         Flat list of :class:`CapInterval` objects across all DBs, unordered.
     """
+    if days <= 0:
+        raise ValueError("days must be positive")
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
@@ -250,11 +254,11 @@ def compute_overlap_ms(
     end: datetime,
     capped: list[tuple[datetime, datetime | None]],
 ) -> int:
-    """Return the total milliseconds in [start, end] covered by *capped* intervals.
+    """Return the total milliseconds in [start, end) covered by *capped* intervals.
 
     Args:
         start: Window start (inclusive).
-        end: Window end (inclusive).
+        end: Window end (exclusive).
         capped: List of ``(cap_start, cap_end)`` tuples.  ``cap_end=None``
             means the cap extends past *end* (clamp to *end*).
 
@@ -307,6 +311,9 @@ def bucketise_cap_sparkline(
     labels: list[str] = []
     values: list[int | float] = []
 
+    # O(num_buckets * len(capped)).  capped is expected to be small (single-digit
+    # merged windows over a 24 h sparkline); if it grows large, switch to a
+    # pointer-advance sweep instead.
     for i in range(num_buckets):
         right_edge = start_at + timedelta(seconds=bucket_seconds * (i + 1))
         label = right_edge.isoformat()
