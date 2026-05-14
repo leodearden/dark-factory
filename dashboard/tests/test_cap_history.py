@@ -383,6 +383,26 @@ class TestMergeAllAccountsCapped:
         result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
         assert result == []
 
+    def test_touching_intervals_produce_no_window(self):
+        """A:[t1,t2) and B:[t2,t3) merely touch at t2 → no merged window.
+
+        Under half-open semantics, touching intervals share a single boundary
+        point but have no common interior.  The zero-width filter at L241 of
+        cap_history.py drops any merged window where start == end, so this
+        correctly returns [].  This characterization test pins that behaviour:
+        if the filter or sort is changed, this test will fail loudly.
+        """
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=2)
+        t3 = now - timedelta(hours=1)
+        intervals = [
+            _iv('alpha', t1, t2),
+            _iv('beta', t2, t3),
+        ]
+        result = merge_all_accounts_capped(intervals, ['alpha', 'beta'])
+        assert result == []
+
     def test_three_accounts_partial_chain(self):
         """Three accounts; only segment where all three overlap is returned."""
         now = datetime.now(UTC)
