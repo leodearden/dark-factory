@@ -5208,3 +5208,35 @@ async def test_set_task_status_done_passes_when_predone_hook_succeeds(
 
     assert 'error' not in result
     taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_predone_hook_only_fires_on_done_transition(
+    taskmaster, reconciler, event_buffer, monkeypatch, tmp_path
+):
+    """The pre-done hook must NOT fire for non-done transitions (blocked, in-progress).
+
+    Belt-and-braces: even when the hook is /bin/false, blocked and in-progress
+    transitions must succeed because the gate is strictly 'done'-only.
+    """
+    project_id_upper = resolve_project_id(str(tmp_path)).upper()
+    monkeypatch.setenv(f'FUSED_MEMORY_PREDONE_HOOK_{project_id_upper}', '/bin/false')
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    # blocked: default fixture has status='pending', so pending→blocked is fine
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
+    )
+    result_blocked = await interceptor.set_task_status('1', 'blocked', str(tmp_path))
+    assert 'error' not in result_blocked, f'blocked transition should not be rejected: {result_blocked}'
+
+    # in-progress: reset and go pending→in-progress
+    taskmaster.set_task_status.reset_mock()
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
+    )
+    result_inprog = await interceptor.set_task_status('1', 'in-progress', str(tmp_path))
+    assert 'error' not in result_inprog, f'in-progress transition should not be rejected: {result_inprog}'
+
+    # taskmaster.set_task_status must have been called for both transitions
+    assert taskmaster.set_task_status.call_count == 1
