@@ -478,6 +478,19 @@ class TestSweeps:
         with pytest.raises(ValueError, match='timezone'):
             store.set_override('proj', 'B', ttl_until=datetime(2026, 5, 14))
 
+    def test_clear_expired_rejects_naive_now(self, tmp_path: Path) -> None:
+        """clear_expired must reject naive (tz-unaware) `now` datetimes.
+
+        Mirrors set_override's ttl_until guard: a naive `now` would be
+        silently interpreted as host-local time by .astimezone(UTC),
+        producing subtly wrong sweep windows.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        with pytest.raises(ValueError, match='timezone'):
+            store.clear_expired('proj', now=datetime(2026, 5, 14))
+
 
 class TestSeparateDB:
     def test_override_survives_simulated_set_task_status_cycle(
