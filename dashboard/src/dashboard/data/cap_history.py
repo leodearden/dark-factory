@@ -254,11 +254,11 @@ def compute_overlap_ms(
     end: datetime,
     capped: list[tuple[datetime, datetime | None]],
 ) -> int:
-    """Return the total milliseconds in [start, end] covered by *capped* intervals.
+    """Return the total milliseconds in [start, end) covered by *capped* intervals.
 
     Args:
         start: Window start (inclusive).
-        end: Window end (inclusive).
+        end: Window end (exclusive).
         capped: List of ``(cap_start, cap_end)`` tuples.  ``cap_end=None``
             means the cap extends past *end* (clamp to *end*).
 
