@@ -10,6 +10,7 @@ TDD steps:
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -475,3 +476,67 @@ def test_curator_endpoint_bad_created_at_returns_age_seconds_none(
     assert row['age_seconds'] is None, (
         f"age_seconds should be None for bad created_at, got {row['age_seconds']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1298 step-1: fan_out and DB queries run concurrently in api_curator
+# ---------------------------------------------------------------------------
+
+
+def test_api_curator_runs_fanout_and_db_concurrently(tmp_path: Path):
+    """fan_out_list_tickets runs concurrently with get_curator_sparks in api_curator.
+
+    Concurrency is verified via an asyncio.Event handshake:
+    - mcp_tool_call (inside fan_out) awaits sparks_started (with 2 s ceiling).
+    - get_curator_sparks sets sparks_started and returns immediately.
+
+    If they run concurrently: sparks_started is set while mcp_tool_call is
+    waiting → wait_for returns normally → mcp_timed_out stays False.
+
+    If they run sequentially (fan_out first): get_curator_sparks hasn't started
+    yet → sparks_started is never set → 2 s wait_for fires → mcp_timed_out = True.
+
+    fan_out_list_tickets swallows TimeoutError at WARNING, so the endpoint
+    returns 200 in BOTH cases — status_code alone cannot distinguish sequential
+    from concurrent.  The mcp_timed_out flag is the only definitive signal.
+
+    NOTE: patch target for get_curator_sparks is dashboard.app.get_curator_sparks
+    (not dashboard.data.metrics.get_curator_sparks) because api_curator looks up
+    the name bound in the dashboard.app module namespace (imported at line ~61-73).
+    """
+    config = _make_config(tmp_path)
+    sparks_started = asyncio.Event()
+    mcp_timed_out = False
+
+    _empty_sparks: dict = {
+        'pending': {'labels': [], 'values': []},
+        'p50': {'labels': [], 'values': []},
+        'p90': {'labels': [], 'values': []},
+        'p99': {'labels': [], 'values': []},
+    }
+
+    async def _mock_sparks(db, *, days):
+        sparks_started.set()
+        return _empty_sparks
+
+    async def _mock_mcp(http_client, url, tool, arguments):
+        nonlocal mcp_timed_out
+        try:
+            await asyncio.wait_for(sparks_started.wait(), timeout=2.0)
+        except TimeoutError:
+            mcp_timed_out = True
+            raise
+        return {'project_id': 'p', 'count': 0, 'tickets': []}
+
+    with (
+        _override_client(config) as c,
+        patch('dashboard.app.get_curator_sparks', new=_mock_sparks),
+        patch(_PATCH_TARGET, new=_mock_mcp),
+    ):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert mcp_timed_out is False, (
+        'mcp_timed_out is True — fan_out ran before get_curator_sparks started; '
+        'api_curator must run fan_out concurrently with DB queries'
+    )
+    assert resp.status_code == 200

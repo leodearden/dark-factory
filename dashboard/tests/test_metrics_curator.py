@@ -1250,3 +1250,118 @@ async def test_sample_curator_long_running_open_ended_cap_overlap_subtracted(
     assert result['capped_now'] == 1, (
         f"Expected capped_now=1 (open-ended interval), got {result['capped_now']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1298 step-3: fan_out_list_tickets runs roots concurrently
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_runs_roots_concurrently(tmp_path: Path):
+    """fan_out_list_tickets runs per-root coroutines in parallel.
+
+    Two-event handshake:
+    - r1's mock sets event_r1_started then awaits event_r2_started (2 s ceiling).
+    - r2's mock sets event_r2_started then awaits event_r1_started (2 s ceiling).
+
+    Concurrent execution: both fire concurrently → each sets its own event before
+    awaiting the other → both wait_for calls return within ms → pending_total == 2.
+
+    Sequential execution: r1 sets event_r1 then waits for event_r2 (which is
+    never set because r2 hasn't started yet) → r1 times out after 2 s →
+    TimeoutError swallowed at WARNING → r1 contributes 0; r2 then runs, sets
+    event_r2, awaits event_r1 (already set) → r2 contributes 1 → pending_total == 1.
+
+    pending_total == 2 is the definitive concurrent signal.
+    """
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    r1 = tmp_path / 'r1'
+    r2 = tmp_path / 'r2'
+    r1.mkdir()
+    r2.mkdir()
+
+    cfg = DashboardConfig(
+        project_root=r1,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[r2],
+    )
+
+    event_r1_started = asyncio.Event()
+    event_r2_started = asyncio.Event()
+
+    async def _side_effect(http_client, url, tool, arguments):
+        root = arguments.get('project_root', '')
+        if root == str(r1):
+            event_r1_started.set()
+            await asyncio.wait_for(event_r2_started.wait(), timeout=2.0)
+        else:
+            event_r2_started.set()
+            await asyncio.wait_for(event_r1_started.wait(), timeout=2.0)
+        return {'project_id': 'p', 'count': 1, 'tickets': []}
+
+    mock_mcp = AsyncMock(side_effect=_side_effect)
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets, pending_total = await fan_out_list_tickets(
+                http_client, cfg, limit=2000, timeout=5.0,
+            )
+
+    assert pending_total == 2, (
+        f'pending_total=={pending_total}, expected 2 — '
+        'roots did not run concurrently (sequential gives 1: r1 times out, r2 succeeds)'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1298 step-4: URL fallback regression — first URL success skips second
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_first_url_succeeds_skips_second(tmp_path: Path):
+    """When URL1 succeeds, URL2 must never be called (break short-circuit holds).
+
+    Setup: ONE root (tmp_path), TWO fused_memory_urls; BOTH return count=5.
+
+    Assertions:
+    - mock_mcp.call_count == 1  (URL2 must NOT be attempted after URL1 succeeds)
+    - pending_total == 5        (URL1's count only — NOT 10 from double-counting)
+
+    This distinguishes the correct sequential-URL-fallback from a regression that
+    parallelises URLs within a root: parallel would call both URLs concurrently,
+    giving call_count == 2 and pending_total == 10.
+
+    The existing test_fan_out_list_tickets_failover_first_url_http_error covers
+    the complementary case (URL1 fails → URL2 is tried).  Together they pin both
+    halves of the sequential-fallback contract.
+    """
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://url1', 'http://url2'],
+        known_project_roots=[],
+    )
+
+    mock_mcp = AsyncMock(return_value={'project_id': 'p', 'count': 5, 'tickets': []})
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets, pending_total = await fan_out_list_tickets(
+                http_client, cfg, limit=2000,
+            )
+
+    assert mock_mcp.call_count == 1, (
+        f'mock_mcp.call_count=={mock_mcp.call_count}, expected 1 — '
+        'URL2 must not be called when URL1 succeeds (break short-circuit)'
+    )
+    assert pending_total == 5, (
+        f'pending_total=={pending_total}, expected 5 — '
+        'should count URL1 only, not double-count both URLs'
+    )
+    assert tickets == []

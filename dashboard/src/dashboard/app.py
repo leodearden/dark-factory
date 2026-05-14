@@ -670,16 +670,40 @@ async def api_curator(request: Request) -> JSONResponse:
     http_client: httpx.AsyncClient = request.app.state.http_client
     now = datetime.now(UTC)
 
-    # 1. Fan-out list_tickets across all project roots (de-duped, first-success-per-root).
-    #    limit=2000 matches _sample_curator so the live count and the stored
-    #    pending_total spark stay consistent.  fan_out_list_tickets logs a WARNING
-    #    when any root's count saturates at the limit.
-    raw_tickets, pending_total = await fan_out_list_tickets(
-        http_client, config,
-        limit=2000,
-        timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+    # 1 + 2 + 3. Fan-out list_tickets, latency sparks, and cap intervals all
+    #              run concurrently — the fan-out dominates latency under slow
+    #              MCP, so overlapping it with DB queries cuts p95 materially.
+    _empty_sparks: dict[str, dict[str, list]] = {
+        'pending': {'labels': [], 'values': []},
+        'p50': {'labels': [], 'values': []},
+        'p90': {'labels': [], 'values': []},
+        'p99': {'labels': [], 'values': []},
+    }
+
+    # Resolve DB connections before the gather (pool.get is cheap; the
+    # coroutine objects below need them as arguments).
+    metrics_db = await pool.get(config.metrics_db)
+    cost_dbs_raw = await _cost_dbs(config, pool)
+
+    fanout_r, sparks_r, intervals_r = await asyncio.gather(
+        fan_out_list_tickets(
+            http_client, config,
+            limit=2000,
+            timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+        ),
+        get_curator_sparks(metrics_db, days=1),
+        read_cap_intervals(cost_dbs_raw, days=1),
+        return_exceptions=True,
     )
+    # fan_out_list_tickets never raises today (all exceptions are swallowed
+    # internally), but safe_gather_result with a tuple default is used for
+    # consistency with the sibling legs and robustness against future changes.
+    raw_tickets, pending_total = safe_gather_result(fanout_r, ([], 0), 'curator/fan_out')
+    curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
+    intervals: list[CapInterval] = safe_gather_result(intervals_r, [], 'curator/intervals')
+
     # Map raw MCP rows to the dashboard display shape (age_seconds, title, etc.).
+    # Pure CPU — runs after the gather with no latency penalty.
     pending: list[dict] = []
     for r in raw_tickets:
         created_at_str = r.get('created_at', '')
@@ -701,32 +725,13 @@ async def api_curator(request: Request) -> JSONResponse:
             'age_seconds': age_seconds,
         })
 
-    # 2 + 3. Latency sparks and cap intervals — independent queries, run concurrently.
-    _empty_sparks: dict[str, dict[str, list]] = {
-        'pending': {'labels': [], 'values': []},
-        'p50': {'labels': [], 'values': []},
-        'p90': {'labels': [], 'values': []},
-        'p99': {'labels': [], 'values': []},
-    }
-    _empty_capped: ChartData = {'labels': [], 'values': []}
-
-    metrics_db = await pool.get(config.metrics_db)
-    cost_dbs_raw = await _cost_dbs(config, pool)
-
-    sparks_r, intervals_r = await asyncio.gather(
-        get_curator_sparks(metrics_db, days=1),
-        read_cap_intervals(cost_dbs_raw, days=1),
-        return_exceptions=True,
-    )
-    curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
-    intervals: list[CapInterval] = safe_gather_result(intervals_r, [], 'curator/intervals')
-
     # capped_now (any-account semantics) + capped_windows (all-accounts merge)
     # come from one helper — single source of truth shared with _sample_curator.
     # See dashboard.data.cap_history for the asymmetric semantics rationale.
     # The sparkline downstream (bucketise_cap_sparkline) renders the strict
     # all-accounts-capped window — a 1 in the sparkline means EVERY account was
     # blocked at that bucket. capped_now flags any-account live state.
+    _empty_capped: ChartData = {'labels': [], 'values': []}
     try:
         capped_now, capped_windows = compute_capped_now_and_windows(intervals)
         capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
