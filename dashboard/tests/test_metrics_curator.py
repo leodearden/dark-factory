@@ -870,45 +870,94 @@ async def test_sample_curator_http_timeout_partial_pending_total(
     )
 
 
+
 # ---------------------------------------------------------------------------
-# Step-3 (task-1279): Saturation warning when list_tickets returns count==2000
+# Step-1 (task-1299): fan_out_list_tickets failover — first URL raises HTTPError
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_sample_curator_saturation_warning_at_cap(tmp_path: Path, config, caplog):
-    """_sample_curator logs a WARNING when list_tickets returns the server cap (2000).
+async def test_fan_out_list_tickets_failover_first_url_http_error(tmp_path: Path):
+    """fan_out_list_tickets falls back to the second URL when the first raises HTTPError.
 
-    Uses _ListTicketsHandler(count=2000) so the mock returns count=2000,
-    which is the server-side ceiling.  The warning must:
-    - mention the cap value ('2000') in its message
-    - NOT suppress the count (pending_total == 2000)
+    Setup: single root (tmp_path), two fused_memory_urls ['http://bad', 'http://good'].
+    The mock raises httpx.HTTPError for 'http://bad' and returns count=3 for 'http://good'.
 
+    Assertions:
+    - pending_total == 3 (counted ONCE via failover, not 6 — proves the per-url
+      exception is swallowed and the break prevents double-counting)
+    - mock_mcp.call_count == 2 (both URLs were attempted)
+    - tickets == [] (no ticket rows in the mock response)
     """
-    from dashboard.data.memory import reset_sessions
-    from dashboard.data.metrics import _sample_curator
+    from dashboard.data.metrics import fan_out_list_tickets
 
-    now = datetime.now(UTC)
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://bad', 'http://good'],
+        known_project_roots=[],
+    )
 
-    handler = _ListTicketsHandler(count=2000)
-    transport = httpx.MockTransport(handler)
+    async def _side_effect(http_client, url, *args, **kwargs):
+        if url == 'http://bad':
+            raise httpx.HTTPError('boom')
+        return {'count': 3, 'tickets': [], 'project_id': 'p'}
 
-    reset_sessions()
-    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+    mock_mcp = AsyncMock(side_effect=_side_effect)
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
         async with httpx.AsyncClient(transport=transport) as http_client:
-            result = await _sample_curator(
-                http_client, config, tickets_db=None, runs_dbs=[], now=now,
+            tickets, pending_total = await fan_out_list_tickets(http_client, cfg)
+
+    assert pending_total == 3, f"Expected pending_total=3, got {pending_total}"
+    assert mock_mcp.call_count == 2, (
+        f"Expected 2 mcp_tool_call invocations (both URLs tried), got {mock_mcp.call_count}"
+    )
+    assert tickets == [], f"Expected empty tickets list, got {tickets}"
+
+
+# ---------------------------------------------------------------------------
+# Step-2 (task-1299): fan_out_list_tickets saturation warning when count == limit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_warns_when_count_at_limit(tmp_path: Path, caplog):
+    """fan_out_list_tickets logs a WARNING when list_tickets returns count == limit.
+
+    Setup: single root (tmp_path), one URL. Mock returns count=2000 == limit=2000.
+
+    Assertions:
+    - pending_total == 2000 (count is NOT suppressed by the warning)
+    - at least one WARNING log record on the dashboard.data.metrics logger whose
+      message mentions both 'list_tickets' and '2000'
+    """
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+
+    mock_mcp = AsyncMock(return_value={'count': 2000, 'tickets': [], 'project_id': 'p'})
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'), \
+         patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets, pending_total = await fan_out_list_tickets(
+                http_client, cfg, limit=2000,
             )
 
-    assert result is not None
-    assert result['pending_total'] == 2000, (
-        f"Expected pending_total=2000, got {result['pending_total']}"
-    )
+    assert pending_total == 2000, f"Expected pending_total=2000, got {pending_total}"
     warning_records = [
         r for r in caplog.records
-        if r.levelno >= logging.WARNING and '2000' in r.getMessage()
+        if r.levelno >= logging.WARNING
+        and 'list_tickets' in r.getMessage()
+        and '2000' in r.getMessage()
     ]
     assert warning_records, (
-        "Expected at least one WARNING log mentioning '2000' for saturation, "
-        f"got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        "Expected at least one WARNING log mentioning 'list_tickets' and '2000' "
+        f"for saturation, got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
