@@ -402,7 +402,6 @@ class TestDedupeTOCTOURace:
             category='infra_issue',
             summary='fused-memory connection timeout on port 8002',
         )
-        parent_id = first['id']
         assert first['status'] == 'queued'
 
         # (2) Monkeypatch find_dedupe_parent so that after finding the parent it
