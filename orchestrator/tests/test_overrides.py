@@ -120,3 +120,21 @@ class TestPinning:
         store.set_override('proj', 'D', pinned=True)
         overrides = store.get_overrides('proj')
         assert overrides['D'].pin_order == 6
+
+    def test_pin_order_collision_raises_with_both_ids(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import PinOrderCollision, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=3)
+
+        with pytest.raises(PinOrderCollision) as exc_info:
+            store.set_override('proj', 'B', pinned=True, pin_order=3)
+
+        msg = str(exc_info.value)
+        assert 'A' in msg
+        assert 'B' in msg
+        assert '3' in msg
+
+        # Store must be left untouched — B was not written
+        overrides = store.get_overrides('proj')
+        assert 'B' not in overrides
