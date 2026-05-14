@@ -1835,6 +1835,14 @@ class TaskInterceptor:
             row = await self._ticket_store.get(ticket_id)
             if row is None:
                 return {'error': 'not_found', 'ticket_id': ticket_id}
+            logger.warning(
+                'cancel_ticket: TOCTOU race lost for ticket %s — '
+                'concurrent writer terminalized row to status=%s; '
+                'an in-flight worker may have produced an orphan task '
+                '(see _process_add_ticket WARNING for task_id)',
+                ticket_id,
+                row['status'],
+            )
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
         logger.info('cancel_ticket: cancelled pending ticket %s', ticket_id)
         return {'status': 'cancelled', 'ticket_id': ticket_id}
