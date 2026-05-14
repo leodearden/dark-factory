@@ -55,6 +55,36 @@ def app_jsx_body(_client):
 # Helper: extract the CURATOR_STATE: { ... } seed block from data.js
 # ---------------------------------------------------------------------------
 
+def _extract_addToast_body(source: str) -> str:
+    """Return the brace-delimited body of the ``addToast = useCallback(...)`` arrow function.
+
+    Finds ``addToast = useCallback(`` then walks to the first ``{`` (the opening
+    brace of the ``(msg) => { ... }`` body) and uses brace-depth counting to
+    return the full callback body, braces included.
+
+    This is used to scope assertions about pruning logic to *inside* addToast
+    rather than anywhere in the file — a stray splice elsewhere (e.g., the
+    unmount cleanup) should not satisfy the assertion.
+    Returns the empty string if addToast is not found.
+    """
+    m = re.search(r'addToast\s*=\s*useCallback\s*\(', source)
+    if m is None:
+        return ''
+    brace_start = source.find('{', m.end())
+    if brace_start == -1:
+        return ''
+    depth = 0
+    for i in range(brace_start, len(source)):
+        c = source[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return source[brace_start:i + 1]
+    return ''
+
+
 def _extract_curator_state_block(data_js: str) -> str:
     """Return the body of the ``CURATOR_STATE: { ... }`` seed object, braces included.
 
@@ -247,7 +277,7 @@ def test_curator_tab_defaults_project_filter_to_empty_list(tab_curator_jsx_body:
     expression) throws a TypeError if the prop is ever undefined — the
     component has no fallback.  This test pins the defensive default.
     """
-    assert 'function CuratorTab({ projectFilter = [] })' in tab_curator_jsx_body, (
+    assert re.search(r'function CuratorTab\(\{\s*projectFilter\s*=\s*\[\s*\]', tab_curator_jsx_body), (
         'tab_curator.jsx CuratorTab signature does not default projectFilter to [] '
         '— change `function CuratorTab({ projectFilter })` to '
         '`function CuratorTab({ projectFilter = [] })` so that calling the '
@@ -267,10 +297,15 @@ def test_addToast_prunes_fired_timer_from_toast_timers(tab_curator_jsx_body: str
     either a splice (array) or a delete (Map).  The test accepts either so that
     a future Map-based refactor does not break this assertion.
     """
-    has_splice = 'toastTimers.current.splice' in tab_curator_jsx_body
-    has_delete = 'toastTimers.current.delete' in tab_curator_jsx_body
+    addToast_body = _extract_addToast_body(tab_curator_jsx_body)
+    assert addToast_body, (
+        'Could not locate addToast useCallback body in tab_curator.jsx — '
+        'ensure addToast is declared as `const addToast = useCallback(...)`.'
+    )
+    has_splice = 'toastTimers.current.splice' in addToast_body
+    has_delete = 'toastTimers.current.delete' in addToast_body
     assert has_splice or has_delete, (
-        'addToast in tab_curator.jsx does not prune fired timer ids from '
+        'addToast body in tab_curator.jsx does not prune fired timer ids from '
         'toastTimers.current — after calling setToasts inside setTimeout, add '
         '`const idx = toastTimers.current.indexOf(timer); '
         'if (idx >= 0) toastTimers.current.splice(idx, 1);` '

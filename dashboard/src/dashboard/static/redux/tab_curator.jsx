@@ -29,6 +29,7 @@ function groupBy(arr, keyFn) {
 
 // ── Latency panel — three stacked Sparklines for p50/p90/p99 ──
 function LatencyPanel({ latency_spark }) {
+  // backend seed also includes a `labels` key; no chart consumer reads it so it is omitted.
   const { p50 = [], p90 = [], p99 = [] } = latency_spark || {};
   const hasData = p50.length > 0 || p90.length > 0 || p99.length > 0;
   return (
