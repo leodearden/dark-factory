@@ -295,12 +295,11 @@ class TestCuratorUsageGateLeakGuard:
         """Original UsageGate init error must survive even if CostStore.close() raises
         CancelledError mid-cleanup.
 
-        On current main the inner ``except Exception:`` does NOT catch
-        ``asyncio.CancelledError`` (a BaseException since Python 3.8), so the
-        cancel escapes the inner guard and the caller sees CancelledError instead
-        of the original RuntimeError — this test will FAIL until step-4 widens
-        the inner handler to ``except BaseException:`` and wraps with
-        ``asyncio.shield``.
+        CostStore.close is mocked to raise CancelledError, which means the real
+        close never runs inside the helper. The capturing_open spy captures the
+        store instance so we can release the orphaned aiosqlite connection +
+        WAL background thread after the with block exits (where patches are
+        gone and the real close is available again).
         """
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
 
@@ -313,8 +312,17 @@ class TestCuratorUsageGateLeakGuard:
         # close() raises CancelledError — simulates a cancel arriving mid-cleanup.
         cancel_close = AsyncMock(side_effect=asyncio.CancelledError())
 
+        # Spy on open() to capture the store instance created inside the helper.
+        opened_stores: list[CostStore] = []
+        original_open = CostStore.open
+
+        async def capturing_open(self_store: CostStore) -> None:
+            opened_stores.append(self_store)
+            return await original_open(self_store)
+
         with (
             patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}),
+            patch.object(CostStore, 'open', capturing_open),
             patch.object(CostStore, 'close', cancel_close),
             patch.object(
                 UsageGate,
@@ -324,4 +332,20 @@ class TestCuratorUsageGateLeakGuard:
             pytest.raises(RuntimeError, match='original init failure'),
         ):
             await _setup_curator_usage_gate(config)
+
+        assert len(opened_stores) == 1, 'CostStore.open() was not called'
+        assert cancel_close.await_count == 1, (
+            f'Expected CostStore.close() patch to be awaited exactly once, '
+            f'got {cancel_close.await_count}'
+        )
+
+        # CostStore.close was replaced by an AsyncMock that raises CancelledError, so
+        # the real close() never ran inside the helper — the aiosqlite connection +
+        # WAL background thread are GUARANTEED to be leaked at this point (the mock
+        # replaces the method entirely; there is no path where the helper could have
+        # released the connection). Patches are now gone after the with block exits,
+        # so this invokes the real CostStore.close() to release the leaked resources.
+        # Nothing to assert about leak state: the mock guarantees the leak, so the
+        # only useful action is cleanup.
+        await opened_stores[0].close()
 
