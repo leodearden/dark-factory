@@ -15,6 +15,7 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     format_task_list,
     id_key,
+    render_active_section,
     select_visible_active,
 )
 
@@ -936,6 +937,101 @@ class TestFormatFilteredTaskTree:
             f'_build_surrounding was called {call_count[0]} time(s); expected exactly 1. '
             f'Eliminate the duplicate _build_surrounding call in '
             f'format_filtered_task_tree (task 1311).'
+        )
+
+
+class TestRenderActiveSection:
+    """Tests for the render_active_section(tree) -> (list[dict], str) public helper.
+
+    render_active_section is the single-call API that returns BOTH the
+    visible-task list (for hint-section consumption) AND the fully assembled
+    prompt string (for the Active Task Tree slot).  These tests pin its contract
+    and confirm the render-once invariant.
+    """
+
+    def test_render_active_section_returns_visible_list_and_assembled_string(self):
+        """render_active_section must return a (list[dict], str) tuple whose elements
+        match select_visible_active and format_filtered_task_tree respectively.
+
+        Parity check: for the same tree, the two halves of the returned tuple
+        must be byte-identical to what the existing public helpers return.
+        """
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 4)]
+        cancelled = [_make_task(20 + i, 'cancelled', f'Cancelled {i}') for i in range(1, 3)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=4,
+            cancelled_count=2,
+            cancelled_tasks=cancelled,
+            other_count=0,
+            total_count=9,
+        )
+
+        result = render_active_section(tree)
+
+        assert len(result) == 2, (
+            f'render_active_section must return a 2-tuple; got {len(result)}-tuple'
+        )
+        visible_list, assembled_str = result
+
+        expected_visible = select_visible_active(tree)
+        assert visible_list == expected_visible, (
+            f'render_active_section visible list must match select_visible_active(tree).\n'
+            f'Got:      {visible_list!r}\n'
+            f'Expected: {expected_visible!r}'
+        )
+
+        expected_str = format_filtered_task_tree(tree)
+        assert assembled_str == expected_str, (
+            f'render_active_section assembled string must match format_filtered_task_tree(tree).\n'
+            f'Got:      {assembled_str!r}\n'
+            f'Expected: {expected_str!r}'
+        )
+
+    def test_render_active_section_renders_each_visible_task_once(self, monkeypatch):
+        """render_active_section must render each task line exactly once.
+
+        Simulates the assemble_payload payload-assembly pattern: call
+        render_active_section once and consume BOTH return values (visible list
+        for the hint section, assembled string for the prompt slot).  The
+        _render_task_line counter must equal len(visible_list) +
+        len(tree.cancelled_tasks) — one render per visible active task plus one
+        per cancelled task in the cancelled section.
+
+        The legacy select_visible_active + format_filtered_task_tree pair would
+        produce 2 * len(visible_list) + 2 * len(tree.cancelled_tasks) invocations.
+        """
+        call_count = [0]
+
+        def _counting_render_task_line(task):
+            call_count[0] += 1
+            return _render_task_line(task)
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._render_task_line',
+            _counting_render_task_line,
+        )
+
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 11)]
+        cancelled = [_make_task(100 + i, 'cancelled', f'Cancelled {i}') for i in range(1, 4)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=2,
+            cancelled_count=3,
+            cancelled_tasks=cancelled,
+            other_count=0,
+            total_count=15,
+        )
+
+        # Single call — simulates assemble_payload using both outputs.
+        visible_list, _assembled_str = render_active_section(tree)
+
+        expected_count = len(visible_list) + len(tree.cancelled_tasks)
+        assert call_count[0] == expected_count, (
+            f'_render_task_line was called {call_count[0]} time(s); '
+            f'expected {expected_count} '
+            f'({len(visible_list)} visible active + {len(tree.cancelled_tasks)} cancelled). '
+            f'Each visible task must be rendered exactly once per render_active_section call.'
         )
 
 
