@@ -50,9 +50,23 @@ def memory_service():
 
 
 @pytest.fixture
-def mcp_server(memory_service):
+def task_interceptor():
+    """Mocked task interceptor with set_task_status returning success by default.
+
+    Exposed as a separate fixture (mirrors test_task_tools.py:26-30) so that
+    tests can configure and assert on the mock — in particular
+    test_set_task_status_done_does_not_clear_override_row which needs to pin
+    the delegation-wiring invariant.
+    """
+    ti = AsyncMock()
+    ti.set_task_status = AsyncMock(return_value={'success': True})
+    return ti
+
+
+@pytest.fixture
+def mcp_server(memory_service, task_interceptor):
     """MCP server with a mocked MemoryService and a mocked task interceptor."""
-    return create_mcp_server(memory_service, task_interceptor=AsyncMock())
+    return create_mcp_server(memory_service, task_interceptor=task_interceptor)
 
 
 # ---------------------------------------------------------------------------
@@ -632,13 +646,26 @@ async def test_all_tools_reject_empty_project_root(
 
 @pytest.mark.asyncio
 async def test_set_task_status_done_does_not_clear_override_row(
-    tmp_path, mcp_server, memory_service,
+    tmp_path, mcp_server, memory_service, task_interceptor,
 ):
-    """set_task_status('done') leaves the override row untouched.
+    """set_task_status('done') delegates to task_interceptor and leaves the override row untouched.
 
-    The two SQLite stores are physically separate files — this test pins
-    that structural invariant so a future refactor that would couple them
-    has a visible reason to think twice.
+    This test pins TWO invariants at the MCP-boundary layer:
+
+    (1) **Delegation wiring** — the set_task_status MCP tool forwards the call
+        to ``task_interceptor.set_task_status``.  If a future refactor broke this
+        delegation the ``assert_called_once()`` assertion would fail immediately.
+
+    (2) **Cross-store separation** — the override row in scheduler_overrides.db is
+        not touched by set_task_status, which writes only to the tasks store (via
+        task_interceptor).  The two SQLite stores are physically separate files;
+        this assertion pins that structural invariant so a future coupling refactor
+        has a visible reason to think twice.
+
+    Note: coupling deeper inside ``task_interceptor.set_task_status`` itself (e.g.
+    verifying that the Taskmaster DB row is mutated) is out of scope at this
+    MCP-boundary layer — that contract is tested at the task_interceptor unit level
+    in test_task_interceptor.py.
     """
     await mcp_server._tool_manager.call_tool(
         'set_task_priority_override',
@@ -656,6 +683,13 @@ async def test_set_task_status_done_does_not_clear_override_row(
         },
     )
 
+    # Invariant (1): delegation wiring — the MCP tool must forward to the interceptor.
+    task_interceptor.set_task_status.assert_called_once()
+    call_kwargs = task_interceptor.set_task_status.call_args.kwargs
+    assert call_kwargs['task_id'] == '5'
+    assert call_kwargs['status'] == 'done'
+
+    # Invariant (2): cross-store separation — override row must survive the status transition.
     conn = _open_db(tmp_path)
     try:
         row = conn.execute(
