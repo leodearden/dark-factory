@@ -1639,6 +1639,51 @@ class Scheduler:
         if not candidates:
             return None
 
+        # Pin-dispatch: try pinned tasks in pin_order ASC before scoring.
+        # Pinned candidates bypass scoring entirely but still respect lock
+        # availability and eligibility checks (status, deps, cooldown).
+        # On lock conflict, fall through to the next pinned candidate without
+        # touching skip counters or arming parks (pins bypass fairness).
+        if self._override_store:
+            pin_queue = self._override_store.get_pin_queue(self._project_root)
+            for pin_tid, _pin_row in pin_queue:
+                if pin_tid not in tasks_by_id:
+                    continue
+                pin_task = tasks_by_id[pin_tid]
+                if pin_task.get('status') != 'pending':
+                    continue
+                if pin_tid in self._dispatched:
+                    continue
+                pin_cooldown = self._requeue_until.get(pin_tid)
+                if pin_cooldown is not None and self._time_source() < pin_cooldown:
+                    continue
+                if not self._deps_satisfied(pin_task, status_map):
+                    continue
+                pin_signal = self._dispatch_cooldown_signal(pin_task)
+                if self._dispatch_cooldown_active(pin_tid, pin_signal):
+                    continue
+                # Eligible pinned candidate — try to acquire its modules.
+                pin_modules = self._get_modules(pin_task)
+                if self.lock_table.try_acquire(pin_tid, pin_modules):
+                    self._dispatched.add(pin_tid)
+                    if pin_signal is not None:
+                        self._last_dispatch_at[pin_tid] = self._time_source()
+                    pin_pri = effective_priorities.get(
+                        pin_tid, coerce_tier(pin_task.get('priority'))
+                    )
+                    self._dispatched_priority[pin_tid] = pin_pri
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.lock_acquired,
+                            task_id=pin_tid,
+                            data={'modules': pin_modules, 'priority': pin_pri},
+                        )
+                    return TaskAssignment(
+                        task_id=pin_tid, task=pin_task, modules=pin_modules
+                    )
+                # Lock conflict — fall through to next pinned candidate.
+                # No skip-bookkeeping for pinned tasks (pins bypass fairness).
+
         # Score each candidate.  Higher score wins; ties broken by task_id
         # string order (stable, FIFO-ish for numeric ids).
         scored: list[tuple[float, str, dict, str]] = []
