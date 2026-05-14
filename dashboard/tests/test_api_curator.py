@@ -72,6 +72,10 @@ def test_curator_endpoint_returns_envelope_shape(client):
     mcp_tool_call is mocked to return empty tickets so the fan-out succeeds
     without a real server. latency_spark / capped_spark default to empty series
     because no DB is seeded in this test.
+
+    Also pins state.paused_reason to None (the current placeholder value until
+    the follow-up MCP tool lands — see app.py paused_reason TODO). When that
+    feature ships, update the assertion on line ~96 in place.
     """
     mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
     with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
@@ -329,7 +333,7 @@ def test_shape_curator_pure_function():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('created_at_value', ['not-an-iso-date', ''])
+@pytest.mark.parametrize('created_at_value', ['not-an-iso-date', ''], ids=['malformed_iso', 'empty_string'])
 def test_curator_endpoint_bad_created_at_returns_age_seconds_none(
     tmp_path: Path, created_at_value: str
 ):
