@@ -755,8 +755,9 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-        # Snapshot the pool entry before close_all() empties pool._conns.
-        expected_conn = pool._conns.get(fixed_config.tickets_db.resolve())
+        # Snapshot the cached connection via the public API before close_all().
+        # DbPool.get() is idempotent: returns the same cached object on repeat call.
+        expected_conn = await pool.get(fixed_config.tickets_db)
     finally:
         await metrics_conn.close()
         await pool.close_all()
@@ -767,13 +768,13 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         f"tickets_db not in kwargs: {call_kwargs}. "
         f"All calls: {mock_collect.call_args_list}"
     )
-    # tickets.db exists on disk so DbPool.get() opens a real connection stored in
-    # pool._conns keyed by the resolved path.  We assert object identity to pin
+    # tickets.db exists on disk so DbPool.get() returns the real connection it
+    # cached during _metrics_loop._run_once().  We assert object identity to pin
     # path-to-connection wiring: a wrong-but-existing path yields a different
     # connection object; a wrong-but-missing path leaves expected_conn as None.
     assert expected_conn is not None, (
-        f"DbPool has no connection for {fixed_config.tickets_db.resolve()}; "
-        f"pool keys: {list(pool._conns)}"
+        f"DbPool.get() returned None; is tickets.db missing from "
+        f"{fixed_config.tickets_db}?"
     )
     assert call_kwargs['tickets_db'] is expected_conn, (
         f"tickets_db should be the DbPool connection for {fixed_config.tickets_db} "
