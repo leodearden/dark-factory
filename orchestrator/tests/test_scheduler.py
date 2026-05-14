@@ -4738,3 +4738,27 @@ class TestRequeueCooldownGc:
             f'Expected _requeue_until to be empty after acquire_next GC sweep; '
             f'got: {scheduler._requeue_until}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Park-and-stop pause mechanism (task 1322)
+# ---------------------------------------------------------------------------
+
+class TestSchedulerPause:
+    """Unit tests for Scheduler.pause() / resume() / is_paused / pause_reason."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_pause_sets_is_paused_and_reason(self, scheduler: Scheduler):
+        scheduler.pause('parked-threshold')
+        assert scheduler.is_paused is True
+        assert scheduler.pause_reason == 'parked-threshold'
+
+    def test_resume_clears_pause(self, scheduler: Scheduler):
+        scheduler.pause('parked-threshold')
+        scheduler.resume()
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
