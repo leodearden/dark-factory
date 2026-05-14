@@ -67,8 +67,10 @@ def _db_path(project_root: str | Path) -> Path:
 
 
 def _open_db(project_root: str | Path) -> sqlite3.Connection:
-    """Open the override DB with sqlite3 (for assertion reads)."""
-    return sqlite3.connect(str(_db_path(project_root)))
+    """Open (creating if needed) the override DB with sqlite3 (for assertion reads)."""
+    p = _db_path(project_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(str(p))
 
 
 def _row_count(project_root: str | Path) -> int:
@@ -149,3 +151,159 @@ async def test_set_task_priority_override_writes_row_and_emits_audit(
     assert audit_kwargs['agent_id'] == 'scheduler-overrides'
     assert audit_kwargs['metadata']['task_id'] == '5'
     assert audit_kwargs['metadata']['fields']['boost_tier'] == 'high'
+
+
+# ===========================================================================
+# set_task_priority_override — validation errors
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_tier', ['urgent', 'urgentish', '', 'critical-ish'])
+async def test_set_task_priority_override_rejects_unknown_boost_tier(
+    tmp_path, mcp_server, memory_service, bad_tier,
+):
+    """Unknown boost_tier returns ValidationError; no row is written, no audit emitted."""
+    memory_service.add_memory.reset_mock()
+    result = await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': bad_tier},
+    )
+    assert result.get('error_type') == 'ValidationError'
+    assert bad_tier in result.get('error', '')
+
+    # DB may not exist at all (validation fires before any DB open).
+    assert _row_count(tmp_path) == 0
+
+    memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_priority_override_pin_order_collision_returns_structured_error(
+    tmp_path, mcp_server, memory_service,
+):
+    """A second pin at the same pin_order returns a structured collision error."""
+    memory_service.add_memory.reset_mock()
+
+    r1 = await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'A', 'pinned': True, 'pin_order': 1},
+    )
+    assert 'error' not in r1
+
+    memory_service.add_memory.reset_mock()
+
+    r2 = await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'B', 'pinned': True, 'pin_order': 1},
+    )
+    assert r2 == {'error': 'pin_order_collision', 'conflicting_task_id': 'A', 'pin_order': 1}
+
+    # task B must have no row
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT task_id FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), 'B'),
+        ).fetchone()
+        assert row is None
+    finally:
+        conn.close()
+
+    memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_priority_override_ttl_secs_converts_to_absolute_iso(
+    tmp_path, mcp_server, memory_service,
+):
+    """ttl_secs is converted to an absolute UTC ISO8601 ttl_until in the DB."""
+    from datetime import timezone
+    before = datetime.now(UTC)
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'X', 'ttl_secs': 3600},
+    )
+    after = datetime.now(UTC)
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT ttl_until FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), 'X'),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None and row[0] is not None
+    parsed = datetime.fromisoformat(row[0])
+    assert parsed.tzinfo is not None
+    low = before + timedelta(seconds=3600) - timedelta(seconds=5)
+    high = after + timedelta(seconds=3600) + timedelta(seconds=5)
+    assert low <= parsed <= high
+
+    _, audit_kwargs = memory_service.add_memory.call_args
+    assert audit_kwargs['metadata']['fields']['ttl_secs'] == 3600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kwargs,expected_pin_orders', [
+    # (a) empty DB → first pin gets pin_order=1
+    ([{'task_id': 'A', 'pinned': True}], {'A': 1}),
+    # (b) second pin auto-assigns pin_order=2
+    (
+        [{'task_id': 'A', 'pinned': True}, {'task_id': 'B', 'pinned': True}],
+        {'A': 1, 'B': 2},
+    ),
+])
+async def test_set_task_priority_override_pinned_true_auto_assigns_pin_order(
+    tmp_path, mcp_server, memory_service, kwargs, expected_pin_orders,
+):
+    """Pinning without explicit pin_order auto-assigns next available position."""
+    for kw in kwargs:
+        await mcp_server._tool_manager.call_tool(
+            'set_task_priority_override',
+            {'project_root': str(tmp_path), **kw},
+        )
+
+    conn = _open_db(tmp_path)
+    try:
+        for task_id, expected_order in expected_pin_orders.items():
+            row = conn.execute(
+                'SELECT pin_order FROM overrides WHERE project_root=? AND task_id=?',
+                (str(tmp_path), task_id),
+            ).fetchone()
+            assert row is not None
+            assert row[0] == expected_order, f'{task_id}: expected {expected_order}, got {row[0]}'
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_set_task_priority_override_re_pin_preserves_existing_pin_order(
+    tmp_path, mcp_server, memory_service,
+):
+    """Re-pinning an already-pinned task preserves its existing pin_order (idempotency)."""
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'A', 'pinned': True},
+    )
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'B', 'pinned': True},
+    )
+    # Re-pin A with a boost_tier change — pin_order must stay 1
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': 'A', 'pinned': True, 'boost_tier': 'high'},
+    )
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT pin_order FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), 'A'),
+        ).fetchone()
+        assert row[0] == 1
+    finally:
+        conn.close()
