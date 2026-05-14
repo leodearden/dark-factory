@@ -17,6 +17,17 @@ from escalation.models import Escalation
 
 logger = logging.getLogger(__name__)
 
+# Severity rank map for promotion logic.  Alphabetical comparison is wrong
+# ('blocking' < 'info'), so we use an explicit rank.  Unknown severities
+# default to rank 0 (treated as info-level) so malformed input never causes
+# unexpected promotion.
+_SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
+
+
+def _max_severity(a: str, b: str) -> str:
+    """Return the higher-urgency severity string between *a* and *b*."""
+    return a if _SEVERITY_RANK.get(a, 0) >= _SEVERITY_RANK.get(b, 0) else b
+
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
     """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
@@ -341,7 +352,7 @@ class EscalationQueue:
         return esc
 
     def attach_dedupe_child(
-        self, parent_id: str, child_id: str,
+        self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
         """Append *child_id* to the pending parent's dedupe_children list.
 
@@ -382,10 +393,11 @@ class EscalationQueue:
             return None
         parent.dedupe_children.append(child_id)
         parent.dedupe_count += 1
+        parent.severity = _max_severity(parent.severity, child_severity)
         self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '
-            f'(dedupe_count={parent.dedupe_count})'
+            f'(dedupe_count={parent.dedupe_count}, severity={parent.severity})'
         )
         return parent
 

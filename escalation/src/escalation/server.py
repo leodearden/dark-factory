@@ -81,7 +81,7 @@ def create_server(
             # was resolved/archived between the find scan and this call.
             # On None, fall through to submit() so the escalation is not
             # silently dropped.
-            if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id) is not None:
+            if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id, child_severity=esc.severity) is not None:
                 # child_id is included for audit: callers can map their assigned
                 # id back to the parent's dedupe_children list.
                 #
