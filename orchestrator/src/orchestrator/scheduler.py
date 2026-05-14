@@ -27,6 +27,7 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.task_status import TERMINAL_STATUSES
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
@@ -622,6 +623,7 @@ class Scheduler:
         *,
         mcp_session: McpSessionLike | None = None,
         time_source: Callable[[], float] | None = None,
+        override_store: OverrideStore | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
@@ -658,6 +660,12 @@ class Scheduler:
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
+        # --- Priority-override state ---
+        self._override_store: OverrideStore | None = override_store
+        # Snapshot from the previous tick, used to diff-detect override changes
+        # and emit the priority_override_* / task_pinned / pin_queue_reordered events.
+        self._prev_overrides_snapshot: dict[str, OverrideRow] = {}
+
     async def dispatch_tool(
         self,
         name: str,
@@ -1517,11 +1525,24 @@ class Scheduler:
             if status in TERMINAL_STATUSES:
                 self._last_dispatch_at.pop(tid_str, None)
 
+        # Load priority-override snapshot for this tick.
+        current_overrides: dict[str, OverrideRow] = (
+            self._override_store.get_overrides(self._project_root)
+            if self._override_store
+            else {}
+        )
+
         # Build reverse index + compute effective priorities + CPM counts
         # once per tick (O(N+E)).
         reverse_index = self._build_reverse_index(tasks)
+        override_boosts = {
+            tid: row.boost_tier
+            for tid, row in current_overrides.items()
+            if row.boost_tier
+        }
         effective_priorities = self._compute_effective_priorities(
-            tasks_by_id, reverse_index, status_map
+            tasks_by_id, reverse_index, status_map,
+            override_boosts=override_boosts or None,
         )
         transitive_counts = self._compute_transitive_counts(
             tasks_by_id, reverse_index, status_map
