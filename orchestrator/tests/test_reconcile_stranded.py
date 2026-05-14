@@ -1652,18 +1652,28 @@ class TestReconcileStrandedInProgress:
             )
 
     @pytest.mark.parametrize(
-        'is_ancestor_val, marker_sha_val, branch_base_sha',
+        'is_ancestor_val, marker_sha_val, branch_base_sha, expected_provenance',
         [
             pytest.param(
                 True,
                 None,
                 'aabbccdd' + 'e' * 32,
+                {
+                    'kind': 'found_on_main',
+                    'commit': 'deadbeef' + 'a' * 32,
+                    'note': 'reconcile: branch already on main when stranded in-progress',
+                },
                 id='is-ancestor-path-with-metadata',
             ),
             pytest.param(
                 False,
                 'cafebabe' + 'c' * 32,
                 'beef0000' + '9' * 32,
+                {
+                    'kind': 'found_on_main',
+                    'commit': 'cafebabe' + 'c' * 32,
+                    'note': 'reconcile: branch deleted but merge marker found on main',
+                },
                 id='merge-marker-path-with-metadata',
             ),
         ],
@@ -1674,6 +1684,7 @@ class TestReconcileStrandedInProgress:
         is_ancestor_val: bool,
         marker_sha_val: str | None,
         branch_base_sha: str,
+        expected_provenance: dict,
     ):
         """Regression lock: the hoisted ``metadata`` dict is CONSUMED by each
         downstream guard that reads ``metadata.get('branch_base_sha')``.
@@ -1710,6 +1721,17 @@ class TestReconcileStrandedInProgress:
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_BRANCH_TIP)  # type: ignore[attr-defined]
 
         await harness._reconcile_stranded_in_progress()
+
+        # Pass-through semantics pin: after both consumer guards verify the
+        # hoisted metadata was read, the task MUST be marked done with the
+        # path-specific provenance.  Without this assertion, a refactor that
+        # inverted a veto condition (e.g. `not await is_ancestor(...)`) would
+        # still call is_ancestor with the correct arguments yet route to
+        # veto-and-return None — the existing input-args assertions below
+        # would not detect the regression (reviewer ref: esc-1276-3 #1).
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '90', 'done', done_provenance=expected_provenance,
+        )
 
         # Guard 3 consumer assertion: resolve_branch_sha is only called when
         # _is_valid_sha_40(branch_base_sha) is True, proving the hoisted metadata
