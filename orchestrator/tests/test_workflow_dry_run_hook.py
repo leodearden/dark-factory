@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,8 +21,42 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.workflow import TaskWorkflow
 
 
+class _Scheduler:
+    """Minimal fake scheduler satisfying _SchedulerLike for workflow tests."""
+
+    def __init__(self) -> None:
+        self.statuses: dict[str, list[str]] = {}
+        self.update_calls: list[dict] = []
+
+    async def set_task_status(self, tid, status, **_kw):
+        self.statuses.setdefault(tid, []).append(status)
+
+    async def get_status(self, tid):
+        hist = self.statuses.get(tid, [])
+        return hist[-1] if hist else None
+
+    async def update_task(self, task_id, metadata, *, append=False):
+        self.update_calls.append({'task_id': task_id, 'metadata': metadata, 'append': append})
+        return True
+
+    async def get_task(self, tid):
+        return None
+
+    async def mark_done(self, task_id, /, *, kind, sha, note=None):
+        pass
+
+    async def handle_blast_radius_expansion(self, task_id, current, needed, /):
+        return False
+
+    async def dispatch_tool(self, name, arguments, *, timeout=30.0):
+        return {}
+
+    def release(self, tid):
+        pass
+
+
 def _make_workflow(*, tmp_path: Path, task_id: str = '42',
-                   enabled: bool = True) -> TaskWorkflow:
+                   enabled: bool = True) -> tuple[TaskWorkflow, _Scheduler]:
     """Minimal TaskWorkflow with controllable unblock_auto flag."""
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -40,29 +74,6 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '42',
     config.unblock_auto.enabled = enabled
 
     git_ops = MagicMock()
-
-    # FakeScheduler inline — track set_task_status calls
-    class _Scheduler:
-        def __init__(self):
-            self.statuses: dict[str, list[str]] = {}
-            self.update_calls: list[dict] = []
-
-        async def set_task_status(self, tid, status, **_kw):
-            self.statuses.setdefault(tid, []).append(status)
-
-        async def get_status(self, tid):
-            hist = self.statuses.get(tid, [])
-            return hist[-1] if hist else None
-
-        async def update_task(self, tid, metadata, *, append=False):
-            self.update_calls.append({'task_id': tid, 'metadata': metadata, 'append': append})
-            return True
-
-        async def get_task(self, tid):
-            return None
-
-        def release(self, tid):
-            pass
 
     scheduler = _Scheduler()
 

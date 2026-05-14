@@ -7,15 +7,13 @@ and invocation_end event tagging.
 
 from __future__ import annotations
 
-import asyncio
 from importlib import resources as pkg_resources
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
 from orchestrator.config import OrchestratorConfig
-
 
 # ---------------------------------------------------------------------------
 # step-3: config defaults
