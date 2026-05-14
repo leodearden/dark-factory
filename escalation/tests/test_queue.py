@@ -1253,3 +1253,77 @@ class TestIterAllEscalationPaths:
             f'Archive-only multi-date duplicate must be yielded exactly once, got: {stems}'
         )
 
+
+class TestAttachDedupeChild:
+    """EscalationQueue.attach_dedupe_child() — mutate a pending parent in place."""
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '1') -> 'Escalation':
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+
+    def test_attach_first_child_returns_updated_escalation(self, tmp_path: Path):
+        """(a) submit parent, attach one child: returns updated Escalation;
+        parent on disk has dedupe_count==1 and dedupe_children==['esc-2-1']."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        result = queue.attach_dedupe_child('esc-1-1', 'esc-2-1')
+
+        assert result is not None
+        assert result.dedupe_count == 1
+        assert result.dedupe_children == ['esc-2-1']
+
+        # Verify the file on disk reflects the mutation
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert from_disk.dedupe_count == 1
+        assert from_disk.dedupe_children == ['esc-2-1']
+
+    def test_attach_second_child_accumulates(self, tmp_path: Path):
+        """(b) Two attach calls accumulate: dedupe_count==2, dedupe_children has both."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        queue.attach_dedupe_child('esc-1-1', 'esc-2-1')
+        result = queue.attach_dedupe_child('esc-1-1', 'esc-3-1')
+
+        assert result is not None
+        assert result.dedupe_count == 2
+        assert result.dedupe_children == ['esc-2-1', 'esc-3-1']
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert from_disk.dedupe_count == 2
+        assert from_disk.dedupe_children == ['esc-2-1', 'esc-3-1']
+
+    def test_attach_to_nonexistent_parent_returns_none(self, tmp_path: Path):
+        """(c) Attaching to a non-existent parent returns None and writes no new files."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        result = queue.attach_dedupe_child('does-not-exist', 'esc-9-1')
+
+        assert result is None
+        # No new JSON files should exist in queue_dir
+        files = list(queue.queue_dir.glob('*.json'))
+        assert files == [], f'Expected no files, found: {files}'
+
+    def test_attach_to_resolved_parent_returns_none(self, tmp_path: Path):
+        """(d) Attaching to a resolved parent (in archive) returns None — no mutation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+        queue.resolve('esc-1-1', 'fixed already')
+
+        # Parent is now in archive, not in queue root
+        assert not (queue.queue_dir / 'esc-1-1.json').exists()
+
+        result = queue.attach_dedupe_child('esc-1-1', 'esc-2-1')
+
+        assert result is None
+
