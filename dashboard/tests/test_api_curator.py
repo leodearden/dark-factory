@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from starlette.testclient import TestClient
 
 from dashboard.data.metrics import METRICS_SCHEMA
@@ -71,6 +72,10 @@ def test_curator_endpoint_returns_envelope_shape(client):
     mcp_tool_call is mocked to return empty tickets so the fan-out succeeds
     without a real server. latency_spark / capped_spark default to empty series
     because no DB is seeded in this test.
+
+    Also pins state.paused_reason to None (the current placeholder value until
+    the follow-up MCP tool lands — see app.py paused_reason TODO). When that
+    feature ships, update the assertion on line ~96 in place.
     """
     mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
     with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
@@ -92,6 +97,7 @@ def test_curator_endpoint_returns_envelope_shape(client):
     state = cs.get('state', {})
     assert 'capped_now' in state
     assert 'paused_reason' in state
+    assert state['paused_reason'] is None  # pinned to None; see app.py paused_reason TODO
     assert 'pending_total' in state
 
 
@@ -323,50 +329,29 @@ def test_shape_curator_pure_function():
 
 
 # ---------------------------------------------------------------------------
-# step-1299-3: paused_reason contract — pinned to None
+# step-1299-4: bad created_at values → age_seconds=None, no 500
 # ---------------------------------------------------------------------------
 
 
-def test_curator_endpoint_paused_reason_pinned_to_none(client):
-    """CURATOR_STATE.state.paused_reason is hardcoded to None (not just present).
+@pytest.mark.parametrize('created_at_value', ['not-an-iso-date', ''], ids=['malformed_iso', 'empty_string'])
+def test_curator_endpoint_bad_created_at_returns_age_seconds_none(
+    tmp_path: Path, created_at_value: str
+):
+    """Bad created_at is preserved verbatim; age_seconds is None; no 500.
 
-    The existing envelope-shape test only asserts key presence. This test pins
-    the current contract so any future change that accidentally sets
-    paused_reason to a non-None value fails explicitly.
+    Two code paths are covered by the two parameter values:
+    - 'not-an-iso-date': app.py raises ValueError/TypeError in the parse block,
+      which is caught and sets age_seconds=None.
+    - '': the `if created_at_str:` guard (app.py) skips the parse block
+      entirely, leaving age_seconds=None implicitly.
 
-    NOTE: paused_reason=None is a temporary placeholder (see app.py TODO near
-    line 732-734: "Returns None until a follow-up task adds a snapshot column
-    or a new get_curator_state MCP tool"). When that follow-up lands this
-    assertion must be updated to reflect the new contract.
-    """
-    mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
-    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
-        resp = client.get('/api/v2/dashboard/curator')
-
-    assert resp.status_code == 200
-    state = resp.json()['CURATOR_STATE']['state']
-    assert 'paused_reason' in state, "state must contain 'paused_reason' key"
-    assert state['paused_reason'] is None, (
-        f"paused_reason should be None (hardcoded contract), got {state['paused_reason']!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# step-1299-4: malformed created_at → age_seconds=None, no 500
-# ---------------------------------------------------------------------------
-
-
-def test_curator_endpoint_malformed_created_at_returns_age_seconds_none(tmp_path: Path):
-    """Malformed created_at is preserved verbatim; age_seconds is None; no 500.
-
-    The app.py parse block catches ValueError/TypeError and sets age_seconds=None.
-    This test pins that: the row survives, the bad string round-trips unchanged,
-    and the endpoint returns 200 (not 500).
+    In both cases the row survives, the bad string round-trips unchanged, and
+    the endpoint returns 200 (not 500).
     """
     ticket_row = {
         'ticket_id': 'tkt_x',
         'candidate_title': 'task X',
-        'created_at': 'not-an-iso-date',
+        'created_at': created_at_value,
     }
     mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
 
@@ -379,46 +364,9 @@ def test_curator_endpoint_malformed_created_at_returns_age_seconds_none(tmp_path
     assert len(cs['pending']) == 1, f"Expected 1 pending row, got {len(cs['pending'])}"
     row = cs['pending'][0]
     assert row['ticket_id'] == 'tkt_x'
-    assert row['created_at'] == 'not-an-iso-date', (
+    assert row['created_at'] == created_at_value, (
         f"created_at should be preserved verbatim, got {row['created_at']!r}"
     )
     assert row['age_seconds'] is None, (
-        f"age_seconds should be None for malformed created_at, got {row['age_seconds']!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# step-1299-4b: empty/absent created_at → age_seconds=None (sibling path)
-# ---------------------------------------------------------------------------
-
-
-def test_curator_endpoint_empty_created_at_returns_age_seconds_none(tmp_path: Path):
-    """Empty (falsy) created_at skips the parse block entirely; age_seconds stays None.
-
-    app.py:670 guards the fromisoformat call with `if created_at_str:`, so an
-    empty string bypasses the try/except entirely and age_seconds is set to None
-    implicitly.  This test pins that sibling code path alongside the ValueError
-    path tested by test_curator_endpoint_malformed_created_at_returns_age_seconds_none.
-    """
-    ticket_row = {
-        'ticket_id': 'tkt_y',
-        'candidate_title': 'task Y',
-        'created_at': '',
-    }
-    mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
-
-    config = _make_config(tmp_path)
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
-        resp = c.get('/api/v2/dashboard/curator')
-
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
-    cs = resp.json()['CURATOR_STATE']
-    assert len(cs['pending']) == 1, f"Expected 1 pending row, got {len(cs['pending'])}"
-    row = cs['pending'][0]
-    assert row['ticket_id'] == 'tkt_y'
-    assert row['created_at'] == '', (
-        f"created_at should be preserved verbatim (empty string), got {row['created_at']!r}"
-    )
-    assert row['age_seconds'] is None, (
-        f"age_seconds should be None for empty created_at, got {row['age_seconds']!r}"
+        f"age_seconds should be None for bad created_at, got {row['age_seconds']!r}"
     )
