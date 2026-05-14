@@ -16,6 +16,12 @@ cwd is set to ``project_root`` so the hook can resolve project-relative paths.
 Timeout defaults to 30 s (≤30 s suggested by the spec).  On timeout the
 process is killed and the transition is refused (fail-closed).
 
+Fail-closed on all configuration errors — ``pre_done_hook_misconfigured``
+is returned when the command cannot be parsed (shlex failure), the parsed
+argv is empty, or the subprocess cannot be launched at all (binary missing,
+not executable, or any other OSError).  This prevents a misconfiguration
+from silently disabling the gate.
+
 Error shapes mirror ``_terminal_exit_error`` / ``_done_gate_error`` in
 ``task_interceptor.py`` — same ``{'success': False, 'error': …, 'task_id':
 …, 'hint': …}`` skeleton so MCP callers can handle them uniformly.
@@ -175,13 +181,23 @@ async def run_hook(
     # Substitute {id} in each token
     argv = [tok.replace('{id}', task_id) for tok in argv]
 
-    # Launch subprocess (argv form — no shell to prevent injection)
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=project_root,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    # Launch subprocess (argv form — no shell to prevent injection).
+    # Catch all OS-level launch failures (missing binary, not executable,
+    # ENOEXEC, ETXTBSY, etc.) and return a structured misconfigured error
+    # rather than propagating the OSError up through the gate chain.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=project_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        return _pre_done_hook_misconfigured_error(
+            task_id,
+            reason=f'failed to launch hook: {exc}',
+            command=command,
+        )
 
     try:
         _stdout, stderr_bytes = await asyncio.wait_for(
