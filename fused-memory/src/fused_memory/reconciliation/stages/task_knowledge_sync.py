@@ -1946,9 +1946,7 @@ def _needs_hint_conversion(task: dict) -> bool:
     task_hints = metadata.get('memory_hints') if isinstance(metadata, dict) else None
     if isinstance(task_hints, list):
         return True
-    if not task_hints:
-        return True
-    return False
+    return not task_hints
 
 
 async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | None:
