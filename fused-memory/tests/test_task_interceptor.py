@@ -6087,7 +6087,9 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
             try:
                 yield
             finally:
-                asyncio.current_task().cancel()
+                task = asyncio.current_task()
+                if task is not None:
+                    task.cancel()
                 await asyncio.sleep(0)
 
         return _ctx()
@@ -6095,9 +6097,8 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
     interceptor_with_store._dispatch_ticket_decision = fake_dispatch
     interceptor_with_store._curator_lock = fake_curator_lock
     try:
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
-            with pytest.raises(asyncio.CancelledError):
-                await interceptor_with_store._process_add_ticket(ticket_id)
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'), pytest.raises(asyncio.CancelledError):
+            await interceptor_with_store._process_add_ticket(ticket_id)
     finally:
         del interceptor_with_store._dispatch_ticket_decision
         del interceptor_with_store._curator_lock
