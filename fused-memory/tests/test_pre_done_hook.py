@@ -1,14 +1,11 @@
 """Tests for fused_memory.middleware.pre_done_hook."""
 
-import asyncio
-import os
 from unittest.mock import AsyncMock
 
 import pytest
 
 from fused_memory.middleware.pre_done_hook import resolve_hook_command, run_hook
 from fused_memory.models.scope import resolve_project_id
-
 
 # ── resolve_hook_command ───────────────────────────────────────────────────────
 

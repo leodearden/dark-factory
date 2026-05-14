@@ -192,13 +192,15 @@ async def run_hook(
         await proc.wait()
         return _pre_done_hook_timeout_error(task_id, timeout, command)
 
-    if proc.returncode == 0:
+    returncode = proc.returncode
+    assert returncode is not None, 'returncode must be set after communicate()'
+    if returncode == 0:
         return None
 
     stderr_text = stderr_bytes.decode('utf-8', errors='replace')
     return _pre_done_hook_rejected_error(
         task_id,
-        exit_code=proc.returncode,
+        exit_code=returncode,
         stderr=stderr_text,
         command=command,
     )
