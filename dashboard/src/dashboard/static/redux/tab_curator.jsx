@@ -158,7 +158,11 @@ function CuratorTab({ projectFilter = [] }) {
   const addToast = useCallback((msg) => {
     const id = Date.now() + Math.random();
     setToasts(prev => [...prev, { id, msg }]);
-    const timer = setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+    const timer = setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+      const idx = toastTimers.current.indexOf(timer);
+      if (idx >= 0) toastTimers.current.splice(idx, 1);
+    }, 5000);
     toastTimers.current.push(timer);
   }, []);
 
