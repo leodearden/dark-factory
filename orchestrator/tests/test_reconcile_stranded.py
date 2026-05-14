@@ -1169,125 +1169,92 @@ class TestReconcileStrandedInProgress:
     # rejected; a marker from this incarnation must flip the task.
     # ------------------------------------------------------------------
 
-    async def test_marker_skipped_when_marker_predates_branch_base_sha(
-        self, harness: Harness
+    @pytest.mark.parametrize(
+        'status',
+        [
+            pytest.param('in-progress', id='in-progress'),
+            pytest.param('blocked', id='blocked'),
+        ],
+    )
+    async def test_marker_skipped_when_marker_predates_branch_base_sha_parametrized(
+        self, harness: Harness, status: str,
     ):
-        """Stale-marker check: marker is_ancestor of branch_base_sha → prior incarnation.
+        """Stale-marker veto is status-agnostic: predates branch_base_sha → must NOT flip.
 
-        The branch was deleted and re-created.  A merge-marker on main from the
-        *prior* incarnation (marker_sha is an ancestor of branch_base_sha) must
-        NOT cause a spurious done flip for the current incarnation.
+        The veto at harness.py:1312-1321 fires on the second is_ancestor call's
+        result (True = marker is ancestor of base = stale = prior incarnation) and
+        short-circuits with `return None` BEFORE the status-aware note construction
+        at harness.py:1323-1327 runs.  The blocked-flavor message
+        'reconcile: merge marker found on main while task was blocked' (and the
+        in-progress fixed message) must NOT fire for vetoed markers.
         """
         marker_sha = 'cafebabe' + 'd' * 32
         branch_base = 'beef0000' + '9' * 32
-        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
-        # Second is_ancestor call: stale-marker check → True (marker predates base)
+        tid = '80'
+        # First is_ancestor: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor: stale-marker check → True (marker predates base)
         harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])
         harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
         harness.scheduler.get_task = AsyncMock(
-            return_value={'id': '80', 'metadata': {'branch_base_sha': branch_base}}
+            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
         )
-        harness.scheduler.get_statuses.return_value = ({'80': 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = ({tid: status}, None)  # type: ignore[attr-defined]
 
         await harness._reconcile_stranded_in_progress()
 
-        # Stale marker from prior incarnation — must NOT flip to done
+        # Stale marker from prior incarnation — must NOT flip to done regardless of status
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
-    async def test_marker_skipped_when_marker_predates_branch_base_sha_blocked(
-        self, harness: Harness
+    @pytest.mark.parametrize(
+        'status,expected_note',
+        [
+            pytest.param(
+                'in-progress',
+                'reconcile: branch deleted but merge marker found on main',
+                id='in-progress',
+            ),
+            pytest.param(
+                'blocked',
+                'reconcile: merge marker found on main while task was blocked',
+                id='blocked',
+            ),
+        ],
+    )
+    async def test_marker_accepted_when_marker_postdates_branch_base_sha_parametrized(
+        self, harness: Harness, status: str, expected_note: str,
     ):
-        """Stale-marker guard is status-agnostic: blocked task with stale marker must NOT flip.
+        """Stale-marker accept path: marker postdates base → flip to done with status-aware note.
 
-        The stale-marker veto at harness.py:1329-1338 fires based on the is_ancestor
-        result, not on task status.  The blocked-flavor message
-        ('reconcile: merge marker found on main while task was blocked') at
-        harness.py:1340-1344 must NOT fire for vetoed markers — the veto
-        short-circuits before reaching the note construction.
+        Exercises the status-aware note conditional at harness.py:1323-1327:
+          - status == 'blocked' → 'reconcile: merge marker found on main while task was blocked'
+          - any other status (here 'in-progress') → 'reconcile: branch deleted but merge marker found on main'
+
+        The expected_note for the blocked arm is the verbatim f-string output and is
+        pinned to catch regressions in the conditional.  The in-progress arm pins
+        the fixed else-branch string.
         """
         marker_sha = 'cafebabe' + 'd' * 32
         branch_base = 'beef0000' + '9' * 32
-        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
-        # Second is_ancestor call: stale-marker check → True (marker predates base)
-        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])
-        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': '80b', 'metadata': {'branch_base_sha': branch_base}}
-        )
-        harness.scheduler.get_statuses.return_value = ({'80b': 'blocked'}, None)  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        # Stale marker from prior incarnation — must NOT flip to done even for blocked tasks
-        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-
-    async def test_marker_accepted_when_marker_postdates_branch_base_sha(
-        self, harness: Harness
-    ):
-        """Stale-marker check positive case: marker is NOT ancestor of base → accept.
-
-        The marker was produced by the *current* incarnation (it post-dates
-        branch creation), so the task must be flipped to done.
-        """
-        marker_sha = 'cafebabe' + 'd' * 32
-        branch_base = 'beef0000' + '9' * 32
-        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
-        # Second is_ancestor call: stale-marker check → False (marker postdates base)
+        tid = '81'
+        # First is_ancestor: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor: stale-marker check → False (marker postdates base)
         harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, False])
         harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
         harness.scheduler.get_task = AsyncMock(
-            return_value={'id': '81', 'metadata': {'branch_base_sha': branch_base}}
+            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
         )
-        harness.scheduler.get_statuses.return_value = ({'81': 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = ({tid: status}, None)  # type: ignore[attr-defined]
 
         await harness._reconcile_stranded_in_progress()
 
-        # Marker is from this incarnation — must flip to done
+        # Marker is from this incarnation — must flip to done with the status-appropriate note
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '81', 'done',
+            tid, 'done',
             done_provenance={
                 'kind': 'found_on_main',
                 'commit': marker_sha,
-                'note': 'reconcile: branch deleted but merge marker found on main',
-            },
-        )
-
-    async def test_marker_accepted_when_marker_postdates_branch_base_sha_blocked(
-        self, harness: Harness
-    ):
-        """Blocked arm of harness.py:1340-1344: marker postdates base → flip with blocked note.
-
-        This exercises the blocked arm of the status-aware note conditional at
-        harness.py:1340-1344.  Unlike test_blocked_with_merge_marker_marked_done
-        (line 2150), which has no branch_base_sha metadata, this test activates the
-        stale-marker guard so the note is constructed through the conditional.
-
-        The 'reconcile: merge marker found on main while task was blocked' string is
-        the verbatim f-string output for status=='blocked' and is pinned here to catch
-        any future regression in the conditional.
-        """
-        marker_sha = 'cafebabe' + 'd' * 32
-        branch_base = 'beef0000' + '9' * 32
-        # First is_ancestor call: branch check → False (skip is_ancestor fast-path)
-        # Second is_ancestor call: stale-marker check → False (marker postdates base)
-        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, False])
-        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': '81b', 'metadata': {'branch_base_sha': branch_base}}
-        )
-        harness.scheduler.get_statuses.return_value = ({'81b': 'blocked'}, None)  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        # Marker is from this incarnation — must flip to done with the blocked-flavor note
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '81b', 'done',
-            done_provenance={
-                'kind': 'found_on_main',
-                'commit': marker_sha,
-                'note': 'reconcile: merge marker found on main while task was blocked',
+                'note': expected_note,
             },
         )
 
