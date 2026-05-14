@@ -66,6 +66,7 @@ class StewardMetrics:
     escalations_handled: int = 0
     escalations_reescalated: int = 0
     timeouts_recovered: int = 0
+    empty_outputs_recovered: int = 0
 
 
 class TaskSteward:
@@ -100,6 +101,7 @@ class TaskSteward:
         self._task: asyncio.Task | None = None
         self._retry_counts: dict[str, int] = {}
         self._timeout_counts: dict[str, int] = {}
+        self._empty_output_counts: dict[str, int] = {}
         self.metrics = StewardMetrics()
 
     # ------------------------------------------------------------------
@@ -334,6 +336,16 @@ class TaskSteward:
             )
             return
 
+        # Guard: per-escalation empty-output cap
+        empty_output_count = self._empty_output_counts.get(escalation.id, 0)
+        if empty_output_count >= self.config.steward_max_empty_outputs_per_escalation:
+            self._auto_escalate_to_human(
+                escalation,
+                f'Invocation repeatedly produced no output '
+                f'({empty_output_count}/{self.config.steward_max_empty_outputs_per_escalation})',
+            )
+            return
+
         cwd = self.worktree
 
         # Pre-triage large suggestion sets before invoking the steward session
@@ -433,6 +445,28 @@ class TaskSteward:
             )
             return
 
+        if _is_empty_output(result):
+            self.metrics.empty_outputs_recovered += 1
+            self._empty_output_counts[escalation.id] = (
+                self._empty_output_counts.get(escalation.id, 0) + 1
+            )
+            # Empty stdout means the Claude subprocess exited before producing JSON.
+            # The dominant cause is --resume hitting a session the per-project store
+            # can't find (stale id from a prior cwd / expired session). Drop the
+            # session id so the next attempt rebuilds a fresh initial prompt at the
+            # current cwd instead of repeating the same instant failure.
+            cleared = self._session_id is not None
+            self._session_id = None
+            logger.warning(
+                f'Steward for task {self.task_id}: invocation produced no output '
+                f'(empty stdout) — retry_count NOT incremented '
+                f'(escalation remains pending: {escalation.id}, '
+                f'empty_output_count: {self._empty_output_counts[escalation.id]}/'
+                f'{self.config.steward_max_empty_outputs_per_escalation}, '
+                f'session_cleared={cleared})'
+            )
+            return
+
         # Patch resolution metadata
         self._patch_resolution_metadata(escalation.id, result)
 
@@ -451,6 +485,7 @@ class TaskSteward:
             # steward dict does not accumulate stale entries indefinitely.
             self._retry_counts.pop(escalation.id, None)
             self._timeout_counts.pop(escalation.id, None)
+            self._empty_output_counts.pop(escalation.id, None)
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
@@ -690,6 +725,7 @@ class TaskSteward:
         # stale entries when cap-fire paths skip the success-path cleanup.
         self._retry_counts.pop(escalation.id, None)
         self._timeout_counts.pop(escalation.id, None)
+        self._empty_output_counts.pop(escalation.id, None)
 
         self.metrics.escalations_reescalated += 1
         logger.warning(
@@ -759,3 +795,17 @@ def _is_timeout_kill(result) -> bool:
         or 'Process terminated after' in stderr
     )
     return has_marker and 'timeout' in stderr
+
+
+def _is_empty_output(result) -> bool:
+    """Return True when *result* represents an instant-empty-stdout subprocess failure.
+
+    Set by ``_parse_claude_output`` (shared/cli_invoke.py) when the Claude CLI
+    exits without producing any JSON on stdout — the dominant cause is a
+    ``--resume <session_id>`` lookup miss (cwd changed, session expired), but
+    bad CLI args / instant auth rejection produce the same shape. The result
+    has ``cost_usd=0, duration_ms=0, turns=0, success=False``: no real work
+    was done, so this attempt should NOT consume retry budget (mirrors the
+    ``_is_timeout_kill`` carve-out).
+    """
+    return result.subtype == 'error_empty_output'
