@@ -276,3 +276,76 @@ class TestCrossTaskDedupe:
         parent = Escalation.from_json(files[0].read_text())
         assert parent.task_id == '42'
         assert parent.dedupe_count == 1
+
+
+# ---------------------------------------------------------------------------
+# TestDedupeGates
+# ---------------------------------------------------------------------------
+
+
+class TestDedupeGates:
+    """Short-circuit gates: disabled flag and non-member category produce two files."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_flag_produces_two_files(self, tmp_path: Path):
+        """(a) DedupeConfig(infra_dedupe_enabled=False): two identical infra_issue calls
+        produce two esc-*.json files and neither response has status='dedup_skipped'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False))
+
+        first = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        second = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 9999',
+        )
+
+        assert first['status'] == 'queued'
+        assert second['status'] == 'queued'
+        assert first.get('status') != 'dedup_skipped'
+        assert second.get('status') != 'dedup_skipped'
+
+        files = _queue_root_files(queue)
+        assert len(files) == 2, (
+            f'Expected 2 files when dedupe disabled; got: {files}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_infra_category_produces_two_files(self, tmp_path: Path):
+        """(b) risk_identified (not in infra_dedupe_categories) with same summary
+        produces two esc-*.json files, no dedup."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)  # default config: only infra_issue is in scope
+
+        first = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='risk_identified',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        second = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='risk_identified',
+            summary='fused-memory connection timeout on port 9999',
+        )
+
+        assert first['status'] == 'queued'
+        assert second['status'] == 'queued'
+        assert first.get('status') != 'dedup_skipped'
+        assert second.get('status') != 'dedup_skipped'
+
+        files = _queue_root_files(queue)
+        assert len(files) == 2, (
+            f'Expected 2 files for non-infra category; got: {files}'
+        )
