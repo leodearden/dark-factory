@@ -490,3 +490,53 @@ class TestWriteStateSnapshot:
         assert path.exists(), (
             'Expected snapshot file to be created even when parent dirs are missing'
         )
+
+
+# ===========================================================================
+# Step-17: acquire_next writes snapshot to default path
+# ===========================================================================
+
+class TestAcquireNextWritesSnapshot:
+    """acquire_next() writes a scheduler_state.json after each tick."""
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_writes_snapshot_to_default_path(self, tmp_path):
+        """After acquire_next, scheduler_state.json exists and parses as JSON."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler._project_root = str(tmp_path)
+
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+
+        await scheduler.acquire_next()
+
+        snap_path = tmp_path / 'data' / 'orchestrator' / 'scheduler_state.json'
+        assert snap_path.exists(), (
+            f'Expected snapshot at {snap_path} after acquire_next'
+        )
+        data = json.loads(snap_path.read_text())
+        assert 'snapshot_at' in data
+
+    @pytest.mark.asyncio
+    async def test_snapshot_write_failure_does_not_break_acquire_next(
+        self, tmp_path, monkeypatch
+    ):
+        """If write_state_snapshot raises, acquire_next still dispatches tasks."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler._project_root = str(tmp_path)
+
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+
+        # Force write_state_snapshot to raise so we test fault isolation.
+        from unittest.mock import MagicMock
+        scheduler.write_state_snapshot = MagicMock(side_effect=RuntimeError('disk full'))
+
+        result = await scheduler.acquire_next()
+        # The dispatch must still succeed despite the snapshot write failure.
+        assert result is not None, (
+            'acquire_next must return a TaskAssignment even if snapshot write fails'
+        )
+        assert result.task_id == 'A'

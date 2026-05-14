@@ -1930,6 +1930,7 @@ class Scheduler:
                             task_id=pin_tid,
                             data={'modules': pin_modules, 'priority': pin_pri},
                         )
+                    self._write_snapshot_best_effort()
                     return TaskAssignment(
                         task_id=pin_tid, task=pin_task, modules=pin_modules
                     )
@@ -2001,10 +2002,12 @@ class Scheduler:
                         task_id=task_id,
                         data={'modules': modules, 'priority': pri},
                     )
+                self._write_snapshot_best_effort()
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
         # Loop exhausted with no acquire — top candidate was also skipped.
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+        self._write_snapshot_best_effort()
         return None
 
     def get_state_snapshot(self) -> dict:
@@ -2096,6 +2099,20 @@ class Scheduler:
             logger.warning(
                 'write_state_snapshot failed for path %s', path, exc_info=True
             )
+
+    def _write_snapshot_best_effort(self) -> None:
+        """Write the scheduler state snapshot to the default path.
+
+        Derives the path from ``_project_root`` and swallows all exceptions
+        so the scheduler never stops ticking due to disk or serialisation errors.
+        """
+        try:
+            path = (
+                Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+            )
+            self.write_state_snapshot(path)
+        except Exception:
+            logger.warning('_write_snapshot_best_effort failed', exc_info=True)
 
     async def handle_blast_radius_expansion(
         self,
