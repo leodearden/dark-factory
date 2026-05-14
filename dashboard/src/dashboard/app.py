@@ -603,7 +603,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     """
     try:
         body = await request.json()
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+    except json.JSONDecodeError:
         body = None
 
     ticket_id = body.get('ticket_id') if isinstance(body, dict) else None
