@@ -7572,3 +7572,17 @@ class TestFormatSnapshotFact:
                 project_id='proj',
                 counts={'total': 1},
             )
+
+    def test_raises_on_empty_counts(self):
+        """Empty counts mapping must raise ValueError to prevent malformed output.
+
+        Without this guard, an empty dict produces 'As of YYYY-MM-DD: project proj has .'
+        — a dangling space before the period.  The guard keeps every emitted fact parseable.
+        """
+        format_snapshot_fact = self._import_helper()
+        with pytest.raises(ValueError, match='non-empty counts'):
+            format_snapshot_fact(
+                as_of=datetime(2026, 5, 13, tzinfo=UTC),
+                project_id='proj',
+                counts={},
+            )
