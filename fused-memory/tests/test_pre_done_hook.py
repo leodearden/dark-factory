@@ -39,3 +39,26 @@ def test_resolve_hook_command_returns_none_for_empty_or_whitespace_value(monkeyp
 
     monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_REIFY', '   ')
     assert resolve_hook_command('/home/leo/src/reify') is None
+
+
+# ── run_hook ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_hook_returns_none_on_zero_exit(monkeypatch):
+    """run_hook returns None (success) when the hook subprocess exits with code 0.
+
+    Uses '/tmp' as project_root so project_id='tmp' and the env var is
+    FUSED_MEMORY_PREDONE_HOOK_TMP — a deterministic name for the test.
+    """
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_TMP', '/bin/true')
+    result = await run_hook('42', '/tmp')
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_run_hook_returns_none_when_unconfigured(monkeypatch):
+    """run_hook returns None immediately when no env var is configured (no subprocess)."""
+    monkeypatch.delenv('FUSED_MEMORY_PREDONE_HOOK_TMP', raising=False)
+    result = await run_hook('42', '/tmp')
+    assert result is None
