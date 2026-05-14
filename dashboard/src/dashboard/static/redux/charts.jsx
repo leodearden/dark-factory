@@ -76,6 +76,11 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
   // Build horizontal-then-vertical path: move to each x at the PREVIOUS y,
   // then drop/rise to the new y — this creates sharp step edges.
   const parts = [`M${points[0][0]},${points[0][1]}`];
+  if (points.length === 1) {
+    // Single data point: draw a full-width horizontal tick so something is visible.
+    // Without this, the path contains only a Move command and renders nothing.
+    parts.push(`L${width},${points[0][1]}`);
+  }
   for (let i = 1; i < points.length; i++) {
     // Horizontal segment to the new x, keeping old y
     parts.push(`L${points[i][0]},${points[i - 1][1]}`);

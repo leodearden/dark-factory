@@ -1,10 +1,10 @@
 /* Curator tab — surfaces CURATOR_STATE from /api/v2/dashboard/curator
    and provides optimistic-UI cancel buttons wired to /api/v2/dashboard/curator/cancel. */
-const { Sparkline: SP_CUR, StepSpark: SS_CUR, PALETTE: PAL_CUR } = window.DF_CHARTS;
-const { ChipList: CL_CUR } = window.DF_TABS;
-const { timeago: ta_CUR } = window.DF_SHELL;
-const D_CUR = window.DF_DATA;
-const { useState: uS_CUR, useEffect: uE_CUR, useCallback: uCB_CUR } = React;
+const { Sparkline, StepSpark, PALETTE } = window.DF_CHARTS;
+const { ChipList } = window.DF_TABS;
+const { timeago } = window.DF_SHELL;
+const D = window.DF_DATA;
+const { useState, useEffect, useCallback, useRef } = React;
 
 // ── Helpers ──
 
@@ -42,18 +42,18 @@ function LatencyPanel({ latency_spark }) {
         ) : (
           <>
             <div style={{ display: 'flex', gap: 8, marginBottom: 4, fontSize: 10, color: 'var(--fg-3)' }}>
-              <span style={{ color: PAL_CUR.accent }}>■</span><span>p50</span>
-              <span style={{ color: PAL_CUR.accent2 }}>■</span><span>p90</span>
-              <span style={{ color: PAL_CUR.fg3 }}>■</span><span>p99</span>
+              <span style={{ color: PALETTE.accent }}>■</span><span>p50</span>
+              <span style={{ color: PALETTE.accent2 }}>■</span><span>p90</span>
+              <span style={{ color: PALETTE.fg3 }}>■</span><span>p99</span>
             </div>
             <div style={{ height: 28, position: 'relative', marginBottom: 2 }}>
-              <SP_CUR values={p99} color={PAL_CUR.fg3} strokeWidth={1} area={false} />
+              <Sparkline values={p99} color={PALETTE.fg3} strokeWidth={1} area={false} />
             </div>
             <div style={{ height: 28, position: 'relative', marginBottom: 2 }}>
-              <SP_CUR values={p90} color={PAL_CUR.accent2} strokeWidth={1} area={false} />
+              <Sparkline values={p90} color={PALETTE.accent2} strokeWidth={1} area={false} />
             </div>
             <div style={{ height: 28, position: 'relative' }}>
-              <SP_CUR values={p50} color={PAL_CUR.accent} strokeWidth={1.5} area={true} />
+              <Sparkline values={p50} color={PALETTE.accent} strokeWidth={1.5} area={true} />
             </div>
           </>
         )}
@@ -75,7 +75,7 @@ function CappedPanel({ capped_spark }) {
           <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>No capped events recorded</span>
         ) : (
           <div style={{ height: 56, position: 'relative' }}>
-            <SS_CUR values={values} color={PAL_CUR.bad} strokeWidth={1.5} />
+            <StepSpark values={values} color={PALETTE.bad} strokeWidth={1.5} />
           </div>
         )}
       </div>
@@ -88,14 +88,14 @@ function QueueRow({ ticket, onCancel }) {
   const { ticket_id, title, files, project_id, age_seconds, created_at } = ticket;
   const age = age_seconds != null
     ? (age_seconds < 60 ? `${age_seconds}s` : age_seconds < 3600 ? `${Math.round(age_seconds / 60)}m` : `${Math.round(age_seconds / 3600)}h`)
-    : ta_CUR(created_at);
+    : timeago(created_at);
   return (
     <tr>
       <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>{shortTicketId(ticket_id)}</td>
       <td style={{ maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis' }} title={title}>{title || '—'}</td>
       <td>
         {files && files.length > 0 ? (
-          <CL_CUR
+          <ChipList
             items={files}
             renderChip={(f, i) => (
               <span key={i} className="chip" title={f} style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>
@@ -114,7 +114,7 @@ function QueueRow({ ticket, onCancel }) {
         <button
           className="badge bad"
           style={{ cursor: 'pointer', fontSize: 10, padding: '2px 8px', border: '1px solid' }}
-          onClick={() => onCancel(ticket_id, ticket)}
+          onClick={() => onCancel(ticket_id, title)}
           title={`Cancel ticket ${ticket_id}`}
         >
           Cancel
@@ -126,22 +126,44 @@ function QueueRow({ ticket, onCancel }) {
 
 // ── Main CuratorTab component ──
 function CuratorTab({ projectFilter }) {
-  const cs = D_CUR.CURATOR_STATE || {};
+  const cs = D.CURATOR_STATE || {};
   const { pending = [], latency_spark, capped_spark, state = {} } = cs;
   const { capped_now = 0, paused_reason = null, pending_total = 0 } = state;
 
   // Optimistic cancellation: set of ticket_ids removed from local view
-  const [cancelled, setCancelled] = uS_CUR(() => new Set());
+  const [cancelled, setCancelled] = useState(() => new Set());
   // Toast list: [{ id, msg }]
-  const [toasts, setToasts] = uS_CUR([]);
+  const [toasts, setToasts] = useState([]);
+  // Track toast timers so we can clear them on unmount to avoid setState-after-unmount warnings
+  const toastTimers = useRef([]);
 
-  const addToast = uCB_CUR((msg) => {
-    const id = Date.now() + Math.random();
-    setToasts(prev => [...prev, { id, msg }]);
-    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+  // Clear all pending toast timers on unmount
+  useEffect(() => {
+    return () => {
+      toastTimers.current.forEach(clearTimeout);
+    };
   }, []);
 
-  const handleCancel = uCB_CUR(async (ticket_id, ticket) => {
+  // Prune stale cancelled IDs whenever pending changes (each 3 s poll).
+  // Prevents unbounded Set growth and handles unlikely ticket_id reuse.
+  useEffect(() => {
+    if (cancelled.size === 0) return;
+    const pendingIds = new Set(pending.map(t => t.ticket_id));
+    setCancelled(prev => {
+      const pruned = new Set([...prev].filter(id => pendingIds.has(id)));
+      return pruned.size === prev.size ? prev : pruned;
+    });
+  }, [pending]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addToast = useCallback((msg) => {
+    const id = Date.now() + Math.random();
+    setToasts(prev => [...prev, { id, msg }]);
+    const timer = setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+    toastTimers.current.push(timer);
+  }, []);
+
+  // title arg is used in failure toasts so operators know which ticket failed.
+  const handleCancel = useCallback(async (ticket_id, title) => {
     // Optimistically hide the row
     setCancelled(prev => new Set([...prev, ticket_id]));
     try {
@@ -153,12 +175,14 @@ function CuratorTab({ projectFilter }) {
       if (!resp.ok) {
         // Revert: restore the row
         setCancelled(prev => { const s = new Set(prev); s.delete(ticket_id); return s; });
-        addToast(`Cancel failed (${resp.status}): ${ticket_id}`);
+        const label = title ? `"${title}"` : ticket_id;
+        addToast(`Cancel failed (${resp.status}): ${label}`);
       }
     } catch (err) {
       // Network error — revert
       setCancelled(prev => { const s = new Set(prev); s.delete(ticket_id); return s; });
-      addToast(`Cancel error: ${err.message || String(err)}`);
+      const label = title ? `"${title}"` : ticket_id;
+      addToast(`Cancel error: ${label} — ${err.message || String(err)}`);
     }
   }, [addToast]);
 

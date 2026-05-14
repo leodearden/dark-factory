@@ -356,14 +356,19 @@ _TAB_CURATOR_PREFIX = '/static/redux/tab_curator.jsx'
 _CHARTS_PREFIX = '/static/redux/charts.jsx'
 _SHELL_PREFIX = '/static/redux/shell.jsx'
 _DATA_JS_PREFIX = '/static/redux/data.js'
+_TABS_PREFIX = '/static/redux/tabs.jsx'
 _APP_JSX_PREFIX = '/static/redux/app.jsx'
 
 # Each pair: (before_src_prefix, before_label, after_src_prefix, after_label)
-# tab_curator.jsx must load AFTER its three deps and BEFORE app.jsx.
+# tab_curator.jsx must load AFTER its four deps and BEFORE app.jsx.
+# tabs.jsx is included because tab_curator.jsx destructures ChipList from
+# window.DF_TABS at top-level execution time — if tabs.jsx moved after
+# tab_curator.jsx the destructure would silently set ChipList to undefined.
 _TAB_CURATOR_ORDER_CASES = [
     (_CHARTS_PREFIX, 'charts.jsx', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
     (_SHELL_PREFIX, 'shell.jsx', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
     (_DATA_JS_PREFIX, 'data.js', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
+    (_TABS_PREFIX, 'tabs.jsx', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
     (_TAB_CURATOR_PREFIX, 'tab_curator.jsx', _APP_JSX_PREFIX, 'app.jsx'),
 ]
 
@@ -375,6 +380,7 @@ _TAB_CURATOR_ORDER_CASES = [
         'charts-before-curator',
         'shell-before-curator',
         'data-before-curator',
+        'tabs-before-curator',
         'curator-before-app',
     ],
 )
