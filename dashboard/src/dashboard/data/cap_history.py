@@ -63,6 +63,7 @@ async def read_cap_intervals(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int,
+    now: datetime | None = None,
 ) -> list[CapInterval]:
     """Return all cap intervals across *dbs* within the last *days* days.
 
@@ -76,13 +77,18 @@ async def read_cap_intervals(
         dbs: List of aiosqlite connections (``None`` entries are skipped).
         days: Look-back window in days.  Must be > 0; raises
             :exc:`ValueError` otherwise.
+        now: Reference instant for the look-back cutoff; defaults to
+            ``datetime.now(UTC)``.  Pass an explicit timestamp to anchor the
+            query to the same clock as the caller's other time computations
+            (e.g. ticket bounds in ``_sample_curator``).
 
     Returns:
         Flat list of :class:`CapInterval` objects across all DBs, unordered.
     """
     if days <= 0:
         raise ValueError("days must be positive")
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    effective_now = now if now is not None else datetime.now(UTC)
+    cutoff = (effective_now - timedelta(days=days)).isoformat()
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
         rows = await db.execute_fetchall(
