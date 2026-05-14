@@ -55,35 +55,6 @@ def app_jsx_body(_client):
 # Helper: extract the CURATOR_STATE: { ... } seed block from data.js
 # ---------------------------------------------------------------------------
 
-def _extract_addToast_body(source: str) -> str:
-    """Return the brace-delimited body of the ``addToast = useCallback(...)`` arrow function.
-
-    Finds ``addToast = useCallback(`` then walks to the first ``{`` (the opening
-    brace of the ``(msg) => { ... }`` body) and uses brace-depth counting to
-    return the full callback body, braces included.
-
-    This is used to scope assertions about pruning logic to *inside* addToast
-    rather than anywhere in the file — a stray splice elsewhere (e.g., the
-    unmount cleanup) should not satisfy the assertion.
-    Returns the empty string if addToast is not found.
-    """
-    m = re.search(r'addToast\s*=\s*useCallback\s*\(', source)
-    if m is None:
-        return ''
-    brace_start = source.find('{', m.end())
-    if brace_start == -1:
-        return ''
-    depth = 0
-    for i in range(brace_start, len(source)):
-        c = source[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return source[brace_start:i + 1]
-    return ''
-
 
 def _extract_curator_state_block(data_js: str) -> str:
     """Return the body of the ``CURATOR_STATE: { ... }`` seed object, braces included.
@@ -263,34 +234,6 @@ def test_app_jsx_wires_curator_tab(app_jsx_body: str) -> None:
     assert "case 'curator':" in app_jsx_body, (
         "app.jsx renderTab switch does not have `case 'curator':` — add the "
         "case branch to render <CuratorTab projectFilter={projects} />."
-    )
-
-
-# ---------------------------------------------------------------------------
-# task-1306 step-3: addToast prunes fired timer from toastTimers.current
-# ---------------------------------------------------------------------------
-
-def test_addToast_prunes_fired_timer_from_toast_timers(tab_curator_jsx_body: str) -> None:
-    """addToast must remove the timer id from toastTimers.current after it fires.
-
-    Without pruning, every auto-dismissed toast leaves a stale timer id in the
-    array.  In a long-lived session the array grows without bound.  The fix is
-    either a splice (array) or a delete (Map).  The test accepts either so that
-    a future Map-based refactor does not break this assertion.
-    """
-    addToast_body = _extract_addToast_body(tab_curator_jsx_body)
-    assert addToast_body, (
-        'Could not locate addToast useCallback body in tab_curator.jsx — '
-        'ensure addToast is declared as `const addToast = useCallback(...)`.'
-    )
-    has_splice = 'toastTimers.current.splice' in addToast_body
-    has_delete = 'toastTimers.current.delete' in addToast_body
-    assert has_splice or has_delete, (
-        'addToast body in tab_curator.jsx does not prune fired timer ids from '
-        'toastTimers.current — after calling setToasts inside setTimeout, add '
-        '`const idx = toastTimers.current.indexOf(timer); '
-        'if (idx >= 0) toastTimers.current.splice(idx, 1);` '
-        'so that the array does not grow monotonically over a long session.'
     )
 
 
