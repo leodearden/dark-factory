@@ -1718,31 +1718,63 @@ class Scheduler:
                 # install harmlessly.  The opposite order risks a duplicate
                 # reservation_installed event if the clear fails after a
                 # successful install.
+                #
+                # In-process exceptions from install_parks are handled separately:
+                # the flag is restored via set_override so the next tick retries.
                 self._override_store.clear_override(
                     self._project_root, rid, field='reserve_now'
                 )
-                installed, _evicted = self.lock_table.install_parks(
-                    rid, r_modules, r_tier
-                )
-                if self.event_store and installed:
-                    self.event_store.emit(
-                        EventType.reservation_installed,
-                        task_id=rid,
-                        data={
-                            'modules': installed,
-                            'priority': r_tier,
-                            'reason': 'reserve_now',
-                        },
+                try:
+                    installed, _evicted = self.lock_table.install_parks(
+                        rid, r_modules, r_tier
                     )
-                # Reflect the cleared flag in the in-memory snapshot so downstream
-                # diff-detection doesn't spuriously re-emit for this tick.
-                current_overrides[rid] = OverrideRow(
-                    boost_tier=rrow.boost_tier,
-                    pinned=rrow.pinned,
-                    pin_order=rrow.pin_order,
-                    reserve_now=False,
-                    ttl_until=rrow.ttl_until,
-                )
+                    if self.event_store and installed:
+                        self.event_store.emit(
+                            EventType.reservation_installed,
+                            task_id=rid,
+                            data={
+                                'modules': installed,
+                                'priority': r_tier,
+                                'reason': 'reserve_now',
+                            },
+                        )
+                    # Reflect the cleared flag in the in-memory snapshot so
+                    # downstream diff-detection doesn't spuriously re-emit for
+                    # this tick.
+                    current_overrides[rid] = OverrideRow(
+                        boost_tier=rrow.boost_tier,
+                        pinned=rrow.pinned,
+                        pin_order=rrow.pin_order,
+                        reserve_now=False,
+                        ttl_until=rrow.ttl_until,
+                    )
+                except Exception:
+                    logger.warning(
+                        'reserve_now: install_parks failed for task %s; restoring reserve_now flag',
+                        rid,
+                        exc_info=True,
+                    )
+                    try:
+                        self._override_store.set_override(
+                            self._project_root, rid, reserve_now=True
+                        )
+                    except Exception:
+                        logger.warning(
+                            'reserve_now: failed to restore reserve_now flag for task %s',
+                            rid,
+                            exc_info=True,
+                        )
+                        # Restore failed — DB still holds reserve_now=False (cleared
+                        # above).  Mirror that in memory so the diff-layer doesn't
+                        # fabricate a spurious priority_override_cleared event next tick.
+                        current_overrides[rid] = OverrideRow(
+                            boost_tier=rrow.boost_tier,
+                            pinned=rrow.pinned,
+                            pin_order=rrow.pin_order,
+                            reserve_now=False,
+                            ttl_until=rrow.ttl_until,
+                        )
+                    continue
 
         # Diff-detect override changes and emit priority_override_* events.
         # The diff runs AFTER all in-memory mutations (GC + reserve_now clearing)
