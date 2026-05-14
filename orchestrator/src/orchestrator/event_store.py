@@ -102,6 +102,12 @@ class EventType(StrEnum):
     # cap-exhaustion event by Scheduler.trigger_retry_cap_exhausted.
     retry_cap_exhausted = 'retry_cap_exhausted'
 
+    # Reserve-now lifecycle — emitted when a reserve_now flag transitions
+    # False→True (armed) or when parks are installed for a reserve_now task
+    # and the flag is cleared (consumed).
+    reserve_now_armed = 'reserve_now_armed'
+    reserve_now_consumed = 'reserve_now_consumed'
+
 
 class EventStore:
     """Append-only SQLite event store.
