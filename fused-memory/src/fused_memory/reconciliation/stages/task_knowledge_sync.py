@@ -1400,19 +1400,21 @@ class TaskKnowledgeSync(BaseStage):
 
         # Compute the hint-attention section: active tasks whose memory_hints
         # need conversion from legacy list format (or are missing entirely).
-        # Rendered conditionally — omitted on the steady-state case where every
-        # active task already has valid dict-format hints (matches the stale_section
-        # / known_projects_section / proactive_sample_section render pattern).
-        tasks_needing_hint_attention = [
-            t for t in filtered.active_tasks if _needs_hint_conversion(t)
-        ]
+        # Gated on `if not self.remediation_mode:` — mirrors proactive_sample_section
+        # (above) because hint conversion is a general-sync activity, not a Stage 1
+        # remediation task. Rendered conditionally within that gate — omitted on the
+        # steady-state case where every active task already has valid dict-format hints.
         hint_conversion_section = ''
-        if tasks_needing_hint_attention:
-            hint_conversion_section = (
-                '\n### Tasks Needing Memory Hint Attention\n'
-                + format_task_list(tasks_needing_hint_attention)
-                + '\n'
-            )
+        if not self.remediation_mode:
+            tasks_needing_hint_attention = [
+                t for t in filtered.active_tasks if _needs_hint_conversion(t)
+            ]
+            if tasks_needing_hint_attention:
+                hint_conversion_section = (
+                    '\n### Tasks Needing Memory Hint Attention\n'
+                    + format_task_list(tasks_needing_hint_attention)
+                    + '\n'
+                )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
