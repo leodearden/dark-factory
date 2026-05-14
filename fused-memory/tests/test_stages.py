@@ -5633,10 +5633,11 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         assert report.stats.get('stale_fixc_markers_swept') == 3
         # Verify delete_memory was called for each stale ID with the exact kwargs
         # that _sweep_stale_fixc_markers emits — pins the partition→sweep contract.
-        # Using a dict keyed by memory_id gives stronger guarantees than assert_any_call:
-        # it catches duplicate calls for the same ID (count-based check would still pass)
-        # and verifies the full kwargs for every expected ID in one compact expression.
+        # Three layered checks: `call_count == 3` rejects duplicate or extra calls;
+        # the set check rejects missing/wrong IDs; the per-ID kwargs check pins
+        # the full invocation contract.
         delete_memory = mock_deps['memory_service'].delete_memory
+        assert delete_memory.call_count == 3
         calls_by_id = {c.kwargs['memory_id']: c.kwargs for c in delete_memory.call_args_list}
         assert set(calls_by_id) == {'missing-1', 'missing-2', 'mismatched'}
         shared_kwargs = {
