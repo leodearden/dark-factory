@@ -4095,3 +4095,52 @@ class TestOverrideGCIntegration:
         # B (done) and C (cancelled) must have been swept.
         assert 'B' not in overrides_after
         assert 'C' not in overrides_after
+
+    @pytest.mark.asyncio
+    async def test_ttl_sweep_calls_clear_expired(self, tmp_path):
+        """acquire_next() GC sweep removes overrides whose TTL has elapsed.
+
+        A has a past TTL → must be cleared.
+        B has a future TTL → must survive.
+        """
+        from orchestrator.overrides import OverrideStore
+        from datetime import datetime, timezone, timedelta
+
+        UTC = timezone.utc
+        now_dt = datetime.now(UTC)
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        # A expired 1 hour ago.
+        store.set_override('/proj', 'A', boost_tier='high', ttl_until=now_dt - timedelta(hours=1))
+        # B expires 1 hour from now.
+        store.set_override('/proj', 'B', boost_tier='critical', ttl_until=now_dt + timedelta(hours=1))
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A (expired TTL)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B (future TTL)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_b']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        await scheduler.acquire_next()
+
+        overrides_after = store.get_overrides('/proj')
+        # A's TTL has elapsed — must be swept.
+        assert 'A' not in overrides_after
+        # B's TTL is in the future — must survive.
+        assert 'B' in overrides_after
