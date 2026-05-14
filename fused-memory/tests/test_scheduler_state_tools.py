@@ -429,7 +429,10 @@ class TestSnapshotPerformance:
         # any reasonable disk, leaving large headroom.  Do NOT loosen this to
         # 150-250ms — that silently inflates the contract.  Do NOT confuse this
         # with an MCP-layer perf bound; this test specifically times the sync
-        # helper to remove asyncio/FastMCP overhead from the measurement.
+        # helper (not mcp_server._tool_manager.call_tool) because the
+        # asyncio.to_thread handoff + FastMCP dispatch are CI-load-sensitive and
+        # flaky under pytest-xdist -n auto with 32 workers, making them
+        # unsuitable for a tight latency canary.
         assert median_ms < 50, (
             f'Median latency {median_ms:.1f}ms exceeds 50ms acceptance criterion '
             f'(regression canary for orchestrator snapshot-read budget, task 1230)'
