@@ -123,6 +123,7 @@ def test_pydantic_spec_exposes_user_property_descriptors():
     This test FAILS on pre-fix pydantic_spec (model_fields only).
     """
     from _orch_helpers import pydantic_spec
+
     from orchestrator.config import OrchestratorConfig
 
     spec = pydantic_spec(OrchestratorConfig)
@@ -147,6 +148,7 @@ def test_pydantic_spec_excludes_basemodel_inherited_members():
     filtering), it must continue to pass.
     """
     from _orch_helpers import pydantic_spec
+
     from orchestrator.config import OrchestratorConfig
 
     m = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
