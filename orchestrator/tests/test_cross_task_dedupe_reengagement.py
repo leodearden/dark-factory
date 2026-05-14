@@ -253,3 +253,100 @@ class TestCrossTaskDedupeReengagement:
         assert not harness._escalation_queue.has_open_l1('A'), (
             'A must have no open L1 escalations after parent resolve.'
         )
+
+    @pytest.mark.asyncio
+    async def test_natural_sweep_can_re_engage_child_after_resolve(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """B becomes re-acquirable by a natural scheduler sweep after parent resolves.
+
+        Uses a thin local _SweepModel that mirrors Scheduler.acquire_next's terminal
+        gates — skip non-pending tasks, skip tasks with pending L0, skip tasks with
+        open L1 — rather than spinning up the real Scheduler (which requires a
+        fused-memory backend and full dispatch graph).
+
+        SCOPE BOUNDARY: this verifies the escalation/harness layer only.
+        The higher-level claim "task B's workflow eventually re-engages" depends on
+        what status B's workflow leaves the task in after terminate_cleanly — that
+        is a workflow-layer concern and is out of scope here.
+
+        Design note: the sweep model pre-sets both tasks to 'pending' after the
+        escalation and resolve sequence, modelling the assumption that "task B
+        returns to pending after the agent terminates cleanly" that the contract
+        relies on.  If B's status is not returned to pending by the workflow layer,
+        the scheduler cannot pick B up regardless of escalation gate state — but
+        that is the workflow-layer concern noted above.
+        """
+        queue = harness._escalation_queue
+        server = create_server(queue)
+
+        # --- Local sweep model mirroring Scheduler.acquire_next's terminal gates ---
+
+        class _SweepModel:
+            """Minimal sweep model: mirrors the three gates from Scheduler.acquire_next."""
+
+            def __init__(self, task_statuses: dict[str, str]) -> None:
+                self.task_statuses = dict(task_statuses)
+                self.acquire_log: list[str] = []
+
+            def acquire_next(self, q: EscalationQueue) -> str | None:
+                for tid, status in self.task_statuses.items():
+                    if status != 'pending':
+                        continue
+                    if q.get_by_task(tid, status='pending', level=0):
+                        continue
+                    if q.has_open_l1(tid):
+                        continue
+                    return tid
+                return None
+
+        sweep = _SweepModel({'A': 'pending', 'B': 'pending'})
+
+        # Simulate two active workflow slots: both tasks "in-progress".
+        sweep.task_statuses['A'] = 'in-progress'
+        sweep.task_statuses['B'] = 'in-progress'
+
+        # Submit A's parent blocker, B's deduped blocker.
+        first = await _blocker(
+            server,
+            task_id='A',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+
+        second = await _blocker(
+            server,
+            task_id='B',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+        assert second['status'] == 'dedup_skipped', (
+            f'Expected dedup_skipped, got: {second}'
+        )
+
+        # Resolve parent.
+        harness._escalation_queue.resolve(
+            parent_id, resolution='infra fixed', resolved_by='steward-test'
+        )
+
+        # Model workflow-slot release: both tasks return to pending.
+        # (This models "task returns to pending after agent terminates_cleanly".)
+        sweep.task_statuses['A'] = 'pending'
+        sweep.task_statuses['B'] = 'pending'
+
+        # Run up to 5 sweep ticks; consume each acquired task by setting it in-progress.
+        for _ in range(5):
+            tid = sweep.acquire_next(queue)
+            if tid is not None:
+                sweep.acquire_log.append(tid)
+                sweep.task_statuses[tid] = 'in-progress'
+
+        assert 'B' in sweep.acquire_log, (
+            f'Task B was never re-acquired in 5 sweep ticks after parent resolved. '
+            f'acquire_log={sweep.acquire_log}. '
+            f'If this fails, the escalation gates were not cleared — see Phase-2 '
+            f'finding F2 option B (explicit per-child resume fan-out) in DESIGN.md.'
+        )
