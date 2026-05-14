@@ -805,6 +805,71 @@ async def test_collect_scheduler_state_enriches_active_tasks_with_project_root(
 
 
 # ---------------------------------------------------------------------------
+# step-36: rows support project-filter isolation (mirrors JSX visibleRows)
+# ---------------------------------------------------------------------------
+
+
+def test_compose_rows_supports_project_filter_isolation():
+    """Rows returned by _compose_rows can be filtered by project field.
+
+    Pins the data-shape contract supporting the JSX visibleRows filter:
+        visibleRows = rows.filter(r => selectedProjects.has(r.project))
+    Guards against the silent no-op regression where project is absent.
+    """
+    from dashboard.data.scheduler import _compose_rows
+
+    active_tasks = [
+        {
+            'task_id': '1',
+            'title': 'A-1',
+            'priority': 'high',
+            'started': 1,
+            'locks': [],
+            'project': 'proj-a',
+            'project_root': '/a',
+        },
+        {
+            'task_id': '2',
+            'title': 'A-2',
+            'priority': 'medium',
+            'started': 2,
+            'locks': [],
+            'project': 'proj-a',
+            'project_root': '/a',
+        },
+        {
+            'task_id': '3',
+            'title': 'B-1',
+            'priority': 'low',
+            'started': 3,
+            'locks': [],
+            'project': 'proj-b',
+            'project_root': '/b',
+        },
+    ]
+
+    snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'overrides': {},
+    }
+
+    rows = _compose_rows(active_tasks, snapshot)
+    assert len(rows) == 3
+
+    # Python equivalent of JSX visibleRows filter
+    proj_a_rows = [r for r in rows if r.get('project') in {'proj-a'}]
+    assert len(proj_a_rows) == 2
+    assert all(r['project'] == 'proj-a' for r in proj_a_rows)
+
+    proj_b_rows = [r for r in rows if r.get('project') in {'proj-b'}]
+    assert len(proj_b_rows) == 1
+    assert proj_b_rows[0]['project'] == 'proj-b'
+    assert proj_b_rows[0]['task_id'] == '3'
+
+
+# ---------------------------------------------------------------------------
 # step-23: index.html references new scheduler JSX files + cache-buster bumped
 # ---------------------------------------------------------------------------
 
