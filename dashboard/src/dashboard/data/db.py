@@ -44,6 +44,8 @@ class DbPool:
         try:
             if not resolved.exists():
                 return None
+            # safe='/' preserves POSIX path separators; dashboard is Linux-only.
+            # For Windows portability use pathlib.PurePath.as_uri() instead.
             conn = await aiosqlite.connect(
                 f'file:{quote(str(resolved), safe="/")}?mode=ro', uri=True,
             )
