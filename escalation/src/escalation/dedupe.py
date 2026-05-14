@@ -21,7 +21,8 @@ from __future__ import annotations
 
 __all__ = ['DedupeConfig', 'find_dedupe_parent', 'summary_dedupe_key']
 
-import string
+import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -30,7 +31,13 @@ if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
-_PUNCT_TABLE = str.maketrans('', '', string.punctuation)
+# Covers all Unicode punctuation (Pc, Pd, Pe, Pf, Pi, Po, Ps), not just ASCII.
+# Precomputed once at import time; handles en/em dashes, curly quotes, etc.
+_PUNCT_TABLE = {
+    c: None
+    for c in range(sys.maxunicode + 1)
+    if unicodedata.category(chr(c)).startswith('P')
+}
 
 
 @dataclass
@@ -53,7 +60,8 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
 
     Normalisation steps:
     1. Casefold (Unicode-aware lower-case).
-    2. Strip all ASCII punctuation (``string.punctuation``).
+    2. Strip all Unicode punctuation (categories Pc/Pd/Pe/Pf/Pi/Po/Ps),
+       including en/em dashes, curly quotes, and ASCII punctuation.
     3. Split on whitespace (collapses multiple spaces / tabs).
     4. Return the first three tokens as a tuple (fewer if the summary
        has fewer than three words).
@@ -85,29 +93,40 @@ def find_dedupe_parent(
     A parent matches when ALL of the following hold:
     - ``parent.status == 'pending'`` (get_pending() already ensures this).
     - ``parent.category == candidate.category``.
-    - ``parent.category in config.infra_dedupe_categories``.
     - ``summary_dedupe_key(parent.summary) == summary_dedupe_key(candidate.summary)``.
     - ``(now - parsed(parent.timestamp)) <= window_secs``.
+    - ``candidate_key != ()`` — empty keys are never matched to prevent
+      unrelated empty-summary escalations from collapsing into one parent.
 
-    The ``config.infra_dedupe_enabled`` flag is intentionally NOT checked
-    here — the server callers gate on that flag before ever calling this
-    function.  This keeps the function's contract simple and testable.
+    The ``config.infra_dedupe_enabled`` flag and category membership are
+    intentionally NOT checked here — the server callers gate on those before
+    calling this function.  This keeps the function's contract simple and
+    testable.
 
     Returns the id of the *oldest* survivor (minimum timestamp) so that
     repeated duplicates always fold into the same canonical first record.
+
+    Performance note: calls ``queue.get_pending()`` which glob-reads the queue
+    root on every invocation (O(N) disk reads, N = pending escalations).
+    This is acceptable given the bounded window and low submit rate; if this
+    path becomes hot, maintain an in-memory (category, key) → [(ts, id)] index
+    populated by submit/resolve callbacks instead.
     """
     effective_now = now if now is not None else datetime.now(UTC)
     window = timedelta(seconds=config.infra_dedupe_window_secs)
     candidate_key = summary_dedupe_key(candidate.summary)
+    # Empty key means the summary was blank/whitespace — never match to avoid
+    # collapsing unrelated escalations that happen to have no useful summary.
+    if not candidate_key:
+        return None
     candidate_category = candidate.category
 
     matches: list[tuple[datetime, str]] = []  # (timestamp, id) for sorting
 
     for parent in queue.get_pending():
-        # Category filter
+        # Category filter — caller already verified candidate_category is in
+        # infra_dedupe_categories, so checking equality is sufficient.
         if parent.category != candidate_category:
-            continue
-        if parent.category not in config.infra_dedupe_categories:
             continue
         # Key filter
         if summary_dedupe_key(parent.summary) != candidate_key:

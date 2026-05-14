@@ -366,7 +366,7 @@ class EscalationQueue:
             return None
         try:
             parent = Escalation.from_json(path.read_text())
-        except (Exception) as e:
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning(f'Failed to parse parent escalation {parent_id}: {e}')
             return None
         parent.dedupe_children.append(child_id)
