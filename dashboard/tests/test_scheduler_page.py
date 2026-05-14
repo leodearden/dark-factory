@@ -164,3 +164,64 @@ def test_compose_rows_joins_active_tasks_with_snapshot():
     assert r2['pinned'] is False
     assert r2['reserve_now'] is False
     assert r2['boost_tier'] is None
+
+
+# ---------------------------------------------------------------------------
+# step-5: _skip_event_sparkline — binning and empty-history guard
+# ---------------------------------------------------------------------------
+
+
+def test_skip_event_sparkline_bins_into_five_minute_buckets():
+    """_skip_event_sparkline bins task_skipped events into 5-minute buckets.
+
+    Setup: 60-minute window starting at ``since``, three task_skipped events
+    for T1 placed at minutes 5, 15, and 35.  Expect exactly 12 buckets (one
+    per 5-minute slot), the three occupied buckets have count > 0, and a
+    different event_type is ignored.
+    """
+    from dashboard.data.scheduler import _skip_event_sparkline
+
+    since = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    until = since + timedelta(hours=1)  # fixed window → exactly 12 buckets
+
+    def make_event(event_type: str, minutes_offset: float) -> dict:
+        ts = since + timedelta(minutes=minutes_offset)
+        return {'event_type': event_type, 'task_id': 'T1', 'timestamp': ts.isoformat()}
+
+    events = [
+        make_event('task_skipped', 5),    # bucket 1
+        make_event('task_skipped', 15),   # bucket 3
+        make_event('task_scheduled', 20), # should be ignored (wrong type)
+        make_event('task_skipped', 35),   # bucket 7
+    ]
+
+    result = _skip_event_sparkline(events, since=since, until=until, bin_seconds=300)
+
+    assert 'labels' in result
+    assert 'values' in result
+    assert len(result['labels']) == len(result['values'])
+    # 60-minute window / 5-minute buckets = exactly 12 buckets
+    assert len(result['labels']) == 12
+
+    # Buckets at minutes 5, 15, 35 → bucket indices 1, 3, 7
+    assert result['values'][1] == 1   # 5-min mark falls in bucket 1
+    assert result['values'][3] == 1   # 15-min mark falls in bucket 3
+    assert result['values'][7] == 1   # 35-min mark falls in bucket 7
+
+    # Other buckets are zero
+    other_buckets = [i for i in range(12) if i not in (1, 3, 7)]
+    assert all(result['values'][i] == 0 for i in other_buckets)
+
+    # Total skipped events counted
+    assert sum(result['values']) == 3
+
+
+def test_skip_event_sparkline_returns_empty_when_no_history():
+    """Empty events list → {labels: [], values: []} (no PRNG fallback)."""
+    from dashboard.data.scheduler import _skip_event_sparkline
+
+    since = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    result = _skip_event_sparkline([], since=since)
+
+    assert result == {'labels': [], 'values': []}
