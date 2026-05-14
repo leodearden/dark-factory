@@ -119,3 +119,172 @@ class TestEscalationDedupeFields:
         assert esc_b.dedupe_children == [], (
             'dedupe_children must use default_factory, not a shared class-level list'
         )
+
+
+class TestFindDedupeParent:
+    """find_dedupe_parent() — scans live queue, returns oldest matching parent id or None."""
+
+    def _make_infra_esc(
+        self,
+        esc_id: str,
+        task_id: str = '1',
+        summary: str = 'fused-memory connection timeout on port 8002',
+        category: str = 'infra_issue',
+    ):
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category=category,
+            summary=summary,
+        )
+
+    def test_matching_parent_returns_parent_id(self, tmp_path):
+        """(a) Same category + first-3-words match within window -> returns parent id."""
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1', task_id='42')
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc(
+            'esc-1-2',
+            task_id='42',
+            summary='fused-memory connection timeout on port 9999',
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result == 'esc-1-1'
+
+    def test_different_category_returns_none(self, tmp_path):
+        """(b) Different category (risk_identified vs infra_issue) -> None."""
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1', task_id='42', category='risk_identified')
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc('esc-1-2', task_id='42', category='infra_issue')
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result is None
+
+    def test_different_summary_tokens_returns_none(self, tmp_path):
+        """(c) Different first-3-words summary -> None."""
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1', summary='neo4j connection timeout on port 8002')
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc('esc-1-2', summary='fused-memory connection timeout on port 8002')
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result is None
+
+    def test_outside_window_returns_none(self, tmp_path):
+        """(d) candidate.timestamp - parent.timestamp > window_secs -> None."""
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+
+        # Move 'now' far into the future, beyond the 600s window
+        now = datetime.now(UTC) + timedelta(seconds=700)
+        config = DedupeConfig(infra_dedupe_window_secs=600.0)
+        candidate = self._make_infra_esc('esc-1-2', summary='fused-memory connection timeout on port 9999')
+        result = find_dedupe_parent(queue, candidate, config, now=now)
+        assert result is None
+
+    def test_resolved_parent_not_found(self, tmp_path):
+        """(e) Already-resolved parent (in archive) -> None, since get_pending() skips archive."""
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+        queue.resolve('esc-1-1', 'fixed')
+
+        candidate = self._make_infra_esc('esc-1-2')
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result is None
+
+    def test_cross_task_dedupe(self, tmp_path):
+        """(f) Cross-task: parent has task_id='42', candidate has task_id='99' -> returns parent id."""
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-42-1', task_id='42')
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc(
+            'esc-99-1',
+            task_id='99',
+            summary='fused-memory connection timeout on port 9999',
+        )
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result == 'esc-42-1'
+
+    def test_multiple_matching_returns_oldest(self, tmp_path):
+        """(g) Multiple matching pending parents: returns the OLDEST by timestamp."""
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # Older parent (earlier timestamp)
+        older = self._make_infra_esc('esc-1-1', task_id='1')
+        older.timestamp = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+        queue.submit(older)
+
+        # Newer parent (later timestamp, still within window)
+        newer = self._make_infra_esc('esc-2-1', task_id='2')
+        newer.timestamp = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
+        queue.submit(newer)
+
+        candidate = self._make_infra_esc('esc-3-1', task_id='3',
+                                          summary='fused-memory connection timeout on port 9999')
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
+        assert result == 'esc-1-1'  # oldest
+
+    def test_enabled_flag_not_checked_inside_find_dedupe_parent(self, tmp_path):
+        """(h) infra_dedupe_enabled=False does NOT affect find_dedupe_parent itself.
+
+        The gate lives in the server callers, not here. This test pins that contract:
+        even with enabled=False, find_dedupe_parent still returns a match.
+        """
+        from datetime import UTC, datetime, timedelta
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc('esc-1-2',
+                                          summary='fused-memory connection timeout on port 9999')
+        config = DedupeConfig(infra_dedupe_enabled=False)  # disabled
+        now = datetime.now(UTC) + timedelta(seconds=5)
+        # Despite enabled=False, find_dedupe_parent still finds a match
+        result = find_dedupe_parent(queue, candidate, config, now=now)
+        assert result == 'esc-1-1'
