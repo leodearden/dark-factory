@@ -75,7 +75,7 @@ subprojects:
       - "Server starts on port 8002, singleton lock prevents duplicate instances"
       - "get_status returns healthy for all backends (Graphiti, Mem0, Taskmaster)"
       - "Unit tests pass — they mock backends so no running services needed"
-      - "Thread monitor shows stable ~9 threads over time (no leak)"
+      - "Thread monitor shows ~33-40 Python threads (threading.active_count) stable over time — composed of MainThread + bounded asyncio default pool + one aiosqlite worker per SQLite store; no upward drift = no leak (OS-level thread count is higher, ~66, due to jemalloc and unnamed python3 kernel threads)"
       - "Memories route correctly by category: entities/temporal/decisions → Graphiti, preferences/procedural/observations → Mem0"
       - "tickets.db pragma settings include synchronous=FULL, journal_mode=WAL, wal_autocheckpoint=100"
 
