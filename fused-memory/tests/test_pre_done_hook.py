@@ -143,6 +143,61 @@ async def test_run_hook_empty_env_var_is_noop(monkeypatch):
     assert result is None
 
 
+# ── launch-failure tests ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_hook_fails_closed_on_missing_binary(monkeypatch, tmp_path):
+    """run_hook returns a misconfigured error when the binary does not exist.
+
+    The subprocess cannot even be launched — FileNotFoundError — which must be
+    caught and returned as a structured error rather than propagating.  The
+    'reason' field must start with 'failed to launch hook:' so callers can
+    distinguish launch failures from hook rejections or timeouts.
+    """
+    monkeypatch.setenv(
+        'FUSED_MEMORY_PREDONE_HOOK_TMP',
+        '/nonexistent/definitely-not-a-real-binary-xyzzy --task {id}',
+    )
+    result = await run_hook('1', '/tmp')
+    assert result is not None
+    assert result['success'] is False
+    assert result['error'] == 'pre_done_hook_misconfigured'
+    assert result['task_id'] == '1'
+    assert 'reason' in result
+    assert result['reason'].startswith('failed to launch hook:'), (
+        f"Expected reason to start with 'failed to launch hook:', got: {result['reason']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_hook_fails_closed_on_non_executable(monkeypatch, tmp_path):
+    """run_hook returns a misconfigured error when the binary exists but is not executable.
+
+    The file is present (no FileNotFoundError) but lacks the +x bit, so the OS
+    raises PermissionError (or OSError on some platforms).  The return value must
+    be the same structured-error shape as the missing-binary case.
+    """
+    # Create a plain file with no execute permission
+    non_exec = tmp_path / 'not_executable.txt'
+    non_exec.write_text('#!/bin/sh\nexit 0\n')
+    non_exec.chmod(0o644)  # read-write, NOT executable
+
+    monkeypatch.setenv(
+        'FUSED_MEMORY_PREDONE_HOOK_TMP',
+        str(non_exec),
+    )
+    result = await run_hook('1', '/tmp')
+    assert result is not None
+    assert result['success'] is False
+    assert result['error'] == 'pre_done_hook_misconfigured'
+    assert result['task_id'] == '1'
+    assert 'reason' in result
+    assert result['reason'].startswith('failed to launch hook:'), (
+        f"Expected reason to start with 'failed to launch hook:', got: {result['reason']!r}"
+    )
+
+
 # ── Three-mode integration test ───────────────────────────────────────────────
 
 
