@@ -965,19 +965,25 @@ async def _setup_curator_usage_gate(
     await curator_cost_store.open()
     logger.info(f'  Curator cost store: {db_path}')
 
+    curator_usage_gate: UsageGate | None = None
     try:
         curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        logger.info(
+            f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
+            f'from {config.usage_cap.accounts_file or "inline"}',
+        )
     except BaseException:
+        if curator_usage_gate is not None:
+            try:
+                await curator_usage_gate.shutdown()
+            except Exception:
+                logger.exception('UsageGate shutdown failed during rollback')
         try:
             await curator_cost_store.close()
         except Exception:
             logger.exception('CostStore close failed during UsageGate init rollback')
         raise
 
-    logger.info(
-        f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
-        f'from {config.usage_cap.accounts_file or "inline"}',
-    )
     return (curator_cost_store, curator_usage_gate)
 
 
