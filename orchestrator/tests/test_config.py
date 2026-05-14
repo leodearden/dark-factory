@@ -493,3 +493,24 @@ class TestValidateAssignment:
             'expected exactly 1. With field_validator, the field-level resolver must not '
             'cause a second full model-validation pass.'
         )
+
+
+class TestParkStopConfig:
+    """park_stop_* config fields: defaults and ge/gt validators."""
+
+    def test_park_stop_enabled_default_true(self):
+        assert OrchestratorConfig().park_stop_enabled is True
+
+    def test_park_stop_parked_threshold_default(self):
+        assert OrchestratorConfig().park_stop_parked_threshold == 5
+
+    def test_park_stop_parked_window_hours_default(self):
+        assert OrchestratorConfig().park_stop_parked_window_hours == 1.0
+
+    def test_park_stop_parked_threshold_ge_1_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(park_stop_parked_threshold=0)
+
+    def test_park_stop_parked_window_hours_gt_0_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(park_stop_parked_window_hours=0.0)
