@@ -5,9 +5,8 @@ from __future__ import annotations
 import sqlite3
 from unittest.mock import patch
 
-import pytest
-
 import aiosqlite
+import pytest
 
 from dashboard.data.db import DbPool, with_db
 
@@ -109,6 +108,7 @@ class TestDbPool:
             assert conn is not None, f'pool.get returned None for path containing {fragment!r}'
             async with conn.execute('SELECT 1') as cur:
                 row = await cur.fetchone()
+            assert row is not None
             assert row[0] == 1
         finally:
             await pool.close_all()
