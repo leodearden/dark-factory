@@ -30,12 +30,14 @@ def _make_server(queue: EscalationQueue, dedupe_config: DedupeConfig | None = No
 
 async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
+    # escalate_blocker is a sync tool — tool.fn() returns dict directly
+    return tool.fn(**kwargs)
 
 
 async def _info(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
+    # escalate_info is a sync tool — tool.fn() returns dict directly
+    return tool.fn(**kwargs)
 
 
 def _queue_root_files(queue: EscalationQueue) -> list[Path]:
