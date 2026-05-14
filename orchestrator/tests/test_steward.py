@@ -13,7 +13,12 @@ import pytest
 from escalation.models import Escalation
 from shared.usage_gate import InvokeSlot
 
-from orchestrator.steward import StewardMetrics, TaskSteward, _is_timeout_kill
+from orchestrator.steward import (
+    StewardMetrics,
+    TaskSteward,
+    _is_empty_output,
+    _is_timeout_kill,
+)
 
 
 def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
@@ -79,6 +84,7 @@ def mock_config():
     config.steward_max_attempts = 1
     config.steward_completion_timeout = 300.0
     config.steward_max_timeouts_per_escalation = 3
+    config.steward_max_empty_outputs_per_escalation = 2
     config.timeouts.steward = 1800.0
     config.suggestion_triage_threshold = 10
     return config
@@ -126,7 +132,7 @@ def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
 
 def _make_result(
     cost=1.0, turns=5, session_id='sess-abc', success=True,
-    duration_ms=5000, stderr='', timed_out=False,
+    duration_ms=5000, stderr='', timed_out=False, subtype='',
 ):
     from shared.cli_invoke import AgentResult
     return AgentResult(
@@ -138,6 +144,7 @@ def _make_result(
         turns=turns,
         session_id=session_id,
         timed_out=timed_out,
+        subtype=subtype,
     )
 
 
@@ -165,6 +172,7 @@ def _assert_cap_fire_pops_counters(steward, esc_id, mock_invoke):  # type: ignor
     assert submitted.level == 1
     assert esc_id not in steward._retry_counts
     assert esc_id not in steward._timeout_counts
+    assert esc_id not in steward._empty_output_counts
     return submitted
 
 
@@ -2298,3 +2306,190 @@ class TestStewardWorktreeMissing:
         assert steward.escalation_queue.submit.call_count == 1
         # The loop ran up to _MAX_LOOP_ERRORS times
         assert steward_mod._MAX_LOOP_ERRORS == 3
+
+
+# ---------------------------------------------------------------------------
+# _is_empty_output helper — direct unit test
+# ---------------------------------------------------------------------------
+
+
+class TestIsEmptyOutput:
+    """Pin the _is_empty_output predicate to subtype='error_empty_output'."""
+
+    def test_error_empty_output_subtype_returns_true(self):
+        result = _make_result(success=False, subtype='error_empty_output')
+        assert _is_empty_output(result) is True
+
+    def test_text_output_subtype_returns_false(self):
+        result = _make_result(success=False, subtype='text_output')
+        assert _is_empty_output(result) is False
+
+    def test_empty_subtype_returns_false(self):
+        result = _make_result(success=True, subtype='')
+        assert _is_empty_output(result) is False
+
+
+# ---------------------------------------------------------------------------
+# Empty-output recovery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardEmptyOutputRecovery:
+    """Empty-output invocations must NOT consume the retry budget and must
+    clear the stale session id so the next attempt rebuilds a fresh prompt.
+    """
+
+    async def test_empty_output_does_not_increment_retry_count(
+        self, steward, mock_config,
+    ):
+        """subtype='error_empty_output' must leave _retry_counts unchanged."""
+        mock_config.steward_max_attempts = 2
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.0, turns=0, duration_ms=0,
+                session_id='', subtype='error_empty_output',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._retry_counts.get('esc-42-1', 0) == 0
+        assert steward._empty_output_counts.get('esc-42-1') == 1
+        steward.escalation_queue.submit.assert_not_called()
+
+    async def test_empty_output_clears_session_id(self, steward, mock_config):
+        """A pre-existing stale _session_id must be cleared on empty output."""
+        mock_config.steward_max_attempts = 2
+        steward._session_id = 'sess-stale'
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.0, turns=0, duration_ms=0,
+                session_id='', subtype='error_empty_output',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._session_id is None
+
+    async def test_empty_output_does_not_auto_escalate_at_retry_cap_with_max_attempts_1(
+        self, steward, mock_config,
+    ):
+        """Fresh escalation, max_attempts=1, empty-output → no submit.
+
+        Regression guard for the exact esc-1017-85 incident: stale _session_id
+        paired with max_attempts=1 used to consume the single retry slot and
+        immediately auto-escalate to L1.
+        """
+        mock_config.steward_max_attempts = 1
+        esc = _make_escalation(id='esc-42-77')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-77', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.0, turns=0, duration_ms=0,
+                session_id='', subtype='error_empty_output',
+            )
+            await steward._handle_escalation(esc)
+
+        steward.escalation_queue.submit.assert_not_called()
+        assert steward._retry_counts.get('esc-42-77', 0) == 0
+        assert steward._empty_output_counts.get('esc-42-77') == 1
+
+    async def test_empty_output_increments_recovered_metric(
+        self, steward, mock_config,
+    ):
+        """empty_outputs_recovered must tick; invocations==1, handled==0."""
+        mock_config.steward_max_attempts = 2
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.0, turns=0, duration_ms=0,
+                session_id='', subtype='error_empty_output',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward.metrics.empty_outputs_recovered == 1
+        assert steward.metrics.invocations == 1
+        assert steward.metrics.escalations_handled == 0
+
+    async def test_empty_output_cap_auto_escalates(self, steward, mock_config):
+        """When _empty_output_counts[id] >= cap, guard must fire before invoke."""
+        mock_config.steward_max_empty_outputs_per_escalation = 2
+        esc = _make_escalation(id='esc-42-1')
+        # Pre-seed at cap
+        steward._empty_output_counts['esc-42-1'] = 2
+        # Pre-seed the other counters too — they must be popped on cap-fire
+        steward._retry_counts['esc-42-1'] = 0
+        steward._timeout_counts['esc-42-1'] = 0
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        submitted = _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        assert 'produced no output' in submitted.summary.lower()
+
+    async def test_non_empty_failure_still_increments_retry_count(
+        self, steward, mock_config,
+    ):
+        """Plain failures (subtype != 'error_empty_output') must still consume retry budget."""
+        mock_config.steward_max_attempts = 2
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.5, subtype='text_output',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._retry_counts.get('esc-42-1') == 1
+        assert steward._empty_output_counts.get('esc-42-1', 0) == 0
+        assert steward.metrics.empty_outputs_recovered == 0
+
+    async def test_empty_output_and_timeout_kill_are_independent(
+        self, steward, mock_config,
+    ):
+        """A timeout-killed result that ALSO has subtype='error_empty_output'
+        is unusual but theoretically possible. _is_timeout_kill is checked
+        first in _handle_escalation, so the timeout carve-out wins and
+        _empty_output_counts is untouched.
+        """
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.0, turns=0, duration_ms=0,
+                session_id='', subtype='error_empty_output',
+                timed_out=True,
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+            )
+            await steward._handle_escalation(esc)
+
+        # Timeout carve-out wins — empty-output counters untouched
+        assert steward._timeout_counts.get('esc-42-1') == 1
+        assert steward.metrics.timeouts_recovered == 1
+        assert steward._empty_output_counts.get('esc-42-1', 0) == 0
+        assert steward.metrics.empty_outputs_recovered == 0
+        # Retry budget not consumed by either carve-out
+        assert steward._retry_counts.get('esc-42-1', 0) == 0

@@ -553,6 +553,7 @@ class OrchestratorConfig(BaseSettings):
     steward_max_attempts: int = Field(default=1)
     steward_completion_timeout: float = Field(default=900.0)
     steward_max_timeouts_per_escalation: int = Field(default=3, ge=2, le=5)
+    steward_max_empty_outputs_per_escalation: int = Field(default=2, ge=2, le=4)
 
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
