@@ -159,9 +159,9 @@ class TestCuratorUsageGateLeakGuard:
                 '__init__',
                 side_effect=RuntimeError('synthetic init failure'),
             ),
+            pytest.raises(RuntimeError, match='synthetic init failure'),
         ):
-            with pytest.raises(RuntimeError, match='synthetic init failure'):
-                await _setup_curator_usage_gate(config)
+            await _setup_curator_usage_gate(config)
 
         assert len(opened_stores) == 1, 'CostStore.open() was not called'
         assert close_count[0] == 1, (
@@ -197,8 +197,10 @@ class TestCuratorUsageGateLeakGuard:
             )
         finally:
             # Clean teardown: close the gate's background tasks and the store.
-            await gate.shutdown()
-            await store.close()
+            if gate is not None:
+                await gate.shutdown()
+            if store is not None:
+                await store.close()
 
     def test_setup_returns_none_when_usage_cap_is_none(self):
         """Helper returns (None, None) immediately when config.usage_cap is None."""
