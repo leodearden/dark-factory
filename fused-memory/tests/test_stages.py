@@ -4507,6 +4507,69 @@ class TestQueryStage2Flags:
         # (b) — present but mismatched run_id
         assert partition.stale_mismatched_run_id_ids == ['prior']
 
+    @pytest.mark.asyncio
+    async def test_warning_logged_when_missing_run_id_count_nonzero(self, caplog):
+        """A WARNING is emitted when any markers have absent/empty run_id."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # matching marker — current
+            self._make_result('current', 'c', {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-now'}),
+            # absent run_id — missing
+            self._make_result('no-id-1', 'a', {'flag_for_stage2': True, 'task_id': '2'}),
+            # empty run_id — missing
+            self._make_result('no-id-2', 'b', {'flag_for_stage2': True, 'task_id': '3', 'run_id': ''}),
+        ]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _query_stage2_flags(memory_service, 'reify', 'r-now')
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'missing' in r.getMessage().lower()
+            and 'run_id' in r.getMessage().lower()
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 missing-run_id WARNING, got {len(warning_records)}: '
+            f'{[r.getMessage() for r in warning_records]}'
+        )
+        # The rendered message (or extra) must contain the count 2
+        msg = warning_records[0].getMessage()
+        assert '2' in msg, f'Expected count 2 in warning message, got: {msg!r}'
+
+    @pytest.mark.asyncio
+    async def test_no_missing_run_id_warning_when_count_is_zero(self, caplog):
+        """No WARNING about missing run_id when all stale markers have a truthy run_id."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # matching marker
+            self._make_result('current', 'c', {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-now'}),
+            # mismatched but truthy run_id — stale_mismatched, not missing
+            self._make_result('prior', 'p', {'flag_for_stage2': True, 'task_id': '2', 'run_id': 'r-old'}),
+        ]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _query_stage2_flags(memory_service, 'reify', 'r-now')
+
+        missing_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'missing' in r.getMessage().lower()
+        ]
+        assert missing_warnings == [], (
+            f'Expected no missing-run_id WARNING, but got: {[r.getMessage() for r in missing_warnings]}'
+        )
+
 
 class TestSweepStaleFixcMarkers:
     """_sweep_stale_fixc_markers deletes stale fixc markers in parallel and returns count."""
