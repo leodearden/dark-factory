@@ -141,5 +141,4 @@ def find_dedupe_parent(
         return None
 
     # Return the oldest by timestamp (first match we should fold into)
-    matches.sort(key=lambda pair: pair[0])
-    return matches[0][1]
+    return min(matches, key=lambda pair: pair[0])[1]
