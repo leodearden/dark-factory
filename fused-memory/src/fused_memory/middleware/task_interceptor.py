@@ -766,6 +766,18 @@ class TaskInterceptor:
                             e,
                         )
 
+            # 2d. Pre-done hook gate: invoke a configurable subprocess validator.
+            # Runs after all cheap/deterministic gates (same-status guard,
+            # bulk-reset, terminal-exit, done-provenance, phantom-done) and
+            # before the actual write — only fires on status == 'done'.
+            # Non-zero exit refuses the transition (fail-closed).
+            # Unconfigured (env var unset or empty) → no-op with zero overhead.
+            if status == 'done':
+                from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
+                _hook_err = await _run_hook(task_id, project_root)
+                if _hook_err is not None:
+                    return _hook_err
+
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
             result: dict[str, Any] = dict(
