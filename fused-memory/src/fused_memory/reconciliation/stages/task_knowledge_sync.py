@@ -1567,12 +1567,15 @@ delete tasks. Update dependent tasks.
 3. For AI-generated tasks: cross-reference against knowledge graph for factual consistency.
 4. Attach memory_hints to tasks that would benefit from knowledge context at execution time. \
 Use entity references + semantic queries, NOT inline content.
-5. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
+5. For tasks listed in **Tasks Needing Memory Hint Attention**: use read-modify-write with \
+`append=False` when writing memory_hints — Stage 2's default `append=True` merge silently \
+discards legacy list-format hints under old-wins semantics (Mem0 memory note `0b0eeb8d`).
+6. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
 in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
 that may now be met, and done tasks for missing knowledge capture.
-6. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
-7. Hints on completed tasks are static — don't update them.
-8. When you have completed your work, produce your final structured report as your response.
+7. Check if any knowledge implies new tasks should be created or existing tasks unblocked.
+8. Hints on completed tasks are static — don't update them.
+9. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE2_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for tasks scoped to this project.
