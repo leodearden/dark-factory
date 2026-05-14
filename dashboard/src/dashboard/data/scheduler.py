@@ -307,7 +307,8 @@ async def collect_scheduler_state(
         # Build task lookup from active_tasks for this project
         project_active = [t for t in all_active if t.get('project') == label]
 
-        # Enrich active tasks with raw task_id for snapshot lookups
+        # Enrich active tasks with raw task_id, project label, and project_root
+        # for snapshot lookups and downstream override POSTs.
         enriched: list[dict] = []
         for task in project_active:
             uid = task.get('id') or ''
@@ -316,7 +317,15 @@ async def collect_scheduler_state(
                 raw_id = uid.split('/T-', 1)[1]
             except (IndexError, AttributeError):
                 raw_id = uid
-            enriched.append({**task, 'task_id': raw_id})
+            enriched.append({
+                **task,
+                'task_id': raw_id,
+                # Propagate project context so _compose_rows can fill
+                # project/project_root on every row — without these the React
+                # drawer sends empty project_root and every override call 400s.
+                'project': label,
+                'project_root': str(root),
+            })
 
         # Compose rows
         rows = _compose_rows(enriched, snapshot)

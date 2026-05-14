@@ -708,6 +708,103 @@ def test_compose_rows_propagates_project_and_project_root():
 
 
 # ---------------------------------------------------------------------------
+# step-34: collect_scheduler_state enriches active tasks with project_root
+# ---------------------------------------------------------------------------
+
+
+async def test_collect_scheduler_state_enriches_active_tasks_with_project_root(
+    dummy_client, tmp_path
+):
+    """collect_scheduler_state must populate project_root and project on every row.
+
+    Regression: the enrichment loop only added task_id; rows were missing
+    project_root and project, causing override/unpin calls to 400 with
+    invalid_project_root.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.config import DashboardConfig
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    # Two project roots
+    p1 = tmp_path / 'p1'
+    p2 = tmp_path / 'p2'
+    p1.mkdir()
+    p2.mkdir()
+
+    config = DashboardConfig(
+        project_root=p1,
+        known_project_roots=[p2],
+    )
+
+    snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'overrides': {},
+        'current_holders': {},
+        'pin_queue': [],
+        'snapshot_at': '2026-01-01T00:00:00+00:00',
+    }
+
+    # Track which project_root each get_scheduler_state call received
+    recorded_roots: list[str] = []
+
+    async def mock_mcp_call(client, url, tool, args):
+        if tool == 'get_scheduler_state':
+            recorded_roots.append(args.get('project_root'))
+            return snapshot
+        # get_scheduler_events returns empty list
+        return []
+
+    active_tasks = [
+        {
+            'id': f'{p1.name}/T-1',
+            'project': p1.name,
+            'title': 'Task in P1',
+            'priority': 'high',
+            'status': 'in-progress',
+            'started': 5,
+            'locks': ['src/a.py'],
+        },
+        {
+            'id': f'{p2.name}/T-2',
+            'project': p2.name,
+            'title': 'Task in P2',
+            'priority': 'medium',
+            'status': 'pending',
+            'started': 3,
+            'locks': [],
+        },
+    ]
+
+    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, _, _, _, offline_projects = await collect_scheduler_state(dummy_client, config)
+
+    assert offline_projects == []
+    assert len(rows) == 2
+
+    # Each row must carry project and project_root matching the iteration root
+    p1_rows = [r for r in rows if r.get('project') == p1.name]
+    p2_rows = [r for r in rows if r.get('project') == p2.name]
+
+    assert len(p1_rows) == 1, f'Expected 1 row for p1, got {p1_rows}'
+    assert p1_rows[0]['project_root'] == str(p1), (
+        f"Expected project_root={str(p1)!r}, got {p1_rows[0].get('project_root')!r}"
+    )
+
+    assert len(p2_rows) == 1, f'Expected 1 row for p2, got {p2_rows}'
+    assert p2_rows[0]['project_root'] == str(p2), (
+        f"Expected project_root={str(p2)!r}, got {p2_rows[0].get('project_root')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-23: index.html references new scheduler JSX files + cache-buster bumped
 # ---------------------------------------------------------------------------
 
