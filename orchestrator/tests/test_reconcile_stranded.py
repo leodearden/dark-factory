@@ -1651,6 +1651,87 @@ class TestReconcileStrandedInProgress:
                 '90', 'pending'
             )
 
+    @pytest.mark.parametrize(
+        'is_ancestor_val, marker_sha_val, branch_base_sha',
+        [
+            pytest.param(
+                True,
+                None,
+                'aabbccdd' + 'e' * 32,
+                id='is-ancestor-path-with-metadata',
+            ),
+            pytest.param(
+                False,
+                'cafebabe' + 'c' * 32,
+                'beef0000' + '9' * 32,
+                id='merge-marker-path-with-metadata',
+            ),
+        ],
+    )
+    async def test_hoisted_metadata_is_consumed_by_each_guard(
+        self,
+        harness: Harness,
+        is_ancestor_val: bool,
+        marker_sha_val: str | None,
+        branch_base_sha: str,
+    ):
+        """Regression lock: the hoisted ``metadata`` dict is CONSUMED by each
+        downstream guard that reads ``metadata.get('branch_base_sha')``.
+
+        ``is-ancestor-path-with-metadata``: Guard 3 (harness.py) calls
+        ``resolve_branch_sha`` only when ``_is_valid_sha_40(branch_base_sha)``
+        is True, proving the guard read the hoisted value.
+
+        ``merge-marker-path-with-metadata``: the stale-marker check calls
+        ``is_ancestor(marker_sha, branch_base_sha)`` only when
+        ``_is_valid_sha_40(branch_base_sha)`` is True, proving the guard read
+        the hoisted value.
+
+        A future refactor that silently drops ``metadata.get('branch_base_sha')``
+        from either guard would break the path-specific assertions below —
+        making the regression visible even though ``get_task.await_count == 1``
+        would still hold in the sibling test.
+        """
+        harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'metadata': {'branch_base_sha': branch_base_sha}}
+        )
+        # Explicitly anchor resolve_branch_sha to a sentinel distinct from
+        # branch_base_sha so Guard 3's branch-advanced veto cannot fire
+        # regardless of future fixture changes, ensuring the guard passes
+        # through to _mark_in_progress_done.
+        _BRANCH_TIP = 'c0ffee11' + '0' * 32
+        assert branch_base_sha != _BRANCH_TIP, (
+            'Test setup error: _BRANCH_TIP collides with branch_base_sha — '
+            'update _BRANCH_TIP to a distinct 40-hex value'
+        )
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_BRANCH_TIP)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Guard 3 consumer assertion: resolve_branch_sha is only called when
+        # _is_valid_sha_40(branch_base_sha) is True, proving the hoisted metadata
+        # dict was consumed by the is_ancestor fast-path guard.
+        if is_ancestor_val:
+            harness.git_ops.resolve_branch_sha.assert_awaited_once_with('task/90')  # type: ignore[attr-defined]
+        # Stale-marker consumer assertion: the second is_ancestor call (marker_sha,
+        # branch_base_sha) only fires when _is_valid_sha_40(branch_base_sha) is True,
+        # proving the hoisted metadata dict was consumed by the merge-marker guard.
+        elif marker_sha_val is not None:
+            assert harness.git_ops.is_ancestor.await_count == 2, (  # type: ignore[attr-defined]
+                f'Expected is_ancestor awaited twice (first for branch->main, '
+                f'second for marker->base); '
+                f'got {harness.git_ops.is_ancestor.await_count}'  # type: ignore[attr-defined]
+            )
+            second_call_args = harness.git_ops.is_ancestor.call_args_list[1].args  # type: ignore[attr-defined]
+            assert second_call_args == (marker_sha_val, branch_base_sha), (
+                f'Expected second is_ancestor call args == '
+                f'(marker_sha_val={marker_sha_val!r}, branch_base_sha={branch_base_sha!r}); '
+                f'got {second_call_args!r}'
+            )
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
