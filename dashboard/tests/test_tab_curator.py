@@ -169,6 +169,24 @@ def test_tab_curator_jsx_served_and_exports_component(_client) -> None:
 
 
 # ---------------------------------------------------------------------------
+# step-1300-6 test: tab_curator.jsx references pending_spark
+# ---------------------------------------------------------------------------
+
+def test_tab_curator_jsx_renders_pending_spark(tab_curator_jsx_body: str) -> None:
+    """tab_curator.jsx source must reference pending_spark.
+
+    Proves the new CURATOR_STATE envelope key is wired through the React
+    component. Mirrors the structural wiring assertions in
+    test_tab_curator_jsx_served_and_exports_component.
+    """
+    assert 'pending_spark' in tab_curator_jsx_body, (
+        "tab_curator.jsx does not reference 'pending_spark' — add a PendingPanel "
+        "component that destructures pending_spark from CURATOR_STATE and renders "
+        "a Sparkline over pending_spark.values."
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-7 test: tabs.jsx exports ChipList for cross-tab reuse
 # ---------------------------------------------------------------------------
 
