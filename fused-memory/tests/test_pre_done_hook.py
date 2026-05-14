@@ -120,3 +120,25 @@ async def test_run_hook_fails_closed_on_timeout(monkeypatch, tmp_path):
     assert result['task_id'] == '1'
     # The subprocess should have been killed — the marker file should NOT exist
     assert not marker.exists(), 'Subprocess was not killed (marker file exists)'
+
+
+@pytest.mark.asyncio
+async def test_run_hook_fails_closed_on_misconfiguration_unterminated_quote(monkeypatch):
+    """run_hook returns misconfigured error when the command has an unterminated quote."""
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_TMP', 'foo "unterminated')
+    result = await run_hook('1', '/tmp')
+    assert result is not None
+    assert result['success'] is False
+    assert result['error'] == 'pre_done_hook_misconfigured'
+    assert result['task_id'] == '1'
+    assert 'reason' in result
+
+
+@pytest.mark.asyncio
+async def test_run_hook_empty_env_var_is_noop(monkeypatch):
+    """Whitespace-only env var is treated as unset — resolve_hook_command returns None,
+    so run_hook is a no-op (not a misconfigured error)."""
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_TMP', '   ')
+    result = await run_hook('1', '/tmp')
+    # Whitespace-only is treated as unset → no-op → None
+    assert result is None
