@@ -1788,19 +1788,19 @@ class TaskInterceptor:
     async def cancel_ticket(self, ticket_id: str) -> dict:
         """Cancel a pending curator ticket by ticket_id.
 
-        Four outcomes:
-        - config_error: ticket store not configured (server misconfiguration) →
-                        ``{'error': 'ticket_store not configured',
-                           'error_type': 'ConfigError', 'ticket_id': ticket_id}``
-        - not_found:    ticket does not exist →
-                        ``{'error': 'not_found', 'ticket_id': ticket_id}``
-        - no_op:        ticket row exists but is already in a terminal/non-pending
-                        status (including TOCTOU race) →
-                        ``{'status': <current>, 'ticket_id': ticket_id,
-                        'no_op': True}``
-        - cancelled:    ticket was pending and we won the race → marks it
-                        cancelled, signals any resolve_ticket waiter, returns
-                        ``{'status': 'cancelled', 'ticket_id': ticket_id}``
+        Four outcome shapes (v1 contract):
+
+        * **config_error** — ticket store not configured (server misconfiguration):
+                             ``{'error': 'ticket_store not configured',
+                                'error_type': 'ConfigError', 'ticket_id': ticket_id}``
+        * **not_found** — ticket does not exist:
+                          ``{'error': 'not_found', 'ticket_id': ticket_id}``
+        * **no_op** — ticket row exists but is already in a terminal/non-pending
+                      status (including TOCTOU race):
+                      ``{'status': <current>, 'ticket_id': ticket_id, 'no_op': True}``
+        * **cancelled** — ticket was pending and we won the race → marks it
+                          cancelled, signals any resolve_ticket waiter, returns
+                          ``{'status': 'cancelled', 'ticket_id': ticket_id}``
 
         v1 trade-off: in-flight curator/LLM calls are NOT interrupted.
         ``_prepare_ticket`` drops non-pending rows when the worker dequeues
@@ -1835,11 +1835,8 @@ class TaskInterceptor:
             row = await self._ticket_store.get(ticket_id)
             if row is None:
                 return {'error': 'not_found', 'ticket_id': ticket_id}
-            logger.warning(
-                'cancel_ticket: TOCTOU race lost for ticket %s — '
-                'concurrent writer terminalized row to status=%s; '
-                'an in-flight worker may have produced an orphan task '
-                '(see _process_add_ticket WARNING for task_id)',
+            logger.info(
+                'cancel_ticket: lost race for ticket %s, current status=%s',
                 ticket_id,
                 row['status'],
             )

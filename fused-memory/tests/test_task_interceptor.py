@@ -5895,21 +5895,23 @@ async def test_cancel_ticket_clean_win_logs_info(
 
 
 @pytest.mark.asyncio
-async def test_cancel_ticket_race_loss_logs_warning_with_status(
+async def test_cancel_ticket_race_loss_logs_info_with_status(
     interceptor_with_store,
     ticket_store,
     caplog,
 ):
-    """cancel_ticket emits a WARNING when it loses the TOCTOU race to a concurrent worker.
+    """cancel_ticket emits an INFO log when it loses the TOCTOU race to a concurrent worker.
 
     Reuses the racing_mark_resolved pattern from
     test_cancel_ticket_race_returns_noop_with_actual_status: a concurrent
     worker terminalizes the row to 'created' between cancel's get() and the
     UPDATE.  After the race, cancel_ticket re-fetches and returns the no_op
-    shape.  We assert a WARNING record exists containing the ticket_id, the
+    shape.  We assert an INFO record exists containing the ticket_id, the
     actual recovered status ('created'), and a race indicator.
 
-    RED: cancel_ticket's TOCTOU branch currently emits no log.
+    Level is INFO (not WARNING) because not every race-loss implies an orphan:
+    if the worker finished normally the race is benign.  The authoritative
+    orphan WARNING lives in _persist_worker_terminal.
     """
     import logging
 
@@ -5926,7 +5928,7 @@ async def test_cancel_ticket_race_loss_logs_warning_with_status(
 
     ticket_store.mark_resolved = racing_mark_resolved
     try:
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        with caplog.at_level(logging.INFO, logger='fused_memory.middleware.task_interceptor'):
             result = await interceptor_with_store.cancel_ticket(ticket_id)
     finally:
         ticket_store.mark_resolved = original_mark_resolved
@@ -5936,16 +5938,66 @@ async def test_cancel_ticket_race_loss_logs_warning_with_status(
         f'Expected no_op with actual status=created, got: {result!r}'
     )
 
-    # (b) WARNING record with ticket_id, actual status, and a race indicator
+    # (b) INFO record with ticket_id, actual status, and a race indicator
+    info_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO
+        and ticket_id in r.message
+        and 'created' in r.message
+        and any(kw in r.message for kw in ('race', 'raced', 'lost'))
+    ]
+    assert info_records, (
+        f'Expected an INFO record containing ticket_id={ticket_id!r}, "created", and a '
+        f'race indicator; got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_worker_terminal_orphan_race_emits_warning(
+    interceptor_with_store,
+    ticket_store,
+    caplog,
+):
+    """_persist_worker_terminal emits a WARNING when mark_resolved returns False
+    while status='created' and task_id is non-None.
+
+    This is a focused unit test for the helper itself.  We pre-terminate the
+    ticket row to 'cancelled' so that the subsequent mark_resolved(status='created')
+    returns False, and verify the orphan-race WARNING is emitted with both the
+    ticket_id and the orphan task_id.
+
+    The authoritative orphan-WARNING lives here — not in cancel_ticket — because
+    only the worker knows whether a live task was created before the race was lost.
+    """
+    import logging
+
+    # Submit a ticket and immediately terminate it to 'cancelled', simulating
+    # cancel_ticket winning the race before the worker reaches mark_resolved.
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+    await ticket_store.mark_resolved(ticket_id, status='cancelled', reason='pre_cancelled')
+
+    orphan_task_id = 'task-orphan-42'
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor_with_store._persist_worker_terminal(
+            ticket_id,
+            status='created',
+            task_id=orphan_task_id,
+            reason='worker_completed',
+            result_dict=None,
+        )
+
+    # mark_resolved returned False because the row was no longer pending
+    assert result is False, f'Expected False (row was pre-cancelled), got {result!r}'
+
+    # A WARNING must be emitted containing both ticket_id and orphan task_id
     warning_records = [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING
-        and ticket_id in r.message
-        and 'created' in r.message
-        and any(kw in r.message for kw in ('race', 'raced', 'TOCTOU'))
+        if r.levelno == logging.WARNING and ticket_id in r.message and orphan_task_id in r.message
     ]
     assert warning_records, (
-        f'Expected a WARNING containing ticket_id={ticket_id!r}, "created", and a '
-        f'race indicator; got records: {[(r.levelno, r.message) for r in caplog.records]}'
+        f'Expected a WARNING containing ticket_id={ticket_id!r} and '
+        f'task_id={orphan_task_id!r}; '
+        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
     )
