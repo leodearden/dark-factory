@@ -1532,7 +1532,8 @@ class Scheduler:
             else {}
         )
 
-        # Override GC: remove override rows for tasks that are terminal or missing.
+        # Override GC: remove override rows for tasks that are terminal or missing,
+        # and remove rows whose TTL has elapsed.
         # Runs alongside the park_gc sweep so the rest of the tick sees post-GC state.
         if self._override_store and current_overrides:
             terminal_or_missing_ids: set[str] = (
@@ -1545,6 +1546,12 @@ class Scheduler:
                 )
                 for tid in cleared_overrides:
                     current_overrides.pop(tid, None)
+            # TTL sweep: clear any rows whose ttl_until has elapsed.
+            expired_overrides = self._override_store.clear_expired(
+                self._project_root, datetime.now(UTC)
+            )
+            for tid in expired_overrides:
+                current_overrides.pop(tid, None)
 
         # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
         # install parks on its modules then clear the flag.  This is single-tick
