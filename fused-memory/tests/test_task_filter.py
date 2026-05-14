@@ -14,6 +14,7 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     format_task_list,
     id_key,
+    select_visible_active,
 )
 
 
@@ -839,6 +840,57 @@ class TestFormatFilteredTaskTree:
             f'deps display is not being truncated'
         )
 
+    def test_format_filtered_task_tree_renders_onlyselect_visible_active_return(
+        self, monkeypatch
+    ):
+        """format_filtered_task_tree must delegate visible-window selection to
+        select_visible_active_with_body (single source of truth requirement).
+
+        A monkeypatched stub makes select_visible_active_with_body return only
+        the first 3 tasks (and their pre-rendered body) regardless of input.
+        format_filtered_task_tree calls the worker for its visible window and
+        reuses the returned body, so only tasks 1-3 are rendered.
+
+        Uses the same module-level monkeypatch pattern as
+        test_budget_lazy_loop_handles_7_digit_trimmed_count (line ~643).
+        """
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 11)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=10,
+        )
+
+        # Stub: return only the first 3 task dicts and their pre-rendered body,
+        # ignoring budget args.
+        def _stub_with_body(t, max_tasks=50, max_chars=50_000):  # noqa: ARG001
+            first_three = t.active_tasks[:3]
+            body = '\n'.join(_render_task_line(task) for task in first_three) + '\n'
+            return first_three, body
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._select_visible_active_with_body',
+            _stub_with_body,
+        )
+
+        output = format_filtered_task_tree(tree)
+
+        # Tasks 1-3 must be present.
+        for tid in (1, 2, 3):
+            assert f'- [{tid}] ' in output, (
+                f'Task {tid} must appear in output when stub returns first 3 tasks.\n'
+                f'Output: {output!r}'
+            )
+
+        # Tasks 4-10 must be absent.
+        for tid in range(4, 11):
+            assert f'- [{tid}] ' not in output, (
+                f'Task {tid} must NOT appear when stub limits visible window to 3.\n'
+                f'Output: {output!r}'
+            )
+
 
 class TestFilterTaskTreeDoneAndCancelledLists:
     """Tests for done_tasks and cancelled_tasks list fields on FilteredTaskTree."""
@@ -1573,3 +1625,158 @@ class TestEndToEndSubtaskPipeline:
         assert '- [100.1] (pending) Sub A deps=[]' in output
         # Summary line shows correct counts
         assert '2 done, 1 cancelled' in output
+
+
+class TestSelectVisibleActive:
+    """Unit tests for select_visible_active(tree, max_tasks, max_chars).
+
+    Covers: empty input, under-cap, max_chars-clamp prefix, budget<=0, and
+    cancelled-section budget accounting.  All five tests fail with ImportError
+    until select_visible_active is defined in task_filter.py (step-2).
+    """
+
+    def _make_active_task(self, tid: int, title_len: int = 20) -> dict:
+        """Build a task dict with title padded to title_len chars."""
+        return {
+            'id': tid,
+            'title': f'T{tid}'.ljust(title_len, 'x'),
+            'status': 'pending',
+            'dependencies': [],
+        }
+
+    def test_empty_active_returns_empty_list(self):
+        """empty tree.active_tasks -> []."""
+        tree = FilteredTaskTree(
+            active_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=0,
+        )
+        result = select_visible_active(tree, max_tasks=50, max_chars=50_000)
+        assert result == []
+
+    def test_under_cap_returns_full_slice(self):
+        """Under-cap with huge max_chars returns full active_tasks[:max_tasks]."""
+        tasks = [self._make_active_task(i) for i in range(1, 6)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=5,
+        )
+        result = select_visible_active(tree, max_tasks=50, max_chars=999_999)
+        assert result == tasks
+
+    def test_max_chars_clamp_returns_prefix_matching_formatter(self):
+        """max_chars clamp fires -> prefix length matches format_filtered_task_tree output count.
+
+        Uses format_filtered_task_tree as ground truth so the assertion stays
+        accurate if the rendering format changes.
+        """
+        # 20 tasks each with a 400-char title to force the max_chars clamp.
+        tasks = [self._make_active_task(i, title_len=400) for i in range(1, 21)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=20,
+        )
+        max_chars = 4000
+
+        # Ground-truth: count task lines rendered by format_filtered_task_tree.
+        output = format_filtered_task_tree(tree, max_tasks=20, max_chars=max_chars)
+        task_lines_in_output = [ln for ln in output.splitlines() if ln.startswith('- [')]
+        expected_count = len(task_lines_in_output)
+
+        # Verify the clamp actually fired — if not, the test is vacuous.
+        assert expected_count < 20, (
+            'Clamp did not fire (all 20 tasks visible); lower max_chars or raise title_len.'
+        )
+
+        result = select_visible_active(tree, max_tasks=20, max_chars=max_chars)
+
+        assert len(result) == expected_count, (
+            f'Expected {expected_count} tasks, got {len(result)}'
+        )
+        # Must be a strict prefix of the input slice.
+        assert result == tasks[:expected_count], (
+            'Result is not a prefix of the original task list'
+        )
+
+    def test_budget_zero_or_negative_returns_empty(self):
+        """budget <= 0 (header+summary alone exceed max_chars) -> returns [].
+
+        With 1 active task: header ~ 78 chars, summary_line ~ 29 chars.
+        max_chars=100 makes budget = 100 - 78 - 29 = -7 <= 0.
+        """
+        tasks = [self._make_active_task(1)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        result = select_visible_active(tree, max_tasks=50, max_chars=100)
+        assert result == [], (
+            f'Expected [] when budget <= 0, got {result!r}'
+        )
+
+    def test_cancelled_section_reduces_active_budget(self):
+        """Non-empty cancelled_tasks subtracts the cancelled-section length from the budget.
+
+        Builds two trees with identical active tasks: one with five cancelled
+        tasks and one without.  At a tight max_chars, the cancelled section
+        consumes part of the budget so fewer active tasks fit.  Both results
+        must match what format_filtered_task_tree renders for the same tree.
+        """
+        active_tasks = [self._make_active_task(i, title_len=200) for i in range(1, 11)]
+        cancelled_tasks = [
+            {'id': 100 + i, 'title': 'C' * 50, 'status': 'cancelled', 'dependencies': []}
+            for i in range(1, 6)
+        ]
+        tree_with = FilteredTaskTree(
+            active_tasks=active_tasks,
+            cancelled_tasks=cancelled_tasks,
+            done_count=0,
+            cancelled_count=5,
+            other_count=0,
+            total_count=15,
+        )
+        tree_without = FilteredTaskTree(
+            active_tasks=active_tasks,
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=10,
+        )
+        max_chars = 2500
+
+        # Ground-truth visible counts from the formatter.
+        # For tree_with the cancelled section also contains '- [' lines — strip it
+        # before counting so we only measure the active-task lines.
+        out_with = format_filtered_task_tree(tree_with, max_tasks=10, max_chars=max_chars)
+        out_without = format_filtered_task_tree(tree_without, max_tasks=10, max_chars=max_chars)
+        active_part_with = out_with.split('\n### Recently Cancelled Tasks')[0]
+        expected_with = len([ln for ln in active_part_with.splitlines() if ln.startswith('- [')])
+        expected_without = len([ln for ln in out_without.splitlines() if ln.startswith('- [')])
+
+        # Precondition: cancelled section must have reduced the active budget.
+        assert expected_with < expected_without, (
+            f'Precondition failed: cancelled section did not reduce active task count '
+            f'({expected_with} vs {expected_without}). Adjust max_chars or title_len.'
+        )
+
+        result_with = select_visible_active(tree_with, max_tasks=10, max_chars=max_chars)
+        result_without = select_visible_active(tree_without, max_tasks=10, max_chars=max_chars)
+
+        assert len(result_with) == expected_with, (
+            f'With cancelled section: expected {expected_with}, got {len(result_with)}'
+        )
+        assert len(result_without) == expected_without, (
+            f'Without cancelled section: expected {expected_without}, got {len(result_without)}'
+        )

@@ -300,6 +300,164 @@ def format_task_list(tasks: list[Any]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Surrounding-strings helper
+# --------------------------------------------------------------------------- #
+
+def _build_surrounding(
+    tree: FilteredTaskTree,
+    max_tasks: int,
+) -> tuple[str, str, str]:
+    """Return (header, cancelled_section, summary_line) for the Active Task Tree block.
+
+    Centralises the header / cancelled-section / summary-line construction used
+    by both _select_visible_active_with_body (for budget arithmetic) and
+    format_filtered_task_tree (for the rendered output).  Any future change to
+    the surrounding format — em-dash style, header phrasing, etc. — need only
+    be made here.
+
+    Args:
+        tree: FilteredTaskTree whose metadata drives the strings.
+        max_tasks: Cap used to compute the 'shown' and 'omitted' counts in
+            the header.
+
+    Returns:
+        (header, cancelled_section, summary_line) as three strings.
+        cancelled_section is '' when tree.cancelled_tasks is empty.
+    """
+    active = tree.active_tasks[:max_tasks]
+    shown = len(active)
+    omitted_active = len(tree.active_tasks) - shown
+
+    header = (
+        f'### Active Task Tree\n'
+        f'({shown} active shown'
+        + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
+        + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
+        f'{tree.other_count} other, {tree.total_count} total)\n'
+    )
+
+    if tree.cancelled_tasks:
+        cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
+        cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
+        summary_line = f'{tree.done_count} done — omitted'
+    else:
+        cancelled_section = ''
+        summary_line = (
+            f'{tree.done_count} done, {tree.cancelled_count} cancelled — omitted'
+        )
+
+    return header, cancelled_section, summary_line
+
+
+# --------------------------------------------------------------------------- #
+# Visible-active selection helpers
+# --------------------------------------------------------------------------- #
+
+def _select_visible_active_with_body(
+    tree: FilteredTaskTree,
+    max_tasks: int = MAX_ACTIVE_TASKS_RENDERED,
+    max_chars: int = 50_000,
+) -> tuple[list[dict], str | None]:
+    """Internal worker: select visible active tasks and return the pre-rendered body.
+
+    Returns (visible_tasks, body_str) where body_str is the fully rendered body
+    string (with truncation notice when partial), or None when no tasks fit the
+    budget.  Both the public select_visible_active helper and
+    format_filtered_task_tree call this worker, so task lines are rendered once
+    and reused rather than being computed independently in each caller.
+
+    Algorithm:
+      1. Slice active = tree.active_tasks[:max_tasks]; return ([], None) if empty.
+      2. Build surroundings via _build_surrounding.
+      3. Render all lines; if full result fits, return (active, body).
+      4. Compute budget = max_chars - overhead; return ([], None) if budget <= 0.
+      5. Greedy fill kept_lines while cumulative cost <= budget.
+      6. Lazy verification: pop lines until the realised result fits or
+         kept_lines is drained.
+      7. Return (active[:kept], body_with_trunc_notice), or ([], None) if drained.
+    """
+    active = tree.active_tasks[:max_tasks]
+    if not active:
+        return [], None
+
+    header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
+
+    # ── Fast path: full result fits in budget ── #
+    lines = [_render_task_line(t) for t in active]
+    body = '\n'.join(lines) + '\n'
+    full = header + body + cancelled_section + summary_line
+    if len(full) <= max_chars:
+        return active, body
+
+    # ── Budget-capped path ── #
+    budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
+    if budget <= 0:
+        return [], None
+
+    # Greedy fill.
+    kept_lines: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > budget:
+            break
+        kept_lines.append(line)
+        used += len(line) + 1
+
+    # Lazy verification: recompute real truncation-notice length and pop until
+    # the realised result fits or kept_lines is exhausted.
+    trimmed_count = len(active) - len(kept_lines)
+    trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
+    result_body = '\n'.join(kept_lines) + trunc_notice
+    result = header + result_body + cancelled_section + summary_line
+    while len(result) > max_chars and kept_lines:
+        kept_lines.pop()
+        trimmed_count = len(active) - len(kept_lines)
+        trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
+        result_body = '\n'.join(kept_lines) + trunc_notice
+        result = header + result_body + cancelled_section + summary_line
+
+    if not kept_lines:
+        return [], None
+    return active[: len(kept_lines)], result_body
+
+
+def select_visible_active(
+    tree: FilteredTaskTree,
+    max_tasks: int = MAX_ACTIVE_TASKS_RENDERED,
+    max_chars: int = 50_000,
+) -> list[dict]:
+    """Return the prefix of tree.active_tasks[:max_tasks] that survives the max_chars clamp.
+
+    This is the shared **public** helper backing both format_filtered_task_tree
+    and the hint-attention section in assemble_payload.  Both consumers use the
+    same _select_visible_active_with_body worker so that the rendered Active
+    Task Tree and the hint section always reference exactly the same set of tasks.
+
+    Algorithm:
+      1. Slice active = tree.active_tasks[:max_tasks]; return [] if empty.
+      2. Build header / cancelled_section / summary_line via _build_surrounding.
+      3. Render all lines; if the full result fits within max_chars, return active.
+      4. Otherwise compute budget = max_chars - overhead; return [] if budget <= 0.
+      5. Greedy fill kept_lines while cumulative cost <= budget.
+      6. Lazy verification pop loop to account for truncation-notice length.
+      7. Return active[:len(kept_lines)] (may be [] if loop drained everything).
+
+    Args:
+        tree: FilteredTaskTree whose active_tasks are the candidates.
+        max_tasks: Maximum number of active tasks to consider (same default as
+            format_filtered_task_tree).
+        max_chars: Character budget for the full rendered output (same default
+            as format_filtered_task_tree).
+
+    Returns:
+        A (possibly empty) prefix list of task dicts that will all appear in
+        the output of format_filtered_task_tree(tree, max_tasks, max_chars).
+    """
+    visible, _ = _select_visible_active_with_body(tree, max_tasks, max_chars)
+    return visible
+
+
+# --------------------------------------------------------------------------- #
 # Formatter
 # --------------------------------------------------------------------------- #
 
@@ -343,72 +501,30 @@ def format_filtered_task_tree(
     Returns:
         Formatted string suitable for injection into a reconciliation prompt.
     """
-    active = tree.active_tasks[:max_tasks]
-    shown = len(active)
-    total_active = len(tree.active_tasks)
-    omitted_active = total_active - shown
+    # active_slice drives the header's "shown" count — reflects the max_tasks cap,
+    # NOT the secondary max_chars clamp (same as the pre-refactor behaviour).
+    active_slice = tree.active_tasks[:max_tasks]
+    # _build_surrounding is also called inside _select_visible_active_with_body;
+    # both calls are cheap (pure string concatenation) relative to task-line rendering.
+    header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
 
-    header = (
-        f'### Active Task Tree\n'
-        f'({shown} active shown'
-        + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
-        + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
-        f'{tree.other_count} other, {tree.total_count} total)\n'
-    )
+    if not active_slice:
+        return header + 'No active tasks.\n' + cancelled_section + summary_line
 
-    # Build optional cancelled section and choose summary line format conditionally.
-    # When cancelled_tasks is non-empty: render section + update summary (cancelled
-    # are shown, not omitted).  When empty: no section, summary unchanged (backward
-    # compatibility — six existing budget tests calibrate max_chars to the old format).
-    if tree.cancelled_tasks:
-        cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
-        cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
-        summary_line = f'{tree.done_count} done \u2014 omitted'
-    else:
-        cancelled_section = ''
-        summary_line = (
-            f'{tree.done_count} done, {tree.cancelled_count} cancelled \u2014 omitted'
-        )
+    # Delegate to the shared internal worker — single source of truth for the
+    # visible-window decision.  The worker returns the pre-rendered body so that
+    # task lines are not rendered a second time here.
+    visible, body = _select_visible_active_with_body(tree, max_tasks, max_chars)
 
-    if not active:
-        body = 'No active tasks.\n'
-    else:
-        lines = [_render_task_line(t) for t in active]
-        body = '\n'.join(lines) + '\n'
+    if not visible or body is None:
+        # Budget too tight for any task lines (budget<=0 or lazy loop drained all).
+        return header + cancelled_section + summary_line
 
     result = header + body + cancelled_section + summary_line
-
-    # Secondary max_chars clamp — only active task lines are truncated.
-    # Subtract cancelled_section length from the budget so that active-task
-    # truncation correctly accounts for the space the cancelled section occupies.
-    if len(result) > max_chars and active:
-        task_lines = body.rstrip('\n').split('\n')
-        # Use the full remaining budget — no fixed reserve.  The actual truncation
-        # notice length is computed lazily after line accumulation and verified below.
-        budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
-        if budget <= 0:
-            return header + cancelled_section + summary_line
-        kept_lines: list[str] = []
-        used = 0
-        for line in task_lines:
-            if used + len(line) + 1 > budget:
-                break
-            kept_lines.append(line)
-            used += len(line) + 1
-
-        # Lazy: compute the real notice length and verify the max_chars contract.
-        # Pop task lines until result fits or kept_lines is exhausted.
-        trimmed_count = len(active) - len(kept_lines)
-        trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
-        body = '\n'.join(kept_lines) + trunc_notice
-        result = header + body + cancelled_section + summary_line
-        while len(result) > max_chars and kept_lines:
-            kept_lines.pop()
-            trimmed_count = len(active) - len(kept_lines)
-            trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
-            body = '\n'.join(kept_lines) + trunc_notice
-            result = header + body + cancelled_section + summary_line
-        if len(result) > max_chars:
-            return header + cancelled_section + summary_line
-
+    # Defensive guard: if _select_visible_active_with_body's budget algorithm ever
+    # drifts from what the formatter assembles (e.g. a truncation-notice format
+    # change applied in one place only), fall back to the safe header-only result
+    # rather than silently returning an oversized string.
+    if len(result) > max_chars:
+        return header + cancelled_section + summary_line
     return result
