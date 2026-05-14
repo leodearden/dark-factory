@@ -360,3 +360,53 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
     assert pin_queue == []
     assert events_by_task == {}
     assert offline_projects == [project]
+
+
+# ---------------------------------------------------------------------------
+# step-11: shape_scheduler envelope
+# ---------------------------------------------------------------------------
+
+
+def test_shape_scheduler_envelope():
+    """shape_scheduler wraps inputs in SCHEDULER key with offline flag."""
+    from dashboard.data.redux_api import shape_scheduler
+
+    rows = [{'task_id': '1', 'title': 'T1'}]
+    modules = [{'path': 'src/a.py', 'holder': '1', 'contention': 1}]
+    pin_queue = [{'task_id': '1', 'order': 0}]
+    events_by_task = {'1': {'labels': [], 'values': []}}
+    snapshot_at = '2026-01-01T00:00:00+00:00'
+
+    # Non-empty offline_projects → offline=True
+    result_offline = shape_scheduler(
+        rows=rows,
+        modules=modules,
+        pin_queue=pin_queue,
+        events_by_task=events_by_task,
+        offline_projects=['proj-a'],
+        snapshot_at=snapshot_at,
+    )
+    assert 'SCHEDULER' in result_offline
+    inner = result_offline['SCHEDULER']
+    assert set(inner.keys()) == {
+        'rows', 'modules', 'pin_queue', 'events_by_task',
+        'snapshot_at', 'offline', 'offline_projects',
+    }
+    assert inner['offline'] is True
+    assert inner['offline_projects'] == ['proj-a']
+    assert inner['rows'] == rows
+    assert inner['modules'] == modules
+    assert inner['pin_queue'] == pin_queue
+    assert inner['events_by_task'] == events_by_task
+    assert inner['snapshot_at'] == snapshot_at
+
+    # Empty offline_projects → offline=False
+    result_online = shape_scheduler(
+        rows=rows,
+        modules=modules,
+        pin_queue=pin_queue,
+        events_by_task=events_by_task,
+        offline_projects=[],
+        snapshot_at=snapshot_at,
+    )
+    assert result_online['SCHEDULER']['offline'] is False
