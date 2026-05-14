@@ -3885,6 +3885,75 @@ class TestReserveNowShortCircuit:
         assert result is not None
         assert result.task_id == 'B'
 
+    @pytest.mark.asyncio
+    async def test_install_parks_failure_restores_reserve_now_and_logs(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """install_parks failure restores reserve_now flag and logs a WARNING.
+
+        On an in-process RuntimeError from install_parks:
+        (a) acquire_next() does NOT propagate the exception;
+        (b) reserve_now is restored to True in the DB;
+        (c) a WARNING with the task id and a traceback is logged;
+        (d) no reservation_installed event is emitted.
+        """
+        import logging as _logging
+
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'A', reserve_now=True)
+
+        recording_store = _RecordingEventStore()
+        scheduler = Scheduler(config, override_store=store, event_store=recording_store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['compiler/src']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+
+        def _raise(rid, modules, tier):
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(scheduler.lock_table, 'install_parks', _raise)
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+            # (a) Must NOT propagate the RuntimeError.
+            await scheduler.acquire_next()
+
+        # (b) reserve_now flag must be restored in the DB.
+        overrides = store.get_overrides('/proj')
+        assert 'A' in overrides, 'Override row for A must exist after restore'
+        assert overrides['A'].reserve_now is True, (
+            'reserve_now must be True after install_parks failure'
+        )
+
+        # (c) A WARNING mentioning task id 'A' with a traceback must be logged.
+        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+        assert warnings, (
+            f'Expected a WARNING log. Records: {[r.getMessage() for r in caplog.records]}'
+        )
+        warning_messages = ' '.join(r.getMessage() for r in warnings)
+        assert 'A' in warning_messages, (
+            f'WARNING must mention task id A. Got: {warning_messages!r}'
+        )
+        assert 'Traceback' in caplog.text, (
+            'WARNING must include traceback (exc_info=True). caplog.text:\n' + caplog.text
+        )
+
+        # (d) No reservation_installed event must be emitted.
+        emitted_types = [ev_type for ev_type, _ in recording_store.events]
+        assert EventType.reservation_installed.value not in emitted_types, (
+            f'Unexpected reservation_installed event was emitted: {recording_store.events}'
+        )
+
 
 class TestSchedulerOverrideStoreInjection:
     """Scheduler accepts an optional OverrideStore kwarg; when None, behaves as today."""
