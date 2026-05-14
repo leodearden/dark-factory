@@ -190,3 +190,75 @@ def test_app_jsx_wires_curator_tab(app_jsx_body: str) -> None:
         "app.jsx renderTab switch does not have `case 'curator':` — add the "
         "case branch to render <CuratorTab projectFilter={projects} />."
     )
+
+
+# ---------------------------------------------------------------------------
+# meta-test: _extract_curator_state_block scoping
+# ---------------------------------------------------------------------------
+
+def test_curator_state_key_check_is_scoped_to_seed_block() -> None:
+    """The scoped key check must detect a missing CURATOR_STATE block.
+
+    This meta-test exercises _extract_curator_state_block with two synthetic
+    data.js bodies:
+
+    (a) fake_without_curator_state — contains all four key names in *other*
+        top-level objects but NO CURATOR_STATE block.  The bare-substring check
+        that the original test used would pass on this input; the scoped check
+        must fail.
+
+    (b) fake_with_curator_state — includes a proper CURATOR_STATE: { ... }
+        block with nested objects so the brace-counted extractor is exercised
+        past the first inner `}`.
+    """
+    import re
+
+    fake_without_curator_state = (
+        "window.DF_DATA = {\n"
+        "  MEMORY_STATUS: { queue: { counts: { pending: 0 } }, burst_state: [] },\n"
+        "  BURNDOWN: { pending: [], state: 'idle' },\n"
+        "  LATENCY: { latency_spark: [], capped_spark: [] },\n"
+        "};\n"
+    )
+
+    fake_with_curator_state = (
+        "window.DF_DATA = {\n"
+        "  MEMORY_STATUS: { queue: { counts: { pending: 0 } }, burst_state: [] },\n"
+        "  BURNDOWN: { pending: [], state: 'idle' },\n"
+        "  LATENCY: { latency_spark: [], capped_spark: [] },\n"
+        "  CURATOR_STATE: {\n"
+        "    pending: [],\n"
+        "    latency_spark: { labels: [] },\n"
+        "    capped_spark: { labels: [] },\n"
+        "    state: { capped_now: 0 },\n"
+        "  },\n"
+        "};\n"
+    )
+
+    # Helper must return '' when CURATOR_STATE block is absent.
+    assert _extract_curator_state_block(fake_without_curator_state) == '', (
+        "_extract_curator_state_block should return '' when no CURATOR_STATE "
+        "block is present — the bare-substring match is defeated by other keys."
+    )
+
+    # Helper must return the full block (including nested braces) when present.
+    block = _extract_curator_state_block(fake_with_curator_state)
+    assert block, (
+        "_extract_curator_state_block returned '' for input that contains a "
+        "CURATOR_STATE block — check the regex anchor and brace-depth walk."
+    )
+    for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
+        assert re.search(rf'\b{key}\s*:', block), (
+            f"Key '{key}:' not found inside the extracted CURATOR_STATE block — "
+            f"the brace-depth walk may have stopped at a nested '}}' before "
+            f"reaching this key."
+        )
+
+    # Scoped check must return None for the without-CURATOR_STATE input.
+    empty_block = _extract_curator_state_block(fake_without_curator_state)
+    for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
+        assert re.search(rf'\b{key}\s*:', empty_block) is None, (
+            f"re.search for '{key}:' returned a match in an empty block — "
+            f"this indicates _extract_curator_state_block returned non-empty "
+            f"when it should have returned ''."
+        )
