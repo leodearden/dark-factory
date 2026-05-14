@@ -55,7 +55,13 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
     1. Casefold (Unicode-aware lower-case).
     2. Strip all non-word, non-whitespace characters (Unicode punctuation,
        symbols, controls), including en/em dashes, curly quotes, and ASCII
-       punctuation.
+       punctuation.  Note: underscore (U+005F, category Pc) is part of
+       ``\\w`` and is therefore *preserved* — ``fused_memory`` stays
+       ``fused_memory``, not ``fusedmemory``.  This is a deliberate
+       divergence from the previous translate-table implementation, which
+       stripped all Unicode Pc (connector punctuation) characters.  In
+       practice escalation summaries do not use underscores, so the
+       divergence is harmless.
     3. Split on whitespace (collapses multiple spaces / tabs).
     4. Return the first three tokens as a tuple (fewer if the summary
        has fewer than three words).

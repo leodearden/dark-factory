@@ -77,6 +77,22 @@ class TestSummaryDedupeKey:
         assert k_ascii == k_en_dash == k_em_dash == k_curly
         assert k_ascii == ('fusedmemory', 'connection', 'timeout')
 
+    def test_underscore_preserved_in_word_token(self):
+        """Underscore (U+005F, category Pc) is NOT stripped — it is part of \\w.
+
+        Deliberate divergence from the previous _PUNCT_TABLE implementation,
+        which stripped all Unicode Pc characters (connector punctuation).
+        The regex [^\\w\\s] keeps '_' because \\w includes [a-zA-Z0-9_].
+        In practice escalation summaries do not use underscores, so the
+        divergence is harmless; this test pins the chosen behaviour so it
+        cannot drift silently.
+        """
+        from escalation.dedupe import summary_dedupe_key
+
+        key = summary_dedupe_key('fused_memory connection timeout')
+        # '_' is part of \w, so 'fused_memory' is kept as a single token
+        assert key == ('fused_memory', 'connection', 'timeout')
+
 
 class TestEscalationDedupeFields:
     """Escalation dataclass gains dedupe_count and dedupe_children fields."""
