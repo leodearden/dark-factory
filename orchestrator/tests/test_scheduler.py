@@ -1,6 +1,7 @@
 """Tests for scheduler module lock logic."""
 
 
+import asyncio
 import time
 from datetime import UTC
 from unittest.mock import AsyncMock, patch
