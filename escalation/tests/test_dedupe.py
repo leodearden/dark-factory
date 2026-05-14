@@ -60,6 +60,39 @@ class TestSummaryDedupeKey:
         k2 = summary_dedupe_key('upper lower mixed')
         assert k1 == k2
 
+    def test_unicode_punctuation_stripped(self):
+        """En-dash, em-dash, and curly quotes are stripped like ASCII punctuation."""
+        from escalation.dedupe import summary_dedupe_key
+
+        # ASCII hyphen (Pd): "fused-memory connection timeout"
+        k_ascii = summary_dedupe_key('fused-memory connection timeout')
+        # En-dash U+2013 (Pd): "fused–memory connection timeout"
+        k_en_dash = summary_dedupe_key('fused–memory connection timeout')
+        # Em-dash U+2014 (Pd): "fused—memory connection timeout"
+        k_em_dash = summary_dedupe_key('fused—memory connection timeout')
+        # Curly double quotes U+201C/U+201D (Pi/Pf): "fused“memory” connection timeout"
+        k_curly = summary_dedupe_key('fused“memory” connection timeout')
+
+        # All four variants must produce the same normalised key
+        assert k_ascii == k_en_dash == k_em_dash == k_curly
+        assert k_ascii == ('fusedmemory', 'connection', 'timeout')
+
+    def test_underscore_preserved_in_word_token(self):
+        """Underscore (U+005F, category Pc) is NOT stripped — it is part of \\w.
+
+        Deliberate divergence from the previous _PUNCT_TABLE implementation,
+        which stripped all Unicode Pc characters (connector punctuation).
+        The regex [^\\w\\s] keeps '_' because \\w includes [a-zA-Z0-9_].
+        In practice escalation summaries do not use underscores, so the
+        divergence is harmless; this test pins the chosen behaviour so it
+        cannot drift silently.
+        """
+        from escalation.dedupe import summary_dedupe_key
+
+        key = summary_dedupe_key('fused_memory connection timeout')
+        # '_' is part of \w, so 'fused_memory' is kept as a single token
+        assert key == ('fused_memory', 'connection', 'timeout')
+
 
 class TestEscalationDedupeFields:
     """Escalation dataclass gains dedupe_count and dedupe_children fields."""
@@ -267,6 +300,42 @@ class TestFindDedupeParent:
         now = datetime.now(UTC) + timedelta(seconds=5)
         result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
         assert result == 'esc-1-1'  # oldest
+
+    def test_oldest_match_with_close_timestamps(self, tmp_path):
+        """(h2) Three parents with sub-second gaps inserted out of order: oldest wins.
+
+        Pins that selection uses timestamp comparison, not insertion order or
+        filesystem iteration order — a gap the existing test_multiple_matching_returns_oldest
+        does not unambiguously cover (it inserts in chronological order with 50s gaps).
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        now = datetime.now(UTC)
+
+        # Submit in non-chronological order: middle, oldest, newest
+        middle = self._make_infra_esc('esc-2-1', task_id='2')
+        middle.timestamp = (now - timedelta(milliseconds=300)).isoformat()
+        queue.submit(middle)
+
+        oldest = self._make_infra_esc('esc-1-1', task_id='1')
+        oldest.timestamp = (now - timedelta(milliseconds=500)).isoformat()
+        queue.submit(oldest)
+
+        newest = self._make_infra_esc('esc-3-1', task_id='3')
+        newest.timestamp = (now - timedelta(milliseconds=100)).isoformat()
+        queue.submit(newest)
+
+        candidate = self._make_infra_esc(
+            'esc-4-1',
+            task_id='4',
+            summary='fused-memory connection timeout on port 9999',
+        )
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now + timedelta(seconds=5))
+        assert result == 'esc-1-1'  # oldest by timestamp, not insertion order
 
     def test_enabled_flag_not_checked_inside_find_dedupe_parent(self, tmp_path):
         """(h) infra_dedupe_enabled=False does NOT affect find_dedupe_parent itself.
