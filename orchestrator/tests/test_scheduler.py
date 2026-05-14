@@ -4643,3 +4643,39 @@ class TestRequeueCooldownGc:
             f'Expected only the future entry to survive GC; '
             f'got: {scheduler._requeue_until}'
         )
+
+    def test_eligible_for_dispatch_does_not_mutate_requeue_until(self):
+        """_eligible_for_dispatch must be a pure predicate: calling it with an
+        expired entry in _requeue_until must NOT delete that entry.
+
+        The per-tick GC (_gc_expired_cooldowns) is the only place allowed to
+        mutate _requeue_until.  This test will fail on current code because
+        _eligible_for_dispatch still contains `del self._requeue_until[tid]`.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        # Seed an expired entry for task '7'.
+        scheduler._requeue_until['7'] = now - 5.0
+
+        task = {
+            'id': '7',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {},
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '7', status_map)
+
+        # Predicate should pass (cooldown has elapsed, no other gates fire).
+        assert result == (True, None), (
+            f'Expected (True, None) for expired cooldown; got: {result}'
+        )
+        # The expired entry must still be in _requeue_until — the predicate
+        # must NOT have removed it.
+        assert '7' in scheduler._requeue_until, (
+            '_eligible_for_dispatch must not delete the expired _requeue_until entry; '
+            'that is the responsibility of _gc_expired_cooldowns'
+        )
