@@ -57,6 +57,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
@@ -773,7 +774,6 @@ class TaskInterceptor:
             # Non-zero exit refuses the transition (fail-closed).
             # Unconfigured (env var unset or empty) → no-op with zero overhead.
             if status == 'done':
-                from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
                 _hook_err = await _run_hook(task_id, project_root)
                 if _hook_err is not None:
                     return _hook_err

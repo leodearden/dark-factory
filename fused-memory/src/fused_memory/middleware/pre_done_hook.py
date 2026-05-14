@@ -192,7 +192,7 @@ async def run_hook(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    except (FileNotFoundError, PermissionError, OSError) as exc:
+    except OSError as exc:  # covers FileNotFoundError, PermissionError, ENOEXEC, ETXTBSY, etc.
         return _pre_done_hook_misconfigured_error(
             task_id,
             reason=f'failed to launch hook: {exc}',
@@ -205,11 +205,12 @@ async def run_hook(
         )
     except TimeoutError:
         proc.kill()
-        await proc.wait()
+        await proc.communicate()  # drain pipes before closing to avoid FD/transport leaks
         return _pre_done_hook_timeout_error(task_id, timeout, command)
 
-    returncode = proc.returncode
-    assert returncode is not None, 'returncode must be set after communicate()'
+    # communicate() guarantees returncode is set; guard defensively so
+    # behaviour under python -O is correct (assert is stripped by -O).
+    returncode = proc.returncode if proc.returncode is not None else -1
     if returncode == 0:
         return None
 

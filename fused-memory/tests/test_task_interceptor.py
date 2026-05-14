@@ -5230,8 +5230,7 @@ async def test_predone_hook_only_fires_on_done_transition(
     result_blocked = await interceptor.set_task_status('1', 'blocked', str(tmp_path))
     assert 'error' not in result_blocked, f'blocked transition should not be rejected: {result_blocked}'
 
-    # in-progress: reset and go pending→in-progress
-    taskmaster.set_task_status.reset_mock()
+    # in-progress: go pending→in-progress (no reset_mock — count accumulates)
     taskmaster.get_task = AsyncMock(
         return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
     )
@@ -5239,7 +5238,7 @@ async def test_predone_hook_only_fires_on_done_transition(
     assert 'error' not in result_inprog, f'in-progress transition should not be rejected: {result_inprog}'
 
     # taskmaster.set_task_status must have been called for both transitions
-    assert taskmaster.set_task_status.call_count == 1
+    assert taskmaster.set_task_status.call_count == 2
 
 
 @pytest.mark.asyncio
