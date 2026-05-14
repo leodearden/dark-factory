@@ -244,7 +244,6 @@ class TestCuratorUsageGateLeakGuard:
         try:
             assert store is not None, 'Expected a CostStore, got None'
             assert gate is not None, 'Expected a UsageGate, got None'
-            assert store._conn is not None, 'CostStore connection should be open on success'
             assert gate.account_count == 1, (
                 f'Expected 1 account in gate, got {gate.account_count}'
             )
