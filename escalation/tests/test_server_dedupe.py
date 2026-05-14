@@ -348,3 +348,102 @@ class TestDedupeGates:
         assert len(files) == 2, (
             f'Expected 2 files for non-infra category; got: {files}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestDedupeTOCTOURace
+# ---------------------------------------------------------------------------
+
+
+class TestDedupeTOCTOURace:
+    """TOCTOU race: parent resolved between find_dedupe_parent() and attach_dedupe_child().
+
+    Simulates a concurrent resolve() that archives the parent file in the narrow window
+    between find_dedupe_parent() returning a parent_id and attach_dedupe_child() trying
+    to load that parent from queue_dir.  In this window attach_dedupe_child returns None
+    because the file no longer exists in the queue root.
+
+    The escalation must NOT be silently dropped — it must fall through to queue.submit().
+    """
+
+    @pytest.mark.asyncio
+    async def test_toctou_falls_through_to_submit(self, tmp_path: Path, monkeypatch):
+        """Parent resolved between find and attach → second escalation is queued normally.
+
+        Setup:
+        (1) Submit a first infra_issue blocker → parent_id.
+        (2) Monkeypatch escalation.server.find_dedupe_parent to a wrapper that resolves
+            the parent (archiving the file) and then returns parent_id as if it were still
+            pending — mimicking the TOCTOU window.
+        (3) Call escalate_blocker a second time with a similar infra_issue summary.
+
+        Assertions:
+        (a) The second result has status='queued' and NOT 'dedup_skipped' — the escalation
+            must NOT be silently dropped.
+        (b) Exactly one new esc-*.json exists in the queue root (the parent was archived,
+            so the root holds only the newly submitted child).
+        (c) The second result['id'] matches the filename id of that new file — confirming
+            queue.submit(esc) was actually invoked with the candidate escalation.
+
+        This test FAILS on the current implementation because attach_dedupe_child returns
+        None silently when the parent is already archived, but the helper still returns
+        {'status': 'dedup_skipped'} unconditionally, dropping the escalation.
+        """
+        import escalation.server as server_module
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        # (1) Submit first infra_issue blocker — establishes the parent.
+        first = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+        assert first['status'] == 'queued'
+
+        # (2) Monkeypatch find_dedupe_parent so that after finding the parent it
+        #     concurrently resolves it (archiving the file) before returning.
+        #     This replicates the race where the parent is resolved between the
+        #     queue scan and the attach call.
+        _original_find = server_module.find_dedupe_parent
+
+        def _racing_find(q, esc, cfg, now=None):
+            result = _original_find(q, esc, cfg, now=now)
+            if result is not None:
+                # Concurrent resolve: parent is archived before attach_dedupe_child runs.
+                q.resolve(result, resolution='raced')
+            return result  # still returns the id — simulating the stale read
+
+        monkeypatch.setattr(server_module, 'find_dedupe_parent', _racing_find)
+
+        # (3) Second blocker with a similar summary — hits the race window.
+        second = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+
+        # (a) Must NOT be silently dropped as 'dedup_skipped' — must be queued.
+        assert second['status'] == 'queued', (
+            f'Expected status=queued after TOCTOU race, got: {second}'
+        )
+
+        # (b) A new esc-*.json must exist in the queue root.
+        #     The parent was archived → root holds only the newly submitted escalation.
+        files = _queue_root_files(queue)
+        assert len(files) == 1, (
+            f'Expected exactly 1 file (the new escalation) in queue root after TOCTOU; '
+            f'got: {files}'
+        )
+
+        # (c) The returned id must match the file on disk — queue.submit() was invoked.
+        new_file_id = files[0].stem  # e.g. 'esc-42-2'
+        assert second['id'] == new_file_id, (
+            f"result id {second['id']!r} does not match file stem {new_file_id!r}"
+        )
