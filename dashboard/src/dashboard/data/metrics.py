@@ -265,9 +265,9 @@ async def _sample_curator(
         tickets_db: Read-only aiosqlite connection to tickets.db. If None,
             ticket latency fields are all None and only pending/capped are set.
         runs_dbs: Per-project runs.db connections for cap-event lookup.
-        now: Reference time (defaults to datetime.now(UTC)). Used for the
-            1-hour ticket cutoff. Note: read_cap_intervals uses its own
-            internal datetime.now(UTC) for the cap-window query.
+        now: Reference time (defaults to datetime.now(UTC)). Used for both
+            the 1-hour ticket cutoff AND threaded into read_cap_intervals so
+            the cap-window query anchors to the same clock.
 
     Returns:
         Always returns a dict with keys: pending_total, capped_now,
@@ -286,9 +286,10 @@ async def _sample_curator(
         timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
     )
 
-    # 2. Cap intervals (last 24h).
+    # 2. Cap intervals (last 7 days — long enough to catch any plausible open-ended
+    # cap; account_events scan is cheap and indexed by created_at).
     try:
-        intervals = await read_cap_intervals(runs_dbs, days=1)
+        intervals = await read_cap_intervals(runs_dbs, days=7, now=effective_now)
     except Exception:
         logger.debug('read_cap_intervals failed', exc_info=True)
         intervals = []
