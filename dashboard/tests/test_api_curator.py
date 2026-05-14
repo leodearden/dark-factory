@@ -333,6 +333,11 @@ def test_curator_endpoint_paused_reason_pinned_to_none(client):
     The existing envelope-shape test only asserts key presence. This test pins
     the current contract so any future change that accidentally sets
     paused_reason to a non-None value fails explicitly.
+
+    NOTE: paused_reason=None is a temporary placeholder (see app.py TODO near
+    line 732-734: "Returns None until a follow-up task adds a snapshot column
+    or a new get_curator_state MCP tool"). When that follow-up lands this
+    assertion must be updated to reflect the new contract.
     """
     mcp_result = {'project_id': 'p', 'count': 0, 'tickets': []}
     with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
@@ -379,4 +384,41 @@ def test_curator_endpoint_malformed_created_at_returns_age_seconds_none(tmp_path
     )
     assert row['age_seconds'] is None, (
         f"age_seconds should be None for malformed created_at, got {row['age_seconds']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-1299-4b: empty/absent created_at → age_seconds=None (sibling path)
+# ---------------------------------------------------------------------------
+
+
+def test_curator_endpoint_empty_created_at_returns_age_seconds_none(tmp_path: Path):
+    """Empty (falsy) created_at skips the parse block entirely; age_seconds stays None.
+
+    app.py:670 guards the fromisoformat call with `if created_at_str:`, so an
+    empty string bypasses the try/except entirely and age_seconds is set to None
+    implicitly.  This test pins that sibling code path alongside the ValueError
+    path tested by test_curator_endpoint_malformed_created_at_returns_age_seconds_none.
+    """
+    ticket_row = {
+        'ticket_id': 'tkt_y',
+        'candidate_title': 'task Y',
+        'created_at': '',
+    }
+    mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
+
+    config = _make_config(tmp_path)
+    with _override_client(config) as c, patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+    cs = resp.json()['CURATOR_STATE']
+    assert len(cs['pending']) == 1, f"Expected 1 pending row, got {len(cs['pending'])}"
+    row = cs['pending'][0]
+    assert row['ticket_id'] == 'tkt_y'
+    assert row['created_at'] == '', (
+        f"created_at should be preserved verbatim (empty string), got {row['created_at']!r}"
+    )
+    assert row['age_seconds'] is None, (
+        f"age_seconds should be None for empty created_at, got {row['age_seconds']!r}"
     )

@@ -870,49 +870,6 @@ async def test_sample_curator_http_timeout_partial_pending_total(
     )
 
 
-# ---------------------------------------------------------------------------
-# Step-3 (task-1279): Saturation warning when list_tickets returns count==2000
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_sample_curator_saturation_warning_at_cap(tmp_path: Path, config, caplog):
-    """_sample_curator logs a WARNING when list_tickets returns the server cap (2000).
-
-    Uses _ListTicketsHandler(count=2000) so the mock returns count=2000,
-    which is the server-side ceiling.  The warning must:
-    - mention the cap value ('2000') in its message
-    - NOT suppress the count (pending_total == 2000)
-
-    """
-    from dashboard.data.memory import reset_sessions
-    from dashboard.data.metrics import _sample_curator
-
-    now = datetime.now(UTC)
-
-    handler = _ListTicketsHandler(count=2000)
-    transport = httpx.MockTransport(handler)
-
-    reset_sessions()
-    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
-        async with httpx.AsyncClient(transport=transport) as http_client:
-            result = await _sample_curator(
-                http_client, config, tickets_db=None, runs_dbs=[], now=now,
-            )
-
-    assert result is not None
-    assert result['pending_total'] == 2000, (
-        f"Expected pending_total=2000, got {result['pending_total']}"
-    )
-    warning_records = [
-        r for r in caplog.records
-        if r.levelno >= logging.WARNING and '2000' in r.getMessage()
-    ]
-    assert warning_records, (
-        "Expected at least one WARNING log mentioning '2000' for saturation, "
-        f"got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
-    )
-
 
 # ---------------------------------------------------------------------------
 # Step-1 (task-1299): fan_out_list_tickets failover — first URL raises HTTPError
@@ -989,9 +946,9 @@ async def test_fan_out_list_tickets_warns_when_count_at_limit(tmp_path: Path, ca
     with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'), \
          patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
         async with httpx.AsyncClient(transport=transport) as http_client:
-                tickets, pending_total = await fan_out_list_tickets(
-                    http_client, cfg, limit=2000,
-                )
+            tickets, pending_total = await fan_out_list_tickets(
+                http_client, cfg, limit=2000,
+            )
 
     assert pending_total == 2000, f"Expected pending_total=2000, got {pending_total}"
     warning_records = [
