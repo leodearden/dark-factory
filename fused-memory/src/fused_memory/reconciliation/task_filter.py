@@ -44,6 +44,12 @@ MAX_DONE_TASKS_RETAINED: int = 30
 # active-task truncation and would single-handedly exceed max_chars without this cap.
 MAX_CANCELLED_TASKS_RETAINED: int = 15
 
+# Maximum number of active tasks rendered to the LLM prompt in a single Stage 2 cycle.
+# Consumed by both format_filtered_task_tree (as the max_tasks default) AND
+# task_knowledge_sync's hint-attention section slice, ensuring the two sections
+# always reference the same set of tasks — see task_knowledge_sync.assemble_payload().
+MAX_ACTIVE_TASKS_RENDERED: int = 50
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
 # 'done': 4 is included so that _select_proactive_sample (which sorts ALL tasks
@@ -299,7 +305,7 @@ def format_task_list(tasks: list[Any]) -> str:
 
 def format_filtered_task_tree(
     tree: FilteredTaskTree,
-    max_tasks: int = 50,
+    max_tasks: int = MAX_ACTIVE_TASKS_RENDERED,
     max_chars: int = 50_000,
 ) -> str:
     """Render a FilteredTaskTree as a prompt-ready string.
