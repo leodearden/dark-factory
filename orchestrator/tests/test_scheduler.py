@@ -4679,3 +4679,62 @@ class TestRequeueCooldownGc:
             '_eligible_for_dispatch must not delete the expired _requeue_until entry; '
             'that is the responsibility of _gc_expired_cooldowns'
         )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_invokes_requeue_cooldown_gc(self, monkeypatch):
+        """acquire_next must call _gc_expired_cooldowns once per tick, clearing
+        both the dispatched task's expired entry and an orphan entry (a task id
+        that doesn't appear in the current task list).
+
+        This pins the invariant that acquire_next is the sole GC owner for
+        _requeue_until — expired entries are guaranteed to be removed by the
+        end of any tick that calls acquire_next.
+        """
+        import json as _json
+
+        base_time = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config, time_source=lambda: base_time)
+
+        pending_task = {
+            'id': '99',
+            'title': 'GC integration test task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend']},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(pending_task) + ']}',
+                    }
+                ]
+            }
+        }
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Seed two expired entries:
+        # '99'   — the task that will be dispatched; its cooldown has elapsed
+        # 'ghost' — an orphan id with no corresponding task in the MCP response;
+        #           exercises that GC is independent of task presence
+        scheduler._requeue_until['99'] = base_time - 1.0
+        scheduler._requeue_until['ghost'] = base_time - 1.0
+
+        result = await scheduler.acquire_next()
+
+        # (a) The task should be dispatched successfully — eligibility is
+        #     preserved after the refactor because GC runs before the loops.
+        assert result is not None and result.task_id == '99', (
+            f'Expected TaskAssignment for task 99; got: {result}'
+        )
+
+        # (b) Both expired entries must be gone — _gc_expired_cooldowns ran
+        #     and cleaned up the dispatched task's entry and the orphan.
+        assert scheduler._requeue_until == {}, (
+            f'Expected _requeue_until to be empty after acquire_next GC sweep; '
+            f'got: {scheduler._requeue_until}'
+        )
