@@ -100,3 +100,52 @@ async def test_get_pin_queue_empty_returns_empty_list(tmp_path, mcp_server, memo
     )
     assert result == {'pin_queue': []}
     memory_service.add_memory.assert_not_called()
+
+
+# ===========================================================================
+# set_task_priority_override — write + audit
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('extra_kwargs,extra_row_checks', [
+    ({}, {'pinned': 0, 'reserve_now': 0}),
+    ({'pinned': True}, {'pinned': 1}),
+    ({'reserve_now': True}, {'reserve_now': 1}),
+])
+async def test_set_task_priority_override_writes_row_and_emits_audit(
+    tmp_path, mcp_server, memory_service, extra_kwargs, extra_row_checks,
+):
+    """Happy-path: a row is written to SQLite and an audit add_memory is emitted."""
+    memory_service.add_memory.reset_mock()
+    result = await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high', **extra_kwargs},
+    )
+    assert result.get('success') is True or 'error' not in result
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT project_root, task_id, boost_tier, pinned, reserve_now '
+            'FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), '5'),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert row[0] == str(tmp_path)
+    assert row[1] == '5'
+    assert row[2] == 'high'
+    for col, val in extra_row_checks.items():
+        idx = {'pinned': 3, 'reserve_now': 4}[col]
+        assert row[idx] == val, f'{col} mismatch: expected {val}, got {row[idx]}'
+
+    memory_service.add_memory.assert_called_once()
+    _, audit_kwargs = memory_service.add_memory.call_args
+    assert audit_kwargs['category'] == 'decisions_and_rationale'
+    assert audit_kwargs['project_id'] == resolve_project_id(str(tmp_path))
+    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
+    assert audit_kwargs['metadata']['task_id'] == '5'
+    assert audit_kwargs['metadata']['fields']['boost_tier'] == 'high'
