@@ -18,6 +18,8 @@ Shape contract (returned by collect_scheduler_state):
         reserve_now        bool        from snapshot.overrides
         boost_tier         str | None  from snapshot.overrides
         ttl_until          str | None  from snapshot.overrides
+        project            str | None  display label for the owning project
+        project_root       str | None  absolute path to the owning project root
 
     modules: list[dict]  — one per unique module path that appears in any lock set:
         path        str
@@ -149,6 +151,11 @@ def _compose_rows(
             'reserve_now': bool(ov.get('reserve_now')),
             'boost_tier': ov.get('boost_tier'),
             'ttl_until': ov.get('ttl_until'),
+            # project/project_root are copied verbatim so the React drawer's
+            # ActionsPanel.submit and ActivePinsStrip unpin handlers can supply
+            # the correct project_root in override/clear-override POSTs.
+            'project': task.get('project'),
+            'project_root': task.get('project_root'),
         })
     return result
 

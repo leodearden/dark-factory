@@ -657,6 +657,57 @@ def test_reorder_pin_queue_returns_502_when_all_unreachable(client):
 
 
 # ---------------------------------------------------------------------------
+# step-32: _compose_rows propagates project and project_root fields
+# ---------------------------------------------------------------------------
+
+
+def test_compose_rows_propagates_project_and_project_root():
+    """_compose_rows copies project and project_root from input tasks verbatim.
+
+    Without these fields the React drawer's ActionsPanel.submit and
+    ActivePinsStrip unpin handlers send empty project_root, causing every
+    override/unpin call to 400 with invalid_project_root.
+    """
+    from dashboard.data.scheduler import _compose_rows
+
+    active_tasks = [
+        {
+            'task_id': '1',
+            'title': 'Task One',
+            'priority': 'high',
+            'started': 5,
+            'locks': ['src/a.py'],
+            'project': 'my-project',
+            'project_root': '/home/user/projects/my-project',
+        },
+        {
+            'task_id': '2',
+            'title': 'Task Two',
+            'priority': 'medium',
+            'started': 3,
+            'locks': [],
+            'project': 'other-project',
+            'project_root': '/home/user/projects/other-project',
+        },
+    ]
+
+    snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'overrides': {},
+    }
+
+    rows = _compose_rows(active_tasks, snapshot)
+
+    assert len(rows) == 2
+    assert rows[0]['project'] == 'my-project'
+    assert rows[0]['project_root'] == '/home/user/projects/my-project'
+    assert rows[1]['project'] == 'other-project'
+    assert rows[1]['project_root'] == '/home/user/projects/other-project'
+
+
+# ---------------------------------------------------------------------------
 # step-23: index.html references new scheduler JSX files + cache-buster bumped
 # ---------------------------------------------------------------------------
 
