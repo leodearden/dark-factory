@@ -492,6 +492,35 @@ class TestSweeps:
             store.clear_expired('proj', now=datetime(2026, 5, 14))
 
 
+class TestFromConfig:
+    def test_from_config_returns_store_at_canonical_db_path(self, tmp_path: Path) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        result = OverrideStore.from_config(config)
+
+        assert isinstance(result, OverrideStore)
+        assert result.db_path == config.overrides_db_path
+
+    def test_from_config_returns_a_usable_store_writing_at_canonical_path(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        store = OverrideStore.from_config(config)
+        store.set_override('proj', 'task-A', boost_tier='high')
+
+        # Open a fresh store from the same canonical path to prove the factory
+        # actually wrote to config.overrides_db_path rather than somewhere else.
+        fresh_store = OverrideStore(config.overrides_db_path)
+        overrides = fresh_store.get_overrides('proj')
+        assert 'task-A' in overrides
+        assert overrides['task-A'].boost_tier == 'high'
+
+
 class TestSeparateDB:
     def test_override_survives_simulated_set_task_status_cycle(
         self, tmp_path: Path
