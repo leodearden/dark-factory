@@ -246,6 +246,7 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
                    'fused_memory.project_id.')
 def status(config_path: Path | None):
     """Show current task tree and status."""
+    from orchestrator.overrides import OverrideStore
     from orchestrator.scheduler import Scheduler
 
     try:
@@ -253,7 +254,7 @@ def status(config_path: Path | None):
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    scheduler = Scheduler(config)
+    scheduler = Scheduler(config, override_store=OverrideStore(config.overrides_db_path))
 
     async def _show():
         tasks = await scheduler.get_tasks()
