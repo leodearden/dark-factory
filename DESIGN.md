@@ -415,3 +415,41 @@ docker-compose:
   + consolidation agent as a separate process/container
   + observability: latency metrics per store, LLM call counts, classification accuracy
 ```
+
+
+## Curator Tickets & Routing Invariant
+
+**Invariant:** every curator ticket lives on exactly one fused-memory instance.
+
+This is enforced at three independent levels:
+
+- **OS-wide singleton lock.** `fused-memory/src/fused_memory/server/main.py:_acquire_singleton_lock`
+  binds an abstract Unix socket (`\0fused-memory-singleton`) on process start.  Any second
+  fused-memory process exits with `SystemExit(1)`.  At most one daemon can hold tickets on
+  a given host.
+
+- **Per-process SQLite ticket store.** `fused-memory/src/fused_memory/middleware/ticket_store.py`
+  persists tickets in a per-instance database file (`<data_dir>/tickets.db`).  There is no
+  replication or cross-instance ticket sync; a ticket created by one process cannot appear in
+  another process's store.
+
+- **`DASHBOARD_FUSED_MEMORY_URLS` is failover-only, not sharding.**
+  `dashboard/src/dashboard/config.py:15-20` documents that the default `('http://localhost:8002',)`
+  is the single canonical systemd-managed instance, and that the ports retired when the
+  architecture consolidated to a shared server cannot host a legitimate fused-memory process
+  (the singleton lock prevents it).  The multi-URL config provides alternate *network paths*
+  to the same logical store, not separate stores.
+  `dashboard/src/dashboard/data/metrics.py:fan_out_list_tickets` uses the same
+  first-success-per-root semantics ("first success wins; avoid double-counting across failover
+  URLs"), confirming the project-wide pattern.
+
+**Routing consequence for the cancel proxy.** Because only one instance can own a given ticket,
+a `not_found` response from the first reachable instance is authoritative: no other URL in the
+list can hold the ticket.  `dashboard/src/dashboard/app.py:api_curator_cancel` short-circuits
+on `not_found` and returns 404 immediately.  The executable contract for this behavior is
+`dashboard/tests/test_api_curator_cancel.py:test_two_url_not_found_short_circuits_loop`
+(asserts `call_count == 1`, only URL[0] called).
+
+**Trigger for revisiting.** If a future infra change introduces ticket replication or
+multi-region deployment, this invariant must be re-evaluated and the cancel proxy
+short-circuit relaxed to fan-out-then-quorum.
