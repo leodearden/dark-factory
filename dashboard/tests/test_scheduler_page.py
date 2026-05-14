@@ -870,6 +870,68 @@ def test_compose_rows_supports_project_filter_isolation():
 
 
 # ---------------------------------------------------------------------------
+# step-37: clear-override boundary uses ttl_until (not raw MCP ttl wire name)
+# ---------------------------------------------------------------------------
+
+
+def test_clear_override_whitelist_uses_ttl_until_not_ttl(client):
+    """clear-override: fields=['ttl_until'] valid (200); fields=['ttl'] invalid (400).
+
+    The dashboard boundary speaks 'ttl_until' (matching the row shape);
+    the MCP wire name 'ttl' must NOT be accepted at the dashboard layer.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+
+    # ttl_until is the canonical dashboard name → accepted
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['ttl_until']},
+        )
+    assert resp.status_code == 200, (
+        f"Expected 200 for fields=['ttl_until'], got {resp.status_code}: {resp.text}"
+    )
+
+    # 'ttl' is the MCP wire name — it must be rejected at the dashboard boundary
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['ttl']},
+        )
+    assert resp.status_code == 400, (
+        f"Expected 400 for fields=['ttl'], got {resp.status_code}: {resp.text}"
+    )
+    assert mock_mcp.call_count == 0
+
+
+def test_clear_override_translates_ttl_until_to_mcp_ttl(client):
+    """Dashboard translates fields=['ttl_until'] → fields=['ttl'] before calling MCP.
+
+    Keeps dashboard boundary speaking 'ttl_until' while the MCP tool
+    receives its expected 'ttl' key. Add a comment in the impl so future
+    maintainers don't re-invert the mapping.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['ttl_until']},
+        )
+
+    assert resp.status_code == 200
+    _client, _url, tool_arg, args = mock_mcp.call_args.args
+    assert tool_arg == 'clear_task_priority_override'
+    # Dashboard must translate 'ttl_until' → 'ttl' before forwarding to MCP
+    assert args.get('fields') == ['ttl'], (
+        f"Expected MCP fields=['ttl'], got {args.get('fields')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-23: index.html references new scheduler JSX files + cache-buster bumped
 # ---------------------------------------------------------------------------
 

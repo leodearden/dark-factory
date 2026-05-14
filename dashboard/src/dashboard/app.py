@@ -783,7 +783,9 @@ async def api_scheduler(request: Request) -> JSONResponse:
 
 
 _VALID_BOOST_TIERS = frozenset({'critical', 'high', 'medium', 'low', 'polish'})
-_VALID_CLEAR_FIELDS = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
+# Dashboard boundary uses 'ttl_until' (matching the row/override shape).
+# The MCP tool expects 'ttl' — translation happens in api_scheduler_clear_override.
+_VALID_CLEAR_FIELDS = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl_until'})
 
 
 def _sched_fan_out_error(errors: list[str]) -> JSONResponse:
@@ -884,7 +886,9 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
 
     args: dict = {'task_id': task_id, 'project_root': project_root}
     if fields is not None:
-        args['fields'] = fields
+        # Translate 'ttl_until' → 'ttl': the dashboard boundary speaks 'ttl_until'
+        # (matching the row shape), but the MCP tool's wire format uses 'ttl'.
+        args['fields'] = ['ttl' if f == 'ttl_until' else f for f in fields]
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
