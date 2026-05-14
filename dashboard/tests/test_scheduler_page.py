@@ -599,7 +599,7 @@ _REORDER_INVALID_BODIES = [
     pytest.param(None, id='non-dict-body'),
     pytest.param({}, id='missing-task_ids'),
     pytest.param({'task_ids': 'not-a-list'}, id='task_ids-not-list'),
-    pytest.param({'task_ids': ['T1', 'T1']}, id='duplicate-task_ids'),
+    pytest.param({'task_ids': ['T1', 'T1'], 'project_root': '/proj'}, id='duplicate-task_ids'),
 ]
 
 
@@ -608,7 +608,10 @@ def test_reorder_pin_queue_rejects_invalid_body(client, body):
     """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    # Patch collect_metrics_snapshot to prevent the background _metrics_loop
+    # from calling mcp_tool_call during the request and inflating call_count.
+    with patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock()), \
+         patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         if body is None:
             resp = client.post(
                 '/api/v2/dashboard/scheduler/reorder-pin-queue',
@@ -977,7 +980,10 @@ def test_override_endpoint_rejects_invalid_ttl_minutes(client, bad_ttl):
     """POST /override with invalid ttl_minutes → 400 invalid_ttl_minutes, no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    # Patch collect_metrics_snapshot to prevent the background _metrics_loop
+    # from calling mcp_tool_call during the request and inflating call_count.
+    with patch('dashboard.app.collect_metrics_snapshot', new=AsyncMock()), \
+         patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         resp = client.post(
             '/api/v2/dashboard/scheduler/override',
             json={
