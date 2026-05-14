@@ -765,3 +765,35 @@ def shape_curator(
             },
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# SCHEDULER
+# ---------------------------------------------------------------------------
+
+
+def shape_scheduler(
+    *,
+    rows: list,
+    modules: list,
+    pin_queue: list,
+    events_by_task: dict,
+    offline_projects: list,
+    snapshot_at: str | None,
+) -> dict:
+    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects}}``.
+
+    Pure, I/O-free — mirrors ``shape_curator`` style.  Deep-copies list/dict
+    inputs to prevent aliasing between the caller and the JSON response.
+    """
+    return {
+        'SCHEDULER': {
+            'rows': list(rows),
+            'modules': list(modules),
+            'pin_queue': list(pin_queue),
+            'events_by_task': dict(events_by_task),
+            'snapshot_at': snapshot_at,
+            'offline': bool(offline_projects),
+            'offline_projects': list(offline_projects),
+        }
+    }
