@@ -7,6 +7,8 @@ export). Follows the idiom established in test_index_html.py.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -61,8 +63,12 @@ def _extract_curator_state_block(data_js: str) -> str:
     This is brace-aware: a simple regex ``[^}]*`` would stop at the first nested
     ``}`` (e.g. the one closing ``latency_spark: { ... }``) and miss later keys.
     Returns the empty string if no CURATOR_STATE block is found.
+
+    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
+    literals.  This is acceptable because the data.js seed block uses simple
+    numeric/array values and does not embed brace characters inside quoted
+    strings.
     """
-    import re
     m = re.search(r'CURATOR_STATE\s*:\s*\{', data_js)
     if m is None:
         return ''
@@ -119,20 +125,20 @@ def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
         "data.js does not reference 'CURATOR_STATE' — add it as the mapped key "
         "for '/api/v2/dashboard/curator' in endpointsFor."
     )
-    import re
-
     seed_block = _extract_curator_state_block(data_js_body)
     assert seed_block, (
         "data.js does not contain a `CURATOR_STATE: { ... }` seed block — "
         "add the initializer to the window.DF_DATA assignment so applyKey has "
         "something to replace on each poll."
     )
+    # Scoped check: assert each key is present as a property name inside the
+    # CURATOR_STATE block only.  A bare-substring check against the full data.js
+    # body would pass even if this block were deleted (e.g. 'pending' appears in
+    # MEMORY_STATUS and BURNDOWN; 'state' appears in MEMORY_STATUS.burst_state).
     for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
         assert re.search(rf'\b{key}\s*:', seed_block), (
-            f"data.js CURATOR_STATE seed does not include key '{key}:' — "
-            f"add it to the CURATOR_STATE seed in the window.DF_DATA initializer. "
-            f"(Bare-substring check against the full data.js body would pass "
-            f"because '{key}' appears elsewhere; this scoped check is the test.)"
+            f"CURATOR_STATE seed missing key '{key}:' — "
+            f"add it to the window.DF_DATA initializer in data.js."
         )
 
 
@@ -216,8 +222,6 @@ def test_app_jsx_wires_curator_tab(app_jsx_body: str) -> None:
     Cosmetic fields (display label) are omitted — they can be renamed without
     breaking the routing.
     """
-    import re
-
     assert re.search(r'const\s*\{[^}]*CuratorTab[^}]*\}\s*=\s*window\.DF_CURATOR', app_jsx_body), (
         "app.jsx does not destructure CuratorTab from window.DF_CURATOR — add "
         "`const { CuratorTab } = window.DF_CURATOR;` near the other destructures."
@@ -251,8 +255,6 @@ def test_curator_state_key_check_is_scoped_to_seed_block() -> None:
         block with nested objects so the brace-counted extractor is exercised
         past the first inner `}`.
     """
-    import re
-
     fake_without_curator_state = (
         "window.DF_DATA = {\n"
         "  MEMORY_STATUS: { queue: { counts: { pending: 0 } }, burst_state: [] },\n"
@@ -294,11 +296,3 @@ def test_curator_state_key_check_is_scoped_to_seed_block() -> None:
             f"reaching this key."
         )
 
-    # Scoped check must return None for the without-CURATOR_STATE input.
-    empty_block = _extract_curator_state_block(fake_without_curator_state)
-    for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
-        assert re.search(rf'\b{key}\s*:', empty_block) is None, (
-            f"re.search for '{key}:' returned a match in an empty block — "
-            f"this indicates _extract_curator_state_block returned non-empty "
-            f"when it should have returned ''."
-        )
