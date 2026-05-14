@@ -90,6 +90,9 @@ def test_curator_endpoint_returns_envelope_shape(client):
     assert 'p50' in ls
     assert 'p90' in ls
     assert 'p99' in ls
+    ps = cs.get('pending_spark', {})
+    assert 'labels' in ps
+    assert 'values' in ps
     capped = cs.get('capped_spark', {})
     assert 'labels' in capped
     assert 'values' in capped
@@ -316,6 +319,9 @@ def test_shape_curator_pure_function():
     assert ls['p50'] == [50]
     assert ls['p90'] == [90]
     assert ls['p99'] == [99]
+
+    # pending_spark surfaces the pending series from curator_sparks
+    assert cs['pending_spark'] == {'labels': ['t1'], 'values': [1]}
 
     # capped_spark passes through
     assert cs['capped_spark'] == capped_spark
