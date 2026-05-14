@@ -2202,13 +2202,16 @@ Output JSON matching the schema. Every task must appear in the output.
                 ) from exc
 
     async def _dismiss_stale_escalations(self) -> None:
-        """Dismiss all pending escalations left over from prior orchestrator runs.
+        """Dismiss stale L0 escalations left over from prior orchestrator runs.
 
-        Called right after _start_escalation_server() so that any escalations
-        persisted in the queue directory from a previous (crashed or completed)
-        run are cleared before the new run begins.  All pending escalations at
-        startup are by definition stale — a new run should never inherit
-        unresolved escalations from a prior one.
+        Called right after _start_escalation_server() so that any L0
+        (agent→steward) escalations persisted in the queue directory from a
+        previous (crashed or completed) run are cleared before the new run
+        begins.
+
+        L1 (steward→human) escalations are intentionally preserved across
+        restart — they represent human-attention requests that were not yet
+        acted on and must not be silently lost during long AFK periods.
         """
         if self._escalation_queue is None:
             return
@@ -2218,7 +2221,10 @@ Output JSON matching the schema. Every task must appear in the output.
         )
         count = self._escalation_queue.dismiss_all_pending(resolution)
         if count:
-            logger.info(f'Dismissed {count} stale escalation(s) from prior run')
+            logger.info(
+                f'Dismissed {count} stale L0 escalation(s) from prior run; '
+                f'L1 escalations preserved across restart'
+            )
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""

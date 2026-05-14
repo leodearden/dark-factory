@@ -13,7 +13,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
 
 
-def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending') -> Escalation:
+def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
     esc = Escalation(
         id=esc_id,
         task_id=task_id,
@@ -21,6 +21,7 @@ def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending') -
         severity='blocking',
         category='task_failure',
         summary='Something failed',
+        level=level,
     )
     esc.status = status
     return esc
@@ -199,6 +200,68 @@ class TestDismissAllPendingResilience:
             count = queue.dismiss_all_pending('Stale from prior run')
 
         assert count == 0
+
+
+class TestDismissAllPendingPreservesL1:
+    """EscalationQueue.dismiss_all_pending() must NOT dismiss level-1 escalations."""
+
+    def test_dismiss_all_pending_skips_level_1_escalations(self, tmp_path: Path):
+        """L0 escalation is dismissed; L1 escalation remains pending — count is 1."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        l0 = _make_escalation('esc-l0-1', task_id='1', level=0)
+        l1 = _make_escalation('esc-l1-1', task_id='2', level=1)
+        queue.submit(l0)
+        queue.submit(l1)
+
+        count = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
+
+        assert count == 1
+
+        updated_l0 = queue.get('esc-l0-1')
+        assert updated_l0 is not None
+        assert updated_l0.status == 'dismissed'
+
+        updated_l1 = queue.get('esc-l1-1')
+        assert updated_l1 is not None
+        assert updated_l1.status == 'pending'
+        assert updated_l1.resolved_at is None
+        assert updated_l1.resolved_by is None
+
+    def test_dismiss_all_pending_only_l1_returns_zero(self, tmp_path: Path):
+        """Queue with only an L1 escalation: dismiss_all_pending returns 0, L1 stays pending."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        l1 = _make_escalation('esc-l1-1', task_id='1', level=1)
+        queue.submit(l1)
+
+        count = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
+
+        assert count == 0
+
+        updated_l1 = queue.get('esc-l1-1')
+        assert updated_l1 is not None
+        assert updated_l1.status == 'pending'
+
+    def test_dismiss_all_pending_idempotent_with_l1(self, tmp_path: Path):
+        """Calling dismiss_all_pending twice is safe: second call returns 0, L1 is unmodified."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        l0 = _make_escalation('esc-l0-1', task_id='1', level=0)
+        l1 = _make_escalation('esc-l1-1', task_id='2', level=1)
+        queue.submit(l0)
+        queue.submit(l1)
+
+        first = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
+        assert first == 1
+
+        # Second call — no pending L0s remain; L1 is untouched.
+        second = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
+        assert second == 0
+
+        # L1 status/resolved_at/resolved_by are unchanged across both calls.
+        updated_l1 = queue.get('esc-l1-1')
+        assert updated_l1 is not None
+        assert updated_l1.status == 'pending'
+        assert updated_l1.resolved_at is None
+        assert updated_l1.resolved_by is None
 
 
 class TestGetArchiveFallback:

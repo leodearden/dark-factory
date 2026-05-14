@@ -16,6 +16,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     """Create a Harness with mocked internals for unit testing stale escalation cleanup."""
     with (
         patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
         patch('orchestrator.harness.Scheduler'),
         patch('orchestrator.harness.BriefingAssembler'),
     ):
