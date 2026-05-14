@@ -5863,6 +5863,12 @@ async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
             f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
         )
 
+    # (a'') WARNING must include the caller label so per-caller grep patterns work
+    for r in warning_records:
+        assert 'caller=add_ticket' in r.message, (
+            f'Expected WARNING to contain "caller=add_ticket" but got: {r.message!r}'
+        )
+
     # (b) Row status is 'cancelled' (cancel_ticket won the race)
     row = await ticket_store.get(ticket_id)
     assert row is not None
@@ -6120,4 +6126,39 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
     for r in warning_records:
         assert 'orphan-race:' in r.message, (
             f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
+        )
+
+    # (c) WARNING must include the caller label so per-caller grep patterns work
+    for r in warning_records:
+        assert 'caller=add_ticket_cancel' in r.message, (
+            f'Expected WARNING to contain "caller=add_ticket_cancel" but got: {r.message!r}'
+        )
+
+
+@pytest.mark.asyncio
+async def test_persist_worker_terminal_requires_caller(
+    interceptor_with_store,
+    ticket_store,
+):
+    """_persist_worker_terminal must require `caller` as a keyword argument — omitting it
+    raises TypeError.
+
+    This test pins the required-kwarg contract.  The signature places `caller` after
+    `*,` (keyword-only) with no default, so Python's runtime must raise TypeError
+    when the argument is missing.  The `match='caller'` regex ensures the error
+    message names the missing parameter.
+
+    RED: today the signature has `caller: str = 'unknown'` so no TypeError is raised.
+    GREEN after step-2 removes the default.
+    """
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    with pytest.raises(TypeError, match='caller'):
+        await interceptor_with_store._persist_worker_terminal(
+            ticket_id,
+            status='created',
+            task_id='task-x',
+            reason=None,
+            result_dict=None,
+            # caller= intentionally omitted to assert required-kwarg contract
         )
