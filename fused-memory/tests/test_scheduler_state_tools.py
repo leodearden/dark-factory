@@ -313,19 +313,21 @@ class TestGetSchedulerEventsTool:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('fragment', ['has?question', 'has#hash'])
+    @pytest.mark.parametrize('fragment', ['has?question', 'has#hash', 'has%41literal'])
     async def test_handles_uri_reserved_chars_in_project_root(
         self, tmp_path, mcp_server, fragment
     ):
         """Tool returns events even when project_root path contains URI-reserved chars.
 
-        Linux filesystems accept '?' and '#' in directory names.  Without
+        Linux filesystems accept '?', '#', and '%' in directory names.  Without
         URL-encoding the db_path before embedding it in the SQLite URI
-        (``file:<path>?mode=ro``), those characters are misinterpreted as URI
-        query-string / fragment delimiters, causing aiosqlite to fail or open
-        the wrong file — surfacing as ``{'error': ..., 'error_type': ...}``
-        (no 'count' key) instead of the expected ``{'events': [...], 'count': 1}``
-        shape.  This test is the regression canary for task 1331.
+        (``file:<path>?mode=ro``), those characters are misinterpreted: '?' and
+        '#' as URI query-string / fragment delimiters (causing aiosqlite to fail
+        or open the wrong file), and a literal '%41' as the percent-encoded form
+        of 'A' (silently opening a different file path).  All three cases surface
+        as ``{'error': ..., 'error_type': ...}`` (no 'count' key) instead of
+        the expected ``{'events': [...], 'count': 1}`` shape.  This test is the
+        regression canary for task 1331.
         """
         project_root = tmp_path / fragment
         project_root.mkdir()
