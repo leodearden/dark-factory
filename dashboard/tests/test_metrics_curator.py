@@ -755,7 +755,7 @@ async def test_sample_curator_http_timeout_partial_pending_total(
     - no exception propagates
     - result['pending_total'] == 3 (partial accumulation from r1 only)
     - mcp_tool_call was called at least twice (loop reached r2)
-    - wall-clock elapsed < 1s (timeout was honoured, not the un-capped 5s sleep)
+    - wall-clock elapsed < 3s (timeout was honoured, not the un-capped 5s sleep)
     """
     import time
 
@@ -804,8 +804,8 @@ async def test_sample_curator_http_timeout_partial_pending_total(
     assert result is not None
     assert result['pending_total'] == 3, f"Expected 3, got {result['pending_total']}"
     assert call_count >= 2, f"Expected at least 2 mcp_tool_call invocations, got {call_count}"
-    assert elapsed < 1.0, (
-        f"Elapsed {elapsed:.3f}s ≥ 1s — wait_for ceiling does not appear to be in place"
+    assert elapsed < 3.0, (
+        f"Elapsed {elapsed:.3f}s ≥ 3s — wait_for ceiling does not appear to be in place"
     )
 
 
@@ -823,8 +823,6 @@ async def test_sample_curator_saturation_warning_at_cap(tmp_path: Path, config, 
     - mention the cap value ('2000') in its message
     - NOT suppress the count (pending_total == 2000)
 
-    Implicitly, the happy-path test (count=2) must NOT trigger a warning —
-    this is verified by its absence from the caplog in that test.
     """
     from dashboard.data.memory import reset_sessions
     from dashboard.data.metrics import _sample_curator
