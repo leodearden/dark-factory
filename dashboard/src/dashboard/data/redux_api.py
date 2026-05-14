@@ -705,3 +705,54 @@ def shape_burndown(
     aggregate.update(compute_forecast_confidence(aggregate))
 
     return {'BURNDOWN': aggregate, 'BURNDOWN_BY_PROJECT': by_project}
+
+
+# ---------------------------------------------------------------------------
+# CURATOR_STATE
+# ---------------------------------------------------------------------------
+
+
+def shape_curator(
+    *,
+    pending: list[dict],
+    curator_sparks: Mapping[str, Mapping[str, list]],
+    capped_spark: Mapping[str, list],
+    capped_now: int,
+    paused_reason: str | None,
+    pending_total: int,
+) -> dict[str, Any]:
+    """Return ``{CURATOR_STATE: {pending, latency_spark, capped_spark, state}}``.
+
+    Pure, I/O-free — mirrors ``shape_recon`` / ``shape_costs`` style.
+
+    *curator_sparks* is the 4-key ``{pending, p50, p90, p99}`` dict returned by
+    ``get_curator_sparks``.  We collapse it to a flat ``{labels, p50, p90, p99}``
+    shape using the p50 labels as the shared time axis (all four series read from
+    the same ``curator_snapshots`` rows so their labels are identical).
+
+    *capped_spark* is passed through unchanged (``{labels, values}`` ChartData).
+    """
+    sparks = curator_sparks or {}
+    p50_series = sparks.get('p50') or {}
+    p90_series = sparks.get('p90') or {}
+    p99_series = sparks.get('p99') or {}
+
+    latency_spark: dict[str, list] = {
+        'labels': list(p50_series.get('labels') or []),
+        'p50': list(p50_series.get('values') or []),
+        'p90': list(p90_series.get('values') or []),
+        'p99': list(p99_series.get('values') or []),
+    }
+
+    return {
+        'CURATOR_STATE': {
+            'pending': list(pending),
+            'latency_spark': latency_spark,
+            'capped_spark': dict(capped_spark) if capped_spark else {'labels': [], 'values': []},
+            'state': {
+                'capped_now': capped_now,
+                'paused_reason': paused_reason,
+                'pending_total': pending_total,
+            },
+        }
+    }
