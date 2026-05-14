@@ -4795,3 +4795,62 @@ class TestSchedulerPause:
         assert result_resumed is not None, (
             'Expected TaskAssignment after resume; got None'
         )
+
+
+class TestSchedulerBlockedTransitionTracking:
+    """Unit tests for the blocked-transition deque used by park-stop trip detection."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        now = 1_000_000.0
+        return Scheduler(config, wall_clock_source=lambda: now)
+
+    def test_record_blocked_transition_appends_timestamp(self):
+        """_record_blocked_transition() adds entries matching the wall-clock source."""
+        timestamps = [1_000_000.0, 1_000_001.0, 1_000_002.0]
+        idx = [0]
+
+        def time_source() -> float:
+            val = timestamps[idx[0]]
+            idx[0] += 1
+            return val
+
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        scheduler = Scheduler(config, wall_clock_source=time_source)
+
+        scheduler._record_blocked_transition()
+        scheduler._record_blocked_transition()
+        scheduler._record_blocked_transition()
+
+        assert len(scheduler._blocked_transitions) == 3
+        assert list(scheduler._blocked_transitions) == timestamps
+
+    def test_record_evicts_entries_older_than_window(self):
+        """Entries older than the rolling window are evicted on each record call."""
+        now = 1_000_000.0
+        call_times = [now]  # subsequent records return `now`
+
+        def time_source() -> float:
+            return call_times[-1]
+
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        scheduler = Scheduler(config, wall_clock_source=time_source)
+
+        # Seed three entries: two outside the 3600s window, one inside.
+        from collections import deque
+        scheduler._blocked_transitions = deque([
+            now - 7200,   # 2h ago — expired
+            now - 3600,   # exactly at cutoff boundary — expired (strictly older)
+            now - 100,    # 100s ago — within window
+        ])
+
+        # Record a new transition at `now`.
+        scheduler._record_blocked_transition()
+
+        entries = list(scheduler._blocked_transitions)
+        assert (now - 7200) not in entries, 'Entry 2h old must be evicted'
+        assert (now - 3600) not in entries, 'Entry at boundary must be evicted'
+        assert (now - 100) in entries, 'Entry 100s old must survive'
+        assert now in entries, 'New entry must be present'
+        assert len(entries) == 2, f'Expected 2 entries; got {len(entries)}: {entries}'
