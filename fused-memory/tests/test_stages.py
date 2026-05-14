@@ -7531,6 +7531,9 @@ class TestFormatSnapshotFact:
         assert '5 in_progress' in result, (
             f'Expected "5 in_progress" in result, got: {result!r}'
         )
+        assert result == 'As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 5 in_progress, 42 total.', (
+            f'Full canonical string mismatch, got: {result!r}'
+        )
 
     def test_keeps_all_fields_in_deterministic_order(self):
         """Zero-value fields are included; output is alphabetically ordered and stable."""
