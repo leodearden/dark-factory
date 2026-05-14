@@ -270,6 +270,46 @@ class TestReadCapIntervals:
         with pytest.raises(ValueError, match="positive"):
             await read_cap_intervals([cap_conn], days=-1)
 
+    @pytest.mark.asyncio
+    async def test_honors_now_parameter(self, tmp_path):
+        """now= shifts the cutoff so events outside the default window are included.
+
+        Inserts a single cap_hit at real_now - 30 days.
+
+        1. read_cap_intervals([conn], days=7) with default now: the event is
+           outside the 7-day window → result is [].
+        2. read_cap_intervals([conn], days=7, now=real_now - 28 days): the
+           synthetic now shifts the cutoff to real_now - 35 days, so the
+           30-day-old event IS within the window → result has 1 CapInterval.
+
+        Failing baseline: read_cap_intervals currently has signature
+        (dbs, *, days: int) — passing now=... raises TypeError.
+        """
+        real_now = datetime.now(UTC)
+        event_ts = real_now - timedelta(days=30)
+        db_path = _make_db_with_events(tmp_path, 'now_param.db', [
+            ('acc-x', 'cap_hit', event_ts),
+        ])
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            # 1. Default now: 30-day-old event outside 7-day window
+            result_default = await read_cap_intervals([conn], days=7)
+            assert result_default == [], (
+                f"Expected [] with default now (event 30d old, window 7d), "
+                f"got {result_default}"
+            )
+
+            # 2. Synthetic now 28 days ago: cutoff shifts to 35 days ago, includes event
+            synthetic_now = real_now - timedelta(days=28)
+            result_shifted = await read_cap_intervals([conn], days=7, now=synthetic_now)
+            assert len(result_shifted) == 1, (
+                f"Expected 1 interval with now=real_now-28d (cutoff 35d ago), "
+                f"got {result_shifted}"
+            )
+            assert result_shifted[0].account_name == 'acc-x'
+            assert result_shifted[0].end is None  # open-ended (no resumed)
+
 
 # ---------------------------------------------------------------------------
 # Step-3 tests: merge_all_accounts_capped
