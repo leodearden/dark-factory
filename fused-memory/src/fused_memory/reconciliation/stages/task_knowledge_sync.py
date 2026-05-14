@@ -562,7 +562,7 @@ class Stage2FlagPartition(NamedTuple):
         stale_missing_run_id_ids: ``id`` strings for records whose
             ``metadata.run_id`` is absent or falsy (empty string).  These
             indicate Stage 1 producer drift — the LLM wrote a flag without the
-            required ``run_id`` field (see prompts/stage1.py:316-332).  A
+            required ``run_id`` field (see prompts/stage1.py).  A
             WARNING is logged by :func:`_query_stage2_flags` when this bucket
             is non-empty.  Caller sweeps these via
             :func:`_sweep_stale_fixc_markers`.
@@ -575,6 +575,11 @@ class Stage2FlagPartition(NamedTuple):
     current: list[dict]
     stale_missing_run_id_ids: list[str]
     stale_mismatched_run_id_ids: list[str]
+
+    @property
+    def stale_all_ids(self) -> list[str]:
+        """Combined stale IDs for sweeping (missing + mismatched)."""
+        return self.stale_missing_run_id_ids + self.stale_mismatched_run_id_ids
 
 
 async def _query_stage2_flags(
@@ -677,7 +682,7 @@ async def _query_stage2_flags(
         logger.warning(
             'reconciliation._query_stage2_flags: %d Stage 2 marker(s) missing '
             'metadata.run_id — Stage 1 producer drift (markers will be swept and '
-            'never reach the LLM); see prompts/stage1.py:316-332',
+            'never reach the LLM); see prompts/stage1.py',
             len(stale_missing_run_id_ids),
             extra={
                 'project_id': project_id,
@@ -1476,7 +1481,7 @@ class TaskKnowledgeSync(BaseStage):
             self.memory, self.project_id, run_id_for_markers
         )
         active_flags = partition.current
-        stale_marker_ids = partition.stale_missing_run_id_ids + partition.stale_mismatched_run_id_ids
+        stale_marker_ids = partition.stale_all_ids
         self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to

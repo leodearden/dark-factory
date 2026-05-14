@@ -4502,7 +4502,8 @@ class TestQueryStage2Flags:
         assert partition.current[0]['id'] == 'current'
 
         # (c) and (d) — missing run_id (absent or empty) in stale_missing_run_id_ids
-        assert partition.stale_missing_run_id_ids == ['no-run-id', 'empty-run-id']
+        # Use set equality: order is incidental (follows search result iteration order)
+        assert set(partition.stale_missing_run_id_ids) == {'no-run-id', 'empty-run-id'}
 
         # (b) — present but mismatched run_id
         assert partition.stale_mismatched_run_id_ids == ['prior']
@@ -4538,9 +4539,11 @@ class TestQueryStage2Flags:
             f'Expected exactly 1 missing-run_id WARNING, got {len(warning_records)}: '
             f'{[r.getMessage() for r in warning_records]}'
         )
-        # The rendered message (or extra) must contain the count 2
-        msg = warning_records[0].getMessage()
-        assert '2' in msg, f'Expected count 2 in warning message, got: {msg!r}'
+        # The structured extra dict must carry the exact count — avoids fragile substring match
+        assert warning_records[0].missing_run_id_count == 2, (
+            f'Expected missing_run_id_count=2 in log extra, '
+            f'got: {getattr(warning_records[0], "missing_run_id_count", "<absent>")}'
+        )
 
     @pytest.mark.asyncio
     async def test_no_missing_run_id_warning_when_count_is_zero(self, caplog):
