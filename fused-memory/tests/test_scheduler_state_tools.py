@@ -310,3 +310,54 @@ class TestGetSchedulerEventsTool:
         assert result.get('error_type') == 'ValidationError', (
             f'Expected ValidationError, got {result!r}'
         )
+
+
+# ===========================================================================
+# Step-23: get_scheduler_state performance
+# ===========================================================================
+
+import statistics
+import time
+
+
+class TestSnapshotPerformance:
+    """get_scheduler_state must serve a 1500-task snapshot under 50ms."""
+
+    @pytest.mark.asyncio
+    async def test_get_scheduler_state_under_50ms_for_1500_tasks(
+        self, tmp_path, mcp_server
+    ):
+        """Median latency for a 1500-task snapshot is < 50ms (acceptance criterion)."""
+        n = 1500
+        snapshot = {
+            'skip_counts': {f'T{i}': i % 5 for i in range(n)},
+            'parks': {
+                f'T{i}': {'modules': [f'm{i}/src'], 'installed_at': '2026-05-14T00:00:00+00:00'}
+                for i in range(0, n, 10)
+            },
+            'effective_priorities': {f'T{i}': 'medium' for i in range(n)},
+            'pin_queue': [{'task_id': f'T{i}', 'order': i} for i in range(10)],
+            'overrides': {
+                f'T{i}': {'boost_tier': 'high', 'pinned': False,
+                           'reserve_now': False, 'ttl_until': None}
+                for i in range(0, n, 5)
+            },
+            'current_holders': {f'm{i}/src': f'T{i}' for i in range(n)},
+            'snapshot_at': '2026-05-14T12:00:00+00:00',
+        }
+        _write_snapshot(tmp_path, snapshot)
+
+        samples = []
+        for _ in range(10):
+            t0 = time.perf_counter()
+            result = await mcp_server._tool_manager.call_tool(
+                'get_scheduler_state',
+                {'project_root': str(tmp_path)},
+            )
+            samples.append((time.perf_counter() - t0) * 1000)
+
+        median_ms = statistics.median(samples)
+        assert 'snapshot_at' in result, 'snapshot_at missing from result'
+        assert median_ms < 50, (
+            f'Median latency {median_ms:.1f}ms exceeds 50ms acceptance criterion'
+        )
