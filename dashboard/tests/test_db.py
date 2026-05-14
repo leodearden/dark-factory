@@ -6,6 +6,7 @@ import sqlite3
 from unittest.mock import patch
 
 import aiosqlite
+import pytest
 
 from dashboard.data.db import DbPool, with_db
 
@@ -77,6 +78,40 @@ class TestDbPool:
         with patch('pathlib.Path.exists', side_effect=PermissionError('permission denied')):
             result = await pool.get(db_path)
         assert result is None
+
+    @pytest.mark.parametrize('fragment', ['has?question', 'has#hash', 'has%41literal'])
+    async def test_get_handles_uri_reserved_chars_in_path(self, tmp_path, fragment):
+        """Regression canary for task 1337 (mirrors task 1331 in test_scheduler_state_tools.py).
+
+        DbPool.get must URL-encode the filesystem path before building the SQLite URI
+        (``file:<path>?mode=ro``).  Three URI-reserved characters are tested:
+
+        - ``?``: URI query-string delimiter — SQLite truncates the path at ``?``,
+          targeting a non-existent file; DbPool.get catches OperationalError and
+          returns None.
+        - ``#``: URI fragment delimiter — SQLite truncates the path at ``#``;
+          same result.
+        - ``%41``: literal percent-sequence — SQLite decodes it to ``A``, silently
+          targeting a different path that does not exist.
+
+        All three cases return None pre-fix.  After the fix (``quote(str(resolved),
+        safe='/')``) all three open a real connection and ``SELECT 1`` returns ``(1,)``.
+        """
+        subdir = tmp_path / fragment
+        subdir.mkdir()
+        db_path = subdir / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        try:
+            conn = await pool.get(db_path)
+            assert conn is not None, f'pool.get returned None for path containing {fragment!r}'
+            async with conn.execute('SELECT 1') as cur:
+                row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == 1
+        finally:
+            await pool.close_all()
 
 
 class TestWithDb:

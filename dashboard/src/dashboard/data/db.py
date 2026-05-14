@@ -12,6 +12,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TypeVar
+from urllib.parse import quote
 
 import aiosqlite
 
@@ -43,8 +44,10 @@ class DbPool:
         try:
             if not resolved.exists():
                 return None
+            # safe='/' preserves POSIX path separators; dashboard is Linux-only.
+            # For Windows portability use pathlib.PurePath.as_uri() instead.
             conn = await aiosqlite.connect(
-                f'file:{resolved}?mode=ro', uri=True,
+                f'file:{quote(str(resolved), safe="/")}?mode=ro', uri=True,
             )
             conn.row_factory = aiosqlite.Row
             self._conns[resolved] = conn
