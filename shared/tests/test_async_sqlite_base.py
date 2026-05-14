@@ -292,6 +292,30 @@ class TestAsyncSqliteBaseOpen:
         finally:
             await store.close()
 
+    async def test_open_sets_synchronous_full(self, tmp_path: Path) -> None:
+        """After open(), PRAGMA synchronous returns 2 (FULL)."""
+        async with _SimpleStore(tmp_path / 'store.db') as store:  # noqa: SIM117
+            async with store._conn.execute('PRAGMA synchronous') as cur:  # type: ignore[union-attr]
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 2  # 2 == FULL
+
+    async def test_open_sets_wal_autocheckpoint_100(self, tmp_path: Path) -> None:
+        """After open(), PRAGMA wal_autocheckpoint returns 100."""
+        async with _SimpleStore(tmp_path / 'store.db') as store:  # noqa: SIM117
+            async with store._conn.execute('PRAGMA wal_autocheckpoint') as cur:  # type: ignore[union-attr]
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 100
+
+    async def test_open_sets_journal_size_limit(self, tmp_path: Path) -> None:
+        """After open(), PRAGMA journal_size_limit returns 67108864."""
+        async with _SimpleStore(tmp_path / 'store.db') as store:  # noqa: SIM117
+            async with store._conn.execute('PRAGMA journal_size_limit') as cur:  # type: ignore[union-attr]
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 67108864
+
     async def test_open_no_resource_leak_on_schema_failure(self, tmp_path: Path) -> None:
         """If executescript fails during open(), the conn is closed and _conn stays None."""
         store = _SimpleStore(tmp_path / 'broken.db')
