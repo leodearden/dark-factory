@@ -4950,6 +4950,8 @@ class TestParkStopTrip:
         await scheduler.set_task_status('1', 'blocked')
         await scheduler.set_task_status('2', 'blocked')
         await scheduler.set_task_status('3', 'blocked')
+        # Yield to the event loop so the ensure_future'd callback can execute.
+        await asyncio.sleep(0)
 
         assert len(callback_args) == 1, (
             f'Expected callback called once; got {len(callback_args)}'

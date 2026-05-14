@@ -776,9 +776,42 @@ class Scheduler:
     def _maybe_fire_park_stop_trip(self) -> None:
         """Check if the park-stop trip threshold is met and fire the callback.
 
-        Implemented fully in step-12; this stub satisfies the step-8 call site
-        so tests can pass without the full trip logic wired.
+        Guards (checked in order, earliest exit first):
+          1. Already paused — no re-trip.
+          2. park_stop_enabled=False — trip suppressed (but deque still records).
+          3. Callback not wired — no-op.
+          4. Count < threshold — not yet.
+
+        When all guards pass, formats a human-readable reason string, logs a
+        WARNING, and schedules the callback via asyncio.ensure_future() (we are
+        always inside an async context because set_task_status is an async
+        method).  Fire-and-forget so the status write is never delayed.
         """
+        if self._paused:
+            return
+        if not self.config.park_stop_enabled:
+            return
+        if self._on_park_stop_trip is None:
+            return
+        n = len(self._blocked_transitions)
+        threshold = self.config.park_stop_parked_threshold
+        if n < threshold:
+            return
+        window_hours = self.config.park_stop_parked_window_hours
+        reason = (
+            f'park-stop: {n} tasks transitioned to blocked within '
+            f'{window_hours}h (threshold={threshold})'
+        )
+        logger.warning('Park-stop trip: %s — pausing scheduler', reason)
+        try:
+            asyncio.ensure_future(self._on_park_stop_trip(reason))
+        except RuntimeError:
+            # No running event loop — should not happen in production since
+            # set_task_status is always called from an async context.  Log and
+            # skip rather than crashing the caller.
+            logger.warning(
+                'park-stop trip: no running event loop; callback not scheduled'
+            )
 
     def _record_blocked_transition(self) -> None:
         """Record a successful blocked transition in the rolling deque.
