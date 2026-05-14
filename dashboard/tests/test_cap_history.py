@@ -257,6 +257,18 @@ class TestReadCapIntervals:
         result = await read_cap_intervals([None, cap_conn, None], days=7)
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_days_zero_raises_value_error(self, cap_conn):
+        """days=0 must raise ValueError with message containing 'positive'."""
+        with pytest.raises(ValueError, match="positive"):
+            await read_cap_intervals([cap_conn], days=0)
+
+    @pytest.mark.asyncio
+    async def test_days_negative_raises_value_error(self, cap_conn):
+        """days=-1 must raise ValueError with message containing 'positive'."""
+        with pytest.raises(ValueError, match="positive"):
+            await read_cap_intervals([cap_conn], days=-1)
+
 
 # ---------------------------------------------------------------------------
 # Step-3 tests: merge_all_accounts_capped
