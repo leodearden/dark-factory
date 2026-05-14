@@ -7519,18 +7519,6 @@ class TestFormatSnapshotFact:
             project_id='dark_factory',
             counts={'total': 42, 'done': 18, 'blocked': 3, 'in_progress': 5},
         )
-        assert result.startswith('As of 2026-05-13'), (
-            f'Expected result to start with "As of 2026-05-13", got: {result!r}'
-        )
-        assert 'project dark_factory' in result, (
-            f'Expected "project dark_factory" in result, got: {result!r}'
-        )
-        assert '42 total' in result, f'Expected "42 total" in result, got: {result!r}'
-        assert '18 done' in result, f'Expected "18 done" in result, got: {result!r}'
-        assert '3 blocked' in result, f'Expected "3 blocked" in result, got: {result!r}'
-        assert '5 in_progress' in result, (
-            f'Expected "5 in_progress" in result, got: {result!r}'
-        )
         assert result == 'As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 5 in_progress, 42 total.', (
             f'Full canonical string mismatch, got: {result!r}'
         )

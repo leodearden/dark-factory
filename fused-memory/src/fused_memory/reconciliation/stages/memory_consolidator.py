@@ -446,7 +446,10 @@ def format_snapshot_fact(
             'Pass e.g. datetime(..., tzinfo=UTC).'
         )
     if not counts:
-        raise ValueError('format_snapshot_fact requires non-empty counts mapping')
+        raise ValueError(
+            'format_snapshot_fact requires non-empty counts mapping; '
+            'pass at least one label→count pair.'
+        )
     iso_date = as_of.date().isoformat()
     count_parts = ', '.join(
         f'{v} {k}' for k, v in sorted(counts.items())
