@@ -1257,7 +1257,7 @@ class TestIterAllEscalationPaths:
 class TestAttachDedupeChild:
     """EscalationQueue.attach_dedupe_child() — mutate a pending parent in place."""
 
-    def _make_infra_esc(self, esc_id: str, task_id: str = '1') -> 'Escalation':
+    def _make_infra_esc(self, esc_id: str, task_id: str = '1') -> Escalation:
         from escalation.models import Escalation
         return Escalation(
             id=esc_id,

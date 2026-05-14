@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
-import pytest
-
 
 class TestSummaryDedupeKey:
     """summary_dedupe_key() — pure helper, no I/O."""
@@ -112,7 +108,6 @@ class TestEscalationDedupeFields:
 
     def test_separate_instances_do_not_share_dedupe_children(self):
         """Two Escalation instances must NOT share the same dedupe_children list."""
-        from escalation.models import Escalation
         esc_a = self._make_min_escalation()
         esc_b = self._make_min_escalation()
         esc_a.dedupe_children.append('esc-2-1')
@@ -144,6 +139,7 @@ class TestFindDedupeParent:
     def test_matching_parent_returns_parent_id(self, tmp_path):
         """(a) Same category + first-3-words match within window -> returns parent id."""
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -163,6 +159,7 @@ class TestFindDedupeParent:
     def test_different_category_returns_none(self, tmp_path):
         """(b) Different category (risk_identified vs infra_issue) -> None."""
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -178,6 +175,7 @@ class TestFindDedupeParent:
     def test_different_summary_tokens_returns_none(self, tmp_path):
         """(c) Different first-3-words summary -> None."""
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -193,6 +191,7 @@ class TestFindDedupeParent:
     def test_outside_window_returns_none(self, tmp_path):
         """(d) candidate.timestamp - parent.timestamp > window_secs -> None."""
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -210,6 +209,7 @@ class TestFindDedupeParent:
     def test_resolved_parent_not_found(self, tmp_path):
         """(e) Already-resolved parent (in archive) -> None, since get_pending() skips archive."""
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -226,6 +226,7 @@ class TestFindDedupeParent:
     def test_cross_task_dedupe(self, tmp_path):
         """(f) Cross-task: parent has task_id='42', candidate has task_id='99' -> returns parent id."""
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 
@@ -245,8 +246,8 @@ class TestFindDedupeParent:
     def test_multiple_matching_returns_oldest(self, tmp_path):
         """(g) Multiple matching pending parents: returns the OLDEST by timestamp."""
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
-        from escalation.models import Escalation
         from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path / 'esc')
@@ -274,6 +275,7 @@ class TestFindDedupeParent:
         even with enabled=False, find_dedupe_parent still returns a match.
         """
         from datetime import UTC, datetime, timedelta
+
         from escalation.dedupe import DedupeConfig, find_dedupe_parent
         from escalation.queue import EscalationQueue
 

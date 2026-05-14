@@ -18,7 +18,6 @@ from escalation.dedupe import DedupeConfig
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

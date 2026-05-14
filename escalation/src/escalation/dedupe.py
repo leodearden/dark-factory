@@ -21,9 +21,8 @@ from __future__ import annotations
 
 __all__ = ['DedupeConfig', 'find_dedupe_parent', 'summary_dedupe_key']
 
-import re
 import string
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -76,8 +75,8 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
 
 
 def find_dedupe_parent(
-    queue: 'EscalationQueue',
-    candidate: 'Escalation',
+    queue: EscalationQueue,
+    candidate: Escalation,
     config: DedupeConfig,
     now: datetime | None = None,
 ) -> str | None:
