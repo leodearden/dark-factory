@@ -5553,6 +5553,125 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
         assert report.stats['stale_fixc_markers_swept'] == 0
 
 
+class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
+    """TaskKnowledgeSync.run() sets report.stats['stale_missing_run_id_markers'] after super().run()."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_run_id_markers_stat_set_after_run(self, mock_deps):
+        """run() injects stale_missing_run_id_markers into report.stats after super().run().
+
+        Verifies that markers with absent run_id are counted in the new stat and
+        that the combined stale sweep count (missing + mismatched) is still correct.
+        """
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # One current-cycle marker, one mismatched, and two with absent run_id
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+            SimpleNamespace(
+                id='mismatched', content='mismatched content',
+                metadata={'flag_for_stage2': True, 'task_id': '2', 'run_id': 'old-run'},
+            ),
+            SimpleNamespace(
+                id='missing-1', content='no run_id',
+                metadata={'flag_for_stage2': True, 'task_id': '3'},
+            ),
+            SimpleNamespace(
+                id='missing-2', content='empty run_id',
+                metadata={'flag_for_stage2': True, 'task_id': '4', 'run_id': ''},
+            ),
+        ]
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # 2 markers had absent/empty run_id
+        assert report.stats.get('stale_missing_run_id_markers') == 2
+        # Combined sweep: 1 mismatched + 2 missing = 3
+        assert report.stats.get('stale_fixc_markers_swept') == 3
+
+    @pytest.mark.asyncio
+    async def test_zero_missing_run_id_markers_stat_explicitly_set(self, mock_deps):
+        """When all markers have matching run_id, stale_missing_run_id_markers is 0 (explicitly set)."""
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # All markers have matching run_id → zero missing
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+        ]
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # Stat must be present and explicitly 0, not absent
+        assert 'stale_missing_run_id_markers' in report.stats
+        assert report.stats['stale_missing_run_id_markers'] == 0
+
+
 class TestStage3PayloadIncludesProjectRoot:
     """IntegrityCheck.assemble_payload() must emit a Use project_root="..." directive.
 
