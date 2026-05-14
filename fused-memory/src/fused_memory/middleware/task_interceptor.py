@@ -2325,6 +2325,9 @@ class TaskInterceptor:
             still pending and the UPDATE landed; ``False`` if a concurrent writer
             already terminalized it).
         """
+        # Both callers (_process_add_ticket and _process_add_tickets_batch_prepared)
+        # guard against _ticket_store being None before reaching this helper.
+        assert self._ticket_store is not None
         resolved = await asyncio.shield(
             self._ticket_store.mark_resolved(
                 ticket_id,
