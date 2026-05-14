@@ -343,6 +343,81 @@ def test_load_order_assertion_fires_on_deferred_tab_tasks(
         )
 
 
+# ---------------------------------------------------------------------------
+# Regression guard: tab_curator.jsx must load AFTER charts.jsx, shell.jsx,
+# data.js, and BEFORE app.jsx (synchronous classic script, no defer/async).
+# ---------------------------------------------------------------------------
+
+_TAB_CURATOR_PREFIX = '/static/redux/tab_curator.jsx'
+_CHARTS_PREFIX = '/static/redux/charts.jsx'
+_SHELL_PREFIX = '/static/redux/shell.jsx'
+_DATA_JS_PREFIX = '/static/redux/data.js'
+_APP_JSX_PREFIX = '/static/redux/app.jsx'
+
+
+def test_tab_curator_loads_before_app_jsx(index_html_body: str) -> None:
+    """tab_curator.jsx must appear in index.html as a classic synchronous script
+    and must load AFTER charts.jsx, shell.jsx, and data.js, and BEFORE app.jsx.
+
+    Uses the same _find_script_position helper and load-order checks as the
+    CDN/tab_tasks tests above.
+
+    * tab_curator.jsx depends on window.DF_CHARTS (StepSpark, Sparkline, PALETTE)
+      and window.DF_TABS (ChipList) and window.DF_SHELL (timeago), so those must
+      load first.
+    * app.jsx destructures window.DF_CURATOR, so tab_curator.jsx must load before
+      app.jsx.
+    """
+    curator_result = _find_script_position(index_html_body, _TAB_CURATOR_PREFIX)
+    assert curator_result is not None, (
+        f'No <script src="{_TAB_CURATOR_PREFIX}..."> tag found in index.html. '
+        f'Add tab_curator.jsx as a classic synchronous script between tab_tasks.jsx '
+        f'and app.jsx.'
+    )
+    curator_pos, curator_attrs = curator_result
+
+    # Must be a classic synchronous script — no defer, no async, no type=module
+    assert 'defer' not in curator_attrs, (
+        'tab_curator.jsx has a defer attribute; remove it — classic synchronous '
+        'script required so that window.DF_CURATOR is defined before app.jsx runs.'
+    )
+    assert 'async' not in curator_attrs, (
+        'tab_curator.jsx has an async attribute; remove it — classic synchronous '
+        'script required so that window.DF_CURATOR is defined before app.jsx runs.'
+    )
+    assert (curator_attrs.get('type') or '').lower() != 'module', (
+        'tab_curator.jsx has type="module"; ES modules are deferred by default — '
+        'use type="text/babel" (or no type) instead.'
+    )
+
+    # Load-order checks
+    for dep_prefix, dep_label in [
+        (_CHARTS_PREFIX, 'charts.jsx'),
+        (_SHELL_PREFIX, 'shell.jsx'),
+        (_DATA_JS_PREFIX, 'data.js'),
+    ]:
+        dep_result = _find_script_position(index_html_body, dep_prefix)
+        assert dep_result is not None, (
+            f'<script src="{dep_prefix}..."> not found in index.html.'
+        )
+        dep_pos, _ = dep_result
+        assert dep_pos < curator_pos, (
+            f'{dep_label} (position {dep_pos}) must load BEFORE tab_curator.jsx '
+            f'(position {curator_pos}) — tab_curator.jsx consumes globals from {dep_label}.'
+        )
+
+    app_result = _find_script_position(index_html_body, _APP_JSX_PREFIX)
+    assert app_result is not None, (
+        f'<script src="{_APP_JSX_PREFIX}..."> not found in index.html.'
+    )
+    app_pos, _ = app_result
+    assert curator_pos < app_pos, (
+        f'tab_curator.jsx (position {curator_pos}) must load BEFORE app.jsx '
+        f'(position {app_pos}) — app.jsx destructures window.DF_CURATOR which '
+        f'tab_curator.jsx defines.'
+    )
+
+
 def test_load_order_assertion_passes_for_classic_scripts() -> None:
     """_assert_cdn_loads_before_tab_tasks raises no exception when both scripts
     are classic synchronous scripts placed in the correct document order.
