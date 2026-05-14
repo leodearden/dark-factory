@@ -287,3 +287,46 @@ class TestSweeps:
         assert 'A' not in remaining
         assert 'B' in remaining
         assert 'C' in remaining
+
+
+class TestSeparateDB:
+    def test_override_survives_simulated_set_task_status_cycle(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression guard: override rows survive unrelated DB writes.
+
+        This test encodes the invariant that overrides live in a *separate*
+        SQLite file from taskmaster state.  If someone ever consolidates the
+        storage, this test will fail and force a conscious decision.
+        """
+        from orchestrator.overrides import OverrideRow, OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('proj', 'A', boost_tier='high', pinned=True)
+
+        # Simulate what set_task_status / a reify cycle does: create or
+        # overwrite an unrelated SQLite file in the same directory.
+        taskmaster_db = tmp_path / 'taskmaster.db'
+        import sqlite3
+
+        conn = sqlite3.connect(str(taskmaster_db))
+        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)')
+        conn.execute("INSERT INTO tasks VALUES ('A', 'in_progress')")
+        conn.commit()
+        conn.close()
+
+        # The override must still be intact.  Re-open from the same path to
+        # exercise the connect-per-call pattern rather than any cached state.
+        store2 = OverrideStore(db_path)
+        overrides = store2.get_overrides('proj')
+
+        assert 'A' in overrides
+        row = overrides['A']
+        assert row == OverrideRow(
+            boost_tier='high',
+            pinned=True,
+            pin_order=1,
+            reserve_now=False,
+            ttl_until=None,
+        )
