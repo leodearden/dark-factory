@@ -41,6 +41,7 @@ from fused_memory.middleware.path_scope_guard import (
     check_candidate_for_scope,
     check_text_for_scope,
 )
+from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
 from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 from fused_memory.middleware.task_curator import (
@@ -57,7 +58,6 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
-from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
