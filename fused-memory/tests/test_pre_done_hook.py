@@ -88,3 +88,18 @@ async def test_run_hook_includes_stderr_in_error(monkeypatch):
     assert result is not None
     assert 'my-failure-reason' in result['stderr']
     assert result['exit_code'] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_hook_substitutes_task_id_in_argv(monkeypatch, tmp_path):
+    """run_hook substitutes {id} with the actual task_id in each argv token."""
+    marker = tmp_path / 'got_id.txt'
+    # Script writes the value of $1 (the substituted task id) to a marker file
+    cmd = f"sh -c 'echo $1 > {marker}; exit 0' -- {{id}}"
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_TMP', cmd)
+    result = await run_hook('4242', '/tmp')
+    # Hook should succeed
+    assert result is None
+    # Marker file should contain the task_id
+    assert marker.exists(), 'Script did not write marker file'
+    assert marker.read_text().strip() == '4242'
