@@ -9,17 +9,16 @@ import asyncio
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
-from orchestrator.scheduler import Scheduler
 
 
 def _make_harness_with_mocks(tmp_path: Path) -> tuple[Harness, MagicMock, EventStore]:
@@ -86,6 +85,7 @@ class TestHarnessPauseScheduler:
         all_args = dict(zip(
             ['project_id', 'reason', 'pause_at_iso', 'set_by_run_id'],
             args,
+            strict=False,
         ))
         all_args.update(kwargs)
         assert all_args.get('reason') == 'test reason', (
