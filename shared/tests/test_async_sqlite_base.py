@@ -784,3 +784,44 @@ class TestSwapLeakGuard:
             await _swap_in_failing_close_mock(store, OSError('boom'))
             with pytest.raises(OSError):
                 await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Step-13: AsyncSqliteBase.checkpoint()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSqliteBaseCheckpoint:
+    """Tests for AsyncSqliteBase.checkpoint()."""
+
+    async def test_checkpoint_raises_when_not_opened(self, tmp_path: Path) -> None:
+        """checkpoint() raises RuntimeError('{ClassName} not opened') before open()."""
+        store = _SimpleStore(tmp_path / 'store.db')
+        with pytest.raises(RuntimeError, match='_SimpleStore not opened'):
+            await store.checkpoint()
+
+    async def test_checkpoint_returns_tuple_on_fresh_store(self, tmp_path: Path) -> None:
+        """checkpoint() returns tuple[int, int, int] with busy==0 on a fresh store."""
+        async with _SimpleStore(tmp_path / 'store.db') as store:
+            result = await store.checkpoint()
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        busy, log, checkpointed = result
+        assert busy == 0
+        # TRUNCATE moves all WAL frames into the main db; log == checkpointed
+        assert log == checkpointed
+
+    async def test_checkpoint_returns_nonzero_log_after_writes(self, tmp_path: Path) -> None:
+        """After inserting rows, checkpoint() returns (0, log, log) with log > 0."""
+        async with _SimpleStore(tmp_path / 'store.db') as store:
+            # Insert enough rows to populate WAL frames
+            for i in range(10):
+                await store._conn.execute(  # type: ignore[union-attr]
+                    "INSERT INTO items (name) VALUES (?)", (f'item-{i}',)
+                )
+            await store._conn.commit()  # type: ignore[union-attr]
+            busy, log, checkpointed = await store.checkpoint()
+        assert busy == 0
+        assert log > 0
+        assert log == checkpointed
