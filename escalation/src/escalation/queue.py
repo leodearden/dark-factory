@@ -356,7 +356,11 @@ class EscalationQueue:
             raise
 
     def dismiss_all_pending(self, resolution: str) -> int:
-        """Dismiss all pending escalations with the given resolution message.
+        """Dismiss all pending L0 escalations with the given resolution message.
+
+        Level-1 escalations are PRESERVED — they represent steward→human work
+        that must survive orchestrator restart and require human attention.
+        Only level-0 (agent→steward) escalations are dismissed.
 
         Returns the number of escalations where resolve() returned non-None.
         In the common single-writer case this equals the number actually dismissed.
@@ -368,7 +372,7 @@ class EscalationQueue:
         """
         pending = self.get_pending()
         count = 0
-        for esc in pending:
+        for esc in (e for e in pending if e.level != 1):
             try:
                 if self.resolve(esc.id, resolution, dismiss=True, resolved_by='auto-dismissed') is not None:
                     count += 1
