@@ -322,6 +322,110 @@ async def test_set_task_priority_override_re_pin_preserves_existing_pin_order(
 
 
 # ===========================================================================
+# set_task_priority_override — pinned=False clears pin_order (CASE WHEN)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_set_task_priority_override_pinned_false_clears_pin_order(
+    tmp_path, mcp_server, memory_service,
+):
+    """Calling set_task_priority_override(pinned=False) on a pinned row must
+    atomically zero ``pinned`` AND null ``pin_order``.
+
+    Regression for the contract-drift bug: a plain ``COALESCE(?, pin_order)``
+    in the UPSERT would leave a stale pin_order alongside pinned=0, violating
+    the structural invariant ``pinned=0 → pin_order IS NULL``.  The CASE WHEN
+    pattern at orchestrator/src/orchestrator/overrides.py:252-253 — which
+    this MCP tool claims to mirror — preserves the invariant.
+    """
+    # Pin a task first (auto-assigns pin_order=1).
+    r1 = await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'pinned': True},
+    )
+    assert 'error' not in r1
+
+    # Confirm baseline: pinned=1, pin_order=1.
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT pinned, pin_order FROM overrides '
+            'WHERE project_root=? AND task_id=?',
+            (str(tmp_path), '5'),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (1, 1)
+
+    # Now unpin via the same tool — pinned=False MUST null pin_order.
+    r2 = await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'pinned': False},
+    )
+    assert 'error' not in r2
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT pinned, pin_order FROM overrides '
+            'WHERE project_root=? AND task_id=?',
+            (str(tmp_path), '5'),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == 0, 'pinned must be cleared'
+    assert row[1] is None, (
+        'pin_order must be NULL after pinned=False; '
+        'structural invariant pinned=0 → pin_order IS NULL was violated'
+    )
+
+
+# ===========================================================================
+# set_task_priority_override — concurrency (BEGIN IMMEDIATE serialization)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_set_task_priority_override_concurrent_pins_no_collision(
+    tmp_path, mcp_server, memory_service,
+):
+    """Two concurrent pinning calls must serialize via BEGIN IMMEDIATE.
+
+    Without the autocommit + BEGIN IMMEDIATE pattern (mirrored from
+    orchestrator/src/orchestrator/overrides.py:188-195) two callers can both
+    read MAX(pin_order)=0 and both attempt to write pin_order=1, producing
+    either a pin_order_collision error or silent duplicate pin_orders.
+
+    This test pins the serialization contract: both calls succeed AND end
+    up with distinct pin_orders {1,2}.
+    """
+    import asyncio
+
+    async def _pin(tid: str):
+        return await mcp_server._tool_manager.call_tool(
+            'set_task_priority_override',
+            {'project_root': str(tmp_path), 'task_id': tid, 'pinned': True},
+        )
+
+    # Warm the schema synchronously so the two concurrent calls don't both
+    # race to executescript the CREATE TABLE.
+    await mcp_server._tool_manager.call_tool(
+        'get_pin_queue', {'project_root': str(tmp_path)},
+    )
+
+    results = await asyncio.gather(_pin('A'), _pin('B'))
+    for r in results:
+        assert 'error' not in r, f'concurrent pin failed: {r!r}'
+
+    orders = _pin_orders(tmp_path, ['A', 'B'])
+    assert set(orders.values()) == {1, 2}, (
+        f'expected distinct pin_orders {{1,2}}, got {orders!r}'
+    )
+
+
+# ===========================================================================
 # clear_task_priority_override
 # ===========================================================================
 
@@ -532,6 +636,64 @@ async def test_reorder_pin_queue_accepts_csv_string(
 
     _, audit_kwargs = memory_service.add_memory.call_args
     assert audit_kwargs['metadata']['ordered_task_ids'] == ['C', 'A', 'B']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dup_ids,expected_dups', [
+    (['A', 'A', 'B', 'C'], ['A']),
+    (['A', 'B', 'C', 'B'], ['B']),
+    (['A', 'A', 'B', 'B', 'C'], ['A', 'B']),
+])
+async def test_reorder_pin_queue_rejects_duplicate_ids(
+    tmp_path, mcp_server, memory_service, dup_ids, expected_dups,
+):
+    """Duplicate task ids in input return ValidationError BEFORE any rewrite.
+
+    Regression for the silent-corruption bug: ['A','A','B','C'] when the
+    current pin set is {'A','B','C'} would otherwise pass the set-equality
+    check and the UPDATE loop would run A→1, A→2, B→3, C→4 — silently
+    producing pin_orders that don't match the user's request.
+    Mirrors source-of-truth at orchestrator/src/orchestrator/overrides.py:352-355.
+    """
+    await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'reorder_pin_queue',
+        {'project_root': str(tmp_path), 'ordered_task_ids': dup_ids},
+    )
+    assert result.get('error_type') == 'ValidationError'
+    err = result.get('error', '')
+    assert 'duplicate' in err
+    # Each duplicated id must appear in the diagnostic.
+    for dup in expected_dups:
+        assert dup in err, f'duplicate {dup!r} missing from error: {err!r}'
+
+    # pin_orders unchanged — no rewrite happened.
+    orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
+    assert orders == {'A': 1, 'B': 2, 'C': 3}
+
+    memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reorder_pin_queue_rejects_csv_duplicates(
+    tmp_path, mcp_server, memory_service,
+):
+    """CSV input is also covered by the duplicate guard."""
+    await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'reorder_pin_queue',
+        {'project_root': str(tmp_path), 'ordered_task_ids': 'A, A, B, C'},
+    )
+    assert result.get('error_type') == 'ValidationError'
+    assert 'duplicate' in result.get('error', '')
+
+    orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
+    assert orders == {'A': 1, 'B': 2, 'C': 3}
+    memory_service.add_memory.assert_not_called()
 
 
 @pytest.mark.asyncio
