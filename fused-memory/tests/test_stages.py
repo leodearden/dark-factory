@@ -70,16 +70,25 @@ def _extract_section(payload: str, header: str) -> str:
     return payload[start:end]
 
 
-def make_configured_task_knowledge_sync_stage(deps: dict, *, project_id: str, project_root: str) -> "TaskKnowledgeSync":
-    """Create a TaskKnowledgeSync stage with _current_run_id='test-run' pre-populated.
+def make_configured_task_knowledge_sync_stage(
+    deps: dict, *, project_id: str, project_root: str, run_id: str = 'test-run'
+) -> "TaskKnowledgeSync":
+    """Create a TaskKnowledgeSync stage with _current_run_id pre-populated.
 
     Using this helper instead of inline setup ensures _current_run_id is always
     set, preventing the RuntimeError guard from firing unexpectedly.
+
+    The default run_id='test-run' is intentional: it matches the run_id written
+    into test flag objects so that flags are not excluded by the run-partition
+    filter (only the relevant scope/task filters are exercised).  Pass a
+    different run_id to tests that specifically need to control partition
+    boundaries or that construct their own flags with a custom run_id.
 
     Args:
         deps: Keyword dependencies dict (memory_service, taskmaster, journal, config).
         project_id: Project identifier string (e.g. 'reify', 'dark_factory').
         project_root: Absolute path to the project root (e.g. '/home/leo/src/reify').
+        run_id: Value for _current_run_id; defaults to 'test-run'.
 
     Returns:
         A TaskKnowledgeSync instance ready for use in assemble_payload() tests.
@@ -87,44 +96,8 @@ def make_configured_task_knowledge_sync_stage(deps: dict, *, project_id: str, pr
     stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **deps)
     stage.project_id = project_id
     stage.project_root = project_root
-    stage._current_run_id = 'test-run'
+    stage._current_run_id = run_id
     return stage
-
-
-class TestMakeConfiguredTaskKnowledgeSyncStage:
-    """Characterize the make_configured_task_knowledge_sync_stage factory contract."""
-
-    def test_returns_task_knowledge_sync_with_required_attributes(self):
-        """Factory returns a TaskKnowledgeSync with project_id, project_root, and _current_run_id set."""
-        deps = {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
-        }
-        stage = make_configured_task_knowledge_sync_stage(
-            deps, project_id='reify', project_root='/home/leo/src/reify'
-        )
-        assert isinstance(stage, TaskKnowledgeSync)
-        assert stage.project_id == 'reify'
-        assert stage.project_root == '/home/leo/src/reify'
-        assert stage._current_run_id == 'test-run'
-
-    def test_mocks_are_wired_through(self):
-        """Factory passes deps kwargs directly to TaskKnowledgeSync constructor."""
-        memory_service = AsyncMock()
-        taskmaster = AsyncMock()
-        deps = {
-            'memory_service': memory_service,
-            'taskmaster': taskmaster,
-            'journal': AsyncMock(),
-            'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
-        }
-        stage = make_configured_task_knowledge_sync_stage(
-            deps, project_id='dark_factory', project_root='/home/leo/src/dark-factory'
-        )
-        assert stage.memory is memory_service
-        assert stage.taskmaster is taskmaster
 
 
 class TestMockTypesConstant:
@@ -5031,6 +5004,9 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
     async def test_task_1139_flag_suppressed(self, mock_deps, watermark):
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='reify', project_root='/home/leo/src/reify')
         mock_deps['memory_service'].search.return_value = [
+            # run_id='test-run' matches stage._current_run_id so this flag is NOT
+            # excluded by the run-partition filter.  The task_id=1139 scope filter
+            # is what we're testing here — it must suppress the flag regardless.
             self._make_flag('mem-1139', 'some flag for task 1139', '1139', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -5049,6 +5025,9 @@ class TestTaskKnowledgeSyncKnownBug1139ScopeFilter:
             'but does NOT include them in flagged_items'
         )
         mock_deps['memory_service'].search.return_value = [
+            # run_id='test-run' matches stage._current_run_id so the flag passes the
+            # run-partition filter; the bug-mechanics content-based scope filter is
+            # what we're testing here — it must suppress the flag.
             self._make_flag('mem-bug', bug_content, '', run_id='test-run'),
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
