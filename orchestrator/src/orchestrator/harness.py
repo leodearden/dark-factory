@@ -2562,3 +2562,60 @@ Output JSON matching the schema. Every task must appear in the output.
             owner, reason,
         )
         return {'unhalted': True, 'prior_owner': owner, 'reason': reason}
+
+    # ------------------------------------------------------------------ #
+    # Scheduler park-and-stop pause (task 1322)                           #
+    # ------------------------------------------------------------------ #
+
+    async def pause_scheduler(self, reason: str) -> None:
+        """Pause the scheduler so acquire_next() returns None until resumed.
+
+        1. Delegates to ``scheduler.pause(reason)`` (idempotent in-memory state).
+        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort).
+        3. Emits ``EventType.scheduler_paused`` (best-effort).
+        4. Logs a WARNING so the operator sees it.
+
+        Called directly by sibling tasks (cost-ceiling 1323, EWA digest 1327)
+        and also wired as the callback for Scheduler's park-stop trip detector.
+        """
+        self.scheduler.pause(reason)
+        logger.warning('Scheduler paused: %s', reason)
+
+        if self._run_store and self._run_id:
+            try:
+                self._run_store.save_scheduler_pause(
+                    project_id=self.config.fused_memory.project_id,
+                    reason=reason,
+                    pause_at_iso=datetime.now(UTC).isoformat(),
+                    set_by_run_id=self._run_id,
+                )
+            except Exception:
+                logger.warning('pause_scheduler: failed to persist pause state', exc_info=True)
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.scheduler_paused,
+                data={'reason': reason},
+            )
+
+    async def resume_scheduler(self) -> None:
+        """Clear the scheduler pause so acquire_next() resumes dispatching.
+
+        1. Delegates to ``scheduler.resume()`` (idempotent).
+        2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
+        3. Emits ``EventType.scheduler_resumed`` (best-effort).
+        4. Logs INFO.
+        """
+        self.scheduler.resume()
+        logger.info('Scheduler resumed.')
+
+        if self._run_store:
+            try:
+                self._run_store.clear_scheduler_pause(
+                    self.config.fused_memory.project_id,
+                )
+            except Exception:
+                logger.warning('resume_scheduler: failed to clear persisted pause', exc_info=True)
+
+        if self.event_store:
+            self.event_store.emit(EventType.scheduler_resumed)
