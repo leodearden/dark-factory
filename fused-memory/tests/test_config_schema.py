@@ -59,6 +59,22 @@ class TestServerConfigTransport:
             ServerConfig(transport='grpc')  # type: ignore[arg-type]
 
 
+class TestServerConfigThreadWarnThreshold:
+    """Tests for ServerConfig.thread_warn_threshold field."""
+
+    def test_default_threshold_is_60(self):
+        config = ServerConfig()
+        assert config.thread_warn_threshold == 60
+
+    def test_explicit_override_accepted(self):
+        config = ServerConfig(thread_warn_threshold=120)
+        assert config.thread_warn_threshold == 120
+
+    def test_non_int_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            ServerConfig(thread_warn_threshold='not-an-int')  # type: ignore[arg-type]
+
+
 class TestLLMConfigProvider:
     """Tests for LLMConfig.provider Literal validation."""
 
