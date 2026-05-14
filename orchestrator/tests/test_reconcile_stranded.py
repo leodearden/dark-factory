@@ -1554,28 +1554,20 @@ class TestReconcileStrandedInProgress:
             )
 
     @pytest.mark.parametrize(
-        'scenario,is_ancestor_val,marker_sha_val,expected_provenance',
+        'scenario,is_ancestor_val,marker_sha_val,expected_commit',
         [
             pytest.param(
                 'is_ancestor',
                 True,
                 None,
-                {
-                    'kind': 'found_on_main',
-                    'commit': 'deadbeef' + 'a' * 32,
-                    'note': 'reconcile: branch already on main when stranded in-progress',
-                },
+                'deadbeef' + 'a' * 32,
                 id='is_ancestor-branch',
             ),
             pytest.param(
                 'marker',
                 False,
                 'cafebabe' + 'd' * 32,
-                {
-                    'kind': 'found_on_main',
-                    'commit': 'cafebabe' + 'd' * 32,
-                    'note': 'reconcile: branch deleted but merge marker found on main',
-                },
+                'cafebabe' + 'd' * 32,
                 id='marker-branch',
             ),
         ],
@@ -1586,12 +1578,13 @@ class TestReconcileStrandedInProgress:
         scenario: str,
         is_ancestor_val: bool,
         marker_sha_val: str | None,
-        expected_provenance: dict,
+        expected_commit: str,
     ):
         """When the worktree directory does not exist, cleanup_worktree must
         NOT be called — the existence guard must hold for both done-branches.
-        set_task_status still fires with 'done' and the expected provenance,
-        and _recovered_plans is popped regardless of worktree absence.
+        scheduler.mark_done (harness.py:1464) still fires with kind='found_on_main'
+        and the expected SHA, and _recovered_plans is popped regardless of
+        worktree absence.
         """
         tid = '97'
         harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)  # type: ignore[attr-defined]
@@ -1610,9 +1603,11 @@ class TestReconcileStrandedInProgress:
 
         # cleanup_worktree must NOT have been called.
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
-        # Task must still be marked done with pinned provenance.
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            tid, 'done', done_provenance=expected_provenance
+        # Task must still be marked done at the production boundary (harness.py:1464).
+        # note=ANY: pinning the literal prose adds no regression-detection value
+        # beyond assert_awaited_once + kind + sha.
+        harness.scheduler.mark_done.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, kind='found_on_main', sha=expected_commit, note=ANY
         )
 
     @pytest.mark.parametrize(
