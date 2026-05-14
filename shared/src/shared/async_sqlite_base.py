@@ -12,11 +12,26 @@ import abc
 import asyncio
 import contextlib
 from pathlib import Path
-from typing import Self
+from typing import NamedTuple, Self
 
 import aiosqlite
 
-__all__ = ['apply_wal_pragmas', 'apply_full_durability_pragmas', 'AsyncSqliteBase']
+__all__ = ['apply_wal_pragmas', 'apply_full_durability_pragmas', 'CheckpointResult', 'AsyncSqliteBase']
+
+
+class CheckpointResult(NamedTuple):
+    """Result of a ``PRAGMA wal_checkpoint(TRUNCATE)`` call.
+
+    Attributes:
+        busy: 1 if one or more WAL frames could not be checkpointed because they
+            are in use by a reader, 0 otherwise.
+        log: Total number of frames in the WAL file.
+        checkpointed: Total number of frames that were successfully checkpointed.
+    """
+
+    busy: int
+    log: int
+    checkpointed: int
 
 
 async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int) -> None:
@@ -44,6 +59,16 @@ async def apply_full_durability_pragmas(conn: aiosqlite.Connection, *, busy_time
     Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then sets the
     three additional PRAGMAs that harden crash durability across all
     fused-memory SQLite stores:
+
+    - ``synchronous=FULL`` (2): fsync per-commit; eliminates corruption on
+      unexpected shutdown without relying on WAL-checkpoint timing.
+    - ``wal_autocheckpoint=100``: auto-checkpoint after every 100 WAL pages to
+      bound WAL growth under normal load.
+    - ``journal_size_limit=67108864`` (64 MiB): caps the WAL file size to
+      prevent unbounded disk use during high-write bursts.
+
+    See ``docs/task-recovery-2026-05-13/`` for the production incident that
+    drove this convention across all fused-memory SQLite stores.
 
     Args:
         conn: An open aiosqlite connection.
@@ -144,24 +169,25 @@ class AsyncSqliteBase(abc.ABC):
             raise RuntimeError(f'{type(self).__name__} not opened')
         return self._conn
 
-    async def checkpoint(self) -> tuple[int, int, int]:
-        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
-        checkpointed)``.
+    async def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return the result.
 
         Returns:
-            A 3-tuple ``(busy, log, checkpointed)`` where:
+            A :class:`CheckpointResult` named-tuple ``(busy, log, checkpointed)`` where:
+
             - ``busy``: 1 if one or more frames could not be checkpointed because
               they are in use by a reader, 0 otherwise.
             - ``log``: total number of frames in the WAL file.
             - ``checkpointed``: total number of checkpointed frames.
-            Returns ``(-1, -1, -1)`` if the PRAGMA returns no rows.
 
         Raises:
             RuntimeError: If the store has not been opened.
+            RuntimeError: If ``PRAGMA wal_checkpoint(TRUNCATE)`` returns no rows
+                (unexpected; SQLite always returns a row for this pragma).
         """
         conn = self._require_conn()
-        cursor = await conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
+        async with conn.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cursor:
+            row = await cursor.fetchone()
         if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))

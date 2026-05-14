@@ -2,6 +2,7 @@
 
 from shared.async_sqlite_base import (
     AsyncSqliteBase,
+    CheckpointResult,
     apply_full_durability_pragmas,
     apply_wal_pragmas,
 )
@@ -25,6 +26,7 @@ __version__ = '0.1.0'
 
 __all__ = [
     'AsyncSqliteBase',
+    'CheckpointResult',
     'apply_wal_pragmas',
     'apply_full_durability_pragmas',
     'CAP_HIT_RESUME_PROMPT',
