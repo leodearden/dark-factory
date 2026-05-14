@@ -107,7 +107,7 @@ class OverrideStore:
         self._ensure_schema()
 
     @classmethod
-    def from_config(cls, config: OrchestratorConfig) -> "OverrideStore":
+    def from_config(cls, config: OrchestratorConfig) -> OverrideStore:
         """Build the canonical OverrideStore for *config*.
 
         Centralizes the "OverrideStore for this config" contract so Harness,
