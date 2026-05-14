@@ -125,7 +125,7 @@ function QueueRow({ ticket, onCancel }) {
 }
 
 // ── Main CuratorTab component ──
-function CuratorTab({ projectFilter }) {
+function CuratorTab({ projectFilter = [] }) {
   const cs = D.CURATOR_STATE || {};
   const { pending = [], latency_spark, capped_spark, state = {} } = cs;
   const { capped_now = 0, paused_reason = null, pending_total = 0 } = state;
