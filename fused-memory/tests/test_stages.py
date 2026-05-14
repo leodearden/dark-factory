@@ -7799,23 +7799,45 @@ class TestStage2HintConversionDetection:
         )
 
     @pytest.mark.asyncio
-    async def test_hint_section_capped_to_format_filtered_task_tree_cap(
+    async def test_hint_section_slice_then_filter_excludes_qualifying_tasks_past_cap(
         self, mock_deps, watermark
     ):
-        """hint section must not reference task IDs absent from the Active Task Tree.
+        """Discriminator test: slice-then-filter must produce exactly 10 hint tasks,
+        not 20 as filter-then-slice would.
 
-        Both sections are capped at 50 active tasks.  Tasks at positions 51-60
-        must appear in neither section — the hint section must slice candidates
-        to the same 50-task window rendered by format_filtered_task_tree
-        (slice-then-filter, not filter-then-slice).
+        Input: 60 tasks (IDs 1..60, status='pending').
+          - Positions 1..40: dict-format hints  → NON-qualifying (already converted)
+          - Positions 41..60: list-format hints → qualifying (need conversion)
+
+        slice-then-filter (correct):
+          slice to positions 1..50, then filter → positions 41..50 qualify → 10 tasks.
+
+        filter-then-slice (wrong ordering):
+          filter first → positions 41..60 qualify → 20 tasks, then slice → all 20.
+
+        Assertions pin the slice-then-filter outcome unambiguously:
+          (a) IDs 41..50 are present   — the qualifying tasks inside the cap
+          (b) IDs 51..60 are absent    — qualifying tasks OUTSIDE the cap
+          (c) IDs 1..40 are absent     — non-qualifying tasks
+          (d) exact count == 10        — distinguishes from filter-then-slice (count=20)
         """
-        # Build 60 tasks with list-format hints (ids 1..60, all 'pending').
+        import re as _re
+
+        # Positions 1..40: dict-format hints (non-qualifying via _needs_hint_conversion)
         tasks = [
+            self._make_task_with_hints(
+                i, 'pending', {'entities': [f'E{i}'], 'queries': ['q']}
+            )
+            for i in range(1, 41)
+        ]
+        # Positions 41..60: list-format hints (qualifying)
+        tasks += [
             self._make_task_with_hints(
                 i, 'pending', [{'entity': f'E{i}', 'query': 'q'}]
             )
-            for i in range(1, 61)
+            for i in range(41, 61)
         ]
+
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='test_project', project_root='/tmp/test_project'
         )
@@ -7824,28 +7846,37 @@ class TestStage2HintConversionDetection:
         payload = await stage.assemble_payload([], watermark, [])
 
         hint_section = _extract_section(payload, self._SECTION_HEADER)
-        active_section = _extract_section(payload, '### Active Task Tree')
 
-        # Tasks 1..50 must appear in BOTH sections.
-        for tid in (1, 25, 50):
+        # (a) IDs 41..50 must be present (qualifying, inside the 50-task cap).
+        for tid in range(41, 51):
             assert f'[{tid}]' in hint_section, (
-                f'Task {tid} (position <={50}) must appear in hint section.\n'
+                f'Task {tid} (qualifying, position <= 50) must appear in hint section.\n'
                 f'Hint section: {hint_section!r}'
-            )
-            assert f'[{tid}]' in active_section, (
-                f'Task {tid} must appear in Active Task Tree section.'
             )
 
-        # Tasks 51..60 must appear in NEITHER section.
-        for tid in (51, 55, 60):
+        # (b) IDs 51..60 must be absent (qualifying, but outside the 50-task cap).
+        for tid in range(51, 61):
             assert f'[{tid}]' not in hint_section, (
-                f'Task {tid} (position >{50}) must NOT appear in hint section '
-                f'(slice-then-filter parity with Active Task Tree).\n'
+                f'Task {tid} (qualifying, position > 50) must NOT appear in hint section '
+                f'(slice-then-filter: cap applied before filter).\n'
                 f'Hint section: {hint_section!r}'
             )
-            assert f'[{tid}]' not in active_section, (
-                f'Task {tid} must NOT appear in Active Task Tree section.'
+
+        # (c) IDs 1..40 must be absent (non-qualifying dict-format hints).
+        for tid in range(1, 41):
+            assert f'[{tid}]' not in hint_section, (
+                f'Task {tid} (non-qualifying dict hints) must NOT appear in hint section.\n'
+                f'Hint section: {hint_section!r}'
             )
+
+        # (d) Exact count == 10 distinguishes slice-then-filter (10) from
+        #     filter-then-slice (20).
+        count = len(_re.findall(r'^- \[\d+\] ', hint_section, _re.MULTILINE))
+        assert count == 10, (
+            f'Expected exactly 10 hint tasks (positions 41-50), got {count}.\n'
+            f'filter-then-slice would produce 20; slice-then-filter produces 10.\n'
+            f'Hint section: {hint_section!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_hint_section_subset_of_active_tree_under_max_chars_clamp(
