@@ -1086,3 +1086,82 @@ async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(
         f"Expected at least one WARNING containing both '{root_str}' and "
         f"'http://localhost:18765', got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-7 (task-1280): long-running open-ended cap is subtracted (days=7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_long_running_open_ended_cap_overlap_subtracted(
+    tmp_path: Path, config
+):
+    """A 2-day-old open-ended cap should be included after bumping lookback to days=7.
+
+    Setup: cap_hit 2 days ago, no resumed (open-ended). One ticket that ran
+    for 60 seconds entirely inside the open-ended cap window.
+
+    With days=1 (current): SQL cutoff filters out the 2-day-old cap_hit →
+    intervals=[], capped_windows=[], overlap=0, active_ms=60_000.
+    With days=7 (target): cap_hit is within the window → full 60_000ms
+    overlap is subtracted → p50_active_ms == 0.
+
+    Failing baseline: _sample_curator calls read_cap_intervals(days=1),
+    so the 2-day-old cap_hit is excluded → p50_active_ms == 60_000.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    # runs.db: open-ended cap 2 days ago
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    cap_start = now - timedelta(days=2)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc1', 'cap_hit', cap_start.isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    # tickets.db: one 60s ticket fully inside the open-ended cap window
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    ticket_start = now - timedelta(minutes=5)
+    ticket_end = now - timedelta(minutes=4)
+    conn_sync.execute(
+        'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
+        ('t1', 'proj', 'created', ticket_start.isoformat(), ticket_end.isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = _ListTicketsHandler(count=0)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            result = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    # With days=7: cap_hit is within window → 60s ticket fully capped → p50=0
+    assert result['p50_active_ms'] == 0, (
+        f"Expected p50_active_ms=0 (cap subtracted full 60s), got {result['p50_active_ms']}. "
+        "This fails if _sample_curator uses days=1 (excludes 2-day-old cap_hit)."
+    )
+    assert result['capped_now'] == 1, (
+        f"Expected capped_now=1 (open-ended interval), got {result['capped_now']}"
+    )
