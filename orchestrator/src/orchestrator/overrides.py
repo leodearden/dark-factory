@@ -162,75 +162,82 @@ class OverrideStore:
         now_iso = datetime.now(UTC).isoformat()
         conn = sqlite3.connect(str(self.db_path))
         try:
-            # Resolve auto-assigned pin_order when pinning without an explicit order.
-            if pinned is True and pin_order is None:
-                # If this task is already pinned, preserve its existing pin_order
-                # so that re-pinning (e.g. set_override(pinned=True, boost_tier='high'))
-                # is idempotent with respect to queue position.  Without this
-                # guard the MAX query would include the task's OWN row and produce
-                # MAX+1, silently shifting an already-pinned task to the back.
-                already_pinned = conn.execute(
-                    'SELECT pin_order FROM overrides '
-                    'WHERE project_root=? AND task_id=? AND pinned=1',
-                    (project_root, task_id),
-                ).fetchone()
-                if already_pinned is not None:
-                    pin_order = already_pinned[0]  # preserve; no re-assignment
-                else:
-                    row = conn.execute(
-                        'SELECT COALESCE(MAX(pin_order), 0) + 1 '
-                        'FROM overrides WHERE project_root=? AND pinned=1',
-                        (project_root,),
+            # Acquire a write lock up-front (IMMEDIATE) so that the MAX(pin_order)
+            # read and the subsequent UPSERT are serialized with respect to
+            # concurrent set_override calls.  Without this, two concurrent
+            # callers can both read MAX=N and both attempt to write N+1, causing
+            # a PinOrderCollision or silent duplicate pin_order values.
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+
+                # Resolve auto-assigned pin_order when pinning without an explicit order.
+                if pinned is True and pin_order is None:
+                    # If this task is already pinned, preserve its existing pin_order
+                    # so that re-pinning (e.g. set_override(pinned=True, boost_tier='high'))
+                    # is idempotent with respect to queue position.  Without this
+                    # guard the MAX query would include the task's OWN row and produce
+                    # MAX+1, silently shifting an already-pinned task to the back.
+                    already_pinned = conn.execute(
+                        'SELECT pin_order FROM overrides '
+                        'WHERE project_root=? AND task_id=? AND pinned=1',
+                        (project_root, task_id),
                     ).fetchone()
-                    pin_order = row[0]
+                    if already_pinned is not None:
+                        pin_order = already_pinned[0]  # preserve; no re-assignment
+                    else:
+                        row = conn.execute(
+                            'SELECT COALESCE(MAX(pin_order), 0) + 1 '
+                            'FROM overrides WHERE project_root=? AND pinned=1',
+                            (project_root,),
+                        ).fetchone()
+                        pin_order = row[0]
 
-            # Collision check for explicit or auto-assigned pin_order.
-            if pin_order is not None:
-                existing = conn.execute(
-                    'SELECT task_id FROM overrides '
-                    'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
-                    (project_root, pin_order, task_id),
-                ).fetchone()
-                if existing:
-                    raise PinOrderCollision(
-                        f'pin_order={pin_order} already in use by task '
-                        f'{existing[0]}; cannot pin task {task_id}'
-                    )
+                # Collision check for explicit or auto-assigned pin_order.
+                if pin_order is not None:
+                    existing = conn.execute(
+                        'SELECT task_id FROM overrides '
+                        'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
+                        (project_root, pin_order, task_id),
+                    ).fetchone()
+                    if existing:
+                        raise PinOrderCollision(
+                            f'pin_order={pin_order} already in use by task '
+                            f'{existing[0]}; cannot pin task {task_id}'
+                        )
 
-            # Convert Python types to SQLite-friendly values.
-            pinned_int = int(pinned) if pinned is not None else None
-            reserve_now_int = int(reserve_now) if reserve_now is not None else None
-            ttl_iso = ttl_until.astimezone(UTC).isoformat() if ttl_until is not None else None
+                # Convert Python types to SQLite-friendly values.
+                pinned_int = int(pinned) if pinned is not None else None
+                reserve_now_int = int(reserve_now) if reserve_now is not None else None
+                ttl_iso = ttl_until.astimezone(UTC).isoformat() if ttl_until is not None else None
 
-            conn.execute(
-                """
-                INSERT INTO overrides
-                    (project_root, task_id, boost_tier, pinned, pin_order,
-                     reserve_now, ttl_until, created_at, updated_at)
-                VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
-                ON CONFLICT(project_root, task_id) DO UPDATE SET
-                    boost_tier  = COALESCE(?, boost_tier),
-                    pinned      = COALESCE(?, pinned),
-                    pin_order   = CASE WHEN ?=0 THEN NULL
-                                       ELSE COALESCE(?, pin_order) END,
-                    reserve_now = COALESCE(?, reserve_now),
-                    ttl_until   = COALESCE(?, ttl_until),
-                    updated_at  = ?
-                """,
-                (
-                    # INSERT values
-                    project_root, task_id,
-                    boost_tier, pinned_int, pin_order,
-                    reserve_now_int, ttl_iso,
-                    now_iso, now_iso,
-                    # UPDATE SET values
-                    boost_tier, pinned_int,
-                    pinned_int, pin_order,   # CASE WHEN pinned_int=0 THEN NULL ELSE COALESCE(pin_order, pin_order)
-                    reserve_now_int, ttl_iso,
-                    now_iso,
-                ),
-            )
-            conn.commit()
+                conn.execute(
+                    """
+                    INSERT INTO overrides
+                        (project_root, task_id, boost_tier, pinned, pin_order,
+                         reserve_now, ttl_until, created_at, updated_at)
+                    VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                    ON CONFLICT(project_root, task_id) DO UPDATE SET
+                        boost_tier  = COALESCE(?, boost_tier),
+                        pinned      = COALESCE(?, pinned),
+                        pin_order   = CASE WHEN ?=0 THEN NULL
+                                           ELSE COALESCE(?, pin_order) END,
+                        reserve_now = COALESCE(?, reserve_now),
+                        ttl_until   = COALESCE(?, ttl_until),
+                        updated_at  = ?
+                    """,
+                    (
+                        # INSERT values
+                        project_root, task_id,
+                        boost_tier, pinned_int, pin_order,
+                        reserve_now_int, ttl_iso,
+                        now_iso, now_iso,
+                        # UPDATE SET values
+                        boost_tier, pinned_int,
+                        pinned_int, pin_order,   # CASE WHEN pinned_int=0 THEN NULL ELSE COALESCE(pin_order, pin_order)
+                        reserve_now_int, ttl_iso,
+                        now_iso,
+                    ),
+                )
         finally:
             conn.close()
 
