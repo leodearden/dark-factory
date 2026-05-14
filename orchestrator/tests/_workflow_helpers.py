@@ -75,7 +75,9 @@ class FakeScheduler:
     async def get_task(self, task_id: str) -> dict | None:
         return self.task_data.get(task_id)
 
-    async def update_task(self, task_id: str, metadata: str | dict) -> bool:
+    async def update_task(
+        self, task_id: str, metadata: str | dict, *, append: bool = False,
+    ) -> bool:
         return True
 
     async def dispatch_tool(
