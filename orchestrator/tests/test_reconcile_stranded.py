@@ -1274,6 +1274,58 @@ class TestReconcileStrandedInProgress:
             },
         )
 
+    @pytest.mark.parametrize(
+        'status,expected_note',
+        [
+            pytest.param(
+                'in-progress',
+                'reconcile: branch deleted but merge marker found on main',
+                id='in-progress',
+            ),
+            pytest.param(
+                'blocked',
+                'reconcile: merge marker found on main while task was blocked',
+                id='blocked',
+            ),
+        ],
+    )
+    async def test_marker_accepted_when_marker_postdates_branch_base_sha_parametrized(
+        self, harness: Harness, status: str, expected_note: str,
+    ):
+        """Stale-marker accept path: marker postdates base → flip to done with status-aware note.
+
+        Exercises the status-aware note conditional at harness.py:1323-1327:
+          - status == 'blocked' → 'reconcile: merge marker found on main while task was blocked'
+          - any other status (here 'in-progress') → 'reconcile: branch deleted but merge marker found on main'
+
+        The expected_note for the blocked arm is the verbatim f-string output and is
+        pinned to catch regressions in the conditional.  The in-progress arm pins
+        the fixed else-branch string.
+        """
+        marker_sha = 'cafebabe' + 'd' * 32
+        branch_base = 'beef0000' + '9' * 32
+        tid = '81'
+        # First is_ancestor: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor: stale-marker check → False (marker postdates base)
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, False])
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({tid: status}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Marker is from this incarnation — must flip to done with the status-appropriate note
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': marker_sha,
+                'note': expected_note,
+            },
+        )
+
     async def test_marker_falls_through_when_branch_base_sha_missing(
         self, harness: Harness
     ):
