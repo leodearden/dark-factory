@@ -986,9 +986,9 @@ async def test_fan_out_list_tickets_warns_when_count_at_limit(tmp_path: Path, ca
     mock_mcp = AsyncMock(return_value={'count': 2000, 'tickets': [], 'project_id': 'p'})
     transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
 
-    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
-        with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
-            async with httpx.AsyncClient(transport=transport) as http_client:
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'), \
+         patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
                 tickets, pending_total = await fan_out_list_tickets(
                     http_client, cfg, limit=2000,
                 )
