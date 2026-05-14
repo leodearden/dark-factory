@@ -21,7 +21,8 @@ All interval bounds use **half-open semantics**: ``[start, end)`` — the start
 instant is included, the end instant is excluded.  An ``end=None`` interval
 extends indefinitely (equivalent to ``[start, ∞)``).  This convention is
 applied consistently in :func:`merge_all_accounts_capped` (sweep events at
-equal timestamps are processed as ends-before-starts) and
+equal timestamps are processed as starts-before-ends, with zero-width merged
+windows filtered out) and
 :func:`bucketise_cap_sparkline` (right-edge sampling uses ``right_edge < end``).
 """
 
