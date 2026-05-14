@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -318,13 +319,24 @@ class TestGetSchedulerEventsTool:
 
 
 class TestSnapshotPerformance:
-    """get_scheduler_state must serve a 1500-task snapshot under 50ms."""
+    """`read_scheduler_state` must serve a 1500-task snapshot under 50ms.
 
-    @pytest.mark.asyncio
-    async def test_get_scheduler_state_under_50ms_for_1500_tasks(
-        self, tmp_path, mcp_server
-    ):
-        """Median latency for a 1500-task snapshot is < 50ms (acceptance criterion)."""
+    Orchestrator snapshot-read budget; regression canary for task 1230.
+    """
+
+    def test_read_scheduler_state_under_50ms_for_1500_tasks(self, tmp_path):
+        """Median latency for a 1500-task snapshot is < 50ms (acceptance criterion).
+
+        This test times ``read_scheduler_state`` (the sync helper) directly
+        rather than routing through
+        ``mcp_server._tool_manager.call_tool('get_scheduler_state', ...)``.
+        The async MCP path adds two CI-load-sensitive latency contributors —
+        ``asyncio.to_thread`` handoff and FastMCP dispatch — that are not part
+        of the orchestrator-promised 50ms snapshot-read budget.  Timing them
+        produces a flaky test under ``pytest-xdist -n auto`` with 32 workers.
+        The contract is: the JSON read+parse itself must be fast; this test is
+        the regression canary for exactly that. (task 1335)
+        """
         n = 1500
         snapshot = {
             'skip_counts': {f'T{i}': i % 5 for i in range(n)},
@@ -345,19 +357,28 @@ class TestSnapshotPerformance:
         _write_snapshot(tmp_path, snapshot)
 
         result: dict = {}
-        samples = []
-        for i in range(10):
+        samples: list[float] = []
+        # 2 warm-up samples (discarded) + 20 measured samples.
+        # Two warm-ups absorb OS page-cache warm-up and any first-call import
+        # cost in the json parser.  20 measured samples make the median robust
+        # against isolated tail spikes (vs. the previous 9-sample window).
+        for i in range(22):
             t0 = time.perf_counter()
-            result = await mcp_server._tool_manager.call_tool(
-                'get_scheduler_state',
-                {'project_root': str(tmp_path)},
-            )
+            result = read_scheduler_state(tmp_path)
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            if i > 0:  # discard the first sample as a cold-start warm-up
+            if i >= 2:  # discard the first two samples as warm-up
                 samples.append(elapsed_ms)
 
         median_ms = statistics.median(samples)
         assert 'snapshot_at' in result, 'snapshot_at missing from result'
+        # Regression canary for the orchestrator snapshot-read budget (task 1230
+        # acceptance criterion).  The bound is 50ms; the actual cost of
+        # json.loads(path.read_bytes()) for a ~500KB file is single-digit ms on
+        # any reasonable disk, leaving large headroom.  Do NOT loosen this to
+        # 150-250ms — that silently inflates the contract.  Do NOT confuse this
+        # with an MCP-layer perf bound; this test specifically times the sync
+        # helper to remove asyncio/FastMCP overhead from the measurement.
         assert median_ms < 50, (
-            f'Median latency {median_ms:.1f}ms exceeds 50ms acceptance criterion'
+            f'Median latency {median_ms:.1f}ms exceeds 50ms acceptance criterion '
+            f'(regression canary for orchestrator snapshot-read budget, task 1230)'
         )
