@@ -58,6 +58,8 @@ logger = logging.getLogger(__name__)
 def _module_contention_counts(
     rows: list[dict],
     current_holders: dict[str, str],
+    *,
+    project: str | None = None,
 ) -> list[dict]:
     """Build a sorted module-contention list from task rows and current holders.
 
@@ -67,29 +69,40 @@ def _module_contention_counts(
     Args:
         rows:            Task row dicts, each with ``task_id`` and ``lock_set``.
         current_holders: ``{module_path: task_id}`` from the scheduler snapshot.
+        project:         Optional project label to tag each module entry with.
+                         Module paths are NOT globally unique (two projects can
+                         each have ``src/utils.py``), so we propagate the
+                         owning project label on every module so the merge
+                         step can key by ``(project, path)`` without conflating
+                         unrelated contention.  When set and a holder exists,
+                         ``holder_project`` is also populated — the snapshot's
+                         ``current_holders`` map only contains task_ids from
+                         the same project root.
 
     Returns:
-        ``[{path, holder, contention}, ...]`` sorted by contention descending,
-        ties broken alphabetically by path.  Each entry's ``holder`` is the
-        task_id string from *current_holders*, or ``None`` if no task currently
-        holds that module.
+        ``[{path, holder, contention, project, holder_project}, ...]`` sorted
+        by contention descending, ties broken alphabetically by path.  Each
+        entry's ``holder`` is the task_id string from *current_holders*, or
+        ``None`` if no task currently holds that module.
     """
     counts: dict[str, int] = {}
     for row in rows:
         for path in row.get('lock_set') or []:
             counts[path] = counts.get(path, 0) + 1
 
-    return sorted(
-        [
-            {
-                'path': path,
-                'holder': current_holders.get(path),
-                'contention': count,
-            }
-            for path, count in counts.items()
-        ],
-        key=lambda m: (-m['contention'], m['path']),
-    )
+    result: list[dict] = []
+    for path, count in counts.items():
+        holder = current_holders.get(path)
+        result.append({
+            'path': path,
+            'holder': holder,
+            'contention': count,
+            # `project` scopes this module entry; `holder_project` qualifies
+            # the holder task_id since taskmaster ids are project-scoped.
+            'project': project,
+            'holder_project': project if holder else None,
+        })
+    return sorted(result, key=lambda m: (-m['contention'], m['path']))
 
 
 def _compose_rows(
@@ -377,14 +390,28 @@ async def collect_scheduler_state(
         rows = _compose_rows(enriched, snapshot)
         all_rows.extend(rows)
 
-        # Module contention from composed rows + snapshot holders
+        # Module contention from composed rows + snapshot holders.
+        # Tag each module with the owning `project` so _merge_module_lists can
+        # key by (project, path) — two projects sharing the same file path
+        # (e.g. `src/utils.py`) must not collide into a single heatmap column.
         current_holders: dict[str, str] = snapshot.get('current_holders') or {}
-        modules = _module_contention_counts(rows, current_holders)
+        modules = _module_contention_counts(rows, current_holders, project=label)
         all_modules = _merge_module_lists(all_modules, modules)
 
-        # Pin queue
+        # Pin queue — tag every pin entry with project/project_root before
+        # extending.  Taskmaster task_ids are project-scoped, so the same
+        # numeric id can appear in two projects' pin queues; without these
+        # fields the React strip would collapse rows under a duplicate key
+        # and the per-project reorder call would be ambiguous.
         pin_queue_raw = snapshot.get('pin_queue') or []
-        all_pin_queue.extend(pin_queue_raw)
+        for pin in pin_queue_raw:
+            if not isinstance(pin, dict):
+                continue
+            all_pin_queue.append({
+                **pin,
+                'project': label,
+                'project_root': str(root),
+            })
 
         # Per-task event sparklines — keyed by composite '{label}/{tid}' to
         # avoid silent overwrite when the same numeric task_id appears in two
@@ -407,15 +434,29 @@ def _merge_module_lists(
 ) -> list[dict]:
     """Merge two module-contention lists, summing contention counts.
 
+    Modules are keyed by ``(project, path)`` rather than ``path`` alone — two
+    different project roots can both contain a file with the same relative
+    path (e.g. ``src/utils.py``) and their contention must remain distinct,
+    otherwise the heatmap would conflate unrelated locks and the holder
+    task_id (project-scoped) would point at a phantom row.
+
+    When the same ``(project, path)`` key appears twice (single project
+    aggregation), counts sum and a later holder wins.
+
     Returns a new sorted list: contention desc, path asc.
     """
-    merged: dict[str, dict] = {}
+    merged: dict[tuple[str | None, str], dict] = {}
     for m in existing + incoming:
-        path = m['path']
-        if path in merged:
-            merged[path]['contention'] += m['contention']
+        key = (m.get('project'), m['path'])
+        if key in merged:
+            merged[key]['contention'] += m['contention']
             if m.get('holder'):
-                merged[path]['holder'] = m['holder']
+                merged[key]['holder'] = m['holder']
+                # holder_project must travel with holder so the React side
+                # can build the composite ${holder_project}/${holder} key
+                # used to look up sparklines and joined row metadata.
+                if m.get('holder_project'):
+                    merged[key]['holder_project'] = m['holder_project']
         else:
-            merged[path] = dict(m)
+            merged[key] = dict(m)
     return sorted(merged.values(), key=lambda m: (-m['contention'], m['path']))

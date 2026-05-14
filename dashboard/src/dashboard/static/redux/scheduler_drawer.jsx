@@ -36,10 +36,17 @@ function p50WaitSeconds(spark) {
 }
 
 // Derive which modules are currently blocking this task.
-// A module blocks this task when: it is in the task's lock_set AND it has a holder.
+// A module blocks this task when: it is in the task's lock_set AND it has a
+// holder.  Modules are project-scoped — a same-named path in another project
+// is unrelated, so we filter to entries whose project matches the task's.
 function blockingModules(task, modules) {
   const lockSet = new Set(task.lock_set || []);
-  return (modules || []).filter(m => lockSet.has(m.path) && m.holder && m.holder !== task.task_id);
+  return (modules || []).filter(m =>
+    (!m.project || !task.project || m.project === task.project) &&
+    lockSet.has(m.path) &&
+    m.holder &&
+    m.holder !== task.task_id
+  );
 }
 
 // ── Holder ETA section ──
@@ -59,7 +66,7 @@ function HolderEtas({ task, modules, spark }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       {blocked.map(m => (
-        <div key={m.path} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11 }}>
+        <div key={`${m.project || ''}/${m.path}`} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11 }}>
           <div style={{ flex: 1, overflow: 'hidden' }}>
             <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)', overflow: 'hidden', textOverflow: 'ellipsis' }} title={m.path}>
               {m.path.split('/').pop()}
@@ -88,8 +95,14 @@ function HolderEtas({ task, modules, spark }) {
 // Other tasks whose lock_set overlaps with this task's lock_set.
 function WaitersList({ task, allRows }) {
   const lockSet = new Set(task.lock_set || []);
+  // Scope to the task's own project — competing rows from a different
+  // project share no lock domain even if their lock_set paths coincide.
+  // The (task_id, project) pair is the project-qualified identity, so we
+  // exclude only the exact same task, not numeric-id collisions across
+  // projects.
   const others = (allRows || []).filter(r =>
-    r.task_id !== task.task_id &&
+    !(r.task_id === task.task_id && r.project === task.project) &&
+    (!task.project || !r.project || r.project === task.project) &&
     (r.lock_set || []).some(p => lockSet.has(p))
   );
   if (others.length === 0) {
@@ -104,7 +117,7 @@ function WaitersList({ task, allRows }) {
       {others.slice(0, 8).map(r => {
         const shared = (r.lock_set || []).filter(p => lockSet.has(p));
         return (
-          <div key={r.task_id} style={{ fontSize: 11, display: 'flex', gap: 8, alignItems: 'baseline' }}>
+          <div key={`${r.project || ''}/${r.task_id}`} style={{ fontSize: 11, display: 'flex', gap: 8, alignItems: 'baseline' }}>
             <span className="mono" style={{ fontSize: 10, color: 'var(--accent)', flexShrink: 0 }}>T-{r.task_id}</span>
             <span style={{ color: 'var(--fg-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.title}>
               {r.title || '—'}

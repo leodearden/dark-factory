@@ -16,6 +16,13 @@
 // `module` may carry an optional `parked_by` field (task_id string) that
 // SchedulerHeatmap pre-computes from the full rows list before calling here.
 function cellStateFor(row, module) {
+  // Modules are project-scoped (keyed by `(project, path)` on the server).
+  // A row from project B sharing a file path with project A's module entry
+  // is NOT contending for the same lock, so the cell must remain blank.
+  // Falsy `module.project` (legacy/single-project mode) skips the check.
+  if (module.project && row.project && module.project !== row.project) {
+    return 'not-in-set';
+  }
   const lockSet = row.lock_set || [];
   if (!lockSet.includes(module.path)) return 'not-in-set';
 
@@ -59,20 +66,22 @@ function HeatmapCell({ state, holder }) {
 function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
   const { useState } = React;
 
-  // Pre-compute {module_path → task_id} for all parked rows so that
-  // cellStateFor can classify 'parked-by-other' without seeing the full rows.
+  // Pre-compute parked rows keyed by `(project, module_path)` so cellStateFor
+  // can classify 'parked-by-other' without leaking parks across projects
+  // (two projects sharing a file path must not appear to park each other).
   const parkedByModule = {};
   for (const row of (rows || [])) {
     const ps = row.park_state;
     if (ps && ps.module_path) {
-      parkedByModule[ps.module_path] = row.task_id;
+      parkedByModule[`${row.project || ''}/${ps.module_path}`] = row.task_id;
     }
   }
 
-  // Enrich each module with `parked_by` before passing to cellStateFor
+  // Enrich each module with `parked_by` before passing to cellStateFor.
+  // Use the module's owning project to look up the project-scoped park map.
   const enriched = (modules || []).map(m => ({
     ...m,
-    parked_by: parkedByModule[m.path] || null,
+    parked_by: parkedByModule[`${m.project || ''}/${m.path}`] || null,
   }));
 
   if (!rows || rows.length === 0) {
@@ -91,7 +100,11 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
             <th className="sched-row-label-hd">Task</th>
             <th className="sched-skip-hd" title="Times skipped in last hour">Skip</th>
             {enriched.map(m => (
-              <th key={m.path} className="sched-col-label" title={m.path}>
+              <th
+                key={`${m.project || ''}/${m.path}`}
+                className="sched-col-label"
+                title={m.project ? `${m.path} · ${m.project}` : m.path}
+              >
                 <span className="sched-col-path">{m.path.split('/').pop()}</span>
                 {m.contention > 1 && (
                   <span className="sched-col-count">{m.contention}</span>
@@ -105,7 +118,7 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
             const isSelected = row.task_id === selectedTaskId;
             return (
               <tr
-                key={row.task_id}
+                key={`${row.project || ''}/${row.task_id}`}
                 className={'sched-row' + (isSelected ? ' selected' : '')}
                 onClick={() => onRowClick && onRowClick(row)}
                 style={{ cursor: 'pointer' }}
@@ -143,7 +156,7 @@ function SchedulerHeatmap({ rows, modules, onRowClick, selectedTaskId }) {
                     state === 'held-by-other'   ? m.holder :
                     state === 'parked-by-other' ? m.parked_by : null;
                   return (
-                    <td key={m.path} className="sched-cell-td">
+                    <td key={`${m.project || ''}/${m.path}`} className="sched-cell-td">
                       <HeatmapCell state={state} holder={holder} />
                     </td>
                   );

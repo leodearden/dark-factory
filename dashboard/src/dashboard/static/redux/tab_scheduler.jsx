@@ -39,15 +39,28 @@ function p50WaitSeconds(spark) {
   return Math.round((n * 300) / total);
 }
 
+// Composite key for a pin entry — taskmaster task_ids are project-scoped,
+// so the same numeric id can appear in two projects' pin queues.  Keying
+// pins by '${project}/${task_id}' lets the React strip render duplicates
+// without collapsing rows and lets the multi-project reorder handler
+// group entries by their owning project_root.
+function pinKey(pin) {
+  return `${pin.project || ''}/${pin.task_id}`;
+}
+
 // ── Active-Pins strip ──
 // Horizontal list of pinned tasks with drag-to-reorder and X-to-unpin.
 function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
   const [dragging, setDragging] = stUseState(null);
   const [dragOver, setDragOver] = stUseState(null);
 
-  // Build ordered pin items enriched with task title
-  const rowById = {};
-  for (const r of (rows || [])) rowById[r.task_id] = r;
+  // Build ordered pin items enriched with task title.  We key by composite
+  // '${project}/${task_id}' to prevent cross-project collisions when two
+  // projects each have a row with task_id='1'.
+  const rowByCompositeKey = {};
+  for (const r of (rows || [])) {
+    rowByCompositeKey[`${r.project || ''}/${r.task_id}`] = r;
+  }
 
   const pins = (pinQueue || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
 
@@ -57,27 +70,29 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
     );
   }
 
-  function handleDragStart(e, taskId) {
-    setDragging(taskId);
+  function handleDragStart(e, key) {
+    setDragging(key);
     e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', taskId);
+    e.dataTransfer.setData('text/plain', key);
   }
 
-  function handleDragOver(e, taskId) {
+  function handleDragOver(e, key) {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    if (taskId !== dragging) setDragOver(taskId);
+    if (key !== dragging) setDragOver(key);
   }
 
-  function handleDrop(e, targetId) {
+  function handleDrop(e, targetKey) {
     e.preventDefault();
-    if (!dragging || dragging === targetId) { setDragging(null); setDragOver(null); return; }
-    // Build new ordered list by inserting dragged item before target
-    const ids = pins.map(p => p.task_id).filter(id => id !== dragging);
-    const idx = ids.indexOf(targetId);
-    if (idx >= 0) ids.splice(idx, 0, dragging);
-    else ids.push(dragging);
-    onReorder(ids);
+    if (!dragging || dragging === targetKey) { setDragging(null); setDragOver(null); return; }
+    // Build new ordered list of composite keys by inserting dragged item
+    // before target.  Composite keys are project-qualified, so the upstream
+    // reorder handler can route per-project without ambiguity.
+    const keys = pins.map(pinKey).filter(k => k !== dragging);
+    const idx = keys.indexOf(targetKey);
+    if (idx >= 0) keys.splice(idx, 0, dragging);
+    else keys.push(dragging);
+    onReorder(keys);
     setDragging(null);
     setDragOver(null);
   }
@@ -90,22 +105,30 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
   return (
     <div className="sched-pins-strip">
       {pins.map(pin => {
-        const row = rowById[pin.task_id];
-        const isDragging = dragging === pin.task_id;
-        const isOver = dragOver === pin.task_id;
+        const key = pinKey(pin);
+        const row = rowByCompositeKey[key];
+        const isDragging = dragging === key;
+        const isOver = dragOver === key;
+        // Prefer the pin's own project_root (server-tagged) over the row's —
+        // the row may be absent on the first poll after a remote pin, but
+        // pin.project_root is always set by collect_scheduler_state.
+        const pinProjectRoot = pin.project_root || (row ? row.project_root : '') || '';
         return (
           <div
-            key={pin.task_id}
+            key={key}
             className={'sched-pin-chip' + (isDragging ? ' dragging' : '') + (isOver ? ' drag-over' : '')}
             draggable
-            onDragStart={e => handleDragStart(e, pin.task_id)}
-            onDragOver={e => handleDragOver(e, pin.task_id)}
-            onDrop={e => handleDrop(e, pin.task_id)}
+            onDragStart={e => handleDragStart(e, key)}
+            onDragOver={e => handleDragOver(e, key)}
+            onDrop={e => handleDrop(e, key)}
             onDragEnd={handleDragEnd}
             title={row ? row.title : `T-${pin.task_id}`}
           >
             <span className="sched-pin-handle" title="Drag to reorder">⠿</span>
             <span className="mono" style={{ fontSize: 10, color: 'var(--accent)' }}>T-{pin.task_id}</span>
+            {pin.project && (
+              <span style={{ fontSize: 9, color: 'var(--fg-3)' }} title={pin.project}>·{pin.project}</span>
+            )}
             {row && (
               <span style={{ fontSize: 11, color: 'var(--fg-2)', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {row.title}
@@ -113,7 +136,7 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
             )}
             <button
               className="sched-pin-remove"
-              onClick={() => onUnpin(pin.task_id, row ? row.project_root : '')}
+              onClick={() => onUnpin(pin.task_id, pinProjectRoot)}
               title={`Unpin T-${pin.task_id}`}
             >
               ×
@@ -133,21 +156,34 @@ function ModulesView({ modules, rows, eventsMap }) {
       <div className="sched-empty">No module contention data available.</div>
     );
   }
-  const rowById = {};
-  for (const r of (rows || [])) rowById[r.task_id] = r;
+  // Build a project-qualified row index.  Taskmaster task_ids are
+  // project-scoped, so two projects can each have T-1 — keying by raw
+  // task_id would pick whichever project the iterator hit last.
+  const rowByCompositeKey = {};
+  for (const r of (rows || [])) {
+    rowByCompositeKey[`${r.project || ''}/${r.task_id}`] = r;
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       {modules.map(m => {
-        // Tasks waiting on this module (have it in their lock_set but don't hold it)
+        // Waiters are scoped to the module's owning project: a row from
+        // project B that happens to include 'src/utils.py' in its lock_set
+        // is NOT waiting on project A's 'src/utils.py' module.
         const waiters = (rows || []).filter(r =>
-          (r.lock_set || []).includes(m.path) && m.holder !== r.task_id
+          (!m.project || r.project === m.project) &&
+          (r.lock_set || []).includes(m.path) &&
+          m.holder !== r.task_id
         );
-        const holder = m.holder ? rowById[m.holder] : null;
+        // The holder task_id is project-scoped; pair it with `holder_project`
+        // (set by the server when `current_holders` is non-empty) so the
+        // joined row lookup hits the correct project's row.
+        const holderProject = m.holder_project || m.project || '';
+        const holder = m.holder ? rowByCompositeKey[`${holderProject}/${m.holder}`] : null;
         const holderAge = holder ? fmtAge(holder.age_seconds) : null;
 
         return (
-          <div key={m.path} className="panel" style={{ padding: '10px 14px' }}>
+          <div key={`${m.project || ''}/${m.path}`} className="panel" style={{ padding: '10px 14px' }}>
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 8 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="mono" style={{ fontSize: 11, color: 'var(--fg-0)', overflow: 'hidden', textOverflow: 'ellipsis' }} title={m.path}>
@@ -155,6 +191,9 @@ function ModulesView({ modules, rows, eventsMap }) {
                 </div>
                 <div style={{ fontSize: 10, color: 'var(--fg-3)', overflow: 'hidden', textOverflow: 'ellipsis' }} title={m.path}>
                   {m.path}
+                  {m.project && (
+                    <span style={{ marginLeft: 6, color: 'var(--fg-3)' }}>·{m.project}</span>
+                  )}
                 </div>
               </div>
               <div style={{ textAlign: 'right', flexShrink: 0 }}>
@@ -173,7 +212,12 @@ function ModulesView({ modules, rows, eventsMap }) {
                   <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>({holderAge})</span>
                 )}
                 {(() => {
-                  const spark = eventsMap && m.holder ? eventsMap[m.holder] : null;
+                  // events_by_task is keyed by '${project}/${task_id}' (see
+                  // collect_scheduler_state); the previous raw-task_id lookup
+                  // here always returned null, silently dropping p50.
+                  const spark = eventsMap && m.holder
+                    ? eventsMap[`${holderProject}/${m.holder}`]
+                    : null;
                   const p50 = p50WaitSeconds(spark);
                   if (p50 == null) return null;
                   return <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>p50 ~{fmtAge(p50)}</span>;
@@ -187,7 +231,7 @@ function ModulesView({ modules, rows, eventsMap }) {
             {waiters.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
                 {waiters.slice(0, 5).map(r => (
-                  <div key={r.task_id} style={{ display: 'flex', gap: 8, fontSize: 11, alignItems: 'baseline' }}>
+                  <div key={`${r.project || ''}/${r.task_id}`} style={{ display: 'flex', gap: 8, fontSize: 11, alignItems: 'baseline' }}>
                     <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>T-{r.task_id}</span>
                     <span style={{ color: 'var(--fg-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.title}>
                       {r.title || '—'}
@@ -271,23 +315,50 @@ function SchedulerTab({ projectFilter = [] }) {
   }, [addToast]);
 
   // ── Reorder pin queue ──
-  const handleReorder = stUseCallback(async (taskIds) => {
-    // Find project_root from any pinned task
-    const firstRow = rows.find(r => taskIds.includes(r.task_id));
-    const projectRoot = firstRow ? (firstRow.project_root || '') : '';
-    try {
-      const resp = await fetch('/api/v2/dashboard/scheduler/reorder-pin-queue', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ task_ids: taskIds, project_root: projectRoot }),
-      });
-      if (!resp.ok) {
-        addToast(`Reorder failed (${resp.status})`);
-      }
-    } catch (err) {
-      addToast(`Reorder error: ${err.message || String(err)}`);
+  // Receives composite keys ('${project}/${task_id}') from ActivePinsStrip and
+  // groups them by project_root.  Each project's pin queue is independent on
+  // the server (reorder_pin_queue is project-scoped), so a multi-project
+  // pin-strip reorder must dispatch one MCP call per project, preserving the
+  // relative order of each project's task_ids in the user's drag result.
+  const handleReorder = stUseCallback(async (compositeKeys) => {
+    // Index pins by composite key so we can recover task_id + project_root.
+    const pinByKey = {};
+    for (const p of (pin_queue || [])) {
+      pinByKey[`${p.project || ''}/${p.task_id}`] = p;
     }
-  }, [rows, addToast]);
+    // Group task_ids by project_root in the order they appear in compositeKeys.
+    const groups = new Map();
+    for (const key of compositeKeys) {
+      const pin = pinByKey[key];
+      if (!pin) continue;
+      const root = pin.project_root || '';
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root).push(pin.task_id);
+    }
+    if (groups.size === 0) return;
+    // Fire all per-project reorder calls in parallel; surface a toast per
+    // failing project so the user can identify which one broke.
+    const calls = [];
+    for (const [projectRoot, taskIds] of groups.entries()) {
+      calls.push(
+        fetch('/api/v2/dashboard/scheduler/reorder-pin-queue', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ task_ids: taskIds, project_root: projectRoot }),
+        })
+          .then(resp => ({ projectRoot, resp, err: null }))
+          .catch(err => ({ projectRoot, resp: null, err })),
+      );
+    }
+    const results = await Promise.all(calls);
+    for (const { projectRoot, resp, err } of results) {
+      if (err) {
+        addToast(`Reorder error (${projectRoot || '∅'}): ${err.message || String(err)}`);
+      } else if (resp && !resp.ok) {
+        addToast(`Reorder failed for ${projectRoot || '∅'} (${resp.status})`);
+      }
+    }
+  }, [pin_queue, addToast]);
 
   // ── Unpin (clear pinned override) ──
   const handleUnpin = stUseCallback(async (taskId, projectRoot) => {

@@ -1039,3 +1039,222 @@ def test_index_html_references_new_scheduler_jsx_files(client):
     version = int(unique.pop())
     # Pin: version must be at least 10 (bumped from previous max of 11)
     assert version >= 10, f'Expected ?v= ≥ 10, got {version}'
+
+
+# ---------------------------------------------------------------------------
+# step-41: multi-project isolation for modules, pins, and event keys
+# ---------------------------------------------------------------------------
+#
+# Regression pins for the review-cycle blockers (esc-1231-85):
+#   * _merge_module_lists must key by (project, path) so two projects sharing
+#     the same file path don't conflate contention.
+#   * pin_queue entries must be tagged with project + project_root so React
+#     can deduplicate task_id collisions across projects.
+#   * Module entries must carry `holder_project` so the front-end can build
+#     the composite '${holder_project}/${holder}' key used to look up
+#     events_by_task (otherwise the p50 hint silently never renders).
+
+
+def test_module_contention_counts_tags_project_and_holder_project():
+    """_module_contention_counts attaches project/holder_project when given a project."""
+    from dashboard.data.scheduler import _module_contention_counts
+
+    rows = [{'task_id': '1', 'lock_set': ['src/a.py']}]
+    result = _module_contention_counts(
+        rows, {'src/a.py': '1'}, project='proj-a',
+    )
+
+    assert len(result) == 1
+    assert result[0]['project'] == 'proj-a'
+    # holder_project tracks the project that owns the holder task_id
+    assert result[0]['holder_project'] == 'proj-a'
+
+    # When no holder is present, holder_project must be None
+    result2 = _module_contention_counts(
+        rows, {}, project='proj-a',
+    )
+    assert result2[0]['project'] == 'proj-a'
+    assert result2[0]['holder_project'] is None
+
+
+def test_merge_module_lists_keys_by_project_and_path():
+    """_merge_module_lists must NOT conflate two projects' identically-named modules.
+
+    Regression: same file path under two project roots used to collide into
+    one row with summed contention and an arbitrary holder, breaking the
+    heatmap (holder task_id matched no row in the other project).
+    """
+    from dashboard.data.scheduler import _merge_module_lists
+
+    a = [{
+        'path': 'src/utils.py',
+        'holder': '1',
+        'contention': 2,
+        'project': 'proj-a',
+        'holder_project': 'proj-a',
+    }]
+    b = [{
+        'path': 'src/utils.py',
+        'holder': '5',
+        'contention': 3,
+        'project': 'proj-b',
+        'holder_project': 'proj-b',
+    }]
+
+    merged = _merge_module_lists(a, b)
+
+    # Two distinct entries — one per project — not a single conflated row
+    assert len(merged) == 2
+
+    by_project = {m['project']: m for m in merged}
+    assert by_project['proj-a']['contention'] == 2
+    assert by_project['proj-a']['holder'] == '1'
+    assert by_project['proj-a']['holder_project'] == 'proj-a'
+    assert by_project['proj-b']['contention'] == 3
+    assert by_project['proj-b']['holder'] == '5'
+    assert by_project['proj-b']['holder_project'] == 'proj-b'
+
+
+async def test_collect_scheduler_state_tags_pins_with_project(dummy_client, tmp_path):
+    """pin_queue entries must carry project + project_root after aggregation.
+
+    Without these fields, two projects pinning their own task_id='1' would
+    produce duplicate React keys and the reorder handler would send all
+    task_ids under a single (arbitrary) project_root.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.config import DashboardConfig
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    p1 = tmp_path / 'p1'
+    p2 = tmp_path / 'p2'
+    p1.mkdir()
+    p2.mkdir()
+
+    config = DashboardConfig(project_root=p1, known_project_roots=[p2])
+
+    snap_p1 = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'overrides': {},
+        'current_holders': {},
+        # Both projects have a pin with task_id='1' — the collision case
+        'pin_queue': [{'task_id': '1', 'order': 0}],
+        'snapshot_at': '2026-01-01T00:00:00+00:00',
+    }
+    snap_p2 = {**snap_p1}
+
+    snapshots = {str(p1): snap_p1, str(p2): snap_p2}
+
+    async def mock_mcp_call(client, url, tool, args):
+        if tool == 'get_scheduler_state':
+            return snapshots[args.get('project_root')]
+        return []
+
+    mock_active = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        _rows, _modules, pin_queue, _events, _offline = \
+            await collect_scheduler_state(dummy_client, config)
+
+    assert len(pin_queue) == 2
+    # Each pin carries its owning project + project_root so React can build
+    # a composite key and the reorder handler can dispatch per-project.
+    projects = sorted(p.get('project') for p in pin_queue)
+    assert projects == sorted([p1.name, p2.name])
+    roots = sorted(p.get('project_root') for p in pin_queue)
+    assert roots == sorted([str(p1), str(p2)])
+
+
+async def test_collect_scheduler_state_keeps_module_contention_per_project(
+    dummy_client, tmp_path,
+):
+    """Same module path under two projects must stay as two distinct module rows.
+
+    Regression: _merge_module_lists used to key by path alone, so a file
+    named 'src/utils.py' contended in both project A and project B would
+    collapse to one row with summed contention and a holder task_id that
+    referenced a phantom row from the wrong project.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.config import DashboardConfig
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    p1 = tmp_path / 'p1'
+    p2 = tmp_path / 'p2'
+    p1.mkdir()
+    p2.mkdir()
+
+    config = DashboardConfig(project_root=p1, known_project_roots=[p2])
+
+    snap_p1 = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'overrides': {},
+        'current_holders': {'src/utils.py': '1'},
+        'pin_queue': [],
+        'snapshot_at': '2026-01-01T00:00:00+00:00',
+    }
+    snap_p2 = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'overrides': {},
+        'current_holders': {'src/utils.py': '5'},
+        'pin_queue': [],
+        'snapshot_at': '2026-01-01T00:00:00+00:00',
+    }
+    snapshots = {str(p1): snap_p1, str(p2): snap_p2}
+
+    async def mock_mcp_call(client, url, tool, args):
+        if tool == 'get_scheduler_state':
+            return snapshots[args.get('project_root')]
+        return []
+
+    active_tasks = [
+        {
+            'id': f'{p1.name}/T-1',
+            'project': p1.name,
+            'title': 'P1 task',
+            'priority': 'high',
+            'status': 'in-progress',
+            'started': 1,
+            'locks': ['src/utils.py'],
+        },
+        {
+            'id': f'{p2.name}/T-5',
+            'project': p2.name,
+            'title': 'P2 task',
+            'priority': 'high',
+            'status': 'in-progress',
+            'started': 1,
+            'locks': ['src/utils.py'],
+        },
+    ]
+    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        _rows, modules, _pins, _events, _offline = \
+            await collect_scheduler_state(dummy_client, config)
+
+    # Two project-scoped entries, NOT one conflated row
+    assert len(modules) == 2
+    by_project = {m['project']: m for m in modules}
+    # Each project's contention count stays at 1 (only that project's task
+    # has the module in its lock_set) — not the conflated 2.
+    assert by_project[p1.name]['contention'] == 1
+    assert by_project[p1.name]['holder'] == '1'
+    assert by_project[p1.name]['holder_project'] == p1.name
+    assert by_project[p2.name]['contention'] == 1
+    assert by_project[p2.name]['holder'] == '5'
+    assert by_project[p2.name]['holder_project'] == p2.name
