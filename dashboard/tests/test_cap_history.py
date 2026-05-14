@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -103,7 +104,7 @@ class TestCapInterval:
 
     def test_frozen_immutable(self):
         iv = CapInterval(account_name='x', start=datetime.now(UTC), end=None)
-        with pytest.raises((AttributeError, TypeError)):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             iv.account_name = 'y'  # type: ignore[misc]
 
 
