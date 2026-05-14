@@ -1467,35 +1467,75 @@ class Scheduler:
         prev: dict[str, 'OverrideRow'],
         cur: dict[str, 'OverrideRow'],
     ) -> None:
-        """Diff prev vs cur override snapshots and emit boost-tier change events.
+        """Diff prev vs cur override snapshots and emit override change events.
 
         Called once per tick after all in-memory override mutations are complete.
         Each change in ``boost_tier`` emits exactly one event per task per tick.
-        Pin-state diffs (task_pinned / task_unpinned / pin_queue_reordered) are
-        handled by :meth:`_emit_pin_diff_events` added in a later step.
+        Pin-state diffs emit ``task_pinned`` / ``task_unpinned`` per task, and a
+        SINGLE ``pin_queue_reordered`` event per tick when any ``pin_order`` shifts.
         """
         if not self.event_store:
             return
         all_ids = set(prev) | set(cur)
+        pin_queue_changed = False
         for tid in all_ids:
             prev_row = prev.get(tid)
             cur_row = cur.get(tid)
+
+            # --- boost_tier diffs ---
             prev_boost = prev_row.boost_tier if prev_row else None
             cur_boost = cur_row.boost_tier if cur_row else None
-            if prev_boost == cur_boost:
-                continue
-            if cur_boost is not None:
-                self.event_store.emit(
-                    EventType.priority_override_set,
-                    task_id=tid,
-                    data={'boost_tier': cur_boost},
-                )
-            else:
-                self.event_store.emit(
-                    EventType.priority_override_cleared,
-                    task_id=tid,
-                    data={'previous_boost_tier': prev_boost},
-                )
+            if prev_boost != cur_boost:
+                if cur_boost is not None:
+                    self.event_store.emit(
+                        EventType.priority_override_set,
+                        task_id=tid,
+                        data={'boost_tier': cur_boost},
+                    )
+                else:
+                    self.event_store.emit(
+                        EventType.priority_override_cleared,
+                        task_id=tid,
+                        data={'previous_boost_tier': prev_boost},
+                    )
+
+            # --- pin state diffs ---
+            prev_pinned = prev_row.pinned if prev_row else False
+            cur_pinned = cur_row.pinned if cur_row else False
+            if prev_pinned != cur_pinned:
+                if cur_pinned:
+                    self.event_store.emit(
+                        EventType.task_pinned,
+                        task_id=tid,
+                        data={'pin_order': cur_row.pin_order if cur_row else None},
+                    )
+                else:
+                    self.event_store.emit(
+                        EventType.task_unpinned,
+                        task_id=tid,
+                        data={
+                            'previous_pin_order': (
+                                prev_row.pin_order if prev_row else None
+                            )
+                        },
+                    )
+            elif prev_pinned and cur_pinned:
+                # Both pinned — detect pin_order shift (signals a reorder).
+                prev_order = prev_row.pin_order if prev_row else None
+                cur_order = cur_row.pin_order if cur_row else None
+                if prev_order != cur_order:
+                    pin_queue_changed = True
+
+        # One ``pin_queue_reordered`` event per tick for any pin_order change.
+        if pin_queue_changed and self._override_store:
+            new_order = [
+                tid
+                for tid, _ in self._override_store.get_pin_queue(self._project_root)
+            ]
+            self.event_store.emit(
+                EventType.pin_queue_reordered,
+                data={'new_order': new_order},
+            )
 
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
