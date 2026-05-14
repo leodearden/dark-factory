@@ -66,6 +66,10 @@ async def fan_out_list_tickets(
       count can ignore this list.
     * ``pending_total`` — sum of the per-root ``count`` fields.
 
+    Roots are queried concurrently via ``asyncio.gather``; within each root the
+    URL list is tried sequentially (first-success wins via ``break``-equivalent
+    early return) so URLs remain a fallback chain without double-counting.
+
     If any per-root count saturates at *limit* the server may have clipped the
     real depth — a WARNING is logged so it surfaces in operator logs.
 
@@ -85,9 +89,13 @@ async def fan_out_list_tickets(
             seen_roots.add(key)
             all_roots.append(key)
 
-    tickets: list[dict] = []
-    pending_total = 0
-    for root_str in all_roots:
+    async def _fan_out_one_root(root_str: str) -> tuple[int, list[dict]]:
+        """Query list_tickets for *root_str* across all configured URLs.
+
+        URLs are tried sequentially; the first success returns immediately
+        (equivalent to ``break`` in the outer URL loop) to avoid double-counting.
+        Returns ``(count, tickets_with_project_id)`` or ``(0, [])`` if every URL fails.
+        """
         for url in config.fused_memory_urls:
             try:
                 result = await asyncio.wait_for(
@@ -105,13 +113,12 @@ async def fan_out_list_tickets(
                         'pending_total may be clipped at the server limit',
                         count, effective_limit, url, root_str,
                     )
-                pending_total += count
                 project_id = result.get('project_id', '')
-                tickets.extend(
+                root_tickets = [
                     {**r, 'project_id': project_id}
                     for r in result.get('tickets', [])
-                )
-                break  # first success wins; avoid double-counting across failover URLs
+                ]
+                return count, root_tickets  # first success wins; skip remaining URLs
             except TimeoutError:
                 logger.warning(
                     'list_tickets timed out for project_root=%s url=%s after %.1fs',
@@ -125,7 +132,13 @@ async def fan_out_list_tickets(
                 logger.warning(
                     'list_tickets unexpected error for %s / %s', url, root_str, exc_info=True,
                 )
+        return 0, []
 
+    per_root_results: list[tuple[int, list[dict]]] = list(
+        await asyncio.gather(*(_fan_out_one_root(r) for r in all_roots))
+    )
+    pending_total = sum(c for c, _ in per_root_results)
+    tickets: list[dict] = [t for _, ts in per_root_results for t in ts]
     return tickets, pending_total
 
 
