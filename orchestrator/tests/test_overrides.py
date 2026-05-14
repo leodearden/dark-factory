@@ -139,6 +139,44 @@ class TestPinning:
         overrides = store.get_overrides('proj')
         assert 'B' not in overrides
 
+    def test_repin_without_explicit_order_is_idempotent(self, tmp_path: Path) -> None:
+        """Regression: re-pinning an already-pinned task must NOT shift its pin_order.
+
+        The auto-assign query previously included the task's OWN row in MAX(),
+        so calling set_override(pinned=True) a second time would shift A from 5 → 6.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        # A is the sole pinned task at pin_order=5.
+        store.set_override('proj', 'A', pinned=True, pin_order=5)
+
+        # Re-pin A (e.g. to also add a boost) — pin_order must NOT change.
+        store.set_override('proj', 'A', pinned=True, boost_tier='high')
+
+        overrides = store.get_overrides('proj')
+        assert overrides['A'].pin_order == 5, (
+            'Re-pinning an already-pinned task must preserve its existing pin_order'
+        )
+        assert overrides['A'].boost_tier == 'high'
+
+    def test_pin_order_without_pinned_raises(self, tmp_path: Path) -> None:
+        """pin_order may only be supplied together with pinned=True."""
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+
+        # pin_order with no pinned kwarg at all (None)
+        with pytest.raises(ValueError, match='pinned=True'):
+            store.set_override('proj', 'A', pin_order=5)
+
+        # pin_order with pinned=False
+        with pytest.raises(ValueError, match='pinned=True'):
+            store.set_override('proj', 'A', pinned=False, pin_order=5)
+
+        # Store is clean — no rows created
+        assert store.get_overrides('proj') == {}
+
 
 class TestPinQueue:
     def test_get_pin_queue_returns_pinned_rows_in_pin_order_asc(

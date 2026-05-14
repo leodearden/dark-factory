@@ -127,6 +127,15 @@ class OverrideStore:
 
         Only supplied (non-None) keyword arguments are written; unsupplied
         fields preserve existing values via ``COALESCE`` in the UPSERT.
+
+        **Asymmetry note:** ``boost_tier=None`` and ``ttl_until=None`` both
+        mean "unchanged" (not supplied), NOT "clear this field".  To null out
+        ``boost_tier`` or ``ttl_until`` use :meth:`clear_override` with
+        ``field='boost_tier'`` or ``field='ttl'`` respectively.  Passing
+        ``pinned=False`` is an explicit write that zeroes ``pinned`` and
+        ``pin_order``; by contrast ``pinned=None`` (omitted) means unchanged.
+        Use :meth:`clear_override` as the canonical way to clear any field to
+        avoid this asymmetry.
         """
         if boost_tier is not None and boost_tier not in PRIORITY_RANK:
             raise ValueError(
@@ -134,17 +143,41 @@ class OverrideStore:
                 f'got {boost_tier!r}'
             )
 
+        # Guard: pin_order without pinned=True is an invariant violation.
+        # The collision-check and auto-assignment logic only fire for pinned=1
+        # rows; writing a non-zero pin_order with pinned=0 creates a dangling
+        # value that the collision check will later silently ignore (it filters
+        # on pinned=1), potentially producing duplicate pin_order values.
+        if pin_order is not None and pinned is not True:
+            raise ValueError(
+                'pin_order may only be supplied together with pinned=True; '
+                f'got pin_order={pin_order!r} with pinned={pinned!r}'
+            )
+
         now_iso = datetime.now(UTC).isoformat()
         conn = sqlite3.connect(str(self.db_path))
         try:
             # Resolve auto-assigned pin_order when pinning without an explicit order.
             if pinned is True and pin_order is None:
-                row = conn.execute(
-                    'SELECT COALESCE(MAX(pin_order), 0) + 1 '
-                    'FROM overrides WHERE project_root=? AND pinned=1',
-                    (project_root,),
+                # If this task is already pinned, preserve its existing pin_order
+                # so that re-pinning (e.g. set_override(pinned=True, boost_tier='high'))
+                # is idempotent with respect to queue position.  Without this
+                # guard the MAX query would include the task's OWN row and produce
+                # MAX+1, silently shifting an already-pinned task to the back.
+                already_pinned = conn.execute(
+                    'SELECT pin_order FROM overrides '
+                    'WHERE project_root=? AND task_id=? AND pinned=1',
+                    (project_root, task_id),
                 ).fetchone()
-                pin_order = row[0]
+                if already_pinned is not None:
+                    pin_order = already_pinned[0]  # preserve; no re-assignment
+                else:
+                    row = conn.execute(
+                        'SELECT COALESCE(MAX(pin_order), 0) + 1 '
+                        'FROM overrides WHERE project_root=? AND pinned=1',
+                        (project_root,),
+                    ).fetchone()
+                    pin_order = row[0]
 
             # Collision check for explicit or auto-assigned pin_order.
             if pin_order is not None:
@@ -281,13 +314,17 @@ class OverrideStore:
         now_iso = datetime.now(UTC).isoformat()
         conn = sqlite3.connect(str(self.db_path))
         try:
-            for idx, tid in enumerate(ordered_task_ids, start=1):
-                conn.execute(
-                    'UPDATE overrides SET pin_order=?, updated_at=? '
-                    'WHERE project_root=? AND task_id=?',
-                    (idx, now_iso, project_root, tid),
-                )
-            conn.commit()
+            # Wrap in a single transaction so a mid-loop failure (interrupt,
+            # OS error, SQLite lock contention) rolls back all updates atomically.
+            # Without this, partial writes leave the pin queue in an inconsistent
+            # state with gaps or duplicate pin_order values until reorder is retried.
+            with conn:
+                for idx, tid in enumerate(ordered_task_ids, start=1):
+                    conn.execute(
+                        'UPDATE overrides SET pin_order=?, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (idx, now_iso, project_root, tid),
+                    )
         finally:
             conn.close()
 
