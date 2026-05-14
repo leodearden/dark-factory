@@ -3818,6 +3818,62 @@ class TestSchedulerV2Config:
         assert EventType.reservation_evicted == 'reservation_evicted'
 
 
+class TestReserveNowShortCircuit:
+    """reserve_now=True installs parks at the top of acquire_next and auto-clears."""
+
+    @pytest.mark.asyncio
+    async def test_reserve_now_installs_parks_and_clears_field(self, tmp_path):
+        """reserve_now fires install_parks for the task then clears the flag."""
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'A', reserve_now=True)
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['compiler/src', 'eval/src']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['other/module']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+
+        # (a) A must have parks installed in the lock table.
+        assert scheduler.lock_table.has_parks('A')
+
+        # (b) The parks must cover A's modules (look inside _parked).
+        parked_owners = {
+            m: owner for m, (owner, _rank) in scheduler.lock_table._parked.items()
+        }
+        assert 'compiler/src' in parked_owners
+        assert parked_owners['compiler/src'] == 'A'
+        assert 'eval/src' in parked_owners
+        assert parked_owners['eval/src'] == 'A'
+
+        # (c) reserve_now flag must be cleared in the store.
+        overrides = store.get_overrides('/proj')
+        if 'A' in overrides:
+            assert overrides['A'].reserve_now is False
+
+        # (d) Something was dispatched (A's own parks don't block it).
+        assert result is not None
+
+
 class TestSchedulerOverrideStoreInjection:
     """Scheduler accepts an optional OverrideStore kwarg; when None, behaves as today."""
 
