@@ -7575,18 +7575,38 @@ class TestStage2HintConversionDetection:
         return Watermark(project_id='test_project')
 
     def _make_task_with_hints(self, tid: int, status: str, hints) -> dict:
-        """Build a minimal task dict with the given memory_hints value."""
+        """Build a minimal task dict with an explicit memory_hints value.
+
+        Always pass a real hints value (list or dict).  For tasks without
+        any hints use ``_make_task_no_hints`` (empty ``metadata`` dict) or
+        ``_make_task_no_metadata`` (missing ``metadata`` key entirely).
+        """
         return {
             'id': tid,
             'title': f'Task {tid}',
             'status': status,
             'dependencies': [],
-            'metadata': {'memory_hints': hints} if hints is not None else {},
+            'metadata': {'memory_hints': hints},
         }
 
     def _make_task_no_hints(self, tid: int, status: str) -> dict:
-        """Build a task dict with no metadata.memory_hints key at all."""
+        """Build a task dict whose ``metadata`` dict has no ``memory_hints`` key.
+
+        Covers the ``not task_hints`` (falsy) branch of ``_needs_hint_conversion``.
+        For the complementary case where ``metadata`` is absent entirely, use
+        ``_make_task_no_metadata``.
+        """
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': [], 'metadata': {}}
+
+    def _make_task_no_metadata(self, tid: int, status: str) -> dict:
+        """Build a task dict with no ``metadata`` key at all.
+
+        Exercises the ``isinstance(metadata, dict) else None`` guard in
+        ``_needs_hint_conversion``: ``task.get('metadata')`` returns ``None``,
+        which is not a dict, so ``task_hints`` is forced to ``None`` (falsy →
+        ``_needs_hint_conversion`` returns ``True``).
+        """
+        return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
 
     def _make_tree(self, active_tasks: list[dict]):
         """Wrap *active_tasks* in a FilteredTaskTree with empty done/cancelled lists."""
@@ -7704,6 +7724,52 @@ class TestStage2HintConversionDetection:
         )
         assert '[50]' in active_section, (
             'Task 50 must appear in Active Task Tree section'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_key_task_appears_in_section(self, mock_deps, watermark):
+        """Active task with no 'metadata' key at all must appear in the section.
+
+        Exercises the ``isinstance(metadata, dict) else None`` guard in
+        ``_needs_hint_conversion``: ``task.get('metadata')`` returns ``None``
+        (not a dict), so ``task_hints`` is forced to ``None`` → falsy →
+        ``_needs_hint_conversion`` returns ``True``.
+        """
+        task = self._make_task_no_metadata(60, 'pending')
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree([task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER in payload, (
+            f'Expected "{self._SECTION_HEADER}" when task has no metadata key.\n'
+            f'Payload snippet: {payload[:3000]!r}'
+        )
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[60]' in section, (
+            f'Task 60 (no metadata key) must appear in the section body.\n'
+            f'Section: {section!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_active_tasks_omits_section(self, mock_deps, watermark):
+        """Empty active_tasks list must produce no hint-attention section header.
+
+        This is the most common production state (no active tasks).  The section
+        must be unconditionally absent because there are no candidates to flag.
+        """
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree([])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER not in payload, (
+            f'Section header must be absent when active_tasks is empty.\n'
+            f'Payload snippet: {payload[:3000]!r}'
         )
 
     @pytest.mark.asyncio
