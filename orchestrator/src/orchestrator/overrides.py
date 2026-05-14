@@ -402,6 +402,11 @@ class OverrideStore:
         ``now`` defaults to the current UTC time.  Returns the sorted list of
         deleted task IDs.
         """
+        if now is not None and now.tzinfo is None:
+            raise ValueError(
+                'now must be timezone-aware; got a naive datetime'
+            )
+
         if now is None:
             now = datetime.now(UTC)
 
