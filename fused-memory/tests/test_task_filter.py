@@ -14,6 +14,7 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     format_task_list,
     id_key,
+    render_active_section,
     select_visible_active,
 )
 
@@ -864,11 +865,13 @@ class TestFormatFilteredTaskTree:
         )
 
         # Stub: return only the first 3 task dicts and their pre-rendered body,
-        # ignoring budget args.
+        # ignoring budget args.  The four extra fields (header, cancelled_section,
+        # summary_line) are empty strings — the test only checks task-line presence,
+        # not the surrounding strings.
         def _stub_with_body(t, max_tasks=50, max_chars=50_000):  # noqa: ARG001
             first_three = t.active_tasks[:3]
             body = '\n'.join(_render_task_line(task) for task in first_three) + '\n'
-            return first_three, body
+            return first_three, body, '', '', ''
 
         monkeypatch.setattr(
             'fused_memory.reconciliation.task_filter._select_visible_active_with_body',
@@ -890,6 +893,168 @@ class TestFormatFilteredTaskTree:
                 f'Task {tid} must NOT appear when stub limits visible window to 3.\n'
                 f'Output: {output!r}'
             )
+
+    def test_render_task_line_invoked_once_per_task_in_format_call(self, monkeypatch):
+        """format_filtered_task_tree must render each task line at most once.
+
+        Counts _render_task_line calls and asserts the total equals
+        len(visible) + len(cancelled_tasks) — the behavioural invariant that
+        guards against double-rendering.  The pre-refactor code triggered
+        2 * (active + cancelled) renders; post-refactor it is 1 * (active +
+        cancelled).
+
+        Using _render_task_line as the counter rather than _build_surrounding
+        pins *behaviour* (output lines rendered) rather than internal structure
+        (call count of a private helper), so this test won't falsely fail if the
+        implementation is reorganised while the render-once invariant is maintained.
+
+        Uses the same module-level monkeypatch pattern as
+        test_budget_lazy_loop_handles_7_digit_trimmed_count (line ~643).
+        """
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 4)]
+        cancelled = [_make_task(10 + i, 'cancelled', f'Cancelled {i}') for i in range(1, 3)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=5,
+            cancelled_count=2,
+            cancelled_tasks=cancelled,
+            other_count=0,
+            total_count=10,
+        )
+
+        # Compute expected count before patching so this call is unaffected.
+        visible = select_visible_active(tree)
+        expected_count = len(visible) + len(tree.cancelled_tasks)
+
+        call_count = [0]
+
+        def _counting_render_task_line(task):
+            call_count[0] += 1
+            return _render_task_line(task)
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._render_task_line',
+            _counting_render_task_line,
+        )
+
+        format_filtered_task_tree(tree)
+
+        assert call_count[0] == expected_count, (
+            f'_render_task_line was called {call_count[0]} time(s); '
+            f'expected {expected_count} '
+            f'({len(visible)} visible active + {len(tree.cancelled_tasks)} cancelled). '
+            f'Each task line must be rendered at most once per format_filtered_task_tree call '
+            f'(task 1311 refactor guard).'
+        )
+
+
+class TestRenderActiveSection:
+    """Tests for the render_active_section(tree) -> (list[dict], str) public helper.
+
+    render_active_section is the single-call API that returns BOTH the
+    visible-task list (for hint-section consumption) AND the fully assembled
+    prompt string (for the Active Task Tree slot).  These tests pin its contract
+    and confirm the render-once invariant.
+    """
+
+    def test_render_active_section_returns_visible_list_and_assembled_string(self):
+        """render_active_section must return a (list[dict], str) tuple whose elements
+        match select_visible_active and format_filtered_task_tree respectively.
+
+        Parity check: for the same tree, the two halves of the returned tuple
+        must be byte-identical to what the existing public helpers return.
+        """
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 4)]
+        cancelled = [_make_task(20 + i, 'cancelled', f'Cancelled {i}') for i in range(1, 3)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=4,
+            cancelled_count=2,
+            cancelled_tasks=cancelled,
+            other_count=0,
+            total_count=9,
+        )
+
+        result = render_active_section(tree)
+
+        assert len(result) == 2, (
+            f'render_active_section must return a 2-tuple; got {len(result)}-tuple'
+        )
+        visible_list, assembled_str = result
+
+        expected_visible = select_visible_active(tree)
+        assert visible_list == expected_visible, (
+            f'render_active_section visible list must match select_visible_active(tree).\n'
+            f'Got:      {visible_list!r}\n'
+            f'Expected: {expected_visible!r}'
+        )
+
+        expected_str = format_filtered_task_tree(tree)
+        assert assembled_str == expected_str, (
+            f'render_active_section assembled string must match format_filtered_task_tree(tree).\n'
+            f'Got:      {assembled_str!r}\n'
+            f'Expected: {expected_str!r}'
+        )
+
+    def test_render_active_section_renders_each_visible_task_once(self, monkeypatch):
+        """render_active_section must render each candidate task line at most once.
+
+        Simulates the assemble_payload payload-assembly pattern: call
+        render_active_section once and consume BOTH return values (visible list
+        for the hint section, assembled string for the prompt slot).  The
+        _render_task_line counter must equal len(candidate_active) +
+        len(tree.cancelled_tasks) — at most one render per candidate active task
+        (tasks iterated by the worker before budget trimming) plus one per
+        cancelled task in the cancelled section.
+
+        ``candidate_active`` is ``tree.active_tasks[:max_tasks]`` — the slice the
+        worker considers before any budget trimming.  On the fast path (all tasks
+        fit the budget), candidate_active == visible_list; on budget-capped paths
+        candidate_active may be larger than visible_list.  The invariant is that
+        each candidate is rendered *at most once*, not exactly once — a future
+        improvement that renders only kept lines would still satisfy this bound.
+
+        The legacy select_visible_active + format_filtered_task_tree pair would
+        produce 2 * len(candidate_active) + 2 * len(tree.cancelled_tasks) invocations.
+        """
+        call_count = [0]
+
+        def _counting_render_task_line(task):
+            call_count[0] += 1
+            return _render_task_line(task)
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._render_task_line',
+            _counting_render_task_line,
+        )
+
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 11)]
+        cancelled = [_make_task(100 + i, 'cancelled', f'Cancelled {i}') for i in range(1, 4)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=2,
+            cancelled_count=3,
+            cancelled_tasks=cancelled,
+            other_count=0,
+            total_count=15,
+        )
+
+        # Single call — simulates assemble_payload using both outputs.
+        visible_list, _assembled_str = render_active_section(tree)
+
+        # The worker iterates all candidates (active_tasks[:max_tasks]) before
+        # trimming to kept_lines, so the correct upper bound is the full candidate
+        # slice, not just the returned visible list.  Using visible_list here would
+        # produce a false regression if the worker is later optimised to skip
+        # rendering lines it knows will be trimmed.
+        candidate_active = tree.active_tasks[:50]  # same cap as MAX_ACTIVE_TASKS_RENDERED
+        expected_count = len(candidate_active) + len(tree.cancelled_tasks)
+        assert call_count[0] == expected_count, (
+            f'_render_task_line was called {call_count[0]} time(s); '
+            f'expected {expected_count} '
+            f'({len(candidate_active)} candidate active + {len(tree.cancelled_tasks)} cancelled). '
+            f'Each candidate task must be rendered at most once per render_active_section call.'
+        )
 
 
 class TestFilterTaskTreeDoneAndCancelledLists:
