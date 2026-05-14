@@ -116,11 +116,31 @@ def test_not_found_returns_404(client):
 # ---------------------------------------------------------------------------
 
 
-def test_all_servers_unreachable_returns_502(client):
-    """ConnectError from every URL → 502 with fused_memory_unreachable envelope."""
+@pytest.mark.parametrize(
+    'exc',
+    [
+        httpx.ConnectError('refused'),
+        httpx.TimeoutException('timed out'),
+        httpx.HTTPStatusError(
+            '500 Internal Server Error',
+            request=MagicMock(),  # type: ignore[arg-type]
+            response=MagicMock(status_code=500),  # type: ignore[arg-type]
+        ),
+        ValueError('bad MCP payload'),
+    ],
+    ids=['ConnectError', 'TimeoutException', 'HTTPStatusError', 'ValueError'],
+)
+def test_all_servers_unreachable_returns_502(client, exc):
+    """Each of the four caught exception types → 502 fused_memory_unreachable.
+
+    This is a regression-pin test: the production except clause catches
+    ConnectError, TimeoutException, HTTPStatusError, and ValueError. Any future
+    refactor that drops one of these types will fail this parametrized test,
+    surfacing the contract break immediately.
+    """
     with patch(
         _PATCH_TARGET,
-        new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        new=AsyncMock(side_effect=exc),
     ) as mock_mcp:
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
