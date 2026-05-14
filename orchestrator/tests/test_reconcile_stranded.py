@@ -1702,6 +1702,11 @@ class TestReconcileStrandedInProgress:
         from either guard would break the path-specific assertions below —
         making the regression visible even though ``get_task.await_count == 1``
         would still hold in the sibling test.
+
+        Additionally pins the final disposition: both paths must reach
+        ``_mark_in_progress_done`` with the path-specific provenance, catching
+        veto-inversion refactors that would otherwise satisfy the input-args
+        asserts.
         """
         harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
         # Decouple the two is_ancestor call sites:
@@ -1729,6 +1734,13 @@ class TestReconcileStrandedInProgress:
             'update _BRANCH_TIP to a distinct 40-hex value'
         )
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_BRANCH_TIP)  # type: ignore[attr-defined]
+        # Anchor find_task_citation_commit explicitly so the is-ancestor-path
+        # expected_provenance['commit'] is self-contained and not silently
+        # coupled to the fixture default (test_reconcile_stranded.py:136).
+        # If the fixture default changes, this test's expected behaviour is
+        # still clearly described here (reviewer ref: esc-1276-3 amendment #2).
+        _CITATION_SHA = 'deadbeef' + 'a' * 32
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=_CITATION_SHA)
 
         await harness._reconcile_stranded_in_progress()
 
