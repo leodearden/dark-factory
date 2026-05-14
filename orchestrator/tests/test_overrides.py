@@ -138,3 +138,24 @@ class TestPinning:
         # Store must be left untouched — B was not written
         overrides = store.get_overrides('proj')
         assert 'B' not in overrides
+
+
+class TestPinQueue:
+    def test_get_pin_queue_returns_pinned_rows_in_pin_order_asc(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=3)
+        store.set_override('proj', 'B', pinned=True, pin_order=1)
+        store.set_override('proj', 'C', pinned=True, pin_order=2)
+        # D is boost-only, not pinned
+        store.set_override('proj', 'D', boost_tier='high')
+
+        queue = store.get_pin_queue('proj')
+        task_ids = [tid for tid, _ in queue]
+        assert task_ids == ['B', 'C', 'A']
+
+        # D must not appear in the pin queue
+        assert all(tid != 'D' for tid, _ in queue)
