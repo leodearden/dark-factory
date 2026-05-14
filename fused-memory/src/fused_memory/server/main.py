@@ -617,12 +617,7 @@ async def run_server():
         prev = 0
         while True:
             await asyncio.sleep(60)
-            count = threading.active_count()
-            delta = count - prev
-            if delta != 0 or count > 30:
-                level = logging.WARNING if count > 30 else logging.INFO
-                logger.log(level, f'thread_monitor: threads={count} delta={delta:+d}')
-            prev = count
+            prev = _thread_monitor_iteration(prev, _THREAD_WARN_THRESHOLD)
 
     asyncio.create_task(_thread_monitor())
 
@@ -851,6 +846,31 @@ def _snapshot_threads() -> dict[str, int]:
             buckets['other'] += 1
     buckets['_total'] = len(threads)
     return buckets
+
+
+# Placeholder replaced in step-6 when ServerConfig.thread_warn_threshold is wired
+_THREAD_WARN_THRESHOLD = 30
+
+
+def _thread_monitor_iteration(prev: int, threshold: int) -> int:
+    """Single iteration of the thread-monitor loop.
+
+    Reads ``threading.active_count()``, decides log level, and emits log
+    records. Returns the new *prev* value for the next iteration.
+
+    Extracted from the inline ``_thread_monitor`` async closure so unit tests
+    can exercise the logging logic without mocking ``asyncio.sleep``.
+    """
+    count = threading.active_count()
+    delta = count - prev
+    if delta != 0 or count > threshold:
+        level = logging.WARNING if count > threshold else logging.INFO
+        logger.log(level, 'thread_monitor: threads=%d delta=%+d', count, delta)
+        if count > threshold:
+            snapshot = _snapshot_threads()
+            breakdown = ' '.join(f'{k}={v}' for k, v in sorted(snapshot.items()))
+            logger.log(level, 'thread_monitor: breakdown %s', breakdown)
+    return count
 
 
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
