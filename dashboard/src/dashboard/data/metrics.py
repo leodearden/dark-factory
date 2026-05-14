@@ -481,6 +481,44 @@ async def get_recon_sparks(
     }
 
 
+async def get_curator_sparks(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 1,
+) -> dict[str, dict[str, list]]:
+    """Return curator pending-count and active-latency centile sparks.
+
+    Returns four ChartData series: 'pending', 'p50', 'p90', 'p99'.
+    Each is a time series of system-wide values sampled every 10 minutes.
+    Returns the empty 4-key shape when *db* is None or when no rows exist.
+    """
+    empty = {
+        'pending': dict(_EMPTY_SERIES),
+        'p50': dict(_EMPTY_SERIES),
+        'p90': dict(_EMPTY_SERIES),
+        'p99': dict(_EMPTY_SERIES),
+    }
+    if db is None:
+        return empty
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    try:
+        async with db.execute(
+            'SELECT ts, pending_total, p50_active_ms, p90_active_ms, p99_active_ms '
+            'FROM curator_snapshots WHERE ts >= ? ORDER BY ts',
+            (since,),
+        ) as cur:
+            rows = await cur.fetchall()
+    except Exception:
+        logger.debug('curator sparks query failed', exc_info=True)
+        return empty
+    return {
+        'pending': _coerce_series([(r[0], r[1]) for r in rows]),
+        'p50': _coerce_series([(r[0], r[2]) for r in rows]),
+        'p90': _coerce_series([(r[0], r[3]) for r in rows]),
+        'p99': _coerce_series([(r[0], r[4]) for r in rows]),
+    }
+
+
 async def get_merge_active_series(
     db: aiosqlite.Connection | None,
     *,
