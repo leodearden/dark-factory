@@ -947,6 +947,75 @@ class TestFormatFilteredTaskTree:
             f'(task 1311 refactor guard).'
         )
 
+    def test_header_counts_consistent_under_max_chars_clamp(self):
+        """Regression (task 1312): the header 'shown' count must equal the number of task
+        lines actually rendered in the body when the max_chars clamp fires below the
+        max_tasks cap.
+
+        Before task 1312, _build_surrounding computed 'shown' from the pre-clamp
+        tree.active_tasks[:max_tasks] slice.  When _select_visible_active_with_body's
+        lazy-pop loop trimmed the body further, the header still reported the pre-clamp
+        count (e.g. 50), while the body contained fewer lines (e.g. 13).
+
+        Setup:
+          - 100 active tasks, each with a 400-char title → each rendered line ~422 chars.
+          - max_tasks=50  → max_tasks cap fires (100 > 50), omitted_active = 50.
+          - max_chars=6000 → max_chars clamp fires (50 tasks × ~422 chars >> ~5850 budget).
+          - Expected body survivors ≈ 13 (well within the 1..49 partial-truncation regime).
+        """
+        title_len = 400
+        title = 'A' * title_len
+        active = [_make_task(i, 'pending', f'{title}-{i}') for i in range(1, 101)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=100,
+        )
+
+        max_tasks = 50
+        max_chars = 6000
+        output = format_filtered_task_tree(tree, max_tasks=max_tasks, max_chars=max_chars)
+
+        # ── Sanity: verify the partial-truncation regime was actually exercised ── #
+        kept_count = len(re.findall(r'^- \[\d+\]', output, re.MULTILINE))
+        assert 0 < kept_count < max_tasks, (
+            f'kept_count={kept_count} is not in the partial-truncation regime (1..{max_tasks - 1}). '
+            f'Tune title_len or max_chars so the max_chars clamp fires below the max_tasks cap. '
+            f'Current title_len={title_len}, max_chars={max_chars}, max_tasks={max_tasks}.'
+        )
+
+        # ── Core regression: header 'shown' count must equal body task-line count ── #
+        # Before fix: shown = pre-clamp len(active[:max_tasks]) = 50 ≠ kept_count ≈ 13.
+        shown_match = re.search(r'\((\d+) active shown', output)
+        assert shown_match is not None, (
+            f'Header "(N active shown" phrase not found in output: {output!r}'
+        )
+        shown = int(shown_match.group(1))
+        assert shown == kept_count, (
+            f'Header shown={shown} disagrees with body task-line count={kept_count}. '
+            f'The header must report the post-max_chars-clamp visible count, '
+            f'not the pre-clamp len(active[:max_tasks])={max_tasks}.'
+        )
+
+        # ── Semantics pin: omitted_active must reflect max_tasks-cap omissions only ── #
+        # omitted_active = len(active) - max_tasks = 100 - 50 = 50.
+        # It must NOT be len(active) - kept_count (option B), which would misattribute
+        # max_chars-truncated tasks to the "max_tasks cap" phrase.
+        omitted_match = re.search(r'(\d+) more active omitted by max_tasks cap', output)
+        assert omitted_match is not None, (
+            f'Header "N more active omitted by max_tasks cap" phrase not found in output: {output!r}'
+        )
+        omitted = int(omitted_match.group(1))
+        expected_omitted = len(active) - max_tasks  # 100 - 50 = 50
+        assert omitted == expected_omitted, (
+            f'omitted_active={omitted} should be len(active)-max_tasks={expected_omitted} '
+            f'(max_tasks-cap-only semantics). '
+            f'If omitted={len(active) - kept_count}, option B was mistakenly applied '
+            f'(misattributes max_chars-truncated tasks to the max_tasks cap phrase).'
+        )
+
 
 class TestRenderActiveSection:
     """Tests for the render_active_section(tree) -> (list[dict], str) public helper.
