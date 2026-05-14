@@ -210,9 +210,12 @@ async def _sample_curator(
     for root_str in all_roots:
         for url in config.fused_memory_urls:
             try:
-                result = await mcp_tool_call(
-                    http_client, url, 'list_tickets',
-                    {'project_root': root_str, 'status': 'pending', 'limit': 2000},
+                result = await asyncio.wait_for(
+                    mcp_tool_call(
+                        http_client, url, 'list_tickets',
+                        {'project_root': root_str, 'status': 'pending', 'limit': 2000},
+                    ),
+                    timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
                 )
                 pending_total += result.get('count', 0) or 0
                 break  # first success wins; avoid double-counting across failover URLs
