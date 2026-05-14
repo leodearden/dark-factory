@@ -205,3 +205,49 @@ class TestClear:
         store = OverrideStore(tmp_path / 'scheduler_overrides.db')
         result = store.clear_override('proj', 'nonexistent')
         assert result is False
+
+
+class TestReorder:
+    def test_reorder_pin_queue_rewrites_pin_order(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=1)
+        store.set_override('proj', 'B', pinned=True, pin_order=2)
+        store.set_override('proj', 'C', pinned=True, pin_order=3)
+
+        store.reorder_pin_queue('proj', ['C', 'A', 'B'])
+
+        queue = store.get_pin_queue('proj')
+        task_ids = [tid for tid, _ in queue]
+        assert task_ids == ['C', 'A', 'B']
+
+    def test_reorder_pin_queue_accepts_csv_string(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=1)
+        store.set_override('proj', 'B', pinned=True, pin_order=2)
+        store.set_override('proj', 'C', pinned=True, pin_order=3)
+
+        store.reorder_pin_queue('proj', 'C,A,B')
+
+        queue = store.get_pin_queue('proj')
+        task_ids = [tid for tid, _ in queue]
+        assert task_ids == ['C', 'A', 'B']
+
+    def test_reorder_pin_queue_rejects_missing_or_extra_ids(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=1)
+        store.set_override('proj', 'B', pinned=True, pin_order=2)
+        store.set_override('proj', 'C', pinned=True, pin_order=3)
+
+        # Omitting B
+        with pytest.raises(ValueError):
+            store.reorder_pin_queue('proj', ['C', 'A'])
+
+        # Including a non-pinned / unknown task
+        with pytest.raises(ValueError):
+            store.reorder_pin_queue('proj', ['C', 'A', 'B', 'D'])
