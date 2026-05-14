@@ -196,8 +196,56 @@ class TestEscalateInfoDedupe:
         assert parent.dedupe_count == 1
 
     @pytest.mark.asyncio
+    async def test_cross_severity_info_then_blocker(self, tmp_path: Path):
+        """(b) Cross-severity: info creates parent, blocker dedupes against it.
+
+        Parent's severity must be PROMOTED to 'blocking' — absorbing a blocker
+        child into an info parent must escalate urgency so the steward UI
+        treats the parent with blocker-level urgency.
+
+        This test FAILS on current main because attach_dedupe_child never
+        mutates parent.severity.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        first = await _info(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+        assert first['status'] == 'queued'
+
+        second = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+        assert second['action'] == 'terminate_cleanly'
+        assert 'child_id' in second
+
+        from escalation.models import Escalation
+        files = _queue_root_files(queue)
+        parent = Escalation.from_json(files[0].read_text())
+        assert parent.severity == 'blocking', (
+            'Parent severity must be promoted from info to blocking after '
+            'absorbing a blocker child'
+        )
+        assert parent.dedupe_count == 1
+        assert len(parent.dedupe_children) == 1
+        assert second['child_id'] == parent.dedupe_children[0]
+
+    @pytest.mark.asyncio
     async def test_cross_severity_blocker_then_info(self, tmp_path: Path):
-        """(b) Cross-severity: blocker creates parent, info dedupes against it.
+        """(c) Cross-severity: blocker creates parent, info dedupes against it.
 
         Parent's severity stays 'blocking' — info call does not demote it.
         """
