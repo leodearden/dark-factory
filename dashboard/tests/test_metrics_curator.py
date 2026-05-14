@@ -699,12 +699,29 @@ async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path
     import asyncio
 
     from dashboard.app import app, lifespan
+    from dashboard.config import DashboardConfig
 
-    mock_collect = AsyncMock()
+    called_event = asyncio.Event()
 
-    with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
+    async def _side_effect(*args, **kwargs):
+        called_event.set()
+
+    mock_collect = AsyncMock(side_effect=_side_effect)
+
+    # Pin config so the test isn't sensitive to developer env vars
+    # (e.g. DASHBOARD_PROJECT_ROOT, DASHBOARD_KNOWN_PROJECT_ROOTS).
+    fixed_config = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+
+    with patch('dashboard.app.collect_metrics_snapshot', mock_collect), \
+         patch.object(DashboardConfig, 'from_env', return_value=fixed_config):
         async with lifespan(app):
-            await asyncio.sleep(0.05)
+            # Wait deterministically — 2 s is generous for a single _run_once() cycle.
+            # Using an event avoids the flaky sleep(0.05) race on slow CI runners.
+            await asyncio.wait_for(called_event.wait(), timeout=2.0)
 
     assert mock_collect.called, 'collect_metrics_snapshot was never called'
     call_kwargs = mock_collect.call_args.kwargs if mock_collect.call_args else {}

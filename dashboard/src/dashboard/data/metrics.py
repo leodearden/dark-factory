@@ -172,7 +172,7 @@ async def _sample_curator(
     runs_dbs: list[aiosqlite.Connection | None],
     *,
     now: datetime | None = None,
-) -> dict | None:
+) -> dict:
     """Sample curator queue depth, cap state, and terminal-ticket latency.
 
     Args:
@@ -186,13 +186,19 @@ async def _sample_curator(
             internal datetime.now(UTC) for the cap-window query.
 
     Returns:
-        Dict with keys: pending_total, capped_now, p50_active_ms,
-        p90_active_ms, p99_active_ms. Returns None on unrecoverable error
-        (individual sub-errors are swallowed and treated as 0/None).
+        Always returns a dict with keys: pending_total, capped_now,
+        p50_active_ms, p90_active_ms, p99_active_ms. Individual sub-errors
+        are swallowed and treated as 0/None — the function never propagates
+        a top-level exception to the caller.
     """
     effective_now = now if now is not None else datetime.now(UTC)
 
-    # 1. HTTP pending count: iterate (url × unique root), sum count.
+    # 1. HTTP pending count: per project_root, try each URL in turn (failover).
+    # First success wins — summing across all URLs would double-count when
+    # multiple URLs serve the same project.
+    # NOTE: limit=2000 is the server-side ceiling; if real pending depth
+    # exceeds 2000 for a (url, root) pair, that project's count silently
+    # saturates at 2000 and pending_total will be understated.
     pending_total = 0
     seen_roots: set[str] = set()
     all_roots: list[str] = []
@@ -201,14 +207,15 @@ async def _sample_curator(
         if key not in seen_roots:
             seen_roots.add(key)
             all_roots.append(key)
-    for url in config.fused_memory_urls:
-        for root_str in all_roots:
+    for root_str in all_roots:
+        for url in config.fused_memory_urls:
             try:
                 result = await mcp_tool_call(
                     http_client, url, 'list_tickets',
                     {'project_root': root_str, 'status': 'pending', 'limit': 2000},
                 )
                 pending_total += result.get('count', 0) or 0
+                break  # first success wins; avoid double-counting across failover URLs
             except Exception:
                 logger.debug('list_tickets failed for %s / %s', url, root_str, exc_info=True)
 
@@ -219,16 +226,28 @@ async def _sample_curator(
         logger.debug('read_cap_intervals failed', exc_info=True)
         intervals = []
 
-    # 3. All-accounts-capped merged windows.
+    # 3. capped_now: 1 if ANY account currently has an open-ended cap interval.
+    # Uses "any account capped" semantics — an open-ended CapInterval (end=None)
+    # means that account is still capped at query time, regardless of what other
+    # accounts are doing. This avoids the false-negative that would arise from the
+    # "all-accounts-simultaneously-capped" merge if some accounts had no events in
+    # the look-back window.
+    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+
+    # Merged cap windows (needed for per-ticket overlap subtraction below).
     account_names = list({iv.account_name for iv in intervals})
     try:
         capped_windows = merge_all_accounts_capped(intervals, account_names)
     except Exception:
         logger.debug('merge_all_accounts_capped failed', exc_info=True)
         capped_windows = []
-    capped_now = 1 if any(end is None for _, end in capped_windows) else 0
 
     # 4. Terminal tickets resolved in the last hour.
+    # NOTE: centiles use a 1-hour rolling window, not the 10-minute sampling
+    # interval. A ticket resolved at minute 0 will be included in ~6 consecutive
+    # snapshots. This is intentional — it produces smoother spark lines at the
+    # cost of the centile rows representing overlapping (not disjoint) windows.
+    # pending_total and capped_now are point-in-time; only the centiles are rolling.
     p50: int | None = None
     p90: int | None = None
     p99: int | None = None
@@ -245,8 +264,8 @@ async def _sample_curator(
             # 5. Per-ticket active_ms with cap subtraction.
             active_ms_list: list[float] = []
             for row in ticket_rows:
-                created_str = row[0] if isinstance(row, (tuple, list)) else row['created_at']
-                resolved_str = row[1] if isinstance(row, (tuple, list)) else row['resolved_at']
+                created_str = row[0]   # positional access works for both aiosqlite.Row and tuple
+                resolved_str = row[1]
                 if not created_str or not resolved_str:
                     continue
                 created_dt = datetime.fromisoformat(created_str)
@@ -397,21 +416,20 @@ async def collect_metrics_snapshot(
         curator = await _sample_curator(
             http_client, config, tickets_db, runs_dbs, now=now_dt,
         )
-        if curator is not None:
-            await conn.execute(
-                'INSERT OR REPLACE INTO curator_snapshots '
-                '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
-                'VALUES (?, ?, ?, ?, ?, ?)',
-                (
-                    now,
-                    curator['pending_total'],
-                    curator['capped_now'],
-                    curator['p50_active_ms'],
-                    curator['p90_active_ms'],
-                    curator['p99_active_ms'],
-                ),
-            )
-            await conn.commit()
+        await conn.execute(
+            'INSERT OR REPLACE INTO curator_snapshots '
+            '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (
+                now,
+                curator['pending_total'],
+                curator['capped_now'],
+                curator['p50_active_ms'],
+                curator['p90_active_ms'],
+                curator['p99_active_ms'],
+            ),
+        )
+        await conn.commit()
     except Exception:
         logger.warning('curator sampler failed', exc_info=True)
         with contextlib.suppress(Exception):
