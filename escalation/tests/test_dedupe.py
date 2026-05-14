@@ -101,9 +101,9 @@ class TestSummaryDedupeKey:
         The regex [^\\w\\s] also removes S* characters because none of Sm/Sc/Sk/So
         belong to \\w or \\s.  For example, the math-plus U+002B (Sm category) in
         'cpu+memory' is stripped, merging the two words into 'cpumemory'.
-        This test pins the chosen behaviour across three symbol subcategories
-        (Sm math, Sc currency) so any future narrowing of the regex is caught
-        immediately.
+        This test pins the chosen behaviour across two symbol subcategories
+        (Sm, Sc) using three examples so any future narrowing of the regex
+        is caught immediately.
         """
         from escalation.dedupe import summary_dedupe_key
 
