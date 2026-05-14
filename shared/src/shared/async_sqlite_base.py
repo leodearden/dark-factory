@@ -94,7 +94,7 @@ class AsyncSqliteBase(abc.ABC):
         """DDL string passed to executescript() when the store is opened."""
 
     async def open(self) -> None:
-        """Open persistent connection, set WAL + busy_timeout, ensure schema."""
+        """Open persistent connection, set WAL + Phase 3 durability triad, ensure schema."""
         async with self._lifecycle_lock:
             if self._conn is not None:
                 raise RuntimeError(f'{type(self).__name__} already opened')
@@ -110,7 +110,7 @@ class AsyncSqliteBase(abc.ABC):
                 conn_awaitable._thread.daemon = True
             conn = await conn_awaitable
             try:
-                await apply_wal_pragmas(conn, busy_timeout_ms=self.busy_timeout_ms)
+                await apply_full_durability_pragmas(conn, busy_timeout_ms=self.busy_timeout_ms)
                 await conn.executescript(self._schema)
             except BaseException:
                 await conn.close()

@@ -327,7 +327,7 @@ class TestAsyncSqliteBaseOpen:
         mock_conn.executescript = AsyncMock(side_effect=RuntimeError('schema failure'))
         mock_conn.close = AsyncMock()
 
-        with patch('shared.async_sqlite_base.apply_wal_pragmas', new=AsyncMock()), \
+        with patch('shared.async_sqlite_base.apply_full_durability_pragmas', new=AsyncMock()), \
              patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)), \
              pytest.raises(RuntimeError, match='schema failure'):
             await store.open()
