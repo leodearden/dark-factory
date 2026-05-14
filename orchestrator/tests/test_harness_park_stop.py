@@ -123,3 +123,32 @@ class TestHarnessPauseScheduler:
         mock_run_store.clear_scheduler_pause.assert_called_once()
         rows = _query_events(event_store, 'scheduler_resumed')
         assert len(rows) == 1, f'Expected 1 scheduler_resumed event; got {len(rows)}'
+
+
+class TestHarnessSchedulerParkStopWiring:
+    """Tests that Harness wires scheduler._on_park_stop_trip → Harness.pause_scheduler."""
+
+    @pytest.mark.asyncio
+    async def test_harness_wires_scheduler_park_stop_callback(self, tmp_path: Path) -> None:
+        """After Harness construction, scheduler._on_park_stop_trip must be set.
+
+        Calling the callback directly with a reason string must cause the
+        scheduler to become paused with that reason — proving that the callback
+        delegates to Harness.pause_scheduler and therefore to scheduler.pause().
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+
+        assert harness.scheduler._on_park_stop_trip is not None, (
+            'Harness must wire scheduler._on_park_stop_trip after construction'
+        )
+
+        # Call the callback directly (simulating a trip event fired by the scheduler).
+        await harness.scheduler._on_park_stop_trip('integration-reason')
+
+        assert harness.scheduler.is_paused is True, (
+            'Scheduler must be paused after the trip callback is invoked'
+        )
+        assert harness.scheduler.pause_reason == 'integration-reason', (
+            f'Expected pause_reason "integration-reason"; got {harness.scheduler.pause_reason!r}'
+        )
