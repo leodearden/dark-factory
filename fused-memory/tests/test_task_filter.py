@@ -1016,6 +1016,72 @@ class TestFormatFilteredTaskTree:
             f'(misattributes max_chars-truncated tasks to the max_tasks cap phrase).'
         )
 
+    def test_header_shown_zero_when_no_line_fits_positive_budget(self):
+        """Regression (task 1319): when budget > 0 but no single task line fits, the
+        header must report '0 active shown', not the pre-clamp active count.
+
+        This test exercises the lazy-drain branch of _select_visible_active_with_body
+        via the greedy-break route: budget is small and positive (> 0), but every
+        rendered task line is wider than the budget, so the greedy fill loop breaks
+        immediately without adding any line.  kept_lines ends up empty, which should
+        trigger a header rebuild reporting shown=0.
+
+        This branch is distinct from:
+          - budget <= 0: the entire budget block is skipped.
+          - partial-clamp: some lines fit, and kept_count > 0.
+
+        The test acts as a safety net for the step-2 consolidation (task 1319): if
+        the refactor accidentally drops the header rebuild for the empty-kept_lines
+        path, or if the single tail rebuild misroutes final_shown, this test will
+        fail with a non-zero shown count.
+
+        Setup:
+          - 5 active pending tasks, each with a 200-char title.
+            Rendered line format: '- [i] (pending) AAA...A deps=[]'
+            Each rendered line ≈ 224 chars (3+'i'+2+1+7+2+200+1+7).
+          - max_chars=120:
+            overhead = len(header) + len(summary_line) = 78 + 30 = 108
+            budget   = 120 - 108 = 12  (positive, but < 224-char task line)
+          Greedy loop: used(0) + len(line)(224) + 1 = 225 > 12 → break.
+          kept_lines = [] → lazy-drain branch → shown must be 0.
+        """
+        title = 'A' * 200
+        active = [_make_task(i, 'pending', title) for i in range(1, 6)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=5,
+        )
+
+        max_chars = 120
+        output = format_filtered_task_tree(tree, max_tasks=50, max_chars=max_chars)
+
+        # ── Sanity: verify that no task line was rendered in the body ── #
+        # Guards against accidentally falling into the partial-clamp or fast-path
+        # branches if surrounding-string lengths drift from the expected ~108-char
+        # overhead.
+        task_lines = re.findall(r'^- \[\d+\]', output, re.MULTILINE)
+        assert task_lines == [], (
+            f'Expected no task lines in output but found {len(task_lines)}. '
+            f'The test parameters may need adjusting if surrounding-string lengths changed. '
+            f'output={output!r}'
+        )
+
+        # ── Core regression: header shown count must be 0 when no line fits ── #
+        shown_match = re.search(r'\((\d+) active shown', output)
+        assert shown_match is not None, (
+            f'Header "(N active shown" phrase not found in output: {output!r}'
+        )
+        shown = int(shown_match.group(1))
+        assert shown == 0, (
+            f'Header shown={shown} but expected 0 for the lazy-drain branch '
+            f'(budget > 0 but no task line fits). '
+            f'The header must report the post-clamp visible count, '
+            f'not the pre-clamp active count.'
+        )
+
 
 class TestRenderActiveSection:
     """Tests for the render_active_section(tree) -> (list[dict], str) public helper.
