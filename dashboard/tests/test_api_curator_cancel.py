@@ -122,8 +122,8 @@ def test_not_found_returns_404(client):
         httpx.TimeoutException('timed out'),
         httpx.HTTPStatusError(
             '500 Internal Server Error',
-            request=MagicMock(),  # type: ignore[arg-type]
-            response=MagicMock(status_code=500),  # type: ignore[arg-type]
+            request=httpx.Request('POST', 'http://x'),
+            response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
         ),
         ValueError('bad MCP payload'),
     ],
@@ -172,7 +172,7 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
     public helper) rather than reaching into memory_data._sessions directly,
     ensuring the module-boundary contract introduced in task-1285/step-4.
     """
-    _INVALIDATE_TARGET = 'dashboard.data.memory.invalidate_session'
+    _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
 
     with (
