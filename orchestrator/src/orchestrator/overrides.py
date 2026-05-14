@@ -302,6 +302,11 @@ class OverrideStore:
         if isinstance(ordered_task_ids, str):
             ordered_task_ids = [t.strip() for t in ordered_task_ids.split(',')]
 
+        if len(ordered_task_ids) != len(set(ordered_task_ids)):
+            raise ValueError(
+                f'reorder_pin_queue: duplicate task ids in input: {ordered_task_ids!r}'
+            )
+
         current_pairs = self.get_pin_queue(project_root)
         current_ids = {tid for tid, _ in current_pairs}
         supplied_ids = set(ordered_task_ids)
