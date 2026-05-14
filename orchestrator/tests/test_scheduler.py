@@ -2,6 +2,7 @@
 
 
 import time
+from datetime import UTC
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -3985,8 +3986,8 @@ class TestPinDispatch:
         B is pinned pin_order=2 with a free module (eval/src).
         Result: B is dispatched.  A accumulates NO skip bookkeeping.
         """
-        from orchestrator.overrides import OverrideStore
         from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
 
         config = OrchestratorConfig(max_per_module=1)
         event_store = _RecordingEventStore()
@@ -4103,10 +4104,10 @@ class TestOverrideGCIntegration:
         A has a past TTL → must be cleared.
         B has a future TTL → must survive.
         """
-        from orchestrator.overrides import OverrideStore
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta
 
-        UTC = timezone.utc
+        from orchestrator.overrides import OverrideStore
+
         now_dt = datetime.now(UTC)
 
         config = OrchestratorConfig(max_per_module=1)
@@ -4157,8 +4158,8 @@ class TestOverrideEventEmission:
         Tick 2: boost='high' set on A → priority_override_set emitted.
         Tick 3: boost cleared → priority_override_cleared emitted.
         """
-        from orchestrator.overrides import OverrideStore
         from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
 
         config = OrchestratorConfig(max_per_module=1)
         event_store = _RecordingEventStore()
@@ -4226,8 +4227,8 @@ class TestOverrideEventEmission:
         Tick 3: reorder [B, A] → pin_queue_reordered with new_order=['B','A'].
         Tick 4: unpin A → task_unpinned for A.
         """
-        from orchestrator.overrides import OverrideStore
         from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
 
         config = OrchestratorConfig(max_per_module=1)
         event_store = _RecordingEventStore()

@@ -1464,8 +1464,8 @@ class Scheduler:
 
     def _emit_override_diff_events(
         self,
-        prev: dict[str, 'OverrideRow'],
-        cur: dict[str, 'OverrideRow'],
+        prev: dict[str, OverrideRow],
+        cur: dict[str, OverrideRow],
     ) -> None:
         """Diff prev vs cur override snapshots and emit override change events.
 

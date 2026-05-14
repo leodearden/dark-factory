@@ -122,7 +122,7 @@ class TestPinning:
         assert overrides['D'].pin_order == 6
 
     def test_pin_order_collision_raises_with_both_ids(self, tmp_path: Path) -> None:
-        from orchestrator.overrides import PinOrderCollision, OverrideStore
+        from orchestrator.overrides import OverrideStore, PinOrderCollision
 
         store = OverrideStore(tmp_path / 'scheduler_overrides.db')
         store.set_override('proj', 'A', pinned=True, pin_order=3)
