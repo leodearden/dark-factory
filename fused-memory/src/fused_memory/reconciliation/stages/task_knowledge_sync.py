@@ -1408,9 +1408,10 @@ class TaskKnowledgeSync(BaseStage):
         hint_conversion_section = ''
         if not self.remediation_mode:
             # Slice to the same window rendered by format_filtered_task_tree
-            # (slice-then-filter): ensures hint section and Active Task Tree
-            # always reference the same set of task IDs — no cross-reference
-            # inconsistency when active_tasks exceeds MAX_ACTIVE_TASKS_RENDERED.
+            # (slice-then-filter): parity holds under the MAX_ACTIVE_TASKS_RENDERED
+            # cap but NOT under format_filtered_task_tree's max_chars clamp — when
+            # that secondary clamp fires, a few tail-position tasks may appear in
+            # the hint section but be absent from the rendered tree.
             visible_active = filtered.active_tasks[:MAX_ACTIVE_TASKS_RENDERED]
             tasks_needing_hint_attention = [
                 t for t in visible_active if _needs_hint_conversion(t)
@@ -1543,6 +1544,11 @@ class TaskKnowledgeSync(BaseStage):
 
         known_projects_section = self._format_known_projects_section()
 
+        # Step 5 in the Your Task block below ("append=False for hint conversion")
+        # is grounded in Mem0 memory 0b0eeb8d (old-wins semantics for list-format
+        # hints under append=True).  The memory id is kept here rather than in
+        # the prompt string so the LLM is not burdened with an opaque reference
+        # it cannot look up, and the traceability survives prompt rewording.
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
@@ -1569,7 +1575,7 @@ delete tasks. Update dependent tasks.
 Use entity references + semantic queries, NOT inline content.
 5. For tasks listed in **Tasks Needing Memory Hint Attention**: use read-modify-write with \
 `append=False` when writing memory_hints — Stage 2's default `append=True` merge silently \
-discards legacy list-format hints under old-wins semantics (Mem0 memory note `0b0eeb8d`).
+discards legacy list-format hints under old-wins semantics.
 6. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
 in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
 that may now be met, and done tasks for missing knowledge capture.
