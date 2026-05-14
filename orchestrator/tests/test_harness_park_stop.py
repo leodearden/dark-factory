@@ -304,3 +304,49 @@ class TestParkStopE2E:
             f'Expected persisted reason {persisted_reason!r}; '
             f'got {harness2.scheduler.pause_reason!r}'
         )
+
+
+class TestInFlightTasksFinishNaturallyWhenPaused:
+    """Validates the design claim: 'In-flight agents finish gracefully when paused.'
+
+    Pausing only gates acquire_next() — it must NOT cancel active workflow tasks.
+    """
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_returns_none_when_paused_and_inflight_tasks_complete(
+        self, tmp_path: Path
+    ) -> None:
+        """Paused scheduler: acquire_next() returns None; existing tasks complete normally.
+
+        Builds two fake in-flight asyncio Tasks (each just yields once via
+        sleep(0) and returns a sentinel result).  Asserts:
+        (a) acquire_next() returns None — no new dispatch.
+        (b) Both Tasks complete normally — pause does not cancel them.
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+
+        # Pause the scheduler.
+        harness.scheduler.pause('test-pause-inflight')
+
+        # Create two fake in-flight workflow tasks that just yield and finish.
+        async def _fake_workflow(sentinel: str) -> str:
+            await asyncio.sleep(0)
+            return sentinel
+
+        task_a = asyncio.create_task(_fake_workflow('result-a'))
+        task_b = asyncio.create_task(_fake_workflow('result-b'))
+
+        # (a) acquire_next() must return None while paused.
+        result = await harness.scheduler.acquire_next()
+        assert result is None, (
+            f'acquire_next() must return None when paused; got {result!r}'
+        )
+
+        # (b) Pre-existing tasks must complete without cancellation.
+        result_a = await task_a
+        result_b = await task_b
+        assert result_a == 'result-a', f'task_a was cancelled or failed: {result_a!r}'
+        assert result_b == 'result-b', f'task_b was cancelled or failed: {result_b!r}'
+        assert not task_a.cancelled(), 'task_a must not have been cancelled by the pause'
+        assert not task_b.cancelled(), 'task_b must not have been cancelled by the pause'
