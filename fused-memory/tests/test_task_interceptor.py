@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2924,7 +2925,7 @@ async def test_set_task_status_holds_lock_across_read_and_write(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    bool(__import__('os').environ.get('PYTEST_XDIST_WORKER')),
+    bool(os.environ.get('PYTEST_XDIST_WORKER')),
     reason='latency threshold unreliable under xdist I/O contention; run without -n to exercise this guard',
 )
 async def test_single_call_latency_smoke(
@@ -2936,11 +2937,16 @@ async def test_single_call_latency_smoke(
     no contention finishes within a 5 s budget, confirming the lock itself
     adds no significant per-call overhead.
 
+    Observed single-worker runtime is ~0.6 s (pure in-process AsyncMock
+    I/O), so the 5 s ceiling gives roughly 8x headroom — wide enough to
+    absorb CI noise while still catching 2-3x regressions.
+
     Skipped automatically when PYTEST_XDIST_WORKER is set: SQLite disk I/O
     contention from 32 concurrent workers inflated the worst-case to 11.3 s,
     making a meaningful threshold flaky.  Running in single-worker mode keeps
-    the bound deterministic and catches genuine regressions (not just
-    orders-of-magnitude blowups).
+    the bound deterministic.  To exercise this guard in CI, invoke pytest
+    without the -n flag in a dedicated single-worker step, e.g.:
+    ``pytest fused-memory/tests/test_task_interceptor.py::test_single_call_latency_smoke``
     """
     import time
 
