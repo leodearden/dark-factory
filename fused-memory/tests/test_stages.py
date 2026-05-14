@@ -7705,3 +7705,29 @@ class TestStage2HintConversionDetection:
         assert '[50]' in active_section, (
             'Task 50 must appear in Active Task Tree section'
         )
+
+    @pytest.mark.asyncio
+    async def test_hint_section_suppressed_in_remediation_mode(
+        self, mock_deps, watermark
+    ):
+        """hint_conversion_section must be absent when remediation_mode=True.
+
+        Mirrors test_proactive_sample_skipped_in_remediation_mode: the
+        hint-attention section is a 'general sync' activity and must not
+        surface during focused remediation runs.
+        """
+        task = self._make_task_with_hints(
+            11, 'in-progress', [{'entity': 'X', 'query': 'q'}]
+        )
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.remediation_mode = True
+        stage.filtered_task_tree = self._make_tree([task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER not in payload, (
+            f'Hint conversion section must be absent in remediation_mode=True.\n'
+            f'Payload snippet: {payload[:3000]!r}'
+        )
