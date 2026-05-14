@@ -159,3 +159,49 @@ class TestPinQueue:
 
         # D must not appear in the pin queue
         assert all(tid != 'D' for tid, _ in queue)
+
+
+class TestClear:
+    def test_clear_override_none_deletes_row(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', boost_tier='high', pinned=True)
+
+        result = store.clear_override('proj', 'A')
+        assert result is True
+        assert 'A' not in store.get_overrides('proj')
+
+    def test_clear_override_field_boost_tier_keeps_row(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', boost_tier='high', pinned=True)
+
+        result = store.clear_override('proj', 'A', field='boost_tier')
+        assert result is True
+
+        overrides = store.get_overrides('proj')
+        assert 'A' in overrides
+        assert overrides['A'].boost_tier is None
+        assert overrides['A'].pinned is True
+
+    def test_clear_override_field_pinned_clears_pin_order_too(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=2)
+
+        store.clear_override('proj', 'A', field='pinned')
+
+        overrides = store.get_overrides('proj')
+        assert 'A' in overrides
+        assert overrides['A'].pinned is False
+        assert overrides['A'].pin_order is None
+
+    def test_clear_override_missing_row_returns_false(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        result = store.clear_override('proj', 'nonexistent')
+        assert result is False
