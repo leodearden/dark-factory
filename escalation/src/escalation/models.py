@@ -28,6 +28,8 @@ class Escalation:
     resolved_at: str | None = None
     resolved_by: str | None = None  # "steward" | "interactive" | "auto-dismissed"
     resolution_turns: int | None = None  # conversation turns to resolve
+    dedupe_count: int = 0  # number of duplicate submissions folded into this parent
+    dedupe_children: list[str] = field(default_factory=list)  # ids of folded duplicates
 
     def to_dict(self) -> dict:
         return asdict(self)
