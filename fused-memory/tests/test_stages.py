@@ -1334,6 +1334,17 @@ class TestNeedsHintConversion:
         task = self._make_task({'entities': ['Foo'], 'queries': ['what is Foo']})
         assert _needs_hint_conversion(task) is False
 
+    def test_truthy_non_dict_non_list_memory_hints_not_flagged(self):
+        """Truthy non-list, non-dict values (string, int) return False — pins branch-3 contract.
+
+        Per design decision 4 in plan 1275: the three-branch pseudo-code's 'else' clause is
+        unconditional for any truthy non-list value; adding an isinstance(task_hints, dict) guard
+        to flag malformed scalars is a separable robustness concern deferred to a follow-up task.
+        This test documents the current contract so future narrowing is a deliberate, visible change.
+        """
+        assert _needs_hint_conversion(self._make_task('oops')) is False
+        assert _needs_hint_conversion(self._make_task(42)) is False
+
     # ------------------------------------------------------------------ defensive edge cases
 
     def test_task_without_metadata_key_classified_as_conversion_target(self):
