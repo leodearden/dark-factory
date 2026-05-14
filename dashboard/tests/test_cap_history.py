@@ -388,10 +388,10 @@ class TestMergeAllAccountsCapped:
         """A:[t1,t2) and B:[t2,t3) merely touch at t2 → no merged window.
 
         Under half-open semantics, touching intervals share a single boundary
-        point but have no common interior.  The zero-width filter at L241 of
-        cap_history.py drops any merged window where start == end, so this
-        correctly returns [].  This characterization test pins that behaviour:
-        if the filter or sort is changed, this test will fail loudly.
+        point but have no common interior.  The zero-width filter at the end of
+        merge_all_accounts_capped drops any merged window where start == end,
+        so this correctly returns [].  This characterization test pins that
+        behaviour: if the filter or sort is changed, this test will fail loudly.
         """
         now = datetime.now(UTC)
         t1 = now - timedelta(hours=3)
