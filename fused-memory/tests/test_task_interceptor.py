@@ -5805,12 +5805,18 @@ async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
     race by persisting status='cancelled' BEFORE forwarding the worker's
     mark_resolved(status='created') call.  The worker's call therefore returns
     False.  We assert that a WARNING record exists whose message contains both
-    the ticket_id and the task_id returned by tm.add_task (fixture default
-    '2').
+    the ticket_id and the distinctive task_id 'task-orphan-99' returned by
+    tm.add_task (overridden below), and that the message uses the neutral
+    'orphan-race:' label rather than the misleading '_process_add_ticket:' prefix.
 
-    RED: no such WARNING is currently emitted.
+    RED: the WARNING message currently starts with '_process_add_ticket: orphan-race'
+    instead of the neutral 'orphan-race:' label.
     """
     import logging
+
+    # Override add_task to return a distinctive id that can't accidentally match
+    # other tokens in the log message.
+    taskmaster.add_task.return_value = {'id': 'task-orphan-99', 'title': 'New Task'}
 
     ticket_id = await ticket_store.submit(
         project_id='project',
@@ -5840,16 +5846,27 @@ async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
     finally:
         ticket_store.mark_resolved = original_mark_resolved
 
-    # (a) WARNING record must contain both ticket_id and orphan task_id '2'
+    # (a) WARNING record must contain both ticket_id and orphan task_id 'task-orphan-99'
     warning_records = [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING and ticket_id in r.message and '2' in r.message
+        if r.levelno == logging.WARNING
+        and ticket_id in r.message
+        and 'task-orphan-99' in r.message
     ]
     assert warning_records, (
-        f'Expected a WARNING containing ticket_id={ticket_id!r} and task_id="2"; '
+        f'Expected a WARNING containing ticket_id={ticket_id!r} and task_id="task-orphan-99"; '
         f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
     )
+
+    # (a') WARNING must use the neutral 'orphan-race:' label, NOT '_process_add_ticket:'
+    for r in warning_records:
+        assert 'orphan-race:' in r.message, (
+            f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
+        )
+        assert '_process_add_ticket:' not in r.message, (
+            f'Expected WARNING to NOT contain "_process_add_ticket:" but got: {r.message!r}'
+        )
 
     # (b) Row status is 'cancelled' (cancel_ticket won the race)
     row = await ticket_store.get(ticket_id)
@@ -6001,3 +6018,12 @@ async def test_persist_worker_terminal_orphan_race_emits_warning(
         f'task_id={orphan_task_id!r}; '
         f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
     )
+
+    # WARNING must use the neutral 'orphan-race:' label, NOT '_process_add_ticket:'
+    for r in warning_records:
+        assert 'orphan-race:' in r.message, (
+            f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
+        )
+        assert '_process_add_ticket:' not in r.message, (
+            f'Expected WARNING to NOT contain "_process_add_ticket:" but got: {r.message!r}'
+        )
