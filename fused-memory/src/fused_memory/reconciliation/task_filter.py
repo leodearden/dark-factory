@@ -408,21 +408,24 @@ def _select_visible_active_with_body(
       1. Build surroundings via _build_surrounding (always, even for empty active).
       2. Slice active = tree.active_tasks[:max_tasks]; return ([], None, ...) if empty.
       3. Render all lines; if full result fits, return (active, body, ...).
-      4. Compute budget = max_chars - overhead; return ([], None, ...) if budget <= 0.
+      4. Compute budget = max_chars - overhead; greedy fill + lazy pop run only
+         when budget > 0 (kept_lines stays empty when budget <= 0).
       5. Greedy fill kept_lines while cumulative cost <= budget.
       6. Lazy verification: pop lines until the realised result fits or
          kept_lines is drained.
-      7. Rebuild header with shown_override=len(visible) so the header's 'shown'
-         count matches the post-clamp body length, then return.
+      7. Single tail rebuild: compute final_shown = len(kept_lines) (0 on both
+         empty-kept_lines paths; partial-clamp count otherwise) and call
+         _format_header exactly once.  Two terminal returns share the rebuilt
+         header.
     """
     header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
 
     active = tree.active_tasks[:max_tasks]
     # omitted_active is constant across this function (depends only on the
     # max_tasks cap, not on how many lines survive the max_chars clamp).
-    # Pre-compute once so the three header-rebuild sites below can call
-    # _format_header directly without re-running the cancelled-section /
-    # summary-line logic inside _build_surrounding.
+    # Pre-computed here so the single tail _format_header call can use it
+    # without re-running the cancelled-section / summary-line logic inside
+    # _build_surrounding.
     omitted_active = len(tree.active_tasks) - len(active)
 
     if not active:
@@ -438,54 +441,46 @@ def _select_visible_active_with_body(
         return active, body, header, cancelled_section, summary_line
 
     # ── Budget-capped path ── #
-    budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
-    if budget <= 0:
-        # Rebuild header: pre-clamp shown overstates when the surrounding strings
-        # alone exhaust the budget.  The rebuilt header is monotonically <= the
-        # pre-clamp header (post-clamp shown=0 <= pre-clamp shown, so digit count
-        # can only stay the same or decrease), so it can only reduce the overrun —
-        # it does not guarantee the assembly fits max_chars (the assembly was already
-        # over budget before any body lines were added).
-        header = _format_header(0, omitted_active, tree)
-        return [], None, header, cancelled_section, summary_line
-
-    # Greedy fill.
     kept_lines: list[str] = []
-    used = 0
-    for line in lines:
-        if used + len(line) + 1 > budget:
-            break
-        kept_lines.append(line)
-        used += len(line) + 1
+    result_body: str | None = None
+    budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
 
-    # Lazy verification: recompute real truncation-notice length and pop until
-    # the realised result fits or kept_lines is exhausted.
-    trimmed_count = len(active) - len(kept_lines)
-    trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
-    result_body = '\n'.join(kept_lines) + trunc_notice
-    result = header + result_body + cancelled_section + summary_line
-    while len(result) > max_chars and kept_lines:
-        kept_lines.pop()
+    if budget > 0:
+        # Greedy fill.
+        used = 0
+        for line in lines:
+            if used + len(line) + 1 > budget:
+                break
+            kept_lines.append(line)
+            used += len(line) + 1
+
+        # Lazy verification: recompute real truncation-notice length and pop until
+        # the realised result fits or kept_lines is exhausted.
         trimmed_count = len(active) - len(kept_lines)
         trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
         result_body = '\n'.join(kept_lines) + trunc_notice
         result = header + result_body + cancelled_section + summary_line
+        while len(result) > max_chars and kept_lines:
+            kept_lines.pop()
+            trimmed_count = len(active) - len(kept_lines)
+            trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
+            result_body = '\n'.join(kept_lines) + trunc_notice
+            result = header + result_body + cancelled_section + summary_line
+
+    # Single tail rebuild: final_shown = len(kept_lines) is 0 on both
+    # empty-kept_lines paths (budget <= 0 and lazy-drain), and equals the
+    # partial-clamp count otherwise.  The rebuilt header is monotonically <=
+    # the pre-clamp header (post-clamp shown <= pre-clamp shown, so digit count
+    # can only stay the same or decrease); for the partial-clamp case the
+    # lazy-pop loop already established len(result) <= max_chars with the
+    # strictly longer pre-clamp header, so no additional pop iterations are
+    # needed after the rebuild.
+    final_shown = len(kept_lines)
+    header = _format_header(final_shown, omitted_active, tree)
 
     if not kept_lines:
-        # Rebuild header: pre-clamp shown overstates when lazy loop drained all lines.
-        # Same monotonic-shrink guarantee as the budget<=0 path above.
-        header = _format_header(0, omitted_active, tree)
         return [], None, header, cancelled_section, summary_line
-
-    # Rebuild header with the post-clamp visible count so the header's 'shown'
-    # field agrees with the number of task lines actually in result_body.
-    # Use _format_header directly (cancelled_section / summary_line are unchanged).
-    # This is safe because post-clamp shown <= pre-clamp shown, so the rebuilt
-    # header is at most as long as the pre-clamp header; the lazy-pop loop above
-    # already established len(result) <= max_chars with the strictly longer
-    # pre-clamp header, so no additional pop iterations are needed.
-    header = _format_header(len(kept_lines), omitted_active, tree)
-    return active[: len(kept_lines)], result_body, header, cancelled_section, summary_line
+    return active[:len(kept_lines)], result_body, header, cancelled_section, summary_line
 
 
 def select_visible_active(
