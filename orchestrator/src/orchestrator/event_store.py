@@ -78,6 +78,13 @@ class EventType(StrEnum):
     reservation_used = 'reservation_used'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
 
+    # Scheduler priority overrides
+    priority_override_set = 'priority_override_set'
+    priority_override_cleared = 'priority_override_cleared'
+    task_pinned = 'task_pinned'
+    task_unpinned = 'task_unpinned'
+    pin_queue_reordered = 'pin_queue_reordered'
+
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
 

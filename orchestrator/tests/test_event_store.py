@@ -164,3 +164,26 @@ class TestEventStore:
         assert len(rows) == 3
         assert rows[0][0] == 'implementer'
         assert rows[0][1] == 0.50
+
+
+class TestSchedulerOverrideEventTypes:
+    """Assert the five priority-override event types exist on EventType.
+
+    Collapsed from five separate assertions into a single membership check.
+    The scheduler integration tests (TestOverrideEventEmission) exercise the
+    actual emission behavior end-to-end; this test only guards against the
+    enum members being accidentally removed.
+    """
+
+    def test_override_event_types_are_present(self) -> None:
+        expected = {
+            'priority_override_set',
+            'priority_override_cleared',
+            'task_pinned',
+            'task_unpinned',
+            'pin_queue_reordered',
+        }
+        actual = {m.name for m in EventType}
+        assert expected <= actual, (
+            f'Missing EventType members: {expected - actual}'
+        )

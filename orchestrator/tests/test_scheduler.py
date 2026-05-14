@@ -2,6 +2,7 @@
 
 
 import time
+from datetime import UTC
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -3042,6 +3043,73 @@ class TestPriorityInheritance:
         assert eff['10'] == 'medium'
 
 
+class TestPriorityOverrideBoostOverlay:
+    """Boost overlay composes with the existing min-rank race in _compute_effective_priorities."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        return Scheduler(OrchestratorConfig(max_per_module=1))
+
+    def test_boost_overlay_lifts_own_priority(self, scheduler: Scheduler):
+        """A boost_tier above the task's own tier becomes the effective priority."""
+        task_a = _pending_task('A', priority='medium')
+        by_id = {'A': task_a}
+        rev = scheduler._build_reverse_index([task_a])
+        status_map = {'A': 'pending'}
+
+        eff = scheduler._compute_effective_priorities(
+            by_id, rev, status_map, override_boosts={'A': 'critical'}
+        )
+        assert eff['A'] == 'critical'
+
+    def test_boost_overlay_composes_with_inheritance(self, scheduler: Scheduler):
+        """Boost + own + inherited priority all race; highest-rank wins.
+
+        base='medium', dependent='critical', boost='high':
+        best-rank = min(rank[medium], rank[critical], rank[high]) = rank[critical]
+        """
+        base = _pending_task('base', priority='medium')
+        consumer = _pending_task('consumer', priority='critical', deps=['base'])
+        tasks = [base, consumer]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+
+        eff = scheduler._compute_effective_priorities(
+            by_id, rev, status_map, override_boosts={'base': 'high'}
+        )
+        # inherited 'critical' beats own 'medium' and boost 'high'
+        assert eff['base'] == 'critical'
+
+    def test_boost_overlay_loses_to_higher_own(self, scheduler: Scheduler):
+        """A boost lower than the task's own tier has no effect."""
+        task_a = _pending_task('A', priority='critical')
+        by_id = {'A': task_a}
+        rev = scheduler._build_reverse_index([task_a])
+        status_map = {'A': 'pending'}
+
+        eff = scheduler._compute_effective_priorities(
+            by_id, rev, status_map, override_boosts={'A': 'high'}
+        )
+        assert eff['A'] == 'critical'
+
+    def test_compute_effective_priorities_default_overrides_none(
+        self, scheduler: Scheduler
+    ):
+        """Omitting override_boosts (default None) preserves existing behavior."""
+        base = _pending_task('10', priority='medium')
+        consumer = _pending_task('11', priority='critical', deps=['10'])
+        tasks = [base, consumer]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+
+        # No override_boosts kwarg — must not raise
+        eff = scheduler._compute_effective_priorities(by_id, rev, status_map)
+        assert eff['10'] == 'critical'
+        assert eff['11'] == 'critical'
+
+
 class TestTransitiveDependents:
     """P3: BFS over the reverse-dependency graph, no double-count."""
 
@@ -3749,3 +3817,658 @@ class TestSchedulerV2Config:
         """EventType.reservation_evicted must be defined for cross-tier preemption."""
         assert hasattr(EventType, 'reservation_evicted')
         assert EventType.reservation_evicted == 'reservation_evicted'
+
+
+class TestReserveNowShortCircuit:
+    """reserve_now=True installs parks at the top of acquire_next and auto-clears."""
+
+    @pytest.mark.asyncio
+    async def test_reserve_now_installs_parks_and_clears_field(self, tmp_path):
+        """reserve_now fires install_parks for the task then clears the flag.
+
+        A's modules are pre-held by a 'seed' task so A cannot be dispatched in
+        the normal scored loop, ensuring parks survive the tick (they would
+        otherwise be cleared when A dispatches successfully as top candidate).
+        B uses different modules and IS dispatched.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'A', reserve_now=True)
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        # Pre-hold A's modules so A cannot acquire them this tick.
+        scheduler.lock_table._held['seed'] = {'compiler/src', 'eval/src'}
+        scheduler._dispatched.add('seed')  # seed is treated as already dispatched
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['compiler/src', 'eval/src']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['other/module']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+
+        # (a) A must have parks installed — A was blocked so parks were NOT cleared.
+        assert scheduler.lock_table.has_parks('A')
+
+        # (b) The parks must cover A's modules (look inside _parked).
+        parked_owners = {
+            m: owner for m, (owner, _rank) in scheduler.lock_table._parked.items()
+        }
+        assert 'compiler/src' in parked_owners
+        assert parked_owners['compiler/src'] == 'A'
+        assert 'eval/src' in parked_owners
+        assert parked_owners['eval/src'] == 'A'
+
+        # (c) reserve_now flag must be cleared in the store.
+        overrides = store.get_overrides('/proj')
+        if 'A' in overrides:
+            assert overrides['A'].reserve_now is False
+
+        # (d) B was dispatched since A's modules were locked out.
+        assert result is not None
+        assert result.task_id == 'B'
+
+
+class TestSchedulerOverrideStoreInjection:
+    """Scheduler accepts an optional OverrideStore kwarg; when None, behaves as today."""
+
+    def test_init_accepts_override_store_kwarg_default_none(self):
+        """Scheduler(config) sets _override_store=None by default."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        assert scheduler._override_store is None
+
+    def test_init_accepts_explicit_override_store(self, tmp_path):
+        """Scheduler(config, override_store=...) stores the instance."""
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'overrides.db')
+        scheduler = Scheduler(config, override_store=store)
+        assert scheduler._override_store is store
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_queries_override_store_when_present(self, tmp_path):
+        """acquire_next() runs without error when an override_store is wired in."""
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'overrides.db')
+        # Set a boost on task A so the override code path is exercised.
+        store.set_override('/proj', 'A', boost_tier='critical')
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        result = await scheduler.acquire_next()
+        # A should be dispatched (no competing tasks, no lock conflicts).
+        assert result is not None
+        assert result.task_id == 'A'
+
+
+class TestSchedulerOverrideRestartSemantics:
+    """First-tick snapshot seeding: no spurious events on scheduler restart."""
+
+    @pytest.mark.asyncio
+    async def test_first_tick_does_not_emit_spurious_events_for_preexisting_overrides(
+        self, tmp_path
+    ):
+        """On scheduler restart with pre-existing overrides, the first tick must not
+        emit priority_override_set / task_pinned events for already-persisted rows.
+
+        Those rows represent state that was already known before the restart — not
+        fresh user actions.  Emitting them would spam downstream consumers and
+        confuse them into treating a restart as a batch of new user commands.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        # Simulate state that existed BEFORE the scheduler started (e.g. written
+        # by a previous process or by the MCP tool while the scheduler was down).
+        store.set_override('/proj', 'A', boost_tier='high')
+        store.set_override('/proj', 'B', pinned=True)
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        task_a = _pending_task('A', priority='medium', files=['a/src'])
+        task_b = _pending_task('B', priority='medium', files=['b/src'])
+
+        # Lock both modules so no task can dispatch (focus on event semantics).
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()  # first tick — snapshot seeded
+
+        override_event_types = {
+            EventType.priority_override_set.value,
+            EventType.priority_override_cleared.value,
+            EventType.task_pinned.value,
+            EventType.task_unpinned.value,
+            EventType.pin_queue_reordered.value,
+        }
+        spurious = [e for e in event_store.events if e[0] in override_event_types]
+        assert spurious == [], (
+            f'First tick must not emit override events for pre-existing rows; '
+            f'got: {spurious}'
+        )
+
+        # Second tick: change a boost → that change MUST emit an event.
+        store.set_override('/proj', 'A', boost_tier='critical')
+        await scheduler.acquire_next()
+
+        set_events = [
+            e for e in event_store.events
+            if e[0] == EventType.priority_override_set.value
+        ]
+        assert len(set_events) == 1, (
+            f'Second tick after a boost change should emit priority_override_set; '
+            f'got: {set_events}'
+        )
+        assert set_events[0][1]['task_id'] == 'A'
+        assert set_events[0][1]['data']['boost_tier'] == 'critical'
+
+
+class TestPinDispatch:
+    """Pinned tasks dispatch ahead of all scored candidates, bypassing fairness."""
+
+    @pytest.mark.asyncio
+    async def test_pin_dispatches_ahead_of_higher_scored_candidate(self, tmp_path):
+        """A pinned low-priority task wins dispatch over an unpin critical-priority task.
+
+        Without pin: B (critical) would score higher and be dispatched first.
+        With pin on A: A must dispatch even though B has a far higher score.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        # Pin A (low priority) — it should dispatch ahead of B (critical).
+        store.set_override('/proj', 'A', pinned=True)
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A (pinned, low)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['x/src']},
+            'priority': 'low',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B (critical, not pinned)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['y/src']},
+            'priority': 'critical',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+
+        # Pinned A must dispatch first, even though B scores higher due to critical priority.
+        assert result is not None
+        assert result.task_id == 'A'
+
+    @pytest.mark.asyncio
+    async def test_multiple_pins_dispatch_in_pin_order_and_lockout_falls_through(
+        self, tmp_path
+    ):
+        """When the first pinned task is locked out, scheduler falls through to next pin.
+
+        A is pinned pin_order=1 but its module (compiler/src) is already held by 'seed'.
+        B is pinned pin_order=2 with a free module (eval/src).
+        Result: B is dispatched.  A accumulates NO skip bookkeeping.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+        # Pin A first (auto pin_order=1), then B (auto pin_order=2).
+        store.set_override('/proj', 'A', pinned=True)
+        store.set_override('/proj', 'B', pinned=True)
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        # Pre-hold A's module so A cannot acquire it this tick.
+        scheduler.lock_table._held['seed'] = {'compiler/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A (pinned 1, locked out)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['compiler/src']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B (pinned 2, free)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['eval/src']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+
+        # A was locked out → fall through to B (next pinned candidate).
+        assert result is not None
+        assert result.task_id == 'B'
+
+        # A must have accumulated NO skip bookkeeping.
+        assert scheduler._skip_count.get('A', 0) == 0
+
+        # No task_skipped event must have been emitted for A.
+        skipped_for_a = [
+            e for e in event_store.events
+            if e[0] == EventType.task_skipped.value and e[1].get('task_id') == 'A'
+        ]
+        assert skipped_for_a == [], f'Unexpected task_skipped events for A: {skipped_for_a}'
+
+
+class TestOverrideGCIntegration:
+    """GC sweep clears overrides for terminal tasks and expired TTLs."""
+
+    @pytest.mark.asyncio
+    async def test_park_gc_pass_calls_clear_terminal_for_terminal_owners(
+        self, tmp_path
+    ):
+        """acquire_next() GC sweep removes overrides for done/cancelled tasks.
+
+        A = pending (boost override must survive).
+        B = done    (override must be removed by GC).
+        C = cancelled (override must be removed by GC).
+        """
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'A', boost_tier='high')
+        store.set_override('/proj', 'B', boost_tier='critical')
+        store.set_override('/proj', 'C', boost_tier='medium')
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'files': ['mod_b']},
+            'priority': 'medium',
+        }
+        task_c = {
+            'id': 'C',
+            'title': 'Task C',
+            'status': 'cancelled',
+            'dependencies': [],
+            'metadata': {'files': ['mod_c']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b, task_c])
+
+        await scheduler.acquire_next()
+
+        overrides_after = store.get_overrides('/proj')
+        # A (pending) still has its override.
+        assert 'A' in overrides_after
+        # B (done) and C (cancelled) must have been swept.
+        assert 'B' not in overrides_after
+        assert 'C' not in overrides_after
+
+    @pytest.mark.asyncio
+    async def test_ttl_sweep_calls_clear_expired(self, tmp_path):
+        """acquire_next() GC sweep removes overrides whose TTL has elapsed.
+
+        A has a past TTL → must be cleared.
+        B has a future TTL → must survive.
+        """
+        from datetime import datetime, timedelta
+
+        from orchestrator.overrides import OverrideStore
+
+        now_dt = datetime.now(UTC)
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        # A expired 1 hour ago.
+        store.set_override('/proj', 'A', boost_tier='high', ttl_until=now_dt - timedelta(hours=1))
+        # B expires 1 hour from now.
+        store.set_override('/proj', 'B', boost_tier='critical', ttl_until=now_dt + timedelta(hours=1))
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A (expired TTL)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B (future TTL)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_b']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        await scheduler.acquire_next()
+
+        overrides_after = store.get_overrides('/proj')
+        # A's TTL has elapsed — must be swept.
+        assert 'A' not in overrides_after
+        # B's TTL is in the future — must survive.
+        assert 'B' in overrides_after
+
+
+class TestOverrideEventEmission:
+    """Scheduler emits priority_override_* events via per-tick diff-detection."""
+
+    @pytest.mark.asyncio
+    async def test_priority_override_set_and_cleared_diff_events(self, tmp_path):
+        """Diff-detect fires priority_override_set when boost appears, cleared when it goes.
+
+        Tick 1: no override → no event.
+        Tick 2: boost='high' set on A → priority_override_set emitted.
+        Tick 3: boost cleared → priority_override_cleared emitted.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+
+        # Tick 1: no override set → no priority_override_* events.
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        override_events_after_tick1 = [
+            e for e in event_store.events
+            if e[0].startswith('priority_override_')
+        ]
+        assert override_events_after_tick1 == [], (
+            f'Expected no override events after tick 1, got: {override_events_after_tick1}'
+        )
+
+        # Tick 2: set boost='high' on A → priority_override_set must fire.
+        store.set_override('/proj', 'A', boost_tier='high')
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        override_events_after_tick2 = [
+            e for e in event_store.events
+            if e[0] == EventType.priority_override_set.value
+        ]
+        assert len(override_events_after_tick2) == 1, (
+            f'Expected 1 priority_override_set event, got: {override_events_after_tick2}'
+        )
+        ev2 = override_events_after_tick2[0]
+        assert ev2[1]['task_id'] == 'A'
+        assert ev2[1]['data'].get('boost_tier') == 'high'
+
+        # Tick 3: clear boost → priority_override_cleared must fire.
+        store.clear_override('/proj', 'A', field='boost_tier')
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        override_events_after_tick3 = [
+            e for e in event_store.events
+            if e[0] == EventType.priority_override_cleared.value
+        ]
+        assert len(override_events_after_tick3) == 1, (
+            f'Expected 1 priority_override_cleared event, got: {override_events_after_tick3}'
+        )
+        ev3 = override_events_after_tick3[0]
+        assert ev3[1]['task_id'] == 'A'
+
+    @pytest.mark.asyncio
+    async def test_pin_unpin_and_reorder_events(self, tmp_path):
+        """Diff-detect fires task_pinned, task_unpinned, and pin_queue_reordered events.
+
+        Tick 1: pin A → task_pinned for A (pin_order=1).
+        Tick 2: pin B → task_pinned for B (pin_order=2).
+        Tick 3: reorder [B, A] → pin_queue_reordered with new_order=['B','A'].
+        Tick 4: unpin A → task_unpinned for A.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        # Pre-hold all modules so no task can dispatch (focus is purely on events).
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending',
+            'dependencies': [], 'metadata': {'files': ['a/src']}, 'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B', 'title': 'Task B', 'status': 'pending',
+            'dependencies': [], 'metadata': {'files': ['b/src']}, 'priority': 'medium',
+        }
+
+        def events_of_type(et):
+            return [e for e in event_store.events if e[0] == et.value]
+
+        # Seed tick: initialise the override snapshot so that the subsequent
+        # ticks can diff-detect changes.  On the very first tick the scheduler
+        # skips diff-emit (Suggestion 3 — restart semantics) and seeds the
+        # snapshot as empty.  All real assertions start from tick 1 onwards.
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+        assert events_of_type(EventType.task_pinned) == [], 'Seed tick must emit no events'
+
+        # Tick 1: pin A (auto pin_order=1)
+        store.set_override('/proj', 'A', pinned=True)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        await scheduler.acquire_next()
+
+        pinned_after_t1 = events_of_type(EventType.task_pinned)
+        assert len(pinned_after_t1) == 1, f'Expected 1 task_pinned after tick 1, got {pinned_after_t1}'
+        assert pinned_after_t1[0][1]['task_id'] == 'A'
+        assert pinned_after_t1[0][1]['data'].get('pin_order') == 1
+
+        # Tick 2: pin B (auto pin_order=2)
+        store.set_override('/proj', 'B', pinned=True)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+
+        pinned_after_t2 = events_of_type(EventType.task_pinned)
+        assert len(pinned_after_t2) == 2, f'Expected 2 task_pinned events after tick 2, got {pinned_after_t2}'
+        b_pinned = [e for e in pinned_after_t2 if e[1]['task_id'] == 'B']
+        assert len(b_pinned) == 1
+        assert b_pinned[0][1]['data'].get('pin_order') == 2
+
+        # Tick 3: reorder to [B, A]
+        store.reorder_pin_queue('/proj', ['B', 'A'])
+        await scheduler.acquire_next()
+
+        reorder_events = events_of_type(EventType.pin_queue_reordered)
+        assert len(reorder_events) == 1, f'Expected 1 pin_queue_reordered event, got {reorder_events}'
+        assert reorder_events[0][1]['data'].get('new_order') == ['B', 'A']
+
+        # Tick 4: unpin A
+        store.clear_override('/proj', 'A', field='pinned')
+        await scheduler.acquire_next()
+
+        unpinned_events = events_of_type(EventType.task_unpinned)
+        assert len(unpinned_events) == 1, f'Expected 1 task_unpinned event, got {unpinned_events}'
+        assert unpinned_events[0][1]['task_id'] == 'A'
+
+    @pytest.mark.asyncio
+    async def test_adding_pin_does_not_emit_pin_queue_reordered(self, tmp_path):
+        """Adding a new pin fires task_pinned but NOT pin_queue_reordered.
+
+        pin_queue_reordered is reserved for pure reorder operations (where
+        existing pinned tasks shift position).  Pinning a new task is already
+        fully described by task_pinned; emitting pin_queue_reordered on top
+        would be redundant noise for downstream consumers.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = _pending_task('A', priority='medium', files=['a/src'])
+        task_b = _pending_task('B', priority='medium', files=['b/src'])
+
+        # Seed tick: initialise snapshot (no overrides yet).
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+
+        # Pin A (first pin) — must emit task_pinned but NOT pin_queue_reordered.
+        store.set_override('/proj', 'A', pinned=True)
+        await scheduler.acquire_next()
+
+        reorder_after_add = [
+            e for e in event_store.events
+            if e[0] == EventType.pin_queue_reordered.value
+        ]
+        assert reorder_after_add == [], (
+            'Adding a new pin must not emit pin_queue_reordered; '
+            f'got: {reorder_after_add}'
+        )
+        pinned_events = [
+            e for e in event_store.events if e[0] == EventType.task_pinned.value
+        ]
+        assert len(pinned_events) == 1
+        assert pinned_events[0][1]['task_id'] == 'A'
+
+        # Pin B (second pin) — again must emit task_pinned but NOT pin_queue_reordered.
+        store.set_override('/proj', 'B', pinned=True)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+
+        reorder_after_second_add = [
+            e for e in event_store.events
+            if e[0] == EventType.pin_queue_reordered.value
+        ]
+        assert reorder_after_second_add == [], (
+            'Adding a second pin must not emit pin_queue_reordered'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unpinning_does_not_emit_pin_queue_reordered(self, tmp_path):
+        """Removing a pin fires task_unpinned but NOT pin_queue_reordered.
+
+        The pin removal changes the effective queue order (remaining tasks may
+        implicitly shift), but the change is already described by task_unpinned.
+        Consumers that need the updated order can re-query get_pin_queue.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = _pending_task('A', priority='medium', files=['a/src'])
+        task_b = _pending_task('B', priority='medium', files=['b/src'])
+
+        # Set up A and B as pinned, then seed the snapshot so both appear as
+        # pre-existing (no spurious events on the seed tick).
+        store.set_override('/proj', 'A', pinned=True, pin_order=1)
+        store.set_override('/proj', 'B', pinned=True, pin_order=2)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()  # seed tick — no events expected
+
+        # Unpin A → must emit task_unpinned but NOT pin_queue_reordered.
+        store.clear_override('/proj', 'A', field='pinned')
+        await scheduler.acquire_next()
+
+        reorder_after_unpin = [
+            e for e in event_store.events
+            if e[0] == EventType.pin_queue_reordered.value
+        ]
+        assert reorder_after_unpin == [], (
+            'Unpinning must not emit pin_queue_reordered; '
+            f'got: {reorder_after_unpin}'
+        )
+        unpinned_events = [
+            e for e in event_store.events if e[0] == EventType.task_unpinned.value
+        ]
+        assert len(unpinned_events) == 1
+        assert unpinned_events[0][1]['task_id'] == 'A'

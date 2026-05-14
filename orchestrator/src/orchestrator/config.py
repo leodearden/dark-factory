@@ -723,6 +723,15 @@ class OrchestratorConfig(BaseSettings):
         first = module_path.strip('/').split('/')[0]
         return self._module_configs.get(first)
 
+    @property
+    def overrides_db_path(self) -> Path:
+        """Path to the scheduler priority-overrides SQLite database.
+
+        Stored separately from runs.db so reify cycles and set_task_status
+        writes cannot wipe override rows.
+        """
+        return self.project_root / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
         env_nested_delimiter='__',
