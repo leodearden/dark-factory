@@ -695,18 +695,22 @@ async def test_collect_metrics_snapshot_writes_curator_row(tmp_path: Path, confi
 
 
 # ---------------------------------------------------------------------------
-# Step-19: App-wiring test
+# Step-19: Metrics-loop kwarg test
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path: Path):
+async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     """_metrics_loop._run_once passes tickets_db kwarg to collect_metrics_snapshot.
 
     Calls _metrics_loop directly against a hand-built app-state stub so the
     real lifespan — and its _burndown_loop side task — are never started.
     Only _metrics_loop is exercised; collect_metrics_snapshot is patched to
     record the call and set an event, then the task is cancelled cleanly.
+
+    tickets.db is created on disk at the canonical path so DbPool.get() returns
+    a real connection.  This pins the path-to-connection wiring: a wrong-but-
+    missing path would make get() return None, failing the is-not-None assertion.
     """
     called_event = asyncio.Event()
 
@@ -721,7 +725,14 @@ async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path
         fused_memory_urls=['http://localhost:18765'],
         known_project_roots=[],
     )
-    pool = DbPool()  # returns None for non-existent paths; fine since collect is patched
+    # Create tickets.db at the canonical path so DbPool.get() returns a real
+    # connection.  This validates path-to-connection wiring, not just key presence.
+    tickets_db_path = fixed_config.tickets_db
+    tickets_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(tickets_db_path)):
+        pass
+
+    pool = DbPool()
     mock_app = MagicMock()
     mock_app.state.config = fixed_config
     mock_app.state.db = pool
@@ -731,6 +742,7 @@ async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path
     await metrics_conn.executescript(METRICS_SCHEMA)
     await metrics_conn.commit()
 
+    expected_conn = None
     try:
         with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
             # _metrics_loop calls _run_once() immediately before entering the
@@ -743,6 +755,8 @@ async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        # Snapshot the pool entry before close_all() empties pool._conns.
+        expected_conn = pool._conns.get(fixed_config.tickets_db.resolve())
     finally:
         await metrics_conn.close()
         await pool.close_all()
@@ -753,11 +767,18 @@ async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path
         f"tickets_db not in kwargs: {call_kwargs}. "
         f"All calls: {mock_collect.call_args_list}"
     )
-    # DbPool.get() returns None for paths not on disk — assert the actual
-    # wiring value, not just key presence.  tmp_path has no tickets.db file.
-    assert call_kwargs['tickets_db'] is None, (
-        f"tickets_db should be None (path not on disk) but got "
-        f"{call_kwargs['tickets_db']!r}. All calls: {mock_collect.call_args_list}"
+    # tickets.db exists on disk so DbPool.get() opens a real connection stored in
+    # pool._conns keyed by the resolved path.  We assert object identity to pin
+    # path-to-connection wiring: a wrong-but-existing path yields a different
+    # connection object; a wrong-but-missing path leaves expected_conn as None.
+    assert expected_conn is not None, (
+        f"DbPool has no connection for {fixed_config.tickets_db.resolve()}; "
+        f"pool keys: {list(pool._conns)}"
+    )
+    assert call_kwargs['tickets_db'] is expected_conn, (
+        f"tickets_db should be the DbPool connection for {fixed_config.tickets_db} "
+        f"but got {call_kwargs['tickets_db']!r}. "
+        f"All calls: {mock_collect.call_args_list}"
     )
 
 
