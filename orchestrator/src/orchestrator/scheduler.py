@@ -1462,6 +1462,41 @@ class Scheduler:
         bonus = min(age_bonus + cpm_bonus, float(TIER_WIDTH - 1))
         return float(base) + bonus
 
+    def _emit_override_diff_events(
+        self,
+        prev: dict[str, 'OverrideRow'],
+        cur: dict[str, 'OverrideRow'],
+    ) -> None:
+        """Diff prev vs cur override snapshots and emit boost-tier change events.
+
+        Called once per tick after all in-memory override mutations are complete.
+        Each change in ``boost_tier`` emits exactly one event per task per tick.
+        Pin-state diffs (task_pinned / task_unpinned / pin_queue_reordered) are
+        handled by :meth:`_emit_pin_diff_events` added in a later step.
+        """
+        if not self.event_store:
+            return
+        all_ids = set(prev) | set(cur)
+        for tid in all_ids:
+            prev_row = prev.get(tid)
+            cur_row = cur.get(tid)
+            prev_boost = prev_row.boost_tier if prev_row else None
+            cur_boost = cur_row.boost_tier if cur_row else None
+            if prev_boost == cur_boost:
+                continue
+            if cur_boost is not None:
+                self.event_store.emit(
+                    EventType.priority_override_set,
+                    task_id=tid,
+                    data={'boost_tier': cur_boost},
+                )
+            else:
+                self.event_store.emit(
+                    EventType.priority_override_cleared,
+                    task_id=tid,
+                    data={'previous_boost_tier': prev_boost},
+                )
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -1594,6 +1629,12 @@ class Scheduler:
                     reserve_now=False,
                     ttl_until=rrow.ttl_until,
                 )
+
+        # Diff-detect override changes and emit priority_override_* events.
+        # The diff runs AFTER all in-memory mutations (GC + reserve_now clearing)
+        # so that the snapshot captures the true post-tick state.
+        self._emit_override_diff_events(self._prev_overrides_snapshot, current_overrides)
+        self._prev_overrides_snapshot = dict(current_overrides)
 
         # Build reverse index + compute effective priorities + CPM counts
         # once per tick (O(N+E)).
