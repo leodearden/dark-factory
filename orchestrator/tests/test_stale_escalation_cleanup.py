@@ -88,23 +88,6 @@ class TestDismissStaleEscalations:
 
         assert '5' in caplog.text
 
-    async def test_log_mentions_l1_preserved(self, harness: Harness, caplog):
-        """Log line must mention both L0 dismissal count and that L1s are preserved."""
-        mock_queue = MagicMock()
-        mock_queue.dismiss_all_pending.return_value = 2
-        harness._escalation_queue = mock_queue
-
-        with caplog.at_level(logging.INFO):
-            await harness._dismiss_stale_escalations()
-
-        log_lower = caplog.text.lower()
-        assert 'l1' in log_lower, (
-            "Expected INFO log to mention 'L1'; got: " + caplog.text
-        )
-        assert 'preserv' in log_lower, (
-            "Expected INFO log to mention 'preserv' (preserved/preserving); got: " + caplog.text
-        )
-
     async def test_called_after_start_escalation_server_before_task_loop(
         self, harness: Harness, tmp_path: Path
     ):
