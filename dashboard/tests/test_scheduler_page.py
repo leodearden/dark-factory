@@ -932,6 +932,68 @@ def test_clear_override_translates_ttl_until_to_mcp_ttl(client):
 
 
 # ---------------------------------------------------------------------------
+# step-39: override endpoint accepts ttl_minutes and translates to ttl_secs
+# ---------------------------------------------------------------------------
+
+
+def test_override_endpoint_accepts_ttl_minutes_and_translates_to_ttl_secs(client):
+    """POST /override with ttl_minutes=60 → MCP receives ttl_secs=3600.
+
+    Client sends ttl_minutes (matching the drawer UI input field); dashboard
+    translates to MCP's ttl_secs. The user-facing name must NOT leak to MCP.
+    Verified against fused-memory tool signature (tools.py:2380).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/override',
+            json={
+                'task_id': 'T1',
+                'project_root': '/proj',
+                'pinned': True,
+                'ttl_minutes': 60,
+            },
+        )
+
+    assert resp.status_code == 200
+    _client, _url, tool_arg, args = mock_mcp.call_args.args
+    assert 'ttl_secs' in args, f'Expected ttl_secs in MCP args, got: {args}'
+    assert args['ttl_secs'] == 3600, f'Expected 3600, got {args["ttl_secs"]}'
+    assert 'ttl_minutes' not in args, (
+        f'ttl_minutes must not leak to MCP, got args={args}'
+    )
+
+
+@pytest.mark.parametrize('bad_ttl', [
+    pytest.param(0, id='ttl_minutes-zero'),
+    pytest.param(-5, id='ttl_minutes-negative'),
+    pytest.param(1441, id='ttl_minutes-too-large'),
+    pytest.param('one-hour', id='ttl_minutes-string'),
+    pytest.param(None, id='ttl_minutes-null'),
+])
+def test_override_endpoint_rejects_invalid_ttl_minutes(client, bad_ttl):
+    """POST /override with invalid ttl_minutes → 400 invalid_ttl_minutes, no MCP call."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/override',
+            json={
+                'task_id': 'T1',
+                'project_root': '/proj',
+                'ttl_minutes': bad_ttl,
+            },
+        )
+
+    assert resp.status_code == 400, (
+        f'Expected 400 for ttl_minutes={bad_ttl!r}, got {resp.status_code}: {resp.text}'
+    )
+    assert mock_mcp.call_count == 0
+
+
+# ---------------------------------------------------------------------------
 # step-23: index.html references new scheduler JSX files + cache-buster bumped
 # ---------------------------------------------------------------------------
 

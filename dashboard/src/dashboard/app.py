@@ -829,10 +829,35 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    # Validate and translate ttl_minutes → ttl_secs.
+    # Client (scheduler_drawer.jsx) sends ttl_minutes; the MCP tool takes ttl_secs.
+    # ttl_until is not forwarded — MCP uses ttl_secs, so passing ttl_until verbatim
+    # was always a no-op.
+    ttl_secs: int | None = None
+    if 'ttl_minutes' in body:
+        ttl_raw = body['ttl_minutes']
+        try:
+            ttl_val = float(ttl_raw)  # raises TypeError for None
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {'error': 'invalid_ttl_minutes', 'detail': 'ttl_minutes must be a positive number ≤ 1440'},
+                status_code=400,
+            )
+        if ttl_val <= 0 or ttl_val > 1440:
+            return JSONResponse(
+                {'error': 'invalid_ttl_minutes', 'detail': 'ttl_minutes must be a positive number ≤ 1440'},
+                status_code=400,
+            )
+        ttl_secs = int(round(ttl_val * 60))
+
     args: dict = {'task_id': task_id, 'project_root': project_root}
-    for key in ('boost_tier', 'pinned', 'pin_order', 'reserve_now', 'ttl_until'):
+    # Forward recognised optional fields; exclude ttl_until (not a MCP param)
+    # and ttl_minutes (translated above into ttl_secs).
+    for key in ('boost_tier', 'pinned', 'pin_order', 'reserve_now'):
         if key in body:
             args[key] = body[key]
+    if ttl_secs is not None:
+        args['ttl_secs'] = ttl_secs
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
