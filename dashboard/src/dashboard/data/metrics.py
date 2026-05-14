@@ -134,9 +134,12 @@ async def fan_out_list_tickets(
                 )
         return 0, []
 
-    per_root_results: list[tuple[int, list[dict]]] = list(
-        await asyncio.gather(*(_fan_out_one_root(r) for r in all_roots))
+    raw_results = await asyncio.gather(
+        *(_fan_out_one_root(r) for r in all_roots), return_exceptions=True
     )
+    per_root_results: list[tuple[int, list[dict]]] = [
+        r if not isinstance(r, BaseException) else (0, []) for r in raw_results
+    ]
     pending_total = sum(c for c, _ in per_root_results)
     tickets: list[dict] = [t for _, ts in per_root_results for t in ts]
     return tickets, pending_total

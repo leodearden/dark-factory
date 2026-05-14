@@ -679,7 +679,6 @@ async def api_curator(request: Request) -> JSONResponse:
         'p90': {'labels': [], 'values': []},
         'p99': {'labels': [], 'values': []},
     }
-    _empty_capped: ChartData = {'labels': [], 'values': []}
 
     # Resolve DB connections before the gather (pool.get is cheap; the
     # coroutine objects below need them as arguments).
@@ -732,6 +731,7 @@ async def api_curator(request: Request) -> JSONResponse:
     # The sparkline downstream (bucketise_cap_sparkline) renders the strict
     # all-accounts-capped window — a 1 in the sparkline means EVERY account was
     # blocked at that bucket. capped_now flags any-account live state.
+    _empty_capped: ChartData = {'labels': [], 'values': []}
     try:
         capped_now, capped_windows = compute_capped_now_and_windows(intervals)
         capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
