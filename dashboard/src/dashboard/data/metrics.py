@@ -25,8 +25,8 @@ import httpx
 
 from dashboard.config import DashboardConfig
 from dashboard.data.cap_history import (
+    compute_capped_now_and_windows,
     compute_overlap_ms,
-    merge_all_accounts_capped,
     read_cap_intervals,
 )
 from dashboard.data.memory import get_memory_status, get_queue_stats, mcp_tool_call
@@ -294,21 +294,15 @@ async def _sample_curator(
         logger.debug('read_cap_intervals failed', exc_info=True)
         intervals = []
 
-    # 3. capped_now: 1 if ANY account currently has an open-ended cap interval.
-    # Uses "any account capped" semantics — an open-ended CapInterval (end=None)
-    # means that account is still capped at query time, regardless of what other
-    # accounts are doing. This avoids the false-negative that would arise from the
-    # "all-accounts-simultaneously-capped" merge if some accounts had no events in
-    # the look-back window.
-    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
-
-    # Merged cap windows (needed for per-ticket overlap subtraction below).
-    account_names = list({iv.account_name for iv in intervals})
+    # 3. capped_now (any-account semantics) + capped_windows (all-accounts merge)
+    # derived together by compute_capped_now_and_windows — single source of truth
+    # shared with api_curator. See cap_history.py for the asymmetric semantics
+    # rationale and the sorted-account_names determinism guard.
     try:
-        capped_windows = merge_all_accounts_capped(intervals, account_names)
+        capped_now, capped_windows = compute_capped_now_and_windows(intervals)
     except Exception:
-        logger.debug('merge_all_accounts_capped failed', exc_info=True)
-        capped_windows = []
+        logger.debug('compute_capped_now_and_windows failed', exc_info=True)
+        capped_now, capped_windows = 0, []
 
     # 4. Terminal tickets resolved in the last hour.
     # NOTE: centiles use a 1-hour rolling window, not the 10-minute sampling
