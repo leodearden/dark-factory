@@ -444,3 +444,103 @@ async def test_clear_task_priority_override_rejects_invalid_field(
         conn.close()
 
     memory_service.add_memory.assert_not_called()
+
+
+# ===========================================================================
+# reorder_pin_queue
+# ===========================================================================
+
+
+async def _populate_pins(mcp_server, tmp_path, task_ids):
+    """Helper: pin task_ids in order A→B→C via set_task_priority_override."""
+    for tid in task_ids:
+        await mcp_server._tool_manager.call_tool(
+            'set_task_priority_override',
+            {'project_root': str(tmp_path), 'task_id': tid, 'pinned': True},
+        )
+
+
+def _pin_orders(tmp_path, task_ids):
+    """Return {task_id: pin_order} dict for the given task_ids."""
+    conn = _open_db(tmp_path)
+    try:
+        result = {}
+        for tid in task_ids:
+            row = conn.execute(
+                'SELECT pin_order FROM overrides WHERE project_root=? AND task_id=?',
+                (str(tmp_path), tid),
+            ).fetchone()
+            result[tid] = row[0] if row else None
+        return result
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reorder_pin_queue_rewrites_pin_order_and_emits_audit(
+    tmp_path, mcp_server, memory_service,
+):
+    """reorder_pin_queue with a list rewrites pin_order columns and emits audit."""
+    await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'reorder_pin_queue',
+        {'project_root': str(tmp_path), 'ordered_task_ids': ['C', 'A', 'B']},
+    )
+    assert 'error' not in result
+
+    orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
+    assert orders == {'A': 2, 'B': 3, 'C': 1}
+
+    memory_service.add_memory.assert_called_once()
+    _, audit_kwargs = memory_service.add_memory.call_args
+    assert audit_kwargs['category'] == 'decisions_and_rationale'
+    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
+    assert audit_kwargs['metadata'] == {'ordered_task_ids': ['C', 'A', 'B']}
+
+
+@pytest.mark.asyncio
+async def test_reorder_pin_queue_accepts_csv_string(
+    tmp_path, mcp_server, memory_service,
+):
+    """reorder_pin_queue also accepts a CSV string."""
+    await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'reorder_pin_queue',
+        {'project_root': str(tmp_path), 'ordered_task_ids': 'C, A, B'},
+    )
+    assert 'error' not in result
+
+    orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
+    assert orders == {'A': 2, 'B': 3, 'C': 1}
+
+    _, audit_kwargs = memory_service.add_memory.call_args
+    assert audit_kwargs['metadata']['ordered_task_ids'] == ['C', 'A', 'B']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_ids,label', [
+    (['A', 'B'], 'subset'),
+    (['A', 'B', 'C', 'D'], 'superset'),
+])
+async def test_reorder_pin_queue_rejects_mismatched_set(
+    tmp_path, mcp_server, memory_service, bad_ids, label,
+):
+    """Mismatched id set returns ValidationError; pin_orders unchanged."""
+    await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'reorder_pin_queue',
+        {'project_root': str(tmp_path), 'ordered_task_ids': bad_ids},
+    )
+    assert result.get('error_type') == 'ValidationError'
+    assert 'supplied' in result.get('error', '') or 'expected' in result.get('error', '')
+
+    orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
+    assert orders == {'A': 1, 'B': 2, 'C': 3}, f'{label}: pin_orders changed unexpectedly'
+
+    memory_service.add_memory.assert_not_called()
