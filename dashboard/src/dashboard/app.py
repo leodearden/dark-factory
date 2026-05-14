@@ -582,6 +582,33 @@ async def api_performance(request: Request) -> JSONResponse:
     ))
 
 
+@app.post('/api/v2/dashboard/curator/cancel')
+async def api_curator_cancel(request: Request) -> JSONResponse:
+    """Proxy POST /curator/cancel → fused-memory cancel_ticket MCP tool.
+
+    Accepts ``{"ticket_id": "tkt_..."}`` and returns the tool's response
+    verbatim.  Status-code mapping:
+      - ``error == 'not_found'``    → 404
+      - network / transport errors  → 502
+      - everything else             → 200
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+
+    ticket_id = body.get('ticket_id') if isinstance(body, dict) else None
+    if not isinstance(ticket_id, str) or not ticket_id.startswith('tkt_'):
+        return JSONResponse(
+            {'error': 'invalid_ticket_id',
+             'detail': "ticket_id must be a string starting with 'tkt_'"},
+            status_code=400,
+        )
+
+    # Placeholder — replaced in step-4
+    return JSONResponse({}, status_code=200)
+
+
 @app.get('/api/v2/dashboard/burndown')
 async def api_burndown(request: Request) -> JSONResponse:
     """BURNDOWN + BURNDOWN_BY_PROJECT — per-project status time series."""
