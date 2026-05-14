@@ -62,3 +62,16 @@ async def test_run_hook_returns_none_when_unconfigured(monkeypatch):
     monkeypatch.delenv('FUSED_MEMORY_PREDONE_HOOK_TMP', raising=False)
     result = await run_hook('42', '/tmp')
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_run_hook_returns_rejected_error_on_nonzero_exit(monkeypatch):
+    """run_hook returns a structured rejection error when the hook exits non-zero."""
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_TMP', '/bin/false')
+    result = await run_hook('1', '/tmp')
+    assert result is not None
+    assert result['success'] is False
+    assert result['error'] == 'pre_done_hook_rejected'
+    assert result['task_id'] == '1'
+    assert result['exit_code'] != 0
+    assert 'hint' in result
