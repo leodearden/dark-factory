@@ -68,7 +68,13 @@ def test_invalid_ticket_id_returns_400(client, body):
     assert resp.status_code == 400
     data = resp.json()
     assert data.get('error') == 'invalid_ticket_id'
-    assert mock_mcp.call_count == 0
+    # Background tasks (metrics loop) may call mcp_tool_call for get_queue_stats
+    # during the test window; filter those out so the assertion only checks that
+    # the cancel handler itself made no cancel_ticket MCP call.
+    cancel_calls = [c for c in mock_mcp.call_args_list if _tool_name(c) == 'cancel_ticket']
+    assert len(cancel_calls) == 0, (
+        f'Expected no cancel_ticket MCP call for invalid input, got: {cancel_calls}'
+    )
 
 
 # ---------------------------------------------------------------------------
