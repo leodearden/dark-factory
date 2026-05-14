@@ -108,6 +108,77 @@ class TestApplyWalPragmas:
 
 
 # ---------------------------------------------------------------------------
+# Step-2: apply_full_durability_pragmas
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestApplyFullDurabilityPragmas:
+    """apply_full_durability_pragmas delegates to apply_wal_pragmas and adds the
+    synchronous/wal_autocheckpoint/journal_size_limit triad."""
+
+    async def test_delegates_journal_mode_wal(self, tmp_path: Path):
+        """After apply_full_durability_pragmas, PRAGMA journal_mode returns 'wal'."""
+        from shared.async_sqlite_base import apply_full_durability_pragmas
+
+        db_path = tmp_path / 'test.db'
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+            async with conn.execute('PRAGMA journal_mode') as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 'wal'
+
+    async def test_delegates_busy_timeout(self, tmp_path: Path):
+        """After apply_full_durability_pragmas, PRAGMA busy_timeout reflects the passed value."""
+        from shared.async_sqlite_base import apply_full_durability_pragmas
+
+        db_path = tmp_path / 'test.db'
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=12345)
+            async with conn.execute('PRAGMA busy_timeout') as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 12345
+
+    async def test_sets_synchronous_full(self, tmp_path: Path):
+        """After apply_full_durability_pragmas, PRAGMA synchronous returns 2 (FULL)."""
+        from shared.async_sqlite_base import apply_full_durability_pragmas
+
+        db_path = tmp_path / 'test.db'
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+            async with conn.execute('PRAGMA synchronous') as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 2  # 2 == FULL
+
+    async def test_sets_wal_autocheckpoint_100(self, tmp_path: Path):
+        """After apply_full_durability_pragmas, PRAGMA wal_autocheckpoint returns 100."""
+        from shared.async_sqlite_base import apply_full_durability_pragmas
+
+        db_path = tmp_path / 'test.db'
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+            async with conn.execute('PRAGMA wal_autocheckpoint') as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 100
+
+    async def test_sets_journal_size_limit(self, tmp_path: Path):
+        """After apply_full_durability_pragmas, PRAGMA journal_size_limit returns 67108864."""
+        from shared.async_sqlite_base import apply_full_durability_pragmas
+
+        db_path = tmp_path / 'test.db'
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+            async with conn.execute('PRAGMA journal_size_limit') as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 67108864
+
+
+# ---------------------------------------------------------------------------
 # Concrete test subclass used for AsyncSqliteBase tests
 # ---------------------------------------------------------------------------
 
