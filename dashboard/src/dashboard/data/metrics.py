@@ -77,6 +77,15 @@ CREATE TABLE IF NOT EXISTS merge_snapshots (
     active_count INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_merge_snap_pid_ts ON merge_snapshots(project_id, ts);
+
+CREATE TABLE IF NOT EXISTS curator_snapshots (
+    ts            TEXT PRIMARY KEY,
+    pending_total INTEGER,
+    capped_now    INTEGER,
+    p50_active_ms INTEGER,
+    p90_active_ms INTEGER,
+    p99_active_ms INTEGER
+);
 """
 
 
