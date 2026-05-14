@@ -169,37 +169,39 @@ def test_find_script_position_returns_document_order(
 _TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
 
 
-def _assert_cdn_loads_before_tab_tasks(
+def _assert_script_loads_before(
     body: str,
-    cdn_src_prefix: str,
-    tab_tasks_src_prefix: str,
-    lib_name: str,
+    before_src_prefix: str,
+    after_src_prefix: str,
+    before_label: str,
+    after_label: str,
     consumer_note: str = '',
 ) -> None:
-    """Assert that the CDN script for ``cdn_src_prefix`` loads BEFORE the
-    tab_tasks.jsx script in ``body``.  Combines a defer/async/type=module
-    false-pass guard with the document-order position comparison.
+    """Assert that the script for ``before_src_prefix`` loads BEFORE the
+    script for ``after_src_prefix`` in ``body``.  Combines a
+    defer/async/type=module false-pass guard with the document-order
+    position comparison.
     """
-    cdn_result = _find_script_position(body, cdn_src_prefix)
-    assert cdn_result is not None, (
-        f'No <script src="{cdn_src_prefix}..."> tag found in index.html. '
+    before_result = _find_script_position(body, before_src_prefix)
+    assert before_result is not None, (
+        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
         f'{consumer_note}'
     )
-    cdn_pos, cdn_attrs = cdn_result
-    cdn_src = cdn_attrs.get('src')
+    before_pos, before_attrs = before_result
+    before_src = before_attrs.get('src')
 
-    tab_tasks_result = _find_script_position(body, tab_tasks_src_prefix)
-    assert tab_tasks_result is not None, (
-        f'<script src="{tab_tasks_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {lib_name}.'
+    after_result = _find_script_position(body, after_src_prefix)
+    assert after_result is not None, (
+        f'<script src="{after_src_prefix}..."> not found in index.html — '
+        f'cannot verify load-order invariant for {before_label}.'
     )
-    tab_tasks_pos, tab_tasks_attrs = tab_tasks_result
+    after_pos, after_attrs = after_result
 
     # Both tags must be classic synchronous scripts — otherwise document order
     # diverges from execution order and the position comparison below is moot.
     for _label, _attrs in [
-        (f'{lib_name} CDN', cdn_attrs),
-        ('tab_tasks.jsx', tab_tasks_attrs),
+        (before_label, before_attrs),
+        (after_label, after_attrs),
     ]:
         assert 'defer' not in _attrs, (
             f'{_label} has a defer attribute; document order no longer implies '
@@ -214,12 +216,11 @@ def _assert_cdn_loads_before_tab_tasks(
             f'so document order no longer implies execution order.'
         )
 
-    assert cdn_pos < tab_tasks_pos, (
-        f'{lib_name} CDN tag (position {cdn_pos}, src={cdn_src!r}) must load '
-        f'BEFORE tab_tasks.jsx (position {tab_tasks_pos}). '
-        f'If it loads after, MarkdownText renders before {lib_name} is defined '
-        f'and falls back to null on first render — the silent-failure class the '
-        f'smoke test was added to catch.'
+    assert before_pos < after_pos, (
+        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
+        f'BEFORE {after_label} (position {after_pos}). '
+        f'If it loads after, {after_label} may execute before {before_label} '
+        f'is defined — the silent-failure class the smoke test was added to catch.'
     )
 
 
@@ -248,11 +249,12 @@ def test_cdn_script_loads_before_tab_tasks_jsx(
     future edit adding those attributes fails loudly rather than silently passing
     a check that no longer reflects execution order.
     """
-    _assert_cdn_loads_before_tab_tasks(
+    _assert_script_loads_before(
         index_html_body,
         src_prefix,
         _TAB_TASKS_PREFIX,
-        lib_name=lib_name,
+        before_label=lib_name,
+        after_label='tab_tasks.jsx',
         consumer_note=consumer_note,
     )
 
@@ -301,11 +303,12 @@ def test_load_order_assertion_fires_on_deferred_cdn(
     )
     body = cdn_tag + _TAB_TASKS_TAG
     with pytest.raises(AssertionError, match=match_pattern):
-        _assert_cdn_loads_before_tab_tasks(
+        _assert_script_loads_before(
             body,
             'https://unpkg.com/marked@',
             _TAB_TASKS_PREFIX,
-            lib_name='marked',
+            before_label='marked',
+            after_label='tab_tasks.jsx',
         )
 
 
@@ -335,12 +338,71 @@ def test_load_order_assertion_fires_on_deferred_tab_tasks(
     )
     body = cdn_tag + bad_tab_tasks_tag
     with pytest.raises(AssertionError, match=match_pattern):
-        _assert_cdn_loads_before_tab_tasks(
+        _assert_script_loads_before(
             body,
             'https://unpkg.com/marked@',
             _TAB_TASKS_PREFIX,
-            lib_name='marked',
+            before_label='marked',
+            after_label='tab_tasks.jsx',
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: tab_curator.jsx must load AFTER charts.jsx, shell.jsx,
+# data.js, and BEFORE app.jsx (synchronous classic script, no defer/async).
+# ---------------------------------------------------------------------------
+
+_TAB_CURATOR_PREFIX = '/static/redux/tab_curator.jsx'
+_CHARTS_PREFIX = '/static/redux/charts.jsx'
+_SHELL_PREFIX = '/static/redux/shell.jsx'
+_DATA_JS_PREFIX = '/static/redux/data.js'
+_TABS_PREFIX = '/static/redux/tabs.jsx'
+_APP_JSX_PREFIX = '/static/redux/app.jsx'
+
+# Each pair: (before_src_prefix, before_label, after_src_prefix, after_label)
+# tab_curator.jsx must load AFTER its four deps and BEFORE app.jsx.
+# tabs.jsx is included because tab_curator.jsx destructures ChipList from
+# window.DF_TABS at top-level execution time — if tabs.jsx moved after
+# tab_curator.jsx the destructure would silently set ChipList to undefined.
+_TAB_CURATOR_ORDER_CASES = [
+    (_CHARTS_PREFIX, 'charts.jsx', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
+    (_SHELL_PREFIX, 'shell.jsx', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
+    (_DATA_JS_PREFIX, 'data.js', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
+    (_TABS_PREFIX, 'tabs.jsx', _TAB_CURATOR_PREFIX, 'tab_curator.jsx'),
+    (_TAB_CURATOR_PREFIX, 'tab_curator.jsx', _APP_JSX_PREFIX, 'app.jsx'),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label',
+    _TAB_CURATOR_ORDER_CASES,
+    ids=[
+        'charts-before-curator',
+        'shell-before-curator',
+        'data-before-curator',
+        'tabs-before-curator',
+        'curator-before-app',
+    ],
+)
+def test_tab_curator_loads_before_app_jsx(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+) -> None:
+    """tab_curator.jsx must load AFTER its deps and BEFORE app.jsx.
+
+    Parametrized over the four required ordering pairs using the generic
+    _assert_script_loads_before helper rather than bespoke per-case logic.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+    )
 
 
 def test_load_order_assertion_passes_for_classic_scripts() -> None:
@@ -356,9 +418,10 @@ def test_load_order_assertion_passes_for_classic_scripts() -> None:
     cdn_tag = '<script src="https://unpkg.com/marked@x/y.js"></script>'
     body = cdn_tag + _TAB_TASKS_TAG
     # Must complete without raising — classic script, correct document order.
-    _assert_cdn_loads_before_tab_tasks(
+    _assert_script_loads_before(
         body,
         'https://unpkg.com/marked@',
         _TAB_TASKS_PREFIX,
-        lib_name='marked',
+        before_label='marked',
+        after_label='tab_tasks.jsx',
     )

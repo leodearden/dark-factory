@@ -4,6 +4,7 @@ const { Rail, StatStrip, Toolbar } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
 const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
+const { CuratorTab } = window.DF_CURATOR;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -73,6 +74,7 @@ function App() {
     { id: 'overview', label: 'Overview' },
     { id: 'orch',     label: 'Orchestrators' },
     { id: 'tasks',    label: 'Tasks' },
+    { id: 'curator',  label: 'Curator' },
     { id: 'perf',     label: 'Performance' },
     { id: 'memory',   label: 'Memory' },
     { id: 'recon',    label: 'Reconciliation' },
@@ -107,6 +109,7 @@ function App() {
       case 'overview': return <OverviewTab paused={tw.pauseLive} />;
       case 'orch':     return <OrchTab projectFilter={projects} search={search} />;
       case 'tasks':    return <TasksTab projectFilter={projects} search={search} />;
+      case 'curator':  return <CuratorTab projectFilter={projects} />;
       case 'perf':     return <PerfTab projectFilter={projects} />;
       case 'memory':   return <MemoryTab projectFilter={projects} />;
       case 'recon':    return <ReconTab projectFilter={projects} search={search} />;
@@ -131,6 +134,7 @@ function App() {
     overview: { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
     orch:     { showWindow: false,                        showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
     tasks:    { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
+    curator:  { showWindow: false,                        showAgents: false, search: false },
     perf:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
     memory:   { showWindow: false,                        showAgents: true,  search: false },
     recon:    { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },

@@ -1235,4 +1235,4 @@ function BurnTab({ projectFilter }) {
   );
 }
 
-window.DF_TABS = { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab };
+window.DF_TABS = { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, ChipList };
