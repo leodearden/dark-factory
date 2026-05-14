@@ -25,6 +25,7 @@ function endpointsFor(win) {
     [`/api/v2/dashboard/costs?window=${w}`]:          ['COSTS'],
     [`/api/v2/dashboard/performance?window=${w}`]:    ['PERFORMANCE'],
     [`/api/v2/dashboard/burndown?window=${w}`]:       ['BURNDOWN', 'BURNDOWN_BY_PROJECT'],
+    '/api/v2/dashboard/curator':                      ['CURATOR_STATE'],
   };
 }
 
@@ -72,6 +73,15 @@ window.DF_DATA = {
   },
   BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], forecast_low: null, forecast_high: null },
   BURNDOWN_BY_PROJECT: {},
+  // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
+  // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
+  // tab_curator.jsx reads through DF_DATA.CURATOR_STATE per render.
+  CURATOR_STATE: {
+    pending: [],
+    latency_spark: { labels: [], p50: [], p90: [], p99: [] },
+    capped_spark: { labels: [], values: [] },
+    state: { capped_now: 0, paused_reason: null, pending_total: 0 },
+  },
 };
 
 function applyKey(key, value) {
