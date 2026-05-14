@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -580,6 +581,57 @@ async def api_performance(request: Request) -> JSONResponse:
         ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
         history=safe_gather_result(history_r, {}, 'perf/history'),
     ))
+
+
+@app.post('/api/v2/dashboard/curator/cancel')
+async def api_curator_cancel(request: Request) -> JSONResponse:
+    """Proxy POST /curator/cancel → fused-memory cancel_ticket MCP tool.
+
+    Accepts ``{"ticket_id": "tkt_..."}`` and returns the tool's response
+    verbatim.  Status-code mapping:
+      - ``error == 'not_found'``    → 404
+      - network / transport errors  → 502
+      - everything else             → 200
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        body = None
+
+    ticket_id = body.get('ticket_id') if isinstance(body, dict) else None
+    if not isinstance(ticket_id, str) or not ticket_id.startswith('tkt_'):
+        return JSONResponse(
+            {'error': 'invalid_ticket_id',
+             'detail': "ticket_id must be a string starting with 'tkt_'"},
+            status_code=400,
+        )
+
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    errors: list[str] = []
+    # Assumption: cancel_ticket is idempotent and each ticket lives on exactly
+    # one fused-memory instance.  First-success-or-not_found semantics are
+    # correct; we do NOT fan out past a successful response to avoid
+    # double-cancelling.  Only network/transport errors trigger fallthrough.
+    for url in config.fused_memory_urls:
+        try:
+            result = await memory_data.mcp_tool_call(
+                http_client, url, 'cancel_ticket', {'ticket_id': ticket_id},
+            )
+        except (httpx.ConnectError, httpx.TimeoutException,
+                httpx.HTTPStatusError, ValueError) as exc:
+            errors.append(f'{url}: {type(exc).__name__}')
+            # Invalidate the cached MCP session so the next caller retries
+            # session initialisation — mirrors get_memory_status/get_queue_stats.
+            memory_data._sessions.pop(url.rstrip('/'), None)
+            continue
+        if result.get('error') == 'not_found':
+            return JSONResponse(result, status_code=404)
+        return JSONResponse(result)
+    return JSONResponse(
+        {'error': 'fused_memory_unreachable', 'detail': '; '.join(errors)},
+        status_code=502,
+    )
 
 
 @app.get('/api/v2/dashboard/burndown')
