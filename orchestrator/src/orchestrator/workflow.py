@@ -24,6 +24,7 @@ from shared.cost_store import CostStore
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
+from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
     ALL_REVIEWERS,
@@ -4358,6 +4359,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     return bypass_outcome
                 # Legitimate done — fall through; the existing post-steward
                 # flow below handles current==done by returning DONE.
+            self._spawn_dry_run_unblock(reason, detail or reason)
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
@@ -4578,6 +4580,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             'Task %s: submitted L1 escalation %s for unresolved BLOCKED state',
             self.task_id, esc.id,
         )
+
+    def _spawn_dry_run_unblock(self, reason: str, detail: str) -> None:
+        """Fire-and-forget: spawn an autonomous dry-run investigation.
+
+        Skips when unblock_auto is disabled. Wraps asyncio.create_task so
+        _mark_blocked never awaits the investigation — it is a pure side-effect.
+        Any exception inside run_dry_run_unblock is caught there and written
+        as a fallback proposal entry, so unhandled task exceptions are closed.
+        """
+        if not getattr(self.config, 'unblock_auto', None) or not self.config.unblock_auto.enabled:
+            return
+        try:
+            asyncio.create_task(
+                run_dry_run_unblock(
+                    task_id=self.task_id,
+                    worktree=str(self.worktree) if self.worktree else '.',
+                    reason=reason,
+                    detail=detail,
+                    scheduler=self.scheduler,
+                    mcp=self.mcp,
+                    config=self.config,
+                    event_store=getattr(self, 'event_store', None),
+                    usage_gate=getattr(self, 'usage_gate', None),
+                ),
+                name=f'unblock-auto-{self.task_id}',
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to spawn dry-run unblock hook: %s',
+                self.task_id, exc,
+            )
 
     async def _write_completion_to_memory(self) -> None:
         """Write task completion summary so dependent tasks find it in briefings."""
