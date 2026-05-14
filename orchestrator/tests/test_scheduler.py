@@ -4611,3 +4611,35 @@ class TestOverrideEventEmission:
         ]
         assert len(unpinned_events) == 1
         assert unpinned_events[0][1]['task_id'] == 'A'
+
+
+class TestRequeueCooldownGc:
+    """Unit tests for the _gc_expired_cooldowns helper and the now-pure
+    _eligible_for_dispatch predicate, plus an integration test that pins
+    acquire_next as the GC owner."""
+
+    def test_gc_expired_cooldowns_removes_only_expired(self):
+        """_gc_expired_cooldowns must remove entries whose deadline <= now
+        (past *and* exactly-at-now boundary) and leave future entries intact.
+
+        Uses a controllable time_source so the test is deterministic.
+        This test will fail until _gc_expired_cooldowns is implemented.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        # Seed three entries:
+        # 'past'     — deadline in the past → should be removed
+        # 'boundary' — deadline exactly at now → treated as expired (>= semantics)
+        # 'future'   — deadline in the future → must survive
+        scheduler._requeue_until['past'] = now - 1.0
+        scheduler._requeue_until['boundary'] = now
+        scheduler._requeue_until['future'] = now + 30.0
+
+        scheduler._gc_expired_cooldowns()
+
+        assert scheduler._requeue_until == {'future': now + 30.0}, (
+            f'Expected only the future entry to survive GC; '
+            f'got: {scheduler._requeue_until}'
+        )
