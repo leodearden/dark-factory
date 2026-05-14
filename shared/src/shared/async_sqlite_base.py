@@ -2,6 +2,7 @@
 
 Provides:
 - apply_wal_pragmas(conn, busy_timeout_ms): standalone utility to configure WAL + busy_timeout
+- apply_full_durability_pragmas(conn, busy_timeout_ms): WAL + busy_timeout + Phase 3 triad
 - AsyncSqliteBase: ABC with lifecycle management (open/close/context-manager/guard)
 """
 
@@ -15,7 +16,7 @@ from typing import Self
 
 import aiosqlite
 
-__all__ = ['apply_wal_pragmas', 'AsyncSqliteBase']
+__all__ = ['apply_wal_pragmas', 'apply_full_durability_pragmas', 'AsyncSqliteBase']
 
 
 async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int) -> None:
@@ -35,6 +36,28 @@ async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int)
         )
     if busy_timeout_ms != 0:
         await conn.execute(f'PRAGMA busy_timeout={busy_timeout_ms}')
+
+
+async def apply_full_durability_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int) -> None:
+    """Configure WAL mode, busy_timeout, and the Phase 3 durability triad.
+
+    Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then sets the
+    three additional PRAGMAs that harden crash durability across all
+    fused-memory SQLite stores:
+
+    Args:
+        conn: An open aiosqlite connection.
+        busy_timeout_ms: Milliseconds to wait for a locked database.
+            Pass 0 to skip setting the busy_timeout pragma entirely.
+    """
+    await apply_wal_pragmas(conn, busy_timeout_ms=busy_timeout_ms)
+    # synchronous=FULL: per-commit fsync. Cost is ~1-5ms/commit; the
+    # win is crash durability without relying on WAL checkpoints. See
+    # docs/task-recovery-2026-05-13/ for the prod incident that drove
+    # this change across all fused-memory SQLite stores.
+    await conn.execute('PRAGMA synchronous=FULL')
+    await conn.execute('PRAGMA wal_autocheckpoint=100')
+    await conn.execute('PRAGMA journal_size_limit=67108864')
 
 
 class AsyncSqliteBase(abc.ABC):
