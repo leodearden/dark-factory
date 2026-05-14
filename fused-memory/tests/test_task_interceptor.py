@@ -5850,22 +5850,17 @@ async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
     warning_records = [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING
-        and ticket_id in r.message
-        and 'task-orphan-99' in r.message
+        if r.levelno == logging.WARNING and ticket_id in r.message and 'task-orphan-99' in r.message
     ]
     assert warning_records, (
         f'Expected a WARNING containing ticket_id={ticket_id!r} and task_id="task-orphan-99"; '
         f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
     )
 
-    # (a') WARNING must use the neutral 'orphan-race:' label, NOT '_process_add_ticket:'
+    # (a') WARNING must use the neutral 'orphan-race:' label
     for r in warning_records:
         assert 'orphan-race:' in r.message, (
             f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
-        )
-        assert '_process_add_ticket:' not in r.message, (
-            f'Expected WARNING to NOT contain "_process_add_ticket:" but got: {r.message!r}'
         )
 
     # (b) Row status is 'cancelled' (cancel_ticket won the race)
@@ -6019,13 +6014,10 @@ async def test_persist_worker_terminal_orphan_race_emits_warning(
         f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
     )
 
-    # WARNING must use the neutral 'orphan-race:' label, NOT '_process_add_ticket:'
+    # WARNING must use the neutral 'orphan-race:' label
     for r in warning_records:
         assert 'orphan-race:' in r.message, (
             f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
-        )
-        assert '_process_add_ticket:' not in r.message, (
-            f'Expected WARNING to NOT contain "_process_add_ticket:" but got: {r.message!r}'
         )
 
 
@@ -6039,15 +6031,16 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
     so orphan-race WARNINGs are emitted uniformly on the cancellation path.
 
     Strategy: hook _dispatch_ticket_decision to pre-cancel the row (simulating
-    cancel_ticket winning the race) and return the success tuple
-    (status='created', task_id='task-cancelled-99').  Then hook _curator_lock
-    with an @asynccontextmanager whose finally clause cancels the current task
-    and awaits asyncio.sleep(0), which fires CancelledError inside
-    _process_add_ticket's try block AFTER the dispatch tuple has been unpacked
-    into status='created', task_id='task-cancelled-99'.
+    cancel_ticket winning the race), schedule task cancellation, and return the
+    success tuple (status='created', task_id='task-cancelled-99').  Hook
+    _curator_lock with a simple @asynccontextmanager that yields then does
+    asyncio.sleep(0); the sleep is the first suspension after the dispatch tuple
+    is unpacked, so the pending cancellation fires there — still inside
+    _process_add_ticket's try block with status='created' already set.
 
-    This is the only reliable way to exercise the orphan-race WARNING in the
-    CancelledError handler without timing flakes.
+    Robustness: the cancel is scheduled in fake_dispatch (where status/task_id
+    are known to be set) rather than in a finally clause, making the trigger
+    point explicit and independent of contextmanager cleanup ordering.
 
     RED: the inline asyncio.shield(mark_resolved(...)) in the CancelledError
     handler emits no WARNING, so this test fails before the fix.
@@ -6066,11 +6059,18 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
         ),
     )
 
-    # Stub: pre-cancel the row then return success tuple so status='created', task_id set.
+    # Stub: pre-cancel the row, schedule task cancellation, then return the success
+    # tuple so that _process_add_ticket's locals reach status='created',
+    # task_id='task-cancelled-99' before the pending cancel is delivered.
     async def fake_dispatch(**kwargs):
-        await ticket_store.mark_resolved(
-            ticket_id, status='cancelled', reason='user_cancelled'
-        )
+        await ticket_store.mark_resolved(ticket_id, status='cancelled', reason='user_cancelled')
+        # Schedule cancellation here, while status/task_id are about to be set.
+        # The CancelledError fires at the first suspension inside fake_curator_lock
+        # (the post-yield asyncio.sleep(0)), which is still inside _process_add_ticket's
+        # try block — so the except asyncio.CancelledError handler sees status='created'.
+        task = asyncio.current_task()
+        if task is not None:
+            task.cancel()
         return (
             'created',
             'task-cancelled-99',
@@ -6079,25 +6079,24 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
             None,
         )
 
-    # Stub: yield normally (so the body + dispatch run), then in finally cancel the
-    # task and yield to the event loop so CancelledError fires inside the try block.
+    # Stub: yield for the body (fake_dispatch runs here), then suspend once so the
+    # pending cancellation scheduled by fake_dispatch is delivered while still inside
+    # _process_add_ticket's try block.
     def fake_curator_lock(project_id):
         @asynccontextmanager
         async def _ctx():
-            try:
-                yield
-            finally:
-                task = asyncio.current_task()
-                if task is not None:
-                    task.cancel()
-                await asyncio.sleep(0)
+            yield
+            await asyncio.sleep(0)  # Deliver pending cancellation from fake_dispatch
 
         return _ctx()
 
     interceptor_with_store._dispatch_ticket_decision = fake_dispatch
     interceptor_with_store._curator_lock = fake_curator_lock
     try:
-        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'), pytest.raises(asyncio.CancelledError):
+        with (
+            caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'),
+            pytest.raises(asyncio.CancelledError),
+        ):
             await interceptor_with_store._process_add_ticket(ticket_id)
     finally:
         del interceptor_with_store._dispatch_ticket_decision

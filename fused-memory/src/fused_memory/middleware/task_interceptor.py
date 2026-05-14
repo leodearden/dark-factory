@@ -2307,6 +2307,7 @@ class TaskInterceptor:
         task_id: str | None,
         reason: str | None,
         result_dict: dict | None,
+        caller: str = 'unknown',
     ) -> bool:
         """Persist a worker's terminal status via asyncio.shield and warn on orphan-race.
 
@@ -2317,13 +2318,18 @@ class TaskInterceptor:
         concurrent ``cancel_ticket`` call won the row-level race and the ticket
         is now ``cancelled`` with ``task_id=NULL``.
 
+        Args:
+            caller: Short label identifying which worker path invoked this
+                helper (e.g. ``'add_ticket'``, ``'add_ticket_cancel'``,
+                ``'add_tickets_batch'``).  Included in the orphan-race WARNING
+                so production logs remain greppable per-caller.
+
         Returns:
             The ``bool`` returned by ``mark_resolved`` (``True`` if the row was
             still pending and the UPDATE landed; ``False`` if a concurrent writer
             already terminalized it).
         """
-        # Both callers (_process_add_ticket and _process_add_tickets_batch_prepared)
-        # guard against _ticket_store being None before reaching this helper.
+        # All callers guard against _ticket_store being None before reaching here.
         assert self._ticket_store is not None
         resolved = await asyncio.shield(
             self._ticket_store.mark_resolved(
@@ -2339,9 +2345,11 @@ class TaskInterceptor:
                 'orphan-race: ticket %s — '
                 'tm.add_task created task %s but ticket row was terminalized '
                 'by a concurrent writer (likely cancel_ticket); task is live '
-                'in tasks.json, recover via journal task_created event',
+                'in tasks.json, recover via journal task_created event '
+                '[caller=%s]',
                 ticket_id,
                 task_id,
+                caller,
             )
         return resolved
 
@@ -2490,6 +2498,7 @@ class TaskInterceptor:
                     if reason
                     else ('cancelled_during_write' if status != 'created' else None),
                     result_dict=result_dict,
+                    caller='add_ticket_cancel',
                 )
                 self._signal_ticket_event(ticket_id)
             except Exception:
@@ -2536,6 +2545,7 @@ class TaskInterceptor:
             task_id=task_id,
             reason=reason,
             result_dict=result_dict,
+            caller='add_ticket',
         )
 
         # ── Emit journal event and schedule commit (create path only) ────
@@ -2905,6 +2915,7 @@ class TaskInterceptor:
                         task_id=task_id,
                         reason=reason,
                         result_dict=result_dict,
+                        caller='add_tickets_batch',
                     )
 
                     # Emit journal event and schedule commit (create path only).
