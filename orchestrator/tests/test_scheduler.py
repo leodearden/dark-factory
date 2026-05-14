@@ -4762,3 +4762,36 @@ class TestSchedulerPause:
         scheduler.resume()
         assert scheduler.is_paused is False
         assert scheduler.pause_reason is None
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_returns_none_when_paused(self, scheduler: Scheduler):
+        """acquire_next() must short-circuit to None when the scheduler is paused."""
+        task = {
+            'id': '1',
+            'title': 'Task one',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Sanity: without pause the task is dispatched normally.
+        result_before = await scheduler.acquire_next()
+        assert result_before is not None, (
+            'Expected TaskAssignment before pause; got None'
+        )
+        scheduler.release('1')
+
+        # Now pause and confirm acquire_next returns None.
+        scheduler.pause('test')
+        result_paused = await scheduler.acquire_next()
+        assert result_paused is None, (
+            f'Expected None while paused; got {result_paused}'
+        )
+
+        # Resume and confirm the task is dispatchable again.
+        scheduler.resume()
+        result_resumed = await scheduler.acquire_next()
+        assert result_resumed is not None, (
+            'Expected TaskAssignment after resume; got None'
+        )
