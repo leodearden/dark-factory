@@ -9,6 +9,7 @@ Step-by-step TDD:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
@@ -170,6 +171,49 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
     assert resp.status_code == 502
     # invalidate_session must have been called exactly once with the failing URL
     assert mock_invalidate.call_args_list == [call(DEFAULT_FUSED_MEMORY_URLS[0])]
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task-1285): logger.warning + str(exc) in 502 detail
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
+    """Transport error → WARNING logged and str(exc) included in 502 detail.
+
+    Three simultaneous assertions:
+      (a) response is 502
+      (b) a WARNING-level record is emitted by the 'dashboard.app' logger
+          whose message contains both the URL and the exception text
+      (c) the response body's 'detail' field contains the full exception
+          message ('connection refused: port 8002'), not just the type name
+    """
+    exc_msg = 'connection refused: port 8002'
+    with patch(
+        _PATCH_TARGET,
+        new=AsyncMock(side_effect=httpx.ConnectError(exc_msg)),
+    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    # (a) 502
+    assert resp.status_code == 502
+
+    # (b) WARNING log
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+    ]
+    assert warning_records, 'Expected at least one WARNING from dashboard.app'
+    combined_msg = ' '.join(r.getMessage() for r in warning_records)
+    assert 'cancel_ticket failed' in combined_msg
+    assert exc_msg in combined_msg
+
+    # (c) detail includes full exception message (not just type name)
+    detail = resp.json().get('detail', '')
+    assert exc_msg in detail, f'Expected "{exc_msg}" in detail, got: {detail!r}'
 
 
 def _two_url_client(two_url_config):
