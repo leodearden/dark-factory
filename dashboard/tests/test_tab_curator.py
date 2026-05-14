@@ -256,6 +256,29 @@ def test_curator_tab_defaults_project_filter_to_empty_list(tab_curator_jsx_body:
 
 
 # ---------------------------------------------------------------------------
+# task-1306 step-3: addToast prunes fired timer from toastTimers.current
+# ---------------------------------------------------------------------------
+
+def test_addToast_prunes_fired_timer_from_toast_timers(tab_curator_jsx_body: str) -> None:
+    """addToast must remove the timer id from toastTimers.current after it fires.
+
+    Without pruning, every auto-dismissed toast leaves a stale timer id in the
+    array.  In a long-lived session the array grows without bound.  The fix is
+    either a splice (array) or a delete (Map).  The test accepts either so that
+    a future Map-based refactor does not break this assertion.
+    """
+    has_splice = 'toastTimers.current.splice' in tab_curator_jsx_body
+    has_delete = 'toastTimers.current.delete' in tab_curator_jsx_body
+    assert has_splice or has_delete, (
+        'addToast in tab_curator.jsx does not prune fired timer ids from '
+        'toastTimers.current — after calling setToasts inside setTimeout, add '
+        '`const idx = toastTimers.current.indexOf(timer); '
+        'if (idx >= 0) toastTimers.current.splice(idx, 1);` '
+        'so that the array does not grow monotonically over a long session.'
+    )
+
+
+# ---------------------------------------------------------------------------
 # meta-test: _extract_curator_state_block scoping
 # ---------------------------------------------------------------------------
 
