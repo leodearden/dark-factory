@@ -1616,11 +1616,44 @@ class TestReconcileStrandedInProgress:
         )
 
     @pytest.mark.parametrize(
+        'is_ancestor_val, marker_sha_val',
+        [
+            pytest.param(True, None, id='is-ancestor-path'),
+            pytest.param(False, 'cafebabe' + 'c' * 32, id='merge-marker-path'),
+            pytest.param(False, None, id='neither-path'),
+        ],
+    )
+    async def test_get_task_fetched_exactly_once_regardless_of_path(
+        self,
+        harness: Harness,
+        is_ancestor_val: bool,
+        marker_sha_val: str | None,
+    ):
+        """Invariant: scheduler.get_task is awaited exactly once per stranded task
+        regardless of which branch wins — is_ancestor fast-path, merge-marker
+        fast-path, or neither.  The hoisted fetch at the top of
+        _reconcile_one_stranded must never be duplicated by a fast-path.
+        """
+        harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)
+
+        await harness._reconcile_stranded_in_progress()
+
+        assert harness.scheduler.get_task.await_count == 1, (  # type: ignore[attr-defined]
+            f'Expected get_task awaited once (path: is_ancestor={is_ancestor_val!r}, '
+            f'marker={marker_sha_val!r}); '
+            f'got {harness.scheduler.get_task.await_count}'  # type: ignore[attr-defined]
+        )
+        # For the neither-path case, confirm the lock-state revert still fires.
+        if not is_ancestor_val and marker_sha_val is None:
+            harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+                '90', 'pending'
+            )
+
+    @pytest.mark.parametrize(
         'is_ancestor_val, marker_sha_val, branch_base_sha',
         [
-            pytest.param(True, None, None, id='is-ancestor-path'),
-            pytest.param(False, 'cafebabe' + 'c' * 32, None, id='merge-marker-path'),
-            pytest.param(False, None, None, id='neither-path'),
             pytest.param(
                 True,
                 None,
@@ -1635,58 +1668,58 @@ class TestReconcileStrandedInProgress:
             ),
         ],
     )
-    async def test_get_task_fetched_exactly_once_regardless_of_path(
+    async def test_hoisted_metadata_is_consumed_by_each_guard(
         self,
         harness: Harness,
         is_ancestor_val: bool,
         marker_sha_val: str | None,
-        branch_base_sha: str | None,
+        branch_base_sha: str,
     ):
-        """Invariant: scheduler.get_task is awaited exactly once per stranded task
-        regardless of which branch wins — is_ancestor fast-path, merge-marker
-        fast-path, or neither.  The hoisted fetch at the top of
-        _reconcile_one_stranded must never be duplicated by a fast-path.
+        """Regression lock: the hoisted ``metadata`` dict is CONSUMED by each
+        downstream guard that reads ``metadata.get('branch_base_sha')``.
 
-        The two ``*-with-metadata`` cases additionally lock down that the hoisted
-        ``metadata`` dict is actually CONSUMED by each downstream guard
-        (``metadata.get('branch_base_sha')`` in Guard 3 and the stale-marker
-        check).  A future refactor that silently drops that read from either guard
-        would still satisfy ``get_task.await_count == 1``, but would break the
-        path-specific consumer assertions below — making the regression visible.
+        ``is-ancestor-path-with-metadata``: Guard 3 (harness.py) calls
+        ``resolve_branch_sha`` only when ``_is_valid_sha_40(branch_base_sha)``
+        is True, proving the guard read the hoisted value.
+
+        ``merge-marker-path-with-metadata``: the stale-marker check calls
+        ``is_ancestor(marker_sha, branch_base_sha)`` only when
+        ``_is_valid_sha_40(branch_base_sha)`` is True, proving the guard read
+        the hoisted value.
+
+        A future refactor that silently drops ``metadata.get('branch_base_sha')``
+        from either guard would break the path-specific assertions below —
+        making the regression visible even though ``get_task.await_count == 1``
+        would still hold in the sibling test.
         """
         harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
         harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)
-
-        # For the *-with-metadata cases, stub get_task to return a metadata dict
-        # containing branch_base_sha so Guard 3 / stale-marker check can consume it.
-        # The three base cases keep the fixture default (return_value=None) unchanged.
-        if branch_base_sha is not None:
-            harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
-                return_value={'metadata': {'branch_base_sha': branch_base_sha}}
-            )
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'metadata': {'branch_base_sha': branch_base_sha}}
+        )
+        # Explicitly anchor resolve_branch_sha to a sentinel distinct from
+        # branch_base_sha so Guard 3's branch-advanced veto cannot fire
+        # regardless of future fixture changes, ensuring the guard passes
+        # through to _mark_in_progress_done.
+        _BRANCH_TIP = 'c0ffee11' + '0' * 32
+        assert _BRANCH_TIP != branch_base_sha, (
+            'Test setup error: _BRANCH_TIP collides with branch_base_sha — '
+            'update _BRANCH_TIP to a distinct 40-hex value'
+        )
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_BRANCH_TIP)  # type: ignore[attr-defined]
 
         await harness._reconcile_stranded_in_progress()
 
-        assert harness.scheduler.get_task.await_count == 1, (  # type: ignore[attr-defined]
-            f'Expected get_task awaited once (path: is_ancestor={is_ancestor_val!r}, '
-            f'marker={marker_sha_val!r}, branch_base_sha={branch_base_sha!r}); '
-            f'got {harness.scheduler.get_task.await_count}'  # type: ignore[attr-defined]
-        )
-        # For the neither-path case, confirm the lock-state revert still fires.
-        if not is_ancestor_val and marker_sha_val is None:
-            harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-                '90', 'pending'
-            )
         # Guard 3 consumer assertion: resolve_branch_sha is only called when
         # _is_valid_sha_40(branch_base_sha) is True, proving the hoisted metadata
         # dict was consumed by the is_ancestor fast-path guard.
-        if branch_base_sha is not None and is_ancestor_val:
+        if is_ancestor_val:
             harness.git_ops.resolve_branch_sha.assert_awaited_once_with('task/90')  # type: ignore[attr-defined]
         # Stale-marker consumer assertion: the second is_ancestor call (marker_sha,
         # branch_base_sha) only fires when _is_valid_sha_40(branch_base_sha) is True,
         # proving the hoisted metadata dict was consumed by the merge-marker guard.
-        elif branch_base_sha is not None and marker_sha_val is not None:
+        elif marker_sha_val is not None:
             assert harness.git_ops.is_ancestor.await_count == 2, (  # type: ignore[attr-defined]
                 f'Expected is_ancestor awaited twice (first for branch->main, '
                 f'second for marker->base); '
