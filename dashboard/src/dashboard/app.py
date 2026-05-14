@@ -688,7 +688,6 @@ async def api_curator(request: Request) -> JSONResponse:
     fanout_r, sparks_r, intervals_r = await asyncio.gather(
         fan_out_list_tickets(
             http_client, config,
-            limit=2000,
             timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
         ),
         get_curator_sparks(metrics_db, days=1),
