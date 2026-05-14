@@ -1924,8 +1924,11 @@ def create_mcp_server(
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
         """Cancel a pending curator ticket by its ticket_id.
 
-        Three outcome shapes (v1 contract):
+        Four outcome shapes (v1 contract):
 
+        * **config_error** — ticket store not configured (server misconfiguration):
+          ``{'error': 'ticket_store not configured', 'error_type': 'ConfigError',
+          'ticket_id': ticket_id}``
         * **not_found** — ticket does not exist:
           ``{'error': 'not_found', 'ticket_id': ticket_id}``
         * **no_op** — ticket is already in a terminal/non-pending status:
