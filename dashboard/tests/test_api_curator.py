@@ -90,6 +90,9 @@ def test_curator_endpoint_returns_envelope_shape(client):
     assert 'p50' in ls
     assert 'p90' in ls
     assert 'p99' in ls
+    ps = cs.get('pending_spark', {})
+    assert 'labels' in ps
+    assert 'values' in ps
     capped = cs.get('capped_spark', {})
     assert 'labels' in capped
     assert 'values' in capped
@@ -317,6 +320,9 @@ def test_shape_curator_pure_function():
     assert ls['p90'] == [90]
     assert ls['p99'] == [99]
 
+    # pending_spark surfaces the pending series from curator_sparks
+    assert cs['pending_spark'] == {'labels': ['t1'], 'values': [1]}
+
     # capped_spark passes through
     assert cs['capped_spark'] == capped_spark
 
@@ -325,6 +331,54 @@ def test_shape_curator_pure_function():
     assert state['capped_now'] == 1
     assert state['paused_reason'] == 'manual'
     assert state['pending_total'] == 42
+
+
+# ---------------------------------------------------------------------------
+# step-1300-3: pending_spark end-to-end from metrics.db
+# ---------------------------------------------------------------------------
+
+
+def test_curator_pending_spark_from_metrics_db(tmp_path: Path):
+    """pending_spark is populated from curator_snapshots.pending_total in metrics.db.
+
+    Mirrors test_curator_latency_spark_from_metrics_db — seeds two rows with
+    distinct ts and pending_total values, GETs the endpoint, and asserts the
+    full round-trip: sampler → snapshot → get_curator_sparks → shape_curator →
+    CURATOR_STATE.pending_spark.
+    """
+    now = datetime.now(UTC)
+    ts1 = (now - timedelta(hours=1)).isoformat()
+    ts2 = (now - timedelta(minutes=30)).isoformat()
+
+    metrics_dir = tmp_path / 'data' / 'burndown'
+    metrics_dir.mkdir(parents=True)
+    metrics_db_path = metrics_dir / 'metrics.db'
+    conn = sqlite3.connect(str(metrics_db_path))
+    conn.executescript(METRICS_SCHEMA)
+    conn.execute(
+        'INSERT INTO curator_snapshots '
+        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (ts1, 5, 0, 100, 200, 300),
+    )
+    conn.execute(
+        'INSERT INTO curator_snapshots '
+        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (ts2, 7, 0, 110, 210, 310),
+    )
+    conn.commit()
+    conn.close()
+
+    config = _make_config(tmp_path)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    ps = resp.json()['CURATOR_STATE']['pending_spark']
+    assert ps['labels'] == [ts1, ts2]
+    assert ps['values'] == [5, 7]
 
 
 # ---------------------------------------------------------------------------

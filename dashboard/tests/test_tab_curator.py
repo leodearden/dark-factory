@@ -136,7 +136,7 @@ def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
     # CURATOR_STATE block only.  A bare-substring check against the full data.js
     # body would pass even if this block were deleted (e.g. 'pending' appears in
     # MEMORY_STATUS and BURNDOWN; 'state' appears in MEMORY_STATUS.burst_state).
-    for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
+    for key in ('pending', 'latency_spark', 'pending_spark', 'capped_spark', 'state'):
         assert re.search(rf'\b{key}\s*:', seed_block), (
             f"CURATOR_STATE seed missing key '{key}:' — "
             f"add it to the window.DF_DATA initializer in data.js."
@@ -165,6 +165,24 @@ def test_tab_curator_jsx_served_and_exports_component(_client) -> None:
     assert '/api/v2/dashboard/curator/cancel' in body, (
         "tab_curator.jsx does not reference '/api/v2/dashboard/curator/cancel' "
         "inside a fetch() call — add the cancel POST handler."
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-1300-6 test: tab_curator.jsx references pending_spark
+# ---------------------------------------------------------------------------
+
+def test_tab_curator_jsx_renders_pending_spark(tab_curator_jsx_body: str) -> None:
+    """tab_curator.jsx must destructure pending_spark in CuratorTab.
+
+    A scoped regex verifies the key is actually used as a destructured binding
+    (followed by ',' or '}'), not merely mentioned in a comment or as an unused
+    identifier.  Mirrors the rf'\\b{key}\\s*:' scoped pattern used in
+    test_data_js_registers_curator_endpoint.
+    """
+    assert re.search(r'\bpending_spark\b\s*[,}]', tab_curator_jsx_body), (
+        "tab_curator.jsx does not destructure 'pending_spark' in CuratorTab — "
+        "add pending_spark to the destructuring of cs and pass it to PendingPanel."
     )
 
 

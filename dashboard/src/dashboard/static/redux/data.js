@@ -79,6 +79,7 @@ window.DF_DATA = {
   CURATOR_STATE: {
     pending: [],
     latency_spark: { labels: [], p50: [], p90: [], p99: [] },
+    pending_spark: { labels: [], values: [] },
     capped_spark: { labels: [], values: [] },
     state: { capped_now: 0, paused_reason: null, pending_total: 0 },
   },
