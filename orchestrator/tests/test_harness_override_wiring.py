@@ -40,6 +40,9 @@ class TestHarnessOverrideStoreIntegration:
 
         # The scheduler must be able to read the pre-written override, proving
         # it was wired to the right SQLite file.
+        assert harness.scheduler._override_store is not None, (
+            "Harness did not wire an OverrideStore into the Scheduler"
+        )
         overrides = harness.scheduler._override_store.get_overrides(project_root_str)
         assert "task-999" in overrides, (
             f"Scheduler did not see pre-written override; got keys: {list(overrides)}"
