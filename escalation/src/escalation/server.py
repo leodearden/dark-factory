@@ -78,8 +78,12 @@ def create_server(
         if cfg.infra_dedupe_enabled and esc.category in cfg.infra_dedupe_categories:
             parent_id = find_dedupe_parent(queue, esc, cfg)
             if parent_id is not None:
-                queue.attach_dedupe_child(parent_id, esc.id)
-                return {'id': parent_id, 'status': 'dedup_skipped', 'parent_id': parent_id}
+                # TOCTOU guard: attach_dedupe_child returns None when the parent
+                # was resolved/archived between the find scan and this call.
+                # On None, fall through to submit() so the escalation is not
+                # silently dropped.
+                if queue.attach_dedupe_child(parent_id, esc.id) is not None:
+                    return {'id': parent_id, 'status': 'dedup_skipped', 'parent_id': parent_id}
         esc_id = queue.submit(esc)
         return {'id': esc_id, 'status': 'queued'}
 
