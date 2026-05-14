@@ -963,3 +963,68 @@ async def test_fan_out_list_tickets_warns_when_count_at_limit(tmp_path: Path, ca
         "Expected at least one WARNING log mentioning 'list_tickets' and '2000' "
         f"for saturation, got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (task-1280): _LIST_TICKETS_LIMIT constant flows into fan_out_list_tickets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
+    tmp_path: Path, caplog, monkeypatch
+):
+    """_LIST_TICKETS_LIMIT constant must flow into the outgoing request limit.
+
+    Monkeypatches _LIST_TICKETS_LIMIT to 50 (raising=False since the constant
+    doesn't exist yet) and calls fan_out_list_tickets WITHOUT a limit kwarg so
+    the function default is exercised.  count=50 == limit=50 triggers the
+    saturation WARNING.
+
+    Assertions:
+    - handler.calls[0]['params']['arguments']['limit'] == 50  (constant flowed in)
+    - pending_total == 50
+    - at least one WARNING record on the dashboard.data.metrics logger whose
+      getMessage() contains '50' (saturation warning uses the patched constant)
+
+    Failing baseline: _LIST_TICKETS_LIMIT doesn't exist today AND
+    fan_out_list_tickets's default is the literal 2000, so the patched value
+    never reaches the payload — handler.calls[0]['params']['arguments']['limit']
+    is 2000, not 50.
+    """
+    import dashboard.data.metrics as _metrics_mod
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    monkeypatch.setattr(_metrics_mod, '_LIST_TICKETS_LIMIT', 50, raising=False)
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+    handler = _ListTicketsHandler(count=50)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            _, pending_total = await fan_out_list_tickets(http_client, cfg)
+
+    # (a) The patched constant flowed into the outgoing payload
+    assert handler.calls, "fan_out_list_tickets made no tool/call requests"
+    assert handler.calls[0]['params']['arguments']['limit'] == 50, (
+        f"Expected limit=50 in outgoing payload, got "
+        f"{handler.calls[0]['params']['arguments'].get('limit')}"
+    )
+    # (b) pending_total reflects the mocked count
+    assert pending_total == 50, f"Expected pending_total=50, got {pending_total}"
+    # (c) Saturation WARNING mentions the patched constant value
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and '50' in r.getMessage()
+    ]
+    assert warning_records, (
+        "Expected at least one WARNING mentioning '50' (saturation at patched limit), "
+        f"got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+    )
