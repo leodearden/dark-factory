@@ -3816,3 +3816,49 @@ class TestSchedulerV2Config:
         """EventType.reservation_evicted must be defined for cross-tier preemption."""
         assert hasattr(EventType, 'reservation_evicted')
         assert EventType.reservation_evicted == 'reservation_evicted'
+
+
+class TestSchedulerOverrideStoreInjection:
+    """Scheduler accepts an optional OverrideStore kwarg; when None, behaves as today."""
+
+    def test_init_accepts_override_store_kwarg_default_none(self):
+        """Scheduler(config) sets _override_store=None by default."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        assert scheduler._override_store is None
+
+    def test_init_accepts_explicit_override_store(self, tmp_path):
+        """Scheduler(config, override_store=...) stores the instance."""
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'overrides.db')
+        scheduler = Scheduler(config, override_store=store)
+        assert scheduler._override_store is store
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_queries_override_store_when_present(self, tmp_path):
+        """acquire_next() runs without error when an override_store is wired in."""
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'overrides.db')
+        # Set a boost on task A so the override code path is exercised.
+        store.set_override('/proj', 'A', boost_tier='critical')
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        result = await scheduler.acquire_next()
+        # A should be dispatched (no competing tasks, no lock conflicts).
+        assert result is not None
+        assert result.task_id == 'A'
