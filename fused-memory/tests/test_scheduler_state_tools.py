@@ -359,9 +359,9 @@ class TestSnapshotPerformance:
         result: dict = {}
         samples: list[float] = []
         # 2 warm-up samples (discarded) + 20 measured samples.
-        # Two warm-ups absorb OS page-cache warm-up and any first-call import
-        # cost in the json parser.  20 measured samples make the median robust
-        # against isolated tail spikes (vs. the previous 9-sample window).
+        # Two warm-ups absorb OS page-cache warm-up and CPU cache warm-up on
+        # the file buffer.  20 measured samples make the median robust against
+        # isolated tail spikes (vs. the previous 9-sample window).
         for i in range(22):
             t0 = time.perf_counter()
             result = read_scheduler_state(tmp_path)
@@ -370,6 +370,8 @@ class TestSnapshotPerformance:
                 samples.append(elapsed_ms)
 
         median_ms = statistics.median(samples)
+        # Guard: if read_scheduler_state silently returns an empty skeleton ({}),
+        # all reads become trivially fast and the perf bound loses meaning.
         assert 'snapshot_at' in result, 'snapshot_at missing from result'
         # Regression canary for the orchestrator snapshot-read budget (task 1230
         # acceptance criterion).  The bound is 50ms; the actual cost of
