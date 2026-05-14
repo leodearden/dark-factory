@@ -2569,6 +2569,80 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def reorder_pin_queue(
+        project_root: str,
+        ordered_task_ids: list[str] | str,
+    ) -> dict[str, Any]:
+        """Rewrite pin_order values to match the supplied ordering.
+
+        ``ordered_task_ids`` may be a list or a comma-separated string. The
+        supplied set must exactly match the current pinned-task set.
+
+        Args:
+            project_root: Absolute path to project root.
+            ordered_task_ids: New ordering — first element gets pin_order=1.
+
+        Mirrors orchestrator/src/orchestrator/overrides.py:289-329.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+
+        # Normalise CSV string input. Mirrors overrides.py:300-301.
+        if isinstance(ordered_task_ids, str):
+            ordered_task_ids = [t.strip() for t in ordered_task_ids.split(',') if t.strip()]
+
+        try:
+            now_iso = datetime.now(UTC).isoformat()
+            db = await _open_overrides_db(project_root)
+            try:
+                # Set-equality check before writing.
+                # Mirrors orchestrator/src/orchestrator/overrides.py:303-312.
+                cursor = await db.execute(
+                    'SELECT task_id FROM overrides WHERE project_root=? AND pinned=1',
+                    (project_root,),
+                )
+                current_rows = await cursor.fetchall()
+                current_set = {r[0] for r in current_rows}
+                supplied_set = set(ordered_task_ids)
+                if supplied_set != current_set:
+                    return {
+                        'error': (
+                            f'reorder_pin_queue: ids do not match current pin queue. '
+                            f'supplied={sorted(supplied_set)!r}, '
+                            f'expected={sorted(current_set)!r}'
+                        ),
+                        'error_type': 'ValidationError',
+                    }
+
+                # Single-transaction rewrite. Mirrors overrides.py:318-326.
+                await db.execute('BEGIN')
+                for idx, tid in enumerate(ordered_task_ids, start=1):
+                    await db.execute(
+                        'UPDATE overrides SET pin_order=?, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (idx, now_iso, project_root, tid),
+                    )
+                await db.commit()
+            finally:
+                await db.close()
+
+            await _emit_override_audit(
+                project_root,
+                'reorder_pin_queue',
+                None,
+                f'Reordered pin queue: {ordered_task_ids}',
+                {'ordered_task_ids': list(ordered_task_ids)},
+            )
+            return {'success': True}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'reorder_pin_queue error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def get_pin_queue(
         project_root: str,
     ) -> dict[str, Any]:
