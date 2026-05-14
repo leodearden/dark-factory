@@ -9,7 +9,7 @@ Step-by-step TDD:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -138,6 +138,38 @@ def test_all_servers_unreachable_returns_502(client):
 # ---------------------------------------------------------------------------
 # Two-URL fan-out tests (suggestion 3): fallback and short-circuit
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task-1285): invalidate_session called on transport error
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_handler_invalidates_session_on_transport_error(client):
+    """Transport error → invalidate_session called once with the failing URL.
+
+    Verifies that the cancel handler routes through invalidate_session (the
+    public helper) rather than reaching into memory_data._sessions directly,
+    ensuring the module-boundary contract introduced in task-1285/step-4.
+    """
+    _INVALIDATE_TARGET = 'dashboard.data.memory.invalidate_session'
+    from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+
+    with (
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        ),
+        patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
+    ):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    assert resp.status_code == 502
+    # invalidate_session must have been called exactly once with the failing URL
+    assert mock_invalidate.call_args_list == [call(DEFAULT_FUSED_MEMORY_URLS[0])]
 
 
 def _two_url_client(two_url_config):
