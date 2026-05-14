@@ -196,8 +196,56 @@ class TestEscalateInfoDedupe:
         assert parent.dedupe_count == 1
 
     @pytest.mark.asyncio
+    async def test_cross_severity_info_then_blocker(self, tmp_path: Path):
+        """(b) Cross-severity: info creates parent, blocker dedupes against it.
+
+        Parent's severity must be PROMOTED to 'blocking' — absorbing a blocker
+        child into an info parent must escalate urgency so the steward UI
+        treats the parent with blocker-level urgency.
+
+        This test FAILS on current main because attach_dedupe_child never
+        mutates parent.severity.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        first = await _info(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+        assert first['status'] == 'queued'
+
+        second = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+        assert second['action'] == 'terminate_cleanly'
+        assert 'child_id' in second
+
+        from escalation.models import Escalation
+        files = _queue_root_files(queue)
+        parent = Escalation.from_json(files[0].read_text())
+        assert parent.severity == 'blocking', (
+            'Parent severity must be promoted from info to blocking after '
+            'absorbing a blocker child'
+        )
+        assert parent.dedupe_count == 1
+        assert len(parent.dedupe_children) == 1
+        assert second['child_id'] == parent.dedupe_children[0]
+
+    @pytest.mark.asyncio
     async def test_cross_severity_blocker_then_info(self, tmp_path: Path):
-        """(b) Cross-severity: blocker creates parent, info dedupes against it.
+        """(c) Cross-severity: blocker creates parent, info dedupes against it.
 
         Parent's severity stays 'blocking' — info call does not demote it.
         """
@@ -536,3 +584,111 @@ class TestDedupeChildIdContract:
         # Submission order must be preserved
         assert parent.dedupe_children[0] == second['child_id']
         assert parent.dedupe_children[1] == third['child_id']
+
+
+# ---------------------------------------------------------------------------
+# TestCrossTaskChildResumeContract
+# ---------------------------------------------------------------------------
+
+
+class TestCrossTaskChildResumeContract:
+    """Characterizes the re-run-on-next-invocation contract for cross-task deduped children.
+
+    A child whose task_id differs from the parent's receives 'dedup_skipped' and
+    has NO on-disk pending escalation under its own task_id.  The child workflow's
+    wait predicate (get_by_task(child_task_id, status='pending', level=0)) therefore
+    returns [] immediately — the child does not block waiting on the parent's resolution.
+    The orchestrator's normal re-invocation of the child task on its next workflow cycle
+    is the resume mechanism.
+
+    See DESIGN.md "Escalation cross-task dedupe: re-run-on-next-invocation contract".
+    """
+
+    @pytest.mark.asyncio
+    async def test_cross_task_child_resume_contract(self, tmp_path: Path):
+        """Cross-task deduped child has no on-disk escalation; resolve introduces no obstacle.
+
+        Sequence:
+        (1) Parent blocker from task 42.
+        (2) Deduped blocker from task 99 — same infra_issue summary.
+        (3) get_by_task('99', pending, level=0) == [] before resolve (contract: no obstacle).
+        (4) get_by_task('42', pending, level=0) contains the parent.
+        (5) Resolve the parent via resolve_issue tool.
+        (6) get_by_task('99', pending, level=0) == [] after resolve (no ghost left behind).
+        (7) Parent is now resolved/archived.
+        (8) A fresh escalation from task 99 with a different summary submits cleanly
+            (status='queued') — no lingering dedupe block from the resolved parent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        # (1) Submit parent blocker from task 42.
+        first = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        assert first['status'] == 'queued'
+        parent_id = first['id']
+
+        # (2) Submit cross-task blocker from task 99 — dedupes into parent under task 42.
+        second = await _blocker(
+            server,
+            task_id='99',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+        assert second['action'] == 'terminate_cleanly'
+
+        # (3) No on-disk pending escalation under task 99's own task_id.
+        #     This is the key contract: the child's workflow wait predicate returns []
+        #     immediately, so the child does not block waiting on the parent's resolution.
+        pending_99_before = queue.get_by_task('99', status='pending', level=0)
+        assert pending_99_before == [], (
+            'Cross-task deduped child must have no on-disk pending escalation '
+            'under its own task_id — the child workflow must not block.'
+        )
+
+        # (4) The parent is still pending under task 42.
+        pending_42 = queue.get_by_task('42', status='pending', level=0)
+        assert len(pending_42) == 1
+        assert pending_42[0].id == parent_id
+
+        # (5) Resolve the parent.
+        resolve_tool = await server.get_tool('resolve_issue')
+        resolved = resolve_tool.fn(escalation_id=parent_id, resolution='fused-memory restarted')
+        assert resolved.get('status') in ('resolved', 'dismissed')
+
+        # (6) Still no pending escalation under task 99 after the parent resolves.
+        pending_99_after = queue.get_by_task('99', status='pending', level=0)
+        assert pending_99_after == [], (
+            'Resolving the parent must not create any pending escalation under '
+            'the child task_id — no ghost left behind.'
+        )
+
+        # (7) The parent is now archived/resolved.
+        resolved_parent = queue.get(parent_id)
+        assert resolved_parent is not None
+        assert resolved_parent.status in ('resolved', 'dismissed')
+
+        # (8) A fresh escalation from task 99 with a different category submits cleanly.
+        #     Using category='scope_violation' (outside the infra_issue dedupe scope)
+        #     makes this assertion immune to similarity-heuristic changes — the test
+        #     proves there is no lingering dedupe block, not that two strings happened
+        #     to be dissimilar enough.
+        fresh = await _blocker(
+            server,
+            task_id='99',
+            agent_role='implementer',
+            category='scope_violation',
+            summary='task 99 needs to write outside its locked modules',
+        )
+        assert fresh['status'] == 'queued', (
+            'After parent resolution, task 99 must be able to submit new '
+            f"escalations without a stale dedupe block; got: {fresh}"
+        )

@@ -1327,3 +1327,58 @@ class TestAttachDedupeChild:
 
         assert result is None
 
+    # --- Severity-promotion quadrant tests ---
+
+    def test_attach_info_into_info_parent_keeps_info(self, tmp_path: Path):
+        """(e) info child into info parent: parent.severity stays 'info'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        parent.severity = 'info'
+        queue.submit(parent)
+
+        result = queue.attach_dedupe_child('esc-1-1', 'esc-2-1', child_severity='info')
+
+        assert result is not None
+        assert result.severity == 'info'
+        assert queue.get('esc-1-1').severity == 'info'
+
+    def test_attach_blocker_into_info_parent_promotes_to_blocker(self, tmp_path: Path):
+        """(f) blocking child into info parent: parent.severity promoted to 'blocking'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        parent.severity = 'info'
+        queue.submit(parent)
+
+        result = queue.attach_dedupe_child('esc-1-1', 'esc-2-1', child_severity='blocking')
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        # Verify promotion is persisted to disk
+        assert queue.get('esc-1-1').severity == 'blocking'
+
+    def test_attach_info_into_blocker_parent_keeps_blocker(self, tmp_path: Path):
+        """(g) info child into blocking parent: parent.severity stays 'blocking'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        parent.severity = 'blocking'
+        queue.submit(parent)
+
+        result = queue.attach_dedupe_child('esc-1-1', 'esc-2-1', child_severity='info')
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert queue.get('esc-1-1').severity == 'blocking'
+
+    def test_attach_blocker_into_blocker_parent_keeps_blocker(self, tmp_path: Path):
+        """(h) blocking child into blocking parent: parent.severity stays 'blocking'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        parent.severity = 'blocking'
+        queue.submit(parent)
+
+        result = queue.attach_dedupe_child('esc-1-1', 'esc-2-1', child_severity='blocking')
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert queue.get('esc-1-1').severity == 'blocking'
+

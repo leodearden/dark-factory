@@ -17,6 +17,25 @@ from escalation.models import Escalation
 
 logger = logging.getLogger(__name__)
 
+# Severity rank map for promotion logic.  Alphabetical comparison is wrong
+# ('blocking' < 'info'), so we use an explicit rank.  Unknown severities
+# default to rank 0 (treated as info-level) so malformed input never causes
+# unexpected promotion.
+_SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
+
+
+def _max_severity(a: str, b: str) -> str:
+    """Return the higher-urgency severity string between *a* and *b*."""
+    for val in (a, b):
+        if val not in _SEVERITY_RANK:
+            logger.warning(
+                '_max_severity: unrecognised severity %r — treating as info-level '
+                '(rank 0). Known values: %s',
+                val,
+                ', '.join(_SEVERITY_RANK),
+            )
+    return a if _SEVERITY_RANK.get(a, 0) >= _SEVERITY_RANK.get(b, 0) else b
+
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
     """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
@@ -341,19 +360,20 @@ class EscalationQueue:
         return esc
 
     def attach_dedupe_child(
-        self, parent_id: str, child_id: str,
+        self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
         """Append *child_id* to the pending parent's dedupe_children list.
 
-        **Not concurrency-safe.**  The read-modify-write of ``dedupe_count``
-        and ``dedupe_children`` is *not* atomic: two concurrent callers for
-        the same parent each read the same pre-mutation snapshot, both append
-        once and both write with the same incremented count, and the second
-        rewrite silently clobbers the first — losing a child.  The caller must
-        serialize concurrent attaches against the same parent.  Today this
-        invariant holds because the MCP server is single-writer; any
-        multi-writer migration must add explicit serialization before calling
-        this function.
+        **Not concurrency-safe.**  The read-modify-write of ``dedupe_count``,
+        ``dedupe_children``, and ``severity`` is *not* atomic: two concurrent
+        callers for the same parent each read the same pre-mutation snapshot,
+        both append once and both write with the same incremented count, and
+        the second rewrite silently clobbers the first — losing a child and
+        potentially reverting a severity promotion.  The caller must serialize
+        concurrent attaches against the same parent.  Today this invariant
+        holds because the MCP server is single-writer; any multi-writer
+        migration must add explicit serialization for all three fields before
+        calling this function.
 
         Loads the parent directly from ``queue_dir/{parent_id}.json`` — it does
         NOT fall back to the archive.  This ensures that resolved / dismissed
@@ -382,10 +402,11 @@ class EscalationQueue:
             return None
         parent.dedupe_children.append(child_id)
         parent.dedupe_count += 1
+        parent.severity = _max_severity(parent.severity, child_severity)
         self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '
-            f'(dedupe_count={parent.dedupe_count})'
+            f'(dedupe_count={parent.dedupe_count}, severity={parent.severity})'
         )
         return parent
 

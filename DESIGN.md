@@ -453,3 +453,71 @@ on `not_found` and returns 404 immediately.  The executable contract for this be
 **Trigger for revisiting.** If a future infra change introduces ticket replication or
 multi-region deployment, this invariant must be re-evaluated and the cancel proxy
 short-circuit relaxed to fan-out-then-quorum.
+
+
+## Escalation cross-task dedupe: re-run-on-next-invocation contract
+
+### Problem statement
+
+Escalation deduplication folds similar `infra_issue` escalations into a single
+"parent" on disk.  Folding can be *same-task* (two calls from task 42 with the
+same summary key) or *cross-task* (task 99 escalates with the same key while
+task 42's parent is still pending).  This section documents the cross-task case,
+which has subtler resume semantics than same-task folding.
+
+When task 99 submits a blocker that dedupes into task 42's pending parent:
+
+- No escalation file is written under task 99.  The child's escalation object
+  exists only in memory during the `_submit_or_dedupe` call; the on-disk change
+  is a mutation of task 42's parent file (incrementing `dedupe_count` and
+  appending the child's synthetic id to `dedupe_children`).
+- Task 99's agent receives `{'status': 'dedup_skipped', 'action': 'terminate_cleanly'}`
+  and stops working.
+
+### Contract
+
+**The child workflow does not block waiting on the parent's resolution.**
+
+The orchestrator workflow's `_wait_for_resolution` predicate queries
+`queue.get_by_task(self.task_id, status='pending', level=0)`.  For task 99,
+this returns `[]` because there is no on-disk pending escalation under task
+99's own `task_id`.  The wait loop never enters `await self._escalation_event.wait()`.
+
+**The orchestrator's normal re-invocation is the resume mechanism.**  When the
+orchestrator cycles through its task queue again, task 99 is re-invoked.  By
+that time the parent's resolution has fixed the shared infra condition (e.g.
+the fused-memory MCP server came back online), so task 99's re-run proceeds
+normally.  If the condition is not yet fixed, task 99 re-escalates and a fresh
+parent is created.
+
+### Why not per-child wake signals
+
+Iterating `parent.dedupe_children` on resolution and emitting a wake signal per
+child `task_id` would be a functional no-op given the contract above:
+
+1. The child workflow has no `asyncio.Event` keyed by its own `task_id` (because
+   it never entered the wait loop — see above).
+2. Even if the event existed, `_on_escalation_resolved` (harness.py) only sets
+   events for the *parent's* `task_id`; wiring a cross-task wake signal would
+   require widening the `resolve_callback` contract and adding harness changes
+   outside the `escalation/` module boundary.
+
+The re-invocation approach is simpler, correctly isolated, and avoids the
+complexity of a distributed wake signal over what is essentially a file-based queue.
+
+### Why this is safe
+
+The parent's resolution is semantically a claim that the shared infra condition
+has been addressed.  Any child task that re-runs after the parent resolves will
+no longer encounter the original infra issue and will proceed normally.  If the
+infra issue is not actually shared — i.e. the child task hits a distinct issue —
+it re-escalates on its next run and a fresh parent is created; the old resolved
+parent's `dedupe_children` list plays no role in that new fold.
+
+### Executable contract
+
+`escalation/tests/test_server_dedupe.py::TestCrossTaskChildResumeContract::test_cross_task_child_resume_contract`
+pins this contract end-to-end using only the public escalation API.  It verifies
+that `get_by_task('99', status='pending', level=0)` returns `[]` before and
+after parent resolution, that the parent is properly archived, and that task 99
+can submit new escalations after the parent resolves with no lingering dedupe block.
