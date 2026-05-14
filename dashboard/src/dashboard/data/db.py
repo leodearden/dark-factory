@@ -12,6 +12,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TypeVar
+from urllib.parse import quote
 
 import aiosqlite
 
@@ -44,7 +45,7 @@ class DbPool:
             if not resolved.exists():
                 return None
             conn = await aiosqlite.connect(
-                f'file:{resolved}?mode=ro', uri=True,
+                f'file:{quote(str(resolved), safe="/")}?mode=ro', uri=True,
             )
             conn.row_factory = aiosqlite.Row
             self._conns[resolved] = conn
