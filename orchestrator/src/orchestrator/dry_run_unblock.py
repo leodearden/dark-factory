@@ -45,14 +45,16 @@ DRY_RUN_PROPOSAL_SCHEMA: dict[str, Any] = {
 _RISK_LABELS: frozenset[str] = frozenset({'low', 'medium', 'human-review-required'})
 _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
 
-# Read-only tools the dry-run agent is allowed to use
+# Read-only tools the dry-run agent is allowed to use.
+# Bash(pytest:*) and Bash(cargo:*) are intentionally omitted: both can
+# write .pyc/__pycache__/target/ files or fetch from the network, which
+# contradicts the read-only safety contract advertised in SKILL.md.
+# The agent can read existing test output from .task/iterations.jsonl instead.
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
     'Grep',
     'Bash(git:*)',
-    'Bash(cargo:*)',
-    'Bash(pytest:*)',
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
@@ -73,16 +75,30 @@ _DISALLOWED_TOOLS: list[str] = [
 # ---------------------------------------------------------------------------
 
 def _load_skill_system_prompt() -> str:
-    """Load skills/unblock-auto/SKILL.md from repo root, strip frontmatter."""
-    skill_path = Path(__file__).parent.parent.parent.parent.parent / 'skills' / 'unblock-auto' / 'SKILL.md'
-    if not skill_path.exists():
-        # Fallback: search upward for the skills directory
-        here = Path(__file__).resolve()
-        for parent in here.parents:
-            candidate = parent / 'skills' / 'unblock-auto' / 'SKILL.md'
-            if candidate.exists():
-                skill_path = candidate
-                break
+    """Load skills/unblock-auto/SKILL.md from repo root, strip frontmatter.
+
+    Walks up from __file__ until it finds a directory containing
+    ``skills/unblock-auto/SKILL.md`` or reaches the repo root (.git marker).
+    Raises FileNotFoundError with a clear message if the file cannot be found
+    (so the outer exception handler in run_dry_run_unblock writes a fallback
+    entry rather than running the agent with an empty/missing system prompt).
+    """
+    here = Path(__file__).resolve()
+    skill_path: Path | None = None
+
+    for parent in here.parents:
+        candidate = parent / 'skills' / 'unblock-auto' / 'SKILL.md'
+        if candidate.exists():
+            skill_path = candidate
+            break
+        # Stop searching once we reach the repo root to avoid wandering above it
+        if (parent / '.git').exists():
+            break
+
+    if skill_path is None:
+        raise FileNotFoundError(
+            f'skills/unblock-auto/SKILL.md not found: searched upward from {here}'
+        )
 
     raw = skill_path.read_text()
     if not raw.startswith('---'):
@@ -105,7 +121,6 @@ async def run_dry_run_unblock(
     mcp: Any,
     config: Any,
     event_store: Any = None,
-    usage_gate: Any = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -243,7 +258,17 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
     }
 
 
-def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:
+# Stable subtype values emitted by the CLI when the cost cap fires.
+_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget'})
+
+
+def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
+    """Return True only when the agent's subtype explicitly signals budget exhaustion.
+
+    We avoid the ``cost >= budget_usd`` heuristic: an agent can spend close to
+    the cap before failing for an unrelated reason (e.g. max_turns, tool error),
+    which would mis-classify those failures as 'budget_exhausted' and produce
+    misleading operator-visible status fields in metadata.
+    """
     subtype = getattr(result, 'subtype', '') or ''
-    cost = getattr(result, 'cost_usd', 0.0)
-    return 'budget' in subtype.lower() or cost >= budget_usd
+    return subtype in _BUDGET_SUBTYPES

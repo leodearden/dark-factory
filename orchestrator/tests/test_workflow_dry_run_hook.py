@@ -126,8 +126,13 @@ class TestMarkBlockedSpawnsFireAndForget:
 
         # Give the background task a tick to register its call
         await asyncio.sleep(0)
+
+        # Capture any still-pending background tasks before releasing hang,
+        # then await them so pytest-asyncio doesn't warn "Task destroyed while pending".
+        pending = list(wf._background_tasks)
         hang_event.set()
-        await asyncio.sleep(0)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
         # run_dry_run_unblock was called with the right kwargs
         assert len(calls) == 1

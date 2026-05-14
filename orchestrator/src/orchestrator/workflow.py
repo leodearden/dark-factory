@@ -330,6 +330,11 @@ class TaskWorkflow:
         # reason from an earlier task slot can't poison the signature.
         self._last_merge_block_reason: str | None = None
 
+        # Background asyncio.Tasks spawned by _spawn_dry_run_unblock.
+        # Holding a strong reference prevents the event loop's weak-ref GC
+        # from destroying long-running investigations before they complete.
+        self._background_tasks: set = set()
+
         # One-shot guard for the architect plan-tightening retry.  Set
         # True on first _try_narrow_plan call regardless of outcome so
         # the workflow never loops the narrowing pass on the same task.
@@ -4349,8 +4354,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         self._last_block_detail = detail or reason
         if not merge_phase:
             self._enter_phase(WorkflowState.BLOCKED)
+            _status_set_ok = False
             try:
                 await self.scheduler.set_task_status(self.task_id, 'blocked')
+                _status_set_ok = True
             except TerminalExitRejection as exc:
                 bypass_outcome = await self._handle_terminal_exit_on_block(
                     exc, reason, detail or reason,
@@ -4359,7 +4366,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     return bypass_outcome
                 # Legitimate done — fall through; the existing post-steward
                 # flow below handles current==done by returning DONE.
-            self._spawn_dry_run_unblock(reason, detail or reason)
+            if _status_set_ok:
+                self._spawn_dry_run_unblock(reason, detail or reason)
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
@@ -4592,7 +4600,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not getattr(self.config, 'unblock_auto', None) or not self.config.unblock_auto.enabled:
             return
         try:
-            asyncio.create_task(
+            _task = asyncio.create_task(
                 run_dry_run_unblock(
                     task_id=self.task_id,
                     worktree=str(self.worktree) if self.worktree else '.',
@@ -4602,10 +4610,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     mcp=self.mcp,
                     config=self.config,
                     event_store=getattr(self, 'event_store', None),
-                    usage_gate=getattr(self, 'usage_gate', None),
                 ),
                 name=f'unblock-auto-{self.task_id}',
             )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
         except Exception as exc:
             logger.warning(
                 'Task %s: failed to spawn dry-run unblock hook: %s',
