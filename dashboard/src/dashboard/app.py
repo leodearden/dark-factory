@@ -591,6 +591,15 @@ async def api_performance(request: Request) -> JSONResponse:
     ))
 
 
+# Cap str(exc) inside the 502 `detail` field to bound response-body
+# leakage when an upstream MCP server returns a large error body via
+# httpx.HTTPStatusError (whose __str__ embeds the full response).  The
+# WARNING log still records the full untruncated exception text.
+# Intentionally cancel-handler-scoped for now; other proxy handlers can
+# adopt the same constant if they gain an equivalent truncation path.
+_CANCEL_DETAIL_EXC_CHAR_LIMIT = 200
+
+
 @app.post('/api/v2/dashboard/curator/cancel')
 async def api_curator_cancel(request: Request) -> JSONResponse:
     """Proxy POST /curator/cancel → fused-memory cancel_ticket MCP tool.
@@ -645,7 +654,10 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
         except (httpx.ConnectError, httpx.TimeoutException,
                 httpx.HTTPStatusError, ValueError) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            errors.append(f'{url}: {type(exc).__name__}: {str(exc)[:200]}')
+            errors.append(
+                f'{url}: {type(exc).__name__}: '
+                f'{str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
+            )
             # Invalidate the cached MCP session so the next caller retries
             # session initialisation — mirrors get_memory_status/get_queue_stats.
             memory_data.invalidate_session(url)

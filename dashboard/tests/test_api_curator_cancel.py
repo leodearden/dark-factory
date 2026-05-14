@@ -15,11 +15,27 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import httpx
 import pytest
 
+from dashboard.app import _CANCEL_DETAIL_EXC_CHAR_LIMIT
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
+
+
+def _tool_name(c):
+    """Return the tool_name argument from an mcp_tool_call mock call.
+
+    Handles both positional-arg (c.args[2]) and keyword-arg
+    (c.kwargs['tool_name']) invocations so call-list filters continue to work
+    correctly if a future refactor switches the handler to keyword-argument
+    style (at which point c.args would be shorter and positional indexing
+    would silently produce 0 matches).
+    """
+    if len(c.args) > 2:
+        return c.args[2]
+    return c.kwargs.get('tool_name')
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +99,17 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     assert resp.status_code == 200
     assert resp.json() == mcp_result
 
-    mock_mcp.assert_called_once()
-    _client_arg, url_arg, tool_arg, args_arg = mock_mcp.call_args.args
+    # The cancel handler must call cancel_ticket exactly once with the correct
+    # args.  Background tasks (metrics loop) may also call mcp_tool_call for
+    # get_status / get_queue_stats probes during the test window; filter those
+    # out so the assertion targets only the handler's own MCP call.
+    # _tool_name() handles both positional and keyword invocations so the
+    # filter is not broken by a future switch to kwargs.
+    cancel_calls = [c for c in mock_mcp.call_args_list if _tool_name(c) == 'cancel_ticket']
+    assert len(cancel_calls) == 1, (
+        f'Expected exactly 1 cancel_ticket call, got {len(cancel_calls)}: {cancel_calls}'
+    )
+    _client_arg, url_arg, tool_arg, args_arg = cancel_calls[0].args
     assert tool_arg == 'cancel_ticket'
     assert args_arg == {'ticket_id': 'tkt_abc'}
     # The URL must be exactly the first entry in the default config
@@ -236,26 +261,31 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
 
 
 def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
-    """502 detail is capped at 200 chars; WARNING log keeps full exception text.
+    """502 detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars; WARNING keeps full text.
 
     Guards against arbitrary-length response-body leakage via the 502 detail
     field: the cancel handler interpolates str(exc) in the detail string, which
-    can be unbounded when the upstream MCP server returns a large error body
-    (e.g. httpx.HTTPStatusError whose message is the full response body).
+    can be unbounded when the upstream MCP server returns a large error body.
+
+    Uses ValueError('X' * 300) as the exception fixture because:
+      - ValueError is already in the handler's caught-exception tuple
+        (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError)
+      - str(ValueError(s)) == s is part of the stdlib BaseException.__str__
+        contract (single-arg case returns self.args[0] as-is), so the assertion
+        directly pins the handler's truncation behaviour rather than depending on
+        httpx.HTTPStatusError.__str__ formatting, which is not contractual and
+        could change across httpx versions.
 
     Assertions:
       (a) response is 502
-      (b) detail contains the first 200 chars of the exception message
-          AND does NOT contain 201 consecutive 'X' chars (i.e. is truncated)
+      (b) detail contains the first _CANCEL_DETAIL_EXC_CHAR_LIMIT chars of the
+          exception message AND does NOT contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1
+          consecutive 'X' chars (i.e. is truncated)
       (c) the WARNING log record still has the FULL 300-char message
           (ops log must not lose information)
     """
     long_msg = 'X' * 300
-    exc = httpx.HTTPStatusError(
-        long_msg,
-        request=httpx.Request('POST', 'http://x'),
-        response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
-    )
+    exc = ValueError(long_msg)
     with patch(
         _PATCH_TARGET,
         new=AsyncMock(side_effect=exc),
@@ -268,10 +298,14 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
     # (a) 502
     assert resp.status_code == 502
 
-    # (b) detail is capped at 200 chars
+    # (b) detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars
     detail = resp.json().get('detail', '')
-    assert 'X' * 200 in detail, 'Expected first 200 X chars in detail'
-    assert 'X' * 201 not in detail, 'Detail must not contain 201+ X chars (leaked exc text)'
+    assert 'X' * _CANCEL_DETAIL_EXC_CHAR_LIMIT in detail, (
+        'Expected first _CANCEL_DETAIL_EXC_CHAR_LIMIT X chars in detail'
+    )
+    assert 'X' * (_CANCEL_DETAIL_EXC_CHAR_LIMIT + 1) not in detail, (
+        'Detail must not contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 X chars (leaked exc text)'
+    )
 
     # (c) WARNING log retains full exception text
     warning_records = [
@@ -281,6 +315,49 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
     assert warning_records, 'Expected at least one WARNING from dashboard.app'
     combined_msg = ' '.join(r.getMessage() for r in warning_records)
     assert long_msg in combined_msg, 'WARNING log must contain full (untruncated) exception text'
+
+
+def test_cancel_handler_502_detail_bounded_for_httpstatuserror(client):
+    """HTTPStatusError with a large response body yields a bounded 502 detail.
+
+    httpx.HTTPStatusError.__str__ embeds the response body in its string
+    representation, so a large upstream error response could leak through the
+    502 detail field.  This test verifies that _CANCEL_DETAIL_EXC_CHAR_LIMIT
+    bounds the detail length without asserting on the exact HTTPStatusError
+    __str__ format (which is not part of the httpx public contract and could
+    change across httpx versions).
+
+    Complements test_cancel_handler_502_detail_truncates_exception_text (which
+    uses ValueError for a stable contract) by exercising the actual upstream
+    scenario the truncation cap was designed to defend against.
+    """
+    large_body = b'E' * 10000
+    exc = httpx.HTTPStatusError(
+        'Server Error',
+        request=httpx.Request('POST', 'http://x'),
+        response=httpx.Response(
+            500,
+            content=large_body,
+            request=httpx.Request('POST', 'http://x'),
+        ),
+    )
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=exc)):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    assert resp.status_code == 502
+    detail = resp.json().get('detail', '')
+    # Each per-URL error segment is '{url}: {typename}: {str(exc)[:LIMIT]}'.
+    # With the default single-URL config the total is bounded by the limit
+    # plus a small fixed overhead (URL + type name + separators).  Use 3×
+    # the limit as a generous ceiling so the assertion catches truncation
+    # failures without depending on URL/typename lengths.
+    max_detail = 3 * _CANCEL_DETAIL_EXC_CHAR_LIMIT
+    assert len(detail) <= max_detail, (
+        f'502 detail must be bounded (≤{max_detail} chars); got {len(detail)} chars'
+    )
 
 
 def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
