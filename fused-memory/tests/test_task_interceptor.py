@@ -5280,3 +5280,41 @@ async def test_predone_hook_skipped_on_done_to_done_noop(
     # taskmaster.set_task_status must NOT have been called
     taskmaster.set_task_status.assert_not_called()
     reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_predone_hook_per_project_isolation(
+    taskmaster, reconciler, event_buffer, monkeypatch, tmp_path
+):
+    """Per-project env-var keying: hook for project-a must not affect project-b.
+
+    project-a has /bin/false → done transition is rejected.
+    project-b has no env var set → done transition succeeds as normal.
+    Confirms env-var lookup is per-call and per-project, not global.
+    """
+    project_a = tmp_path / 'project-a'
+    project_b = tmp_path / 'project-b'
+    project_a.mkdir()
+    project_b.mkdir()
+
+    pid_a = resolve_project_id(str(project_a)).upper()  # e.g. PROJECT_A
+    pid_b = resolve_project_id(str(project_b)).upper()  # e.g. PROJECT_B
+
+    monkeypatch.setenv(f'FUSED_MEMORY_PREDONE_HOOK_{pid_a}', '/bin/false')
+    monkeypatch.delenv(f'FUSED_MEMORY_PREDONE_HOOK_{pid_b}', raising=False)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    # project-a: hook fires and rejects
+    result_a = await interceptor.set_task_status('1', 'done', str(project_a))
+    assert result_a['success'] is False
+    assert result_a['error'] == 'pre_done_hook_rejected', (
+        f'Expected pre_done_hook_rejected for project-a, got: {result_a}'
+    )
+
+    # project-b: no hook, transition succeeds
+    taskmaster.set_task_status.reset_mock()
+    result_b = await interceptor.set_task_status('2', 'done', str(project_b))
+    assert 'error' not in result_b, (
+        f'project-b should succeed without hook, got: {result_b}'
+    )
+    taskmaster.set_task_status.assert_called_once()
