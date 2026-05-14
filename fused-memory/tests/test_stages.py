@@ -4468,6 +4468,40 @@ class TestQueryStage2Flags:
             assert current_flags == []
             assert stale_marker_ids == ['test-id']
 
+    @pytest.mark.asyncio
+    async def test_partition_separates_missing_from_mismatched_stale(self):
+        """Missing-run_id and mismatched-run_id markers land in distinct partition fields."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            _query_stage2_flags,
+        )
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # (a) matching run_id — should be in current
+            self._make_result('current', 'content a', {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-current'}),
+            # (b) mismatched run_id — should be in stale_mismatched_run_id_ids
+            self._make_result('prior', 'content b', {'flag_for_stage2': True, 'task_id': '2', 'run_id': 'r-prior'}),
+            # (c) run_id key absent — should be in stale_missing_run_id_ids
+            self._make_result('no-run-id', 'content c', {'flag_for_stage2': True, 'task_id': '3'}),
+            # (d) run_id empty string — should be in stale_missing_run_id_ids
+            self._make_result('empty-run-id', 'content d', {'flag_for_stage2': True, 'task_id': '4', 'run_id': ''}),
+        ]
+        partition = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+
+        # Partition must be the right type with 3 fields
+        assert isinstance(partition, Stage2FlagPartition)
+        assert len(partition) == 3
+
+        # (a) only matching marker in current
+        assert len(partition.current) == 1
+        assert partition.current[0]['id'] == 'current'
+
+        # (c) and (d) — missing run_id (absent or empty) in stale_missing_run_id_ids
+        assert partition.stale_missing_run_id_ids == ['no-run-id', 'empty-run-id']
+
+        # (b) — present but mismatched run_id
+        assert partition.stale_mismatched_run_id_ids == ['prior']
+
 
 class TestSweepStaleFixcMarkers:
     """_sweep_stale_fixc_markers deletes stale fixc markers in parallel and returns count."""
