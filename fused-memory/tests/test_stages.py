@@ -5631,6 +5631,21 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         assert report.stats.get('stale_missing_run_id_markers') == 2
         # Combined sweep: 1 mismatched + 2 missing = 3
         assert report.stats.get('stale_fixc_markers_swept') == 3
+        # Verify delete_memory was called for each stale ID with the exact kwargs
+        # that _sweep_stale_fixc_markers emits — pins the partition→sweep contract.
+        mock_deps['memory_service'].delete_memory.assert_any_call(
+            memory_id='missing-1', store='mem0', project_id='reify',
+            causation_id='test-run', _source='stage2_stale_fixc_sweep',
+        )
+        mock_deps['memory_service'].delete_memory.assert_any_call(
+            memory_id='missing-2', store='mem0', project_id='reify',
+            causation_id='test-run', _source='stage2_stale_fixc_sweep',
+        )
+        mock_deps['memory_service'].delete_memory.assert_any_call(
+            memory_id='mismatched', store='mem0', project_id='reify',
+            causation_id='test-run', _source='stage2_stale_fixc_sweep',
+        )
+        assert mock_deps['memory_service'].delete_memory.call_count == 3
 
     @pytest.mark.asyncio
     async def test_zero_missing_run_id_markers_stat_explicitly_set(self, mock_deps):
