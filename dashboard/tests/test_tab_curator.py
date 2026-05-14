@@ -82,13 +82,14 @@ def _extract_curator_state_block(data_js: str) -> str:
         elif c == '}':
             depth -= 1
             if depth == 0:
-                return data_js[start:i + 1]
+                return data_js[start : i + 1]
     return ''
 
 
 # ---------------------------------------------------------------------------
 # step-1 test: charts.jsx exports StepSpark
 # ---------------------------------------------------------------------------
+
 
 def test_charts_jsx_exports_step_spark(charts_jsx_body: str) -> None:
     """charts.jsx must define a StepSpark function and register it on window.DF_CHARTS.
@@ -111,6 +112,7 @@ def test_charts_jsx_exports_step_spark(charts_jsx_body: str) -> None:
 # step-3 test: data.js registers the curator endpoint
 # ---------------------------------------------------------------------------
 
+
 def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
     """data.js must register /api/v2/dashboard/curator mapped to ['CURATOR_STATE'].
 
@@ -120,7 +122,7 @@ def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
     """
     assert '/api/v2/dashboard/curator' in data_js_body, (
         "data.js does not contain the literal URL '/api/v2/dashboard/curator' — "
-        "add it to the unwindowed entries in endpointsFor."
+        'add it to the unwindowed entries in endpointsFor.'
     )
     assert "'CURATOR_STATE'" in data_js_body or '"CURATOR_STATE"' in data_js_body, (
         "data.js does not reference 'CURATOR_STATE' — add it as the mapped key "
@@ -128,9 +130,9 @@ def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
     )
     seed_block = _extract_curator_state_block(data_js_body)
     assert seed_block, (
-        "data.js does not contain a `CURATOR_STATE: { ... }` seed block — "
-        "add the initializer to the window.DF_DATA assignment so applyKey has "
-        "something to replace on each poll."
+        'data.js does not contain a `CURATOR_STATE: { ... }` seed block — '
+        'add the initializer to the window.DF_DATA assignment so applyKey has '
+        'something to replace on each poll.'
     )
     # Scoped check: assert each key is present as a property name inside the
     # CURATOR_STATE block only.  A bare-substring check against the full data.js
@@ -139,13 +141,14 @@ def test_data_js_registers_curator_endpoint(data_js_body: str) -> None:
     for key in ('pending', 'latency_spark', 'pending_spark', 'capped_spark', 'state'):
         assert re.search(rf'\b{key}\s*:', seed_block), (
             f"CURATOR_STATE seed missing key '{key}:' — "
-            f"add it to the window.DF_DATA initializer in data.js."
+            f'add it to the window.DF_DATA initializer in data.js.'
         )
 
 
 # ---------------------------------------------------------------------------
 # step-5 test: tab_curator.jsx is served and exports CuratorTab
 # ---------------------------------------------------------------------------
+
 
 def test_tab_curator_jsx_served_and_exports_component(_client) -> None:
     """GET /static/redux/tab_curator.jsx returns 200 with the expected wiring."""
@@ -164,7 +167,7 @@ def test_tab_curator_jsx_served_and_exports_component(_client) -> None:
     )
     assert '/api/v2/dashboard/curator/cancel' in body, (
         "tab_curator.jsx does not reference '/api/v2/dashboard/curator/cancel' "
-        "inside a fetch() call — add the cancel POST handler."
+        'inside a fetch() call — add the cancel POST handler.'
     )
 
 
@@ -172,23 +175,39 @@ def test_tab_curator_jsx_served_and_exports_component(_client) -> None:
 # step-1300-6 test: tab_curator.jsx references pending_spark
 # ---------------------------------------------------------------------------
 
-def test_tab_curator_jsx_renders_pending_spark(tab_curator_jsx_body: str) -> None:
-    """tab_curator.jsx must destructure pending_spark in CuratorTab.
 
-    A scoped regex verifies the key is actually used as a destructured binding
-    (followed by ',' or '}'), not merely mentioned in a comment or as an unused
-    identifier.  Mirrors the rf'\\b{key}\\s*:' scoped pattern used in
-    test_data_js_registers_curator_endpoint.
+def test_tab_curator_jsx_renders_pending_spark(tab_curator_jsx_body: str) -> None:
+    """tab_curator.jsx must satisfy two independent contracts for pending_spark.
+
+    1. **Destructure binding**: ``pending_spark`` appears as a destructured
+       binding (followed by ',' or '}') in CuratorTab, confirming the metric is
+       bound into local scope.  A scoped regex avoids false positives from
+       comments or unused identifiers.  Mirrors the rf'\\b{key}\\s*:' pattern
+       used in test_data_js_registers_curator_endpoint.
+
+    2. **JSX rendering**: ``<PendingPanel pending_spark=`` appears in the body,
+       confirming PendingPanel is actually invoked with the pending_spark prop.
+       Mutation criterion (reviewer esc-1300-40 #1): deleting
+       ``<PendingPanel pending_spark={pending_spark}/>`` from tab_curator.jsx
+       causes the second assertion to fail even though the destructure binding
+       remains in place.
     """
     assert re.search(r'\bpending_spark\b\s*[,}]', tab_curator_jsx_body), (
         "tab_curator.jsx does not destructure 'pending_spark' in CuratorTab — "
-        "add pending_spark to the destructuring of cs and pass it to PendingPanel."
+        'add pending_spark to the destructuring of cs and pass it to PendingPanel.'
+    )
+    assert re.search(r'<PendingPanel\b[^>]*\bpending_spark\s*=', tab_curator_jsx_body), (
+        'tab_curator.jsx does not render `<PendingPanel pending_spark={...}/>` — '
+        'even though pending_spark is destructured, PendingPanel is not being '
+        'invoked with it. Add or restore the `<PendingPanel pending_spark={pending_spark} />` '
+        "element inside CuratorTab's JSX."
     )
 
 
 # ---------------------------------------------------------------------------
 # step-7 test: tabs.jsx exports ChipList for cross-tab reuse
 # ---------------------------------------------------------------------------
+
 
 def test_tabs_jsx_exports_chiplist_for_reuse(tabs_jsx_body: str) -> None:
     """tabs.jsx must include ChipList in its window.DF_TABS export.
@@ -213,6 +232,7 @@ def test_tabs_jsx_exports_chiplist_for_reuse(tabs_jsx_body: str) -> None:
 # step-9 test: shell.jsx registers curator glyph and rail entry
 # ---------------------------------------------------------------------------
 
+
 def test_shell_jsx_registers_curator_glyph_and_rail_entry(shell_jsx_body: str) -> None:
     """shell.jsx must include a Rail item with id 'curator'.
 
@@ -222,13 +242,14 @@ def test_shell_jsx_registers_curator_glyph_and_rail_entry(shell_jsx_body: str) -
     """
     assert "id: 'curator'" in shell_jsx_body, (
         "shell.jsx Rail items array does not contain an entry with `id: 'curator'` "
-        "— add the curator item to the Rail items array."
+        '— add the curator item to the Rail items array.'
     )
 
 
 # ---------------------------------------------------------------------------
 # step-11 test: app.jsx wires the curator tab
 # ---------------------------------------------------------------------------
+
 
 def test_app_jsx_wires_curator_tab(app_jsx_body: str) -> None:
     """app.jsx must destructure CuratorTab, add it to tabs[], and handle it in renderTab.
@@ -242,8 +263,8 @@ def test_app_jsx_wires_curator_tab(app_jsx_body: str) -> None:
     breaking the routing.
     """
     assert re.search(r'const\s*\{[^}]*CuratorTab[^}]*\}\s*=\s*window\.DF_CURATOR', app_jsx_body), (
-        "app.jsx does not destructure CuratorTab from window.DF_CURATOR — add "
-        "`const { CuratorTab } = window.DF_CURATOR;` near the other destructures."
+        'app.jsx does not destructure CuratorTab from window.DF_CURATOR — add '
+        '`const { CuratorTab } = window.DF_CURATOR;` near the other destructures.'
     )
     assert "id: 'curator'" in app_jsx_body, (
         "app.jsx tabs array does not contain an entry with `id: 'curator'` — "
@@ -251,13 +272,14 @@ def test_app_jsx_wires_curator_tab(app_jsx_body: str) -> None:
     )
     assert "case 'curator':" in app_jsx_body, (
         "app.jsx renderTab switch does not have `case 'curator':` — add the "
-        "case branch to render <CuratorTab projectFilter={projects} />."
+        'case branch to render <CuratorTab projectFilter={projects} />.'
     )
 
 
 # ---------------------------------------------------------------------------
 # meta-test: _extract_curator_state_block scoping
 # ---------------------------------------------------------------------------
+
 
 def test_curator_state_key_check_is_scoped_to_seed_block() -> None:
     """The scoped key check must detect a missing CURATOR_STATE block.
@@ -275,43 +297,42 @@ def test_curator_state_key_check_is_scoped_to_seed_block() -> None:
         past the first inner `}`.
     """
     fake_without_curator_state = (
-        "window.DF_DATA = {\n"
-        "  MEMORY_STATUS: { queue: { counts: { pending: 0 } }, burst_state: [] },\n"
+        'window.DF_DATA = {\n'
+        '  MEMORY_STATUS: { queue: { counts: { pending: 0 } }, burst_state: [] },\n'
         "  BURNDOWN: { pending: [], state: 'idle' },\n"
-        "  LATENCY: { latency_spark: [], capped_spark: [] },\n"
-        "};\n"
+        '  LATENCY: { latency_spark: [], capped_spark: [] },\n'
+        '};\n'
     )
 
     fake_with_curator_state = (
-        "window.DF_DATA = {\n"
-        "  MEMORY_STATUS: { queue: { counts: { pending: 0 } }, burst_state: [] },\n"
+        'window.DF_DATA = {\n'
+        '  MEMORY_STATUS: { queue: { counts: { pending: 0 } }, burst_state: [] },\n'
         "  BURNDOWN: { pending: [], state: 'idle' },\n"
-        "  LATENCY: { latency_spark: [], capped_spark: [] },\n"
-        "  CURATOR_STATE: {\n"
-        "    pending: [],\n"
-        "    latency_spark: { labels: [] },\n"
-        "    capped_spark: { labels: [] },\n"
-        "    state: { capped_now: 0 },\n"
-        "  },\n"
-        "};\n"
+        '  LATENCY: { latency_spark: [], capped_spark: [] },\n'
+        '  CURATOR_STATE: {\n'
+        '    pending: [],\n'
+        '    latency_spark: { labels: [] },\n'
+        '    capped_spark: { labels: [] },\n'
+        '    state: { capped_now: 0 },\n'
+        '  },\n'
+        '};\n'
     )
 
     # Helper must return '' when CURATOR_STATE block is absent.
     assert _extract_curator_state_block(fake_without_curator_state) == '', (
         "_extract_curator_state_block should return '' when no CURATOR_STATE "
-        "block is present — the bare-substring match is defeated by other keys."
+        'block is present — the bare-substring match is defeated by other keys.'
     )
 
     # Helper must return the full block (including nested braces) when present.
     block = _extract_curator_state_block(fake_with_curator_state)
     assert block, (
         "_extract_curator_state_block returned '' for input that contains a "
-        "CURATOR_STATE block — check the regex anchor and brace-depth walk."
+        'CURATOR_STATE block — check the regex anchor and brace-depth walk.'
     )
     for key in ('pending', 'latency_spark', 'capped_spark', 'state'):
         assert re.search(rf'\b{key}\s*:', block), (
             f"Key '{key}:' not found inside the extracted CURATOR_STATE block — "
             f"the brace-depth walk may have stopped at a nested '}}' before "
-            f"reaching this key."
+            f'reaching this key.'
         )
-
