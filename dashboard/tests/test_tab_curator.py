@@ -196,7 +196,7 @@ def test_tab_curator_jsx_renders_pending_spark(tab_curator_jsx_body: str) -> Non
         "tab_curator.jsx does not destructure 'pending_spark' in CuratorTab — "
         'add pending_spark to the destructuring of cs and pass it to PendingPanel.'
     )
-    assert re.search(r'<PendingPanel\s+pending_spark=', tab_curator_jsx_body), (
+    assert re.search(r'<PendingPanel\b[^>]*\bpending_spark\s*=', tab_curator_jsx_body), (
         'tab_curator.jsx does not render `<PendingPanel pending_spark={...}/>` — '
         'even though pending_spark is destructured, PendingPanel is not being '
         'invoked with it. Add or restore the `<PendingPanel pending_spark={pending_spark} />` '
