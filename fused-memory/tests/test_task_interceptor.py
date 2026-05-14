@@ -5282,6 +5282,47 @@ async def test_predone_hook_skipped_on_done_to_done_noop(
 
 
 @pytest.mark.asyncio
+async def test_predone_hook_spy_intercepts_bound_alias_on_pending_to_done(
+    taskmaster, reconciler, event_buffer, monkeypatch
+):
+    """Bound-alias patch target intercepts the hook call on a pending→done transition.
+
+    Verifies that patching ``fused_memory.middleware.task_interceptor._run_hook``
+    (the module-level alias bound at import time) correctly intercepts the hook
+    invocation — confirming the patch target is correct.
+
+    When the task is pending (not done), the same-status guard does NOT
+    short-circuit, so the hook gate IS reached.  The spy therefore MUST be
+    called.  Compare with test_predone_hook_skipped_on_done_to_done_noop where
+    the guard fires first and the spy is never reached.
+    """
+    # taskmaster fixture default already returns status='pending' — same-status
+    # guard will NOT short-circuit the done transition.
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', '/bin/false')
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    spy_calls: list = []
+
+    async def _spy_run_hook(task_id, project_root, **kwargs):
+        spy_calls.append((task_id, project_root))
+        return None  # return None = success so the transition proceeds
+
+    # Patch the bound alias on the consuming module, not the source module.
+    monkeypatch.setattr('fused_memory.middleware.task_interceptor._run_hook', _spy_run_hook)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    # Spy must have been reached: pending→done bypasses the same-status guard
+    assert spy_calls == [('1', '/project')], (
+        f'_run_hook spy was not called; spy_calls={spy_calls!r}'
+    )
+    # Hook returned None (success) → transition proceeds; no error in result
+    assert 'error' not in result, f'Expected successful transition, got: {result}'
+    # Taskmaster must have been invoked (transition completed)
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_predone_hook_per_project_isolation(
     taskmaster, reconciler, event_buffer, monkeypatch, tmp_path
 ):
