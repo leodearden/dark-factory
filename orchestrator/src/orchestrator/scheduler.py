@@ -385,6 +385,8 @@ class ModuleLockTable:
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
         # normalized_module -> (owner_task_id, priority_rank)
         self._parked: dict[str, tuple[str, int]] = {}
+        # task_id -> ISO8601 timestamp of first install_parks call for that owner
+        self._park_install_at: dict[str, str] = {}
         self._config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
 
@@ -479,6 +481,8 @@ class ModuleLockTable:
             (owner, sorted(eviction_acc[owner]))
             for owner in eviction_order
         ]
+        if installed:
+            self._park_install_at.setdefault(task_id, datetime.now(UTC).isoformat())
         return installed, evicted
 
     def clear_parks_for(self, task_id: str) -> None:
@@ -488,6 +492,7 @@ class ModuleLockTable:
             for m, (owner, rank) in self._parked.items()
             if owner != task_id
         }
+        self._park_install_at.pop(task_id, None)
 
     def prune_owners(self, predicate: Callable[[str], bool]) -> list[str]:
         """Evict every park whose owner satisfies *predicate*.
@@ -515,6 +520,8 @@ class ModuleLockTable:
                 for m, (owner, rank) in self._parked.items()
                 if owner not in evicted_set
             }
+            for owner in evicted:
+                self._park_install_at.pop(owner, None)
         return evicted
 
     # --- Limit lookup (unchanged) ---

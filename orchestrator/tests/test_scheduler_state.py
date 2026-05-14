@@ -197,3 +197,56 @@ class TestReserveNowConsumedShortCircuit:
             and e[1]['data'].get('reason') == 'reserve_now'
         ]
         assert old_style == [], f'Expected no legacy reservation_installed event, got: {old_style}'
+
+
+# ===========================================================================
+# Step-7: _park_install_at tracking in ModuleLockTable
+# ===========================================================================
+
+class TestParkInstallAtTracking:
+    """ModuleLockTable._park_install_at records ISO8601 install time per owner."""
+
+    def _make_lock_table(self) -> ModuleLockTable:
+        return ModuleLockTable(OrchestratorConfig(max_per_module=1))
+
+    def test_install_parks_records_install_at_for_owner(self):
+        lt = self._make_lock_table()
+        installed, _ = lt.install_parks('T', ['mod/a'], 'medium')
+        assert installed, 'Expected at least one module to be installed'
+        assert 'T' in lt._park_install_at
+        # Must be a parseable ISO8601 string.
+        datetime.fromisoformat(lt._park_install_at['T'])
+
+    def test_repeat_install_preserves_first_install_at(self):
+        lt = self._make_lock_table()
+        lt.install_parks('T', ['mod/a'], 'medium')
+        first_ts = lt._park_install_at['T']
+        # Install additional modules for the same owner.
+        lt.install_parks('T', ['mod/b'], 'medium')
+        assert lt._park_install_at['T'] == first_ts, (
+            'Second install_parks must not overwrite the first install timestamp'
+        )
+
+    def test_clear_parks_for_drops_install_at(self):
+        lt = self._make_lock_table()
+        lt.install_parks('T', ['mod/a'], 'medium')
+        assert 'T' in lt._park_install_at
+        lt.clear_parks_for('T')
+        assert 'T' not in lt._park_install_at
+
+    def test_prune_owners_drops_install_at(self):
+        lt = self._make_lock_table()
+        lt.install_parks('T', ['mod/a'], 'medium')
+        assert 'T' in lt._park_install_at
+        evicted = lt.prune_owners(lambda owner: owner == 'T')
+        assert 'T' in evicted
+        assert 'T' not in lt._park_install_at
+
+    def test_no_install_at_when_nothing_installed(self):
+        lt = self._make_lock_table()
+        # Install a conflicting higher-priority park so T's install is blocked.
+        lt.install_parks('blocker', ['mod/a'], 'critical')
+        lt.install_parks('T', ['mod/a'], 'medium')
+        assert 'T' not in lt._park_install_at, (
+            '_park_install_at must not be set when install_parks installs nothing'
+        )
