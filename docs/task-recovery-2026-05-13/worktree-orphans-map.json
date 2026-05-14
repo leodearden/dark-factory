@@ -1,0 +1,72 @@
+[
+  {
+    "old_task_id": "3465",
+    "new_task_id": "3522",
+    "title": "Auto-type-param resolver: invoke Phase A/B/C orchestrator from compile pipeline; populate CompiledModule.auto_type_substitution"
+  },
+  {
+    "old_task_id": "3466",
+    "new_task_id": "3523",
+    "title": "Selector v2 vocabulary: register selector_vocabulary_v2 names in GEOMETRY_TOPOLOGY_SELECTOR_NAMES + eval dispatch"
+  },
+  {
+    "old_task_id": "3469",
+    "new_task_id": "3524",
+    "title": "Kinematic interferes/min_clearance: apply per-body world_transform before OCCT distance probe"
+  },
+  {
+    "old_task_id": "3472",
+    "new_task_id": "3525",
+    "title": "Manifold KernelAttributeHook: implement MeshGL attribute walk (no longer task_9_pending Discarded)"
+  },
+  {
+    "old_task_id": "3475",
+    "new_task_id": "3526",
+    "title": "Grammar: `auto:` / `auto(free):` in type_arg_list (parser + fixture)"
+  },
+  {
+    "old_task_id": "3479",
+    "new_task_id": "3527",
+    "title": "screenshot_window MCP tool: implement html-to-image route (replace docs-only close of 2954)"
+  },
+  {
+    "old_task_id": "3482",
+    "new_task_id": "3528",
+    "title": "AdHocSelector engine evaluator: replace `Value::Undef` with kernel-backed @face/@point/@edge resolution"
+  },
+  {
+    "old_task_id": "3487",
+    "new_task_id": "3529",
+    "title": "Refresh stdlib-trait-audit.md to reflect inheritance edges shipped by 2349/2352/2354 (PRD-named deliverable rename)"
+  },
+  {
+    "old_task_id": "3505",
+    "new_task_id": "3530",
+    "title": "Annotation schema registry framework (annotation-args \u03b1)"
+  },
+  {
+    "old_task_id": "3525",
+    "new_task_id": "3531",
+    "title": "F-infra T-1: reify-audit P5 phantom-done detector library + tests"
+  },
+  {
+    "old_task_id": "3546",
+    "new_task_id": "3532",
+    "title": "engine-integration-norm \u03b4: mesh-morphing PRD cross-references engine-integration-norm \u00a77 worked example"
+  },
+  {
+    "old_task_id": "3547",
+    "new_task_id": "3533",
+    "title": "engine-integration-norm \u03b5 (optional): G-allow sweep on engine-seam orphans cites norm \u00a73.N"
+  },
+  {
+    "old_task_id": "3549",
+    "new_task_id": "3534",
+    "title": "Shell-extract bridge \u03b2: ElasticResult.shell_channels extension + FORMAT_VERSION bump"
+  },
+  {
+    "old_task_id": "3598",
+    "new_task_id": "3535",
+    "title": "OCCT Projector impl (BRepExtrema_DistShapeShape-backed; OnFace/OnEdge/OnVertex)"
+  }
+]

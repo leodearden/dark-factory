@@ -1,0 +1,308 @@
+[
+  {
+    "old_id": 2973,
+    "target_id": 2973,
+    "sha": "86683bc5ab0962bd3ac9b950b7729fc0f04de502",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 2989,
+    "target_id": 2989,
+    "sha": "305c96f1856f81dffc95dde74688149aaa163db5",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 2991,
+    "target_id": 2991,
+    "sha": "5d5335d871e4871a3a723572dc16044c2f574dfd",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 2994,
+    "target_id": 2994,
+    "sha": "9dc871da111c2e6cecca22da05b22b8e0fbc2632",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3349,
+    "target_id": 3349,
+    "sha": "7146bd225b544eadde7269a265440187ba4f0935",
+    "action": "SKIP_ALREADY_DONE",
+    "note": "status=done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "skipped"
+  },
+  {
+    "old_id": 3382,
+    "target_id": 3382,
+    "sha": "5208985803912d85dec0f4bb24424d3b537d806d",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3385,
+    "target_id": 3385,
+    "sha": "a72c1c522c208a3976c7e5b8fddb75c2978966c6",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3387,
+    "target_id": 3387,
+    "sha": "093e749f68241f8db3760e2dd88f3860b062fdd0",
+    "action": "SKIP_ALREADY_DONE",
+    "note": "status=done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "skipped"
+  },
+  {
+    "old_id": 3388,
+    "target_id": 3388,
+    "sha": "f6b2657a5f14bf5e9607e55a5e33ba89db0b16c8",
+    "action": "MARK_DONE",
+    "note": "status=in-progress -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3398,
+    "target_id": 3398,
+    "sha": "626c53891493f70980b054a6b9ea8100197a6f64",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3403,
+    "target_id": 3403,
+    "sha": "bde634819fbadce7db1e78c7b255e931558c47f1",
+    "action": "SKIP_ALREADY_DONE",
+    "note": "status=done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "skipped"
+  },
+  {
+    "old_id": 3405,
+    "target_id": 3405,
+    "sha": "2a9ab242840fbfb66bc234ac3691e5116fa7c45a",
+    "action": "SKIP_ALREADY_DONE",
+    "note": "status=done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "skipped"
+  },
+  {
+    "old_id": 3415,
+    "target_id": 3415,
+    "sha": "b6838a67cdcb51ca28f7dfbc6fef6158081ca016",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3416,
+    "target_id": 3416,
+    "sha": "ace4dc94794de5e3594af6c19dbe4db340b991aa",
+    "action": "MARK_DONE",
+    "note": "status=in-progress -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3417,
+    "target_id": 3417,
+    "sha": "614ce7884b74f13d2aa3327f73aa6c098add069f",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3418,
+    "target_id": 3418,
+    "sha": "f40ec8eef5a7adf89436c0ea5fd85935bd9b7d5e",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3419,
+    "target_id": 3419,
+    "sha": "31a29ef9b9133ffe5992b6e4b51f596641e9be44",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3422,
+    "target_id": 3478,
+    "sha": "4d9648ed2bfbabdfe32dcb528bed4b8f80acde27",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3422)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3424,
+    "target_id": 3480,
+    "sha": "fbf98cc443f1ec91d3d8e6be50c37e65dfbd96f2",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3424)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3427,
+    "target_id": 3483,
+    "sha": "b466df4821651f3897883bdff0e41ef91dfd7d12",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3427)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3431,
+    "target_id": 3487,
+    "sha": "28ece8e6ec142c3c4d6f5eaa15f586ed1d8e711e",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3431)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3436,
+    "target_id": 3492,
+    "sha": "2e8a87eb90b3b372d89c5c881a0f633ceebe0804",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3436)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3440,
+    "target_id": 3496,
+    "sha": "86fd3a576d36f09724ddffc98957d1bcdbd74620",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3440)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3441,
+    "target_id": 3497,
+    "sha": "5f5f719a1cff7c22f0db2c030f432271217c7158",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3441)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3442,
+    "target_id": 3498,
+    "sha": "0971793ac6e3a1db646dfe60fa5f8c2f595d1cad",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3442)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3445,
+    "target_id": 3501,
+    "sha": "3beaaf27ab8873b22230177f622eaddc8c793428",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3445)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3446,
+    "target_id": 3502,
+    "sha": "14850f74386234e4cad857b6dee6f795dd706276",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3446)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3448,
+    "target_id": 3504,
+    "sha": "a548f9cf9b59d43673664527564064bb863395e2",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3448)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3449,
+    "target_id": 3505,
+    "sha": "bf27854aa64183c66e4855ded524ff365821235b",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3449)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3451,
+    "target_id": 3451,
+    "sha": "d03923206c3a53611225e47f4a55a116cda96cab",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3455,
+    "target_id": 3510,
+    "sha": "ac2d3e4899e30e2e33ab55720c6c1fa268816198",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3455)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3456,
+    "target_id": 3511,
+    "sha": "786383f9050d47b3e90bae2d715b981a024d9228",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(translated from 3456)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3545,
+    "target_id": 3545,
+    "sha": "54dcf79caaf5708ebfc8461d003730147465d199",
+    "action": "MARK_DONE",
+    "note": "status=pending -> done",
+    "translation": "(no translation; same id)",
+    "mcp_result": "ok"
+  },
+  {
+    "old_id": 3557,
+    "target_id": 3557,
+    "sha": "db37e52316eebf78058c8a02b1be632f289713f3",
+    "action": "SKIP_MISSING",
+    "note": "target id 3557 not in live DB",
+    "translation": "(no translation; same id)",
+    "mcp_result": "skipped"
+  }
+]

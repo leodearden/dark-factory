@@ -1,0 +1,362 @@
+[
+  {
+    "ticket_id": "tkt_0RNVPZERQVAE6SQFSBTB1AMSGM",
+    "old_task_id": "3575",
+    "new_task_id": "3463",
+    "title": "Wire AdHocSelector engine-side evaluator (@face(\"name\") \u2192 handle)"
+  },
+  {
+    "ticket_id": "tkt_0RNVQ0MQMVRKAA3PB6W8TP2324",
+    "old_task_id": "3578",
+    "new_task_id": "3464",
+    "title": "Wire NodePolicyOverrides config-file ingestion (reify.toml [node_overrides])"
+  },
+  {
+    "ticket_id": "tkt_0RNVQ2E62WDXJ76QX594YKQHKT",
+    "old_task_id": "3579",
+    "new_task_id": "3465",
+    "title": "Ship half_space primitive (Bounded=false producer)"
+  },
+  {
+    "ticket_id": "tkt_0RNVQ2KTNNR3EAN7N2A7KDB0W3",
+    "old_task_id": "3580",
+    "new_task_id": "3466",
+    "title": "Ship extrude_infinite primitive (Bounded=false producer)"
+  },
+  {
+    "ticket_id": "tkt_0RNVQ2W0KGY8ZFBR9794XN4406",
+    "old_task_id": "3581",
+    "new_task_id": "3467",
+    "title": "Widen RepresentationWithin recognizer to accept member-access subjects"
+  },
+  {
+    "ticket_id": "tkt_0RNVQ35E9X59VSEA90DQH5VZ7X",
+    "old_task_id": "3584",
+    "new_task_id": "3468",
+    "title": "Flip WarmStatePool cost_per_byte LRU comparator + replace pinning test"
+  },
+  {
+    "ticket_id": "tkt_0RNSCWH2WW8NYRPRTBH729ZNK1",
+    "old_task_id": "3413",
+    "new_task_id": "3469",
+    "title": "Fix TS cast regression in AutoResolvePanel.test.tsx blocking lint on main"
+  },
+  {
+    "ticket_id": "tkt_0RNSDGA9QEGBYGY95TV7FNRH5X",
+    "old_task_id": "3414",
+    "new_task_id": "3470",
+    "title": "Unify compile-diagnostics fields into a tagged enum"
+  },
+  {
+    "ticket_id": "tkt_0RNSE27DNHBT4WGHCCZDX7S42F",
+    "old_task_id": "3415",
+    "new_task_id": "3471",
+    "title": "Reconcile EvaluationGraph node-map naming asymmetry (computations field vs compute_nodes() method)"
+  },
+  {
+    "ticket_id": "tkt_0RNSES8KS350NNSS1MFAEGP50H",
+    "old_task_id": "3416",
+    "new_task_id": "3472",
+    "title": "test_support.rs: pattern-destructure ElementStiffnessTestSpec to prevent silent field swaps"
+  },
+  {
+    "ticket_id": "tkt_0RNSESE3DSPPNMSK9CZA5B5Q36",
+    "old_task_id": "3417",
+    "new_task_id": "3473",
+    "title": "AutoResolvePanel.test.tsx: replace `as unknown as SVGElement` double-cast with narrowed query"
+  },
+  {
+    "ticket_id": "tkt_0RNSESF16FEXFW881F8SP19PSV",
+    "old_task_id": "3418",
+    "new_task_id": "3474",
+    "title": "Extend is_geometry_let to Block and Match initialisers (follow-up to 3395)"
+  },
+  {
+    "ticket_id": "tkt_0RNSESMW45GAECYDFXFM2QSJJY",
+    "old_task_id": "3419",
+    "new_task_id": "3475",
+    "title": "Tighten brittle assertions in cross_sub_geometry_diagnostic_tests.rs"
+  },
+  {
+    "ticket_id": "tkt_0RNSESW25C7F17C6GJPKPE6ZAZ",
+    "old_task_id": "3420",
+    "new_task_id": "3476",
+    "title": "Lock in `sub_realization_names \u2282 sub_component_types` invariant in try_emit_cross_sub_geometry"
+  },
+  {
+    "ticket_id": "tkt_0RNSFRA14W86S7RESP1Z9HKA49",
+    "old_task_id": "3421",
+    "new_task_id": "3477",
+    "title": "engine_hash_algo: filter editor debris + correct symlink comment"
+  },
+  {
+    "ticket_id": "tkt_0RNSFT116TYD332W6C823BV07J",
+    "old_task_id": "3422",
+    "new_task_id": "3478",
+    "title": "reify-mesh-morph elasticity polish: dispatch dedupe, clamp safety, default-change audit, test comments"
+  },
+  {
+    "ticket_id": "tkt_0RNSKP64G5FGPM7WEWQ2D89DT1",
+    "old_task_id": "3423",
+    "new_task_id": "3479",
+    "title": "Auto-resolve loop: backend emitter for auto-resolve-start/iteration/complete Tauri events"
+  },
+  {
+    "ticket_id": "tkt_0RNSKWWNSMTX827TD6GYFPVG35",
+    "old_task_id": "3424",
+    "new_task_id": "3480",
+    "title": "meshManager removeMesh: restore overlay-ordering rationale comment"
+  },
+  {
+    "ticket_id": "tkt_0RNSMDA51FC2A3EK84S2JYX5Y2",
+    "old_task_id": "3425",
+    "new_task_id": "3481",
+    "title": "Tighten match_returning_solid_in_let_emits_compile_error span assertions to exact byte offsets"
+  },
+  {
+    "ticket_id": "tkt_0RNSNS5CTAKK3J37H090KMJ9C6",
+    "old_task_id": "3426",
+    "new_task_id": "3482",
+    "title": "engineStore: test loop-boundary reset of canonicalDrivingMetric across begin/end"
+  },
+  {
+    "ticket_id": "tkt_0RNSNS7PKX9Y9T5V926W0F01Y7",
+    "old_task_id": "3427",
+    "new_task_id": "3483",
+    "title": "engineStore: tighten driving_metric type or handle empty-string explicitly"
+  },
+  {
+    "ticket_id": "tkt_0RNSPD225GEEB4WV8N5BW5NTZW",
+    "old_task_id": "3428",
+    "new_task_id": "3484",
+    "title": "engine_hash_algo: add Cargo.lock to CONTRIBUTORS_RELATIVE for transitive-dep invalidation"
+  },
+  {
+    "ticket_id": "tkt_0RNSPD79CYH5YRZGKP02VKR1Q3",
+    "old_task_id": "3429",
+    "new_task_id": "3485",
+    "title": "engine_hash_algo: justify or remove #[inline(never)] LLVM-workaround attributes"
+  },
+  {
+    "ticket_id": "tkt_0RNSPNT54YE3QDF7JDF7PZ0RHT",
+    "old_task_id": "3430",
+    "new_task_id": "3486",
+    "title": "engineStore test (c): assert no spurious empty-metric warn on iteration following empty-string"
+  },
+  {
+    "ticket_id": "tkt_0RNSR4QYCK7X9WW0X5GSGAJ30B",
+    "old_task_id": "3431",
+    "new_task_id": "3487",
+    "title": "Replace soft fallback in try_emit_cross_sub_geometry with .expect() so release builds enforce invariant"
+  },
+  {
+    "ticket_id": "tkt_0RNSRC16TSN3T874JWAKYQ6KZC",
+    "old_task_id": "3432",
+    "new_task_id": "3488",
+    "title": "engine_hash_algo: tighten is_editor_debris (extension lookup, doc, dot-prefixed names)"
+  },
+  {
+    "ticket_id": "tkt_0RNSRKVQKDRQ7X4KHC47J5G7DG",
+    "old_task_id": "3433",
+    "new_task_id": "3489",
+    "title": "sweep.rs: defensive invariants for malformed Mesh2d and pathological layer counts"
+  },
+  {
+    "ticket_id": "tkt_0RNSRVB1NMV4EG66HM77BK9HFF",
+    "old_task_id": "3434",
+    "new_task_id": "3490",
+    "title": "Revisit MorphOptions quality_floor_pct_below_025: revert prod default or remove knob"
+  },
+  {
+    "ticket_id": "tkt_0RNSRVDV26203NJBGAKQZD5KKS",
+    "old_task_id": "3435",
+    "new_task_id": "3491",
+    "title": "Calibration AR materiality: compute true from_scratch_max_ar_factor instead of assuming source\u2248baseline"
+  },
+  {
+    "ticket_id": "tkt_0RNSRVHAAKN1N5RD1H7HGN5JAS",
+    "old_task_id": "3436",
+    "new_task_id": "3492",
+    "title": "De-fragilize bracket sweep verdict-mix assertion and soften coupled lib.rs doc claim"
+  },
+  {
+    "ticket_id": "tkt_0RNSSP9TGAT5ZG16FFR5FW1TB3",
+    "old_task_id": "3437",
+    "new_task_id": "3493",
+    "title": "source_location resolver: dedupe with engine helper, fix doc/clamp divergence, tighten asserts"
+  },
+  {
+    "ticket_id": "tkt_0RNSSPCAK1DGBT2ZB0E3C0N8WE",
+    "old_task_id": "3438",
+    "new_task_id": "3494",
+    "title": "useEditorSelectionSync: snapshot selectedEntity at cursor-change, not after debounce"
+  },
+  {
+    "ticket_id": "tkt_0RNSSYH7EZTGN8PV6CVE36EC91",
+    "old_task_id": "3439",
+    "new_task_id": "3495",
+    "title": "expr.rs: restore dynamic panic message for sub_realization_names invariant"
+  },
+  {
+    "ticket_id": "tkt_0RNSVG73C23WFXC9779YVC6CP9",
+    "old_task_id": "3440",
+    "new_task_id": "3496",
+    "title": "compiler: resolve stdlib trait/structure names in fn signatures (two-pass compile)"
+  },
+  {
+    "ticket_id": "tkt_0RNSVQQNQJGJATNBECSGZS5MK8",
+    "old_task_id": "3441",
+    "new_task_id": "3497",
+    "title": "Implement cross-sub geometry composition (`self.&lt;sub&gt;.body`) \u2014 eval-side GeomRef::Sub plumbing"
+  },
+  {
+    "ticket_id": "tkt_0RNSWT7P4HKVMZ2HN5Y4WPGPDT",
+    "old_task_id": "3442",
+    "new_task_id": "3498",
+    "title": "Polish useEditorSelectionSync: reorder token capture + clarify snapshot-refresh comment"
+  },
+  {
+    "ticket_id": "tkt_0RNSWXY3CQ63P9NXMWW26074B0",
+    "old_task_id": "3443",
+    "new_task_id": "3499",
+    "title": "compiler: fn_param default-value grammar + lowering (`fn f(x: Int = 1)`)"
+  },
+  {
+    "ticket_id": "tkt_0RNSWYNGP63AVCZPZQBGT7QQT2",
+    "old_task_id": "3444",
+    "new_task_id": "3500",
+    "title": "stdlib: restore `options: ElasticOptions = ElasticOptions.default` default on solve_elastic_static"
+  },
+  {
+    "ticket_id": "tkt_0RNSYBWS9AZQGZYC561S4Y8RKN",
+    "old_task_id": "3445",
+    "new_task_id": "3501",
+    "title": "sweep.rs: tighten MAX_LAYERS and derive_layer_count doc comments"
+  },
+  {
+    "ticket_id": "tkt_0RNSYBX9MV205K4HKCPNXG7PAE",
+    "old_task_id": "3446",
+    "new_task_id": "3502",
+    "title": "reify-mesh-morph: re-export CgSolverOptions from crate root"
+  },
+  {
+    "ticket_id": "tkt_0RNSYC1BBKKBXXKR0G83RCD290",
+    "old_task_id": "3447",
+    "new_task_id": "3503",
+    "title": "compute_cache_key: add 3 test-coverage gaps (domain-separation, panic policy, cardinality)"
+  },
+  {
+    "ticket_id": "tkt_0RNSYC1BBXY01CYX4XYTAWV478",
+    "old_task_id": "3448",
+    "new_task_id": "3504",
+    "title": "ZZ error estimator: harden P1-only contract + document centroid quadrature order"
+  },
+  {
+    "ticket_id": "tkt_0RNSYC1X423E15ABN83KNN3HQV",
+    "old_task_id": "3449",
+    "new_task_id": "3505",
+    "title": "reify-mesh-morph: surface tet_indices non-multiple-of-4 as structured failure"
+  },
+  {
+    "ticket_id": "tkt_0RNSYKBC733DAZVQGJ5RQKSEXN",
+    "old_task_id": "3450",
+    "new_task_id": "3506",
+    "title": "Enforce engine_lock poison-recovery invariant via type system"
+  },
+  {
+    "ticket_id": "tkt_0RNT49S433RX5071NTGB45H6K1",
+    "old_task_id": "3451",
+    "new_task_id": null,
+    "title": null
+  },
+  {
+    "ticket_id": "tkt_0RNTDA60B1WBJD9B5N3KECQBCR",
+    "old_task_id": "3452",
+    "new_task_id": "3507",
+    "title": "Migrate gui/src-tauri/src/commands.rs to with_engine_lock for panic recovery"
+  },
+  {
+    "ticket_id": "tkt_0RNTDRW0ES926XYNYE7PJA65RP",
+    "old_task_id": "3453",
+    "new_task_id": "3508",
+    "title": "Replace fragile `entity.contains('.')` cross-sub geometry marker with typed discriminator"
+  },
+  {
+    "ticket_id": "tkt_0RNTDRYXPX4Q0YG29ECYAEN8Y3",
+    "old_task_id": "3454",
+    "new_task_id": "3509",
+    "title": "Emit v0.1 diagnostic when bare `let copy = self.&lt;sub&gt;.&lt;geom&gt;` is dropped (no-op)"
+  },
+  {
+    "ticket_id": "tkt_0RNTDS2EGQ0PTJNZTMW1CR9YCX",
+    "old_task_id": "3455",
+    "new_task_id": "3510",
+    "title": "Extract shared forward-declared-sub predicate to keep `try_resolve_cross_sub_geom_ref` and `try_resolve_cross_sub_geometry_value_ref` in lockstep"
+  },
+  {
+    "ticket_id": "tkt_0RNTDS4N7C3EY5537CTP6F638P",
+    "old_task_id": "3456",
+    "new_task_id": "3511",
+    "title": "Document or add happy-path assertion linking compile-side cross-sub lowering to eval-side resolution"
+  },
+  {
+    "ticket_id": "tkt_0RNTDS8337XSQXJCQ1A5FK0XZ2",
+    "old_task_id": "3457",
+    "new_task_id": "3512",
+    "title": "Route near-miss cross-sub MemberAccess in boolean args through `try_emit_cross_sub_geometry` before generic fallback"
+  },
+  {
+    "ticket_id": "tkt_0RNTFC37WKQZH866EZJAQNP1YW",
+    "old_task_id": "3458",
+    "new_task_id": "3513",
+    "title": "Tighten MITC3+ benchmark band: Scordelis-Lo roof"
+  },
+  {
+    "ticket_id": "tkt_0RNTMT7MGET5GNZRK1V8RSDTMF",
+    "old_task_id": "3459",
+    "new_task_id": "3514",
+    "title": "significance_filter: cache BTreeMap key Values via LazyLock"
+  },
+  {
+    "ticket_id": "tkt_0RNTMTATAZYM8GVCNRR1BEQWQD",
+    "old_task_id": "3460",
+    "new_task_id": "3515",
+    "title": "SampledField: add grid_metadata_eq method to centralize grid-field list"
+  },
+  {
+    "ticket_id": "tkt_0RNTN58V7SX1836FRQS9N0DGT6",
+    "old_task_id": "3461",
+    "new_task_id": "3516",
+    "title": "compiler: fn_param call-site lowering \u2014 splice default CompiledExpr when arg omitted"
+  },
+  {
+    "ticket_id": "tkt_0RNWSTBGSNTD4KF3HE3FNSM399",
+    "old_task_id": "3415",
+    "new_task_id": "3517",
+    "title": "Polish commands.rs/engine_lock.rs after task-3452 with_engine_lock migration"
+  },
+  {
+    "ticket_id": "tkt_0RNWT0Z6WY9ZAXXJQS0XXKR493",
+    "old_task_id": "3416",
+    "new_task_id": "3518",
+    "title": "Add DiagnosticCode::BareCrossSubGeometryNoOp; pin task-3454 tests to code, not substrings"
+  },
+  {
+    "ticket_id": "tkt_0RNWVMJ1HFEGJNP1H0V66F8421",
+    "old_task_id": "3417",
+    "new_task_id": "3519",
+    "title": "volume_refine: harden test soundness and projector defensive checks"
+  },
+  {
+    "ticket_id": "tkt_0RNWVMNDPMHDW4WR1W9JMX8Q0X",
+    "old_task_id": "3418",
+    "new_task_id": "3520",
+    "title": "refine_volume (gmsh): generalize classify_surfaces angle and corner-mapping distance"
+  },
+  {
+    "ticket_id": "tkt_0RNWVMQ8WQ40BYJ66PMMA4W4S5",
+    "old_task_id": "3419",
+    "new_task_id": "3521",
+    "title": "volume_refine: bucketize O(n_surf \u00d7 n_vol) projection (deferred until MMG3D wallclock measurement)"
+  }
+]

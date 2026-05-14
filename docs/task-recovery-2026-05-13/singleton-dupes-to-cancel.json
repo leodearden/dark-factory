@@ -1,0 +1,74 @@
+[
+  {
+    "ticket_id": "tkt_0RNSCWH2WW8NYRPRTBH729ZNK1",
+    "old_task_id": "3413",
+    "new_task_id": "3469",
+    "title": "Fix TS cast regression in AutoResolvePanel.test.tsx blocking lint on main"
+  },
+  {
+    "ticket_id": "tkt_0RNSDGA9QEGBYGY95TV7FNRH5X",
+    "old_task_id": "3414",
+    "new_task_id": "3470",
+    "title": "Unify compile-diagnostics fields into a tagged enum"
+  },
+  {
+    "ticket_id": "tkt_0RNSE27DNHBT4WGHCCZDX7S42F",
+    "old_task_id": "3415",
+    "new_task_id": "3471",
+    "title": "Reconcile EvaluationGraph node-map naming asymmetry (computations field vs compute_nodes() method)"
+  },
+  {
+    "ticket_id": "tkt_0RNSES8KS350NNSS1MFAEGP50H",
+    "old_task_id": "3416",
+    "new_task_id": "3472",
+    "title": "test_support.rs: pattern-destructure ElementStiffnessTestSpec to prevent silent field swaps"
+  },
+  {
+    "ticket_id": "tkt_0RNSESE3DSPPNMSK9CZA5B5Q36",
+    "old_task_id": "3417",
+    "new_task_id": "3473",
+    "title": "AutoResolvePanel.test.tsx: replace `as unknown as SVGElement` double-cast with narrowed query"
+  },
+  {
+    "ticket_id": "tkt_0RNSESF16FEXFW881F8SP19PSV",
+    "old_task_id": "3418",
+    "new_task_id": "3474",
+    "title": "Extend is_geometry_let to Block and Match initialisers (follow-up to 3395)"
+  },
+  {
+    "ticket_id": "tkt_0RNSESMW45GAECYDFXFM2QSJJY",
+    "old_task_id": "3419",
+    "new_task_id": "3475",
+    "title": "Tighten brittle assertions in cross_sub_geometry_diagnostic_tests.rs"
+  },
+  {
+    "ticket_id": "tkt_0RNWSTBGSNTD4KF3HE3FNSM399",
+    "old_task_id": "3415",
+    "new_task_id": "3517",
+    "title": "Polish commands.rs/engine_lock.rs after task-3452 with_engine_lock migration"
+  },
+  {
+    "ticket_id": "tkt_0RNWT0Z6WY9ZAXXJQS0XXKR493",
+    "old_task_id": "3416",
+    "new_task_id": "3518",
+    "title": "Add DiagnosticCode::BareCrossSubGeometryNoOp; pin task-3454 tests to code, not substrings"
+  },
+  {
+    "ticket_id": "tkt_0RNWVMJ1HFEGJNP1H0V66F8421",
+    "old_task_id": "3417",
+    "new_task_id": "3519",
+    "title": "volume_refine: harden test soundness and projector defensive checks"
+  },
+  {
+    "ticket_id": "tkt_0RNWVMNDPMHDW4WR1W9JMX8Q0X",
+    "old_task_id": "3418",
+    "new_task_id": "3520",
+    "title": "refine_volume (gmsh): generalize classify_surfaces angle and corner-mapping distance"
+  },
+  {
+    "ticket_id": "tkt_0RNWVMQ8WQ40BYJ66PMMA4W4S5",
+    "old_task_id": "3419",
+    "new_task_id": "3521",
+    "title": "volume_refine: bucketize O(n_surf \u00d7 n_vol) projection (deferred until MMG3D wallclock measurement)"
+  }
+]
