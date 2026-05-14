@@ -676,19 +676,46 @@ class TestCrossTaskChildResumeContract:
         assert resolved_parent is not None
         assert resolved_parent.status in ('resolved', 'dismissed')
 
-        # (8) A fresh escalation from task 99 with a different category submits cleanly.
-        #     Using category='scope_violation' (outside the infra_issue dedupe scope)
-        #     makes this assertion immune to similarity-heuristic changes — the test
-        #     proves there is no lingering dedupe block, not that two strings happened
-        #     to be dissimilar enough.
-        fresh = await _blocker(
+        # (8a) A fresh infra_issue from task 99 with a clearly distinct summary submits
+        #      cleanly — this sub-case exercises the full dedupe code path.
+        #      Both dedupe gates pass (infra_dedupe_enabled=True by default;
+        #      'infra_issue' is in infra_dedupe_categories), so find_dedupe_parent IS
+        #      called.  find_dedupe_parent scans only queue.get_pending(), so the
+        #      resolved/archived parent from step (5) is invisible to it — no stale
+        #      dedupe block.  The candidate's distinct dedupe key ('qdrant','connection',
+        #      'refused') vs the parent's ('fusedmemory','connection','timeout') provides
+        #      defense-in-depth: even if the similarity heuristic is later tuned, two
+        #      clearly disjoint keys will never fold.  status='queued' proves there is no
+        #      lingering block from the archived parent (no-ghost contract).
+        fresh_infra = await _blocker(
+            server,
+            task_id='99',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='qdrant connection refused on port 6333',
+        )
+        assert fresh_infra['status'] == 'queued', (
+            'infra_issue dedupe path: archived parent must not match — '
+            'find_dedupe_parent scans only pending escalations; '
+            f'got: {fresh_infra}'
+        )
+
+        # (8b) A fresh scope_violation from task 99 also submits cleanly, covering the
+        #      orthogonal gate-2 short-circuit path.  'scope_violation' is not in
+        #      cfg.infra_dedupe_categories, so _submit_or_dedupe short-circuits before
+        #      find_dedupe_parent is called.  The escalation is queued normally regardless
+        #      of any archived parents — the two status='queued' outcomes (gate-2
+        #      short-circuit vs. dedupe-path-with-no-match) have meaningfully different
+        #      causes and are asserted separately to document both contracts.
+        fresh_sv = await _blocker(
             server,
             task_id='99',
             agent_role='implementer',
             category='scope_violation',
             summary='task 99 needs to write outside its locked modules',
         )
-        assert fresh['status'] == 'queued', (
-            'After parent resolution, task 99 must be able to submit new '
-            f"escalations without a stale dedupe block; got: {fresh}"
+        assert fresh_sv['status'] == 'queued', (
+            'scope_violation: gate-2 short-circuit must yield queued — '
+            'category not in infra_dedupe_categories bypasses find_dedupe_parent; '
+            f'got: {fresh_sv}'
         )
