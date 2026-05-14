@@ -583,15 +583,23 @@ class TestFormatFilteredTaskTree:
         Uses repeated-reference trick ([same_dict]*N) to keep allocations under 1 MB
         instead of creating N full task dicts.
         """
-        # Task line for title='T', id=1: "- [1] (pending) T deps=[]" = 25 chars.
-        # With N=10_000, max_tasks=N, header is:
-        # "### Active Task Tree\n(10000 active shown, 0 done, 0 cancelled, 0 other, 10000 total)\n"
-        # = 85 chars. summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
-        # budget = max_chars - 85 - 29 = max_chars - 114.
-        # For max_chars=500: budget=386. Each line costs 26 chars (25 + newline separator).
-        # 14 lines fit (14×26=364 ≤ 386, 15×26=390 > 386). trimmed=9986, notice=49 chars.
-        # Initial result = 85 + (14×25+13) + 49 + 29 = 85+363+49+29 = 526 > 500.
-        # Lazy loop pops 1 line → 13 lines, trimmed=9987, result=500 ≤ 500. Loop exits.
+        # Pre-clamp (budget arithmetic, unchanged):
+        # Task line: "- [1] (pending) T deps=[]" = 25 chars. Pre-clamp header:
+        #   "### Active Task Tree\n(10000 active shown, 0 done, 0 cancelled, 0 other, 10000 total)\n"
+        #   = 85 chars. summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
+        # budget = 500 - 85 - 29 = 386. Each line costs 26 chars (25 + newline sep).
+        # 14 fit (14×26=364 ≤ 386; 15×26=390 > 386). trimmed=9986, notice=49 chars.
+        # Initial result = 85 + (14×25+13) + 49 + 29 = 526 > 500.
+        # Lazy loop pops 1 line → kept=13, trimmed=9987, notice=49;
+        # intermediate result = 85 + (13×25+12) + 49 + 29 = 500 ≤ 500. Loop exits.
+        #
+        # Post-clamp rebuild (returned in final output):
+        # _select_visible_active_with_body rebuilds the header using final_shown = len(kept_lines) = 13.
+        # New header: "### Active Task Tree\n(13 active shown, 0 done, 0 cancelled, 0 other, 10000 total)\n"
+        #           = 82 chars (5-digit shown → 2-digit, saves 3 chars).
+        # Final returned output = 82 + (13×25+12) + 49 + 29 = 497 chars ≤ 500.
+        # The pre-clamp intermediate (500) is not the assertion target — because the rebuilt
+        # header is monotonically ≤ the pre-clamp header, the lazy-loop invariant carries through.
 
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
         n = 10_000
@@ -647,15 +655,22 @@ class TestFormatFilteredTaskTree:
             lambda task: 'X',
         )
 
-        # Stub lines are 1 char each. With N=1_100_000, max_tasks=N, max_chars=500:
-        # header = "### Active Task Tree\n(1100000 active shown, 0 done, 0 cancelled, 0 other, 1100000 total)\n"
-        #        = 89 chars.
-        # summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
+        # Pre-clamp (budget arithmetic, unchanged):
+        # Stub lines are 1 char each. Pre-clamp header:
+        #   "### Active Task Tree\n(1100000 active shown, 0 done, 0 cancelled, 0 other, 1100000 total)\n"
+        #   = 89 chars. summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
         # budget = 500 - 89 - 29 = 382. Each stub line costs 2 chars (1 char + newline sep).
         # initial kept = floor(383/2) = 191. trimmed_count = 1_100_000 - 191 = 1_099_809 (7 digits).
-        # Notice = "... and 1099809 more active (truncated for budget)" = 52 chars.
+        # Notice = "... and 1099809 more active (truncated for budget)" framed by \n = 52 chars.
         # Initial result = 89 + 381 + 52 + 29 = 551 > 500. Lazy loop fires, pops ~26 lines.
-        # After ~26 pops: kept=165, trimmed=1_099_835 (still 7 digits), result=499 ≤ 500. ✓
+        # After ~26 pops: kept=165, body=329 (165+164), trimmed=1_099_835 (7 digits — regression preserved),
+        # notice=52; intermediate result = 89 + 329 + 52 + 29 = 499 ≤ 500. Loop exits.
+        #
+        # Post-clamp rebuild (returned in final output):
+        # Rebuilt header: "### Active Task Tree\n(165 active shown, 0 done, 0 cancelled, 0 other, 1100000 total)\n"
+        #              = 85 chars (7-digit shown → 3-digit, saves 4 chars).
+        # Final returned output = 85 + 329 + 52 + 29 = 495 chars ≤ 500.
+        # The 7-digit trimmed_count regex assertion below still matches: trimmed=1,099,835 has 7 digits.
 
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
         n = 1_100_000
