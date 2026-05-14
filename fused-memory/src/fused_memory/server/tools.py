@@ -1638,6 +1638,15 @@ def create_mcp_server(
         Reconciliation may: attach memory_hints to the task, write completion
         knowledge to memory stores, or flag dependent tasks that need attention.
 
+        Pre-done hook: when ``FUSED_MEMORY_PREDONE_HOOK_<PROJECT_ID>`` is
+        configured (where ``<PROJECT_ID>`` is the upper-cased project id
+        derived from ``project_root``, e.g. ``FUSED_MEMORY_PREDONE_HOOK_REIFY``
+        for ``/home/leo/src/reify``), ``status='done'`` transitions invoke that
+        subprocess as a pre-write validator before any state is mutated.
+        Non-zero exit refuses the transition and returns
+        ``{'success': False, 'error': 'pre_done_hook_rejected', ...}``.
+        Unset or empty value = no-op (no subprocess, no latency overhead).
+
         Args:
             id: Task ID (comma-separated for multiple)
             status: pending, done, in-progress, blocked, review, deferred, or cancelled
