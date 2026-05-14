@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -2074,6 +2075,27 @@ class Scheduler:
             'current_holders': current_holders,
             'snapshot_at': datetime.now(UTC).isoformat(),
         }
+
+    def write_state_snapshot(self, path: Path) -> None:
+        """Atomically write the current state snapshot to *path* as JSON.
+
+        Creates parent directories if missing.  Uses a tmp-file + os.replace
+        atomic rename so concurrent readers never see a partial write.
+
+        Best-effort: swallows all exceptions and logs a warning on failure so
+        the scheduler never stops ticking due to a disk issue.
+        """
+        try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix('.json.tmp')
+            payload = json.dumps(self.get_state_snapshot(), default=str)
+            tmp_path.write_text(payload, encoding='utf-8')
+            os.replace(tmp_path, path)
+        except Exception:
+            logger.warning(
+                'write_state_snapshot failed for path %s', path, exc_info=True
+            )
 
     async def handle_blast_radius_expansion(
         self,

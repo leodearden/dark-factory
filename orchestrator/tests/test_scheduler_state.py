@@ -440,3 +440,53 @@ class TestGetStateSnapshotPopulated:
         assert ch.get('t1/src') == 'T1', (
             f"Expected current_holders['t1/src']='T1', got {ch}"
         )
+
+
+# ===========================================================================
+# Step-15: write_state_snapshot()
+# ===========================================================================
+
+class TestWriteStateSnapshot:
+    """Scheduler.write_state_snapshot() writes a valid JSON file atomically."""
+
+    def test_write_state_snapshot_creates_valid_json(self, tmp_path):
+        """write_state_snapshot writes the snapshot to disk as parseable JSON."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        path = tmp_path / 'scheduler_state.json'
+        scheduler.write_state_snapshot(path)
+
+        assert path.exists(), 'Expected snapshot file to be created'
+        data = json.loads(path.read_text())
+        assert set(data.keys()) == _SNAPSHOT_KEYS, (
+            f'Expected keys {_SNAPSHOT_KEYS}, got {set(data.keys())}'
+        )
+
+    def test_write_state_snapshot_atomic_replace(self, tmp_path):
+        """Second write overwrites the first; no partial writes visible."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        path = tmp_path / 'scheduler_state.json'
+
+        # First write: inject a sentinel skip count.
+        scheduler._skip_count['first'] = 1
+        scheduler.write_state_snapshot(path)
+        first_content = json.loads(path.read_text())
+
+        # Second write: clear skip_count and add a different sentinel.
+        scheduler._skip_count.clear()
+        scheduler._skip_count['second'] = 2
+        scheduler.write_state_snapshot(path)
+        second_content = json.loads(path.read_text())
+
+        assert 'first' not in second_content['skip_counts'], (
+            'Second write must have overwritten the first completely'
+        )
+        assert second_content['skip_counts'].get('second') == 2
+
+    def test_write_state_snapshot_creates_parent_dirs(self, tmp_path):
+        """write_state_snapshot creates missing parent directories."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        path = tmp_path / 'deep' / 'nested' / 'dir' / 'scheduler_state.json'
+        scheduler.write_state_snapshot(path)
+        assert path.exists(), (
+            'Expected snapshot file to be created even when parent dirs are missing'
+        )
