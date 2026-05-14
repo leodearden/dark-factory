@@ -211,6 +211,59 @@ class TestHarnessRestartPersistence:
             f'save_scheduler_pause must not be called on restart load; got {save_call_count} calls'
         )
 
+    @pytest.mark.asyncio
+    async def test_load_persisted_pause_emits_restored_event(self, tmp_path: Path) -> None:
+        """_load_persisted_scheduler_pause() must emit scheduler_pause_restored.
+
+        Operators querying the event log for a run that starts with dispatch
+        halted would see no event explaining WHY without this (the scheduler_paused
+        event is on the previous run_id).  The restored event carries {reason,
+        pause_at, restored_from_run_id} so the timeline self-documents cross-run
+        continuity.
+        """
+        # Seed a real RunStore with a persisted pause.
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True)
+        db_path = db_dir / 'runs.db'
+        seeder = RunStore(db_path)
+        seeder.save_scheduler_pause(
+            project_id='dark_factory',
+            reason='pre-restart park-stop',
+            pause_at_iso='2026-05-13T22:00:00+00:00',
+            set_by_run_id='prior-run-007',
+        )
+
+        # Build a Harness with a real EventStore so we can query emitted events.
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+        harness._run_store = seeder
+        harness._run_id = 'new-run-001'
+        event_db = tmp_path / 'events.db'
+        harness.event_store = EventStore(event_db, 'new-run-001')
+
+        # Act
+        await harness._load_persisted_scheduler_pause()
+
+        # Assert scheduler state restored.
+        assert harness.scheduler.is_paused is True
+
+        # Assert the restored event was emitted with the expected payload.
+        rows = _query_events(harness.event_store, 'scheduler_pause_restored')
+        assert len(rows) == 1, (
+            f'Expected 1 scheduler_pause_restored event; got {len(rows)}'
+        )
+        import json
+        data = json.loads(rows[0]['data'])
+        assert data['reason'] == 'pre-restart park-stop', (
+            f'Expected reason "pre-restart park-stop"; got {data["reason"]!r}'
+        )
+        assert data['pause_at'] == '2026-05-13T22:00:00+00:00', (
+            f'Expected pause_at to match; got {data["pause_at"]!r}'
+        )
+        assert data['restored_from_run_id'] == 'prior-run-007', (
+            f'Expected restored_from_run_id "prior-run-007"; got {data["restored_from_run_id"]!r}'
+        )
+
 
 class TestParkStopE2E:
     """End-to-end integration tests for the park-stop trip → persist → restart lifecycle.

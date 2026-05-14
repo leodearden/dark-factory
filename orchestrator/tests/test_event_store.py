@@ -219,3 +219,34 @@ class TestSchedulerPauseEventTypes:
         assert data['reason'] == 'park-stop: 5 tasks blocked'
         assert data['threshold'] == 5
         assert data['window_hours'] == 1.0
+
+    def test_scheduler_pause_restored_event_type_defined(self) -> None:
+        """scheduler_pause_restored must exist as an EventType member with the expected value."""
+        assert EventType.scheduler_pause_restored.value == 'scheduler_pause_restored', (
+            f'Expected scheduler_pause_restored, '
+            f'got {EventType.scheduler_pause_restored.value!r}'
+        )
+
+    def test_scheduler_pause_restored_event_writes_and_reads_back(
+        self, tmp_path: Path
+    ) -> None:
+        """Emitting scheduler_pause_restored writes a row with the correct payload."""
+        db_path = tmp_path / 'events.db'
+        store = EventStore(db_path, 'run-restored-test')
+        store.emit(
+            EventType.scheduler_pause_restored,
+            data={
+                'reason': 'park-stop: 5 tasks blocked',
+                'pause_at': '2026-05-13T22:00:00+00:00',
+                'restored_from_run_id': 'prior-run-001',
+            },
+        )
+
+        rows = _query_all(db_path)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['event_type'] == 'scheduler_pause_restored'
+        data = json.loads(row['data'])
+        assert data['reason'] == 'park-stop: 5 tasks blocked'
+        assert data['pause_at'] == '2026-05-13T22:00:00+00:00'
+        assert data['restored_from_run_id'] == 'prior-run-001'

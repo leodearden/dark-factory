@@ -2650,13 +2650,29 @@ Output JSON matching the schema. Every task must appear in the output.
             if record:
                 reason = record.get('reason', '<unknown reason>')
                 pause_at = record.get('pause_at', '<unknown time>')
+                restored_from_run_id = record.get('set_by_run_id', '<unknown>')
                 logger.warning(
                     'Scheduler pause persisted from prior run — restoring. '
-                    'reason=%r  pause_at=%r  (call Harness.resume_scheduler() to clear)',
+                    'reason=%r  pause_at=%r  set_by_run_id=%r  '
+                    '(call Harness.resume_scheduler() to clear)',
                     reason,
                     pause_at,
+                    restored_from_run_id,
                 )
                 self.scheduler.pause(reason)
+                # Emit a distinct event so the timeline self-documents
+                # cross-run continuity.  Operators querying the event log
+                # for a run that starts with dispatch halted can see WHY
+                # without having to cross-reference the previous run_id.
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.scheduler_pause_restored,
+                        data={
+                            'reason': reason,
+                            'pause_at': pause_at,
+                            'restored_from_run_id': restored_from_run_id,
+                        },
+                    )
         except Exception:
             logger.warning(
                 '_load_persisted_scheduler_pause: failed to read pause state',
