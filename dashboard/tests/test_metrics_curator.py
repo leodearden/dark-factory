@@ -743,6 +743,7 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     await metrics_conn.commit()
 
     expected_conn = None
+    loop_opened = False
     try:
         with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
             # _metrics_loop calls _run_once() immediately before entering the
@@ -755,6 +756,11 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        # Verify the loop opened the connection BEFORE calling pool.get() ourselves.
+        # pool.open_count > 0 means _metrics_loop._run_once() actually called pool.get();
+        # without this check, pool.get() below would lazily open the connection and mask
+        # a regression where the loop stops using the pool.
+        loop_opened = pool.open_count > 0
         # Snapshot the cached connection via the public API before close_all().
         # DbPool.get() is idempotent: returns the same cached object on repeat call.
         expected_conn = await pool.get(fixed_config.tickets_db)
@@ -768,13 +774,18 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         f"tickets_db not in kwargs: {call_kwargs}. "
         f"All calls: {mock_collect.call_args_list}"
     )
+    assert loop_opened, (
+        f"_metrics_loop._run_once() never called pool.get(); "
+        f"pool.open_count was 0 after the task ran — "
+        f"check that _run_once() uses the pool for {fixed_config.tickets_db}"
+    )
     # tickets.db exists on disk so DbPool.get() returns the real connection it
     # cached during _metrics_loop._run_once().  We assert object identity to pin
     # path-to-connection wiring: a wrong-but-existing path yields a different
     # connection object; a wrong-but-missing path leaves expected_conn as None.
     assert expected_conn is not None, (
-        f"DbPool.get() returned None; is tickets.db missing from "
-        f"{fixed_config.tickets_db}?"
+        f"DbPool.get() returned None for {fixed_config.tickets_db}; "
+        f"file was created in test setup — check if the pool connection opened correctly"
     )
     assert call_kwargs['tickets_db'] is expected_conn, (
         f"tickets_db should be the DbPool connection for {fixed_config.tickets_db} "
