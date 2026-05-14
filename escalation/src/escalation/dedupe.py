@@ -8,9 +8,18 @@ Provides:
 - find_dedupe_parent() — scans the live queue and returns the oldest
                          pending parent id whose key matches the candidate,
                          or None.
+
+Design contracts (see plan.json design_decisions for rationale):
+- find_dedupe_parent() does NOT check DedupeConfig.infra_dedupe_enabled.
+  That gate is the caller's responsibility (server._submit_or_dedupe).
+  This keeps the function pure/testable and avoids action-at-a-distance.
+- Cross-task: get_pending() scans all tasks, so infra fan-out (same
+  summary from 30 task_ids simultaneously) collapses into a single parent.
 """
 
 from __future__ import annotations
+
+__all__ = ['DedupeConfig', 'find_dedupe_parent', 'summary_dedupe_key']
 
 import re
 import string
