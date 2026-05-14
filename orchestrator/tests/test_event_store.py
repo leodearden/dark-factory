@@ -164,3 +164,27 @@ class TestEventStore:
         assert len(rows) == 3
         assert rows[0][0] == 'implementer'
         assert rows[0][1] == 0.50
+
+
+class TestSchedulerOverrideEventTypes:
+    """Assert the five priority-override event types exist on EventType."""
+
+    def test_priority_override_set_exists(self) -> None:
+        assert EventType.priority_override_set == 'priority_override_set'
+        assert EventType.priority_override_set.value == EventType.priority_override_set.name
+
+    def test_priority_override_cleared_exists(self) -> None:
+        assert EventType.priority_override_cleared == 'priority_override_cleared'
+        assert EventType.priority_override_cleared.value == EventType.priority_override_cleared.name
+
+    def test_task_pinned_exists(self) -> None:
+        assert EventType.task_pinned == 'task_pinned'
+        assert EventType.task_pinned.value == EventType.task_pinned.name
+
+    def test_task_unpinned_exists(self) -> None:
+        assert EventType.task_unpinned == 'task_unpinned'
+        assert EventType.task_unpinned.value == EventType.task_unpinned.name
+
+    def test_pin_queue_reordered_exists(self) -> None:
+        assert EventType.pin_queue_reordered == 'pin_queue_reordered'
+        assert EventType.pin_queue_reordered.value == EventType.pin_queue_reordered.name
