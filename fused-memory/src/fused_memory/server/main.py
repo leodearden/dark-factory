@@ -947,9 +947,19 @@ async def _setup_curator_usage_gate(
     without allocating any resources.
 
     Otherwise the CostStore is opened first (persistent aiosqlite connection).
-    If ``UsageGate.__init__`` subsequently raises for any reason, the open
-    connection is closed before re-raising — preventing a file-handle / WAL
-    thread leak that would occur if the caller's ``finally:`` block never ran.
+    If ``UsageGate.__init__`` or the success-path log subsequently raises for
+    any reason, both the gate (if constructed) and the open store are cleaned up
+    before re-raising — preventing a file-handle / WAL thread leak that would
+    occur if the caller's ``finally:`` block never ran.
+
+    **Cancellation hardening:** each cleanup await is wrapped in
+    ``asyncio.shield(...)`` and guarded by ``except BaseException:`` +
+    log-and-swallow.  This mirrors the pattern at
+    ``SqliteTaskBackend._txn`` (``sqlite_task_backend.py:414-417``):
+    shielding prevents an external cancel from tearing the close mid-flush;
+    catching ``BaseException`` ensures a synchronous ``CancelledError``
+    originating inside the awaited coroutine cannot mask the original
+    ``UsageGate.__init__`` exception.
 
     Extracted as a module-level helper (mirroring ``_resolve_curator_cost_store_path``)
     so the leak-guard is unit-testable without spinning up the full server.
@@ -965,19 +975,25 @@ async def _setup_curator_usage_gate(
     await curator_cost_store.open()
     logger.info(f'  Curator cost store: {db_path}')
 
+    curator_usage_gate: UsageGate | None = None
     try:
         curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        logger.info(
+            f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
+            f'from {config.usage_cap.accounts_file or "inline"}',
+        )
     except BaseException:
+        if curator_usage_gate is not None:
+            try:
+                await asyncio.shield(curator_usage_gate.shutdown())
+            except BaseException:
+                logger.exception('UsageGate shutdown failed during rollback')
         try:
-            await curator_cost_store.close()
-        except Exception:
+            await asyncio.shield(curator_cost_store.close())
+        except BaseException:
             logger.exception('CostStore close failed during UsageGate init rollback')
         raise
 
-    logger.info(
-        f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
-        f'from {config.usage_cap.accounts_file or "inline"}',
-    )
     return (curator_cost_store, curator_usage_gate)
 
 

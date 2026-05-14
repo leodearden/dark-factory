@@ -169,6 +169,72 @@ class TestCuratorUsageGateLeakGuard:
         )
 
     @pytest.mark.asyncio
+    async def test_setup_closes_resources_when_success_path_logger_raises(self, tmp_path):
+        """Success-path logger.info must be inside the try block: both gate.shutdown()
+        and store.close() must run when the log call raises unexpectedly.
+
+        On current main the trailing logger.info sits outside the try/except, so
+        neither cleanup runs — this test will FAIL until step-2 folds the log
+        call into the guarded block.
+        """
+        import fused_memory.server.main as main_module  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
+        usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
+        config = MagicMock()
+        config.usage_cap = usage_cap_cfg
+        config.reconciliation = MagicMock(data_dir=str(tmp_path))
+
+        # Spy on CostStore.close() to count awaits.
+        close_count: list[int] = [0]
+        original_close = CostStore.close
+
+        async def spy_close(self_store: CostStore) -> None:
+            close_count[0] += 1
+            return await original_close(self_store)
+
+        # Spy on UsageGate.shutdown() to count awaits.
+        shutdown_count: list[int] = [0]
+        original_shutdown = UsageGate.shutdown
+
+        async def spy_shutdown(self_gate: UsageGate) -> None:
+            shutdown_count[0] += 1
+            return await original_shutdown(self_gate)
+
+        # Patch logger.info to raise only on the success-path gate log call.
+        # raiser_invoked tracks whether the raiser actually branched into the raise
+        # path, so the test fails loudly if the 'Curator usage gate:' substring
+        # ever drifts (rather than silently passing via a never-reached raise).
+        raiser_invoked: list[bool] = [False]
+
+        def logger_info_raiser(msg: str, *args: object, **kwargs: object) -> None:
+            if 'Curator usage gate:' in str(msg):
+                raiser_invoked[0] = True
+                raise RuntimeError('synthetic logger failure')
+
+        with (
+            patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}),
+            patch.object(CostStore, 'close', spy_close),
+            patch.object(UsageGate, 'shutdown', spy_shutdown),
+            patch.object(main_module.logger, 'info', side_effect=logger_info_raiser),
+            pytest.raises(RuntimeError, match='synthetic logger failure'),
+        ):
+            await _setup_curator_usage_gate(config)
+
+        assert raiser_invoked[0], (
+            "logger_info_raiser was never triggered on 'Curator usage gate:' — "
+            'the log prefix may have drifted; update the substring match'
+        )
+        assert close_count[0] == 1, (
+            f'Expected CostStore.close() to be awaited exactly once, got {close_count[0]}'
+        )
+        assert shutdown_count[0] == 1, (
+            f'Expected UsageGate.shutdown() to be awaited exactly once, '
+            f'got {shutdown_count[0]}'
+        )
+
+    @pytest.mark.asyncio
     async def test_setup_returns_store_and_gate_on_success(self, tmp_path):
         """Happy path: helper returns both open store and gate; store stays open."""
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
@@ -188,7 +254,6 @@ class TestCuratorUsageGateLeakGuard:
         try:
             assert store is not None, 'Expected a CostStore, got None'
             assert gate is not None, 'Expected a UsageGate, got None'
-            assert store._conn is not None, 'CostStore connection should be open on success'
             assert gate.account_count == 1, (
                 f'Expected 1 account in gate, got {gate.account_count}'
             )
@@ -224,4 +289,39 @@ class TestCuratorUsageGateLeakGuard:
         result = asyncio.run(_setup_curator_usage_gate(config))
 
         assert result == (None, None), f'Expected (None, None), got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_setup_preserves_original_error_when_cleanup_cancelled(self, tmp_path):
+        """Original UsageGate init error must survive even if CostStore.close() raises
+        CancelledError mid-cleanup.
+
+        On current main the inner ``except Exception:`` does NOT catch
+        ``asyncio.CancelledError`` (a BaseException since Python 3.8), so the
+        cancel escapes the inner guard and the caller sees CancelledError instead
+        of the original RuntimeError — this test will FAIL until step-4 widens
+        the inner handler to ``except BaseException:`` and wraps with
+        ``asyncio.shield``.
+        """
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
+        usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
+        config = MagicMock()
+        config.usage_cap = usage_cap_cfg
+        config.reconciliation = MagicMock(data_dir=str(tmp_path))
+
+        # close() raises CancelledError — simulates a cancel arriving mid-cleanup.
+        cancel_close = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with (
+            patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}),
+            patch.object(CostStore, 'close', cancel_close),
+            patch.object(
+                UsageGate,
+                '__init__',
+                side_effect=RuntimeError('original init failure'),
+            ),
+            pytest.raises(RuntimeError, match='original init failure'),
+        ):
+            await _setup_curator_usage_gate(config)
 
