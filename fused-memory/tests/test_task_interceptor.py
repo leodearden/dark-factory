@@ -5174,3 +5174,35 @@ async def test_set_task_status_done_skips_predone_hook_when_env_unset(
 
     assert 'error' not in result
     taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_rejected_by_predone_hook(
+    taskmaster, reconciler, event_buffer, monkeypatch
+):
+    """When hook exits non-zero, the done transition is refused and tm.set_task_status is not called."""
+    # /project → project_id=project → FUSED_MEMORY_PREDONE_HOOK_PROJECT
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', '/bin/false')
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['success'] is False
+    assert result['error'] == 'pre_done_hook_rejected'
+    assert result['task_id'] == '1'
+    taskmaster.set_task_status.assert_not_called()
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_passes_when_predone_hook_succeeds(
+    taskmaster, reconciler, event_buffer, monkeypatch
+):
+    """When hook exits 0, the done transition proceeds and taskmaster.set_task_status is called."""
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', '/bin/true')
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
