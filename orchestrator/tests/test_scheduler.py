@@ -3974,3 +3974,64 @@ class TestPinDispatch:
         # Pinned A must dispatch first, even though B scores higher due to critical priority.
         assert result is not None
         assert result.task_id == 'A'
+
+    @pytest.mark.asyncio
+    async def test_multiple_pins_dispatch_in_pin_order_and_lockout_falls_through(
+        self, tmp_path
+    ):
+        """When the first pinned task is locked out, scheduler falls through to next pin.
+
+        A is pinned pin_order=1 but its module (compiler/src) is already held by 'seed'.
+        B is pinned pin_order=2 with a free module (eval/src).
+        Result: B is dispatched.  A accumulates NO skip bookkeeping.
+        """
+        from orchestrator.overrides import OverrideStore
+        from orchestrator.event_store import EventType
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+        # Pin A first (auto pin_order=1), then B (auto pin_order=2).
+        store.set_override('/proj', 'A', pinned=True)
+        store.set_override('/proj', 'B', pinned=True)
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        # Pre-hold A's module so A cannot acquire it this tick.
+        scheduler.lock_table._held['seed'] = {'compiler/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A (pinned 1, locked out)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['compiler/src']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B (pinned 2, free)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['eval/src']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+
+        # A was locked out → fall through to B (next pinned candidate).
+        assert result is not None
+        assert result.task_id == 'B'
+
+        # A must have accumulated NO skip bookkeeping.
+        assert scheduler._skip_count.get('A', 0) == 0
+
+        # No task_skipped event must have been emitted for A.
+        skipped_for_a = [
+            e for e in event_store.events
+            if e[0] == EventType.task_skipped.value and e[1].get('task_id') == 'A'
+        ]
+        assert skipped_for_a == [], f'Unexpected task_skipped events for A: {skipped_for_a}'
