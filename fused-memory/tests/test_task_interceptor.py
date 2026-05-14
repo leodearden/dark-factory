@@ -5250,23 +5250,32 @@ async def test_predone_hook_skipped_on_done_to_done_noop(
     Even when the hook env var is /bin/false (which would reject the done
     transition if it ran), the done→done same-status no-op guard fires first
     and returns without ever invoking run_hook.
-    """
-    import fused_memory.middleware.pre_done_hook as _hook_mod
 
+    The spy patches the bound alias on the consuming module
+    (``fused_memory.middleware.task_interceptor._run_hook``) — the correct
+    target for ``monkeypatch`` when the call site holds a module-level alias
+    bound at import time.  Compare with
+    test_predone_hook_spy_intercepts_bound_alias_on_pending_to_done which
+    shows the same patch target IS intercepted when the guard does not
+    short-circuit.
+    """
     # Env var set to /bin/false — would reject if the hook fired
     monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', '/bin/false')
     # Task is already done — same-status guard should short-circuit
     taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
-    # Spy on run_hook to verify it is never called
+    # Spy on the bound alias to verify it is never called.
+    # Patching the source module attribute (_hook_mod.run_hook) would NOT
+    # intercept the call site because task_interceptor already holds the
+    # reference as _run_hook at import time.
     spy_calls: list = []
 
     async def _spy_run_hook(task_id, project_root, **kwargs):
         spy_calls.append((task_id, project_root))
         return None  # should never be reached
 
-    monkeypatch.setattr(_hook_mod, 'run_hook', _spy_run_hook)
+    monkeypatch.setattr('fused_memory.middleware.task_interceptor._run_hook', _spy_run_hook)
 
     result = await interceptor.set_task_status('1', 'done', '/project')
 
