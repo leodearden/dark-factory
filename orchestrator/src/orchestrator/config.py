@@ -229,6 +229,18 @@ class BackendsConfig(BaseModel):
     judge: str = Field(default='claude')
 
 
+class UnblockAutoConfig(BaseModel):
+    """Configuration for the autonomous dry-run unblock hook."""
+
+    enabled: bool = Field(default=True)
+    budget_usd: float = Field(default=5.0)
+    timeout_seconds: float = Field(default=600.0)
+    model: str = Field(default='sonnet')
+    max_turns: int = Field(default=50)
+    effort: str = Field(default='high')
+    backend: str = Field(default='claude')
+
+
 class ReviewConfig(BaseModel):
     """Periodic deep review checkpoint configuration."""
 
@@ -688,6 +700,9 @@ class OrchestratorConfig(BaseSettings):
 
     # Usage cap handling
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
+
+    # Autonomous dry-run unblock hook
+    unblock_auto: UnblockAutoConfig = Field(default_factory=UnblockAutoConfig)
 
     # Environment overrides forwarded to agent invocations
     env_overrides: dict[str, str] = Field(default_factory=dict)
