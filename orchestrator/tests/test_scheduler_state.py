@@ -335,3 +335,108 @@ class TestGetStateSnapshotShape:
         assert scheduler._skip_count['X'] == 3, (
             'Mutating snapshot must not affect internal _skip_count'
         )
+
+
+# ===========================================================================
+# Step-13: get_state_snapshot() with populated state after real ticks
+# ===========================================================================
+
+class TestGetStateSnapshotPopulated:
+    """get_state_snapshot() reflects real scheduler state after ticks."""
+
+    @pytest.mark.asyncio
+    async def test_snapshot_after_real_tick_with_skips_parks_overrides_holders(
+        self, tmp_path
+    ):
+        """Full integration: snapshot reflects real data after two acquire_next ticks.
+
+        Setup:
+        - T1 (medium): boost_tier='high' override → effective priority 'high'
+        - T2 (medium): pinned=True → pin_queue entry with order 1
+        - T3 (critical): pre-hold T3's modules → accumulates skip then park
+
+        Tick 1: T2 dispatches (pinned, bypasses scored loop).
+        Tick 2: T3 is top scored (critical > high), can't acquire (modules
+                pre-held by 'holder').  T1 (high) dispatches instead.
+                T3 skip counter bumped; skip_threshold(critical)=0 so parks
+                installed after 1 skip.
+
+        Assertions mirror the step-13 spec exactly.
+        """
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.scheduler_v2 = True
+        store = OverrideStore(tmp_path / 'o.db')
+
+        # T1 gets a boost override (medium → high).
+        store.set_override('/proj', 'T1', boost_tier='high')
+        # T2 gets pinned (auto-assigns pin_order=1).
+        store.set_override('/proj', 'T2', pinned=True)
+
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            config, override_store=store, event_store=event_store  # type: ignore[arg-type]
+        )
+        scheduler._project_root = '/proj'
+
+        # Pre-hold T3's modules so T3 can never acquire them.
+        scheduler.lock_table._held['holder'] = {'t3/src'}
+        scheduler._dispatched.add('holder')
+
+        # Three tasks with distinct modules so they don't conflict each other.
+        task_t1 = _pending_task('T1', priority='medium', files=['t1/src'])
+        task_t2 = _pending_task('T2', priority='medium', files=['t2/src'])
+        task_t3 = _pending_task('T3', priority='critical', files=['t3/src'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_t1, task_t2, task_t3])
+
+        # Tick 1: T2 dispatches (pinned — bypasses the scored candidate loop).
+        await scheduler.acquire_next()
+
+        # Tick 2: T3 is top scored (critical), modules pre-held → skip+park.
+        #          T1 (high boosted) acquires its free modules.
+        await scheduler.acquire_next()
+
+        snap = scheduler.get_state_snapshot()
+
+        # --- skip_counts ---
+        assert snap['skip_counts'].get('T3', 0) >= 1, (
+            f"Expected T3 skip_count >= 1, got snap['skip_counts']={snap['skip_counts']}"
+        )
+
+        # --- parks ---
+        assert 'T3' in snap['parks'], f"Expected T3 in parks, got {snap['parks']}"
+        assert snap['parks']['T3']['modules'], (
+            'Expected non-empty modules list in parks[T3]'
+        )
+        datetime.fromisoformat(snap['parks']['T3']['installed_at'])
+
+        # --- effective_priorities ---
+        assert snap['effective_priorities'].get('T1') == 'high', (
+            f"Expected effective_priorities['T1']='high', "
+            f"got {snap['effective_priorities']}"
+        )
+
+        # --- pin_queue ---
+        assert snap['pin_queue'] == [{'task_id': 'T2', 'order': 1}], (
+            f"Expected pin_queue=[{{task_id:'T2',order:1}}], got {snap['pin_queue']}"
+        )
+
+        # --- overrides ---
+        assert 'T1' in snap['overrides'], f"Expected T1 in overrides, got {snap['overrides']}"
+        ov_t1 = snap['overrides']['T1']
+        assert ov_t1['boost_tier'] == 'high', f"Expected boost_tier='high', got {ov_t1}"
+        assert ov_t1['pinned'] is False, f"Expected pinned=False, got {ov_t1}"
+        assert ov_t1['ttl_until'] is None, f"Expected ttl_until=None, got {ov_t1}"
+
+        # --- current_holders ---
+        ch = snap['current_holders']
+        assert ch, 'Expected non-empty current_holders'
+        # Every held module must map to its task_id.
+        assert ch.get('t2/src') == 'T2', (
+            f"Expected current_holders['t2/src']='T2', got {ch}"
+        )
+        assert ch.get('t3/src') == 'holder', (
+            f"Expected current_holders['t3/src']='holder', got {ch}"
+        )
+        assert ch.get('t1/src') == 'T1', (
+            f"Expected current_holders['t1/src']='T1', got {ch}"
+        )
