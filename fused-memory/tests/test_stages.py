@@ -5631,6 +5631,20 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         assert report.stats.get('stale_missing_run_id_markers') == 2
         # Combined sweep: 1 mismatched + 2 missing = 3
         assert report.stats.get('stale_fixc_markers_swept') == 3
+        # Verify delete_memory was called for each stale ID with the exact kwargs
+        # that _sweep_stale_fixc_markers emits — pins the partition→sweep contract.
+        # Using a dict keyed by memory_id gives stronger guarantees than assert_any_call:
+        # it catches duplicate calls for the same ID (count-based check would still pass)
+        # and verifies the full kwargs for every expected ID in one compact expression.
+        delete_memory = mock_deps['memory_service'].delete_memory
+        calls_by_id = {c.kwargs['memory_id']: c.kwargs for c in delete_memory.call_args_list}
+        assert set(calls_by_id) == {'missing-1', 'missing-2', 'mismatched'}
+        shared_kwargs = {
+            'store': 'mem0', 'project_id': 'reify',
+            'causation_id': 'test-run', '_source': 'stage2_stale_fixc_sweep',
+        }
+        for mid, actual_kwargs in calls_by_id.items():
+            assert actual_kwargs == {'memory_id': mid, **shared_kwargs}
 
     @pytest.mark.asyncio
     async def test_zero_missing_run_id_markers_stat_explicitly_set(self, mock_deps):
