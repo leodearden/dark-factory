@@ -254,7 +254,7 @@ def status(config_path: Path | None):
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    scheduler = Scheduler(config, override_store=OverrideStore(config.overrides_db_path))
+    scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
 
     async def _show():
         tasks = await scheduler.get_tasks()

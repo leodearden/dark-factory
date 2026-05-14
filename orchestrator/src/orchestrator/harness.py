@@ -215,7 +215,7 @@ class Harness:
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
         self.git_ops = GitOps(config.git, config.project_root)
-        self.scheduler = Scheduler(config, override_store=OverrideStore(config.overrides_db_path))
+        self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
