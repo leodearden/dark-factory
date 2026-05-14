@@ -311,6 +311,9 @@ def bucketise_cap_sparkline(
     labels: list[str] = []
     values: list[int | float] = []
 
+    # O(num_buckets * len(capped)).  capped is expected to be small (single-digit
+    # merged windows over a 24 h sparkline); if it grows large, switch to a
+    # pointer-advance sweep instead.
     for i in range(num_buckets):
         right_edge = start_at + timedelta(seconds=bucket_seconds * (i + 1))
         label = right_edge.isoformat()
