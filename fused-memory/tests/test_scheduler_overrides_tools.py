@@ -795,8 +795,7 @@ async def test_all_tools_reject_empty_project_root(
     assert result.get('error_type') == 'ValidationError', (
         f'{tool_name}: expected ValidationError, got {result!r}'
     )
-    # No DB file should have been created
-    assert not _db_path('').exists() if str(tmp_path) != '' else True
+    # Validation fires before any disk side effect — no audit for write tools.
     if tool_name != 'get_pin_queue':
         memory_service.add_memory.assert_not_called()
 

@@ -2333,7 +2333,7 @@ def create_mcp_server(
         content: str,
         metadata: dict,
     ) -> None:
-        """Fire-and-forget audit write to fused-memory.
+        """Best-effort audit write — awaited inline; failures are logged but never propagated.
 
         Mirrors the _log_read pattern at tools.py:272 — audit failures log
         a warning but never fail the user-visible tool response.
@@ -2508,6 +2508,11 @@ def create_mcp_server(
             if pinned is not None:
                 changed_fields['pinned'] = pinned
             if pin_order is not None:
+                # Intentionally the post-auto-assignment value — if pinned=True was
+                # supplied without an explicit pin_order, this records the integer
+                # that was actually written to the DB (auto-MAX+1 logic above).
+                # Contrast with ttl_secs below, which is intentionally the raw
+                # caller-supplied input rather than the derived ttl_until ISO string.
                 changed_fields['pin_order'] = pin_order
             if reserve_now is not None:
                 changed_fields['reserve_now'] = reserve_now
@@ -2661,36 +2666,49 @@ def create_mcp_server(
 
         try:
             now_iso = datetime.now(UTC).isoformat()
-            db = await _open_overrides_db(project_root)
+            # Use autocommit=True so we can issue BEGIN IMMEDIATE, making the
+            # set-equality SELECT and the rewrite loop a single atomic
+            # read-then-write under a write lock.  Without BEGIN IMMEDIATE a
+            # concurrent set_task_priority_override(pinned=True) call could pin
+            # a new task between the SELECT and the UPDATE loop, invalidating
+            # the set-equality invariant that was checked before the writes.
+            # Mirrors set_task_priority_override's concurrency pattern above.
+            db = await _open_overrides_db(project_root, autocommit=True)
             try:
-                # Set-equality check before writing.
-                # Mirrors orchestrator/src/orchestrator/overrides.py:303-312.
-                cursor = await db.execute(
-                    'SELECT task_id FROM overrides WHERE project_root=? AND pinned=1',
-                    (project_root,),
-                )
-                current_rows = await cursor.fetchall()
-                current_set = {r[0] for r in current_rows}
-                supplied_set = set(ordered_task_ids)
-                if supplied_set != current_set:
-                    return {
-                        'error': (
-                            f'reorder_pin_queue: ids do not match current pin queue. '
-                            f'supplied={sorted(supplied_set)!r}, '
-                            f'expected={sorted(current_set)!r}'
-                        ),
-                        'error_type': 'ValidationError',
-                    }
-
-                # Single-transaction rewrite. Mirrors overrides.py:318-326.
-                await db.execute('BEGIN')
-                for idx, tid in enumerate(ordered_task_ids, start=1):
-                    await db.execute(
-                        'UPDATE overrides SET pin_order=?, updated_at=? '
-                        'WHERE project_root=? AND task_id=?',
-                        (idx, now_iso, project_root, tid),
+                await db.execute('BEGIN IMMEDIATE')
+                try:
+                    # Set-equality check before writing.
+                    # Mirrors orchestrator/src/orchestrator/overrides.py:303-312.
+                    cursor = await db.execute(
+                        'SELECT task_id FROM overrides WHERE project_root=? AND pinned=1',
+                        (project_root,),
                     )
-                await db.commit()
+                    current_rows = await cursor.fetchall()
+                    current_set = {r[0] for r in current_rows}
+                    supplied_set = set(ordered_task_ids)
+                    if supplied_set != current_set:
+                        await db.execute('ROLLBACK')
+                        return {
+                            'error': (
+                                f'reorder_pin_queue: ids do not match current pin queue. '
+                                f'supplied={sorted(supplied_set)!r}, '
+                                f'expected={sorted(current_set)!r}'
+                            ),
+                            'error_type': 'ValidationError',
+                        }
+
+                    # Single-transaction rewrite. Mirrors overrides.py:318-326.
+                    for idx, tid in enumerate(ordered_task_ids, start=1):
+                        await db.execute(
+                            'UPDATE overrides SET pin_order=?, updated_at=? '
+                            'WHERE project_root=? AND task_id=?',
+                            (idx, now_iso, project_root, tid),
+                        )
+                    await db.execute('COMMIT')
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await db.execute('ROLLBACK')
+                    raise
             finally:
                 await db.close()
 
