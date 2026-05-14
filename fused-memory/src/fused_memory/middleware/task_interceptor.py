@@ -1836,6 +1836,7 @@ class TaskInterceptor:
             if row is None:
                 return {'error': 'not_found', 'ticket_id': ticket_id}
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
+        logger.info('cancel_ticket: cancelled pending ticket %s', ticket_id)
         return {'status': 'cancelled', 'ticket_id': ticket_id}
 
     def _start_worker_if_needed(self, project_id: str) -> None:
