@@ -152,3 +152,59 @@ class TestHarnessSchedulerParkStopWiring:
         assert harness.scheduler.pause_reason == 'integration-reason', (
             f'Expected pause_reason "integration-reason"; got {harness.scheduler.pause_reason!r}'
         )
+
+
+class TestHarnessRestartPersistence:
+    """Tests for restart-time rehydration of persisted scheduler pause state."""
+
+    @pytest.mark.asyncio
+    async def test_harness_restart_loads_persisted_pause(self, tmp_path: Path) -> None:
+        """_load_persisted_scheduler_pause() restores is_paused and pause_reason from runs.db.
+
+        It must NOT re-write the row (save_scheduler_pause call_count == 0) because
+        the pause was already persisted by the prior run.
+        """
+        # Seed a real RunStore with a persisted pause.
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True)
+        db_path = db_dir / 'runs.db'
+        seeder = RunStore(db_path)
+        seeder.save_scheduler_pause(
+            project_id='dark_factory',
+            reason='pre-restart park-stop',
+            pause_at_iso='2026-05-13T22:00:00+00:00',
+            set_by_run_id='prior-run-id',
+        )
+
+        # Build a fresh Harness (without calling run()) and inject the real RunStore.
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+        harness._run_store = seeder  # inject so _load_persisted_scheduler_pause can read
+        harness._run_id = 'new-run-id'
+
+        # Spy: assert save_scheduler_pause is NOT called (no re-persist).
+        original_save = seeder.save_scheduler_pause
+        save_call_count = 0
+
+        def _spy_save(*args, **kwargs):
+            nonlocal save_call_count
+            save_call_count += 1
+            return original_save(*args, **kwargs)
+
+        seeder.save_scheduler_pause = _spy_save
+
+        # Act
+        await harness._load_persisted_scheduler_pause()
+
+        # Assert scheduler state restored.
+        assert harness.scheduler.is_paused is True, (
+            'Scheduler must be paused after loading persisted pause state'
+        )
+        assert harness.scheduler.pause_reason == 'pre-restart park-stop', (
+            f'Expected pause_reason "pre-restart park-stop"; got {harness.scheduler.pause_reason!r}'
+        )
+
+        # Assert no re-persist.
+        assert save_call_count == 0, (
+            f'save_scheduler_pause must not be called on restart load; got {save_call_count} calls'
+        )
