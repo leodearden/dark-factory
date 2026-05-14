@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 
@@ -61,3 +63,59 @@ class TestSummaryDedupeKey:
         k1 = summary_dedupe_key('UPPER lower MiXeD')
         k2 = summary_dedupe_key('upper lower mixed')
         assert k1 == k2
+
+
+class TestEscalationDedupeFields:
+    """Escalation dataclass gains dedupe_count and dedupe_children fields."""
+
+    def _make_min_escalation(self):
+        from escalation.models import Escalation
+        return Escalation(
+            id='esc-1-1',
+            task_id='1',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+
+    def test_defaults_are_zero_and_empty(self):
+        """New Escalation has dedupe_count==0 and dedupe_children==[]."""
+        esc = self._make_min_escalation()
+        assert esc.dedupe_count == 0
+        assert esc.dedupe_children == []
+
+    def test_round_trips_via_json(self):
+        """dedupe_count and dedupe_children survive to_json / from_json."""
+        from escalation.models import Escalation
+        esc = self._make_min_escalation()
+        esc.dedupe_count = 3
+        esc.dedupe_children = ['esc-2-1', 'esc-3-1', 'esc-4-1']
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.dedupe_count == 3
+        assert restored.dedupe_children == ['esc-2-1', 'esc-3-1', 'esc-4-1']
+
+    def test_from_dict_without_dedupe_keys_uses_defaults(self):
+        """Old JSON on disk (without dedupe keys) loads with default values."""
+        from escalation.models import Escalation
+        old_dict = {
+            'id': 'esc-1-1',
+            'task_id': '1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'infra_issue',
+            'summary': 'connection lost',
+        }
+        esc = Escalation.from_dict(old_dict)
+        assert esc.dedupe_count == 0
+        assert esc.dedupe_children == []
+
+    def test_separate_instances_do_not_share_dedupe_children(self):
+        """Two Escalation instances must NOT share the same dedupe_children list."""
+        from escalation.models import Escalation
+        esc_a = self._make_min_escalation()
+        esc_b = self._make_min_escalation()
+        esc_a.dedupe_children.append('esc-2-1')
+        assert esc_b.dedupe_children == [], (
+            'dedupe_children must use default_factory, not a shared class-level list'
+        )
