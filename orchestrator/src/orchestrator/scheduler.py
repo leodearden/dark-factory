@@ -1248,6 +1248,12 @@ class Scheduler:
         of truth ensures that future gate additions (e.g. a new suppression
         signal) apply to both dispatch paths automatically.
 
+        This method is a **pure predicate** — it has no side effects and may be
+        called any number of times without surprise.  In particular it does *not*
+        remove expired entries from ``self._requeue_until``; that bookkeeping is
+        the responsibility of :meth:`_gc_expired_cooldowns`, which is called
+        once per tick from :meth:`acquire_next` before either candidate loop.
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -1259,11 +1265,8 @@ class Scheduler:
         if tid in self._dispatched:
             return False, None
         cooldown_deadline = self._requeue_until.get(tid)
-        if cooldown_deadline is not None:
-            if self._time_source() < cooldown_deadline:
-                return False, None
-            # Deadline has passed — clean up the stale entry.
-            del self._requeue_until[tid]
+        if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
+            return False, None
         if not self._deps_satisfied(task, status_map):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
@@ -1684,6 +1687,13 @@ class Scheduler:
         for tid_str, status in status_map.items():
             if status in TERMINAL_STATUSES:
                 self._last_dispatch_at.pop(tid_str, None)
+
+        # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
+        # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
+        # both the scored-candidate loop and the pin-dispatch loop so both
+        # observe post-GC state, matching the contract previously provided by
+        # the lazy per-call delete inside _eligible_for_dispatch.
+        self._gc_expired_cooldowns()
 
         # Load priority-override snapshot for this tick.
         current_overrides: dict[str, OverrideRow] = (
