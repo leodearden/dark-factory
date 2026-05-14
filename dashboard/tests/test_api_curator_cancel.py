@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import httpx
 import pytest
 
+from dashboard.app import _CANCEL_DETAIL_EXC_CHAR_LIMIT
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -236,26 +238,31 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
 
 
 def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
-    """502 detail is capped at 200 chars; WARNING log keeps full exception text.
+    """502 detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars; WARNING keeps full text.
 
     Guards against arbitrary-length response-body leakage via the 502 detail
     field: the cancel handler interpolates str(exc) in the detail string, which
-    can be unbounded when the upstream MCP server returns a large error body
-    (e.g. httpx.HTTPStatusError whose message is the full response body).
+    can be unbounded when the upstream MCP server returns a large error body.
+
+    Uses ValueError('X' * 300) as the exception fixture because:
+      - ValueError is already in the handler's caught-exception tuple
+        (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError)
+      - str(ValueError(s)) == s is part of the stdlib BaseException.__str__
+        contract (single-arg case returns self.args[0] as-is), so the assertion
+        directly pins the handler's truncation behaviour rather than depending on
+        httpx.HTTPStatusError.__str__ formatting, which is not contractual and
+        could change across httpx versions.
 
     Assertions:
       (a) response is 502
-      (b) detail contains the first 200 chars of the exception message
-          AND does NOT contain 201 consecutive 'X' chars (i.e. is truncated)
+      (b) detail contains the first _CANCEL_DETAIL_EXC_CHAR_LIMIT chars of the
+          exception message AND does NOT contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1
+          consecutive 'X' chars (i.e. is truncated)
       (c) the WARNING log record still has the FULL 300-char message
           (ops log must not lose information)
     """
     long_msg = 'X' * 300
-    exc = httpx.HTTPStatusError(
-        long_msg,
-        request=httpx.Request('POST', 'http://x'),
-        response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
-    )
+    exc = ValueError(long_msg)
     with patch(
         _PATCH_TARGET,
         new=AsyncMock(side_effect=exc),
@@ -268,10 +275,14 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
     # (a) 502
     assert resp.status_code == 502
 
-    # (b) detail is capped at 200 chars
+    # (b) detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars
     detail = resp.json().get('detail', '')
-    assert 'X' * 200 in detail, 'Expected first 200 X chars in detail'
-    assert 'X' * 201 not in detail, 'Detail must not contain 201+ X chars (leaked exc text)'
+    assert 'X' * _CANCEL_DETAIL_EXC_CHAR_LIMIT in detail, (
+        f'Expected first _CANCEL_DETAIL_EXC_CHAR_LIMIT X chars in detail'
+    )
+    assert 'X' * (_CANCEL_DETAIL_EXC_CHAR_LIMIT + 1) not in detail, (
+        'Detail must not contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 X chars (leaked exc text)'
+    )
 
     # (c) WARNING log retains full exception text
     warning_records = [
