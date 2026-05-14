@@ -815,6 +815,44 @@ def _collect_checkpoint_targets(
     return targets
 
 
+def _snapshot_threads() -> dict[str, int]:
+    """Return a categorised count of live threads plus a ``_total`` key.
+
+    Buckets:
+      - ``main``       — the MainThread
+      - ``asyncio_pool`` — asyncio's default thread-pool workers (names start
+                          with ``asyncio_`` or ``ThreadPoolExecutor``)
+      - ``aiosqlite``  — aiosqlite connection worker threads (name starts with
+                          ``aiosqlite``)
+      - ``timer``      — :class:`threading.Timer` instances (short-lived)
+      - ``other``      — everything else
+
+    ``_total`` matches ``threading.active_count()`` at snapshot time.
+    """
+    threads = threading.enumerate()
+    buckets: dict[str, int] = {
+        'main': 0,
+        'asyncio_pool': 0,
+        'aiosqlite': 0,
+        'timer': 0,
+        'other': 0,
+    }
+    for t in threads:
+        name = t.name or ''
+        if name == 'MainThread':
+            buckets['main'] += 1
+        elif name.startswith('asyncio_') or name.startswith('ThreadPoolExecutor'):
+            buckets['asyncio_pool'] += 1
+        elif name.startswith('aiosqlite'):
+            buckets['aiosqlite'] += 1
+        elif isinstance(t, threading.Timer):
+            buckets['timer'] += 1
+        else:
+            buckets['other'] += 1
+    buckets['_total'] = len(threads)
+    return buckets
+
+
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     """One pass of WAL TRUNCATE checkpoints over every target.
 
