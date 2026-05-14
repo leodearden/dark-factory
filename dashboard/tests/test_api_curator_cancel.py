@@ -9,11 +9,11 @@ Step-by-step TDD:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+import logging
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
-from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,11 +115,31 @@ def test_not_found_returns_404(client):
 # ---------------------------------------------------------------------------
 
 
-def test_all_servers_unreachable_returns_502(client):
-    """ConnectError from every URL → 502 with fused_memory_unreachable envelope."""
+@pytest.mark.parametrize(
+    'exc',
+    [
+        httpx.ConnectError('refused'),
+        httpx.TimeoutException('timed out'),
+        httpx.HTTPStatusError(
+            '500 Internal Server Error',
+            request=httpx.Request('POST', 'http://x'),
+            response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
+        ),
+        ValueError('bad MCP payload'),
+    ],
+    ids=['ConnectError', 'TimeoutException', 'HTTPStatusError', 'ValueError'],
+)
+def test_all_servers_unreachable_returns_502(client, exc):
+    """Each of the four caught exception types → 502 fused_memory_unreachable.
+
+    This is a regression-pin test: the production except clause catches
+    ConnectError, TimeoutException, HTTPStatusError, and ValueError. Any future
+    refactor that drops one of these types will fail this parametrized test,
+    surfacing the contract break immediately.
+    """
     with patch(
         _PATCH_TARGET,
-        new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        new=AsyncMock(side_effect=exc),
     ) as mock_mcp:
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
@@ -140,17 +160,82 @@ def test_all_servers_unreachable_returns_502(client):
 # ---------------------------------------------------------------------------
 
 
-def _two_url_client(two_url_config):
-    """Return a TestClient with the two-URL config overriding app.state.config."""
-    from dashboard.app import app
-
-    ctx = TestClient(app)
-    ctx.__enter__()
-    app.state.config = two_url_config
-    return ctx
+# ---------------------------------------------------------------------------
+# step-3 (task-1285): invalidate_session called on transport error
+# ---------------------------------------------------------------------------
 
 
-def test_two_url_fallback_url0_fails_url1_succeeds(two_url_config):
+def test_cancel_handler_invalidates_session_on_transport_error(client):
+    """Transport error → invalidate_session called once with the failing URL.
+
+    Verifies that the cancel handler routes through invalidate_session (the
+    public helper) rather than reaching into memory_data._sessions directly,
+    ensuring the module-boundary contract introduced in task-1285/step-4.
+    """
+    _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
+    from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+
+    with (
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        ),
+        patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
+    ):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    assert resp.status_code == 502
+    # invalidate_session must have been called exactly once with the failing URL
+    assert mock_invalidate.call_args_list == [call(DEFAULT_FUSED_MEMORY_URLS[0])]
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task-1285): logger.warning + str(exc) in 502 detail
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
+    """Transport error → WARNING logged and str(exc) included in 502 detail.
+
+    Three simultaneous assertions:
+      (a) response is 502
+      (b) a WARNING-level record is emitted by the 'dashboard.app' logger
+          whose message contains both the URL and the exception text
+      (c) the response body's 'detail' field contains the full exception
+          message ('connection refused: port 8002'), not just the type name
+    """
+    exc_msg = 'connection refused: port 8002'
+    with patch(
+        _PATCH_TARGET,
+        new=AsyncMock(side_effect=httpx.ConnectError(exc_msg)),
+    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    # (a) 502
+    assert resp.status_code == 502
+
+    # (b) WARNING log
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+    ]
+    assert warning_records, 'Expected at least one WARNING from dashboard.app'
+    combined_msg = ' '.join(r.getMessage() for r in warning_records)
+    assert 'cancel_ticket failed' in combined_msg
+    assert exc_msg in combined_msg
+
+    # (c) detail includes full exception message (not just type name)
+    detail = resp.json().get('detail', '')
+    assert exc_msg in detail, f'Expected "{exc_msg}" in detail, got: {detail!r}'
+
+
+def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
     """URL[0] raises ConnectError; URL[1] returns cancelled → overall 200.
 
     Verifies that the for-loop actually falls through to the next server on a
@@ -159,25 +244,21 @@ def test_two_url_fallback_url0_fails_url1_succeeds(two_url_config):
     mcp_result = {'status': 'cancelled', 'ticket_id': 'tkt_abc'}
     side_effects = [httpx.ConnectError('refused'), mcp_result]
 
-    ctx = _two_url_client(two_url_config)
-    try:
-        with patch(_PATCH_TARGET, new=AsyncMock(side_effect=side_effects)) as mock_mcp:
-            resp = ctx.post(
-                '/api/v2/dashboard/curator/cancel',
-                json={'ticket_id': 'tkt_abc'},
-            )
-    finally:
-        ctx.__exit__(None, None, None)
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=side_effects)) as mock_mcp:
+        resp = two_url_client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_abc'},
+        )
 
     assert resp.status_code == 200
     assert resp.json() == mcp_result
     # Both URLs must have been tried
     assert mock_mcp.call_count == 2
-    urls_called = [call.args[1] for call in mock_mcp.call_args_list]
+    urls_called = [c.args[1] for c in mock_mcp.call_args_list]
     assert urls_called == ['http://localhost:9000', 'http://localhost:9001']
 
 
-def test_two_url_not_found_short_circuits_loop(two_url_config):
+def test_two_url_not_found_short_circuits_loop(two_url_client):
     """URL[0] returns not_found → 404 immediately; URL[1] is never called.
 
     Verifies the first-success-or-not_found semantics: an authoritative MCP
@@ -186,15 +267,11 @@ def test_two_url_not_found_short_circuits_loop(two_url_config):
     """
     mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
 
-    ctx = _two_url_client(two_url_config)
-    try:
-        with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
-            resp = ctx.post(
-                '/api/v2/dashboard/curator/cancel',
-                json={'ticket_id': 'tkt_missing'},
-            )
-    finally:
-        ctx.__exit__(None, None, None)
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = two_url_client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_missing'},
+        )
 
     assert resp.status_code == 404
     assert resp.json() == mcp_result
@@ -203,20 +280,16 @@ def test_two_url_not_found_short_circuits_loop(two_url_config):
     assert mock_mcp.call_args.args[1] == 'http://localhost:9000'
 
 
-def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_config):
+def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     """Both URLs raise ConnectError → 502 with detail mentioning both URLs."""
-    ctx = _two_url_client(two_url_config)
-    try:
-        with patch(
-            _PATCH_TARGET,
-            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
-        ) as mock_mcp:
-            resp = ctx.post(
-                '/api/v2/dashboard/curator/cancel',
-                json={'ticket_id': 'tkt_xyz'},
-            )
-    finally:
-        ctx.__exit__(None, None, None)
+    with patch(
+        _PATCH_TARGET,
+        new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+    ) as mock_mcp:
+        resp = two_url_client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
 
     assert resp.status_code == 502
     data = resp.json()

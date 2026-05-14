@@ -555,3 +555,43 @@ class TestMcpToolCallLogging:
             r.levelno == logging.WARNING and 'dashboard.data.memory' in r.name
             for r in caplog.records
         )
+
+
+# ── invalidate_session ──────────────────────────────────────────
+
+
+class TestInvalidateSession:
+    """Unit tests for the public invalidate_session helper.
+
+    Each test relies on the module-scoped _clean_sessions autouse fixture
+    (defined above) to guarantee a clean _sessions dict before and after.
+    """
+
+    def test_removes_cached_entry(self):
+        """invalidate_session removes an existing entry keyed to the base URL."""
+        from dashboard.data.memory import _get_session, _sessions, invalidate_session
+
+        _get_session('http://x:8000')
+        assert 'http://x:8000' in _sessions
+
+        invalidate_session('http://x:8000')
+        assert 'http://x:8000' not in _sessions
+
+    def test_trailing_slash_normalized(self):
+        """invalidate_session with trailing slash removes entry keyed without slash."""
+        from dashboard.data.memory import _get_session, _sessions, invalidate_session
+
+        # _get_session strips trailing slashes, so the key has none.
+        _get_session('http://x:8000')
+        assert 'http://x:8000' in _sessions
+
+        # Caller passes URL with trailing slash — should still work.
+        invalidate_session('http://x:8000/')
+        assert 'http://x:8000' not in _sessions
+
+    def test_unknown_url_is_no_op(self):
+        """invalidate_session with a URL not in the cache does not raise."""
+        from dashboard.data.memory import invalidate_session
+
+        # Must not raise — idempotent by design.
+        invalidate_session('http://unknown:9999')

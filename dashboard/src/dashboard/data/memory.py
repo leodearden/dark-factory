@@ -160,6 +160,15 @@ def reset_sessions() -> None:
     _sessions.clear()
 
 
+def invalidate_session(url: str) -> None:
+    """Remove a single cached MCP session, forcing re-initialisation on next call.
+
+    Symmetric with reset_sessions(). Uses the same URL-normalisation rule
+    (.rstrip('/')) as _get_session so callers need not strip manually.
+    """
+    _sessions.pop(url.rstrip('/'), None)
+
+
 # ── Public API (backward-compatible return types) ──────────────────
 
 
@@ -191,7 +200,7 @@ async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) 
             logger.debug('get_status failed for %s: %s', url, e)
             errors.append(f'{url}: {e}')
             # Invalidate stale session so next poll retries init
-            _sessions.pop(url.rstrip('/'), None)
+            invalidate_session(url)
     return {'offline': True, 'error': '; '.join(errors)}
 
 
@@ -210,7 +219,7 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
             logger.debug('get_queue_stats failed for %s: %s', url, e)
-            _sessions.pop(url.rstrip('/'), None)
+            invalidate_session(url)
             continue
 
         any_success = True
@@ -246,7 +255,7 @@ async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> 
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 ValueError) as e:
             logger.debug('get_wal_status failed for %s: %s', url, e)
-            _sessions.pop(url.rstrip('/'), None)
+            invalidate_session(url)
             errors.append(f'{url}: {e}')
             continue
         per_server[url] = result.get('stores') or {}
