@@ -667,6 +667,10 @@ class Scheduler:
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
+        # Effective-priority cache: populated at the end of each acquire_next tick
+        # so get_state_snapshot() can include it without re-fetching tasks.
+        # Empty dict before the first tick.
+        self._last_effective_priorities: dict[str, str] = {}
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
@@ -1852,6 +1856,7 @@ class Scheduler:
             tasks_by_id, reverse_index, status_map,
             override_boosts=override_boosts or None,
         )
+        self._last_effective_priorities = dict(effective_priorities)
         transitive_counts = self._compute_transitive_counts(
             tasks_by_id, reverse_index, status_map
         )

@@ -250,3 +250,47 @@ class TestParkInstallAtTracking:
         assert 'T' not in lt._park_install_at, (
             '_park_install_at must not be set when install_parks installs nothing'
         )
+
+
+# ===========================================================================
+# Step-9: _last_effective_priorities cache
+# ===========================================================================
+
+class TestEffectivePrioritiesCache:
+    """Scheduler._last_effective_priorities is populated after acquire_next."""
+
+    def test_empty_before_first_tick(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        assert scheduler._last_effective_priorities == {}
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_caches_effective_priorities(self):
+        """After a tick, _last_effective_priorities maps task_id -> effective tier.
+
+        B (high priority) depends on A (medium).  The reverse index has A as a
+        dependency of B, so A's effective priority is upgraded to high via
+        priority inheritance (effective = min-rank over dependents).
+        """
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        task_a = _pending_task('A', priority='medium', files=['mod_a'])
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'pending',
+            'dependencies': [{'id': 'A'}],
+            'metadata': {'files': ['mod_b']},
+            'priority': 'high',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        await scheduler.acquire_next()
+
+        assert 'A' in scheduler._last_effective_priorities
+        assert 'B' in scheduler._last_effective_priorities
+        # A's effective priority inherits high from B (B is A's dependent).
+        assert scheduler._last_effective_priorities['A'] == 'high', (
+            'A is depended upon by high-priority B; effective priority must be high'
+        )
+        assert scheduler._last_effective_priorities['B'] == 'high'
