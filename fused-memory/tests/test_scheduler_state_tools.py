@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+import statistics
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 from fused_memory.server.tools import create_mcp_server
-
 
 # ---------------------------------------------------------------------------
 # Fixtures (mirror test_scheduler_overrides_tools.py pattern)
@@ -315,9 +315,6 @@ class TestGetSchedulerEventsTool:
 # ===========================================================================
 # Step-23: get_scheduler_state performance
 # ===========================================================================
-
-import statistics
-import time
 
 
 class TestSnapshotPerformance:

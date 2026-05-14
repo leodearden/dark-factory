@@ -14,14 +14,14 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 
-from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
-from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
-from fused_memory.services.memory_service import MemoryService
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
+from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
+from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     validate_int_ids,
     validate_project_id,
