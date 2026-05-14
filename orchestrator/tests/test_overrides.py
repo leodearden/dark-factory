@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -176,6 +177,45 @@ class TestPinning:
 
         # Store is clean — no rows created
         assert store.get_overrides('proj') == {}
+
+    def test_concurrent_auto_pin_assigns_distinct_pin_orders(self, tmp_path: Path) -> None:
+        """Two concurrent set_override(pinned=True) calls must produce {1,2}.
+
+        Pre-fix (no BEGIN IMMEDIATE): both threads can read MAX=0 simultaneously
+        and both compute pin_order=1, producing a PinOrderCollision or duplicate
+        pin_order values.  Post-fix (BEGIN IMMEDIATE): SQLite serializes the two
+        write transactions so they assign 1 and 2 respectively.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def pin_task(task_id: str) -> None:
+            try:
+                barrier.wait()  # both threads enter set_override at the same time
+                store.set_override('proj', task_id, pinned=True)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = threading.Thread(target=pin_task, args=('A',))
+        t2 = threading.Thread(target=pin_task, args=('B',))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == [], f'Unexpected exceptions: {errors}'
+
+        overrides = store.get_overrides('proj')
+        assert 'A' in overrides, 'Task A must be present after concurrent pin'
+        assert 'B' in overrides, 'Task B must be present after concurrent pin'
+
+        pin_orders = {overrides['A'].pin_order, overrides['B'].pin_order}
+        assert pin_orders == {1, 2}, (
+            f'Expected distinct pin_orders {{1, 2}}; got {pin_orders}'
+        )
 
     def test_set_override_pinned_false_clears_pin_order(self, tmp_path: Path) -> None:
         """set_override(pinned=False) must also zero out pin_order.
