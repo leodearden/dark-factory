@@ -682,3 +682,4 @@ class TestRunArmsWatchdog:
             'disarm() was called on the blocked>0 path — watchdog must remain armed to '
             'guard interpreter shutdown (threading._shutdown() joining non-daemon threads)'
         )
+

@@ -23,6 +23,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.overrides import OverrideStore
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
@@ -214,7 +215,7 @@ class Harness:
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
         self.git_ops = GitOps(config.git, config.project_root)
-        self.scheduler = Scheduler(config)
+        self.scheduler = Scheduler(config, override_store=OverrideStore(config.overrides_db_path))
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
