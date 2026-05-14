@@ -294,11 +294,8 @@ async def _sample_curator(
     effective_now = now if now is not None else datetime.now(UTC)
 
     # 1. HTTP pending count via fan_out_list_tickets (de-duped roots, first-success-per-root).
-    # Pass limit explicitly so _LIST_TICKETS_LIMIT is read at call time (not from the
-    # default arg which is bound at function definition time).
     _, pending_total = await fan_out_list_tickets(
         http_client, config,
-        limit=_LIST_TICKETS_LIMIT,
         timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
     )
 
