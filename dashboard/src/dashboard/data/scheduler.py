@@ -267,7 +267,7 @@ async def collect_scheduler_state(
                     'get_scheduler_state',
                     {'project_root': str(root)},
                 )
-                events = await mcp_tool_call(
+                events_raw = await mcp_tool_call(
                     client,
                     url,
                     'get_scheduler_events',
@@ -277,11 +277,12 @@ async def collect_scheduler_state(
                         'event_types': ['task_skipped'],
                     },
                 )
-                if isinstance(events, list):
+                if isinstance(events_raw, list):
+                    events = events_raw
                     break
                 # events may be wrapped: {'events': [...]}
-                if isinstance(events, dict):
-                    events = events.get('events') or []
+                if isinstance(events_raw, dict):
+                    events = events_raw.get('events') or []
                 break
             except (
                 httpx.ConnectError,

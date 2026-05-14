@@ -21,7 +21,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # step-1: pure-function test for _module_contention_counts
 # ---------------------------------------------------------------------------
@@ -326,8 +325,9 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
     Mirrors test_collect_active_tasks_surfaces_offline_projects.
     All other tuple members must be empty.
     """
-    import httpx
     from unittest.mock import AsyncMock, patch
+
+    import httpx
 
     from dashboard.data.scheduler import collect_scheduler_state
 
@@ -498,8 +498,9 @@ def test_override_endpoint_proxies_verbatim_on_success(client):
 
 def test_override_endpoint_returns_502_when_all_unreachable(client):
     """All URLs unreachable → 502."""
-    import httpx
     from unittest.mock import AsyncMock, patch
+
+    import httpx
 
     with patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError('refused'))):
         resp = client.post(
@@ -577,8 +578,9 @@ def test_clear_override_returns_404_on_not_found(client):
 
 def test_clear_override_returns_502_when_all_unreachable(client):
     """All URLs unreachable → 502."""
-    import httpx
     from unittest.mock import AsyncMock, patch
+
+    import httpx
 
     with patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError('refused'))):
         resp = client.post(
@@ -641,8 +643,9 @@ def test_reorder_pin_queue_proxies_verbatim_on_success(client):
 
 def test_reorder_pin_queue_returns_502_when_all_unreachable(client):
     """All URLs unreachable → 502."""
-    import httpx
     from unittest.mock import AsyncMock, patch
+
+    import httpx
 
     with patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError('refused'))):
         resp = client.post(
