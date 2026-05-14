@@ -8,6 +8,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from escalation.dedupe import DedupeConfig, find_dedupe_parent
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -35,6 +36,7 @@ def create_server(
     orch_config: Any = None,
     event_store: Any = None,
     harness: Any = None,
+    dedupe_config: DedupeConfig | None = None,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -44,8 +46,63 @@ def create_server(
     workflow whose task has been completed out-of-band.  When omitted (e.g.
     in tests with no orchestrator), the tool reports that no workflow is
     active.
+
+    *dedupe_config* controls infra_issue deduplication.  When omitted,
+    ``DedupeConfig()`` is used (enabled, 600 s window, infra_issue category).
+    Pass ``DedupeConfig(infra_dedupe_enabled=False)`` to disable.
     """
     mcp = FastMCP('escalation')
+    cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
+
+    # --- Shared submit/dedupe helper ---
+
+    def _submit_or_dedupe(esc: Escalation) -> dict[str, Any]:
+        """Submit *esc* to the queue, or fold it into an existing pending parent.
+
+        Deduplication is applied only when:
+        - ``cfg.infra_dedupe_enabled`` is True, AND
+        - ``esc.category`` is in ``cfg.infra_dedupe_categories``.
+
+        On a dedupe match: the parent's dedupe_count / dedupe_children are
+        updated atomically (no new file is written for the child) and a
+        ``{'id': parent_id, 'status': 'dedup_skipped', 'parent_id': parent_id}``
+        dict is returned.
+
+        On no match (or when dedupe is disabled / category not in scope):
+        the escalation is submitted normally and
+        ``{'id': esc_id, 'status': 'queued'}`` is returned.
+        """
+        # Gate 1 (infra_dedupe_enabled) and gate 2 (category membership) both
+        # short-circuit in pure memory before any disk I/O via find_dedupe_parent.
+        # This is the ONLY call site for find_dedupe_parent in server.py.
+        if cfg.infra_dedupe_enabled and esc.category in cfg.infra_dedupe_categories:
+            parent_id = find_dedupe_parent(queue, esc, cfg)
+            # TOCTOU guard: attach_dedupe_child returns None when the parent
+            # was resolved/archived between the find scan and this call.
+            # On None, fall through to submit() so the escalation is not
+            # silently dropped.
+            if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id) is not None:
+                # child_id is included for audit: callers can map their assigned
+                # id back to the parent's dedupe_children list.
+                #
+                # Cross-task resume note: when the parent is resolved, only
+                # the parent's task_id receives a resume signal.  Child tasks
+                # that dedupe'd against a cross-task parent (e.g. task 99
+                # folded into task 42's escalation) receive 'dedup_skipped'
+                # and must re-check their infra condition on their next run.
+                # This is intentional: the parent resolution fixes the shared
+                # infra condition, so child tasks that re-run will no longer
+                # hit the same issue.  If per-child resume signals are needed
+                # in future, iterate parent.dedupe_children on resolution and
+                # emit a wake signal per child task_id.
+                return {
+                    'id': parent_id,
+                    'status': 'dedup_skipped',
+                    'parent_id': parent_id,
+                    'child_id': esc.id,
+                }
+        esc_id = queue.submit(esc)
+        return {'id': esc_id, 'status': 'queued'}
 
     # --- Agent-side tools ---
 
@@ -77,8 +134,9 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
         )
-        esc_id = queue.submit(esc)
-        return {'id': esc_id, 'status': 'queued'}
+        # Returns {id, status} or {id, status, parent_id} on dedupe.
+        # No 'action' key — that is only on the blocker path.
+        return _submit_or_dedupe(esc)
 
     @mcp.tool()
     def escalate_blocker(
@@ -110,8 +168,8 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
         )
-        esc_id = queue.submit(esc)
-        return {'id': esc_id, 'status': 'queued', 'action': 'terminate_cleanly'}
+        result = _submit_or_dedupe(esc)
+        return {**result, 'action': 'terminate_cleanly'}
 
     # --- Handler-side tools ---
 

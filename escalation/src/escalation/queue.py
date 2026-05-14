@@ -340,6 +340,44 @@ class EscalationQueue:
 
         return esc
 
+    def attach_dedupe_child(
+        self, parent_id: str, child_id: str,
+    ) -> Escalation | None:
+        """Atomically append *child_id* to the pending parent's dedupe_children list.
+
+        Loads the parent directly from ``queue_dir/{parent_id}.json`` — it does
+        NOT fall back to the archive.  This ensures that resolved / dismissed
+        parents (which have been moved to the archive) are treated as
+        not-eligible and return ``None`` without any mutation.
+
+        On a successful attach:
+        - ``parent.dedupe_children`` gains *child_id* (appended).
+        - ``parent.dedupe_count`` is incremented by 1.
+        - The updated parent is atomically written back to disk via
+          ``_rewrite()``.
+        - The updated ``Escalation`` object is returned.
+
+        Returns ``None`` when:
+        - The parent file does not exist in the queue root (unknown id or
+          already archived / resolved — refusing to touch archived parents).
+        """
+        path = self.queue_dir / f'{parent_id}.json'
+        if not path.exists():
+            return None
+        try:
+            parent = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse parent escalation {parent_id}: {e}')
+            return None
+        parent.dedupe_children.append(child_id)
+        parent.dedupe_count += 1
+        self._rewrite(parent_id, parent)
+        logger.info(
+            f'Dedupe: folded {child_id} into parent {parent_id} '
+            f'(dedupe_count={parent.dedupe_count})'
+        )
+        return parent
+
     def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
         """Atomically rewrite an escalation's JSON file."""
         path = self.queue_dir / f'{escalation_id}.json'
