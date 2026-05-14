@@ -178,7 +178,6 @@ class TestCuratorUsageGateLeakGuard:
         call into the guarded block.
         """
         import fused_memory.server.main as main_module  # noqa: PLC0415
-
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
