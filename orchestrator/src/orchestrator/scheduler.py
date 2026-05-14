@@ -714,6 +714,51 @@ class Scheduler:
         # was already known, not fresh user actions.  The first tick seeds the
         # snapshot without emitting events; subsequent ticks diff-emit normally.
         self._overrides_initialized: bool = False
+        # --- Park-and-stop pause state (task 1322) ---
+        self._paused: bool = False
+        self._pause_reason: str | None = None
+
+    # --- Park-and-stop pause API (task 1322) ---
+
+    @property
+    def is_paused(self) -> bool:
+        """True when the scheduler is paused and acquire_next() returns None."""
+        return self._paused
+
+    @property
+    def pause_reason(self) -> str | None:
+        """Human-readable reason for the current pause, or None if not paused."""
+        return self._pause_reason
+
+    def pause(self, reason: str) -> None:
+        """Pause the scheduler.  acquire_next() will return None until resume().
+
+        Idempotent: if already paused, the original reason is kept and a DEBUG
+        log is emitted.  The pause state is in-memory only; callers that need
+        persistence (e.g. Harness.pause_scheduler) must persist separately.
+        """
+        if self._paused:
+            logger.debug(
+                'Scheduler.pause() called while already paused '
+                '(existing reason=%r, new reason=%r) — keeping original',
+                self._pause_reason, reason,
+            )
+            return
+        self._paused = True
+        self._pause_reason = reason
+        logger.info('Scheduler paused: %s', reason)
+
+    def resume(self) -> None:
+        """Resume the scheduler.  Next acquire_next() tick will dispatch normally.
+
+        Idempotent: if not paused, this is a no-op.
+        """
+        if not self._paused:
+            logger.debug('Scheduler.resume() called while not paused — no-op')
+            return
+        self._paused = False
+        self._pause_reason = None
+        logger.info('Scheduler resumed')
 
     async def dispatch_tool(
         self,
