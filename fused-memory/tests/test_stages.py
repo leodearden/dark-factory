@@ -7892,7 +7892,7 @@ class TestStage2HintConversionDetection:
         With the current raw-slice code (filtered.active_tasks[:MAX_ACTIVE_TASKS_RENDERED])
         in assemble_payload, hint_ids = {1..50} but active_tree_ids = {1..N} for some
         N < 50 — so this test FAILS until step-4 replaces the slice with
-        _select_visible_active.
+        select_visible_active.
         """
         # 50 tasks, each with a ~1100-char title so that 50 * 1100 = 55_000 > 50_000,
         # forcing format_filtered_task_tree to drop tail tasks.  All tasks have

@@ -43,11 +43,11 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
-    _select_visible_active,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
     id_key,
+    select_visible_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -1407,11 +1407,11 @@ class TaskKnowledgeSync(BaseStage):
         # steady-state case where every active task already has valid dict-format hints.
         hint_conversion_section = ''
         if not self.remediation_mode:
-            # Use _select_visible_active to get exactly the same window that
+            # Use select_visible_active to get exactly the same window that
             # format_filtered_task_tree renders — both the max_tasks=50 slice cap
             # AND the secondary max_chars=50_000 clamp are applied in one place,
             # so the hint section never references a task ID absent from the tree.
-            visible_active = _select_visible_active(filtered)
+            visible_active = select_visible_active(filtered)
             tasks_needing_hint_attention = [
                 t for t in visible_active if _needs_hint_conversion(t)
             ]

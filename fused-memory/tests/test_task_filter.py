@@ -10,11 +10,11 @@ from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     _flatten_with_subtasks,
     _render_task_line,
-    _select_visible_active,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
     id_key,
+    select_visible_active,
 )
 
 
@@ -840,17 +840,16 @@ class TestFormatFilteredTaskTree:
             f'deps display is not being truncated'
         )
 
-    def test_format_filtered_task_tree_renders_only_select_visible_active_return(
+    def test_format_filtered_task_tree_renders_onlyselect_visible_active_return(
         self, monkeypatch
     ):
         """format_filtered_task_tree must delegate visible-window selection to
-        _select_visible_active (single source of truth requirement).
+        select_visible_active_with_body (single source of truth requirement).
 
-        A monkeypatched stub makes _select_visible_active return only the first
-        3 tasks regardless of input.  After the step-6 refactor,
-        format_filtered_task_tree calls the helper for its visible window, so
-        only tasks 1-3 are rendered.  Without the refactor, the formatter
-        applies its own internal slicing and renders all 10 — FAILS.
+        A monkeypatched stub makes select_visible_active_with_body return only
+        the first 3 tasks (and their pre-rendered body) regardless of input.
+        format_filtered_task_tree calls the worker for its visible window and
+        reuses the returned body, so only tasks 1-3 are rendered.
 
         Uses the same module-level monkeypatch pattern as
         test_budget_lazy_loop_handles_7_digit_trimmed_count (line ~643).
@@ -864,13 +863,16 @@ class TestFormatFilteredTaskTree:
             total_count=10,
         )
 
-        # Stub: always return only the first 3 task dicts, ignoring budget args.
-        def _stub_select(t, max_tasks=50, max_chars=50_000):  # noqa: ARG001
-            return t.active_tasks[:3]
+        # Stub: return only the first 3 task dicts and their pre-rendered body,
+        # ignoring budget args.
+        def _stub_with_body(t, max_tasks=50, max_chars=50_000):  # noqa: ARG001
+            first_three = t.active_tasks[:3]
+            body = '\n'.join(_render_task_line(task) for task in first_three) + '\n'
+            return first_three, body
 
         monkeypatch.setattr(
-            'fused_memory.reconciliation.task_filter._select_visible_active',
-            _stub_select,
+            'fused_memory.reconciliation.task_filter._select_visible_active_with_body',
+            _stub_with_body,
         )
 
         output = format_filtered_task_tree(tree)
@@ -1626,11 +1628,11 @@ class TestEndToEndSubtaskPipeline:
 
 
 class TestSelectVisibleActive:
-    """Unit tests for _select_visible_active(tree, max_tasks, max_chars).
+    """Unit tests for select_visible_active(tree, max_tasks, max_chars).
 
     Covers: empty input, under-cap, max_chars-clamp prefix, budget<=0, and
     cancelled-section budget accounting.  All five tests fail with ImportError
-    until _select_visible_active is defined in task_filter.py (step-2).
+    until select_visible_active is defined in task_filter.py (step-2).
     """
 
     def _make_active_task(self, tid: int, title_len: int = 20) -> dict:
@@ -1651,7 +1653,7 @@ class TestSelectVisibleActive:
             other_count=0,
             total_count=0,
         )
-        result = _select_visible_active(tree, max_tasks=50, max_chars=50_000)
+        result = select_visible_active(tree, max_tasks=50, max_chars=50_000)
         assert result == []
 
     def test_under_cap_returns_full_slice(self):
@@ -1664,7 +1666,7 @@ class TestSelectVisibleActive:
             other_count=0,
             total_count=5,
         )
-        result = _select_visible_active(tree, max_tasks=50, max_chars=999_999)
+        result = select_visible_active(tree, max_tasks=50, max_chars=999_999)
         assert result == tasks
 
     def test_max_chars_clamp_returns_prefix_matching_formatter(self):
@@ -1694,7 +1696,7 @@ class TestSelectVisibleActive:
             'Clamp did not fire (all 20 tasks visible); lower max_chars or raise title_len.'
         )
 
-        result = _select_visible_active(tree, max_tasks=20, max_chars=max_chars)
+        result = select_visible_active(tree, max_tasks=20, max_chars=max_chars)
 
         assert len(result) == expected_count, (
             f'Expected {expected_count} tasks, got {len(result)}'
@@ -1718,7 +1720,7 @@ class TestSelectVisibleActive:
             other_count=0,
             total_count=1,
         )
-        result = _select_visible_active(tree, max_tasks=50, max_chars=100)
+        result = select_visible_active(tree, max_tasks=50, max_chars=100)
         assert result == [], (
             f'Expected [] when budget <= 0, got {result!r}'
         )
@@ -1769,8 +1771,8 @@ class TestSelectVisibleActive:
             f'({expected_with} vs {expected_without}). Adjust max_chars or title_len.'
         )
 
-        result_with = _select_visible_active(tree_with, max_tasks=10, max_chars=max_chars)
-        result_without = _select_visible_active(tree_without, max_tasks=10, max_chars=max_chars)
+        result_with = select_visible_active(tree_with, max_tasks=10, max_chars=max_chars)
+        result_without = select_visible_active(tree_without, max_tasks=10, max_chars=max_chars)
 
         assert len(result_with) == expected_with, (
             f'With cancelled section: expected {expected_with}, got {len(result_with)}'
