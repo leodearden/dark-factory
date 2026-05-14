@@ -95,3 +95,28 @@ class TestSetGet:
             store.set_override('proj', f'task-{tier}', boost_tier=tier)
             result = store.get_overrides('proj')
             assert result[f'task-{tier}'].boost_tier == tier
+
+
+class TestPinning:
+    def test_pin_auto_assigns_pin_order_max_plus_one(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+
+        # Pin A and B without explicit pin_order
+        store.set_override('proj', 'A', pinned=True)
+        store.set_override('proj', 'B', pinned=True)
+
+        overrides = store.get_overrides('proj')
+        assert overrides['A'].pin_order == 1
+        assert overrides['B'].pin_order == 2
+
+        # Pin C with explicit pin_order=5
+        store.set_override('proj', 'C', pinned=True, pin_order=5)
+        overrides = store.get_overrides('proj')
+        assert overrides['C'].pin_order == 5
+
+        # Pin D without explicit pin_order — should get MAX(5)+1 = 6
+        store.set_override('proj', 'D', pinned=True)
+        overrides = store.get_overrides('proj')
+        assert overrides['D'].pin_order == 6
