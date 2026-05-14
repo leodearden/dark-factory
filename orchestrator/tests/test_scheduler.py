@@ -3929,3 +3929,48 @@ class TestSchedulerOverrideStoreInjection:
         # A should be dispatched (no competing tasks, no lock conflicts).
         assert result is not None
         assert result.task_id == 'A'
+
+
+class TestPinDispatch:
+    """Pinned tasks dispatch ahead of all scored candidates, bypassing fairness."""
+
+    @pytest.mark.asyncio
+    async def test_pin_dispatches_ahead_of_higher_scored_candidate(self, tmp_path):
+        """A pinned low-priority task wins dispatch over an unpin critical-priority task.
+
+        Without pin: B (critical) would score higher and be dispatched first.
+        With pin on A: A must dispatch even though B has a far higher score.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        # Pin A (low priority) — it should dispatch ahead of B (critical).
+        store.set_override('/proj', 'A', pinned=True)
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A (pinned, low)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['x/src']},
+            'priority': 'low',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B (critical, not pinned)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['y/src']},
+            'priority': 'critical',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        result = await scheduler.acquire_next()
+
+        # Pinned A must dispatch first, even though B scores higher due to critical priority.
+        assert result is not None
+        assert result.task_id == 'A'
