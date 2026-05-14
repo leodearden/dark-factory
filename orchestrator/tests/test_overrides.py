@@ -317,6 +317,34 @@ class TestReorder:
         with pytest.raises(ValueError):
             store.reorder_pin_queue('proj', ['C', 'A', 'B', 'D'])
 
+    def test_reorder_pin_queue_rejects_duplicate_ids(self, tmp_path: Path) -> None:
+        """Duplicate task IDs in the input must raise ValueError before writing.
+
+        Pre-fix: ['A', 'A', 'B'] passes set-equality against {A,B} (wrong set)
+        and writes A→1, A→2 silently.  The duplicate check must fire BEFORE the
+        set-equality check so the error message clearly says 'duplicate'.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True, pin_order=1)
+        store.set_override('proj', 'B', pinned=True, pin_order=2)
+        store.set_override('proj', 'C', pinned=True, pin_order=3)
+
+        # List form: duplicate A, only 3 elements so set-equality would be
+        # {A,B} != {A,B,C} — but the duplicate check must fire first
+        with pytest.raises(ValueError, match='duplicate'):
+            store.reorder_pin_queue('proj', ['A', 'A', 'B'])
+
+        # CSV form: same check via string path
+        with pytest.raises(ValueError, match='duplicate'):
+            store.reorder_pin_queue('proj', 'A,A,B')
+
+        # After both raises, pin_order values must be unchanged
+        queue = store.get_pin_queue('proj')
+        task_ids = [tid for tid, _ in queue]
+        assert task_ids == ['A', 'B', 'C'], 'pin_order must be unchanged after rejected reorder'
+
 
 class TestSweeps:
     def test_clear_terminal_deletes_named_owners(self, tmp_path: Path) -> None:
