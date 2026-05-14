@@ -2838,4 +2838,46 @@ def create_mcp_server(
             logger.exception(f'get_scheduler_state error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
+    @mcp.tool()
+    async def get_scheduler_events(
+        project_root: str,
+        since: str | None = None,
+        limit: int = 200,
+        event_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return a tail of scheduler events from runs.db, newest-first.
+
+        Reads ``<project_root>/data/orchestrator/runs.db`` in read-only mode
+        via aiosqlite.  Never mutates data.  Does NOT emit an audit add_memory
+        call.
+
+        Args:
+            project_root: Absolute path to project root.
+            since: Optional ISO8601 lower bound (inclusive) on event timestamp.
+            limit: Maximum number of events to return (default 200).
+            event_types: Optional list of EventType values to include; if
+                omitted all event types are returned.
+
+        Returns:
+            ``{'events': [...], 'count': <int>}`` where each event is a dict
+            with keys: id, timestamp, run_id, task_id, event_type, data.
+            Returns ``{'events': [], 'count': 0}`` when runs.db is missing.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            return await read_scheduler_events(
+                Path(project_root),
+                since=since,
+                limit=limit,
+                event_types=event_types,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_scheduler_events error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
     return mcp
