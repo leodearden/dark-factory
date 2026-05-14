@@ -169,6 +169,63 @@ class TestCuratorUsageGateLeakGuard:
         )
 
     @pytest.mark.asyncio
+    async def test_setup_closes_resources_when_success_path_logger_raises(self, tmp_path):
+        """Success-path logger.info must be inside the try block: both gate.shutdown()
+        and store.close() must run when the log call raises unexpectedly.
+
+        On current main the trailing logger.info sits outside the try/except, so
+        neither cleanup runs — this test will FAIL until step-2 folds the log
+        call into the guarded block.
+        """
+        import fused_memory.server.main as main_module  # noqa: PLC0415
+
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
+        usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
+        config = MagicMock()
+        config.usage_cap = usage_cap_cfg
+        config.reconciliation = MagicMock(data_dir=str(tmp_path))
+
+        # Spy on CostStore.close() to count awaits.
+        close_count: list[int] = [0]
+        original_close = CostStore.close
+
+        async def spy_close(self_store: CostStore) -> None:
+            close_count[0] += 1
+            return await original_close(self_store)
+
+        # Spy on UsageGate.shutdown() to count awaits.
+        shutdown_count: list[int] = [0]
+        original_shutdown = UsageGate.shutdown
+
+        async def spy_shutdown(self_gate: UsageGate) -> None:
+            shutdown_count[0] += 1
+            return await original_shutdown(self_gate)
+
+        # Patch logger.info to raise only on the success-path gate log call.
+        def logger_info_raiser(msg: str, *args: object, **kwargs: object) -> None:
+            if 'Curator usage gate:' in str(msg):
+                raise RuntimeError('synthetic logger failure')
+
+        with (
+            patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}),
+            patch.object(CostStore, 'close', spy_close),
+            patch.object(UsageGate, 'shutdown', spy_shutdown),
+            patch.object(main_module.logger, 'info', side_effect=logger_info_raiser),
+            pytest.raises(RuntimeError, match='synthetic logger failure'),
+        ):
+            await _setup_curator_usage_gate(config)
+
+        assert close_count[0] == 1, (
+            f'Expected CostStore.close() to be awaited exactly once, got {close_count[0]}'
+        )
+        assert shutdown_count[0] == 1, (
+            f'Expected UsageGate.shutdown() to be awaited exactly once, '
+            f'got {shutdown_count[0]}'
+        )
+
+    @pytest.mark.asyncio
     async def test_setup_returns_store_and_gate_on_success(self, tmp_path):
         """Happy path: helper returns both open store and gate; store stays open."""
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
