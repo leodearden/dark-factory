@@ -300,6 +300,108 @@ def format_task_list(tasks: list[Any]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Visible-active selection helper
+# --------------------------------------------------------------------------- #
+
+def _select_visible_active(
+    tree: FilteredTaskTree,
+    max_tasks: int = MAX_ACTIVE_TASKS_RENDERED,
+    max_chars: int = 50_000,
+) -> list[dict]:
+    """Return the prefix of tree.active_tasks[:max_tasks] that survives the max_chars clamp.
+
+    Replays the budget arithmetic from format_filtered_task_tree so that both
+    the Active Task Tree section and the hint-attention section in
+    assemble_payload share a single visible-window computation.
+
+    Algorithm:
+      1. Slice active = tree.active_tasks[:max_tasks]; return [] if empty.
+      2. Build header / cancelled_section / summary_line identically to
+         format_filtered_task_tree.
+      3. Render all lines; if the full result fits within max_chars, return active.
+      4. Otherwise compute budget = max_chars - len(header) - len(cancelled_section)
+         - len(summary_line); return [] if budget <= 0.
+      5. Greedy fill kept_lines while cumulative cost <= budget.
+      6. Lazy verification: pop lines until the realised result (with truncation
+         notice) fits within max_chars, or kept_lines is drained.
+      7. Return active[:len(kept_lines)].
+
+    Args:
+        tree: FilteredTaskTree whose active_tasks are the candidates.
+        max_tasks: Maximum number of active tasks to consider (same default as
+            format_filtered_task_tree).
+        max_chars: Character budget for the full rendered output (same default
+            as format_filtered_task_tree).
+
+    Returns:
+        A (possibly empty) prefix list of task dicts that will all appear in
+        the output of format_filtered_task_tree(tree, max_tasks, max_chars).
+    """
+    active = tree.active_tasks[:max_tasks]
+    if not active:
+        return []
+
+    # ── Build the same surrounding strings as format_filtered_task_tree ── #
+    shown = len(active)
+    total_active = len(tree.active_tasks)
+    omitted_active = total_active - shown
+
+    header = (
+        f'### Active Task Tree\n'
+        f'({shown} active shown'
+        + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
+        + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
+        f'{tree.other_count} other, {tree.total_count} total)\n'
+    )
+
+    if tree.cancelled_tasks:
+        cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
+        cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
+        summary_line = f'{tree.done_count} done — omitted'
+    else:
+        cancelled_section = ''
+        summary_line = (
+            f'{tree.done_count} done, {tree.cancelled_count} cancelled — omitted'
+        )
+
+    # ── Fast path: full result fits in budget ── #
+    lines = [_render_task_line(t) for t in active]
+    body = '\n'.join(lines) + '\n'
+    full = header + body + cancelled_section + summary_line
+    if len(full) <= max_chars:
+        return active
+
+    # ── Budget-capped path ── #
+    budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
+    if budget <= 0:
+        return []
+
+    # Greedy fill.
+    kept_lines: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > budget:
+            break
+        kept_lines.append(line)
+        used += len(line) + 1
+
+    # Lazy verification: recompute real truncation-notice length and pop until
+    # the realised result fits or kept_lines is exhausted.
+    trimmed_count = len(active) - len(kept_lines)
+    trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
+    result_body = '\n'.join(kept_lines) + trunc_notice
+    result = header + result_body + cancelled_section + summary_line
+    while len(result) > max_chars and kept_lines:
+        kept_lines.pop()
+        trimmed_count = len(active) - len(kept_lines)
+        trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
+        result_body = '\n'.join(kept_lines) + trunc_notice
+        result = header + result_body + cancelled_section + summary_line
+
+    return active[: len(kept_lines)]
+
+
+# --------------------------------------------------------------------------- #
 # Formatter
 # --------------------------------------------------------------------------- #
 

@@ -1642,7 +1642,7 @@ class TestSelectVisibleActive:
 
         # Verify the clamp actually fired — if not, the test is vacuous.
         assert expected_count < 20, (
-            f'Clamp did not fire (all 20 tasks visible); lower max_chars or raise title_len.'
+            'Clamp did not fire (all 20 tasks visible); lower max_chars or raise title_len.'
         )
 
         result = _select_visible_active(tree, max_tasks=20, max_chars=max_chars)
@@ -1652,7 +1652,7 @@ class TestSelectVisibleActive:
         )
         # Must be a strict prefix of the input slice.
         assert result == tasks[:expected_count], (
-            f'Result is not a prefix of the original task list'
+            'Result is not a prefix of the original task list'
         )
 
     def test_budget_zero_or_negative_returns_empty(self):
@@ -1706,9 +1706,12 @@ class TestSelectVisibleActive:
         max_chars = 2500
 
         # Ground-truth visible counts from the formatter.
+        # For tree_with the cancelled section also contains '- [' lines — strip it
+        # before counting so we only measure the active-task lines.
         out_with = format_filtered_task_tree(tree_with, max_tasks=10, max_chars=max_chars)
         out_without = format_filtered_task_tree(tree_without, max_tasks=10, max_chars=max_chars)
-        expected_with = len([ln for ln in out_with.splitlines() if ln.startswith('- [')])
+        active_part_with = out_with.split('\n### Recently Cancelled Tasks')[0]
+        expected_with = len([ln for ln in active_part_with.splitlines() if ln.startswith('- [')])
         expected_without = len([ln for ln in out_without.splitlines() if ln.startswith('- [')])
 
         # Precondition: cancelled section must have reduced the active budget.
