@@ -676,7 +676,18 @@ async def _query_stage2_flags(
             # Absent or empty run_id — Stage 1 producer drift (producer contract requires a non-empty string)
             stale_missing_run_id_ids.append(r.id)
         else:
-            # Present and truthy but does not match current run_id — prior-cycle residue
+            # Present but does not match current run_id — prior-cycle residue (or unexpected type).
+            # Log a warning when run_id is not a string: producer contract requires a non-empty
+            # string, so any non-string type is a detectable protocol violation.
+            _rid_val = meta.get('run_id')
+            if not isinstance(_rid_val, str):
+                logger.warning(
+                    'reconciliation._query_stage2_flags: non-string run_id type %s=%r — '
+                    'routing to mismatched bucket; producer contract requires a non-empty string',
+                    type(_rid_val).__name__,
+                    _rid_val,
+                    extra={'project_id': project_id, 'current_run_id': run_id_str},
+                )
             stale_mismatched_run_id_ids.append(r.id)
     if stale_missing_run_id_ids:
         logger.warning(
