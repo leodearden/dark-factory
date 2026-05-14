@@ -306,6 +306,7 @@ def format_task_list(tasks: list[Any]) -> str:
 def _build_surrounding(
     tree: FilteredTaskTree,
     max_tasks: int,
+    shown_override: int | None = None,
 ) -> tuple[str, str, str]:
     """Return (header, cancelled_section, summary_line) for the Active Task Tree block.
 
@@ -317,16 +318,23 @@ def _build_surrounding(
 
     Args:
         tree: FilteredTaskTree whose metadata drives the strings.
-        max_tasks: Cap used to compute the 'shown' and 'omitted' counts in
-            the header.
+        max_tasks: Cap used to compute the 'omitted' count in the header.
+        shown_override: When provided, use this value for the 'shown' count in
+            the header instead of the default len(tree.active_tasks[:max_tasks]).
+            Used by _select_visible_active_with_body to report the
+            post-max_chars-clamp visible count rather than the pre-clamp
+            len(tree.active_tasks[:max_tasks]).
 
     Returns:
         (header, cancelled_section, summary_line) as three strings.
         cancelled_section is '' when tree.cancelled_tasks is empty.
     """
     active = tree.active_tasks[:max_tasks]
-    shown = len(active)
-    omitted_active = len(tree.active_tasks) - shown
+    # 'shown' may reflect the post-clamp count when an override is supplied.
+    # 'omitted_active' retains its max_tasks-cap-only meaning; the body's
+    # truncation notice reports max_chars-clamped count separately.
+    shown = shown_override if shown_override is not None else len(active)
+    omitted_active = len(tree.active_tasks) - len(active)
 
     header = (
         f'### Active Task Tree\n'
@@ -378,12 +386,14 @@ def _select_visible_active_with_body(
       5. Greedy fill kept_lines while cumulative cost <= budget.
       6. Lazy verification: pop lines until the realised result fits or
          kept_lines is drained.
-      7. Return (active[:kept], body_with_trunc_notice, ...), or ([], None, ...) if drained.
+      7. Rebuild header with shown_override=len(visible) so the header's 'shown'
+         count matches the post-clamp body length, then return.
     """
     header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
 
     active = tree.active_tasks[:max_tasks]
     if not active:
+        # Empty-active early return: shown count is unchanged (0 either way).
         return [], None, header, cancelled_section, summary_line
 
     # ── Fast path: full result fits in budget ── #
@@ -391,11 +401,17 @@ def _select_visible_active_with_body(
     body = '\n'.join(lines) + '\n'
     full = header + body + cancelled_section + summary_line
     if len(full) <= max_chars:
+        # visible == active: shown count is unchanged; no header rebuild needed.
         return active, body, header, cancelled_section, summary_line
 
     # ── Budget-capped path ── #
     budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
     if budget <= 0:
+        # Rebuild header: pre-clamp shown overstates when budget is exhausted.
+        # Post-clamp shown <= pre-clamp shown, so digit count can only stay the
+        # same or decrease, keeping the rebuilt header <= pre-clamp header length
+        # (total assembly stays within max_chars without additional pop iterations).
+        header, _, _ = _build_surrounding(tree, max_tasks, shown_override=0)
         return [], None, header, cancelled_section, summary_line
 
     # Greedy fill.
@@ -421,7 +437,17 @@ def _select_visible_active_with_body(
         result = header + result_body + cancelled_section + summary_line
 
     if not kept_lines:
+        # Rebuild header: pre-clamp shown overstates when lazy loop drained all lines.
+        header, _, _ = _build_surrounding(tree, max_tasks, shown_override=0)
         return [], None, header, cancelled_section, summary_line
+
+    # Rebuild header with the post-clamp visible count so the header's 'shown'
+    # field agrees with the number of task lines actually in result_body.
+    # This is safe because post-clamp shown <= pre-clamp shown, so the rebuilt
+    # header is at most as long as the pre-clamp header; the lazy-pop loop above
+    # already established len(result) <= max_chars with the strictly longer
+    # pre-clamp header, so no additional pop iterations are needed.
+    header, _, _ = _build_surrounding(tree, max_tasks, shown_override=len(kept_lines))
     return active[: len(kept_lines)], result_body, header, cancelled_section, summary_line
 
 
