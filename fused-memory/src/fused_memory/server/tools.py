@@ -2404,6 +2404,8 @@ def create_mcp_server(
                             'FROM overrides WHERE project_root=? AND pinned=1',
                             (project_root,),
                         )).fetchone()
+                        # Aggregate query always returns a row; assert for pyright.
+                        assert row is not None
                         pin_order = row[0]
 
                 # Collision check for explicit or auto-assigned pin_order.

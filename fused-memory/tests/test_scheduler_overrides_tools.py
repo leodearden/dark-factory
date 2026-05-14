@@ -24,7 +24,6 @@ import pytest
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.tools import create_mcp_server
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -218,7 +217,6 @@ async def test_set_task_priority_override_ttl_secs_converts_to_absolute_iso(
     tmp_path, mcp_server, memory_service,
 ):
     """ttl_secs is converted to an absolute UTC ISO8601 ttl_until in the DB."""
-    from datetime import timezone
     before = datetime.now(UTC)
     await mcp_server._tool_manager.call_tool(
         'set_task_priority_override',
@@ -387,7 +385,8 @@ async def test_clear_task_priority_override_field_specific_clears_one_column(
             (str(tmp_path), '5'),
         ).fetchone()
         cols = dict(zip(
-            ['boost_tier', 'pinned', 'pin_order', 'reserve_now', 'ttl_until'], row
+            ['boost_tier', 'pinned', 'pin_order', 'reserve_now', 'ttl_until'], row,
+            strict=True,
         ))
     finally:
         conn.close()
@@ -621,7 +620,7 @@ async def test_all_tools_reject_empty_project_root(
         f'{tool_name}: expected ValidationError, got {result!r}'
     )
     # No DB file should have been created
-    assert not _db_path('').exists() if '' != str(tmp_path) else True
+    assert not _db_path('').exists() if str(tmp_path) != '' else True
     if tool_name != 'get_pin_queue':
         memory_service.add_memory.assert_not_called()
 
