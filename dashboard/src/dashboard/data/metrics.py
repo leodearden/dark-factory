@@ -46,13 +46,15 @@ logger = logging.getLogger(__name__)
 # not per-loop — worst-case latency for the pending-count accumulation loop
 # scales as N_roots × M_urls × 5s if all URLs hang for every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
+# Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
+_LIST_TICKETS_LIMIT = 2000
 
 
 async def fan_out_list_tickets(
     http_client: httpx.AsyncClient,
     config: DashboardConfig,
     *,
-    limit: int = 2000,
+    limit: int | None = None,
     timeout: float = _HTTP_SAMPLER_TIMEOUT_SECONDS,
 ) -> tuple[list[dict], int]:
     """Fan-out ``list_tickets`` across all project roots; first-success-per-root.
@@ -67,10 +69,14 @@ async def fan_out_list_tickets(
     If any per-root count saturates at *limit* the server may have clipped the
     real depth — a WARNING is logged so it surfaces in operator logs.
 
-    Per-(url, root) network/timeout/decode errors are swallowed at DEBUG level.
+    Per-(url, root) network/decode errors are swallowed at DEBUG level; timeouts
+    surface at WARNING so slow fused-memory instances are visible to operators.
     Unexpected exception types are logged at WARNING level so programming bugs
     don't silently vanish into the fan-out loop.
     """
+    # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
+    # takes effect without needing to pass an explicit kwarg.
+    effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
     seen_roots: set[str] = set()
     all_roots: list[str] = []
     for root in [config.project_root, *config.known_project_roots]:
@@ -87,17 +93,17 @@ async def fan_out_list_tickets(
                 result = await asyncio.wait_for(
                     mcp_tool_call(
                         http_client, url, 'list_tickets',
-                        {'project_root': root_str, 'status': 'pending', 'limit': limit},
+                        {'project_root': root_str, 'status': 'pending', 'limit': effective_limit},
                     ),
                     timeout=timeout,
                 )
                 count = result.get('count', 0) or 0
-                if count >= limit:
+                if count >= effective_limit:
                     logger.warning(
                         'list_tickets returned count=%d at-or-above the requested '
                         'limit of %d for %s / %s — '
                         'pending_total may be clipped at the server limit',
-                        count, limit, url, root_str,
+                        count, effective_limit, url, root_str,
                     )
                 pending_total += count
                 project_id = result.get('project_id', '')
@@ -267,9 +273,11 @@ async def _sample_curator(
     effective_now = now if now is not None else datetime.now(UTC)
 
     # 1. HTTP pending count via fan_out_list_tickets (de-duped roots, first-success-per-root).
+    # Pass limit explicitly so _LIST_TICKETS_LIMIT is read at call time (not from the
+    # default arg which is bound at function definition time).
     _, pending_total = await fan_out_list_tickets(
         http_client, config,
-        limit=2000,
+        limit=_LIST_TICKETS_LIMIT,
         timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
     )
 
