@@ -85,16 +85,9 @@ def create_server(
                 # child_id is included for audit: callers can map their assigned
                 # id back to the parent's dedupe_children list.
                 #
-                # Cross-task resume note: when the parent is resolved, only
-                # the parent's task_id receives a resume signal.  Child tasks
-                # that dedupe'd against a cross-task parent (e.g. task 99
-                # folded into task 42's escalation) receive 'dedup_skipped'
-                # and must re-check their infra condition on their next run.
-                # This is intentional: the parent resolution fixes the shared
-                # infra condition, so child tasks that re-run will no longer
-                # hit the same issue.  If per-child resume signals are needed
-                # in future, iterate parent.dedupe_children on resolution and
-                # emit a wake signal per child task_id.
+                # Cross-task resume contract: see DESIGN.md "Escalation cross-task dedupe"
+                # — the child re-runs on its next workflow invocation; no per-child wake
+                # signal is emitted.
                 return {
                     'id': parent_id,
                     'status': 'dedup_skipped',
