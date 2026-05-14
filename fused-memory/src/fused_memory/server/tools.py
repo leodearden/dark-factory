@@ -8,6 +8,7 @@ import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
@@ -17,6 +18,10 @@ from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.mcp_tools.scheduler_state import (
+    read_scheduler_events,
+    read_scheduler_state,
+)
 from fused_memory.utils.validation import (
     validate_int_ids,
     validate_project_id,
@@ -2799,6 +2804,38 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'get_pin_queue error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_scheduler_state(
+        project_root: str,
+    ) -> dict[str, Any]:
+        """Return the latest in-memory scheduler state snapshot.
+
+        The snapshot is written atomically by the orchestrator after every
+        ``acquire_next`` tick.  This tool reads the JSON file from disk;
+        it never touches the live scheduler process.
+
+        Read-only.  Does NOT emit an audit add_memory call.
+
+        Args:
+            project_root: Absolute path to project root.
+
+        Returns:
+            Snapshot dict with keys: skip_counts, parks, effective_priorities,
+            pin_queue, overrides, current_holders, snapshot_at.
+            Returns the empty skeleton when no snapshot file exists yet.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_scheduler_state error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp
