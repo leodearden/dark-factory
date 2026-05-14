@@ -43,6 +43,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
     with (
         patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
         patch('orchestrator.harness.Scheduler'),
         patch('orchestrator.harness.BriefingAssembler'),
     ):
@@ -69,3 +70,64 @@ async def _info(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_info')
     # escalate_info is a sync tool — tool.fn() returns dict directly
     return tool.fn(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# TestCrossTaskDedupeReengagement
+# ---------------------------------------------------------------------------
+
+
+class TestCrossTaskDedupeReengagement:
+    """Orchestrator-integration verification of the cross-task escalation dedupe contract.
+
+    SCOPE BOUNDARY: verifies the escalation/harness layer only.
+    The higher-level claim "task B's workflow eventually re-engages" depends on what
+    status B's workflow leaves the task in after terminate_cleanly — that is a
+    workflow-layer concern (no special dedup_skipped handling exists today in
+    orchestrator/workflow.py) and is explicitly OUT OF SCOPE for this test class.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dedupe_response_shape_across_task_ids(self, harness: Harness, tmp_path: Path):
+        """Cross-task infra_issue blocker dedupes: B's response has dedup_skipped shape.
+
+        Verifies _submit_or_dedupe + find_dedupe_parent + attach_dedupe_child handle
+        cross-task dedupe correctly at the orchestrator integration boundary.
+
+        Summary pair from escalation/tests/test_dedupe.py::test_similar_summaries_share_key:
+        they share a dedupe key after summary_dedupe_key normalisation.
+        """
+        queue = harness._escalation_queue
+        server = create_server(queue)
+
+        # Submit parent blocker from task A.
+        first = await _blocker(
+            server,
+            task_id='A',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        assert first['status'] == 'queued'
+        parent_id = first['id']
+
+        # Submit cross-task blocker from task B — must dedupe into parent under task A.
+        second = await _blocker(
+            server,
+            task_id='B',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+        assert second['action'] == 'terminate_cleanly'
+        assert 'child_id' in second
+        assert second['child_id'] != parent_id
+
+        # Exactly one esc-*.json in queue root — the parent file under task A.
+        queue_root_files = sorted(queue.queue_dir.glob('esc-*.json'))
+        assert len(queue_root_files) == 1, (
+            f'Expected exactly 1 file (parent under task A); got: {queue_root_files}'
+        )
