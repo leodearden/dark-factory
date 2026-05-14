@@ -311,3 +311,52 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
     assert '1' in events_by_task
     assert 'labels' in events_by_task['1']
     assert 'values' in events_by_task['1']
+
+
+# ---------------------------------------------------------------------------
+# step-9: collect_scheduler_state surfaces offline when MCP unreachable
+# ---------------------------------------------------------------------------
+
+
+async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
+    dummy_client, dummy_config
+):
+    """When every fused-memory URL is unreachable, offline_projects is non-empty.
+
+    Mirrors test_collect_active_tasks_surfaces_offline_projects.
+    All other tuple members must be empty.
+    """
+    import httpx
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+
+    active_tasks = [
+        {
+            'id': f'{project}/T-1',
+            'project': project,
+            'title': 'Task One',
+            'priority': 'medium',
+            'status': 'in-progress',
+            'started': 5,
+            'locks': ['src/a.py'],
+        }
+    ]
+
+    mock_mcp = AsyncMock(side_effect=httpx.ConnectError('refused'))
+    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, modules, pin_queue, events_by_task, offline_projects = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert rows == []
+    assert modules == []
+    assert pin_queue == []
+    assert events_by_task == {}
+    assert offline_projects == [project]
