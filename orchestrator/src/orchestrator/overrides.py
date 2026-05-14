@@ -182,13 +182,6 @@ class OverrideStore:
             # concurrent set_override calls.  Without IMMEDIATE, two concurrent
             # callers can both read MAX=N and both attempt to write N+1, causing
             # a PinOrderCollision or silent duplicate pin_order values.
-            #
-            # The connection uses isolation_level=None (autocommit) so that
-            # BEGIN IMMEDIATE / COMMIT / ROLLBACK are the explicit transaction
-            # boundaries — not Python's deferred-mode auto-begin.  This makes
-            # the pattern safe even if future edits add DML before BEGIN
-            # IMMEDIATE (which would silently break with the default
-            # isolation_level on Python <3.12).
             conn.execute('BEGIN IMMEDIATE')
             try:
                 # Resolve auto-assigned pin_order when pinning without an explicit order.
@@ -267,7 +260,10 @@ class OverrideStore:
                 )
                 conn.execute('COMMIT')
             except Exception:
-                conn.execute('ROLLBACK')
+                try:
+                    conn.execute('ROLLBACK')
+                except sqlite3.Error:
+                    pass  # don't mask the original exception with a rollback error
                 raise
         finally:
             conn.close()
@@ -289,6 +285,8 @@ class OverrideStore:
         """
         _VALID_FIELDS = {'boost_tier', 'pinned', 'reserve_now', 'ttl'}
         now_iso = datetime.now(UTC).isoformat()
+        # Default isolation_level is fine here: no read-then-write pattern
+        # requiring BEGIN IMMEDIATE serialization (unlike set_override).
         conn = sqlite3.connect(str(self.db_path))
         try:
             if field is None:
@@ -362,6 +360,9 @@ class OverrideStore:
             )
 
         now_iso = datetime.now(UTC).isoformat()
+        # Default isolation_level is fine here: the loop writes are a simple
+        # batch UPDATE with no read-then-write race (unlike set_override's
+        # MAX(pin_order) pattern that requires BEGIN IMMEDIATE).
         conn = sqlite3.connect(str(self.db_path))
         try:
             # Wrap in a single transaction so a mid-loop failure (interrupt,
@@ -395,6 +396,8 @@ class OverrideStore:
             return []
 
         placeholders = ','.join('?' * len(terminal_task_ids))
+        # Default isolation_level is fine here: single-statement DELETE with no
+        # read-then-write race requiring BEGIN IMMEDIATE (unlike set_override).
         conn = sqlite3.connect(str(self.db_path))
         try:
             rows = conn.execute(
@@ -426,6 +429,8 @@ class OverrideStore:
         if now is None:
             now = datetime.now(UTC)
 
+        # Default isolation_level is fine here: single-statement DELETE with no
+        # read-then-write race requiring BEGIN IMMEDIATE (unlike set_override).
         conn = sqlite3.connect(str(self.db_path))
         try:
             rows = conn.execute(
