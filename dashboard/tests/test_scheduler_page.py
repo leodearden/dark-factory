@@ -414,6 +414,45 @@ def test_shape_scheduler_envelope():
     assert result_online['SCHEDULER']['offline'] is False
 
 
+def test_shape_scheduler_top_level_lists_are_shallow_copies():
+    """shape_scheduler shallow-copies top-level containers so callers can mutate.
+
+    Pins the docstring claim that `list(rows)` / `dict(events_by_task)` are
+    fresh containers — appending to the result must not affect the caller's
+    inputs.  Inner dicts and sparkline lists remain aliased (caveat in the
+    docstring), but that's by design and not under test here.
+    """
+    from dashboard.data.redux_api import shape_scheduler
+
+    rows = [{'task_id': '1'}]
+    modules = [{'path': 'src/a.py'}]
+    pin_queue = [{'task_id': '1', 'order': 0}]
+    events_by_task = {'1': {'labels': [], 'values': []}}
+
+    result = shape_scheduler(
+        rows=rows,
+        modules=modules,
+        pin_queue=pin_queue,
+        events_by_task=events_by_task,
+        offline_projects=[],
+        snapshot_at=None,
+    )
+    inner = result['SCHEDULER']
+
+    # Top-level lists/dicts are fresh containers — mutating the result
+    # must not alter the caller's originals.
+    inner['rows'].append({'task_id': 'sentinel'})
+    inner['modules'].append({'path': 'sentinel'})
+    inner['pin_queue'].append({'task_id': 'sentinel'})
+    inner['events_by_task']['sentinel'] = {'labels': [], 'values': []}
+    inner['offline_projects'].append('sentinel')
+
+    assert rows == [{'task_id': '1'}], 'rows must not be mutated by caller'
+    assert modules == [{'path': 'src/a.py'}], 'modules must not be mutated'
+    assert pin_queue == [{'task_id': '1', 'order': 0}], 'pin_queue must not be mutated'
+    assert 'sentinel' not in events_by_task, 'events_by_task must be a copy'
+
+
 # ---------------------------------------------------------------------------
 # step-13: GET /api/v2/dashboard/scheduler envelope shape
 # ---------------------------------------------------------------------------
@@ -625,6 +664,12 @@ _REORDER_INVALID_BODIES = [
     pytest.param({}, id='missing-task_ids'),
     pytest.param({'task_ids': 'not-a-list'}, id='task_ids-not-list'),
     pytest.param({'task_ids': ['T1', 'T1'], 'project_root': '/proj'}, id='duplicate-task_ids'),
+    # Element-type validation — match the strict checking on the override
+    # endpoint so junk values fail fast at the boundary rather than at MCP.
+    pytest.param({'task_ids': [1, '1'], 'project_root': '/proj'}, id='task_ids-non-string-element'),
+    pytest.param({'task_ids': [None], 'project_root': '/proj'}, id='task_ids-null-element'),
+    pytest.param({'task_ids': [''], 'project_root': '/proj'}, id='task_ids-empty-element'),
+    pytest.param({'task_ids': [{}, []], 'project_root': '/proj'}, id='task_ids-junk-elements'),
 ]
 
 
@@ -1274,3 +1319,98 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
     assert by_project[p2.name]['contention'] == 1
     assert by_project[p2.name]['holder'] == '5'
     assert by_project[p2.name]['holder_project'] == p2.name
+
+
+# ---------------------------------------------------------------------------
+# step-42: defensive boundary fixes (esc-1231-86 triage)
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_proxy_handles_non_dict_mcp_result(client):
+    """_scheduler_proxy: a non-dict MCP result must not 500 on `.get('error')`.
+
+    Older/buggy MCP tools could return a list or None.  The not_found→404
+    mapping must guard with isinstance(result, dict) so the unexpected type
+    is forwarded verbatim as 200 rather than escaping as AttributeError/500.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=['unexpected', 'list'])):
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/proj'},
+        )
+
+    # Forwarded verbatim — the list reaches JSONResponse without crashing.
+    assert resp.status_code == 200
+    assert resp.json() == ['unexpected', 'list']
+
+
+def test_compose_rows_tolerates_non_string_installed_at():
+    """park_state.installed_at coerced to str so non-string values don't AttributeError.
+
+    Regression guard: if a buggy producer writes installed_at as a number or
+    dict, age_seconds must fall back to 0 rather than raising AttributeError
+    on `.replace(...)`.
+    """
+    from dashboard.data.scheduler import _compose_rows
+
+    active_tasks = [{
+        'task_id': '1',
+        'title': 'T',
+        'priority': 'high',
+        'started': 0,
+        'locks': [],
+    }]
+
+    # Number for installed_at — used to crash on .replace(...)
+    snapshot_num = {
+        'parks': {'1': {'installed_at': 12345}},
+        'effective_priorities': {}, 'overrides': {}, 'skip_counts': {},
+    }
+    rows_num = _compose_rows(active_tasks, snapshot_num)
+    assert rows_num[0]['age_seconds'] == 0
+
+    # Dict for installed_at — same crash path
+    snapshot_dict = {
+        'parks': {'1': {'installed_at': {'nested': 'oops'}}},
+        'effective_priorities': {}, 'overrides': {}, 'skip_counts': {},
+    }
+    rows_dict = _compose_rows(active_tasks, snapshot_dict)
+    assert rows_dict[0]['age_seconds'] == 0
+
+
+async def test_collect_scheduler_state_normalises_non_dict_snapshot(
+    dummy_client, dummy_config,
+):
+    """A non-dict MCP get_scheduler_state result must be normalised to {} (online-but-empty).
+
+    Without normalisation, downstream `.get('current_holders')` would
+    AttributeError and propagate as exception → caller would never see the
+    project.  Treating as online-but-empty matches the documented contract:
+    snapshot={} means quiescent, snapshot=None means offline.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+
+    # MCP returns a list (buggy/older server) instead of a dict
+    mock_mcp = AsyncMock(side_effect=[['unexpected'], []])
+    mock_active = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, modules, pin_queue, events, offline = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    # The project is treated as online-but-empty, NOT offline.
+    assert offline == [], f'expected online treatment, got offline={offline}'
+    assert rows == []
+    assert modules == []
+    assert pin_queue == []
+    # No project should be misclassified as offline either
+    assert project not in offline

@@ -10,7 +10,7 @@
 
    Exports: window.DF_SCHEDULER = { SchedulerTab }
 */
-const { useState: stUseState, useCallback: stUseCallback, useEffect: stUseEffect, useRef: stUseRef } = React;
+const { useState: stUseState, useCallback: stUseCallback, useEffect: stUseEffect, useRef: stUseRef, useMemo: stUseMemo } = React;
 const { Segmented, timeago, fmtDateTime } = window.DF_SHELL;
 const { SchedulerHeatmap, cellStateFor } = window.DF_SCHED_HEATMAP;
 const { SchedulerDrawer } = window.DF_SCHED_DRAWER;
@@ -36,11 +36,16 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
 
   // Build ordered pin items enriched with task title.  We key by composite
   // '${project}/${task_id}' to prevent cross-project collisions when two
-  // projects each have a row with task_id='1'.
-  const rowByCompositeKey = {};
-  for (const r of (rows || [])) {
-    rowByCompositeKey[`${r.project || ''}/${r.task_id}`] = r;
-  }
+  // projects each have a row with task_id='1'.  Memoised against `rows` so
+  // we don't rebuild the O(n) index on every parent re-render of the live
+  // 5s poll cycle.
+  const rowByCompositeKey = stUseMemo(() => {
+    const idx = {};
+    for (const r of (rows || [])) {
+      idx[`${r.project || ''}/${r.task_id}`] = r;
+    }
+    return idx;
+  }, [rows]);
 
   const pins = (pinQueue || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
 
@@ -138,11 +143,15 @@ function ModulesView({ modules, rows, eventsMap }) {
   }
   // Build a project-qualified row index.  Taskmaster task_ids are
   // project-scoped, so two projects can each have T-1 — keying by raw
-  // task_id would pick whichever project the iterator hit last.
-  const rowByCompositeKey = {};
-  for (const r of (rows || [])) {
-    rowByCompositeKey[`${r.project || ''}/${r.task_id}`] = r;
-  }
+  // task_id would pick whichever project the iterator hit last.  Memoised
+  // against `rows` to avoid rebuilding on every poll-driven re-render.
+  const rowByCompositeKey = stUseMemo(() => {
+    const idx = {};
+    for (const r of (rows || [])) {
+      idx[`${r.project || ''}/${r.task_id}`] = r;
+    }
+    return idx;
+  }, [rows]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -357,8 +366,16 @@ function SchedulerTab({ projectFilter = [] }) {
   }, [addToast]);
 
   // ── Row click ──
+  // Toggle by (project, task_id) composite identity — clicking a row in
+  // project B that shares a numeric task_id with the selected row in
+  // project A should switch selection, not deselect.  Matches the
+  // composite identity used everywhere else in this file.
   const handleRowClick = stUseCallback((row) => {
-    setSelectedTask(prev => prev && prev.task_id === row.task_id ? null : row);
+    setSelectedTask(prev => (
+      prev && prev.task_id === row.task_id && prev.project === row.project
+        ? null
+        : row
+    ));
   }, []);
 
   const snapshotLabel = snapshot_at ? `snapshot ${fmtDateTime(snapshot_at)}` : 'no snapshot';

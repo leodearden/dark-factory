@@ -819,7 +819,15 @@ async def _scheduler_proxy(
             errors.append(f'{url}: {str(exc)[:200]}')
             memory_data.invalidate_session(url)
             continue
-        if treat_not_found_as_404 and result.get('error') == 'not_found':
+        # Guard the not_found mapping with isinstance: an MCP tool that
+        # returns a list or None (buggy/older server) would AttributeError
+        # on `.get(...)` and escape as a 500.  Defensive at the single
+        # boundary that all override/clear/reorder endpoints share.
+        if (
+            treat_not_found_as_404
+            and isinstance(result, dict)
+            and result.get('error') == 'not_found'
+        ):
             return JSONResponse(result, status_code=404)
         return JSONResponse(result)
     return _sched_fan_out_error(errors)
@@ -966,11 +974,22 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
     if not isinstance(task_ids, list):
         return JSONResponse({'error': 'invalid_task_ids', 'detail': 'task_ids must be a list'}, status_code=400)
 
+    # Validate each element at the boundary — the override endpoint enforces
+    # str/non-empty for task_id, and reorder should match.  Without this a
+    # request like task_ids=[None, {}, []] would proceed past the duplicate
+    # check (str() of dissimilar non-string objects rarely collides) and the
+    # failure would surface from fused-memory rather than failing fast here.
+    if not all(isinstance(t, str) and t for t in task_ids):
+        return JSONResponse(
+            {'error': 'invalid_task_ids', 'detail': 'task_ids must be non-empty strings'},
+            status_code=400,
+        )
+
     project_root = body.get('project_root')
     if not isinstance(project_root, str) or not project_root:
         return JSONResponse({'error': 'invalid_project_root'}, status_code=400)
 
-    if len(task_ids) != len(set(str(t) for t in task_ids)):
+    if len(task_ids) != len(set(task_ids)):
         return JSONResponse({'error': 'duplicate_task_ids'}, status_code=400)
 
     config: DashboardConfig = request.app.state.config

@@ -134,8 +134,10 @@ def _compose_rows(
 
         park_state = parks.get(tid)
         if park_state:
-            # Age from when parks were installed
-            installed_at_str = park_state.get('installed_at') or ''
+            # Age from when parks were installed.  Coerce to str up front
+            # — `or ''` handles None, but a number/dict would raise
+            # AttributeError on `.replace(...)` and was not previously caught.
+            installed_at_str = str(park_state.get('installed_at') or '')
             try:
                 installed_at = datetime.fromisoformat(
                     installed_at_str.replace('Z', '+00:00')
@@ -283,8 +285,16 @@ async def collect_scheduler_state(
         function returns immediately from inside the ``try`` block, so there is
         no risk of bleed between a partial success on url1 and a failure on url2.
 
+        Simplicity trade-off: if the snapshot call succeeds on url1 but the
+        events call raises, the whole pair is re-issued against url2 rather
+        than retrying only the events leg.  This amplifies load slightly on
+        the surviving URL but keeps the retry logic single-axis; both calls
+        are idempotent and small, so the re-fetch is cheap.
+
         Returns ``(label, snapshot, events)`` on success — ``snapshot`` may be
-        ``{}`` for a project with no scheduler state yet (online but empty).
+        ``{}`` for a project with no scheduler state yet (online but empty),
+        and is normalised to ``{}`` if the MCP server returns a non-dict
+        (defensive — older/buggy servers should never crash the aggregator).
         Returns ``(label, None, [])`` when every URL fails; the ``None``
         sentinel lets the caller distinguish *offline* from *online-but-empty*
         so a legitimately quiescent project is never misclassified as offline.
@@ -299,6 +309,11 @@ async def collect_scheduler_state(
                     'get_scheduler_state',
                     {'project_root': str(root)},
                 )
+                # Normalise: a buggy/older MCP server returning a list or
+                # None must not propagate as AttributeError on downstream
+                # `.get(...)` calls.  Treat as online-but-empty.
+                if not isinstance(snapshot, dict):
+                    snapshot = {}
                 events_raw = await mcp_tool_call(
                     client,
                     url,
