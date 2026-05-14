@@ -605,8 +605,25 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    # Placeholder — replaced in step-4
-    return JSONResponse({}, status_code=200)
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    errors: list[str] = []
+    for url in config.fused_memory_urls:
+        try:
+            result = await memory_data.mcp_tool_call(
+                http_client, url, 'cancel_ticket', {'ticket_id': ticket_id},
+            )
+        except (httpx.ConnectError, httpx.TimeoutException,
+                httpx.HTTPStatusError, ValueError) as exc:
+            errors.append(f'{url}: {exc}')
+            continue
+        if result.get('error') == 'not_found':
+            return JSONResponse(result, status_code=404)
+        return JSONResponse(result)
+    return JSONResponse(
+        {'error': 'fused_memory_unreachable', 'detail': '; '.join(errors)},
+        status_code=502,
+    )
 
 
 @app.get('/api/v2/dashboard/burndown')
