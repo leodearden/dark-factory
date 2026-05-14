@@ -413,24 +413,10 @@ async def run_server():
     # Curator UsageGate — independent instance reading the same shared
     # accounts file the orchestrator / eval runner use. Protects the curator
     # from silent outages when its default account caps.
-    curator_usage_gate = None
-    curator_cost_store = None
-    if config.usage_cap is not None and config.usage_cap.enabled:
-        from shared.cost_store import CostStore
-        from shared.usage_gate import UsageGate
-
-        # Build the CostStore first so it can be passed via the public
-        # constructor kwarg — avoids mutating the private _cost_store attr.
-        db_path = _resolve_curator_cost_store_path(config)
-        curator_cost_store = CostStore(db_path)
-        await curator_cost_store.open()
-        logger.info(f'  Curator cost store: {db_path}')
-
-        curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
-        logger.info(
-            f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
-            f'from {config.usage_cap.accounts_file or "inline"}',
-        )
+    # The helper closes the CostStore if UsageGate construction fails, so the
+    # open aiosqlite connection never leaks even though this runs before the
+    # try/finally that wraps transport.serve().
+    curator_cost_store, curator_usage_gate = await _setup_curator_usage_gate(config)
 
     event_queue = None
     sqlite_watchdog = None
@@ -948,6 +934,46 @@ def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
     if config.reconciliation:
         return Path(config.reconciliation.data_dir) / 'curator_events.db'
     return Path('./data/curator_events.db')
+
+
+async def _setup_curator_usage_gate(
+    config: FusedMemoryConfig,
+) -> 'tuple[CostStore | None, UsageGate | None]':
+    """Open a CostStore and construct a UsageGate for the curator, with leak protection.
+
+    If ``config.usage_cap`` is None or disabled, returns ``(None, None)``
+    without allocating any resources.
+
+    Otherwise the CostStore is opened first (persistent aiosqlite connection).
+    If ``UsageGate.__init__`` subsequently raises for any reason, the open
+    connection is closed before re-raising — preventing a file-handle / WAL
+    thread leak that would occur if the caller's ``finally:`` block never ran.
+
+    Extracted as a module-level helper (mirroring ``_resolve_curator_cost_store_path``)
+    so the leak-guard is unit-testable without spinning up the full server.
+    """
+    if config.usage_cap is None or not config.usage_cap.enabled:
+        return (None, None)
+
+    from shared.cost_store import CostStore  # noqa: PLC0415
+    from shared.usage_gate import UsageGate  # noqa: PLC0415
+
+    db_path = _resolve_curator_cost_store_path(config)
+    curator_cost_store = CostStore(db_path)
+    await curator_cost_store.open()
+    logger.info(f'  Curator cost store: {db_path}')
+
+    try:
+        curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+    except BaseException:
+        await curator_cost_store.close()
+        raise
+
+    logger.info(
+        f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
+        f'from {config.usage_cap.accounts_file or "inline"}',
+    )
+    return (curator_cost_store, curator_usage_gate)
 
 
 def _install_safe_tool_wrapper(mcp: Any) -> None:
