@@ -1089,6 +1089,91 @@ async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(
 
 
 # ---------------------------------------------------------------------------
+# Step-11 (task-1280): _sample_curator delegates to compute_capped_now_and_windows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_delegates_to_compute_capped_now_and_windows(
+    tmp_path: Path, config
+):
+    """_sample_curator must call compute_capped_now_and_windows and use its return.
+
+    Setup: cap_hit 30 min ago (open-ended interval), empty tickets.db.
+    Patches dashboard.data.metrics.compute_capped_now_and_windows with a
+    MagicMock returning sentinel (7, []) — capped_now=7 is impossible from
+    the real helper so its presence in the result proves the mock was used.
+
+    Assertions:
+    - result['capped_now'] == 7  (sentinel flowed through)
+    - mock was called exactly once
+    - mock's first positional arg is a non-empty list of CapInterval objects
+
+    Failing baseline: _sample_curator computes capped_now inline (line ~289),
+    never calling compute_capped_now_and_windows, so result['capped_now'] is
+    1 (real open-ended interval), not 7.
+    """
+    from dashboard.data.cap_history import CapInterval
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    # runs.db: one open-ended cap_hit 30 min ago
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc1', 'cap_hit', (now - timedelta(minutes=30)).isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    # tickets.db: empty
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = _ListTicketsHandler(count=0)
+    transport = httpx.MockTransport(handler)
+    mock_helper = MagicMock(return_value=(7, []))
+
+    reset_sessions()
+    with patch('dashboard.data.metrics.compute_capped_now_and_windows', mock_helper):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets_conn = await aiosqlite.connect(str(tickets_path))
+            tickets_conn.row_factory = aiosqlite.Row
+            runs_conn = await aiosqlite.connect(str(runs_path))
+            runs_conn.row_factory = aiosqlite.Row
+            try:
+                result = await _sample_curator(
+                    http_client, config, tickets_conn, [runs_conn], now=now,
+                )
+            finally:
+                await tickets_conn.close()
+                await runs_conn.close()
+
+    # (a) Sentinel capped_now flowed through
+    assert result['capped_now'] == 7, (
+        f"Expected capped_now=7 (sentinel from mock), got {result['capped_now']}. "
+        "This fails if _sample_curator computes capped_now inline instead of delegating."
+    )
+    # (b) Mock was called exactly once
+    assert mock_helper.call_count == 1, (
+        f"Expected compute_capped_now_and_windows called once, got {mock_helper.call_count}"
+    )
+    # (c) First arg is a non-empty list of CapInterval
+    call_arg = mock_helper.call_args.args[0]
+    assert len(call_arg) >= 1, f"Expected non-empty intervals arg, got {call_arg}"
+    assert all(isinstance(iv, CapInterval) for iv in call_arg), (
+        f"Expected list of CapInterval, got {call_arg}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step-7 (task-1280): long-running open-ended cap is subtracted (days=7)
 # ---------------------------------------------------------------------------
 
