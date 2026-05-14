@@ -4144,3 +4144,75 @@ class TestOverrideGCIntegration:
         assert 'A' not in overrides_after
         # B's TTL is in the future — must survive.
         assert 'B' in overrides_after
+
+
+class TestOverrideEventEmission:
+    """Scheduler emits priority_override_* events via per-tick diff-detection."""
+
+    @pytest.mark.asyncio
+    async def test_priority_override_set_and_cleared_diff_events(self, tmp_path):
+        """Diff-detect fires priority_override_set when boost appears, cleared when it goes.
+
+        Tick 1: no override → no event.
+        Tick 2: boost='high' set on A → priority_override_set emitted.
+        Tick 3: boost cleared → priority_override_cleared emitted.
+        """
+        from orchestrator.overrides import OverrideStore
+        from orchestrator.event_store import EventType
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+
+        # Tick 1: no override set → no priority_override_* events.
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        override_events_after_tick1 = [
+            e for e in event_store.events
+            if e[0].startswith('priority_override_')
+        ]
+        assert override_events_after_tick1 == [], (
+            f'Expected no override events after tick 1, got: {override_events_after_tick1}'
+        )
+
+        # Tick 2: set boost='high' on A → priority_override_set must fire.
+        store.set_override('/proj', 'A', boost_tier='high')
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        override_events_after_tick2 = [
+            e for e in event_store.events
+            if e[0] == EventType.priority_override_set.value
+        ]
+        assert len(override_events_after_tick2) == 1, (
+            f'Expected 1 priority_override_set event, got: {override_events_after_tick2}'
+        )
+        ev2 = override_events_after_tick2[0]
+        assert ev2[1]['task_id'] == 'A'
+        assert ev2[1]['data'].get('boost_tier') == 'high'
+
+        # Tick 3: clear boost → priority_override_cleared must fire.
+        store.clear_override('/proj', 'A', field='boost_tier')
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        override_events_after_tick3 = [
+            e for e in event_store.events
+            if e[0] == EventType.priority_override_cleared.value
+        ]
+        assert len(override_events_after_tick3) == 1, (
+            f'Expected 1 priority_override_cleared event, got: {override_events_after_tick3}'
+        )
+        ev3 = override_events_after_tick3[0]
+        assert ev3[1]['task_id'] == 'A'
