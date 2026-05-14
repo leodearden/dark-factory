@@ -95,6 +95,104 @@ def test_shape_memory_online_passes_through_plus_defaults():
 
 
 # ---------------------------------------------------------------------------
+# shape_memory — WAL block
+# ---------------------------------------------------------------------------
+
+
+def _basic_status_and_queue():
+    return (
+        {'graphiti': {}, 'mem0': {}, 'projects': {}},
+        {'counts': {}, 'oldest_pending_age_seconds': None},
+    )
+
+
+def test_shape_memory_wal_offline_when_wal_missing():
+    status, queue = _basic_status_and_queue()
+    body = redux_api.shape_memory(status, queue, wal=None)
+    wal = body['MEMORY_STATUS']['wal']
+    assert wal['status'] == 'offline'
+    assert wal['rows'] == []
+
+
+def test_shape_memory_wal_offline_payload_propagates_error():
+    status, queue = _basic_status_and_queue()
+    body = redux_api.shape_memory(
+        status, queue, wal={'offline': True, 'error': 'unreachable'},
+    )
+    wal = body['MEMORY_STATUS']['wal']
+    assert wal['status'] == 'offline'
+    assert wal['reason'] == 'unreachable'
+
+
+def test_shape_memory_wal_ok_when_all_rows_healthy():
+    from datetime import UTC, datetime
+    now_iso = datetime.now(UTC).isoformat()
+    status, queue = _basic_status_and_queue()
+    body = redux_api.shape_memory(status, queue, wal={
+        'stores': {
+            'http://srv': {
+                'task_backend': {'ts': now_iso, 'busy': 0, 'log': 12, 'checkpointed': 12,
+                                 'detail': '1 project(s)'},
+                'recon_journal': {'ts': now_iso, 'busy': 0, 'log': 4, 'checkpointed': 4,
+                                  'detail': None},
+            },
+        },
+    })
+    wal = body['MEMORY_STATUS']['wal']
+    assert wal['status'] == 'ok'
+    assert wal['reason'] is None
+    assert {r['store'] for r in wal['rows']} == {'task_backend', 'recon_journal'}
+    for row in wal['rows']:
+        assert row['status'] == 'ok'
+
+
+def test_shape_memory_wal_red_on_busy_row():
+    from datetime import UTC, datetime
+    now_iso = datetime.now(UTC).isoformat()
+    status, queue = _basic_status_and_queue()
+    body = redux_api.shape_memory(status, queue, wal={
+        'stores': {'http://srv': {
+            'recon_journal': {'ts': now_iso, 'busy': 1, 'log': 200, 'checkpointed': 0,
+                              'detail': None},
+        }},
+    })
+    wal = body['MEMORY_STATUS']['wal']
+    assert wal['status'] == 'red'
+    assert 'recon_journal' in (wal['reason'] or '')
+    assert wal['rows'][0]['status'] == 'red'
+
+
+def test_shape_memory_wal_warn_on_log_frames_overflow():
+    from datetime import UTC, datetime
+    now_iso = datetime.now(UTC).isoformat()
+    status, queue = _basic_status_and_queue()
+    body = redux_api.shape_memory(status, queue, wal={
+        'stores': {'http://srv': {
+            'event_buffer': {'ts': now_iso, 'busy': 0, 'log': 10_000, 'checkpointed': 10_000,
+                             'detail': None},
+        }},
+    })
+    wal = body['MEMORY_STATUS']['wal']
+    assert wal['status'] == 'warn'
+    assert 'log=' in (wal['reason'] or '')
+
+
+def test_shape_memory_wal_red_on_stale_ts():
+    from datetime import UTC, datetime, timedelta
+    old_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    status, queue = _basic_status_and_queue()
+    body = redux_api.shape_memory(status, queue, wal={
+        'stores': {'http://srv': {
+            'write_journal': {'ts': old_iso, 'busy': 0, 'log': 5, 'checkpointed': 5,
+                              'detail': None},
+        }},
+    })
+    wal = body['MEMORY_STATUS']['wal']
+    assert wal['status'] == 'red'
+    assert 'stale' in (wal['reason'] or '')
+
+
+# ---------------------------------------------------------------------------
 # shape_memory_graphs
 # ---------------------------------------------------------------------------
 

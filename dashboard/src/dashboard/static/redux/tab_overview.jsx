@@ -158,6 +158,19 @@ function OverviewTab({ paused }) {
               const action = v?.action_taken || 'none';
               return { l: 'Reconciliation', sub: `verdict: ${sev} · ${action}`, ok: sev !== 'serious', warn: sev === 'minor' };
             })(),
+            (() => {
+              const wal = D.MEMORY_STATUS.wal || { status: 'offline', rows: [] };
+              const rowCount = (wal.rows || []).length;
+              const sub = wal.reason
+                ? wal.reason
+                : (rowCount ? `${rowCount} store(s) · all current` : 'no data yet');
+              return {
+                l: 'SQLite WAL',
+                sub,
+                ok: wal.status === 'ok' || wal.status === 'warn',
+                warn: wal.status === 'warn',
+              };
+            })(),
           ].map(s => (
             <div key={s.l} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 8, alignItems: 'center' }}>
               <span className={`dot ${s.ok ? (s.warn ? 'warn' : 'ok') : 'bad'}`}></span>

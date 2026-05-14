@@ -19,6 +19,9 @@ load_dotenv()
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from fused_memory.server.tools import create_mcp_server  # noqa: E402
+from fused_memory.server.wal_status import (  # noqa: E402
+    CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
+)
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
@@ -66,6 +69,22 @@ _FORCE_EXIT_BUDGET = 75.0
 # WatchdogSec in the unit file (we use 30s there) so a single missed tick
 # doesn't trigger a restart.
 _WATCHDOG_INTERVAL = 10.0
+
+# Periodic WAL TRUNCATE checkpoint interval. The 2026-05-13 incident
+# (see docs/task-recovery-2026-05-13/) was caused in part by SQLite's
+# default auto-checkpoint stalling for ~60 hours under reader pressure,
+# letting the WAL accumulate ~3 days of un-checkpointed writes. The
+# periodic loop below TRUNCATEs each store's WAL on a known cadence so
+# the on-disk main DB advances independent of reader-snapshot pinning.
+# 5 min is short enough to bound recovery work on crash to a small
+# WAL window, long enough to avoid I/O churn under steady load.
+_CHECKPOINT_INTERVAL = 300.0
+
+# Most recent per-store checkpoint result lives in
+# :mod:`fused_memory.server.wal_status` (imported at top of file as
+# ``_CHECKPOINT_STATUS``) so both this module (writer — periodic loop)
+# and ``tools.py`` (reader — the ``get_wal_status`` MCP tool) share
+# state without a circular import.
 
 
 def _sd_notify(state: str) -> None:
@@ -657,6 +676,31 @@ async def run_server():
     else:
         logger.info('  Ticket janitor: disabled')
 
+    # Periodic WAL checkpoint loop — runs PRAGMA wal_checkpoint(TRUNCATE) on
+    # every live SQLite store every _CHECKPOINT_INTERVAL seconds. Bounds the
+    # un-flushed WAL window even if PASSIVE auto-checkpoints stall under
+    # reader pressure (the failure mode of the 2026-05-13 incident).
+    checkpoint_task: asyncio.Task[None] | None = None
+    _checkpoint_targets: list[tuple[str, object]] = _collect_checkpoint_targets(
+        taskmaster=taskmaster,
+        recon_journal=recon_journal,
+        event_buffer=event_buffer if 'event_buffer' in locals() else None,
+        ticket_store=ticket_store if 'ticket_store' in locals() else None,
+        write_journal=write_journal,
+        memory_service=memory_service,
+    )
+    if _checkpoint_targets:
+        checkpoint_task = asyncio.create_task(
+            _periodic_checkpoint_loop(_checkpoint_targets),
+        )
+        logger.info(
+            '  Checkpoint loop: enabled (interval=%.0fs, targets=%s)',
+            _CHECKPOINT_INTERVAL,
+            [name for name, _ in _checkpoint_targets],
+        )
+    else:
+        logger.info('  Checkpoint loop: no SQLite targets — skipped')
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -731,6 +775,10 @@ async def run_server():
             janitor_task.cancel()
             with contextlib.suppress(BaseException):
                 await janitor_task
+        if checkpoint_task is not None:
+            checkpoint_task.cancel()
+            with contextlib.suppress(BaseException):
+                await checkpoint_task
         await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
@@ -742,6 +790,120 @@ async def run_server():
             curator_cost_store=curator_cost_store,
             curator_usage_gate=curator_usage_gate,
         )
+
+
+def _collect_checkpoint_targets(
+    *,
+    taskmaster,
+    recon_journal,
+    event_buffer,
+    ticket_store,
+    write_journal,
+    memory_service,
+) -> list[tuple[str, object]]:
+    """Gather every live SQLite store that exposes a ``checkpoint`` method.
+
+    Returns ``[(name, callable)]`` pairs. ``SqliteTaskBackend.checkpoint_all``
+    returns a per-project dict; the others return ``(busy, log, checkpointed)``.
+    The loop in :func:`_periodic_checkpoint_loop` normalises both.
+    """
+    targets: list[tuple[str, object]] = []
+    if taskmaster is not None and hasattr(taskmaster, 'checkpoint_all'):
+        targets.append(('task_backend', taskmaster.checkpoint_all))
+    if recon_journal is not None and hasattr(recon_journal, 'checkpoint'):
+        targets.append(('recon_journal', recon_journal.checkpoint))
+    if event_buffer is not None and hasattr(event_buffer, 'checkpoint'):
+        targets.append(('event_buffer', event_buffer.checkpoint))
+    if ticket_store is not None and hasattr(ticket_store, 'checkpoint'):
+        targets.append(('ticket_store', ticket_store.checkpoint))
+    if write_journal is not None and hasattr(write_journal, 'checkpoint'):
+        targets.append(('write_journal', write_journal.checkpoint))
+    dq = getattr(memory_service, 'durable_queue', None)
+    if dq is not None and hasattr(dq, 'checkpoint'):
+        targets.append(('durable_queue', dq.checkpoint))
+    pe = getattr(memory_service, 'planned_episode_registry', None)
+    if pe is not None and hasattr(pe, 'checkpoint'):
+        targets.append(('planned_episode_registry', pe.checkpoint))
+    return targets
+
+
+async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
+    """One pass of WAL TRUNCATE checkpoints over every target.
+
+    Updates :data:`_CHECKPOINT_STATUS` and logs WARN when busy>0. Extracted
+    from :func:`_periodic_checkpoint_loop` so unit tests can exercise the
+    bookkeeping without waiting for ``_CHECKPOINT_INTERVAL``.
+    """
+    from datetime import UTC, datetime
+
+    now_iso = datetime.now(UTC).isoformat()
+    for name, fn in targets:
+        try:
+            result = await fn()  # type: ignore[misc]
+        except Exception as exc:
+            logger.exception('checkpoint %s failed', name)
+            _CHECKPOINT_STATUS[name] = {
+                'ts': now_iso,
+                'busy': -1,
+                'log': -1,
+                'checkpointed': -1,
+                'detail': f'error: {exc}',
+            }
+            continue
+        if isinstance(result, dict):
+            # SqliteTaskBackend.checkpoint_all returns per-project dict.
+            # Aggregate to a single triple for the dashboard and log
+            # per-project rows for diagnosis.
+            agg_busy = 0
+            agg_log = 0
+            agg_chk = 0
+            for proj, r in result.items():
+                agg_busy = max(agg_busy, int(r.get('busy', 0) or 0))
+                agg_log += int(r.get('log', 0) or 0)
+                agg_chk += int(r.get('checkpointed', 0) or 0)
+                if int(r.get('busy', 0) or 0) > 0:
+                    logger.warning(
+                        'checkpoint busy: %s project=%s busy=%s log=%s checkpointed=%s',
+                        name, proj, r.get('busy'), r.get('log'),
+                        r.get('checkpointed'),
+                    )
+            _CHECKPOINT_STATUS[name] = {
+                'ts': now_iso,
+                'busy': agg_busy,
+                'log': agg_log,
+                'checkpointed': agg_chk,
+                'detail': f'{len(result)} project(s)',
+            }
+        else:
+            busy, log_n, chk = result
+            _CHECKPOINT_STATUS[name] = {
+                'ts': now_iso,
+                'busy': busy,
+                'log': log_n,
+                'checkpointed': chk,
+                'detail': None,
+            }
+            if busy > 0:
+                logger.warning(
+                    'checkpoint busy: %s busy=%s log=%s checkpointed=%s',
+                    name, busy, log_n, chk,
+                )
+
+
+async def _periodic_checkpoint_loop(targets: list[tuple[str, object]]) -> None:
+    """Run ``_run_checkpoint_cycle`` every :data:`_CHECKPOINT_INTERVAL` s.
+
+    Bounds the un-flushed WAL window so a stalled PASSIVE auto-checkpoint
+    (the 2026-05-13 failure mode) can't accumulate indefinitely. The
+    cycle is independent of the per-project write lock — SQLite serialises
+    the checkpoint against writers internally.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_CHECKPOINT_INTERVAL)
+        except asyncio.CancelledError:
+            return
+        await _run_checkpoint_cycle(targets)
 
 
 async def _build_task_backend(taskmaster_config):

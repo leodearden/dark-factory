@@ -202,7 +202,11 @@ class ReconciliationJournal:
         # primary intra-process contention vector before WP-C.
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.execute('PRAGMA busy_timeout=5000')
-        await self._db.execute('PRAGMA synchronous=NORMAL')
+        # synchronous=FULL: per-commit fsync. See docs/task-recovery-2026-05-13/
+        # for the prod incident that drove this across all SQLite stores.
+        await self._db.execute('PRAGMA synchronous=FULL')
+        await self._db.execute('PRAGMA wal_autocheckpoint=100')
+        await self._db.execute('PRAGMA journal_size_limit=67108864')
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
 
@@ -251,7 +255,21 @@ class ReconciliationJournal:
 
     async def close(self) -> None:
         if self._db:
+            # Final TRUNCATE checkpoint so the next open starts with an empty
+            # WAL. Best-effort: failures don't block the close.
+            with contextlib.suppress(Exception):
+                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             await self._db.close()
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """``PRAGMA wal_checkpoint(TRUNCATE)``. Returns ``(busy, log,
+        checkpointed)``. Called by the periodic loop in ``server/main.py``."""
+        db = self._require_db()
+        cursor = await db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        row = await cursor.fetchone()
+        if row is None:
+            return (-1, -1, -1)
+        return int(row[0]), int(row[1]), int(row[2])
 
     def _require_db(self) -> aiosqlite.Connection:
         if self._db is None:

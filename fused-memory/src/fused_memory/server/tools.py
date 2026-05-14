@@ -1156,6 +1156,32 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def get_wal_status() -> dict[str, Any]:
+        """Latest per-store WAL checkpoint status.
+
+        Returns ``{'stores': {store_name: {ts, busy, log, checkpointed, detail}}}``
+        — one row per live SQLite store. ``ts`` is the iso8601 of the most
+        recent checkpoint pass. ``busy>0`` means readers/writers blocked
+        the TRUNCATE from fully truncating the WAL; ``log`` reports frames
+        present pre-checkpoint; ``checkpointed`` reports frames copied to
+        the main DB this pass. A missing store means the periodic loop has
+        not yet checkpointed it (typically only true within the first
+        five minutes of startup).
+
+        The dashboard polls this to surface WAL health — drift in ``ts``
+        means the periodic loop has stalled; ``busy>0`` consistently
+        means a long-held reader/writer is preventing TRUNCATE; ``log``
+        growing without bound suggests checkpoint backpressure.
+
+        Added in response to the 2026-05-13 incident — see
+        ``docs/task-recovery-2026-05-13/`` for forensic detail.
+        """
+        from fused_memory.server.wal_status import CHECKPOINT_STATUS
+        # Defensive copy so concurrent updates from the periodic loop
+        # don't tear the wire payload mid-serialise.
+        return {'stores': {name: dict(row) for name, row in CHECKPOINT_STATUS.items()}}
+
+    @mcp.tool()
     async def replay_dead_letters(
         project_id: str | None = None,
     ) -> dict[str, Any]:

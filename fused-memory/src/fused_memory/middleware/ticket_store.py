@@ -93,7 +93,13 @@ class TicketStore:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.execute('PRAGMA busy_timeout=5000')
-        await self._db.execute('PRAGMA synchronous=NORMAL')
+        # synchronous=FULL: per-commit fsync. Cost is ~1-5ms/commit; the
+        # win is crash durability without relying on WAL checkpoints. See
+        # docs/task-recovery-2026-05-13/ for the prod incident that drove
+        # this change across all fused-memory SQLite stores.
+        await self._db.execute('PRAGMA synchronous=FULL')
+        await self._db.execute('PRAGMA wal_autocheckpoint=100')
+        await self._db.execute('PRAGMA journal_size_limit=67108864')
         # Tables first, then in-place migrate, then indexes — the
         # escalated_at index references the column added by the migration.
         await self._db.executescript(TABLE_SQL)
@@ -347,7 +353,25 @@ class TicketStore:
         return cursor.rowcount
 
     async def close(self) -> None:
-        """Close the underlying aiosqlite connection."""
+        """Close the underlying aiosqlite connection.
+
+        Runs a final ``wal_checkpoint(TRUNCATE)`` so the next open sees an
+        empty WAL and the main DB is fully up to date. Best-effort —
+        failures don't block the close.
+        """
         if self._db is not None:
+            with contextlib.suppress(Exception):
+                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             await self._db.close()
             self._db = None
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
+        checkpointed)``. Called by the periodic checkpoint loop in
+        ``server/main.py``."""
+        db = self._require_db()
+        cursor = await db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        row = await cursor.fetchone()
+        if row is None:
+            return (-1, -1, -1)
+        return int(row[0]), int(row[1]), int(row[2])

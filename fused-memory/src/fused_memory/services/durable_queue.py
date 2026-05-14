@@ -118,6 +118,11 @@ class DurableWriteQueue:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.execute('PRAGMA busy_timeout=5000')
+        # synchronous=FULL: per-commit fsync. See docs/task-recovery-2026-05-13/
+        # for the prod incident that drove this across all SQLite stores.
+        await self._db.execute('PRAGMA synchronous=FULL')
+        await self._db.execute('PRAGMA wal_autocheckpoint=100')
+        await self._db.execute('PRAGMA journal_size_limit=67108864')
         await self._db.execute(_CREATE_TABLE)
         await self._db.execute(_CREATE_INDEX)
         await self._db.commit()
@@ -139,9 +144,23 @@ class DurableWriteQueue:
             await asyncio.gather(*all_tasks, return_exceptions=True)
         self._worker_tasks.clear()
         if self._db:
+            # Final TRUNCATE checkpoint so the next open sees an empty WAL.
+            with contextlib.suppress(Exception):
+                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             await self._db.close()
             self._db = None
         logger.info('DurableWriteQueue closed')
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
+        Called by the periodic loop in ``server/main.py``."""
+        if self._db is None:
+            return (-1, -1, -1)
+        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        row = await cursor.fetchone()
+        if row is None:
+            return (-1, -1, -1)
+        return int(row[0]), int(row[1]), int(row[2])
 
     # -- callbacks ------------------------------------------------------------
 

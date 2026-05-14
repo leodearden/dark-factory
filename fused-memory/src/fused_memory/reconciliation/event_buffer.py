@@ -108,10 +108,17 @@ class EventBuffer:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.execute('PRAGMA busy_timeout=5000')
-        # synchronous=NORMAL is safe under WAL and shortens the writer-lock
-        # hold window — important because EventBuffer shares this DB file
-        # with ReconciliationJournal (separate aiosqlite.Connection).
-        await self._db.execute('PRAGMA synchronous=NORMAL')
+        # synchronous=FULL: per-commit fsync. Costs ~1-5ms/commit but
+        # makes deferred-write rows durable on disk regardless of WAL
+        # checkpoint progress. EventBuffer shares reconciliation.db with
+        # ReconciliationJournal (separate aiosqlite.Connection) — if one
+        # used NORMAL while the other used FULL, NORMAL commits between
+        # FULL commits would still be at risk on a crash, so we keep
+        # both at FULL for consistent recovery semantics.
+        # See docs/task-recovery-2026-05-13/ for the prod incident.
+        await self._db.execute('PRAGMA synchronous=FULL')
+        await self._db.execute('PRAGMA wal_autocheckpoint=100')
+        await self._db.execute('PRAGMA journal_size_limit=67108864')
         await self._db.executescript(_BUFFER_SCHEMA_SQL)
         await self._db.commit()
         # Idempotent migration: add claimed_at column for pre-existing DBs.
@@ -903,5 +910,17 @@ class EventBuffer:
     async def close(self) -> None:
         """Close the database connection."""
         if self._db:
+            with contextlib.suppress(Exception):
+                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             await self._db.close()
             self._db = None
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``."""
+        if self._db is None:
+            return (-1, -1, -1)
+        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        row = await cursor.fetchone()
+        if row is None:
+            return (-1, -1, -1)
+        return int(row[0]), int(row[1]), int(row[2])

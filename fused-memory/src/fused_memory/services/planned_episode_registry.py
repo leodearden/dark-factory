@@ -11,6 +11,7 @@ visible in normal searches.  This happens when a task is marked done.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -68,6 +69,11 @@ class PlannedEpisodeRegistry:
         self._db = await aiosqlite.connect(str(db_path))
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.execute('PRAGMA busy_timeout=5000')
+        # synchronous=FULL: per-commit fsync. See docs/task-recovery-2026-05-13/
+        # for the prod incident that drove this across all SQLite stores.
+        await self._db.execute('PRAGMA synchronous=FULL')
+        await self._db.execute('PRAGMA wal_autocheckpoint=100')
+        await self._db.execute('PRAGMA journal_size_limit=67108864')
         await self._db.execute(_CREATE_TABLE)
         await self._db.execute(_CREATE_INDEX)
         await self._db.commit()
@@ -76,9 +82,21 @@ class PlannedEpisodeRegistry:
     async def close(self) -> None:
         """Close the database connection."""
         if self._db:
+            with contextlib.suppress(Exception):
+                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             await self._db.close()
             self._db = None
         logger.info('PlannedEpisodeRegistry closed')
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``."""
+        if self._db is None:
+            return (-1, -1, -1)
+        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        row = await cursor.fetchone()
+        if row is None:
+            return (-1, -1, -1)
+        return int(row[0]), int(row[1]), int(row[2])
 
     # ------------------------------------------------------------------
     # Core operations

@@ -135,6 +135,7 @@ def shape_memory(
     sparks: Mapping[str, Mapping[str, list]] | None = None,
     queue_spark: Mapping[str, list] | None = None,
     delta_24h: Mapping[str, Mapping[str, Any]] | None = None,
+    wal: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return ``{MEMORY_STATUS: {...}}`` matching the redux UI's read sites.
 
@@ -167,6 +168,7 @@ def shape_memory(
                       'oldest_pending_age_seconds': queue.get('oldest_pending_age_seconds'),
                       'spark': _empty_series_dict()},
             'projects': {},
+            'wal': _shape_wal_status(wal),
             'offline': True,
             'error': status.get('error'),
         }}
@@ -206,13 +208,105 @@ def shape_memory(
     raw_projects = dict(status.get('projects') or {})
     enriched_projects = {pid: _project_block(pid, payload) for pid, payload in raw_projects.items()}
 
+    wal_block = _shape_wal_status(wal)
+
     return {'MEMORY_STATUS': {
         'graphiti': graphiti,
         'mem0': mem0,
         'taskmaster': taskmaster,
         'queue': queue_block,
         'projects': enriched_projects,
+        'wal': wal_block,
     }}
+
+
+# Thresholds for surfacing WAL health alarms in the UI. Aligned with the
+# hardening plan from docs/task-recovery-2026-05-13/: a checkpoint loop
+# that hasn't ticked in over an hour is "stale"; a WAL with more than
+# 5000 frames suggests checkpoint backpressure.
+_WAL_STALE_SECONDS = 3600
+_WAL_LOG_FRAMES_WARN = 5000
+
+
+def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Shape the get_wal_status payload into a redux-ready block.
+
+    Returns ``{'status': 'ok' | 'warn' | 'red' | 'offline',
+              'reason': str | None, 'rows': [...]}``. The status field is
+    what the UI badges off of; ``rows`` carries per-store detail for an
+    expanded panel. ``offline`` indicates we couldn't reach any
+    fused-memory server.
+    """
+    from datetime import UTC, datetime
+
+    if not wal or wal.get('offline'):
+        return {
+            'status': 'offline',
+            'reason': (wal or {}).get('error') or 'No data',
+            'rows': [],
+        }
+
+    rows: list[dict[str, Any]] = []
+    worst_status: str = 'ok'
+    worst_reason: str | None = None
+    now = datetime.now(UTC)
+
+    for server_url, stores in (wal.get('stores') or {}).items():
+        if not isinstance(stores, Mapping):
+            continue
+        for store_name, payload in stores.items():
+            if not isinstance(payload, Mapping):
+                continue
+            ts_raw = payload.get('ts')
+            try:
+                ts_dt = (
+                    datetime.fromisoformat(ts_raw) if isinstance(ts_raw, str) else None
+                )
+            except ValueError:
+                ts_dt = None
+            age_s = (now - ts_dt).total_seconds() if ts_dt else None
+            busy = int(payload.get('busy') or 0)
+            log_frames = int(payload.get('log') or 0)
+
+            row_status = 'ok'
+            row_reason: str | None = None
+            if busy < 0:
+                row_status = 'red'
+                row_reason = str(payload.get('detail') or 'error')
+            elif busy > 0:
+                row_status = 'red'
+                row_reason = f'busy={busy}'
+            elif age_s is not None and age_s > _WAL_STALE_SECONDS:
+                row_status = 'red'
+                row_reason = f'stale ({int(age_s)}s)'
+            elif log_frames > _WAL_LOG_FRAMES_WARN:
+                row_status = 'warn'
+                row_reason = f'log={log_frames} frames'
+
+            rows.append({
+                'server': server_url,
+                'store': store_name,
+                'ts': ts_raw,
+                'age_seconds': int(age_s) if age_s is not None else None,
+                'busy': busy,
+                'log': log_frames,
+                'checkpointed': int(payload.get('checkpointed') or 0),
+                'detail': payload.get('detail'),
+                'status': row_status,
+                'reason': row_reason,
+            })
+
+            # Escalate the panel-level status to the worst row.
+            order = {'ok': 0, 'warn': 1, 'red': 2, 'offline': 3}
+            if order[row_status] > order[worst_status]:
+                worst_status = row_status
+                worst_reason = f'{store_name}: {row_reason}'
+
+    return {
+        'status': worst_status,
+        'reason': worst_reason,
+        'rows': rows,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -925,6 +925,54 @@ async def test_state_survives_close_and_reopen(tmp_path):
     await b2.close()
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_all_reports_per_project_result(tmp_path):
+    """``checkpoint_all`` returns ``{root: {busy, log, checkpointed}}`` for
+    every open project, and an empty dict when no project has been touched."""
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg)
+    await backend.start()
+
+    # No projects opened yet → empty result.
+    assert await backend.checkpoint_all() == {}
+
+    root_a = str(tmp_path / 'a')
+    root_b = str(tmp_path / 'b')
+    await backend.add_task(project_root=root_a, title='a')
+    await backend.add_task(project_root=root_b, title='b')
+
+    results = await backend.checkpoint_all()
+    assert set(results.keys()) == {root_a, root_b}
+    for root, r in results.items():
+        # busy=0 with no concurrent readers; log/checkpointed are non-negative.
+        assert r['busy'] == 0, f'{root}: unexpected busy {r}'
+        assert r['log'] >= 0
+        assert r['checkpointed'] >= 0
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_close_runs_final_truncate_checkpoint(tmp_path):
+    """``close()`` should run a final TRUNCATE checkpoint so the next open
+    sees an empty WAL and the main DB file is fully up-to-date — minimises
+    recovery work on the next start."""
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg)
+    await backend.start()
+    project_root = str(tmp_path / 'proj')
+    await backend.add_task(project_root=project_root, title='one')
+    await backend.close()
+
+    wal_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db-wal'
+    # After clean close, the WAL file either does not exist or has been
+    # truncated to its 32-byte header (= 0-frame state). Either is acceptable.
+    if wal_path.exists():
+        # 32 bytes is the WAL header with zero frames.
+        assert wal_path.stat().st_size <= 32, (
+            f'WAL not truncated on close: {wal_path.stat().st_size} bytes'
+        )
+
+
 # ── Concurrency ────────────────────────────────────────────────────
 
 

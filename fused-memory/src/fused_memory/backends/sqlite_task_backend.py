@@ -270,17 +270,66 @@ class SqliteTaskBackend:
         # Snapshot under the lock so concurrent open() calls don't observe
         # a half-empty map mid-tear-down.
         async with self._connect_locks_lock:
-            connections = list(self._connections.values())
+            connection_items = list(self._connections.items())
             self._connections.clear()
-        for conn in connections:
+        # Final TRUNCATE checkpoint on each connection so a clean shutdown
+        # leaves the WAL empty and the main DB up to date — the prod
+        # recovery path on next-open then has nothing to replay. Best-effort:
+        # failures here don't block the close.
+        for root, conn in connection_items:
+            with contextlib.suppress(Exception):
+                await conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             with contextlib.suppress(Exception):
                 await conn.close()
-        logger.info('SqliteTaskBackend closed (%d connection(s))', len(connections))
+            logger.debug('SqliteTaskBackend final-checkpointed and closed %s', root)
+        logger.info('SqliteTaskBackend closed (%d connection(s))', len(connection_items))
 
     async def is_alive(self) -> tuple[bool, str | None]:
         if self._closed or not self._started:
             return False, 'not started'
         return True, None
+
+    # ── WAL maintenance ────────────────────────────────────────────────
+
+    async def checkpoint_all(self) -> dict[str, dict[str, int]]:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` on every open project DB.
+
+        Returns ``{project_root: {'busy': int, 'log': int, 'checkpointed': int}}``
+        — the three values SQLite reports for each checkpoint. A non-zero
+        ``busy`` means active readers/writers blocked the truncate from
+        completing fully; the routine still copies what it can but the WAL
+        will not shrink.
+
+        Called by the periodic checkpoint task in ``server/main.py`` to
+        bound the un-flushed-WAL window and advance the main DB file on a
+        known cadence. Independent of the per-project write lock — the
+        checkpoint pragma itself is what serialises against writers in
+        SQLite.
+        """
+        results: dict[str, dict[str, int]] = {}
+        async with self._connect_locks_lock:
+            roots = list(self._connections.keys())
+        for root in roots:
+            conn = self._connections.get(root)
+            if conn is None:
+                continue
+            try:
+                cursor = await conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                row = await cursor.fetchone()
+                # PRAGMA wal_checkpoint returns (busy, log, checkpointed):
+                # busy=0 means truncate succeeded; busy=1 means readers blocked.
+                if row is None:
+                    results[root] = {'busy': -1, 'log': -1, 'checkpointed': -1}
+                else:
+                    results[root] = {
+                        'busy': int(row[0]),
+                        'log': int(row[1]),
+                        'checkpointed': int(row[2]),
+                    }
+            except Exception as exc:
+                logger.warning('checkpoint failed for %s: %s', root, exc)
+                results[root] = {'busy': -1, 'log': -1, 'checkpointed': -1}
+        return results
 
     # ── Connection management ──────────────────────────────────────────
 
@@ -315,7 +364,23 @@ class SqliteTaskBackend:
             conn.row_factory = aiosqlite.Row
             await conn.execute('PRAGMA journal_mode=WAL')
             await conn.execute('PRAGMA busy_timeout=5000')
-            await conn.execute('PRAGMA synchronous=NORMAL')
+            # synchronous=FULL: per-commit fsync. Costs ~1-5ms/commit but
+            # makes committed data durable on disk regardless of checkpoint
+            # progress. The 2026-05-13 incident (60h of uncheckpointed WAL
+            # → SIGABRT → ~150 task rows lost) was the trigger for the
+            # NORMAL → FULL switch — see docs/task-recovery-2026-05-13/.
+            await conn.execute('PRAGMA synchronous=FULL')
+            # wal_autocheckpoint=100: cap the pre-checkpoint risk window at
+            # ~100 pages (vs SQLite's 1000-page default). Combined with the
+            # periodic explicit wal_checkpoint(TRUNCATE) loop in main.py,
+            # the WAL is kept short and the main DB advances on a known
+            # cadence even if PASSIVE auto-checkpoints stall under reader
+            # pressure.
+            await conn.execute('PRAGMA wal_autocheckpoint=100')
+            # journal_size_limit caps the on-disk WAL after a TRUNCATE
+            # checkpoint — 64 MiB is generous for our row sizes but stops
+            # runaway growth if periodic checkpoint stops firing.
+            await conn.execute('PRAGMA journal_size_limit=67108864')
             await conn.execute('PRAGMA foreign_keys=OFF')
             await conn.executescript(_SCHEMA_SQL)
             await conn.commit()

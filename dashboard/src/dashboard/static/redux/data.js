@@ -50,6 +50,7 @@ window.DF_DATA = {
     taskmaster: { connected: false },
     queue: { counts: { pending: 0, retry: 0, dead: 0 }, oldest_pending_age_seconds: null },
     projects: {},
+    wal: { status: 'offline', reason: null, rows: [] },
   },
   MEMORY_TIMESERIES: { labels: [], reads: [], writes: [] },
   MEMORY_OPS_BREAKDOWN: [],

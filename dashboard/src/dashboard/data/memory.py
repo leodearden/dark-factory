@@ -224,3 +224,33 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
     if not any_success:
         return {'offline': True, 'error': 'All servers unreachable'}
     return {'counts': merged_counts, 'oldest_pending_age_seconds': oldest_age}
+
+
+async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
+    """Fetch per-store WAL checkpoint status from each fused-memory server.
+
+    Returns ``{'stores': {server_url: {store_name: row, ...}}}`` — one
+    column per server, one row per SQLite store. The frontend renders
+    these as a small badge in the memory panel (red on ``busy>0`` or
+    stale ``ts``, amber on missing rows, green otherwise).
+
+    Returns ``{'offline': True, 'error': ...}`` if all configured servers
+    are unreachable. Added 2026-05-14 in response to the 2026-05-13
+    task-DB-loss incident — see ``docs/task-recovery-2026-05-13/``.
+    """
+    per_server: dict[str, dict] = {}
+    errors: list[str] = []
+    for url in config.fused_memory_urls:
+        try:
+            result = await mcp_tool_call(client, url, 'get_wal_status', {})
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
+                ValueError) as e:
+            logger.debug('get_wal_status failed for %s: %s', url, e)
+            _sessions.pop(url.rstrip('/'), None)
+            errors.append(f'{url}: {e}')
+            continue
+        per_server[url] = result.get('stores') or {}
+
+    if not per_server:
+        return {'offline': True, 'error': '; '.join(errors)}
+    return {'stores': per_server}

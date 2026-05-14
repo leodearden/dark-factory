@@ -419,16 +419,18 @@ async def api_memory(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     metrics_db = await pool.get(config.metrics_db)
-    status, queue, sparks, queue_spark, delta_24h = await asyncio.gather(
+    status, queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
         memory_data.get_memory_status(http_client, config),
         memory_data.get_queue_stats(http_client, config),
         get_memory_sparks(metrics_db, days=1),
         get_queue_pending_series(metrics_db, days=1),
         get_memory_24h_ago(metrics_db),
+        memory_data.get_wal_status(http_client, config),
     )
     return JSONResponse(redux_api.shape_memory(
         status, queue,
         sparks=sparks, queue_spark=queue_spark, delta_24h=delta_24h,
+        wal=wal,
     ))
 
 
