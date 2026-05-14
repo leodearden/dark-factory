@@ -4341,10 +4341,11 @@ class TestQueryStage2Flags:
             self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'}),
             self._make_result('id-2', 'no flag', {}),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         assert current_flags[0]['id'] == 'id-1'
-        assert stale_marker_ids == []
+        assert stale_missing_ids == []
+        assert stale_mismatched_ids == []
 
     @pytest.mark.asyncio
     async def test_excludes_memories_without_either_marker(self):
@@ -4354,9 +4355,10 @@ class TestQueryStage2Flags:
             self._make_result('id-4', 'irrelevant', {'some_other_key': True}),
             self._make_result('id-5', 'also irrelevant', {}),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
-        assert stale_marker_ids == []
+        assert stale_missing_ids == []
+        assert stale_mismatched_ids == []
 
     @pytest.mark.asyncio
     async def test_preserves_fields_and_extracts_task_id(self):
@@ -4366,7 +4368,7 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('id-6', 'content here', meta),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         flag = current_flags[0]
         assert flag['id'] == 'id-6'
@@ -4382,9 +4384,10 @@ class TestQueryStage2Flags:
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
         with caplog.at_level(logging.WARNING):
-            current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+            current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
-        assert stale_marker_ids == []
+        assert stale_missing_ids == []
+        assert stale_mismatched_ids == []
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -4423,13 +4426,14 @@ class TestQueryStage2Flags:
                 {'flag_for_stage2': True, 'task_id': '999'},
             ),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        stale_marker_ids = stale_missing_ids + stale_mismatched_ids
 
         # Only the current-cycle marker should be in current_flags
         assert len(current_flags) == 1
         assert current_flags[0]['id'] == 'mem0-current'
 
-        # Stale partition contains only IDs (not dicts)
+        # Combined stale partition contains only IDs (not dicts)
         assert set(stale_marker_ids) == {'mem0-prior', 'mem0-no-run-id'}
         assert len(stale_marker_ids) == 2
         # Confirm stale_marker_ids contains strings, not dicts
@@ -4457,9 +4461,10 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('test-id', 'content', meta),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(
             memory_service, 'reify', filter_run_id
         )
+        stale_marker_ids = stale_missing_ids + stale_mismatched_ids
         if expect_current:
             assert len(current_flags) == 1
             assert current_flags[0]['id'] == 'test-id'
@@ -4467,6 +4472,106 @@ class TestQueryStage2Flags:
         else:
             assert current_flags == []
             assert stale_marker_ids == ['test-id']
+
+    @pytest.mark.asyncio
+    async def test_partition_separates_missing_from_mismatched_stale(self):
+        """Missing-run_id and mismatched-run_id markers land in distinct partition fields."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            _query_stage2_flags,
+        )
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # (a) matching run_id — should be in current
+            self._make_result('current', 'content a', {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-current'}),
+            # (b) mismatched run_id — should be in stale_mismatched_run_id_ids
+            self._make_result('prior', 'content b', {'flag_for_stage2': True, 'task_id': '2', 'run_id': 'r-prior'}),
+            # (c) run_id key absent — should be in stale_missing_run_id_ids
+            self._make_result('no-run-id', 'content c', {'flag_for_stage2': True, 'task_id': '3'}),
+            # (d) run_id empty string — should be in stale_missing_run_id_ids
+            self._make_result('empty-run-id', 'content d', {'flag_for_stage2': True, 'task_id': '4', 'run_id': ''}),
+        ]
+        partition = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+
+        # Partition must be the right type with 3 fields
+        assert isinstance(partition, Stage2FlagPartition)
+        assert len(partition) == 3
+
+        # (a) only matching marker in current
+        assert len(partition.current) == 1
+        assert partition.current[0]['id'] == 'current'
+
+        # (c) and (d) — missing run_id (absent or empty) in stale_missing_run_id_ids
+        # Use set equality: order is incidental (follows search result iteration order)
+        assert set(partition.stale_missing_run_id_ids) == {'no-run-id', 'empty-run-id'}
+
+        # (b) — present but mismatched run_id
+        assert partition.stale_mismatched_run_id_ids == ['prior']
+
+    @pytest.mark.asyncio
+    async def test_warning_logged_when_missing_run_id_count_nonzero(self, caplog):
+        """A WARNING is emitted when any markers have absent/empty run_id."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # matching marker — current
+            self._make_result('current', 'c', {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-now'}),
+            # absent run_id — missing
+            self._make_result('no-id-1', 'a', {'flag_for_stage2': True, 'task_id': '2'}),
+            # empty run_id — missing
+            self._make_result('no-id-2', 'b', {'flag_for_stage2': True, 'task_id': '3', 'run_id': ''}),
+        ]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _query_stage2_flags(memory_service, 'reify', 'r-now')
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'missing' in r.getMessage().lower()
+            and 'run_id' in r.getMessage().lower()
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 missing-run_id WARNING, got {len(warning_records)}: '
+            f'{[r.getMessage() for r in warning_records]}'
+        )
+        # The structured extra dict must carry the exact count — avoids fragile substring match
+        assert warning_records[0].missing_run_id_count == 2, (
+            f'Expected missing_run_id_count=2 in log extra, '
+            f'got: {getattr(warning_records[0], "missing_run_id_count", "<absent>")}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_missing_run_id_warning_when_count_is_zero(self, caplog):
+        """No WARNING about missing run_id when all stale markers have a truthy run_id."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # matching marker
+            self._make_result('current', 'c', {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-now'}),
+            # mismatched but truthy run_id — stale_mismatched, not missing
+            self._make_result('prior', 'p', {'flag_for_stage2': True, 'task_id': '2', 'run_id': 'r-old'}),
+        ]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _query_stage2_flags(memory_service, 'reify', 'r-now')
+
+        missing_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'missing' in r.getMessage().lower()
+        ]
+        assert missing_warnings == [], (
+            f'Expected no missing-run_id WARNING, but got: {[r.getMessage() for r in missing_warnings]}'
+        )
 
 
 class TestSweepStaleFixcMarkers:
@@ -5449,6 +5554,125 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
         # Stat must be present and == 0, not absent
         assert 'stale_fixc_markers_swept' in report.stats
         assert report.stats['stale_fixc_markers_swept'] == 0
+
+
+class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
+    """TaskKnowledgeSync.run() sets report.stats['stale_missing_run_id_markers'] after super().run()."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_run_id_markers_stat_set_after_run(self, mock_deps):
+        """run() injects stale_missing_run_id_markers into report.stats after super().run().
+
+        Verifies that markers with absent run_id are counted in the new stat and
+        that the combined stale sweep count (missing + mismatched) is still correct.
+        """
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # One current-cycle marker, one mismatched, and two with absent run_id
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+            SimpleNamespace(
+                id='mismatched', content='mismatched content',
+                metadata={'flag_for_stage2': True, 'task_id': '2', 'run_id': 'old-run'},
+            ),
+            SimpleNamespace(
+                id='missing-1', content='no run_id',
+                metadata={'flag_for_stage2': True, 'task_id': '3'},
+            ),
+            SimpleNamespace(
+                id='missing-2', content='empty run_id',
+                metadata={'flag_for_stage2': True, 'task_id': '4', 'run_id': ''},
+            ),
+        ]
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # 2 markers had absent/empty run_id
+        assert report.stats.get('stale_missing_run_id_markers') == 2
+        # Combined sweep: 1 mismatched + 2 missing = 3
+        assert report.stats.get('stale_fixc_markers_swept') == 3
+
+    @pytest.mark.asyncio
+    async def test_zero_missing_run_id_markers_stat_explicitly_set(self, mock_deps):
+        """When all markers have matching run_id, stale_missing_run_id_markers is 0 (explicitly set)."""
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # All markers have matching run_id → zero missing
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='current', content='current content',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+            ),
+        ]
+        mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        fake_cli_result = MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1,
+            tokens_used=0,
+            cost_usd=0.0,
+            model='test-model',
+            error=None,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=fake_cli_result)):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # Stat must be present and explicitly 0, not absent
+        assert 'stale_missing_run_id_markers' in report.stats
+        assert report.stats['stale_missing_run_id_markers'] == 0
 
 
 class TestStage3PayloadIncludesProjectRoot:

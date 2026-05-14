@@ -553,21 +553,33 @@ def _check_flag_counter_completeness(
 class Stage2FlagPartition(NamedTuple):
     """Partition result from :func:`_query_stage2_flags`.
 
-    Using a NamedTuple makes both return values self-documenting at call sites
+    Using a NamedTuple makes all return values self-documenting at call sites
     and avoids positional-index surprises when the return shape evolves.
-    Positional unpacking (``current, stale_ids = await _query_stage2_flags(...)``)
-    continues to work unchanged since NamedTuple is a tuple subclass.
 
     Attributes:
         current: Full dict records whose ``metadata.run_id`` matches the active
             run.  Rendered to the Stage 2 LLM for FIX-C processing.
-        stale_ids: ``id`` strings for records whose ``metadata.run_id`` is
-            absent, empty, or mismatched.  Caller sweeps these via
+        stale_missing_run_id_ids: ``id`` strings for records whose
+            ``metadata.run_id`` is absent or falsy (empty string).  These
+            indicate Stage 1 producer drift — the LLM wrote a flag without the
+            required ``run_id`` field (see prompts/stage1.py).  A
+            WARNING is logged by :func:`_query_stage2_flags` when this bucket
+            is non-empty.  Caller sweeps these via
             :func:`_sweep_stale_fixc_markers`.
+        stale_mismatched_run_id_ids: ``id`` strings for records whose
+            ``metadata.run_id`` is present and truthy but does not match the
+            current ``run_id``.  These are normal prior-cycle residue.  Caller
+            sweeps these via :func:`_sweep_stale_fixc_markers`.
     """
 
     current: list[dict]
-    stale_ids: list[str]
+    stale_missing_run_id_ids: list[str]
+    stale_mismatched_run_id_ids: list[str]
+
+    @property
+    def stale_all_ids(self) -> list[str]:
+        """Combined stale IDs for sweeping (missing + mismatched)."""
+        return self.stale_missing_run_id_ids + self.stale_mismatched_run_id_ids
 
 
 async def _query_stage2_flags(
@@ -582,18 +594,21 @@ async def _query_stage2_flags(
     alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
 
-    Results are partitioned into two groups:
+    Results are partitioned into three groups:
 
-    * **current_flags** — full dict records whose ``metadata.run_id`` is
-      present, non-empty, and matches ``current_run_id`` after ``str()``
-      coercion.  These are rendered to the Stage 2 LLM for FIX-C processing.
-    * **stale_marker_ids** — ``id`` strings only for records whose
-      ``metadata.run_id`` is absent, empty, or does not match
-      ``current_run_id``.  Markers missing or with an empty ``run_id`` are
-      unconditionally classified as stale (legacy disposition: they pre-date
-      the run_id producer contract and cannot be attributed to any specific
-      run).  The caller is responsible for sweeping these via
-      :func:`_sweep_stale_fixc_markers`.
+    * **current** — full dict records whose ``metadata.run_id`` is present,
+      non-empty, and matches ``current_run_id`` after ``str()`` coercion.
+      These are rendered to the Stage 2 LLM for FIX-C processing.
+    * **stale_missing_run_id_ids** — ``id`` strings for records whose
+      ``metadata.run_id`` is absent or falsy (empty string).  These indicate
+      Stage 1 producer drift — the LLM omitted the required ``run_id`` field.
+      A WARNING is logged when this bucket is non-empty.
+    * **stale_mismatched_run_id_ids** — ``id`` strings for records whose
+      ``metadata.run_id`` is present and truthy but does not match
+      ``current_run_id``.  These are normal prior-cycle residue.
+
+    Both stale buckets must be swept by the caller via
+    :func:`_sweep_stale_fixc_markers`.
 
     .. note::
         The partition check requires ``metadata.run_id`` to be **truthy**
@@ -613,7 +628,7 @@ async def _query_stage2_flags(
         carries the top-N risk — see follow-up task for a proper
         ``scroll_by_metadata`` API on Mem0Backend.
 
-    Returns ``([], [])`` on search failure (best-effort; logs WARNING).
+    Returns ``([], [], [])`` on search failure (best-effort; logs WARNING).
     """
     try:
         results = await memory_service.search(
@@ -628,7 +643,7 @@ async def _query_stage2_flags(
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return Stage2FlagPartition([], [])
+        return Stage2FlagPartition([], [], [])
 
     if len(results) == 100:
         logger.warning(
@@ -640,7 +655,8 @@ async def _query_stage2_flags(
         )
 
     current_flags: list[dict] = []
-    stale_marker_ids: list[str] = []
+    stale_missing_run_id_ids: list[str] = []
+    stale_mismatched_run_id_ids: list[str] = []
     run_id_str = str(current_run_id)
     for r in results:
         meta = dict(r.metadata or {})
@@ -653,12 +669,28 @@ async def _query_stage2_flags(
             'task_id': str(meta.get('task_id', '')),
         }
         # Require run_id to be truthy before comparing; empty-string run_id is
-        # treated as absent and placed in the stale partition unconditionally.
+        # treated as absent and placed in the missing partition unconditionally.
         if meta.get('run_id') and str(meta['run_id']) == run_id_str:
             current_flags.append(flag_dict)
+        elif not meta.get('run_id'):
+            # Absent or falsy run_id — Stage 1 producer drift
+            stale_missing_run_id_ids.append(r.id)
         else:
-            stale_marker_ids.append(r.id)
-    return Stage2FlagPartition(current_flags, stale_marker_ids)
+            # Present and truthy but does not match current run_id — prior-cycle residue
+            stale_mismatched_run_id_ids.append(r.id)
+    if stale_missing_run_id_ids:
+        logger.warning(
+            'reconciliation._query_stage2_flags: %d Stage 2 marker(s) missing '
+            'metadata.run_id — Stage 1 producer drift (markers will be swept and '
+            'never reach the LLM); see prompts/stage1.py',
+            len(stale_missing_run_id_ids),
+            extra={
+                'project_id': project_id,
+                'missing_run_id_count': len(stale_missing_run_id_ids),
+                'current_run_id': run_id_str,
+            },
+        )
+    return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids)
 
 
 def _compute_stale_flags(
@@ -961,6 +993,12 @@ class TaskKnowledgeSync(BaseStage):
     # report.stats['stale_fixc_markers_swept'] after super().run() returns.
     _stale_fixc_markers_swept: int = 0
 
+    # Count of Stage 2 markers with absent/empty metadata.run_id observed during
+    # the current assemble_payload() call (task 1257).  Non-zero indicates Stage 1
+    # producer drift — the LLM omitted the required run_id field.  Reset and
+    # injected via the same four-touchpoint pattern as _stale_fixc_markers_swept.
+    _stale_missing_run_id_markers: int = 0
+
     # Set to True by assemble_payload() when the autopilot_video contamination
     # guardrail fires (task IDs above AUTOPILOT_VIDEO_TASK_CEILING detected).
     # get_disallowed_tools() then adds DISALLOW_TASK_WRITES to the disallowed list
@@ -1004,6 +1042,7 @@ class TaskKnowledgeSync(BaseStage):
         # Reset per-run counters so cross-invocation contamination is impossible
         # (mirrors _current_run_id overwrite pattern).
         self._stale_fixc_markers_swept = 0
+        self._stale_missing_run_id_markers = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
 
@@ -1013,6 +1052,10 @@ class TaskKnowledgeSync(BaseStage):
         # downstream consumers (Stage 3 prompt, observability) can see how
         # many prior-cycle markers were swept (mirrors stage2_stage1_dups_suppressed).
         report.stats['stale_fixc_markers_swept'] = self._stale_fixc_markers_swept
+        # --- missing-run_id marker stat (task 1257) ---
+        # Mirrors _stale_fixc_markers_swept; explicit zero is required so
+        # downstream consumers never need .get(..., 0) fallbacks.
+        report.stats['stale_missing_run_id_markers'] = self._stale_missing_run_id_markers
 
         # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
         # Guard on stage identity so a future reorder of prior_reports doesn't
@@ -1427,15 +1470,19 @@ class TaskKnowledgeSync(BaseStage):
                 )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
-        # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
-        # Returns (current_flags, stale_marker_ids): stale partition contains markers
-        # whose metadata.run_id does not match the current run (or is absent — legacy
-        # markers pre-dating the run_id producer contract).  Stale markers are swept
-        # below by _sweep_stale_fixc_markers so they are never rendered to the LLM.
+        # _query_stage2_flags is best-effort: search failures yield ([], [], []) internally.
+        # Returns a Stage2FlagPartition with three fields:
+        #   .current          — markers matching the current run_id (rendered to LLM)
+        #   .stale_missing_run_id_ids  — markers with absent/empty run_id (producer drift)
+        #   .stale_mismatched_run_id_ids — markers with wrong run_id (prior-cycle residue)
+        # Both stale buckets are swept below so they are never rendered to the LLM.
         run_id_for_markers = self._current_run_id
-        active_flags, stale_marker_ids = await _query_stage2_flags(
+        partition = await _query_stage2_flags(
             self.memory, self.project_id, run_id_for_markers
         )
+        active_flags = partition.current
+        stale_marker_ids = partition.stale_all_ids
+        self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
         # the active-query path ONLY.  Stage 1's structured-output flags are
