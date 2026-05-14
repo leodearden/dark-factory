@@ -9,9 +9,8 @@ import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from mcp.server.fastmcp import Context, FastMCP
-
 import aiosqlite
+from mcp.server.fastmcp import Context, FastMCP
 
 from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
