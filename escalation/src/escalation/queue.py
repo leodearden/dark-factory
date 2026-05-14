@@ -343,7 +343,17 @@ class EscalationQueue:
     def attach_dedupe_child(
         self, parent_id: str, child_id: str,
     ) -> Escalation | None:
-        """Atomically append *child_id* to the pending parent's dedupe_children list.
+        """Append *child_id* to the pending parent's dedupe_children list.
+
+        **Not concurrency-safe.**  The read-modify-write of ``dedupe_count``
+        and ``dedupe_children`` is *not* atomic: two concurrent callers for
+        the same parent each read the same pre-mutation snapshot, both append
+        once and both write with the same incremented count, and the second
+        rewrite silently clobbers the first — losing a child.  The caller must
+        serialize concurrent attaches against the same parent.  Today this
+        invariant holds because the MCP server is single-writer; any
+        multi-writer migration must add explicit serialization before calling
+        this function.
 
         Loads the parent directly from ``queue_dir/{parent_id}.json`` — it does
         NOT fall back to the archive.  This ensures that resolved / dismissed
@@ -353,8 +363,9 @@ class EscalationQueue:
         On a successful attach:
         - ``parent.dedupe_children`` gains *child_id* (appended).
         - ``parent.dedupe_count`` is incremented by 1.
-        - The updated parent is atomically written back to disk via
-          ``_rewrite()``.
+        - The updated parent is written back to disk via ``_rewrite()``.  Only
+          this final file-replace step is atomic (``tempfile.mkstemp`` +
+          ``os.rename``); the preceding in-memory mutations are not.
         - The updated ``Escalation`` object is returned.
 
         Returns ``None`` when:
