@@ -325,6 +325,10 @@ class TestPathResolution:
         assert str(resolved).startswith(str(tmp_path))
         assert '..' not in resolved.parts
 
+    def test_overrides_db_path_default(self, tmp_path: Path) -> None:
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.overrides_db_path == tmp_path / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+
 
 class TestStewardTimeoutInvariant:
     """OrchestratorConfig must reject configs where timeouts.steward < steward_completion_timeout."""
