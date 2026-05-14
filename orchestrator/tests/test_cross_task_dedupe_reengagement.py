@@ -131,3 +131,68 @@ class TestCrossTaskDedupeReengagement:
         assert len(queue_root_files) == 1, (
             f'Expected exactly 1 file (parent under task A); got: {queue_root_files}'
         )
+
+    @pytest.mark.asyncio
+    async def test_resolve_callback_fires_for_parent_task_id_only(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Parent resolution signals only A's event; B's event stays clear.
+
+        Pins Harness._on_escalation_resolved (harness.py:2503-2521): callback
+        looks up escalation.task_id in _escalation_events — the parent's task_id
+        is 'A', so only events['A'] is set.  B receives no direct harness signal.
+
+        Contract reference: DESIGN.md "Escalation cross-task dedupe"
+        — "On parent resolve, only the parent's task_id receives a per-task wake
+        signal (Harness._escalation_events[A]); cross-task children receive NO
+        direct harness signal."
+        """
+        queue = harness._escalation_queue
+        server = create_server(queue)
+
+        # Pre-populate per-task events to simulate two active workflow slots.
+        harness._escalation_events['A'] = asyncio.Event()
+        harness._escalation_events['B'] = asyncio.Event()
+        events = harness._escalation_events
+
+        # Submit parent blocker from task A — notify callback fires, sets events['A'].
+        first = await _blocker(
+            server,
+            task_id='A',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        assert first['status'] == 'queued'
+        parent_id = first['id']
+
+        # Submit cross-task blocker from task B — dedupes; notify callback NOT fired.
+        second = await _blocker(
+            server,
+            task_id='B',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+        assert second['status'] == 'dedup_skipped'
+
+        # Reset both events before the resolve step so we can assert the
+        # resolve callback's fan-out in isolation.
+        events['A'].clear()
+        events['B'].clear()
+
+        # Resolve parent directly (resolve_callback fires _on_escalation_resolved).
+        harness._escalation_queue.resolve(
+            parent_id, resolution='infra fixed', resolved_by='steward-test'
+        )
+
+        # Only A's event is set — the resolve callback keys on escalation.task_id.
+        assert events['A'].is_set(), (
+            'Parent task A event must be set after queue.resolve() — '
+            '_on_escalation_resolved uses escalation.task_id to look up the event.'
+        )
+        assert not events['B'].is_set(), (
+            'Child task B event must NOT be set after parent resolves — '
+            'cross-task children receive no direct harness signal per '
+            'DESIGN.md "Escalation cross-task dedupe" / server.py:88-90 contract.'
+        )
