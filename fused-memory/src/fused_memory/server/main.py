@@ -1,5 +1,7 @@
 """Entry point for the Fused Memory MCP server."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import contextlib
@@ -904,7 +906,7 @@ async def _build_task_backend(taskmaster_config):
     return SqliteTaskBackend(taskmaster_config)
 
 
-async def _build_ticket_store(data_dir: Path) -> 'TicketStore':
+async def _build_ticket_store(data_dir: Path) -> TicketStore:
     """Construct and initialise a :class:`TicketStore` for the given data directory.
 
     The store is backed by ``data_dir/tickets.db`` (sibling to
@@ -938,7 +940,7 @@ def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
 
 async def _setup_curator_usage_gate(
     config: FusedMemoryConfig,
-) -> 'tuple[CostStore | None, UsageGate | None]':
+) -> tuple[CostStore | None, UsageGate | None]:
     """Open a CostStore and construct a UsageGate for the curator, with leak protection.
 
     If ``config.usage_cap`` is None or disabled, returns ``(None, None)``
@@ -966,7 +968,10 @@ async def _setup_curator_usage_gate(
     try:
         curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
     except BaseException:
-        await curator_cost_store.close()
+        try:
+            await curator_cost_store.close()
+        except Exception:
+            logger.exception('CostStore close failed during UsageGate init rollback')
         raise
 
     logger.info(
@@ -1064,7 +1069,7 @@ def _install_operator_stop_handler(on_operator_stop: Callable[[], None]) -> None
             )
 
 
-def _register_drain_signal_handler(reconciliation_harness: 'ReconciliationHarness') -> None:
+def _register_drain_signal_handler(reconciliation_harness: ReconciliationHarness) -> None:
     """Register a SIGUSR1 handler that triggers reconciliation_harness.drain().
 
     Uses loop.add_signal_handler (asyncio-safe) when a running event loop is
@@ -1102,14 +1107,14 @@ def _register_drain_signal_handler(reconciliation_harness: 'ReconciliationHarnes
 
 async def _graceful_shutdown(
     memory_service: MemoryService,
-    task_interceptor: 'TaskInterceptor | None',
-    harness_loop_task: 'asyncio.Task[None] | None',
-    recon_journal: 'ReconciliationJournal | None',
-    event_queue: 'EventQueue | None' = None,
-    sqlite_watchdog: 'SqliteWatchdog | None' = None,
+    task_interceptor: TaskInterceptor | None,
+    harness_loop_task: asyncio.Task[None] | None,
+    recon_journal: ReconciliationJournal | None,
+    event_queue: EventQueue | None = None,
+    sqlite_watchdog: SqliteWatchdog | None = None,
     taskmaster: Any = None,
-    curator_cost_store: 'CostStore | None' = None,
-    curator_usage_gate: 'UsageGate | None' = None,
+    curator_cost_store: CostStore | None = None,
+    curator_usage_gate: UsageGate | None = None,
 ) -> None:
     """Perform an ordered, exception-resilient server shutdown.
 
