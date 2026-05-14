@@ -12,9 +12,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
-
-import pytest
 
 from fused_memory.server import main as server_main
 
