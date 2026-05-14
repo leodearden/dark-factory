@@ -2284,9 +2284,11 @@ def create_mcp_server(
     # fused_memory/middleware/task_interceptor.py:108-112.
     #
     # Invariant: overrides live in scheduler_overrides.db, physically separate
-    # from the tasks store.  set_task_status writes to the tasks store and
-    # cannot affect override rows.
-    # See test_set_task_status_done_does_not_clear_override_row.
+    # from the tasks store.  set_task_status writes to the tasks store via
+    # task_interceptor and the MCP-tool body does not touch override rows.
+    # test_set_task_status_done_does_not_clear_override_row pins both:
+    #   (1) delegation wiring — task_interceptor.set_task_status.assert_called_once()
+    #   (2) cross-store separation — override row survives the status transition.
     # ------------------------------------------------------------------
 
     async def _open_overrides_db(project_root: str) -> aiosqlite.Connection:
