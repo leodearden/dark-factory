@@ -1293,6 +1293,26 @@ class TaskKnowledgeSync(BaseStage):
         watermark: Watermark,
         prior_reports: list[StageReport],
     ) -> str:
+        # Guard: reject calls without a run_id before any I/O.  With an empty
+        # run_id, _query_stage2_flags would classify ALL existing Mem0 markers
+        # as stale (the partition treats an empty-string run_id as absent — see
+        # its docstring), so stale_marker_ids becomes non-empty even when no
+        # flags are active.  _sweep_stale_fixc_markers (called unconditionally
+        # whenever stale_marker_ids is non-empty) would then mass-delete all
+        # fixc markers, corrupting the marker store with causation_id=''.
+        # Raising here short-circuits before any filter_task_tree / Mem0 /
+        # Taskmaster I/O, ensuring _track_flag_persistence and
+        # _write_escalation_markers never write records stamped with an empty
+        # run_id.
+        if not self._current_run_id:
+            raise RuntimeError(
+                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
+                '_current_run_id is not set.  In production this is set '
+                'automatically by run().  In tests, assign '
+                'stage._current_run_id = "test-run" before calling '
+                'assemble_payload() directly.'
+            )
+
         stage1_report = prior_reports[0] if prior_reports else None
 
         # Dual-path: use harness-injected tree or self-fetch (task 455)
@@ -1378,33 +1398,13 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
-        # Guard fires BEFORE the search.  With an empty run_id,
-        # _query_stage2_flags would classify ALL existing Mem0 markers as stale
-        # (the partition treats an empty-string run_id as absent — see its
-        # docstring), so stale_marker_ids becomes non-empty even when no flags
-        # are active.  _sweep_stale_fixc_markers (called unconditionally
-        # whenever stale_marker_ids is non-empty) would then mass-delete all
-        # fixc markers, corrupting the marker store with causation_id=''.
-        # Short-circuiting before the search catches this case, avoids the
-        # Mem0 round-trip, and ensures _track_flag_persistence and
-        # _write_escalation_markers never write persistence/escalation records
-        # stamped with an empty run_id.
-        if not self._current_run_id:
-            raise RuntimeError(
-                'TaskKnowledgeSync.assemble_payload() called without a run_id: '
-                '_current_run_id is not set.  In production this is set '
-                'automatically by run().  In tests, assign '
-                'stage._current_run_id = "test-run" before calling '
-                'assemble_payload() directly.'
-            )
-
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
         # Returns (current_flags, stale_marker_ids): stale partition contains markers
         # whose metadata.run_id does not match the current run (or is absent — legacy
         # markers pre-dating the run_id producer contract).  Stale markers are swept
         # below by _sweep_stale_fixc_markers so they are never rendered to the LLM.
-        run_id_for_markers = self._current_run_id or ''
+        run_id_for_markers = self._current_run_id
         active_flags, stale_marker_ids = await _query_stage2_flags(
             self.memory, self.project_id, run_id_for_markers
         )
