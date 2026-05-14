@@ -1704,7 +1704,17 @@ class TestReconcileStrandedInProgress:
         would still hold in the sibling test.
         """
         harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
-        harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)
+        # Decouple the two is_ancestor call sites:
+        #   - 1st call: is_ancestor(branch, main_branch) — fires on both branches.
+        #   - 2nd call: is_ancestor(marker_sha, branch_base_sha) — fires only on
+        #     the merge-marker path, and must return False here so the stale-
+        #     marker veto does NOT fire (we want pass-through on this test).
+        # Element [1]=False is never consumed on the is-ancestor-path branch
+        # (only one call happens before _mark_in_progress_done is invoked);
+        # it is load-bearing on the merge-marker-path branch.  Do not collapse
+        # back to return_value= — that couples two semantically distinct call
+        # sites to the same value (reviewer ref: esc-1276-3 #2).
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[is_ancestor_val, False])
         harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)
         harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
             return_value={'metadata': {'branch_base_sha': branch_base_sha}}
