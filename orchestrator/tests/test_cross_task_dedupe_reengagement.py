@@ -24,7 +24,6 @@ from escalation.server import create_server
 
 from orchestrator.harness import Harness
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -98,6 +97,7 @@ class TestCrossTaskDedupeReengagement:
         they share a dedupe key after summary_dedupe_key normalisation.
         """
         queue = harness._escalation_queue
+        assert queue is not None
         server = create_server(queue)
 
         # Submit parent blocker from task A.
@@ -148,6 +148,7 @@ class TestCrossTaskDedupeReengagement:
         direct harness signal."
         """
         queue = harness._escalation_queue
+        assert queue is not None
         server = create_server(queue)
 
         # Pre-populate per-task events to simulate two active workflow slots.
@@ -182,7 +183,7 @@ class TestCrossTaskDedupeReengagement:
         events['B'].clear()
 
         # Resolve parent directly (resolve_callback fires _on_escalation_resolved).
-        harness._escalation_queue.resolve(
+        queue.resolve(
             parent_id, resolution='infra fixed', resolved_by='steward-test'
         )
 
@@ -212,6 +213,7 @@ class TestCrossTaskDedupeReengagement:
         must satisfy these gates, making them eligible for re-acquisition.
         """
         queue = harness._escalation_queue
+        assert queue is not None
         server = create_server(queue)
 
         # Submit parent from A, dedupe child from B, then resolve the parent.
@@ -233,24 +235,24 @@ class TestCrossTaskDedupeReengagement:
         )
         assert second['status'] == 'dedup_skipped'
 
-        harness._escalation_queue.resolve(
+        queue.resolve(
             parent_id, resolution='infra fixed', resolved_by='steward-test'
         )
 
         # B: no pending L0 — dedupe meant no file was ever written under task_id='B'.
-        assert harness._escalation_queue.get_by_task('B', status='pending', level=0) == [], (
+        assert queue.get_by_task('B', status='pending', level=0) == [], (
             'B must have no pending L0 escalations — cross-task dedupe wrote no '
             'file under task_id=B, so the scheduler gate is clear.'
         )
-        assert not harness._escalation_queue.has_open_l1('B'), (
+        assert not queue.has_open_l1('B'), (
             'B must have no open L1 escalations after parent resolve.'
         )
 
         # A: parent archived on resolve — no pending L0 or L1 remains.
-        assert harness._escalation_queue.get_by_task('A', status='pending', level=0) == [], (
+        assert queue.get_by_task('A', status='pending', level=0) == [], (
             'A must have no pending L0 escalations after parent is resolved/archived.'
         )
-        assert not harness._escalation_queue.has_open_l1('A'), (
+        assert not queue.has_open_l1('A'), (
             'A must have no open L1 escalations after parent resolve.'
         )
 
@@ -278,6 +280,7 @@ class TestCrossTaskDedupeReengagement:
         that is the workflow-layer concern noted above.
         """
         queue = harness._escalation_queue
+        assert queue is not None
         server = create_server(queue)
 
         # --- Local sweep model mirroring Scheduler.acquire_next's terminal gates ---
@@ -328,7 +331,7 @@ class TestCrossTaskDedupeReengagement:
         )
 
         # Resolve parent.
-        harness._escalation_queue.resolve(
+        queue.resolve(
             parent_id, resolution='infra fixed', resolved_by='steward-test'
         )
 
