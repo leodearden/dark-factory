@@ -285,6 +285,42 @@ class TestFindDedupeParent:
         result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now)
         assert result == 'esc-1-1'  # oldest
 
+    def test_oldest_match_with_close_timestamps(self, tmp_path):
+        """(h2) Three parents with sub-second gaps inserted out of order: oldest wins.
+
+        Pins that selection uses timestamp comparison, not insertion order or
+        filesystem iteration order — a gap the existing test_multiple_matching_returns_oldest
+        does not unambiguously cover (it inserts in chronological order with 50s gaps).
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        now = datetime.now(UTC)
+
+        # Submit in non-chronological order: middle, oldest, newest
+        middle = self._make_infra_esc('esc-2-1', task_id='2')
+        middle.timestamp = (now - timedelta(milliseconds=300)).isoformat()
+        queue.submit(middle)
+
+        oldest = self._make_infra_esc('esc-1-1', task_id='1')
+        oldest.timestamp = (now - timedelta(milliseconds=500)).isoformat()
+        queue.submit(oldest)
+
+        newest = self._make_infra_esc('esc-3-1', task_id='3')
+        newest.timestamp = (now - timedelta(milliseconds=100)).isoformat()
+        queue.submit(newest)
+
+        candidate = self._make_infra_esc(
+            'esc-4-1',
+            task_id='4',
+            summary='fused-memory connection timeout on port 9999',
+        )
+        result = find_dedupe_parent(queue, candidate, DedupeConfig(), now=now + timedelta(seconds=5))
+        assert result == 'esc-1-1'  # oldest by timestamp, not insertion order
+
     def test_enabled_flag_not_checked_inside_find_dedupe_parent(self, tmp_path):
         """(h) infra_dedupe_enabled=False does NOT affect find_dedupe_parent itself.
 
