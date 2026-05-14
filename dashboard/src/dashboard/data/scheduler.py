@@ -145,6 +145,9 @@ def _compose_rows(
                 )
                 age_seconds = max(age_seconds, 0)
             except (ValueError, TypeError):
+                logger.warning(
+                    'park_state.installed_at unparseable for %s: %r', tid, installed_at_str
+                )
                 age_seconds = 0
         else:
             # Age from task started (minutes → seconds)
@@ -273,27 +276,22 @@ async def collect_scheduler_state(
         if _project_label(root) not in offline_projects
     ]
 
-    async def _one_project(root) -> tuple[str, dict, list[dict]]:
-        """Fetch snapshot + events for one project root; return (label, snapshot, events).
+    async def _one_project(root) -> tuple[str, dict | None, list[dict]]:
+        """Fetch snapshot + events for one project root.
 
-        URLs are tried sequentially (first-success wins).  Each URL iteration
-        resets snapshot/events to prevent a partial-success on url1 from bleeding
-        into a failed url2 attempt (robustness guard: snapshot from one URL must
-        not be paired with events fetched from a different URL attempt).
+        URLs are tried sequentially (first-success wins).  On success the
+        function returns immediately from inside the ``try`` block, so there is
+        no risk of bleed between a partial success on url1 and a failure on url2.
 
-        Returns ``(label, {}, [])`` when every URL fails (caller detects offline
-        via ``not snapshot``).
+        Returns ``(label, snapshot, events)`` on success — ``snapshot`` may be
+        ``{}`` for a project with no scheduler state yet (online but empty).
+        Returns ``(label, None, [])`` when every URL fails; the ``None``
+        sentinel lets the caller distinguish *offline* from *online-but-empty*
+        so a legitimately quiescent project is never misclassified as offline.
         """
         label = _project_label(root)
-        snapshot: dict = {}
-        events: list[dict] = []
 
         for url in config.fused_memory_urls:
-            # Reset per-URL so a partial success on a prior URL doesn't bleed
-            # into this attempt — e.g. snapshot from url1 paired with empty
-            # events because url1's get_scheduler_events raised.
-            snapshot = {}
-            events = []
             try:
                 snapshot = await mcp_tool_call(
                     client,
@@ -312,11 +310,13 @@ async def collect_scheduler_state(
                     },
                 )
                 if isinstance(events_raw, list):
-                    events = events_raw
+                    events: list[dict] = events_raw
                 elif isinstance(events_raw, dict):
                     # events may be wrapped: {'events': [...]}
                     events = events_raw.get('events') or []
-                break  # first-success wins; don't try remaining URLs
+                else:
+                    events = []
+                return label, snapshot, events  # first-success wins
             except (
                 httpx.ConnectError,
                 httpx.TimeoutException,
@@ -327,7 +327,12 @@ async def collect_scheduler_state(
                 invalidate_session(url)
                 continue
 
-        return label, snapshot, events
+        return label, None, []  # all URLs failed; None signals offline
+
+    # Build a label→root map for O(1) lookup after asyncio.gather.
+    # (A linear next(...) search over roots_to_query would be O(n²) in the
+    # number of projects — trivially avoidable with a single pre-pass.)
+    label_to_root = {_project_label(r): r for r in roots_to_query}
 
     # Fan out to all project roots concurrently (mirrors metrics.py pattern)
     per_project_results = await asyncio.gather(
@@ -351,15 +356,13 @@ async def collect_scheduler_state(
             continue
         label, snapshot, events = result
 
-        if not snapshot:
+        # None snapshot means every URL failed (offline); {} means online-but-empty.
+        if snapshot is None:
             offline_projects.append(label)
             continue
 
-        # Find the matching project root for this label
-        root = next(
-            (r for r in roots_to_query if _project_label(r) == label),
-            None,
-        )
+        # O(1) lookup via pre-built map (avoids O(n²) linear search per project)
+        root = label_to_root.get(label)
         if root is None:
             continue
 

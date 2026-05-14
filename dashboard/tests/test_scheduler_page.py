@@ -420,7 +420,11 @@ def test_shape_scheduler_envelope():
 
 
 def test_scheduler_endpoint_returns_envelope_shape(client):
-    """GET /scheduler returns 200 with SCHEDULER key containing the inner keys."""
+    """GET /scheduler returns 200 with SCHEDULER key containing the inner keys.
+
+    Also pins the empty-state contract: when the collector returns empty tuples,
+    the shaped response must have offline=False, rows=[], etc.
+    """
     from unittest.mock import AsyncMock, patch
 
     empty_5tuple = ([], [], [], {}, [])
@@ -438,6 +442,14 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert 'snapshot_at' in inner
     assert 'offline' in inner
     assert 'offline_projects' in inner
+    # Pin empty-state values so a future shape change doesn't silently regress
+    assert inner['offline'] is False
+    assert inner['rows'] == []
+    assert inner['modules'] == []
+    assert inner['pin_queue'] == []
+    assert inner['events_by_task'] == {}
+    assert inner['snapshot_at'] is None
+    assert inner['offline_projects'] == []
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +466,10 @@ _OVERRIDE_INVALID_BODIES = [
     # project_root must be present so validation reaches the named branches below
     pytest.param({'task_id': 'T1', 'project_root': '/proj', 'boost_tier': 'invalid_tier'}, 'invalid_boost_tier', id='bad-boost_tier'),
     pytest.param({'task_id': 'T1', 'project_root': '/proj', 'pin_order': 5}, 'invalid_pin_order', id='pin_order-without-pinned'),
+    # Type checks: forwarding non-bool/non-int verbatim is inconsistent with strict validation
+    pytest.param({'task_id': 'T1', 'project_root': '/proj', 'pinned': 'yes'}, 'invalid_pinned', id='pinned-not-bool'),
+    pytest.param({'task_id': 'T1', 'project_root': '/proj', 'reserve_now': 1}, 'invalid_reserve_now', id='reserve_now-not-bool'),
+    pytest.param({'task_id': 'T1', 'project_root': '/proj', 'pinned': True, 'pin_order': '5'}, 'invalid_pin_order', id='pin_order-not-int'),
 ]
 
 

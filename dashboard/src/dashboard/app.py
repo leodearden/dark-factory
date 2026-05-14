@@ -795,6 +795,36 @@ def _sched_fan_out_error(errors: list[str]) -> JSONResponse:
     )
 
 
+async def _scheduler_proxy(
+    http_client: httpx.AsyncClient,
+    config: DashboardConfig,
+    tool_name: str,
+    args: dict,
+    *,
+    treat_not_found_as_404: bool = True,
+) -> JSONResponse:
+    """Fan out an MCP tool call over all fused_memory_urls, return first success.
+
+    Validation and argument construction happen in the calling route handler;
+    this helper is responsible only for the fan-out, transport error handling,
+    and status-code mapping (502 when all URLs fail, optional 404 on not_found).
+    """
+    errors: list[str] = []
+    for url in config.fused_memory_urls:
+        try:
+            result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
+        except (httpx.ConnectError, httpx.TimeoutException,
+                httpx.HTTPStatusError, ValueError) as exc:
+            logger.warning('%s failed for %s: %s', tool_name, url, exc)
+            errors.append(f'{url}: {str(exc)[:200]}')
+            memory_data.invalidate_session(url)
+            continue
+        if treat_not_found_as_404 and result.get('error') == 'not_found':
+            return JSONResponse(result, status_code=404)
+        return JSONResponse(result)
+    return _sched_fan_out_error(errors)
+
+
 @app.post('/api/v2/dashboard/scheduler/override')
 async def api_scheduler_override(request: Request) -> JSONResponse:
     """Proxy POST /scheduler/override → set_task_priority_override MCP tool."""
@@ -821,8 +851,24 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    pin_order = body.get('pin_order')
+    # Type-check bool fields before forwarding — forwarding 'yes'/1 verbatim
+    # would surface whatever fused-memory chooses to return, inconsistent with
+    # the strict validation applied to boost_tier/ttl_minutes/task_id/project_root.
     pinned = body.get('pinned')
+    if pinned is not None and not isinstance(pinned, bool):
+        return JSONResponse({'error': 'invalid_pinned'}, status_code=400)
+
+    reserve_now = body.get('reserve_now')
+    if reserve_now is not None and not isinstance(reserve_now, bool):
+        return JSONResponse({'error': 'invalid_reserve_now'}, status_code=400)
+
+    pin_order = body.get('pin_order')
+    # Reject non-integer pin_order (bool subclasses int in Python, so exclude it)
+    if pin_order is not None and not (isinstance(pin_order, int) and not isinstance(pin_order, bool)):
+        return JSONResponse(
+            {'error': 'invalid_pin_order', 'detail': 'pin_order must be an integer'},
+            status_code=400,
+        )
     if pin_order is not None and pinned is not True:
         return JSONResponse(
             {'error': 'invalid_pin_order', 'detail': 'pin_order requires pinned=True'},
@@ -861,22 +907,7 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
-        try:
-            result = await memory_data.mcp_tool_call(
-                http_client, url, 'set_task_priority_override', args,
-            )
-        except (httpx.ConnectError, httpx.TimeoutException,
-                httpx.HTTPStatusError, ValueError) as exc:
-            logger.warning('set_task_priority_override failed for %s: %s', url, exc)
-            errors.append(f'{url}: {str(exc)[:200]}')
-            memory_data.invalidate_session(url)
-            continue
-        if result.get('error') == 'not_found':
-            return JSONResponse(result, status_code=404)
-        return JSONResponse(result)
-    return _sched_fan_out_error(errors)
+    return await _scheduler_proxy(http_client, config, 'set_task_priority_override', args)
 
 
 @app.post('/api/v2/dashboard/scheduler/clear-override')
@@ -917,22 +948,7 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
-        try:
-            result = await memory_data.mcp_tool_call(
-                http_client, url, 'clear_task_priority_override', args,
-            )
-        except (httpx.ConnectError, httpx.TimeoutException,
-                httpx.HTTPStatusError, ValueError) as exc:
-            logger.warning('clear_task_priority_override failed for %s: %s', url, exc)
-            errors.append(f'{url}: {str(exc)[:200]}')
-            memory_data.invalidate_session(url)
-            continue
-        if result.get('error') == 'not_found':
-            return JSONResponse(result, status_code=404)
-        return JSONResponse(result)
-    return _sched_fan_out_error(errors)
+    return await _scheduler_proxy(http_client, config, 'clear_task_priority_override', args)
 
 
 @app.post('/api/v2/dashboard/scheduler/reorder-pin-queue')
@@ -959,21 +975,13 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
-        try:
-            result = await memory_data.mcp_tool_call(
-                http_client, url, 'reorder_pin_queue',
-                {'task_ids': task_ids, 'project_root': project_root},
-            )
-        except (httpx.ConnectError, httpx.TimeoutException,
-                httpx.HTTPStatusError, ValueError) as exc:
-            logger.warning('reorder_pin_queue failed for %s: %s', url, exc)
-            errors.append(f'{url}: {str(exc)[:200]}')
-            memory_data.invalidate_session(url)
-            continue
-        return JSONResponse(result)
-    return _sched_fan_out_error(errors)
+    # reorder_pin_queue forwards MCP results verbatim (no not_found→404 mapping),
+    # so the React layer can toast on 'mismatch' without an extra round-trip.
+    return await _scheduler_proxy(
+        http_client, config, 'reorder_pin_queue',
+        {'task_ids': task_ids, 'project_root': project_root},
+        treat_not_found_as_404=False,
+    )
 
 
 @app.get('/api/v2/dashboard/burndown')
