@@ -1165,9 +1165,9 @@ async def test_collect_scheduler_state_tags_pins_with_project(dummy_client, tmp_
     assert len(pin_queue) == 2
     # Each pin carries its owning project + project_root so React can build
     # a composite key and the reorder handler can dispatch per-project.
-    projects = sorted(p.get('project') for p in pin_queue)
+    projects = sorted(p['project'] for p in pin_queue)
     assert projects == sorted([p1.name, p2.name])
-    roots = sorted(p.get('project_root') for p in pin_queue)
+    roots = sorted(p['project_root'] for p in pin_queue)
     assert roots == sorted([str(p1), str(p2)])
 
 
