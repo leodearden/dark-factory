@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -380,6 +380,38 @@ class TestSweeps:
         assert 'A' not in remaining
         assert 'B' in remaining
         assert 'C' in remaining
+
+    def test_clear_expired_handles_non_utc_ttl(self, tmp_path: Path) -> None:
+        """TTLs stored with non-UTC offsets must still expire correctly.
+
+        Pre-fix: ttl_until is stored verbatim as ISO string, so lexicographic
+        compare of "2026-05-14T05:00:00+05:00" vs "2026-05-14T01:00:00+00:00"
+        incorrectly puts the TTL *after* now (05 > 01).
+
+        Post-fix: set_override normalises to UTC before storing, so the stored
+        value is "2026-05-14T00:00:00+00:00" and clear_expired correctly sees
+        it has expired when now = 01:00 UTC.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        # +05:00 time that is 00:00 UTC absolute (i.e. already expired vs 01:00 UTC)
+        ttl_plus5 = datetime(2026, 5, 14, 5, 0, tzinfo=timezone(timedelta(hours=5)))
+        now_utc = datetime(2026, 5, 14, 1, 0, tzinfo=UTC)  # 1 hour later in absolute time
+
+        store.set_override('proj', 'A', ttl_until=ttl_plus5)
+        cleared = store.clear_expired('proj', now_utc)
+        assert cleared == ['A'], (
+            'Entry with ttl_plus5 (==00:00 UTC absolute) must be cleared when now=01:00 UTC'
+        )
+
+    def test_set_override_rejects_naive_ttl(self, tmp_path: Path) -> None:
+        """set_override must reject naive (tz-unaware) ttl_until datetimes."""
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        with pytest.raises(ValueError, match='timezone'):
+            store.set_override('proj', 'B', ttl_until=datetime(2026, 5, 14))
 
 
 class TestSeparateDB:
