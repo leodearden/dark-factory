@@ -17,8 +17,8 @@ import pytest
 
 from dashboard.data.metrics import (
     METRICS_SCHEMA,
-    downsample_metrics,
     collect_metrics_snapshot,
+    downsample_metrics,
 )
 
 # ---------------------------------------------------------------------------
@@ -675,7 +675,7 @@ async def test_collect_metrics_snapshot_writes_curator_row(tmp_path: Path, confi
         'SELECT pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms '
         'FROM curator_snapshots'
     ) as cur:
-        rows = await cur.fetchall()
+        rows = list(await cur.fetchall())
 
     await metrics_conn.close()
 
@@ -697,6 +697,7 @@ async def test_collect_metrics_snapshot_writes_curator_row(tmp_path: Path, confi
 async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path: Path):
     """_metrics_loop._run_once passes tickets_db kwarg to collect_metrics_snapshot."""
     import asyncio
+
     from dashboard.app import app, lifespan
 
     mock_collect = AsyncMock()
