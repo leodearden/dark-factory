@@ -2006,6 +2006,75 @@ class Scheduler:
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
         return None
 
+    def get_state_snapshot(self) -> dict:
+        """Return a deep-copy snapshot of current in-memory scheduler state.
+
+        Contains seven top-level keys:
+        - skip_counts: {task_id: int}
+        - parks: {task_id: {modules: [...], installed_at: str}}
+        - effective_priorities: {task_id: str}
+        - pin_queue: [{task_id: str, order: int}, ...]
+        - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
+        - current_holders: {module: task_id}
+        - snapshot_at: ISO8601 timestamp
+        """
+        # skip_counts — plain int values, safe to copy.
+        skip_counts = dict(self._skip_count)
+
+        # parks — invert _parked (module→owner) to owner→{modules, installed_at}.
+        parks: dict[str, dict] = {}
+        for module, (owner, _rank) in self.lock_table._parked.items():
+            if owner not in parks:
+                parks[owner] = {
+                    'modules': [],
+                    'installed_at': self.lock_table._park_install_at.get(owner, ''),
+                }
+            parks[owner]['modules'].append(module)
+
+        # effective_priorities — already a shallow dict of str→str.
+        effective_priorities = dict(self._last_effective_priorities)
+
+        # pin_queue — read from the override store if available.
+        pin_queue: list[dict] = []
+        if self._override_store:
+            try:
+                for tid, row in self._override_store.get_pin_queue(self._project_root):
+                    pin_queue.append({'task_id': tid, 'order': row.pin_order})
+            except Exception:
+                pass
+
+        # overrides — convert OverrideRow dataclasses to plain dicts.
+        overrides: dict[str, dict] = {}
+        if self._override_store:
+            try:
+                for tid, row in self._override_store.get_overrides(
+                    self._project_root
+                ).items():
+                    overrides[tid] = {
+                        'boost_tier': row.boost_tier,
+                        'pinned': row.pinned,
+                        'reserve_now': row.reserve_now,
+                        'ttl_until': row.ttl_until.isoformat() if row.ttl_until else None,
+                    }
+            except Exception:
+                pass
+
+        # current_holders — invert _held (task→modules) to module→task.
+        current_holders: dict[str, str] = {}
+        for task_id, modules in self.lock_table._held.items():
+            for m in modules:
+                current_holders[m] = task_id
+
+        return {
+            'skip_counts': skip_counts,
+            'parks': parks,
+            'effective_priorities': effective_priorities,
+            'pin_queue': pin_queue,
+            'overrides': overrides,
+            'current_holders': current_holders,
+            'snapshot_at': datetime.now(UTC).isoformat(),
+        }
+
     async def handle_blast_radius_expansion(
         self,
         task_id: str,

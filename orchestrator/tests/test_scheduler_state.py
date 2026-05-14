@@ -294,3 +294,44 @@ class TestEffectivePrioritiesCache:
             'A is depended upon by high-priority B; effective priority must be high'
         )
         assert scheduler._last_effective_priorities['B'] == 'high'
+
+
+# ===========================================================================
+# Step-11: get_state_snapshot() shape and deep-copy
+# ===========================================================================
+
+_SNAPSHOT_KEYS = frozenset({
+    'skip_counts', 'parks', 'effective_priorities',
+    'pin_queue', 'overrides', 'current_holders', 'snapshot_at',
+})
+
+
+class TestGetStateSnapshotShape:
+    """get_state_snapshot() returns the correct seven-key dict."""
+
+    def test_snapshot_returns_seven_top_level_keys(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        snap = scheduler.get_state_snapshot()
+        assert set(snap.keys()) == _SNAPSHOT_KEYS
+
+    def test_snapshot_empty_scheduler_returns_empty_collections(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        snap = scheduler.get_state_snapshot()
+        assert snap['skip_counts'] == {}
+        assert snap['parks'] == {}
+        assert snap['effective_priorities'] == {}
+        assert snap['pin_queue'] == []
+        assert snap['overrides'] == {}
+        assert snap['current_holders'] == {}
+        # snapshot_at must be an ISO8601 string.
+        datetime.fromisoformat(snap['snapshot_at'])
+
+    def test_snapshot_is_deep_copy_of_internal_state(self):
+        """Mutating the returned snapshot must not affect the scheduler's internal state."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler._skip_count['X'] = 3
+        snap = scheduler.get_state_snapshot()
+        snap['skip_counts']['X'] = 99
+        assert scheduler._skip_count['X'] == 3, (
+            'Mutating snapshot must not affect internal _skip_count'
+        )
