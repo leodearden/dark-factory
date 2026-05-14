@@ -99,32 +99,6 @@ def _is_valid_sha_40(s: object) -> TypeGuard[str]:
     )
 
 
-def _get_task_metadata_dict(task: dict | None) -> dict:
-    """Coerce raw ``task['metadata']`` from ``Scheduler.get_task`` to a dict.
-
-    ``Scheduler.get_task`` now normalises ``task['metadata']`` to a dict at
-    the boundary (via ``_normalize_task_metadata``) — consistent with
-    ``get_tasks`` / ``acquire_next``.  This helper is therefore defensive:
-    it handles the ``task is None`` and ``metadata`` absent/malformed cases
-    that can still occur for callers passing raw task dicts from other sources.
-
-    Returns an empty dict for any missing / malformed / non-dict result
-    so callers can always do ``.get('key')`` without further checks.
-    """
-    if task is None:
-        return {}
-    raw = task.get('metadata')
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
-
-
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
@@ -1206,6 +1180,19 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         branch = f'{self.git_ops.config.branch_prefix}{tid}'
 
+        # Fetch task metadata once for both fast-paths (is_ancestor + find_merge_marker).
+        # Scheduler.get_task normalises metadata at the boundary
+        # (scheduler.py:_normalize_task_metadata), so task['metadata'] is always a
+        # dict whenever task is not None.  `or {}` collapses any residual None value
+        # (e.g. a manually-constructed task dict that bypasses normalisation); the
+        # load-bearing guard against task itself being absent is `if task else {}`.
+        # The unconditional fetch is the deliberate trade-off: one MCP call per
+        # stranded task even when neither fast-path fires (e.g. lock-state revert),
+        # in exchange for a single source of truth for `metadata` shared by both
+        # fast-paths (eliminating the duplicated per-branch get_task pattern).
+        task = await self.scheduler.get_task(tid)
+        metadata = (task.get('metadata') or {}) if task else {}
+
         # Already-on-main fast-path (is_ancestor == True).
         # NB: is_ancestor is degenerate for zero-commit branches whose tip
         # equals the main HEAD at branch-create time.  Two guards reject
@@ -1269,8 +1256,6 @@ Output JSON matching the schema. Every task must appear in the output.
             # Missing / malformed branch_base_sha → fall through (backward
             # compat for tasks created before this guard was deployed, or
             # if the metadata write failed transiently at creation time).
-            task = await self.scheduler.get_task(tid)
-            metadata = _get_task_metadata_dict(task)
             branch_base_sha = metadata.get('branch_base_sha')
             if _is_valid_sha_40(branch_base_sha):
                 branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
@@ -1323,8 +1308,6 @@ Output JSON matching the schema. Every task must appear in the output.
             #
             # Missing/malformed branch_base_sha → fall through (backward compat
             # for tasks created before this guard was deployed).
-            task = await self.scheduler.get_task(tid)
-            metadata = _get_task_metadata_dict(task)
             branch_base_sha = metadata.get('branch_base_sha')
             if _is_valid_sha_40(branch_base_sha) and await self.git_ops.is_ancestor(
                 marker_sha, branch_base_sha
