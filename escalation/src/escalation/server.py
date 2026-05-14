@@ -110,6 +110,8 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
         )
+        # Returns {id, status} or {id, status, parent_id} on dedupe.
+        # No 'action' key — that is only on the blocker path.
         return _submit_or_dedupe(esc)
 
     @mcp.tool()
