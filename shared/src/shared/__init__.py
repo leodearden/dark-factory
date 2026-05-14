@@ -1,6 +1,10 @@
 """dark-factory-shared — public API surface."""
 
-from shared.async_sqlite_base import AsyncSqliteBase, apply_full_durability_pragmas, apply_wal_pragmas
+from shared.async_sqlite_base import (
+    AsyncSqliteBase,
+    apply_full_durability_pragmas,
+    apply_wal_pragmas,
+)
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentFailureClass,
