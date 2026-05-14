@@ -514,3 +514,30 @@ class TestParkStopConfig:
     def test_park_stop_parked_window_hours_gt_0_rejects_zero(self):
         with pytest.raises(ValidationError):
             OrchestratorConfig(park_stop_parked_window_hours=0.0)
+
+    def test_defaults_yaml_has_park_stop_block(self):
+        """defaults.yaml must carry the park_stop_* keys with the documented defaults.
+
+        This guards against the shipped defaults diverging from the Pydantic
+        field defaults — any OrchestratorConfig() instantiation will pull the
+        YAML values first (via settings_customise_sources).
+        """
+        defaults = _load_package_defaults()
+        assert 'park_stop_enabled' in defaults, (
+            "defaults.yaml is missing 'park_stop_enabled'"
+        )
+        assert 'park_stop_parked_threshold' in defaults, (
+            "defaults.yaml is missing 'park_stop_parked_threshold'"
+        )
+        assert 'park_stop_parked_window_hours' in defaults, (
+            "defaults.yaml is missing 'park_stop_parked_window_hours'"
+        )
+        assert defaults['park_stop_enabled'] is True
+        assert defaults['park_stop_parked_threshold'] == 5
+        assert defaults['park_stop_parked_window_hours'] == 1.0
+
+        # Also verify the values flow through OrchestratorConfig() at runtime.
+        config = OrchestratorConfig()
+        assert config.park_stop_enabled is True
+        assert config.park_stop_parked_threshold == 5
+        assert config.park_stop_parked_window_hours == 1.0
