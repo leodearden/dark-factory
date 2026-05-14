@@ -62,6 +62,17 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
        stripped all Unicode Pc (connector punctuation) characters.  In
        practice escalation summaries do not use underscores, so the
        divergence is harmless.
+
+       A second divergence: the regex ``[^\\w\\s]`` also strips Unicode
+       *symbol* categories (Sm/Sc/Sk/So — math symbols such as ``+`` and
+       ``=``, currency signs such as ``$``, modifier and other symbols),
+       whereas the old translate-table only removed categories starting with
+       ``P`` (Pd/Pc/Pi/Pf/Po/Ps/Pe).  Stripping symbols is deliberate: it
+       prevents adjacent tokens from being falsely split on a bare symbol
+       (e.g. ``cpu+memory`` → ``cpumemory``, not ``cpu+memory``).  The
+       old behaviour (keeping symbols) is gone; do not attempt to restore
+       it.  See ``test_unicode_symbols_stripped`` in ``test_dedupe.py`` for
+       the pinned contract.
     3. Split on whitespace (collapses multiple spaces / tabs).
     4. Return the first three tokens as a tuple (fewer if the summary
        has fewer than three words).
@@ -76,6 +87,8 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
         ('lost', 'link')
         >>> summary_dedupe_key("")
         ()
+        >>> summary_dedupe_key("cpu+memory leak")
+        ('cpumemory', 'leak')
     """
     normalised = _NON_WORD_PATTERN.sub('', summary.casefold())
     tokens = normalised.split()
