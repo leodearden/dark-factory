@@ -5367,3 +5367,73 @@ async def test_predone_hook_per_project_isolation(
         f'project-b should succeed without hook, got: {result_b}'
     )
     taskmaster.set_task_status.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 1272: orphan-race observability + cancel_ticket logs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_add_ticket_orphan_race_logs_warning_with_task_id(
+    interceptor_with_store, ticket_store, taskmaster, caplog,
+):
+    """_process_add_ticket emits a WARNING when the terminal mark_resolved returns
+    False because cancel_ticket won the TOCTOU race.
+
+    Setup: a racing_mark_resolved wrapper simulates cancel_ticket winning the
+    race by persisting status='cancelled' BEFORE forwarding the worker's
+    mark_resolved(status='created') call.  The worker's call therefore returns
+    False.  We assert that a WARNING record exists whose message contains both
+    the ticket_id and the task_id returned by tm.add_task (fixture default
+    '2').
+
+    RED: no such WARNING is currently emitted.
+    """
+    import logging
+
+    ticket_id = await ticket_store.submit(
+        project_id='project',
+        candidate_json=json.dumps({
+            'project_root': '/project',
+            'kwargs': {'title': 'T', 'description': 'D'},
+            'metadata': None,
+        }),
+    )
+
+    original_mark_resolved = ticket_store.mark_resolved
+
+    async def racing_mark_resolved(tid: str, *, status: str, **kwargs):
+        if tid == ticket_id and status == 'created':
+            # Simulate cancel_ticket winning the race: flip the row to
+            # 'cancelled' BEFORE the worker's mark_resolved lands.
+            await original_mark_resolved(tid, status='cancelled', reason='user_cancelled')
+        # Forward the worker's call — returns False because row is no longer pending.
+        return await original_mark_resolved(tid, status=status, **kwargs)
+
+    ticket_store.mark_resolved = racing_mark_resolved
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            await interceptor_with_store._process_add_ticket(ticket_id)
+    finally:
+        ticket_store.mark_resolved = original_mark_resolved
+
+    # (a) WARNING record must contain both ticket_id and orphan task_id '2'
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and ticket_id in r.message
+        and '2' in r.message
+    ]
+    assert warning_records, (
+        f'Expected a WARNING containing ticket_id={ticket_id!r} and task_id="2"; '
+        f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
+
+    # (b) Row status is 'cancelled' (cancel_ticket won the race)
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'cancelled', f'Expected cancelled, got {row["status"]!r}'
+
+    # (c) tm.add_task was called once — the task is live in tasks.json
+    taskmaster.add_task.assert_called_once()
