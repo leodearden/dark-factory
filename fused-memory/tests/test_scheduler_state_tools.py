@@ -370,9 +370,23 @@ class TestSnapshotPerformance:
                 samples.append(elapsed_ms)
 
         median_ms = statistics.median(samples)
-        # Guard: if read_scheduler_state silently returns an empty skeleton ({}),
-        # all reads become trivially fast and the perf bound loses meaning.
-        assert 'snapshot_at' in result, 'snapshot_at missing from result'
+        # Guard against false-positive perf passes.  The two failure modes that
+        # would make this test trivially fast and therefore meaningless are:
+        #   (1) read_scheduler_state silently falls back to _empty_skeleton() —
+        #       json.loads of a non-existent path is microseconds, so the
+        #       median bound would pass without exercising real read+parse.
+        #   (2) A future bug truncates the deserialized payload (e.g. partial
+        #       parse, streaming decode that stops early).
+        # `'snapshot_at' in result` does NOT catch (1) because _empty_skeleton()
+        # also contains the key `'snapshot_at'` (value None).  Checking the
+        # full size of `skip_counts` catches both: skeleton has skip_counts={}
+        # (len 0), a truncated payload has len < n, and a healthy read has len == n.
+        assert len(result['skip_counts']) == n, (
+            f'Expected {n} entries in skip_counts (full 1500-task payload), got '
+            f'{len(result["skip_counts"])} — read_scheduler_state may have fallen '
+            f'back to the empty skeleton or returned a truncated payload, which '
+            f'would make the perf bound trivially pass.'
+        )
         # Regression canary for the orchestrator snapshot-read budget (task 1230
         # acceptance criterion).  The bound is 50ms; the actual cost of
         # json.loads(path.read_bytes()) for a ~500KB file is single-digit ms on
