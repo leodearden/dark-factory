@@ -171,3 +171,62 @@ class TestCuratorUsageGateLeakGuard:
             'CostStore connection was not closed (._conn is not None after failure)'
         )
 
+    @pytest.mark.asyncio
+    async def test_setup_returns_store_and_gate_on_success(self, tmp_path):
+        """Happy path: helper returns both open store and gate; store stays open."""
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
+        usage_cap_cfg = UsageCapConfig(
+            accounts=[acct_cfg],
+            wait_for_reset=False,
+        )
+        config = MagicMock()
+        config.usage_cap = usage_cap_cfg
+        config.reconciliation = MagicMock(data_dir=str(tmp_path))
+
+        with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}):
+            store, gate = await _setup_curator_usage_gate(config)
+
+        try:
+            assert store is not None, 'Expected a CostStore, got None'
+            assert gate is not None, 'Expected a UsageGate, got None'
+            assert store._conn is not None, 'CostStore connection should be open on success'
+            assert gate.account_count == 1, (
+                f'Expected 1 account in gate, got {gate.account_count}'
+            )
+        finally:
+            # Clean teardown: close the gate's background tasks and the store.
+            await gate.shutdown()
+            await store.close()
+
+    def test_setup_returns_none_when_usage_cap_is_none(self):
+        """Helper returns (None, None) immediately when config.usage_cap is None."""
+        import asyncio  # noqa: PLC0415
+
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        config = MagicMock()
+        config.usage_cap = None
+
+        with patch('shared.cost_store.CostStore') as mock_cost_store_cls:
+            result = asyncio.run(_setup_curator_usage_gate(config))
+
+        assert result == (None, None), f'Expected (None, None), got {result!r}'
+        mock_cost_store_cls.assert_not_called()
+
+    def test_setup_returns_none_when_usage_cap_disabled(self):
+        """Helper returns (None, None) immediately when usage_cap.enabled is False."""
+        import asyncio  # noqa: PLC0415
+
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        config = MagicMock()
+        config.usage_cap = UsageCapConfig(enabled=False)
+
+        with patch('shared.cost_store.CostStore') as mock_cost_store_cls:
+            result = asyncio.run(_setup_curator_usage_gate(config))
+
+        assert result == (None, None), f'Expected (None, None), got {result!r}'
+        mock_cost_store_cls.assert_not_called()
+
