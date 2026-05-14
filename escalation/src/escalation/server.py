@@ -72,6 +72,9 @@ def create_server(
         the escalation is submitted normally and
         ``{'id': esc_id, 'status': 'queued'}`` is returned.
         """
+        # Gate 1 (infra_dedupe_enabled) and gate 2 (category membership) both
+        # short-circuit in pure memory before any disk I/O via find_dedupe_parent.
+        # This is the ONLY call site for find_dedupe_parent in server.py.
         if cfg.infra_dedupe_enabled and esc.category in cfg.infra_dedupe_categories:
             parent_id = find_dedupe_parent(queue, esc, cfg)
             if parent_id is not None:
