@@ -235,6 +235,54 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
     assert exc_msg in detail, f'Expected "{exc_msg}" in detail, got: {detail!r}'
 
 
+def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
+    """502 detail is capped at 200 chars; WARNING log keeps full exception text.
+
+    Guards against arbitrary-length response-body leakage via the 502 detail
+    field: the cancel handler interpolates str(exc) in the detail string, which
+    can be unbounded when the upstream MCP server returns a large error body
+    (e.g. httpx.HTTPStatusError whose message is the full response body).
+
+    Assertions:
+      (a) response is 502
+      (b) detail contains the first 200 chars of the exception message
+          AND does NOT contain 201 consecutive 'X' chars (i.e. is truncated)
+      (c) the WARNING log record still has the FULL 300-char message
+          (ops log must not lose information)
+    """
+    long_msg = 'X' * 300
+    exc = httpx.HTTPStatusError(
+        long_msg,
+        request=httpx.Request('POST', 'http://x'),
+        response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
+    )
+    with patch(
+        _PATCH_TARGET,
+        new=AsyncMock(side_effect=exc),
+    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    # (a) 502
+    assert resp.status_code == 502
+
+    # (b) detail is capped at 200 chars
+    detail = resp.json().get('detail', '')
+    assert 'X' * 200 in detail, 'Expected first 200 X chars in detail'
+    assert 'X' * 201 not in detail, 'Detail must not contain 201+ X chars (leaked exc text)'
+
+    # (c) WARNING log retains full exception text
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+    ]
+    assert warning_records, 'Expected at least one WARNING from dashboard.app'
+    combined_msg = ' '.join(r.getMessage() for r in warning_records)
+    assert long_msg in combined_msg, 'WARNING log must contain full (untruncated) exception text'
+
+
 def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
     """URL[0] raises ConnectError; URL[1] returns cancelled → overall 200.
 
