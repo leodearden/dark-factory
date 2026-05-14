@@ -613,11 +613,13 @@ async def run_server():
     mcp.settings.json_response = config.server.json_response
 
     # Thread monitor — log count every 60s, warn if growing unexpectedly
+    _warn_threshold = config.server.thread_warn_threshold
+
     async def _thread_monitor():
         prev = 0
         while True:
             await asyncio.sleep(60)
-            prev = _thread_monitor_iteration(prev, _THREAD_WARN_THRESHOLD)
+            prev = _thread_monitor_iteration(prev, _warn_threshold)
 
     asyncio.create_task(_thread_monitor())
 
