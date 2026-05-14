@@ -169,16 +169,28 @@ class OverrideStore:
         # SQLite will retry for up to 30 s before raising OperationalError.  The
         # default 5 s is tight for MCP override tools that could drive concurrent
         # writes from multiple sessions.
-        conn = sqlite3.connect(str(self.db_path), timeout=30)
+        #
+        # isolation_level=None (autocommit) so that BEGIN IMMEDIATE / COMMIT /
+        # ROLLBACK are the explicit transaction boundaries — not Python's
+        # deferred-mode auto-begin.  This makes the pattern safe even if future
+        # edits add DML before BEGIN IMMEDIATE (which would silently break with
+        # the default isolation_level on Python <3.12).
+        conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
         try:
             # Acquire a write lock up-front (IMMEDIATE) so that the MAX(pin_order)
             # read and the subsequent UPSERT are serialized with respect to
-            # concurrent set_override calls.  Without this, two concurrent
+            # concurrent set_override calls.  Without IMMEDIATE, two concurrent
             # callers can both read MAX=N and both attempt to write N+1, causing
             # a PinOrderCollision or silent duplicate pin_order values.
-            with conn:
-                conn.execute('BEGIN IMMEDIATE')
-
+            #
+            # The connection uses isolation_level=None (autocommit) so that
+            # BEGIN IMMEDIATE / COMMIT / ROLLBACK are the explicit transaction
+            # boundaries — not Python's deferred-mode auto-begin.  This makes
+            # the pattern safe even if future edits add DML before BEGIN
+            # IMMEDIATE (which would silently break with the default
+            # isolation_level on Python <3.12).
+            conn.execute('BEGIN IMMEDIATE')
+            try:
                 # Resolve auto-assigned pin_order when pinning without an explicit order.
                 if pinned is True and pin_order is None:
                     # If this task is already pinned, preserve its existing pin_order
@@ -253,6 +265,10 @@ class OverrideStore:
                         now_iso,
                     ),
                 )
+                conn.execute('COMMIT')
+            except Exception:
+                conn.execute('ROLLBACK')
+                raise
         finally:
             conn.close()
 
