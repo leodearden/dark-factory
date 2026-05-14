@@ -1775,13 +1775,9 @@ class Scheduler:
                     )
                     if self.event_store and installed:
                         self.event_store.emit(
-                            EventType.reservation_installed,
+                            EventType.reserve_now_consumed,
                             task_id=rid,
-                            data={
-                                'modules': installed,
-                                'priority': r_tier,
-                                'reason': 'reserve_now',
-                            },
+                            data={'modules': installed, 'priority': r_tier},
                         )
                     # Reflect the cleared flag in the in-memory snapshot so
                     # downstream diff-detection doesn't spuriously re-emit for

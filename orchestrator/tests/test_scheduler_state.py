@@ -15,6 +15,7 @@ import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.overrides import OverrideStore
 from orchestrator.scheduler import ModuleLockTable, Scheduler
 
 
@@ -136,3 +137,63 @@ class TestReserveNowArmedDiffEmit:
         await scheduler.acquire_next()
         armed = [e for e in event_store.events if e[0] == EventType.reserve_now_armed.value]
         assert armed == [], f'Expected no armed events for boost-only change, got: {armed}'
+
+
+# ===========================================================================
+# Step-5: reserve_now_consumed short-circuit emit
+# ===========================================================================
+
+class TestReserveNowConsumedShortCircuit:
+    """reserve_now_consumed is emitted when parks are installed via the short-circuit."""
+
+    @pytest.mark.asyncio
+    async def test_reserve_now_consumed_emitted_when_parks_install(self, tmp_path):
+        """reserve_now_consumed fires when parks are installed for reserve_now=True task.
+
+        Mirrors TestReserveNowShortCircuit setup: A's modules are pre-held so
+        parks survive the tick.  Asserts:
+        (a) exactly one reserve_now_consumed event with task_id='A',
+            data['modules'] covering A's modules, data['priority'] = A's tier;
+        (b) NO reservation_installed event with data.get('reason') == 'reserve_now'
+            (semantic upgrade — old event replaced).
+        """
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'A', reserve_now=True)
+
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        # Pre-hold A's modules so parks survive the tick (A cannot acquire them).
+        scheduler.lock_table._held['seed'] = {'compiler/src', 'eval/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = _pending_task('A', files=['compiler/src', 'eval/src'], priority='medium')
+        task_b = _pending_task('B', files=['other/module'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+
+        await scheduler.acquire_next()
+
+        consumed = [
+            e for e in event_store.events
+            if e[0] == EventType.reserve_now_consumed.value
+        ]
+        # (a) Exactly one consumed event with correct fields.
+        assert len(consumed) == 1, f'Expected 1 consumed event, got: {consumed}'
+        ev = consumed[0]
+        assert ev[1]['task_id'] == 'A'
+        assert set(ev[1]['data']['modules']) == {
+            'compiler/src', 'eval/src',
+        }, f"Expected A's modules in consumed event, got: {ev[1]['data']['modules']}"
+        assert ev[1]['data']['priority'] == 'medium', (
+            f"Expected priority='medium', got: {ev[1]['data']['priority']}"
+        )
+
+        # (b) No legacy reservation_installed with reason='reserve_now'.
+        old_style = [
+            e for e in event_store.events
+            if e[0] == EventType.reservation_installed.value
+            and e[1]['data'].get('reason') == 'reserve_now'
+        ]
+        assert old_style == [], f'Expected no legacy reservation_installed event, got: {old_style}'
