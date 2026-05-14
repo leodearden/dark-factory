@@ -110,6 +110,9 @@ class TestEscalateBlockerDedupe:
         parent = Escalation.from_json(files[0].read_text())
         assert parent.dedupe_count == 1
         assert len(parent.dedupe_children) == 1
+        # child_id in the response must match what was stored in dedupe_children
+        assert 'child_id' in second
+        assert second['child_id'] == parent.dedupe_children[0]
 
     @pytest.mark.asyncio
     async def test_notify_callback_fires_once_for_parent_not_for_dedupe(self, tmp_path: Path):
@@ -162,7 +165,6 @@ class TestEscalateInfoDedupe:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        first = _info.__wrapped__ if hasattr(_info, '__wrapped__') else None  # defensive
         first = await _info(
             server,
             task_id='42',
@@ -446,3 +448,91 @@ class TestDedupeTOCTOURace:
         assert second['id'] == new_file_id, (
             f"result id {second['id']!r} does not match file stem {new_file_id!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestDedupeChildIdContract
+# ---------------------------------------------------------------------------
+
+
+class TestDedupeChildIdContract:
+    """End-to-end tests that pin the child_id audit trail at the server tier."""
+
+    @pytest.mark.asyncio
+    async def test_child_id_in_response_matches_dedupe_children(self, tmp_path: Path):
+        """child_id in the dedup_skipped response equals dedupe_children[0] on disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        first = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+
+        second = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+        assert 'child_id' in second
+
+        from escalation.models import Escalation
+        files = _queue_root_files(queue)
+        parent = Escalation.from_json(files[0].read_text())
+        assert parent.dedupe_children == [second['child_id']]
+
+    @pytest.mark.asyncio
+    async def test_two_deduped_children_stored_in_submission_order(self, tmp_path: Path):
+        """Three calls: first is parent, second and third are folded.
+
+        dedupe_children on disk must list the children in submission order,
+        and each response's child_id must correspond to its entry in the list.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+
+        second = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+        third = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 9999',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert third['status'] == 'dedup_skipped'
+
+        from escalation.models import Escalation
+        files = _queue_root_files(queue)
+        assert len(files) == 1
+        parent = Escalation.from_json(files[0].read_text())
+
+        assert parent.dedupe_count == 2
+        assert len(parent.dedupe_children) == 2
+        # Submission order must be preserved
+        assert parent.dedupe_children[0] == second['child_id']
+        assert parent.dedupe_children[1] == third['child_id']
