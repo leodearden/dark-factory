@@ -595,6 +595,8 @@ async def api_performance(request: Request) -> JSONResponse:
 # leakage when an upstream MCP server returns a large error body via
 # httpx.HTTPStatusError (whose __str__ embeds the full response).  The
 # WARNING log still records the full untruncated exception text.
+# Intentionally cancel-handler-scoped for now; other proxy handlers can
+# adopt the same constant if they gain an equivalent truncation path.
 _CANCEL_DETAIL_EXC_CHAR_LIMIT = 200
 
 
