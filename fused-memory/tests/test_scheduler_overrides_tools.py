@@ -307,3 +307,140 @@ async def test_set_task_priority_override_re_pin_preserves_existing_pin_order(
         assert row[0] == 1
     finally:
         conn.close()
+
+
+# ===========================================================================
+# clear_task_priority_override
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_clear_task_priority_override_field_none_deletes_row_and_emits_audit(
+    tmp_path, mcp_server, memory_service,
+):
+    """clear_task_priority_override with no field deletes the row and emits audit."""
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high'},
+    )
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'clear_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5'},
+    )
+    assert 'error' not in result
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT task_id FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), '5'),
+        ).fetchone()
+        assert row is None
+    finally:
+        conn.close()
+
+    memory_service.add_memory.assert_called_once()
+    _, audit_kwargs = memory_service.add_memory.call_args
+    assert audit_kwargs['category'] == 'decisions_and_rationale'
+    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
+    assert audit_kwargs['metadata'] == {'task_id': '5', 'field': None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field,null_checks,preserved_checks', [
+    ('boost_tier',  {'boost_tier': None}, {'pinned': 1}),
+    ('pinned',      {'pinned': 0, 'pin_order': None}, {'boost_tier': 'high'}),
+    ('reserve_now', {'reserve_now': 0}, {'boost_tier': 'high', 'pinned': 1}),
+    ('ttl',         {'ttl_until': None}, {'boost_tier': 'high', 'pinned': 1}),
+])
+async def test_clear_task_priority_override_field_specific_clears_one_column(
+    tmp_path, mcp_server, memory_service, field, null_checks, preserved_checks,
+):
+    """Clearing a specific field nulls only that column; others are preserved."""
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {
+            'project_root': str(tmp_path),
+            'task_id': '5',
+            'boost_tier': 'high',
+            'pinned': True,
+            'pin_order': 1,
+            'reserve_now': True,
+            'ttl_secs': 3600,
+        },
+    )
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'clear_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'field': field},
+    )
+    assert 'error' not in result
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT boost_tier, pinned, pin_order, reserve_now, ttl_until '
+            'FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), '5'),
+        ).fetchone()
+        cols = dict(zip(
+            ['boost_tier', 'pinned', 'pin_order', 'reserve_now', 'ttl_until'], row
+        ))
+    finally:
+        conn.close()
+
+    for col, expected in null_checks.items():
+        assert cols[col] == expected, f'{col}: expected {expected!r}, got {cols[col]!r}'
+    for col, expected in preserved_checks.items():
+        if expected is None:
+            assert cols[col] is None, f'{col} should be None'
+        elif isinstance(expected, int):
+            assert cols[col] == expected, f'{col}: expected {expected}, got {cols[col]}'
+        else:
+            assert cols[col] == expected, f'{col}: expected {expected!r}, got {cols[col]!r}'
+
+    memory_service.add_memory.assert_called_once()
+    _, audit_kwargs = memory_service.add_memory.call_args
+    assert audit_kwargs['metadata'] == {'task_id': '5', 'field': field}
+
+
+@pytest.mark.asyncio
+async def test_clear_task_priority_override_rejects_invalid_field(
+    tmp_path, mcp_server, memory_service,
+):
+    """Unknown field name returns ValidationError; row is unchanged, no audit."""
+    await mcp_server._tool_manager.call_tool(
+        'set_task_priority_override',
+        {
+            'project_root': str(tmp_path),
+            'task_id': '5',
+            'boost_tier': 'high',
+            'pinned': True,
+            'pin_order': 1,
+        },
+    )
+    memory_service.add_memory.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        'clear_task_priority_override',
+        {'project_root': str(tmp_path), 'task_id': '5', 'field': 'garbage'},
+    )
+    assert result.get('error_type') == 'ValidationError'
+    assert 'garbage' in result.get('error', '')
+
+    conn = _open_db(tmp_path)
+    try:
+        row = conn.execute(
+            'SELECT boost_tier, pinned FROM overrides WHERE project_root=? AND task_id=?',
+            (str(tmp_path), '5'),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 'high'
+        assert row[1] == 1
+    finally:
+        conn.close()
+
+    memory_service.add_memory.assert_not_called()
