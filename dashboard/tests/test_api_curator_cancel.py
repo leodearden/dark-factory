@@ -329,11 +329,22 @@ def test_two_url_not_found_short_circuits_loop(two_url_client):
 
 
 def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
-    """Both URLs raise ConnectError → 502 with detail mentioning both URLs."""
-    with patch(
-        _PATCH_TARGET,
-        new=AsyncMock(side_effect=httpx.ConnectError('refused')),
-    ) as mock_mcp:
+    """Both URLs raise ConnectError → 502 with detail mentioning both URLs.
+
+    Also pins the per-URL invalidate_session contract: for each failing URL
+    the handler must call memory_data.invalidate_session(url) exactly once,
+    in URL-list order.  Any future refactor that batches or removes these calls
+    (e.g. moves invalidation to after the loop, or skips it for certain error
+    types) will fail this assertion immediately.
+    """
+    _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
+    with (
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        ) as mock_mcp,
+        patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
+    ):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -347,3 +358,8 @@ def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     assert 'localhost:9000' in detail
     assert 'localhost:9001' in detail
     assert mock_mcp.call_count == 2
+    # Per-URL invalidation contract: invalidate_session called once per failing URL, in order
+    assert mock_invalidate.call_args_list == [
+        call('http://localhost:9000'),
+        call('http://localhost:9001'),
+    ]
