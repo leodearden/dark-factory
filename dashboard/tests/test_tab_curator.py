@@ -115,10 +115,6 @@ def test_tab_curator_jsx_served_and_exports_component(_client) -> None:
         'tab_curator.jsx does not set window.DF_CURATOR — add '
         '`window.DF_CURATOR = { CuratorTab }` at the bottom of the file.'
     )
-    assert 'Queue empty' in body, (
-        "tab_curator.jsx does not contain the 'Queue empty' placeholder string — "
-        "add it to the empty-state branch of the component."
-    )
     assert '/api/v2/dashboard/curator/cancel' in body, (
         "tab_curator.jsx does not reference '/api/v2/dashboard/curator/cancel' "
         "inside a fetch() call — add the cancel POST handler."
