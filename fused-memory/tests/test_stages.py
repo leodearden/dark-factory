@@ -5021,8 +5021,13 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
     async def test_assemble_payload_raises_before_search_when_current_run_id_is_none(
         self, mock_deps, watermark,
     ):
-        """Guard must raise RuntimeError BEFORE _query_stage2_flags is awaited when
-        _current_run_id is not set, so callers get an early, attributable failure."""
+        """Guard must raise RuntimeError BEFORE any filter_task_tree / Mem0 / Taskmaster I/O
+        when _current_run_id is not set, so callers get an early, attributable failure.
+
+        After the guard was hoisted to the top of assemble_payload() (task 1273), the raise
+        happens before the filter_task_tree branch, so neither taskmaster.get_tasks nor
+        memory_service.search should be awaited.
+        """
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'reify'
         stage.project_root = '/home/leo/src/reify'
@@ -5032,6 +5037,8 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         with pytest.raises(RuntimeError) as excinfo:
             await stage.assemble_payload([], watermark, [])
 
+        # Guard must fire BEFORE any Taskmaster I/O (filter_task_tree fetch).
+        mock_deps['taskmaster'].get_tasks.assert_not_awaited()
         # Guard must fire BEFORE the Mem0 search — no search round-trip on bad setup.
         mock_deps['memory_service'].search.assert_not_awaited()
 
