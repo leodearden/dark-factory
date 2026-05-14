@@ -142,6 +142,15 @@ class OverrideStore:
         ``pin_order``; by contrast ``pinned=None`` (omitted) means unchanged.
         Use :meth:`clear_override` as the canonical way to clear any field to
         avoid this asymmetry.
+
+        **Concurrency note:** ``set_override`` is the only writer in this
+        class that opens its connection with ``isolation_level=None`` and an
+        explicit ``BEGIN IMMEDIATE``, because it performs a ``MAX(pin_order)``
+        read followed by an UPSERT and must serialize that pair against
+        concurrent callers.  All other writers (``clear_override``,
+        ``reorder_pin_queue``, ``clear_terminal``, ``clear_expired``) are
+        single-statement or single-transaction batch operations with no
+        read-then-write race, so they use sqlite3's default isolation_level.
         """
         if boost_tier is not None and boost_tier not in PRIORITY_RANK:
             raise ValueError(
@@ -284,8 +293,6 @@ class OverrideStore:
         """
         _VALID_FIELDS = {'boost_tier', 'pinned', 'reserve_now', 'ttl'}
         now_iso = datetime.now(UTC).isoformat()
-        # Default isolation_level is fine here: no read-then-write pattern
-        # requiring BEGIN IMMEDIATE serialization (unlike set_override).
         conn = sqlite3.connect(str(self.db_path))
         try:
             if field is None:
@@ -359,9 +366,6 @@ class OverrideStore:
             )
 
         now_iso = datetime.now(UTC).isoformat()
-        # Default isolation_level is fine here: the loop writes are a simple
-        # batch UPDATE with no read-then-write race (unlike set_override's
-        # MAX(pin_order) pattern that requires BEGIN IMMEDIATE).
         conn = sqlite3.connect(str(self.db_path))
         try:
             # Wrap in a single transaction so a mid-loop failure (interrupt,
@@ -395,8 +399,6 @@ class OverrideStore:
             return []
 
         placeholders = ','.join('?' * len(terminal_task_ids))
-        # Default isolation_level is fine here: single-statement DELETE with no
-        # read-then-write race requiring BEGIN IMMEDIATE (unlike set_override).
         conn = sqlite3.connect(str(self.db_path))
         try:
             rows = conn.execute(
@@ -428,8 +430,6 @@ class OverrideStore:
         if now is None:
             now = datetime.now(UTC)
 
-        # Default isolation_level is fine here: single-statement DELETE with no
-        # read-then-write race requiring BEGIN IMMEDIATE (unlike set_override).
         conn = sqlite3.connect(str(self.db_path))
         try:
             rows = conn.execute(
