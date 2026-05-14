@@ -10,6 +10,7 @@ from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     _flatten_with_subtasks,
     _render_task_line,
+    _select_visible_active,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
@@ -1573,3 +1574,155 @@ class TestEndToEndSubtaskPipeline:
         assert '- [100.1] (pending) Sub A deps=[]' in output
         # Summary line shows correct counts
         assert '2 done, 1 cancelled' in output
+
+
+class TestSelectVisibleActive:
+    """Unit tests for _select_visible_active(tree, max_tasks, max_chars).
+
+    Covers: empty input, under-cap, max_chars-clamp prefix, budget<=0, and
+    cancelled-section budget accounting.  All five tests fail with ImportError
+    until _select_visible_active is defined in task_filter.py (step-2).
+    """
+
+    def _make_active_task(self, tid: int, title_len: int = 20) -> dict:
+        """Build a task dict with title padded to title_len chars."""
+        return {
+            'id': tid,
+            'title': f'T{tid}'.ljust(title_len, 'x'),
+            'status': 'pending',
+            'dependencies': [],
+        }
+
+    def test_empty_active_returns_empty_list(self):
+        """empty tree.active_tasks -> []."""
+        tree = FilteredTaskTree(
+            active_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=0,
+        )
+        result = _select_visible_active(tree, max_tasks=50, max_chars=50_000)
+        assert result == []
+
+    def test_under_cap_returns_full_slice(self):
+        """Under-cap with huge max_chars returns full active_tasks[:max_tasks]."""
+        tasks = [self._make_active_task(i) for i in range(1, 6)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=5,
+        )
+        result = _select_visible_active(tree, max_tasks=50, max_chars=999_999)
+        assert result == tasks
+
+    def test_max_chars_clamp_returns_prefix_matching_formatter(self):
+        """max_chars clamp fires -> prefix length matches format_filtered_task_tree output count.
+
+        Uses format_filtered_task_tree as ground truth so the assertion stays
+        accurate if the rendering format changes.
+        """
+        # 20 tasks each with a 400-char title to force the max_chars clamp.
+        tasks = [self._make_active_task(i, title_len=400) for i in range(1, 21)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=20,
+        )
+        max_chars = 4000
+
+        # Ground-truth: count task lines rendered by format_filtered_task_tree.
+        output = format_filtered_task_tree(tree, max_tasks=20, max_chars=max_chars)
+        task_lines_in_output = [ln for ln in output.splitlines() if ln.startswith('- [')]
+        expected_count = len(task_lines_in_output)
+
+        # Verify the clamp actually fired — if not, the test is vacuous.
+        assert expected_count < 20, (
+            f'Clamp did not fire (all 20 tasks visible); lower max_chars or raise title_len.'
+        )
+
+        result = _select_visible_active(tree, max_tasks=20, max_chars=max_chars)
+
+        assert len(result) == expected_count, (
+            f'Expected {expected_count} tasks, got {len(result)}'
+        )
+        # Must be a strict prefix of the input slice.
+        assert result == tasks[:expected_count], (
+            f'Result is not a prefix of the original task list'
+        )
+
+    def test_budget_zero_or_negative_returns_empty(self):
+        """budget <= 0 (header+summary alone exceed max_chars) -> returns [].
+
+        With 1 active task: header ~ 78 chars, summary_line ~ 29 chars.
+        max_chars=100 makes budget = 100 - 78 - 29 = -7 <= 0.
+        """
+        tasks = [self._make_active_task(1)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        result = _select_visible_active(tree, max_tasks=50, max_chars=100)
+        assert result == [], (
+            f'Expected [] when budget <= 0, got {result!r}'
+        )
+
+    def test_cancelled_section_reduces_active_budget(self):
+        """Non-empty cancelled_tasks subtracts the cancelled-section length from the budget.
+
+        Builds two trees with identical active tasks: one with five cancelled
+        tasks and one without.  At a tight max_chars, the cancelled section
+        consumes part of the budget so fewer active tasks fit.  Both results
+        must match what format_filtered_task_tree renders for the same tree.
+        """
+        active_tasks = [self._make_active_task(i, title_len=200) for i in range(1, 11)]
+        cancelled_tasks = [
+            {'id': 100 + i, 'title': 'C' * 50, 'status': 'cancelled', 'dependencies': []}
+            for i in range(1, 6)
+        ]
+        tree_with = FilteredTaskTree(
+            active_tasks=active_tasks,
+            cancelled_tasks=cancelled_tasks,
+            done_count=0,
+            cancelled_count=5,
+            other_count=0,
+            total_count=15,
+        )
+        tree_without = FilteredTaskTree(
+            active_tasks=active_tasks,
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=10,
+        )
+        max_chars = 2500
+
+        # Ground-truth visible counts from the formatter.
+        out_with = format_filtered_task_tree(tree_with, max_tasks=10, max_chars=max_chars)
+        out_without = format_filtered_task_tree(tree_without, max_tasks=10, max_chars=max_chars)
+        expected_with = len([ln for ln in out_with.splitlines() if ln.startswith('- [')])
+        expected_without = len([ln for ln in out_without.splitlines() if ln.startswith('- [')])
+
+        # Precondition: cancelled section must have reduced the active budget.
+        assert expected_with < expected_without, (
+            f'Precondition failed: cancelled section did not reduce active task count '
+            f'({expected_with} vs {expected_without}). Adjust max_chars or title_len.'
+        )
+
+        result_with = _select_visible_active(tree_with, max_tasks=10, max_chars=max_chars)
+        result_without = _select_visible_active(tree_without, max_tasks=10, max_chars=max_chars)
+
+        assert len(result_with) == expected_with, (
+            f'With cancelled section: expected {expected_with}, got {len(result_with)}'
+        )
+        assert len(result_without) == expected_without, (
+            f'Without cancelled section: expected {expected_without}, got {len(result_without)}'
+        )
