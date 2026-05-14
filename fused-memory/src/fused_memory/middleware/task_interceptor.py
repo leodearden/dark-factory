@@ -2307,7 +2307,7 @@ class TaskInterceptor:
         task_id: str | None,
         reason: str | None,
         result_dict: dict | None,
-        caller: str = 'unknown',
+        caller: str,
     ) -> bool:
         """Persist a worker's terminal status via asyncio.shield and warn on orphan-race.
 

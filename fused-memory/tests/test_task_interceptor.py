@@ -6003,6 +6003,7 @@ async def test_persist_worker_terminal_orphan_race_emits_warning(
             task_id=orphan_task_id,
             reason='worker_completed',
             result_dict=None,
+            caller='unit_test',
         )
 
     # mark_resolved returned False because the row was no longer pending
