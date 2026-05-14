@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from orchestrator.config import PRIORITY_RANK
+from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS overrides (
@@ -105,6 +105,16 @@ class OverrideStore:
         # artificial pause and make the auto-assign race condition observable.
         self._after_max_select: Callable[[], None] | None = None
         self._ensure_schema()
+
+    @classmethod
+    def from_config(cls, config: OrchestratorConfig) -> OverrideStore:
+        """Build the canonical OverrideStore for *config*.
+
+        Centralizes the "OverrideStore for this config" contract so Harness,
+        CLI, and any future caller stay in lock-step on the DB-path
+        derivation. See ``OrchestratorConfig.overrides_db_path``.
+        """
+        return cls(config.overrides_db_path)
 
     def _ensure_schema(self) -> None:
         conn = sqlite3.connect(str(self.db_path))
