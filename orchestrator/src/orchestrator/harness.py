@@ -371,6 +371,9 @@ class Harness:
         except Exception:
             logger.warning('Failed to create run store', exc_info=True)
 
+        # 0a-post. Restore scheduler pause state from prior run (if any).
+        await self._load_persisted_scheduler_pause()
+
         # 0b. Create cost store (shares runs.db with EventStore/RunStore)
         try:
             self.cost_store = CostStore(db_path)
@@ -2624,3 +2627,38 @@ Output JSON matching the schema. Every task must appear in the output.
 
         if self.event_store:
             self.event_store.emit(EventType.scheduler_resumed)
+
+    async def _load_persisted_scheduler_pause(self) -> None:
+        """Restore scheduler pause state from runs.db on restart.
+
+        Called once from ``Harness.run()`` after the RunStore is initialised.
+        If a pause record exists, the scheduler is paused in-memory using
+        ``scheduler.pause()`` directly — NOT ``pause_scheduler()`` — so that
+        no duplicate persistence write or event emission occurs (the row is
+        already on disk from the prior run that set it).
+
+        Logs a WARNING with the persisted reason and pause_at so the operator
+        is alerted on startup.  Any failure is caught and logged but never
+        blocks startup.
+        """
+        if not self._run_store:
+            return
+        try:
+            record = self._run_store.load_scheduler_pause(
+                self.config.fused_memory.project_id,
+            )
+            if record:
+                reason = record.get('reason', '<unknown reason>')
+                pause_at = record.get('pause_at', '<unknown time>')
+                logger.warning(
+                    'Scheduler pause persisted from prior run — restoring. '
+                    'reason=%r  pause_at=%r  (call Harness.resume_scheduler() to clear)',
+                    reason,
+                    pause_at,
+                )
+                self.scheduler.pause(reason)
+        except Exception:
+            logger.warning(
+                '_load_persisted_scheduler_pause: failed to read pause state',
+                exc_info=True,
+            )
