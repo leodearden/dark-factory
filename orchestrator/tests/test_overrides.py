@@ -251,3 +251,39 @@ class TestReorder:
         # Including a non-pinned / unknown task
         with pytest.raises(ValueError):
             store.reorder_pin_queue('proj', ['C', 'A', 'B', 'D'])
+
+
+class TestSweeps:
+    def test_clear_terminal_deletes_named_owners(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', boost_tier='high')
+        store.set_override('proj', 'B', boost_tier='medium')
+        store.set_override('proj', 'C', boost_tier='low')
+
+        cleared = store.clear_terminal('proj', {'A', 'C'})
+        assert sorted(cleared) == ['A', 'C']
+
+        remaining = store.get_overrides('proj')
+        assert list(remaining.keys()) == ['B']
+
+    def test_clear_expired_deletes_past_ttl(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        now = datetime(2026, 5, 14, tzinfo=UTC)
+        past = now - timedelta(hours=1)
+        future = now + timedelta(hours=1)
+
+        store.set_override('proj', 'A', ttl_until=past)
+        store.set_override('proj', 'B', ttl_until=future)
+        store.set_override('proj', 'C')  # no TTL
+
+        cleared = store.clear_expired('proj', now)
+        assert cleared == ['A']
+
+        remaining = store.get_overrides('proj')
+        assert 'A' not in remaining
+        assert 'B' in remaining
+        assert 'C' in remaining
