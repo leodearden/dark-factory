@@ -312,6 +312,48 @@ class TestGetSchedulerEventsTool:
             f'Expected ValidationError, got {result!r}'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('fragment', ['has?question', 'has#hash'])
+    async def test_handles_uri_reserved_chars_in_project_root(
+        self, tmp_path, mcp_server, fragment
+    ):
+        """Tool returns events even when project_root path contains URI-reserved chars.
+
+        Linux filesystems accept '?' and '#' in directory names.  Without
+        URL-encoding the db_path before embedding it in the SQLite URI
+        (``file:<path>?mode=ro``), those characters are misinterpreted as URI
+        query-string / fragment delimiters, causing aiosqlite to fail or open
+        the wrong file — surfacing as ``{'error': ..., 'error_type': ...}``
+        (no 'count' key) instead of the expected ``{'events': [...], 'count': 1}``
+        shape.  This test is the regression canary for task 1331.
+        """
+        project_root = tmp_path / fragment
+        project_root.mkdir()
+        _seed_runs_db(
+            project_root,
+            [
+                {
+                    'timestamp': '2026-05-14T12:00:00+00:00',
+                    'event_type': 'lock_released',
+                    'task_id': 'T1',
+                    'data': {},
+                }
+            ],
+        )
+
+        result = await mcp_server._tool_manager.call_tool(
+            'get_scheduler_events',
+            {'project_root': str(project_root)},
+        )
+        assert isinstance(result, dict), f'Expected dict, got {type(result)!r}'
+        assert 'count' in result, (
+            f"Expected 'count' key (got error envelope instead): {result!r}"
+        )
+        assert result['count'] == 1, f'Expected count=1, got {result!r}'
+        events = result['events']
+        assert len(events) == 1
+        assert events[0]['event_type'] == 'lock_released'
+
 
 # ===========================================================================
 # Step-23: get_scheduler_state performance
