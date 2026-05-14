@@ -1218,6 +1218,23 @@ class Scheduler:
 
         return signal is not None
 
+    def _gc_expired_cooldowns(self) -> None:
+        """Sweep ``self._requeue_until`` and remove entries whose deadline has
+        passed.
+
+        Called once per tick from :meth:`acquire_next` (alongside the other
+        per-tick GC sweeps) so that :meth:`_eligible_for_dispatch` can remain a
+        pure, side-effect-free predicate.  An entry is expired when
+        ``self._time_source() >= deadline`` — i.e. the same boundary semantics
+        used by the eligibility check (``time_source() < deadline`` means *still
+        cooling*).  Iterates over a snapshot of the dict so removal during
+        iteration is safe.
+        """
+        now = self._time_source()
+        for tid, deadline in list(self._requeue_until.items()):
+            if deadline <= now:
+                del self._requeue_until[tid]
+
     def _eligible_for_dispatch(
         self,
         task: dict,
