@@ -667,11 +667,13 @@ class Scheduler:
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
-        # Wall-clock time source for park-stop transition recording.  Separate
-        # from the monotonic _time_source used by module-lock GC and dispatch
-        # cooldowns — injectable for deterministic tests.
-        self._wall_clock_source: Callable[[], float] = (
-            wall_clock_source if wall_clock_source is not None else time.time
+        # Monotonic clock source for the park-stop rolling-window transition
+        # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
+        # from non-monotonic wall-clock skew (NTP steps, VM clock drift).
+        # Injectable via the ``wall_clock_source`` kwarg so deterministic tests
+        # can inject a fixed lambda without touching production semantics.
+        self._park_stop_clock: Callable[[], float] = (
+            wall_clock_source if wall_clock_source is not None else time.monotonic
         )
         self.lock_table = ModuleLockTable(config, time_source=self._time_source)
         self.event_store = event_store
@@ -834,7 +836,20 @@ class Scheduler:
         self.pause(reason)
         logger.warning('Park-stop trip: %s — pausing scheduler', reason)
         try:
-            asyncio.ensure_future(self._on_park_stop_trip(reason))
+            t = asyncio.ensure_future(self._on_park_stop_trip(reason))
+            # Attach a done-callback so exceptions inside harness.pause_scheduler
+            # (e.g. RunStore write failure, EventStore emit failure) are logged
+            # immediately rather than surfacing as GC-collected Task warnings
+            # with no context.  Without this the operator sees the scheduler is
+            # paused but has no diagnostic for why persistence failed.
+            t.add_done_callback(
+                lambda f: logger.error(
+                    'park-stop trip callback raised an exception',
+                    exc_info=f.exception(),
+                )
+                if not f.cancelled() and f.exception() is not None
+                else None
+            )
         except RuntimeError:
             # No running event loop — should not happen in production since
             # set_task_status is always called from an async context.  Log and
@@ -850,7 +865,7 @@ class Scheduler:
         ``park_stop_parked_window_hours * 3600`` seconds from the left side.
         O(k) where k is the number of expired entries (typically tiny).
         """
-        now = self._wall_clock_source()
+        now = self._park_stop_clock()
         self._blocked_transitions.append(now)
         cutoff = now - self.config.park_stop_parked_window_hours * 3600
         while self._blocked_transitions and self._blocked_transitions[0] <= cutoff:
