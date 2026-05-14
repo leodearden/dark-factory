@@ -84,6 +84,24 @@ def client():
 
 
 @pytest.fixture()
+def two_url_client(monkeypatch):
+    """TestClient running the lifespan with a two-URL fused-memory config.
+
+    Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
+    produces the two-URL list naturally — no post-hoc mutation of app.state.
+    monkeypatch teardown restores os.environ automatically after each test.
+    """
+    from dashboard.app import app
+
+    monkeypatch.setenv(
+        'DASHBOARD_FUSED_MEMORY_URLS',
+        'http://localhost:9000,http://localhost:9001',
+    )
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture()
 def reconciliation_db(tmp_path):
     """Create a temporary SQLite reconciliation DB with schema and sample data.
 
