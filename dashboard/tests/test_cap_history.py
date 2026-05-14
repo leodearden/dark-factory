@@ -596,11 +596,6 @@ class TestComputeCappedNowAndWindows:
         """At least one open-ended interval → capped_now=1."""
         now = datetime.now(UTC)
         t1 = now - timedelta(hours=2)
-        t2 = now - timedelta(hours=1)
-        intervals = [
-            CapInterval('alpha', t1, None),   # open-ended
-            CapInterval('alpha', t1, t2),     # closed (second interval same account — unusual but valid)
-        ]
         # Simplified: just one open-ended is enough for capped_now=1
         open_only = [CapInterval('alpha', t1, None)]
         capped_now, windows = compute_capped_now_and_windows(open_only)
