@@ -4854,3 +4854,63 @@ class TestSchedulerBlockedTransitionTracking:
         assert (now - 100) in entries, 'Entry 100s old must survive'
         assert now in entries, 'New entry must be present'
         assert len(entries) == 2, f'Expected 2 entries; got {len(entries)}: {entries}'
+
+
+class TestSetTaskStatusBlockedRecording:
+    """set_task_status('blocked') must record in the deque; other statuses must not."""
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_blocked_records_transition(self, monkeypatch):
+        """A successful blocked transition adds one entry to _blocked_transitions."""
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_clock_source=lambda: now)
+
+        # Return a clean success response (no rejection structure).
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('42', 'blocked')
+
+        assert len(scheduler._blocked_transitions) == 1
+        assert list(scheduler._blocked_transitions) == [now]
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_non_blocked_does_not_record(self, monkeypatch):
+        """A successful non-blocked status transition must not touch _blocked_transitions."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('42', 'pending')
+
+        assert len(scheduler._blocked_transitions) == 0
+
+    @pytest.mark.asyncio
+    async def test_blocked_transition_not_recorded_on_rejection(self, monkeypatch):
+        """A terminal_exit_rejected response (warn-and-return carve-out) must NOT record."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        # Return a terminal_exit_rejected response — blocked is in _TERMINAL_STATUSES
+        # so the warn-and-return carve-out fires.
+        rejection_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"error": "terminal_exit_rejected", "from_status": "done", "to_status": "blocked"}',
+                    }
+                ]
+            }
+        }
+        mock = AsyncMock(return_value=rejection_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('42', 'blocked')
+
+        assert len(scheduler._blocked_transitions) == 0, (
+            'Rejected transition must not be recorded in _blocked_transitions'
+        )
