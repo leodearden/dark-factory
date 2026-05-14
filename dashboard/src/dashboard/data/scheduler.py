@@ -158,6 +158,7 @@ def _skip_event_sparkline(
     events: list[dict],
     *,
     since: datetime,
+    until: datetime | None = None,
     bin_seconds: int = 300,
 ) -> dict:
     """Bin ``task_skipped`` events into fixed-width time buckets.
@@ -166,11 +167,13 @@ def _skip_event_sparkline(
         events:      List of event dicts (may include events of any type).
                      Each dict must have ``event_type`` and ``timestamp`` fields.
         since:       Start of the time window (inclusive).
+        until:       End of the time window (exclusive).  Defaults to
+                     ``datetime.now(UTC)`` when omitted.
         bin_seconds: Bucket width in seconds (default 5 minutes).
 
     Returns:
         ``{labels: [iso_str, ...], values: [int, ...]}`` — one entry per bucket
-        from *since* to ``now``.  Returns ``{labels: [], values: []}`` when
+        from *since* to *until*.  Returns ``{labels: [], values: []}`` when
         *events* is empty (no PRNG fallback; the caller renders no sparkline).
     """
     if not events:
@@ -179,10 +182,12 @@ def _skip_event_sparkline(
     # Filter to task_skipped events only
     skipped = [e for e in events if e.get('event_type') == 'task_skipped']
 
-    now = datetime.now(UTC)
+    now = until if until is not None else datetime.now(UTC)
     # Normalise since to UTC
     if since.tzinfo is None:
         since = since.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
 
     window_seconds = int((now - since).total_seconds())
     n_bins = max(1, (window_seconds + bin_seconds - 1) // bin_seconds)
