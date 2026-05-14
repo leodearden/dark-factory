@@ -44,10 +44,9 @@ from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     filter_task_tree,
-    format_filtered_task_tree,
     format_task_list,
     id_key,
-    select_visible_active,
+    render_active_section,
 )
 
 logger = logging.getLogger(__name__)
@@ -1399,6 +1398,14 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
+        # Call render_active_section once to get both the visible-task list (for
+        # hint-attention slice-then-filter below) and the fully assembled Active
+        # Task Tree string (for the prompt template slot) — single rendering pass.
+        # Both the max_tasks=50 slice cap and the secondary max_chars=50_000 clamp
+        # are applied once here, so the hint section and the tree slot always
+        # reference the same set of tasks.
+        visible_active, active_tree_text = render_active_section(filtered)
+
         # Compute the hint-attention section: active tasks whose memory_hints
         # need conversion from legacy list format (or are missing entirely).
         # Gated on `if not self.remediation_mode:` — mirrors proactive_sample_section
@@ -1407,11 +1414,6 @@ class TaskKnowledgeSync(BaseStage):
         # steady-state case where every active task already has valid dict-format hints.
         hint_conversion_section = ''
         if not self.remediation_mode:
-            # Use select_visible_active to get exactly the same window that
-            # format_filtered_task_tree renders — both the max_tasks=50 slice cap
-            # AND the secondary max_chars=50_000 clamp are applied in one place,
-            # so the hint section never references a task ID absent from the tree.
-            visible_active = select_visible_active(filtered)
             tasks_needing_hint_attention = [
                 t for t in visible_active if _needs_hint_conversion(t)
             ]
@@ -1557,7 +1559,7 @@ class TaskKnowledgeSync(BaseStage):
 ### Stage 1 Flagged Items (Task-Relevant)
 {flagged_text}
 {stale_section}{known_projects_section}
-{format_filtered_task_tree(filtered)}
+{active_tree_text}
 
 ### Recently Completed Tasks
 {recently_completed_text}

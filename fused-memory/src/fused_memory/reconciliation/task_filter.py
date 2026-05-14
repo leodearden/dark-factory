@@ -463,6 +463,56 @@ def select_visible_active(
     return visible
 
 
+def render_active_section(
+    tree: FilteredTaskTree,
+    max_tasks: int = MAX_ACTIVE_TASKS_RENDERED,
+    max_chars: int = 50_000,
+) -> tuple[list[dict], str]:
+    """Return (visible_tasks, assembled_string) for the Active Task Tree prompt slot.
+
+    Single-call API that returns BOTH the visible-task list (for hint-section
+    consumption) AND the fully assembled prompt string (for the Active Task Tree
+    slot), calling _select_visible_active_with_body exactly once.
+
+    This eliminates the double rendering that occurs when a caller invokes
+    select_visible_active and format_filtered_task_tree separately — each call
+    invoked the worker internally, rendering every task line twice and calling
+    _build_surrounding twice.
+
+    The returned assembled_string is byte-identical to format_filtered_task_tree(
+    tree, max_tasks, max_chars).  The returned visible list is byte-identical to
+    select_visible_active(tree, max_tasks, max_chars).
+
+    Args:
+        tree: FilteredTaskTree to render.
+        max_tasks: Maximum number of active tasks to include.
+        max_chars: Maximum total character budget for the output string.
+
+    Returns:
+        (visible_tasks, assembled_string) tuple.  visible_tasks is a (possibly
+        empty) prefix list of task dicts; assembled_string is the fully rendered
+        prompt string suitable for injection into a reconciliation prompt.
+    """
+    active_slice = tree.active_tasks[:max_tasks]
+    visible, body, header, cancelled_section, summary_line = _select_visible_active_with_body(
+        tree, max_tasks, max_chars
+    )
+
+    if not active_slice:
+        return visible, header + 'No active tasks.\n' + cancelled_section + summary_line
+
+    if not visible or body is None:
+        # Budget too tight for any task lines (budget<=0 or lazy loop drained all).
+        return visible, header + cancelled_section + summary_line
+
+    assembled = header + body + cancelled_section + summary_line
+    # Defensive guard: mirrors the guard in the former format_filtered_task_tree
+    # body — if the budget algorithm drifts from the assembly, fall back safely.
+    if len(assembled) > max_chars:
+        return visible, header + cancelled_section + summary_line
+    return visible, assembled
+
+
 # --------------------------------------------------------------------------- #
 # Formatter
 # --------------------------------------------------------------------------- #
@@ -507,30 +557,5 @@ def format_filtered_task_tree(
     Returns:
         Formatted string suitable for injection into a reconciliation prompt.
     """
-    # active_slice drives the "No active tasks" branch — reflects the max_tasks cap,
-    # NOT the secondary max_chars clamp (same as the pre-refactor behaviour).
-    active_slice = tree.active_tasks[:max_tasks]
-
-    # Delegate to the shared internal worker — single source of truth for both the
-    # visible-window decision and the surroundings construction.  The worker calls
-    # _build_surrounding exactly once and returns its outputs alongside the
-    # pre-rendered body, so _build_surrounding is never called twice per invocation.
-    visible, body, header, cancelled_section, summary_line = _select_visible_active_with_body(
-        tree, max_tasks, max_chars
-    )
-
-    if not active_slice:
-        return header + 'No active tasks.\n' + cancelled_section + summary_line
-
-    if not visible or body is None:
-        # Budget too tight for any task lines (budget<=0 or lazy loop drained all).
-        return header + cancelled_section + summary_line
-
-    result = header + body + cancelled_section + summary_line
-    # Defensive guard: if _select_visible_active_with_body's budget algorithm ever
-    # drifts from what the formatter assembles (e.g. a truncation-notice format
-    # change applied in one place only), fall back to the safe header-only result
-    # rather than silently returning an oversized string.
-    if len(result) > max_chars:
-        return header + cancelled_section + summary_line
-    return result
+    _, assembled_str = render_active_section(tree, max_tasks, max_chars)
+    return assembled_str
