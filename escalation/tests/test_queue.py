@@ -241,6 +241,28 @@ class TestDismissAllPendingPreservesL1:
         assert updated_l1 is not None
         assert updated_l1.status == 'pending'
 
+    def test_dismiss_all_pending_idempotent_with_l1(self, tmp_path: Path):
+        """Calling dismiss_all_pending twice is safe: second call returns 0, L1 is unmodified."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        l0 = _make_escalation('esc-l0-1', task_id='1', level=0)
+        l1 = _make_escalation('esc-l1-1', task_id='2', level=1)
+        queue.submit(l0)
+        queue.submit(l1)
+
+        first = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
+        assert first == 1
+
+        # Second call — no pending L0s remain; L1 is untouched.
+        second = queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted')
+        assert second == 0
+
+        # L1 status/resolved_at/resolved_by are unchanged across both calls.
+        updated_l1 = queue.get('esc-l1-1')
+        assert updated_l1 is not None
+        assert updated_l1.status == 'pending'
+        assert updated_l1.resolved_at is None
+        assert updated_l1.resolved_by is None
+
 
 class TestGetArchiveFallback:
     """EscalationQueue.get() falls back to the archive when the root path is missing."""

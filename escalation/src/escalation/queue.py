@@ -372,14 +372,14 @@ class EscalationQueue:
         """
         pending = self.get_pending()
         count = 0
-        for esc in (e for e in pending if e.level != 1):
+        for esc in (e for e in pending if e.level == 0):
             try:
                 if self.resolve(esc.id, resolution, dismiss=True, resolved_by='auto-dismissed') is not None:
                     count += 1
             except Exception as e:
                 logger.warning(f'Failed to dismiss escalation {esc.id}: {e}')
         if count:
-            logger.info(f'Dismissed {count} stale escalation(s): {resolution[:100]}')
+            logger.info(f'Dismissed {count} stale L0 escalation(s): {resolution[:100]}')
         return count
 
     def make_id(self, task_id: str) -> str:
