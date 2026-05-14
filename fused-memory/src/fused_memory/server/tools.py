@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 
 from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import resolve_main_checkout
+from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     validate_int_ids,
@@ -29,6 +31,43 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Scheduler-override constants
+#
+# These are intentional duplicates of orchestrator.overrides._SCHEMA and
+# orchestrator.config.PRIORITY_RANK.  fused-memory has no orchestrator
+# dependency in pyproject.toml; adding one would invert the dependency graph.
+# The same "ossified contract" pattern is used for TERMINAL_STATUSES, which
+# are duplicated at fused_memory/middleware/task_interceptor.py:108-112.
+# ---------------------------------------------------------------------------
+
+_OVERRIDE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS overrides (
+    project_root  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    boost_tier    TEXT,
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    pin_order     INTEGER,
+    reserve_now   INTEGER NOT NULL DEFAULT 0,
+    ttl_until     TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (project_root, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_overrides_pinned
+    ON overrides(project_root, pinned, pin_order);
+"""  # Source of truth: orchestrator/src/orchestrator/overrides.py:33-49
+
+# Mirrors orchestrator/src/orchestrator/config.py PRIORITY_RANK keys.
+# Source of truth: orchestrator/src/orchestrator/config.py:27.
+_PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
+
+# Valid field names for clear_task_priority_override.
+# Mirrors orchestrator.overrides.OverrideStore.clear_override validation at
+# orchestrator/src/orchestrator/overrides.py:258.
+_VALID_CLEAR_FIELDS: frozenset[str] = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
 
 FUSED_MEMORY_INSTRUCTIONS = """\
 Fused Memory is a unified memory system that combines Graphiti (temporal knowledge graph)
@@ -2233,6 +2272,508 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'remove_dependency error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    # ------------------------------------------------------------------
+    # Scheduler-override tools
+    #
+    # These four tools operate on
+    # ``<project_root>/data/orchestrator/scheduler_overrides.db`` directly
+    # via aiosqlite.  They duplicate the SQL semantics from
+    # orchestrator.overrides.OverrideStore (no import) — the same
+    # ossified-contract pattern as TERMINAL_STATUSES at
+    # fused_memory/middleware/task_interceptor.py:108-112.
+    #
+    # Invariant: overrides live in scheduler_overrides.db, physically separate
+    # from the tasks store.  set_task_status writes to the tasks store via
+    # task_interceptor and the MCP-tool body does not touch override rows.
+    # test_set_task_status_done_does_not_clear_override_row pins both:
+    #   (1) delegation wiring — task_interceptor.set_task_status.assert_called_once()
+    #   (2) cross-store separation — override row survives the status transition.
+    # ------------------------------------------------------------------
+
+    async def _open_overrides_db(
+        project_root: str, *, autocommit: bool = False,
+    ) -> aiosqlite.Connection:
+        """Open (and initialise) the scheduler_overrides.db for project_root.
+
+        Creates parent directories on first call, runs idempotent DDL, and
+        sets PRAGMA journal_mode=WAL / busy_timeout / synchronous=FULL.
+
+        When ``autocommit=True`` the connection is opened with
+        ``isolation_level=None`` and ``timeout=30`` so callers can use explicit
+        ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK`` to serialize
+        read-then-write sequences against concurrent writers.  Mirrors the
+        source-of-truth concurrency contract at
+        orchestrator/src/orchestrator/overrides.py:177-195 which documents
+        why ``set_override`` MUST use this pattern.
+        """
+        from pathlib import Path as _Path
+        db_path = _Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if autocommit:
+            db = await aiosqlite.connect(
+                str(db_path), timeout=30, isolation_level=None,
+            )
+        else:
+            db = await aiosqlite.connect(str(db_path))
+        await db.execute('PRAGMA journal_mode=WAL')
+        # busy_timeout=30000ms when autocommit so BEGIN IMMEDIATE will wait up
+        # to 30s for the write lock (matches source-of-truth timeout=30 above).
+        busy_ms = 30000 if autocommit else 5000
+        await db.execute(f'PRAGMA busy_timeout={busy_ms}')
+        await db.execute('PRAGMA synchronous=FULL')
+        await db.executescript(_OVERRIDE_SCHEMA)
+        return db
+
+    async def _emit_override_audit(
+        project_root: str,
+        tool_name: str,
+        task_id: str | None,
+        content: str,
+        metadata: dict,
+    ) -> None:
+        """Best-effort audit write — awaited inline; failures are logged but never propagated.
+
+        Mirrors the _log_read pattern at tools.py:272 — audit failures log
+        a warning but never fail the user-visible tool response.
+        """
+        try:
+            pid = resolve_project_id(project_root)
+            await memory_service.add_memory(
+                content=content,
+                category='decisions_and_rationale',
+                project_id=pid,
+                agent_id='scheduler-overrides',
+                metadata=metadata,
+            )
+        except Exception as audit_exc:
+            logger.warning(
+                'override audit emit failed (tool=%s task_id=%s): %s',
+                tool_name, task_id, audit_exc,
+            )
+
+    @mcp.tool()
+    async def set_task_priority_override(
+        project_root: str,
+        task_id: str,
+        boost_tier: str | None = None,
+        pinned: bool | None = None,
+        pin_order: int | None = None,
+        reserve_now: bool | None = None,
+        ttl_secs: int | None = None,
+    ) -> dict[str, Any]:
+        """Upsert a scheduler priority override for a task.
+
+        Only supplied (non-None) fields are written; unsupplied fields preserve
+        existing values via COALESCE in the UPSERT.
+
+        Args:
+            project_root: Absolute path to project root.
+            task_id: Task ID to override.
+            boost_tier: One of critical/high/medium/low/polish.
+            pinned: Pin this task to the front of the queue.
+            pin_order: Explicit position in the pin queue (only with pinned=True).
+            reserve_now: Reserve the next worker slot for this task.
+            ttl_secs: Seconds from now until this override expires.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+
+        if boost_tier is not None and boost_tier not in _PRIORITY_TIERS:
+            return {
+                'error': f'boost_tier must be one of {list(_PRIORITY_TIERS)}; got {boost_tier!r}',
+                'error_type': 'ValidationError',
+            }
+
+        # Guard: pin_order without pinned=True is an invariant violation.
+        # Mirrors orchestrator/src/orchestrator/overrides.py:151-155.
+        if pin_order is not None and pinned is not True:
+            return {
+                'error': (
+                    'pin_order may only be supplied together with pinned=True; '
+                    f'got pin_order={pin_order!r} with pinned={pinned!r}'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        try:
+            now_iso = datetime.now(UTC).isoformat()
+            ttl_until_iso: str | None = None
+            if ttl_secs is not None:
+                from datetime import timedelta
+                ttl_until_iso = (datetime.now(UTC) + timedelta(seconds=ttl_secs)).isoformat()
+
+            db = await _open_overrides_db(project_root, autocommit=True)
+            collision_response: dict[str, Any] | None = None
+            try:
+                # Acquire a write lock up-front (IMMEDIATE) so the MAX(pin_order)
+                # read and the subsequent UPSERT are serialized against concurrent
+                # set_task_priority_override callers.  Without BEGIN IMMEDIATE
+                # two concurrent callers can both read MAX=N and both attempt
+                # to write N+1, producing a collision or silently duplicating
+                # pin_order values.  Mirrors source-of-truth at
+                # orchestrator/src/orchestrator/overrides.py:188-195.
+                await db.execute('BEGIN IMMEDIATE')
+                try:
+                    # Auto-assign or preserve pin_order when pinning without an
+                    # explicit order. Mirrors orchestrator/src/orchestrator/overrides.py:160-180.
+                    if pinned is True and pin_order is None:
+                        already = await (await db.execute(
+                            'SELECT pin_order FROM overrides '
+                            'WHERE project_root=? AND task_id=? AND pinned=1',
+                            (project_root, task_id),
+                        )).fetchone()
+                        if already is not None:
+                            pin_order = already[0]
+                        else:
+                            row = await (await db.execute(
+                                'SELECT COALESCE(MAX(pin_order), 0) + 1 '
+                                'FROM overrides WHERE project_root=? AND pinned=1',
+                                (project_root,),
+                            )).fetchone()
+                            # Aggregate query always returns a row; assert for pyright.
+                            assert row is not None
+                            pin_order = row[0]
+
+                    # Collision check for explicit or auto-assigned pin_order.
+                    if pin_order is not None:
+                        existing = await (await db.execute(
+                            'SELECT task_id FROM overrides '
+                            'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
+                            (project_root, pin_order, task_id),
+                        )).fetchone()
+                        if existing:
+                            await db.execute('ROLLBACK')
+                            collision_response = {
+                                'error': 'pin_order_collision',
+                                'conflicting_task_id': existing[0],
+                                'pin_order': pin_order,
+                            }
+
+                    if collision_response is None:
+                        pinned_int = int(pinned) if pinned is not None else None
+                        reserve_now_int = int(reserve_now) if reserve_now is not None else None
+
+                        # CASE WHEN ?=0 THEN NULL ELSE COALESCE(?, pin_order) END
+                        # — passing pinned=False (pinned_int=0) zeroes pinned AND
+                        # nulls pin_order in one atomic write, preserving the
+                        # structural invariant `pinned=0 → pin_order IS NULL`.
+                        # Mirrors orchestrator/src/orchestrator/overrides.py:252-253.
+                        await db.execute(
+                            """
+                            INSERT INTO overrides
+                                (project_root, task_id, boost_tier, pinned, pin_order,
+                                 reserve_now, ttl_until, created_at, updated_at)
+                            VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                            ON CONFLICT(project_root, task_id) DO UPDATE SET
+                                boost_tier  = COALESCE(?, boost_tier),
+                                pinned      = COALESCE(?, pinned),
+                                pin_order   = CASE WHEN ?=0 THEN NULL
+                                                   ELSE COALESCE(?, pin_order) END,
+                                reserve_now = COALESCE(?, reserve_now),
+                                ttl_until   = COALESCE(?, ttl_until),
+                                updated_at  = ?
+                            """,
+                            (
+                                # INSERT values
+                                project_root, task_id,
+                                boost_tier, pinned_int, pin_order,
+                                reserve_now_int, ttl_until_iso,
+                                now_iso, now_iso,
+                                # UPDATE SET values
+                                boost_tier, pinned_int,
+                                pinned_int, pin_order,
+                                reserve_now_int, ttl_until_iso,
+                                now_iso,
+                            ),
+                        )
+                        await db.execute('COMMIT')
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await db.execute('ROLLBACK')
+                    raise
+            finally:
+                await db.close()
+
+            if collision_response is not None:
+                return collision_response
+
+            # Build changed_fields for audit (use original ttl_secs, not derived absolute).
+            changed_fields: dict[str, Any] = {}
+            if boost_tier is not None:
+                changed_fields['boost_tier'] = boost_tier
+            if pinned is not None:
+                changed_fields['pinned'] = pinned
+            if pin_order is not None:
+                # Intentionally the post-auto-assignment value — if pinned=True was
+                # supplied without an explicit pin_order, this records the integer
+                # that was actually written to the DB (auto-MAX+1 logic above).
+                # Contrast with ttl_secs below, which is intentionally the raw
+                # caller-supplied input rather than the derived ttl_until ISO string.
+                changed_fields['pin_order'] = pin_order
+            if reserve_now is not None:
+                changed_fields['reserve_now'] = reserve_now
+            if ttl_secs is not None:
+                changed_fields['ttl_secs'] = ttl_secs
+
+            await _emit_override_audit(
+                project_root,
+                'set_task_priority_override',
+                task_id,
+                f'Set priority override for task {task_id}: {changed_fields}',
+                {'task_id': task_id, 'fields': changed_fields},
+            )
+            return {'success': True, 'task_id': task_id}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'set_task_priority_override error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def clear_task_priority_override(
+        project_root: str,
+        task_id: str,
+        field: str | None = None,
+    ) -> dict[str, Any]:
+        """Clear a priority override row or a single field within it.
+
+        When ``field`` is None the entire row is deleted. Otherwise one
+        field is nulled/zeroed. Valid field names: boost_tier, pinned,
+        reserve_now, ttl. Clearing pinned also sets pin_order=NULL.
+
+        Args:
+            project_root: Absolute path to project root.
+            task_id: Task ID whose override to clear.
+            field: Field to clear, or None to delete the entire row.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+
+        if field is not None and field not in _VALID_CLEAR_FIELDS:
+            return {
+                'error': (
+                    f'field must be one of {sorted(_VALID_CLEAR_FIELDS)} or None; '
+                    f'got {field!r}'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        try:
+            now_iso = datetime.now(UTC).isoformat()
+            db = await _open_overrides_db(project_root)
+            try:
+                if field is None:
+                    await db.execute(
+                        'DELETE FROM overrides WHERE project_root=? AND task_id=?',
+                        (project_root, task_id),
+                    )
+                elif field == 'boost_tier':
+                    await db.execute(
+                        'UPDATE overrides SET boost_tier=NULL, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                elif field == 'pinned':
+                    # Clearing pinned also clears pin_order.
+                    # Mirrors orchestrator/src/orchestrator/overrides.py:267-271.
+                    await db.execute(
+                        'UPDATE overrides SET pinned=0, pin_order=NULL, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                elif field == 'reserve_now':
+                    await db.execute(
+                        'UPDATE overrides SET reserve_now=0, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                else:  # 'ttl'
+                    await db.execute(
+                        'UPDATE overrides SET ttl_until=NULL, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                await db.commit()
+            finally:
+                await db.close()
+
+            label = 'all' if field is None else field
+            await _emit_override_audit(
+                project_root,
+                'clear_task_priority_override',
+                task_id,
+                f'Cleared {label} priority override(s) for task {task_id}',
+                {'task_id': task_id, 'field': field},
+            )
+            return {'success': True, 'task_id': task_id, 'field': field}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'clear_task_priority_override error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def reorder_pin_queue(
+        project_root: str,
+        ordered_task_ids: list[str] | str,
+    ) -> dict[str, Any]:
+        """Rewrite pin_order values to match the supplied ordering.
+
+        ``ordered_task_ids`` may be a list or a comma-separated string. The
+        supplied set must exactly match the current pinned-task set.
+
+        Args:
+            project_root: Absolute path to project root.
+            ordered_task_ids: New ordering — first element gets pin_order=1.
+
+        Mirrors orchestrator/src/orchestrator/overrides.py:289-329.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+
+        # Normalise CSV string input. Mirrors overrides.py:300-301.
+        if isinstance(ordered_task_ids, str):
+            ordered_task_ids = [t.strip() for t in ordered_task_ids.split(',') if t.strip()]
+
+        # Duplicate-id guard MUST run before the set-equality check below,
+        # otherwise an input like ['A','A','B','C'] when the current pin set is
+        # {'A','B','C'} would pass set-equality and the rewrite loop would
+        # silently produce pin_orders that don't match the user's request
+        # (UPDATE A→1 then A→2, B→3, C→4 — creating gaps/duplicates depending
+        # on order).  Mirrors orchestrator/src/orchestrator/overrides.py:352-355.
+        if len(ordered_task_ids) != len(set(ordered_task_ids)):
+            seen: set[str] = set()
+            dups: list[str] = []
+            for tid in ordered_task_ids:
+                if tid in seen and tid not in dups:
+                    dups.append(tid)
+                seen.add(tid)
+            return {
+                'error': (
+                    f'reorder_pin_queue: duplicate task ids in input: '
+                    f'{ordered_task_ids!r} (duplicates: {sorted(dups)!r})'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        try:
+            now_iso = datetime.now(UTC).isoformat()
+            # Use autocommit=True so we can issue BEGIN IMMEDIATE, making the
+            # set-equality SELECT and the rewrite loop a single atomic
+            # read-then-write under a write lock.  Without BEGIN IMMEDIATE a
+            # concurrent set_task_priority_override(pinned=True) call could pin
+            # a new task between the SELECT and the UPDATE loop, invalidating
+            # the set-equality invariant that was checked before the writes.
+            # Mirrors set_task_priority_override's concurrency pattern above.
+            db = await _open_overrides_db(project_root, autocommit=True)
+            try:
+                await db.execute('BEGIN IMMEDIATE')
+                try:
+                    # Set-equality check before writing.
+                    # Mirrors orchestrator/src/orchestrator/overrides.py:303-312.
+                    cursor = await db.execute(
+                        'SELECT task_id FROM overrides WHERE project_root=? AND pinned=1',
+                        (project_root,),
+                    )
+                    current_rows = await cursor.fetchall()
+                    current_set = {r[0] for r in current_rows}
+                    supplied_set = set(ordered_task_ids)
+                    if supplied_set != current_set:
+                        await db.execute('ROLLBACK')
+                        return {
+                            'error': (
+                                f'reorder_pin_queue: ids do not match current pin queue. '
+                                f'supplied={sorted(supplied_set)!r}, '
+                                f'expected={sorted(current_set)!r}'
+                            ),
+                            'error_type': 'ValidationError',
+                        }
+
+                    # Single-transaction rewrite. Mirrors overrides.py:318-326.
+                    for idx, tid in enumerate(ordered_task_ids, start=1):
+                        await db.execute(
+                            'UPDATE overrides SET pin_order=?, updated_at=? '
+                            'WHERE project_root=? AND task_id=?',
+                            (idx, now_iso, project_root, tid),
+                        )
+                    await db.execute('COMMIT')
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await db.execute('ROLLBACK')
+                    raise
+            finally:
+                await db.close()
+
+            await _emit_override_audit(
+                project_root,
+                'reorder_pin_queue',
+                None,
+                f'Reordered pin queue: {ordered_task_ids}',
+                {'ordered_task_ids': list(ordered_task_ids)},
+            )
+            return {'success': True}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'reorder_pin_queue error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_pin_queue(
+        project_root: str,
+    ) -> dict[str, Any]:
+        """Return the current pinned-task queue in ascending pin_order.
+
+        Read-only.  Does NOT emit an audit add_memory call.
+
+        Args:
+            project_root: Absolute path to project root.
+
+        Returns:
+            ``{'pin_queue': [{'task_id': ..., 'boost_tier': ..., 'pinned': ...,
+            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...}, ...]}``
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            db = await _open_overrides_db(project_root)
+            try:
+                cursor = await db.execute(
+                    'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                    'FROM overrides '
+                    'WHERE project_root=? AND pinned=1 '
+                    'ORDER BY pin_order ASC',
+                    (project_root,),
+                )
+                rows = await cursor.fetchall()
+                pin_queue = [
+                    {
+                        'task_id': r[0],
+                        'boost_tier': r[1],
+                        'pinned': bool(r[2]),
+                        'pin_order': r[3],
+                        'reserve_now': bool(r[4]),
+                        'ttl_until': r[5],
+                    }
+                    for r in rows
+                ]
+                return {'pin_queue': pin_queue}
+            finally:
+                await db.close()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_pin_queue error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp
