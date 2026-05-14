@@ -619,8 +619,9 @@ async def test_collect_metrics_snapshot_writes_curator_row(tmp_path: Path, confi
     from dashboard.data.memory import reset_sessions
     from dashboard.data.stats_utils import percentile
 
-    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-    t_base = now - timedelta(minutes=30)
+    # collect_metrics_snapshot uses datetime.now(UTC) internally, so tickets
+    # must be resolved within the last hour of the real current time.
+    t_base = datetime.now(UTC) - timedelta(minutes=30)
 
     metrics_path = tmp_path / 'metrics.db'
     metrics_conn = await aiosqlite.connect(str(metrics_path))

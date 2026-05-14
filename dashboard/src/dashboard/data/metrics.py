@@ -289,6 +289,8 @@ async def collect_metrics_snapshot(
     http_client: httpx.AsyncClient,
     recon_db: aiosqlite.Connection | None,
     merge_dbs: list[tuple[str, aiosqlite.Connection | None]],
+    *,
+    tickets_db: aiosqlite.Connection | None = None,
 ) -> None:
     """Sample every metric source and insert one row per signal.
 
@@ -296,8 +298,14 @@ async def collect_metrics_snapshot(
     fused-memory HTTP timeout) does not poison the others. Per-row inserts
     commit individually so a write error on one signal cannot drop earlier
     rows.
+
+    Args:
+        tickets_db: Read-only connection to tickets.db for curator latency
+            sampling. Optional — when None the curator block records None
+            centiles but still captures pending_total and capped_now.
     """
-    now = datetime.now(UTC).isoformat()
+    now_dt = datetime.now(UTC)
+    now = now_dt.isoformat()
 
     # Orchestrators (synchronous; subprocess in to_thread).
     try:
@@ -380,6 +388,32 @@ async def collect_metrics_snapshot(
         await conn.commit()
     except Exception:
         logger.warning('merge sampler driver failed', exc_info=True)
+        with contextlib.suppress(Exception):
+            await conn.rollback()
+
+    # Curator (queue depth via HTTP list_tickets + cap state + ticket latency).
+    try:
+        runs_dbs = [db for _, db in merge_dbs]
+        curator = await _sample_curator(
+            http_client, config, tickets_db, runs_dbs, now=now_dt,
+        )
+        if curator is not None:
+            await conn.execute(
+                'INSERT OR REPLACE INTO curator_snapshots '
+                '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (
+                    now,
+                    curator['pending_total'],
+                    curator['capped_now'],
+                    curator['p50_active_ms'],
+                    curator['p90_active_ms'],
+                    curator['p99_active_ms'],
+                ),
+            )
+            await conn.commit()
+    except Exception:
+        logger.warning('curator sampler failed', exc_info=True)
         with contextlib.suppress(Exception):
             await conn.rollback()
 
