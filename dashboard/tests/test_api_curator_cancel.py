@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
-from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Helpers
