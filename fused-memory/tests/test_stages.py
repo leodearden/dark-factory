@@ -7731,3 +7731,52 @@ class TestStage2HintConversionDetection:
             f'Hint conversion section must be absent in remediation_mode=True.\n'
             f'Payload snippet: {payload[:3000]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_hint_section_capped_to_format_filtered_task_tree_cap(
+        self, mock_deps, watermark
+    ):
+        """hint section must not reference task IDs absent from the Active Task Tree.
+
+        Both sections are capped at 50 active tasks.  Tasks at positions 51-60
+        must appear in neither section — the hint section must slice candidates
+        to the same 50-task window rendered by format_filtered_task_tree
+        (slice-then-filter, not filter-then-slice).
+        """
+        # Build 60 tasks with list-format hints (ids 1..60, all 'pending').
+        tasks = [
+            self._make_task_with_hints(
+                i, 'pending', [{'entity': f'E{i}', 'query': 'q'}]
+            )
+            for i in range(1, 61)
+        ]
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree(tasks)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        hint_section = _extract_section(payload, self._SECTION_HEADER)
+        active_section = _extract_section(payload, '### Active Task Tree')
+
+        # Tasks 1..50 must appear in BOTH sections.
+        for tid in (1, 25, 50):
+            assert f'[{tid}]' in hint_section, (
+                f'Task {tid} (position <={50}) must appear in hint section.\n'
+                f'Hint section: {hint_section!r}'
+            )
+            assert f'[{tid}]' in active_section, (
+                f'Task {tid} must appear in Active Task Tree section.'
+            )
+
+        # Tasks 51..60 must appear in NEITHER section.
+        for tid in (51, 55, 60):
+            assert f'[{tid}]' not in hint_section, (
+                f'Task {tid} (position >{50}) must NOT appear in hint section '
+                f'(slice-then-filter parity with Active Task Tree).\n'
+                f'Hint section: {hint_section!r}'
+            )
+            assert f'[{tid}]' not in active_section, (
+                f'Task {tid} must NOT appear in Active Task Tree section.'
+            )
