@@ -445,8 +445,10 @@ def format_filtered_task_tree(
     Returns:
         Formatted string suitable for injection into a reconciliation prompt.
     """
-    active = tree.active_tasks[:max_tasks]
-    shown = len(active)
+    # active_slice drives the header's "shown" count — reflects the max_tasks cap,
+    # NOT the secondary max_chars clamp (same as the pre-refactor behaviour).
+    active_slice = tree.active_tasks[:max_tasks]
+    shown = len(active_slice)
     total_active = len(tree.active_tasks)
     omitted_active = total_active - shown
 
@@ -465,52 +467,33 @@ def format_filtered_task_tree(
     if tree.cancelled_tasks:
         cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
         cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
-        summary_line = f'{tree.done_count} done \u2014 omitted'
+        summary_line = f'{tree.done_count} done — omitted'
     else:
         cancelled_section = ''
         summary_line = (
-            f'{tree.done_count} done, {tree.cancelled_count} cancelled \u2014 omitted'
+            f'{tree.done_count} done, {tree.cancelled_count} cancelled — omitted'
         )
 
-    if not active:
+    if not active_slice:
         body = 'No active tasks.\n'
+        return header + body + cancelled_section + summary_line
+
+    # Delegate visible-window selection to the shared helper so that the Active
+    # Task Tree section and the hint-attention section in assemble_payload always
+    # reference exactly the same set of tasks (single source of truth).
+    visible = _select_visible_active(tree, max_tasks, max_chars)
+
+    if not visible:
+        # Budget too tight for any task lines (budget<=0 or lazy loop drained all).
+        return header + cancelled_section + summary_line
+
+    if len(visible) == len(active_slice):
+        # All max_tasks tasks fit — no truncation notice needed.
+        body = '\n'.join(_render_task_line(t) for t in visible) + '\n'
     else:
-        lines = [_render_task_line(t) for t in active]
-        body = '\n'.join(lines) + '\n'
-
-    result = header + body + cancelled_section + summary_line
-
-    # Secondary max_chars clamp — only active task lines are truncated.
-    # Subtract cancelled_section length from the budget so that active-task
-    # truncation correctly accounts for the space the cancelled section occupies.
-    if len(result) > max_chars and active:
-        task_lines = body.rstrip('\n').split('\n')
-        # Use the full remaining budget — no fixed reserve.  The actual truncation
-        # notice length is computed lazily after line accumulation and verified below.
-        budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
-        if budget <= 0:
-            return header + cancelled_section + summary_line
-        kept_lines: list[str] = []
-        used = 0
-        for line in task_lines:
-            if used + len(line) + 1 > budget:
-                break
-            kept_lines.append(line)
-            used += len(line) + 1
-
-        # Lazy: compute the real notice length and verify the max_chars contract.
-        # Pop task lines until result fits or kept_lines is exhausted.
-        trimmed_count = len(active) - len(kept_lines)
+        # Partial: some tail tasks were dropped by the max_chars clamp.
+        trimmed_count = len(active_slice) - len(visible)
         trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
-        body = '\n'.join(kept_lines) + trunc_notice
-        result = header + body + cancelled_section + summary_line
-        while len(result) > max_chars and kept_lines:
-            kept_lines.pop()
-            trimmed_count = len(active) - len(kept_lines)
-            trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
-            body = '\n'.join(kept_lines) + trunc_notice
-            result = header + body + cancelled_section + summary_line
-        if len(result) > max_chars:
-            return header + cancelled_section + summary_line
+        body = '\n'.join(_render_task_line(t) for t in visible) + trunc_notice
 
-    return result
+    return header + body + cancelled_section + summary_line
