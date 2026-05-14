@@ -1549,6 +1549,7 @@ class TaskKnowledgeSync(BaseStage):
 ### Recently Completed Tasks
 {recently_completed_text}
 {provenance_section}{proactive_sample_section}{hint_conversion_section}
+
 ## Your Task
 Reconcile task state against memory:
 1. For completed tasks: verify knowledge was captured. If sparse, search for related memories \
@@ -1952,11 +1953,8 @@ def _needs_hint_conversion(task: dict) -> bool:
        ``[{entity: ..., query: ...}, ...]`` — treat as conversion target).
     2. ``not task_hints`` (missing key or empty dict) → True (existing falsy path).
     3. otherwise (any truthy non-list value, including malformed scalars like strings
-       or ints) → False (skip). The helper treats *any* truthy non-list value as
-       already-converted; callers must defend against malformed scalars themselves —
-       a separable robustness narrowing is deferred (see
-       ``TestNeedsHintConversion.test_truthy_non_dict_non_list_memory_hints_not_flagged``
-       in test_stages.py for the pinned contract).
+       or ints) → False (skip). Any truthy non-list value is treated as
+       already-converted — narrowing to dict is a separable robustness change.
 
     Per Mem0 memory ``0b0eeb8d``: Stage 2's ``append=True`` merge silently discards
     list-format hints under old-wins semantics, so list-format must be re-classified

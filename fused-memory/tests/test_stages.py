@@ -7699,9 +7699,9 @@ class TestStage2HintConversionDetection:
 
         # Both tasks must appear in the Active Task Tree (section sanity check)
         active_section = _extract_section(payload, '### Active Task Tree')
-        assert '[40]' in active_section or 'Task 40' in active_section, (
+        assert '[40]' in active_section, (
             'Task 40 must appear in Active Task Tree section'
         )
-        assert '[50]' in active_section or 'Task 50' in active_section, (
+        assert '[50]' in active_section, (
             'Task 50 must appear in Active Task Tree section'
         )
