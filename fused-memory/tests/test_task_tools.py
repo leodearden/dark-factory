@@ -486,6 +486,43 @@ async def test_set_task_status_all_trigger_statuses_pass_through(
 
 
 # ---------------------------------------------------------------------------
+# pre-done hook error passthrough at the MCP surface
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_mcp_tool_surfaces_pre_done_hook_error(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """The set_task_status MCP tool passes pre_done_hook_rejected errors through unchanged.
+
+    Confirms the existing dict-passthrough at tools.py propagates the new
+    error code correctly — no exception raised, no field stripping.
+    """
+    task_interceptor.set_task_status = AsyncMock(
+        return_value={
+            'success': False,
+            'error': 'pre_done_hook_rejected',
+            'task_id': '1',
+            'exit_code': 1,
+            'stderr': 'hook validation failed',
+            'command': '/bin/false',
+            'hint': 'Fix the underlying issue and retry.',
+        }
+    )
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {'id': '1', 'project_root': '/project', 'status': 'done'},
+    )
+    assert isinstance(result, dict)
+    assert result['error'] == 'pre_done_hook_rejected'
+    assert result['task_id'] == '1'
+    assert result['exit_code'] == 1
+    # error_type is only added by the exception handler — must not appear here
+    assert 'error_type' not in result
+
+
+# ---------------------------------------------------------------------------
 # step-17: ticket-shaped id rejection for all id-accepting tools
 # ---------------------------------------------------------------------------
 
