@@ -840,6 +840,55 @@ class TestFormatFilteredTaskTree:
             f'deps display is not being truncated'
         )
 
+    def test_format_filtered_task_tree_renders_only_select_visible_active_return(
+        self, monkeypatch
+    ):
+        """format_filtered_task_tree must delegate visible-window selection to
+        _select_visible_active (single source of truth requirement).
+
+        A monkeypatched stub makes _select_visible_active return only the first
+        3 tasks regardless of input.  After the step-6 refactor,
+        format_filtered_task_tree calls the helper for its visible window, so
+        only tasks 1-3 are rendered.  Without the refactor, the formatter
+        applies its own internal slicing and renders all 10 — FAILS.
+
+        Uses the same module-level monkeypatch pattern as
+        test_budget_lazy_loop_handles_7_digit_trimmed_count (line ~643).
+        """
+        tasks = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 11)]
+        tree = FilteredTaskTree(
+            active_tasks=tasks,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=10,
+        )
+
+        # Stub: always return only the first 3 task dicts, ignoring budget args.
+        def _stub_select(t, max_tasks=50, max_chars=50_000):  # noqa: ARG001
+            return t.active_tasks[:3]
+
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._select_visible_active',
+            _stub_select,
+        )
+
+        output = format_filtered_task_tree(tree)
+
+        # Tasks 1-3 must be present.
+        for tid in (1, 2, 3):
+            assert f'- [{tid}] ' in output, (
+                f'Task {tid} must appear in output when stub returns first 3 tasks.\n'
+                f'Output: {output!r}'
+            )
+
+        # Tasks 4-10 must be absent.
+        for tid in range(4, 11):
+            assert f'- [{tid}] ' not in output, (
+                f'Task {tid} must NOT appear when stub limits visible window to 3.\n'
+                f'Output: {output!r}'
+            )
+
 
 class TestFilterTaskTreeDoneAndCancelledLists:
     """Tests for done_tasks and cancelled_tasks list fields on FilteredTaskTree."""
