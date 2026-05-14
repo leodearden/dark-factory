@@ -540,3 +540,43 @@ def test_api_curator_runs_fanout_and_db_concurrently(tmp_path: Path):
         'api_curator must run fan_out concurrently with DB queries'
     )
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# task-1336 step-1: _LIST_TICKETS_LIMIT constant flows through api_curator
+# ---------------------------------------------------------------------------
+
+
+def test_api_curator_uses_LIST_TICKETS_LIMIT_constant(tmp_path: Path, monkeypatch):
+    """api_curator must not pass a magic literal limit to fan_out_list_tickets.
+
+    Monkeypatches _LIST_TICKETS_LIMIT to 50. Patches mcp_tool_call to capture
+    the outgoing arguments['limit']. GETs /api/v2/dashboard/curator. Asserts the
+    captured limit equals 50 (the monkeypatched constant).
+
+    Failing baseline: app.py passes limit=2000 to fan_out_list_tickets. Since
+    limit is non-None, effective_limit stays 2000 regardless of the monkeypatch.
+    The captured payload limit is 2000, not 50 — test fails with a clear message
+    pointing at app.py.
+    """
+    import dashboard.data.metrics as _metrics_mod
+
+    monkeypatch.setattr(_metrics_mod, '_LIST_TICKETS_LIMIT', 50)
+
+    captured: dict = {}
+
+    async def _mock_mcp(client, base_url, tool_name, arguments):
+        captured['limit'] = arguments.get('limit')
+        return {'project_id': 'p', 'count': 0, 'tickets': []}
+
+    config = _make_config(tmp_path)
+    with _override_client(config) as c, patch(_PATCH_TARGET, new=_mock_mcp):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    assert captured.get('limit') == 50, (
+        f"Expected captured limit == 50 (the monkeypatched _LIST_TICKETS_LIMIT), "
+        f"got {captured.get('limit')!r}. A non-50 value (e.g. 2000) means "
+        "app.py is passing a magic literal that overrides the constant — "
+        "remove the limit=2000 kwarg from the fan_out_list_tickets call in app.py."
+    )
