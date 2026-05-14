@@ -673,6 +673,18 @@ async def _query_stage2_flags(
         else:
             # Present and truthy but does not match current run_id — prior-cycle residue
             stale_mismatched_run_id_ids.append(r.id)
+    if stale_missing_run_id_ids:
+        logger.warning(
+            'reconciliation._query_stage2_flags: %d Stage 2 marker(s) missing '
+            'metadata.run_id — Stage 1 producer drift (markers will be swept and '
+            'never reach the LLM); see prompts/stage1.py:316-332',
+            len(stale_missing_run_id_ids),
+            extra={
+                'project_id': project_id,
+                'missing_run_id_count': len(stale_missing_run_id_ids),
+                'current_run_id': run_id_str,
+            },
+        )
     return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids)
 
 
