@@ -988,6 +988,12 @@ class TaskKnowledgeSync(BaseStage):
     # report.stats['stale_fixc_markers_swept'] after super().run() returns.
     _stale_fixc_markers_swept: int = 0
 
+    # Count of Stage 2 markers with absent/empty metadata.run_id observed during
+    # the current assemble_payload() call (task 1257).  Non-zero indicates Stage 1
+    # producer drift — the LLM omitted the required run_id field.  Reset and
+    # injected via the same four-touchpoint pattern as _stale_fixc_markers_swept.
+    _stale_missing_run_id_markers: int = 0
+
     # Set to True by assemble_payload() when the autopilot_video contamination
     # guardrail fires (task IDs above AUTOPILOT_VIDEO_TASK_CEILING detected).
     # get_disallowed_tools() then adds DISALLOW_TASK_WRITES to the disallowed list
@@ -1031,6 +1037,7 @@ class TaskKnowledgeSync(BaseStage):
         # Reset per-run counters so cross-invocation contamination is impossible
         # (mirrors _current_run_id overwrite pattern).
         self._stale_fixc_markers_swept = 0
+        self._stale_missing_run_id_markers = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
 
@@ -1040,6 +1047,10 @@ class TaskKnowledgeSync(BaseStage):
         # downstream consumers (Stage 3 prompt, observability) can see how
         # many prior-cycle markers were swept (mirrors stage2_stage1_dups_suppressed).
         report.stats['stale_fixc_markers_swept'] = self._stale_fixc_markers_swept
+        # --- missing-run_id marker stat (task 1257) ---
+        # Mirrors _stale_fixc_markers_swept; explicit zero is required so
+        # downstream consumers never need .get(..., 0) fallbacks.
+        report.stats['stale_missing_run_id_markers'] = self._stale_missing_run_id_markers
 
         # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
         # Guard on stage identity so a future reorder of prior_reports doesn't
@@ -1466,6 +1477,7 @@ class TaskKnowledgeSync(BaseStage):
         )
         active_flags = partition.current
         stale_marker_ids = partition.stale_missing_run_id_ids + partition.stale_mismatched_run_id_ids
+        self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
         # the active-query path ONLY.  Stage 1's structured-output flags are
