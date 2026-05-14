@@ -663,17 +663,20 @@ class Scheduler:
         mcp_session: McpSessionLike | None = None,
         time_source: Callable[[], float] | None = None,
         override_store: OverrideStore | None = None,
-        wall_clock_source: Callable[[], float] | None = None,
+        monotonic_clock_source: Callable[[], float] | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
         # Monotonic clock source for the park-stop rolling-window transition
         # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
         # from non-monotonic wall-clock skew (NTP steps, VM clock drift).
-        # Injectable via the ``wall_clock_source`` kwarg so deterministic tests
-        # can inject a fixed lambda without touching production semantics.
+        # Injectable via the ``monotonic_clock_source`` kwarg so deterministic
+        # tests can inject a fixed lambda without touching production semantics.
+        # NOTE: callers MUST inject a monotonic-style source (no epoch relation,
+        # immune to NTP/clock skew).  Injecting ``time.time`` will break trip
+        # semantics under clock adjustments.
         self._park_stop_clock: Callable[[], float] = (
-            wall_clock_source if wall_clock_source is not None else time.monotonic
+            monotonic_clock_source if monotonic_clock_source is not None else time.monotonic
         )
         self.lock_table = ModuleLockTable(config, time_source=self._time_source)
         self.event_store = event_store
@@ -778,10 +781,10 @@ class Scheduler:
 
         Clears the rolling ``_blocked_transitions`` deque so the operator's
         resume establishes a clean baseline.  Without this, a still-full deque
-        (the window is wall-clock 1h by default) would cause the next blocked
-        transition — e.g. an in-flight workflow finishing shortly after resume
-        — to immediately re-trip the park-stop pause, silently undoing the
-        operator's action.  Requiring fresh transitions post-resume keeps the
+        (the window is a monotonic-clock 1h by default) would cause the next
+        blocked transition — e.g. an in-flight workflow finishing shortly after
+        resume — to immediately re-trip the park-stop pause, silently undoing
+        the operator's action.  Requiring fresh transitions post-resume keeps the
         circuit breaker observable: trips correspond to bursts after resume,
         not stale history from before it.
         """
@@ -822,6 +825,19 @@ class Scheduler:
              Persistence (run_store) and event emission still fire exactly once.
 
         The synchronous latch is the key invariant: pause() BEFORE ensure_future.
+
+        Crash semantics — at-most-once on disk: the in-memory ``_paused`` latch
+        is set synchronously, but the ``run_store.save_scheduler_pause`` write
+        and ``scheduler_paused`` event emission both live inside the scheduled
+        ``harness.pause_scheduler`` coroutine.  If the orchestrator crashes
+        (or the loop is shut down) AFTER the latch is set but BEFORE that
+        coroutine executes, the pause is observable in-memory and in the WARN
+        log but never reaches disk.  The next restart will therefore NOT
+        restore the pause — operators investigating a near-trip crash should
+        verify ``run_store.load_scheduler_pause`` reflects the expected state
+        before resuming dispatch.  This trade-off is intentional: keeping the
+        status write off the synchronous path avoids blocking the caller
+        (set_task_status) on a SQLite write.
         """
         if self._paused:
             return

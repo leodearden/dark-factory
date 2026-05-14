@@ -184,17 +184,6 @@ class TestHarnessRestartPersistence:
         harness._run_store = seeder  # inject so _load_persisted_scheduler_pause can read
         harness._run_id = 'new-run-id'
 
-        # Spy: assert save_scheduler_pause is NOT called (no re-persist).
-        original_save = seeder.save_scheduler_pause
-        save_call_count = 0
-
-        def _spy_save(*args, **kwargs):
-            nonlocal save_call_count
-            save_call_count += 1
-            return original_save(*args, **kwargs)
-
-        seeder.save_scheduler_pause = _spy_save
-
         # Act
         await harness._load_persisted_scheduler_pause()
 
@@ -206,9 +195,19 @@ class TestHarnessRestartPersistence:
             f'Expected pause_reason "pre-restart park-stop"; got {harness.scheduler.pause_reason!r}'
         )
 
-        # Assert no re-persist.
-        assert save_call_count == 0, (
-            f'save_scheduler_pause must not be called on restart load; got {save_call_count} calls'
+        # Assert the persisted row was NOT re-written on restart: re-load from
+        # disk and check every field still matches the seed values.  This is
+        # the load-bearing assertion — a stale spy on save_scheduler_pause
+        # would pass vacuously because the load path never invokes save.
+        reloaded = RunStore(db_path).load_scheduler_pause('dark_factory')
+        assert reloaded is not None, 'Seed row must still exist after load'
+        assert reloaded == {
+            'reason': 'pre-restart park-stop',
+            'pause_at': '2026-05-13T22:00:00+00:00',
+            'set_by_run_id': 'prior-run-id',
+        }, (
+            f'Persisted row must be unchanged after restart load (no re-write '
+            f'with new run_id); got {reloaded!r}'
         )
 
     @pytest.mark.asyncio

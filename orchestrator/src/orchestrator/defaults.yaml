@@ -246,8 +246,11 @@ usage_cap:
 #   transitions are still recorded in the in-process deque so flipping back to
 #   true at runtime reflects accurate state immediately (no warm-up delay).
 #
-# park_stop_parked_threshold: number of blocked transitions in the window to
-#   trip the pause (ge=1; default 5).
+# park_stop_parked_threshold: number of DISTINCT tasks transitioning to blocked
+#   within the window required to trip the pause (ge=1; default 5).  Counts
+#   distinct task_ids — a single flaky task re-blocked N times within the
+#   window counts as one, not N.  Tune for "how many concurrent failures
+#   warrant a human look", not "how many retries are too many".
 #
 # park_stop_parked_window_hours: rolling-window length in hours (gt=0; default 1.0).
 park_stop_enabled: true

@@ -4805,7 +4805,7 @@ class TestSchedulerBlockedTransitionTracking:
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
         now = 1_000_000.0
-        return Scheduler(config, wall_clock_source=lambda: now)
+        return Scheduler(config, monotonic_clock_source=lambda: now)
 
     def test_record_blocked_transition_appends_timestamp(self):
         """_record_blocked_transition() adds entries matching the clock source."""
@@ -4818,7 +4818,7 @@ class TestSchedulerBlockedTransitionTracking:
             return val
 
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
-        scheduler = Scheduler(config, wall_clock_source=time_source)
+        scheduler = Scheduler(config, monotonic_clock_source=time_source)
 
         # Three distinct task IDs → three entries in the deque.
         scheduler._record_blocked_transition('t1')
@@ -4838,7 +4838,7 @@ class TestSchedulerBlockedTransitionTracking:
             return call_times[-1]
 
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
-        scheduler = Scheduler(config, wall_clock_source=time_source)
+        scheduler = Scheduler(config, monotonic_clock_source=time_source)
 
         # Seed three (task_id, timestamp) entries: two outside the 3600s window, one inside.
         from collections import deque
@@ -4878,7 +4878,7 @@ class TestSchedulerBlockedTransitionTracking:
         """
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
-        scheduler = Scheduler(config, wall_clock_source=lambda: now)
+        scheduler = Scheduler(config, monotonic_clock_source=lambda: now)
 
         # Block the same task three times.
         scheduler._record_blocked_transition('task-1')
@@ -4905,7 +4905,7 @@ class TestSetTaskStatusBlockedRecording:
         """A successful blocked transition adds one entry to _blocked_transitions."""
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1)
-        scheduler = Scheduler(config, wall_clock_source=lambda: now)
+        scheduler = Scheduler(config, monotonic_clock_source=lambda: now)
 
         # Return a clean success response (no rejection structure).
         mock = AsyncMock(return_value={})

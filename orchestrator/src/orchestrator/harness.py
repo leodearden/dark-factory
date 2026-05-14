@@ -2585,6 +2585,18 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Called directly by sibling tasks (cost-ceiling 1323, EWA digest 1327)
         and also wired as the callback for Scheduler's park-stop trip detector.
+
+        Race note: when this is invoked as the park-stop trip callback, the
+        scheduler's synchronous latch has already set ``is_paused=True`` with
+        the trip reason, so a different external caller racing in between the
+        latch and this callback executing would briefly see is_paused=True
+        with the trip reason but no disk row yet.  After this callback runs,
+        disk and memory both reflect the trip reason — first-wins on memory,
+        last-write-wins on disk for the same reason value.  Sequential
+        external callers after a trip see no-op idempotent in-memory plus a
+        disk overwrite with the new reason; this divergence between memory
+        and disk for the in-flight pause is accepted as the cost of keeping
+        the trip's status write off the synchronous critical path.
         """
         self.scheduler.pause(reason)
         logger.warning('Scheduler paused: %s', reason)
