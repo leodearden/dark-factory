@@ -436,3 +436,218 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert 'snapshot_at' in inner
     assert 'offline' in inner
     assert 'offline_projects' in inner
+
+
+# ---------------------------------------------------------------------------
+# step-15: POST /scheduler/override — validation → 400
+# ---------------------------------------------------------------------------
+
+_PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
+
+_OVERRIDE_INVALID_BODIES = [
+    pytest.param(None, id='non-dict-body'),
+    pytest.param({}, id='missing-task_id'),
+    pytest.param({'task_id': 123}, id='task_id-not-string'),
+    pytest.param({'task_id': ''}, id='task_id-empty'),
+    pytest.param({'task_id': 'T1', 'boost_tier': 'invalid_tier'}, id='bad-boost_tier'),
+    pytest.param({'task_id': 'T1', 'pin_order': 5}, id='pin_order-without-pinned'),
+]
+
+
+@pytest.mark.parametrize('body', _OVERRIDE_INVALID_BODIES)
+def test_override_endpoint_rejects_invalid_body(client, body):
+    """Invalid body → 400 with no MCP call."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+        if body is None:
+            resp = client.post(
+                '/api/v2/dashboard/scheduler/override',
+                content=b'not json',
+                headers={'Content-Type': 'application/json'},
+            )
+        else:
+            resp = client.post('/api/v2/dashboard/scheduler/override', json=body)
+
+    assert resp.status_code == 400
+    assert mock_mcp.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# step-17: POST /scheduler/override — happy path and 502
+# ---------------------------------------------------------------------------
+
+
+def test_override_endpoint_proxies_verbatim_on_success(client):
+    """Valid body → 200 with MCP result forwarded verbatim."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/override',
+            json={'task_id': 'T1', 'project_root': '/proj', 'boost_tier': 'high'},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == mcp_result
+    mock_mcp.assert_called_once()
+    _client, _url, tool_arg, _args = mock_mcp.call_args.args
+    assert tool_arg == 'set_task_priority_override'
+
+
+def test_override_endpoint_returns_502_when_all_unreachable(client):
+    """All URLs unreachable → 502."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError('refused'))):
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/override',
+            json={'task_id': 'T1', 'project_root': '/proj'},
+        )
+
+    assert resp.status_code == 502
+    assert resp.json().get('error') == 'fused_memory_unreachable'
+
+
+# ---------------------------------------------------------------------------
+# step-19: POST /scheduler/clear-override — validation, proxy, 404, 502
+# ---------------------------------------------------------------------------
+
+_CLEAR_INVALID_BODIES = [
+    pytest.param(None, id='non-dict-body'),
+    pytest.param({}, id='missing-task_id'),
+    pytest.param({'task_id': ''}, id='empty-task_id'),
+    pytest.param({'task_id': 'T1', 'fields': 'not-a-list'}, id='fields-not-list'),
+    pytest.param({'task_id': 'T1', 'fields': ['bad_field']}, id='invalid-field'),
+]
+
+
+@pytest.mark.parametrize('body', _CLEAR_INVALID_BODIES)
+def test_clear_override_rejects_invalid_body(client, body):
+    """Invalid body → 400 with no MCP call."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+        if body is None:
+            resp = client.post(
+                '/api/v2/dashboard/scheduler/clear-override',
+                content=b'not json',
+                headers={'Content-Type': 'application/json'},
+            )
+        else:
+            resp = client.post('/api/v2/dashboard/scheduler/clear-override', json=body)
+
+    assert resp.status_code == 400
+    assert mock_mcp.call_count == 0
+
+
+def test_clear_override_proxies_verbatim_on_success(client):
+    """Valid body → 200, tool name is clear_task_priority_override."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/proj', 'fields': ['boost_tier']},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == mcp_result
+    _client, _url, tool_arg, _args = mock_mcp.call_args.args
+    assert tool_arg == 'clear_task_priority_override'
+
+
+def test_clear_override_returns_404_on_not_found(client):
+    """MCP returns not_found → 404 verbatim."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'error': 'not_found', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/proj'},
+        )
+
+    assert resp.status_code == 404
+    assert resp.json() == mcp_result
+
+
+def test_clear_override_returns_502_when_all_unreachable(client):
+    """All URLs unreachable → 502."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError('refused'))):
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/proj'},
+        )
+
+    assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# step-21: POST /scheduler/reorder-pin-queue — validation, proxy, 502
+# ---------------------------------------------------------------------------
+
+_REORDER_INVALID_BODIES = [
+    pytest.param(None, id='non-dict-body'),
+    pytest.param({}, id='missing-task_ids'),
+    pytest.param({'task_ids': 'not-a-list'}, id='task_ids-not-list'),
+    pytest.param({'task_ids': ['T1', 'T1']}, id='duplicate-task_ids'),
+]
+
+
+@pytest.mark.parametrize('body', _REORDER_INVALID_BODIES)
+def test_reorder_pin_queue_rejects_invalid_body(client, body):
+    """Invalid body → 400 with no MCP call."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+        if body is None:
+            resp = client.post(
+                '/api/v2/dashboard/scheduler/reorder-pin-queue',
+                content=b'not json',
+                headers={'Content-Type': 'application/json'},
+            )
+        else:
+            resp = client.post('/api/v2/dashboard/scheduler/reorder-pin-queue', json=body)
+
+    assert resp.status_code == 400
+    assert mock_mcp.call_count == 0
+
+
+def test_reorder_pin_queue_proxies_verbatim_on_success(client):
+    """Valid body → 200, tool name is reorder_pin_queue."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/reorder-pin-queue',
+            json={'task_ids': ['T1', 'T2'], 'project_root': '/proj'},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == mcp_result
+    _client, _url, tool_arg, args = mock_mcp.call_args.args
+    assert tool_arg == 'reorder_pin_queue'
+    assert args['task_ids'] == ['T1', 'T2']
+    assert args['project_root'] == '/proj'
+
+
+def test_reorder_pin_queue_returns_502_when_all_unreachable(client):
+    """All URLs unreachable → 502."""
+    import httpx
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError('refused'))):
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/reorder-pin-queue',
+            json={'task_ids': ['T1'], 'project_root': '/proj'},
+        )
+
+    assert resp.status_code == 502
