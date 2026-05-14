@@ -79,3 +79,19 @@ class TestSetGet:
         result_b = store.get_overrides('proj-B')
         assert 'task-2' in result_b
         assert 'task-1' not in result_b
+
+    def test_set_override_rejects_unknown_boost_tier(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        with pytest.raises(ValueError, match='boost_tier'):
+            store.set_override('proj', 'A', boost_tier='urgent')
+
+    def test_set_override_accepts_valid_boost_tiers(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        for tier in ('critical', 'high', 'medium', 'low', 'polish'):
+            store.set_override('proj', f'task-{tier}', boost_tier=tier)
+            result = store.get_overrides('proj')
+            assert result[f'task-{tier}'].boost_tier == tier
