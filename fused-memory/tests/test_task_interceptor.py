@@ -5470,3 +5470,57 @@ async def test_cancel_ticket_clean_win_logs_info(
         f'Expected an INFO record containing ticket_id={ticket_id!r} and "cancelled"; '
         f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_race_loss_logs_warning_with_status(
+    interceptor_with_store, ticket_store, caplog,
+):
+    """cancel_ticket emits a WARNING when it loses the TOCTOU race to a concurrent worker.
+
+    Reuses the racing_mark_resolved pattern from
+    test_cancel_ticket_race_returns_noop_with_actual_status: a concurrent
+    worker terminalizes the row to 'created' between cancel's get() and the
+    UPDATE.  After the race, cancel_ticket re-fetches and returns the no_op
+    shape.  We assert a WARNING record exists containing the ticket_id, the
+    actual recovered status ('created'), and a race indicator.
+
+    RED: cancel_ticket's TOCTOU branch currently emits no log.
+    """
+    import logging
+
+    ticket_id = await ticket_store.submit(project_id='p', candidate_json='{}')
+
+    original_mark_resolved = ticket_store.mark_resolved
+
+    async def racing_mark_resolved(tid: str, *, status: str, **kwargs):
+        if tid == ticket_id and status == 'cancelled':
+            # The racing writer wins first: force the row to terminal 'created'.
+            await original_mark_resolved(tid, status='created', reason='raced_first')
+        # Now our cancel UPDATE runs — returns False because status != 'pending'.
+        return await original_mark_resolved(tid, status=status, **kwargs)
+
+    ticket_store.mark_resolved = racing_mark_resolved
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor_with_store.cancel_ticket(ticket_id)
+    finally:
+        ticket_store.mark_resolved = original_mark_resolved
+
+    # (a) Existing contract is preserved
+    assert result == {'status': 'created', 'ticket_id': ticket_id, 'no_op': True}, (
+        f'Expected no_op with actual status=created, got: {result!r}'
+    )
+
+    # (b) WARNING record with ticket_id, actual status, and a race indicator
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and ticket_id in r.message
+        and 'created' in r.message
+        and any(kw in r.message for kw in ('race', 'raced', 'TOCTOU'))
+    ]
+    assert warning_records, (
+        f'Expected a WARNING containing ticket_id={ticket_id!r}, "created", and a '
+        f'race indicator; got records: {[(r.levelno, r.message) for r in caplog.records]}'
+    )
