@@ -14,7 +14,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -269,6 +269,58 @@ def test_curator_capped_now_open_ended_interval(tmp_path: Path):
 
     assert resp.status_code == 200
     assert resp.json()['CURATOR_STATE']['state']['capped_now'] == 1
+
+
+# ---------------------------------------------------------------------------
+# step-13: api_curator delegates to compute_capped_now_and_windows
+# ---------------------------------------------------------------------------
+
+
+def test_api_curator_delegates_to_compute_capped_now_and_windows(tmp_path: Path):
+    """api_curator uses compute_capped_now_and_windows; sentinel return value flows through.
+
+    Sentinel capped_now == 7 is impossible from the real helper (returns 0 or 1)
+    so its appearance in the response proves api_curator is using the helper's
+    return value.  Failing baseline: app.py computes capped_now inline — the mock
+    is never called and capped_now is 1 (real open-ended interval), not 7.
+    """
+    from dashboard.data.cap_history import CapInterval
+
+    now = datetime.now(UTC)
+    cap_hit_time = now - timedelta(minutes=10)
+
+    runs_dir = tmp_path / 'data' / 'orchestrator'
+    runs_dir.mkdir(parents=True)
+    runs_db_path = runs_dir / 'runs.db'
+    conn = sqlite3.connect(str(runs_db_path))
+    conn.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc1', 'cap_hit', cap_hit_time.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    config = _make_config(tmp_path)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+    mock_helper = MagicMock(return_value=(7, []))
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=empty_result),
+        patch('dashboard.app.compute_capped_now_and_windows', new=mock_helper),
+    ):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    # Sentinel capped_now == 7 proves the helper's return value flowed through.
+    assert resp.json()['CURATOR_STATE']['state']['capped_now'] == 7
+    # Helper was called exactly once.
+    assert mock_helper.call_count == 1
+    # The intervals list forwarded to the helper contains CapInterval instances.
+    forwarded = mock_helper.call_args.args[0]
+    assert isinstance(forwarded, list)
+    assert len(forwarded) >= 1
+    assert all(isinstance(iv, CapInterval) for iv in forwarded)
 
 
 # ---------------------------------------------------------------------------
