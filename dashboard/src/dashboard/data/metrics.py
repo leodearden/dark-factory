@@ -271,6 +271,7 @@ _DOWNSAMPLE_TABLES = (
     ('queue_snapshots', None),
     ('recon_snapshots', None),
     ('merge_snapshots', 'project_id'),
+    ('curator_snapshots', None),
 )
 
 
