@@ -7546,3 +7546,162 @@ class TestFormatSnapshotFact:
                 project_id='proj',
                 counts={},
             )
+
+
+class TestStage2HintConversionDetection:
+    """assemble_payload() surfaces Tasks Needing Memory Hint Attention section.
+
+    Tests that the new conditional ``### Tasks Needing Memory Hint Attention``
+    section is produced by ``assemble_payload()`` exactly when active tasks fail
+    ``_needs_hint_conversion()``.  Uses the harness-injection pattern
+    (``stage.filtered_task_tree``) from ``TestTaskKnowledgeSyncFilteredTaskTree``
+    to control the task pool without calling taskmaster.
+    """
+
+    _SECTION_HEADER = '### Tasks Needing Memory Hint Attention'
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task_with_hints(self, tid: int, status: str, hints) -> dict:
+        """Build a minimal task dict with the given memory_hints value."""
+        return {
+            'id': tid,
+            'title': f'Task {tid}',
+            'status': status,
+            'dependencies': [],
+            'metadata': {'memory_hints': hints} if hints is not None else {},
+        }
+
+    def _make_task_no_hints(self, tid: int, status: str) -> dict:
+        """Build a task dict with no metadata.memory_hints key at all."""
+        return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': [], 'metadata': {}}
+
+    def _make_tree(self, active_tasks: list[dict]):
+        """Wrap *active_tasks* in a FilteredTaskTree with empty done/cancelled lists."""
+        return FilteredTaskTree(
+            active_tasks=active_tasks,
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=len(active_tasks),
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_format_task_appears_in_hint_conversion_section(
+        self, mock_deps, watermark
+    ):
+        """Active task with legacy list-format hints must appear in the new section."""
+        task = self._make_task_with_hints(
+            10, 'in-progress', [{'entity': 'Foo', 'query': 'q'}]
+        )
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree([task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER in payload, (
+            f'Expected "{self._SECTION_HEADER}" in payload, but it was absent.\n'
+            f'Payload snippet: {payload[:3000]!r}'
+        )
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[10]' in section, (
+            f'Task 10 (list-format hints) must appear in the section body.\n'
+            f'Section: {section!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_valid_dict_hints_task_excluded_from_section(
+        self, mock_deps, watermark
+    ):
+        """Active task with valid dict hints must NOT produce the section (empty list → omit)."""
+        task = self._make_task_with_hints(
+            20, 'pending', {'entities': ['Bar'], 'queries': ['q']}
+        )
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree([task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER not in payload, (
+            f'Section header must be absent when all active tasks have valid dict hints.\n'
+            f'Payload snippet: {payload[:3000]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_hints_task_appears_in_section(self, mock_deps, watermark):
+        """Active task with no memory_hints key must appear in the section (falsy branch)."""
+        task = self._make_task_no_hints(30, 'pending')
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree([task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER in payload, (
+            f'Expected "{self._SECTION_HEADER}" when task has no hints.\n'
+            f'Payload snippet: {payload[:3000]!r}'
+        )
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[30]' in section, (
+            f'Task 30 (no hints) must appear in the section body.\n'
+            f'Section: {section!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_tree_filters_correctly(self, mock_deps, watermark):
+        """Mixed tree: only the list-format task appears in the new section; both in Active Task Tree."""
+        list_task = self._make_task_with_hints(
+            40, 'in-progress', [{'entity': 'X', 'query': 'q'}]
+        )
+        dict_task = self._make_task_with_hints(
+            50, 'pending', {'entities': ['Y'], 'queries': ['q2']}
+        )
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree([list_task, dict_task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # The section must be present (at least one qualifying task)
+        assert self._SECTION_HEADER in payload, (
+            f'Expected "{self._SECTION_HEADER}" with one list-format task in tree.'
+        )
+        section = _extract_section(payload, self._SECTION_HEADER)
+
+        # List-format task (id=40) must be in the section
+        assert '[40]' in section, (
+            f'Task 40 (list-format hints) must appear in hint section.\nSection: {section!r}'
+        )
+        # Valid-dict task (id=50) must NOT be in the section
+        assert '[50]' not in section, (
+            f'Task 50 (valid dict hints) must NOT appear in hint section.\nSection: {section!r}'
+        )
+
+        # Both tasks must appear in the Active Task Tree (section sanity check)
+        active_section = _extract_section(payload, '### Active Task Tree')
+        assert '[40]' in active_section, (
+            'Task 40 must appear in Active Task Tree section'
+        )
+        assert '[50]' in active_section, (
+            'Task 50 must appear in Active Task Tree section'
+        )

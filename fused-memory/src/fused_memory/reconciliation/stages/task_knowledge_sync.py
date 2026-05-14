@@ -1398,6 +1398,22 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
+        # Compute the hint-attention section: active tasks whose memory_hints
+        # need conversion from legacy list format (or are missing entirely).
+        # Rendered conditionally — omitted on the steady-state case where every
+        # active task already has valid dict-format hints (matches the stale_section
+        # / known_projects_section / proactive_sample_section render pattern).
+        tasks_needing_hint_attention = [
+            t for t in filtered.active_tasks if _needs_hint_conversion(t)
+        ]
+        hint_conversion_section = ''
+        if tasks_needing_hint_attention:
+            hint_conversion_section = (
+                '\n### Tasks Needing Memory Hint Attention\n'
+                + format_task_list(tasks_needing_hint_attention)
+                + '\n'
+            )
+
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], []) internally.
         # Returns (current_flags, stale_marker_ids): stale partition contains markers
@@ -1532,7 +1548,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}
+{provenance_section}{proactive_sample_section}{hint_conversion_section}
 
 ## Your Task
 Reconcile task state against memory:
@@ -1936,7 +1952,9 @@ def _needs_hint_conversion(task: dict) -> bool:
     1. ``isinstance(task_hints, list)`` → True (legacy list-of-dict format
        ``[{entity: ..., query: ...}, ...]`` — treat as conversion target).
     2. ``not task_hints`` (missing key or empty dict) → True (existing falsy path).
-    3. otherwise (truthy, non-list — assumed already-structured dict) → False (skip).
+    3. otherwise (any truthy non-list value, including malformed scalars like strings
+       or ints) → False (skip). Any truthy non-list value is treated as
+       already-converted — narrowing to dict is a separable robustness change.
 
     Per Mem0 memory ``0b0eeb8d``: Stage 2's ``append=True`` merge silently discards
     list-format hints under old-wins semantics, so list-format must be re-classified
