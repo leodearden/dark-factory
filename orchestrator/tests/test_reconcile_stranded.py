@@ -1223,6 +1223,43 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
+    @pytest.mark.parametrize(
+        'status',
+        [
+            pytest.param('in-progress', id='in-progress'),
+            pytest.param('blocked', id='blocked'),
+        ],
+    )
+    async def test_marker_skipped_when_marker_predates_branch_base_sha_parametrized(
+        self, harness: Harness, status: str,
+    ):
+        """Stale-marker veto is status-agnostic: predates branch_base_sha → must NOT flip.
+
+        The veto at harness.py:1312-1321 fires on the second is_ancestor call's
+        result (True = marker is ancestor of base = stale = prior incarnation) and
+        short-circuits with `return None` BEFORE the status-aware note construction
+        at harness.py:1323-1327 runs.  The blocked-flavor message
+        'reconcile: merge marker found on main while task was blocked' (and the
+        in-progress fixed message) must NOT fire for vetoed markers.
+        """
+        marker_sha = 'cafebabe' + 'd' * 32
+        branch_base = 'beef0000' + '9' * 32
+        tid = '80'
+        # First is_ancestor: branch check → False (skip is_ancestor fast-path)
+        # Second is_ancestor: stale-marker check → True (marker predates base)
+        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
+        )
+        harness.scheduler.get_statuses.return_value = ({tid: status}, None)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Stale marker from prior incarnation — must NOT flip to done regardless of status
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
     async def test_marker_accepted_when_marker_postdates_branch_base_sha(
         self, harness: Harness
     ):
