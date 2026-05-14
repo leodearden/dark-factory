@@ -5240,3 +5240,43 @@ async def test_predone_hook_only_fires_on_done_transition(
 
     # taskmaster.set_task_status must have been called for both transitions
     assert taskmaster.set_task_status.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_predone_hook_skipped_on_done_to_done_noop(
+    taskmaster, reconciler, event_buffer, monkeypatch
+):
+    """Same-status guard short-circuits before the pre-done hook fires.
+
+    Even when the hook env var is /bin/false (which would reject the done
+    transition if it ran), the done→done same-status no-op guard fires first
+    and returns without ever invoking run_hook.
+    """
+    import fused_memory.middleware.pre_done_hook as _hook_mod
+
+    # Env var set to /bin/false — would reject if the hook fired
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', '/bin/false')
+    # Task is already done — same-status guard should short-circuit
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    # Spy on run_hook to verify it is never called
+    spy_calls: list = []
+
+    async def _spy_run_hook(task_id, project_root, **kwargs):
+        spy_calls.append((task_id, project_root))
+        return None  # should never be reached
+
+    monkeypatch.setattr(_hook_mod, 'run_hook', _spy_run_hook)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    # Must be the no-op shape — NOT a hook rejection
+    assert result.get('success') is True
+    assert result.get('no_op') is True
+    assert result.get('task_id') == '1'
+    # run_hook must not have been called
+    assert spy_calls == [], f'run_hook should not have fired; got calls: {spy_calls}'
+    # taskmaster.set_task_status must NOT have been called
+    taskmaster.set_task_status.assert_not_called()
+    reconciler.reconcile_task.assert_not_called()
