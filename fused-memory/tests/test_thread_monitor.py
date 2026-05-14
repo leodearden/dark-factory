@@ -4,6 +4,8 @@ Covers:
   * ``_snapshot_threads()`` — categorises live threads by name prefix
   * ``_thread_monitor_iteration(prev, threshold) -> int`` — decides log level
     and calls _snapshot_threads when above threshold
+
+Pattern mirrors tests/test_periodic_checkpoint.py (caplog-based logging tests).
 """
 
 from __future__ import annotations
@@ -59,3 +61,60 @@ class TestSnapshotThreads:
         finally:
             stop_event.set()
             t.join(timeout=2)
+
+
+class TestThreadMonitorIteration:
+    """_thread_monitor_iteration(prev, threshold) -> int decides log level."""
+
+    def test_no_change_below_threshold_no_log(self, monkeypatch, caplog):
+        """count==prev and count<=threshold → no log records emitted."""
+        monkeypatch.setattr(threading, 'active_count', lambda: 10)
+        with caplog.at_level(logging.DEBUG, logger='fused_memory.server.main'):
+            result = server_main._thread_monitor_iteration(prev=10, threshold=60)
+        assert result == 10
+        monitor_records = [r for r in caplog.records if 'thread_monitor' in r.getMessage()]
+        assert len(monitor_records) == 0
+
+    def test_change_below_threshold_emits_info(self, monkeypatch, caplog):
+        """count!=prev and count<=threshold → exactly one INFO record."""
+        monkeypatch.setattr(threading, 'active_count', lambda: 15)
+        with caplog.at_level(logging.INFO, logger='fused_memory.server.main'):
+            result = server_main._thread_monitor_iteration(prev=10, threshold=60)
+        assert result == 15
+        monitor_records = [r for r in caplog.records if 'thread_monitor' in r.getMessage()]
+        assert len(monitor_records) == 1
+        assert monitor_records[0].levelno == logging.INFO
+        assert 'threads=15' in monitor_records[0].getMessage()
+        assert 'delta=+5' in monitor_records[0].getMessage()
+
+    def test_above_threshold_emits_warning_with_snapshot(self, monkeypatch, caplog):
+        """count>threshold (delta=0) → WARNING with snapshot breakdown."""
+        monkeypatch.setattr(threading, 'active_count', lambda: 70)
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.main'):
+            result = server_main._thread_monitor_iteration(prev=70, threshold=60)
+        assert result == 70
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'thread_monitor' in r.getMessage()
+        ]
+        assert len(warning_records) >= 1
+        # The primary WARNING must contain the count
+        assert any('threads=70' in r.getMessage() for r in warning_records)
+        # A snapshot breakdown record must be emitted (contains _total=)
+        all_records = [r for r in caplog.records if 'thread_monitor' in r.getMessage()]
+        assert any('_total=' in r.getMessage() for r in all_records), (
+            f"Expected snapshot breakdown in records: {[r.getMessage() for r in all_records]}"
+        )
+
+    def test_above_threshold_and_delta_uses_warning_not_info(self, monkeypatch, caplog):
+        """count>threshold AND delta!=0 → WARNING (not INFO)."""
+        monkeypatch.setattr(threading, 'active_count', lambda: 80)
+        with caplog.at_level(logging.INFO, logger='fused_memory.server.main'):
+            result = server_main._thread_monitor_iteration(prev=70, threshold=60)
+        assert result == 80
+        primary_records = [
+            r for r in caplog.records
+            if 'thread_monitor' in r.getMessage() and 'threads=80' in r.getMessage()
+        ]
+        assert len(primary_records) >= 1
+        assert primary_records[0].levelno == logging.WARNING
