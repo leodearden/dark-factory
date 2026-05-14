@@ -1557,6 +1557,13 @@ class Scheduler:
             prev_pinned = prev_row.pinned if prev_row else False
             cur_pinned = cur_row.pinned if cur_row else False
             if prev_pinned != cur_pinned:
+                # A task was pinned or unpinned.  Emit task_pinned / task_unpinned
+                # for the individual task but do NOT set pin_queue_changed for a
+                # pin_queue_reordered event.  Rationale: the add/remove is already
+                # described by task_pinned / task_unpinned, and emitting a
+                # pin_queue_reordered on top would be redundant noise.  Consumers
+                # that need the new order can re-query get_pin_queue after receiving
+                # the task_pinned / task_unpinned event.
                 if cur_pinned:
                     self.event_store.emit(
                         EventType.task_pinned,
@@ -1574,7 +1581,9 @@ class Scheduler:
                         },
                     )
             elif prev_pinned and cur_pinned:
-                # Both pinned — detect pin_order shift (signals a reorder).
+                # Both pinned — detect pin_order shift (signals a pure reorder).
+                # Only fires for tasks that were already in the queue and moved
+                # to a different position (via reorder_pin_queue).
                 prev_order = prev_row.pin_order if prev_row else None
                 cur_order = cur_row.pin_order if cur_row else None
                 if prev_order != cur_order:

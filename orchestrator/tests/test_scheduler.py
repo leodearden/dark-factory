@@ -4365,3 +4365,110 @@ class TestOverrideEventEmission:
         unpinned_events = events_of_type(EventType.task_unpinned)
         assert len(unpinned_events) == 1, f'Expected 1 task_unpinned event, got {unpinned_events}'
         assert unpinned_events[0][1]['task_id'] == 'A'
+
+    @pytest.mark.asyncio
+    async def test_adding_pin_does_not_emit_pin_queue_reordered(self, tmp_path):
+        """Adding a new pin fires task_pinned but NOT pin_queue_reordered.
+
+        pin_queue_reordered is reserved for pure reorder operations (where
+        existing pinned tasks shift position).  Pinning a new task is already
+        fully described by task_pinned; emitting pin_queue_reordered on top
+        would be redundant noise for downstream consumers.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = _pending_task('A', priority='medium', files=['a/src'])
+        task_b = _pending_task('B', priority='medium', files=['b/src'])
+
+        # Seed tick: initialise snapshot (no overrides yet).
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+
+        # Pin A (first pin) — must emit task_pinned but NOT pin_queue_reordered.
+        store.set_override('/proj', 'A', pinned=True)
+        await scheduler.acquire_next()
+
+        reorder_after_add = [
+            e for e in event_store.events
+            if e[0] == EventType.pin_queue_reordered.value
+        ]
+        assert reorder_after_add == [], (
+            'Adding a new pin must not emit pin_queue_reordered; '
+            f'got: {reorder_after_add}'
+        )
+        pinned_events = [
+            e for e in event_store.events if e[0] == EventType.task_pinned.value
+        ]
+        assert len(pinned_events) == 1
+        assert pinned_events[0][1]['task_id'] == 'A'
+
+        # Pin B (second pin) — again must emit task_pinned but NOT pin_queue_reordered.
+        store.set_override('/proj', 'B', pinned=True)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()
+
+        reorder_after_second_add = [
+            e for e in event_store.events
+            if e[0] == EventType.pin_queue_reordered.value
+        ]
+        assert reorder_after_second_add == [], (
+            'Adding a second pin must not emit pin_queue_reordered'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unpinning_does_not_emit_pin_queue_reordered(self, tmp_path):
+        """Removing a pin fires task_unpinned but NOT pin_queue_reordered.
+
+        The pin removal changes the effective queue order (remaining tasks may
+        implicitly shift), but the change is already described by task_unpinned.
+        Consumers that need the updated order can re-query get_pin_queue.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = _pending_task('A', priority='medium', files=['a/src'])
+        task_b = _pending_task('B', priority='medium', files=['b/src'])
+
+        # Set up A and B as pinned, then seed the snapshot so both appear as
+        # pre-existing (no spurious events on the seed tick).
+        store.set_override('/proj', 'A', pinned=True, pin_order=1)
+        store.set_override('/proj', 'B', pinned=True, pin_order=2)
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b])
+        await scheduler.acquire_next()  # seed tick — no events expected
+
+        # Unpin A → must emit task_unpinned but NOT pin_queue_reordered.
+        store.clear_override('/proj', 'A', field='pinned')
+        await scheduler.acquire_next()
+
+        reorder_after_unpin = [
+            e for e in event_store.events
+            if e[0] == EventType.pin_queue_reordered.value
+        ]
+        assert reorder_after_unpin == [], (
+            'Unpinning must not emit pin_queue_reordered; '
+            f'got: {reorder_after_unpin}'
+        )
+        unpinned_events = [
+            e for e in event_store.events if e[0] == EventType.task_unpinned.value
+        ]
+        assert len(unpinned_events) == 1
+        assert unpinned_events[0][1]['task_id'] == 'A'

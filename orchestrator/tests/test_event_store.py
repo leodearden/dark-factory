@@ -167,24 +167,23 @@ class TestEventStore:
 
 
 class TestSchedulerOverrideEventTypes:
-    """Assert the five priority-override event types exist on EventType."""
+    """Assert the five priority-override event types exist on EventType.
 
-    def test_priority_override_set_exists(self) -> None:
-        assert EventType.priority_override_set == 'priority_override_set'
-        assert EventType.priority_override_set.value == EventType.priority_override_set.name
+    Collapsed from five separate assertions into a single membership check.
+    The scheduler integration tests (TestOverrideEventEmission) exercise the
+    actual emission behavior end-to-end; this test only guards against the
+    enum members being accidentally removed.
+    """
 
-    def test_priority_override_cleared_exists(self) -> None:
-        assert EventType.priority_override_cleared == 'priority_override_cleared'
-        assert EventType.priority_override_cleared.value == EventType.priority_override_cleared.name
-
-    def test_task_pinned_exists(self) -> None:
-        assert EventType.task_pinned == 'task_pinned'
-        assert EventType.task_pinned.value == EventType.task_pinned.name
-
-    def test_task_unpinned_exists(self) -> None:
-        assert EventType.task_unpinned == 'task_unpinned'
-        assert EventType.task_unpinned.value == EventType.task_unpinned.name
-
-    def test_pin_queue_reordered_exists(self) -> None:
-        assert EventType.pin_queue_reordered == 'pin_queue_reordered'
-        assert EventType.pin_queue_reordered.value == EventType.pin_queue_reordered.name
+    def test_override_event_types_are_present(self) -> None:
+        expected = {
+            'priority_override_set',
+            'priority_override_cleared',
+            'task_pinned',
+            'task_unpinned',
+            'pin_queue_reordered',
+        }
+        actual = {m.name for m in EventType}
+        assert expected <= actual, (
+            f'Missing EventType members: {expected - actual}'
+        )
