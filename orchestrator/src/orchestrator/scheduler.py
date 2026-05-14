@@ -1730,7 +1730,18 @@ class Scheduler:
         Dispatch order is determined by ``_compute_score()``: tier base is
         dominant, age + CPM bonuses order tasks within a tier, and
         per-tier slot caps reserve headroom for higher-value work.
+
+        Returns ``None`` immediately when the scheduler is paused (park-stop).
+        No MCP round-trips, no GC, no override snapshots are performed while
+        paused — all resume cleanly on the first unpaused tick.
         """
+        if self._paused:
+            logger.debug(
+                'acquire_next() short-circuit: scheduler is paused (reason=%r)',
+                self._pause_reason,
+            )
+            return None
+
         tasks = await self.get_tasks()
         if not tasks:
             return None
