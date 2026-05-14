@@ -2484,6 +2484,91 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def clear_task_priority_override(
+        project_root: str,
+        task_id: str,
+        field: str | None = None,
+    ) -> dict[str, Any]:
+        """Clear a priority override row or a single field within it.
+
+        When ``field`` is None the entire row is deleted. Otherwise one
+        field is nulled/zeroed. Valid field names: boost_tier, pinned,
+        reserve_now, ttl. Clearing pinned also sets pin_order=NULL.
+
+        Args:
+            project_root: Absolute path to project root.
+            task_id: Task ID whose override to clear.
+            field: Field to clear, or None to delete the entire row.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+
+        if field is not None and field not in _VALID_CLEAR_FIELDS:
+            return {
+                'error': (
+                    f'field must be one of {sorted(_VALID_CLEAR_FIELDS)} or None; '
+                    f'got {field!r}'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        try:
+            now_iso = datetime.now(UTC).isoformat()
+            db = await _open_overrides_db(project_root)
+            try:
+                if field is None:
+                    await db.execute(
+                        'DELETE FROM overrides WHERE project_root=? AND task_id=?',
+                        (project_root, task_id),
+                    )
+                elif field == 'boost_tier':
+                    await db.execute(
+                        'UPDATE overrides SET boost_tier=NULL, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                elif field == 'pinned':
+                    # Clearing pinned also clears pin_order.
+                    # Mirrors orchestrator/src/orchestrator/overrides.py:267-271.
+                    await db.execute(
+                        'UPDATE overrides SET pinned=0, pin_order=NULL, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                elif field == 'reserve_now':
+                    await db.execute(
+                        'UPDATE overrides SET reserve_now=0, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                else:  # 'ttl'
+                    await db.execute(
+                        'UPDATE overrides SET ttl_until=NULL, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (now_iso, project_root, task_id),
+                    )
+                await db.commit()
+            finally:
+                await db.close()
+
+            label = 'all' if field is None else field
+            await _emit_override_audit(
+                project_root,
+                'clear_task_priority_override',
+                task_id,
+                f'Cleared {label} priority override(s) for task {task_id}',
+                {'task_id': task_id, 'field': field},
+            )
+            return {'success': True, 'task_id': task_id, 'field': field}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'clear_task_priority_override error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def get_pin_queue(
         project_root: str,
     ) -> dict[str, Any]:
