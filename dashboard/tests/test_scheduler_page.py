@@ -225,3 +225,89 @@ def test_skip_event_sparkline_returns_empty_when_no_history():
     result = _skip_event_sparkline([], since=since)
 
     assert result == {'labels': [], 'values': []}
+
+
+# ---------------------------------------------------------------------------
+# step-7: collect_scheduler_state happy path
+# ---------------------------------------------------------------------------
+
+
+async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
+    """collect_scheduler_state returns correct shapes and joined fields.
+
+    Patches:
+      - mcp_tool_call → returns snapshot then events list
+      - collect_active_tasks → returns one synthetic in-progress task
+    Asserts the 5-tuple (rows, modules, pin_queue, events_by_task, offline_projects)
+    has the right shapes and a couple of joined field values.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name  # _project_label result
+
+    snapshot = {
+        'skip_counts': {'1': 2},
+        'parks': {},
+        'effective_priorities': {'1': 'high'},
+        'pin_queue': [{'task_id': '1', 'order': 0}],
+        'overrides': {
+            '1': {
+                'boost_tier': 'high',
+                'pinned': True,
+                'reserve_now': False,
+                'ttl_until': None,
+            }
+        },
+        'current_holders': {'src/a.py': '1'},
+        'snapshot_at': '2026-01-01T00:00:00+00:00',
+    }
+    now_iso = datetime.now(UTC).isoformat()
+    events = [
+        {'event_type': 'task_skipped', 'task_id': '1', 'timestamp': now_iso},
+    ]
+
+    active_tasks = [
+        {
+            'id': f'{project}/T-1',
+            'project': project,
+            'title': 'Task One',
+            'priority': 'medium',
+            'status': 'in-progress',
+            'started': 5,
+            'locks': ['src/a.py', 'src/b.py'],
+        }
+    ]
+
+    mock_mcp = AsyncMock(side_effect=[snapshot, events])
+    mock_active = AsyncMock(return_value=(active_tasks, {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, modules, pin_queue, events_by_task, offline_projects = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert offline_projects == []
+    assert len(rows) == 1
+
+    # Joined fields
+    assert rows[0]['lock_set'] == ['src/a.py', 'src/b.py']
+    assert rows[0]['task_id'] == '1'
+    assert rows[0]['pinned'] is True
+    assert rows[0]['skip_count'] == 2
+
+    # Module contention: both src/a.py and src/b.py appear once;
+    # src/a.py sorts first (alpha tie-break) and carries the holder
+    assert len(modules) == 2
+    assert modules[0]['holder'] == '1'   # src/a.py is held by task '1'
+
+    assert len(pin_queue) == 1
+    assert pin_queue[0]['task_id'] == '1'
+
+    # events_by_task for task '1' has a sparkline
+    assert '1' in events_by_task
+    assert 'labels' in events_by_task['1']
+    assert 'values' in events_by_task['1']
