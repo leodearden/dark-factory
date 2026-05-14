@@ -5,35 +5,8 @@
 */
 const { useState: sdUseState, useCallback: sdUseCallback, useRef: sdUseRef, useEffect: sdUseEffect } = React;
 const { timeago, fmtDateTime } = window.DF_SHELL;
-
-// ── Helpers ──
-
-// Format seconds into a human-readable elapsed string.
-function fmtAge(seconds) {
-  if (seconds == null || isNaN(seconds)) return '—';
-  if (seconds < 60)   return `${seconds}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  return `${Math.round(seconds / 3600)}h`;
-}
-
-// Given a sparkline {labels, values}, return the total event count.
-function totalEvents(spark) {
-  if (!spark || !spark.values) return 0;
-  return spark.values.reduce((a, b) => a + b, 0);
-}
-
-// Compute approximate p50 wait as median skip interval (seconds).
-// Only meaningful when totalCount >= 10 (enough signal to estimate).
-// `spark.labels` are ISO timestamps of each bucket start; bucket width is 300s.
-function p50WaitSeconds(spark) {
-  const total = totalEvents(spark);
-  if (total < 10) return null;
-  const n = (spark.labels || []).length;
-  if (n === 0) return null;
-  // Window is n buckets of 300s each; average interval between skips.
-  // p50 ≈ window / total gives median inter-skip interval in seconds.
-  return Math.round((n * 300) / total);
-}
+// Shared helpers loaded by scheduler_utils.jsx (must come before this script).
+const { fmtAge, totalEvents, avgWaitSeconds } = window.DF_SCHED_UTILS;
 
 // Derive which modules are currently blocking this task.
 // A module blocks this task when: it is in the task's lock_set AND it has a
@@ -61,7 +34,7 @@ function HolderEtas({ task, modules, spark }) {
   }
   const elapsed = fmtAge(task.age_seconds);
   const n = totalEvents(spark);
-  const p50 = n >= 10 ? p50WaitSeconds(spark) : null;
+  const p50 = n >= 10 ? avgWaitSeconds(spark) : null;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -81,7 +54,7 @@ function HolderEtas({ task, modules, spark }) {
             </div>
             {p50 != null && (
               <div style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                p50 ~{fmtAge(p50)}
+                avg wait ~{fmtAge(p50)}
               </div>
             )}
           </div>

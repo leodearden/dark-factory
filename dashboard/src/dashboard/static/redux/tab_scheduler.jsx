@@ -14,30 +14,10 @@ const { useState: stUseState, useCallback: stUseCallback, useEffect: stUseEffect
 const { Segmented, timeago, fmtDateTime } = window.DF_SHELL;
 const { SchedulerHeatmap, cellStateFor } = window.DF_SCHED_HEATMAP;
 const { SchedulerDrawer } = window.DF_SCHED_DRAWER;
+// Shared helpers loaded by scheduler_utils.jsx (must come before this script).
+const { fmtAge, totalEvents, avgWaitSeconds } = window.DF_SCHED_UTILS;
 
 const D = window.DF_DATA;
-
-// ── Helpers ──
-
-function fmtAge(seconds) {
-  if (seconds == null || isNaN(seconds)) return '—';
-  if (seconds < 60)   return `${seconds}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  return `${Math.round(seconds / 3600)}h`;
-}
-
-function totalEvents(spark) {
-  if (!spark || !spark.values) return 0;
-  return spark.values.reduce((a, b) => a + b, 0);
-}
-
-function p50WaitSeconds(spark) {
-  const total = totalEvents(spark);
-  if (total < 10) return null;
-  const n = (spark.labels || []).length;
-  if (n === 0) return null;
-  return Math.round((n * 300) / total);
-}
 
 // Composite key for a pin entry — taskmaster task_ids are project-scoped,
 // so the same numeric id can appear in two projects' pin queues.  Keying
@@ -218,9 +198,9 @@ function ModulesView({ modules, rows, eventsMap }) {
                   const spark = eventsMap && m.holder
                     ? eventsMap[`${holderProject}/${m.holder}`]
                     : null;
-                  const p50 = p50WaitSeconds(spark);
+                  const p50 = avgWaitSeconds(spark);
                   if (p50 == null) return null;
-                  return <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>p50 ~{fmtAge(p50)}</span>;
+                  return <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>avg wait ~{fmtAge(p50)}</span>;
                 })()}
               </div>
             ) : (
