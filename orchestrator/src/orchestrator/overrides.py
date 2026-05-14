@@ -26,7 +26,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from orchestrator.config import PRIORITY_RANK
 
@@ -98,6 +98,10 @@ class OverrideStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Debug hook: called between the MAX(pin_order) SELECT and the UPSERT
+        # inside set_override.  Set to a callable in tests to inject an
+        # artificial pause and make the auto-assign race condition observable.
+        self._after_max_select: Callable[[], None] | None = None
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -160,7 +164,11 @@ class OverrideStore:
             )
 
         now_iso = datetime.now(UTC).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        # timeout=30: when BEGIN IMMEDIATE blocks (another writer holds the lock)
+        # SQLite will retry for up to 30 s before raising OperationalError.  The
+        # default 5 s is tight for MCP override tools that could drive concurrent
+        # writes from multiple sessions.
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
         try:
             # Acquire a write lock up-front (IMMEDIATE) so that the MAX(pin_order)
             # read and the subsequent UPSERT are serialized with respect to
@@ -191,6 +199,12 @@ class OverrideStore:
                             (project_root,),
                         ).fetchone()
                         pin_order = row[0]
+                        # Debug hook: tests may inject a sleep here to expose
+                        # the race between reading MAX and writing the UPSERT.
+                        # Post-fix (BEGIN IMMEDIATE), the sleep holds the write
+                        # lock so the other thread blocks at its BEGIN IMMEDIATE.
+                        if self._after_max_select is not None:
+                            self._after_max_select()
 
                 # Collision check for explicit or auto-assigned pin_order.
                 if pin_order is not None:
@@ -233,7 +247,7 @@ class OverrideStore:
                         now_iso, now_iso,
                         # UPDATE SET values
                         boost_tier, pinned_int,
-                        pinned_int, pin_order,   # CASE WHEN pinned_int=0 THEN NULL ELSE COALESCE(pin_order, pin_order)
+                        pinned_int, pin_order,   # CASE WHEN new_pinned=0 THEN NULL ELSE COALESCE(new_pin_order, existing_pin_order) END
                         reserve_now_int, ttl_iso,
                         now_iso,
                     ),
@@ -396,7 +410,11 @@ class OverrideStore:
                 'DELETE FROM overrides '
                 'WHERE project_root=? AND ttl_until IS NOT NULL AND ttl_until < ? '
                 'RETURNING task_id',
-                (project_root, now.isoformat()),
+                # Normalise to UTC so the ISO-string comparison is invariant
+                # under caller-supplied tzinfo.  Stored TTLs are also UTC-
+                # normalised (set_override guarantees this since step-6), so
+                # the lexicographic comparison produces correct results.
+                (project_root, now.astimezone(UTC).isoformat()),
             ).fetchall()
             conn.commit()
             return sorted(r[0] for r in rows)

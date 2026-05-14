@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -185,10 +186,20 @@ class TestPinning:
         and both compute pin_order=1, producing a PinOrderCollision or duplicate
         pin_order values.  Post-fix (BEGIN IMMEDIATE): SQLite serializes the two
         write transactions so they assign 1 and 2 respectively.
+
+        The ``_after_max_select`` hook injects a 50 ms pause between the MAX
+        SELECT and the UPSERT.  Post-fix the pause is inside the locked
+        transaction, so the second thread blocks at its BEGIN IMMEDIATE until
+        the first commits.  Pre-fix (no BEGIN IMMEDIATE) the pause would let
+        the second thread read the same MAX=0 and produce duplicate pin_orders.
+        This makes the race deterministic rather than a probabilistic smoke test.
         """
         from orchestrator.overrides import OverrideStore
 
         store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        # Inject a pause between MAX read and UPSERT to expose the race pre-fix.
+        store._after_max_select = lambda: time.sleep(0.05)
+
         barrier = threading.Barrier(2)
         errors: list[Exception] = []
 
