@@ -62,6 +62,11 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
        stripped all Unicode Pc (connector punctuation) characters.  In
        practice escalation summaries do not use underscores, so the
        divergence is harmless.
+
+       Symbols (Unicode categories Sm/Sc/Sk/So such as ``+``, ``=``,
+       ``$``) are also stripped, which can merge adjacent tokens (e.g.
+       ``cpu+memory`` → ``cpumemory``); see ``test_unicode_symbols_stripped``
+       in ``test_dedupe.py``.
     3. Split on whitespace (collapses multiple spaces / tabs).
     4. Return the first three tokens as a tuple (fewer if the summary
        has fewer than three words).
@@ -76,6 +81,8 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
         ('lost', 'link')
         >>> summary_dedupe_key("")
         ()
+        >>> summary_dedupe_key("cpu+memory leak")
+        ('cpumemory', 'leak')
     """
     normalised = _NON_WORD_PATTERN.sub('', summary.casefold())
     tokens = normalised.split()
