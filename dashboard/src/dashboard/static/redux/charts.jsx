@@ -59,6 +59,39 @@ function Sparkline({ values, width = 100, height = 28, area = true, color = PALE
   );
 }
 
+// StepSpark — step-interpolated sparkline (horizontal-then-vertical, no diagonals).
+// Used by CuratorTab to render the capped_spark time-series so that discrete
+// state transitions are visible as sharp steps rather than smoothed lines.
+function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, strokeWidth = 1.5, area = false }) {
+  if (!values || values.length === 0) return null;
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const range = max - min || 1;
+  const stepX = width / Math.max(values.length - 1, 1);
+  const points = values.map((v, i) => {
+    const x = i * stepX;
+    const y = height - ((v - min) / range) * height;
+    return [x, y];
+  });
+  // Build horizontal-then-vertical path: move to each x at the PREVIOUS y,
+  // then drop/rise to the new y — this creates sharp step edges.
+  const parts = [`M${points[0][0]},${points[0][1]}`];
+  for (let i = 1; i < points.length; i++) {
+    // Horizontal segment to the new x, keeping old y
+    parts.push(`L${points[i][0]},${points[i - 1][1]}`);
+    // Vertical segment to the new y
+    parts.push(`L${points[i][0]},${points[i][1]}`);
+  }
+  const linePath = parts.join(' ');
+  const areaPath = `${linePath} L${width},${height} L0,${height} Z`;
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ width: '100%', height: '100%', display: 'block' }}>
+      {area && <path d={areaPath} fill={color} fillOpacity={0.15} />}
+      <path d={linePath} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="square" />
+    </svg>
+  );
+}
+
 function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -330,4 +363,4 @@ function HistBar({ values, maxOverride, height = 50, color = PALETTE.accent }) {
   );
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar };
+window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar };
