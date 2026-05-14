@@ -22,6 +22,7 @@ them at read-time.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -260,10 +261,8 @@ class OverrideStore:
                 )
                 conn.execute('COMMIT')
             except Exception:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.execute('ROLLBACK')
-                except sqlite3.Error:
-                    pass  # don't mask the original exception with a rollback error
                 raise
         finally:
             conn.close()
