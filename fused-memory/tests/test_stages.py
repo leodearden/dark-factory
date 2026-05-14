@@ -4341,10 +4341,11 @@ class TestQueryStage2Flags:
             self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'}),
             self._make_result('id-2', 'no flag', {}),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         assert current_flags[0]['id'] == 'id-1'
-        assert stale_marker_ids == []
+        assert stale_missing_ids == []
+        assert stale_mismatched_ids == []
 
     @pytest.mark.asyncio
     async def test_excludes_memories_without_either_marker(self):
@@ -4354,9 +4355,10 @@ class TestQueryStage2Flags:
             self._make_result('id-4', 'irrelevant', {'some_other_key': True}),
             self._make_result('id-5', 'also irrelevant', {}),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
-        assert stale_marker_ids == []
+        assert stale_missing_ids == []
+        assert stale_mismatched_ids == []
 
     @pytest.mark.asyncio
     async def test_preserves_fields_and_extracts_task_id(self):
@@ -4366,7 +4368,7 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('id-6', 'content here', meta),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         flag = current_flags[0]
         assert flag['id'] == 'id-6'
@@ -4382,9 +4384,10 @@ class TestQueryStage2Flags:
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
         with caplog.at_level(logging.WARNING):
-            current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+            current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
-        assert stale_marker_ids == []
+        assert stale_missing_ids == []
+        assert stale_mismatched_ids == []
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -4423,13 +4426,14 @@ class TestQueryStage2Flags:
                 {'flag_for_stage2': True, 'task_id': '999'},
             ),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        stale_marker_ids = stale_missing_ids + stale_mismatched_ids
 
         # Only the current-cycle marker should be in current_flags
         assert len(current_flags) == 1
         assert current_flags[0]['id'] == 'mem0-current'
 
-        # Stale partition contains only IDs (not dicts)
+        # Combined stale partition contains only IDs (not dicts)
         assert set(stale_marker_ids) == {'mem0-prior', 'mem0-no-run-id'}
         assert len(stale_marker_ids) == 2
         # Confirm stale_marker_ids contains strings, not dicts
@@ -4457,9 +4461,10 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('test-id', 'content', meta),
         ]
-        current_flags, stale_marker_ids = await _query_stage2_flags(
+        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(
             memory_service, 'reify', filter_run_id
         )
+        stale_marker_ids = stale_missing_ids + stale_mismatched_ids
         if expect_current:
             assert len(current_flags) == 1
             assert current_flags[0]['id'] == 'test-id'
