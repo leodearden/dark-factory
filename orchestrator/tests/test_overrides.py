@@ -177,6 +177,33 @@ class TestPinning:
         # Store is clean — no rows created
         assert store.get_overrides('proj') == {}
 
+    def test_set_override_pinned_false_clears_pin_order(self, tmp_path: Path) -> None:
+        """set_override(pinned=False) must also zero out pin_order.
+
+        Docstring contract: 'Passing pinned=False is an explicit write that
+        zeroes pinned AND pin_order.'  Pre-fix the COALESCE leaves a stale
+        pin_order on the row when no pin_order kwarg is supplied.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+
+        # Setup: pin A with an explicit pin_order
+        store.set_override('proj', 'A', pinned=True, pin_order=2)
+        overrides = store.get_overrides('proj')
+        assert overrides['A'].pinned is True
+        assert overrides['A'].pin_order == 2
+
+        # Action: un-pin without supplying a pin_order
+        store.set_override('proj', 'A', pinned=False)
+
+        # Assertion: pinned=False AND pin_order=None
+        overrides = store.get_overrides('proj')
+        assert overrides['A'].pinned is False
+        assert overrides['A'].pin_order is None, (
+            'pin_order must be cleared when pinned=False is set explicitly'
+        )
+
 
 class TestPinQueue:
     def test_get_pin_queue_returns_pinned_rows_in_pin_order_asc(
