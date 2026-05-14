@@ -26,6 +26,7 @@ function endpointsFor(win) {
     [`/api/v2/dashboard/performance?window=${w}`]:    ['PERFORMANCE'],
     [`/api/v2/dashboard/burndown?window=${w}`]:       ['BURNDOWN', 'BURNDOWN_BY_PROJECT'],
     '/api/v2/dashboard/curator':                      ['CURATOR_STATE'],
+    '/api/v2/dashboard/scheduler':                    ['SCHEDULER'],
   };
 }
 
@@ -82,6 +83,17 @@ window.DF_DATA = {
     pending_spark: { labels: [], values: [] },
     capped_spark: { labels: [], values: [] },
     state: { capped_now: 0, paused_reason: null, pending_total: 0 },
+  },
+  // SCHEDULER is read through DF_DATA.SCHEDULER per render (not captured at
+  // module-load), so reference replacement on each poll is safe.
+  SCHEDULER: {
+    rows: [],
+    modules: [],
+    pin_queue: [],
+    events_by_task: {},
+    snapshot_at: null,
+    offline: false,
+    offline_projects: [],
   },
 };
 
