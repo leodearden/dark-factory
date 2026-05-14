@@ -5157,3 +5157,163 @@ class TestInterceptorWriteSucceeded:
     def test_list_response_is_failure(self):
         """[] → False."""
         assert self._fn()([]) is False
+
+
+# ── Tests for pre-done hook gate ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_skips_predone_hook_when_env_unset(
+    taskmaster, reconciler, event_buffer, monkeypatch
+):
+    """When FUSED_MEMORY_PREDONE_HOOK_PROJECT is unset, done transition succeeds normally."""
+    monkeypatch.delenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', raising=False)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_rejected_by_predone_hook(
+    taskmaster, reconciler, event_buffer, monkeypatch, tmp_path
+):
+    """When hook exits non-zero, the done transition is refused and tm.set_task_status is not called."""
+    # Derive env var key from tmp_path basename (e.g. test_set_task_status_done_rejected0)
+    project_id_upper = resolve_project_id(str(tmp_path)).upper()
+    monkeypatch.setenv(f'FUSED_MEMORY_PREDONE_HOOK_{project_id_upper}', '/bin/false')
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', str(tmp_path))
+
+    assert result['success'] is False
+    assert result['error'] == 'pre_done_hook_rejected'
+    assert result['task_id'] == '1'
+    taskmaster.set_task_status.assert_not_called()
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_passes_when_predone_hook_succeeds(
+    taskmaster, reconciler, event_buffer, monkeypatch, tmp_path
+):
+    """When hook exits 0, the done transition proceeds and taskmaster.set_task_status is called."""
+    project_id_upper = resolve_project_id(str(tmp_path)).upper()
+    monkeypatch.setenv(f'FUSED_MEMORY_PREDONE_HOOK_{project_id_upper}', '/bin/true')
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', str(tmp_path))
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_predone_hook_only_fires_on_done_transition(
+    taskmaster, reconciler, event_buffer, monkeypatch, tmp_path
+):
+    """The pre-done hook must NOT fire for non-done transitions (blocked, in-progress).
+
+    Belt-and-braces: even when the hook is /bin/false, blocked and in-progress
+    transitions must succeed because the gate is strictly 'done'-only.
+    """
+    project_id_upper = resolve_project_id(str(tmp_path)).upper()
+    monkeypatch.setenv(f'FUSED_MEMORY_PREDONE_HOOK_{project_id_upper}', '/bin/false')
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    # blocked: default fixture has status='pending', so pending→blocked is fine
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
+    )
+    result_blocked = await interceptor.set_task_status('1', 'blocked', str(tmp_path))
+    assert 'error' not in result_blocked, f'blocked transition should not be rejected: {result_blocked}'
+
+    # in-progress: go pending→in-progress (no reset_mock — count accumulates)
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
+    )
+    result_inprog = await interceptor.set_task_status('1', 'in-progress', str(tmp_path))
+    assert 'error' not in result_inprog, f'in-progress transition should not be rejected: {result_inprog}'
+
+    # taskmaster.set_task_status must have been called for both transitions
+    assert taskmaster.set_task_status.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_predone_hook_skipped_on_done_to_done_noop(
+    taskmaster, reconciler, event_buffer, monkeypatch
+):
+    """Same-status guard short-circuits before the pre-done hook fires.
+
+    Even when the hook env var is /bin/false (which would reject the done
+    transition if it ran), the done→done same-status no-op guard fires first
+    and returns without ever invoking run_hook.
+    """
+    import fused_memory.middleware.pre_done_hook as _hook_mod
+
+    # Env var set to /bin/false — would reject if the hook fired
+    monkeypatch.setenv('FUSED_MEMORY_PREDONE_HOOK_PROJECT', '/bin/false')
+    # Task is already done — same-status guard should short-circuit
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    # Spy on run_hook to verify it is never called
+    spy_calls: list = []
+
+    async def _spy_run_hook(task_id, project_root, **kwargs):
+        spy_calls.append((task_id, project_root))
+        return None  # should never be reached
+
+    monkeypatch.setattr(_hook_mod, 'run_hook', _spy_run_hook)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    # Must be the no-op shape — NOT a hook rejection
+    assert result.get('success') is True
+    assert result.get('no_op') is True
+    assert result.get('task_id') == '1'
+    # run_hook must not have been called
+    assert spy_calls == [], f'run_hook should not have fired; got calls: {spy_calls}'
+    # taskmaster.set_task_status must NOT have been called
+    taskmaster.set_task_status.assert_not_called()
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_predone_hook_per_project_isolation(
+    taskmaster, reconciler, event_buffer, monkeypatch, tmp_path
+):
+    """Per-project env-var keying: hook for project-a must not affect project-b.
+
+    project-a has /bin/false → done transition is rejected.
+    project-b has no env var set → done transition succeeds as normal.
+    Confirms env-var lookup is per-call and per-project, not global.
+    """
+    project_a = tmp_path / 'project-a'
+    project_b = tmp_path / 'project-b'
+    project_a.mkdir()
+    project_b.mkdir()
+
+    pid_a = resolve_project_id(str(project_a)).upper()  # e.g. PROJECT_A
+    pid_b = resolve_project_id(str(project_b)).upper()  # e.g. PROJECT_B
+
+    monkeypatch.setenv(f'FUSED_MEMORY_PREDONE_HOOK_{pid_a}', '/bin/false')
+    monkeypatch.delenv(f'FUSED_MEMORY_PREDONE_HOOK_{pid_b}', raising=False)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    # project-a: hook fires and rejects
+    result_a = await interceptor.set_task_status('1', 'done', str(project_a))
+    assert result_a['success'] is False
+    assert result_a['error'] == 'pre_done_hook_rejected', (
+        f'Expected pre_done_hook_rejected for project-a, got: {result_a}'
+    )
+
+    # project-b: no hook, transition succeeds
+    taskmaster.set_task_status.reset_mock()
+    result_b = await interceptor.set_task_status('2', 'done', str(project_b))
+    assert 'error' not in result_b, (
+        f'project-b should succeed without hook, got: {result_b}'
+    )
+    taskmaster.set_task_status.assert_called_once()
