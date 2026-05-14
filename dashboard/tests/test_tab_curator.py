@@ -55,6 +55,7 @@ def app_jsx_body(_client):
 # Helper: extract the CURATOR_STATE: { ... } seed block from data.js
 # ---------------------------------------------------------------------------
 
+
 def _extract_curator_state_block(data_js: str) -> str:
     """Return the body of the ``CURATOR_STATE: { ... }`` seed object, braces included.
 

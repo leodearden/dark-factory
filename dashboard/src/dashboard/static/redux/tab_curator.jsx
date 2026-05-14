@@ -29,7 +29,8 @@ function groupBy(arr, keyFn) {
 
 // ── Latency panel — three stacked Sparklines for p50/p90/p99 ──
 function LatencyPanel({ latency_spark }) {
-  const { p50 = [], p90 = [], p99 = [], labels = [] } = latency_spark || {};
+  // backend seed also includes a `labels` key; no chart consumer reads it so it is omitted.
+  const { p50 = [], p90 = [], p99 = [] } = latency_spark || {};
   const hasData = p50.length > 0 || p90.length > 0 || p99.length > 0;
   return (
     <div className="panel" style={{ flex: 1, minWidth: 0 }}>
@@ -125,7 +126,7 @@ function QueueRow({ ticket, onCancel }) {
 }
 
 // ── Main CuratorTab component ──
-function CuratorTab({ projectFilter }) {
+function CuratorTab({ projectFilter = [] }) {
   const cs = D.CURATOR_STATE || {};
   const { pending = [], latency_spark, capped_spark, state = {} } = cs;
   const { capped_now = 0, paused_reason = null, pending_total = 0 } = state;
@@ -158,7 +159,11 @@ function CuratorTab({ projectFilter }) {
   const addToast = useCallback((msg) => {
     const id = Date.now() + Math.random();
     setToasts(prev => [...prev, { id, msg }]);
-    const timer = setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+    const timer = setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+      const idx = toastTimers.current.indexOf(timer);
+      if (idx >= 0) toastTimers.current.splice(idx, 1);
+    }, 5000);
     toastTimers.current.push(timer);
   }, []);
 
