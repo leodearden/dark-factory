@@ -73,11 +73,14 @@ async def read_cap_intervals(
 
     Args:
         dbs: List of aiosqlite connections (``None`` entries are skipped).
-        days: Look-back window in days.
+        days: Look-back window in days.  Must be > 0; raises
+            :exc:`ValueError` otherwise.
 
     Returns:
         Flat list of :class:`CapInterval` objects across all DBs, unordered.
     """
+    if days <= 0:
+        raise ValueError("days must be positive")
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
