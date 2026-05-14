@@ -21,18 +21,22 @@ from typing import Any
 # Status constants
 # --------------------------------------------------------------------------- #
 
-ACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
-    'pending',
-    'in-progress',
-    'blocked',
-    'deferred',
-    'review',
-})
+ACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
+    {
+        'pending',
+        'in-progress',
+        'blocked',
+        'deferred',
+        'review',
+    }
+)
 
-INACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
-    'done',
-    'cancelled',
-})
+INACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
+    {
+        'done',
+        'cancelled',
+    }
+)
 
 # Maximum number of done task dicts to retain in FilteredTaskTree.done_tasks.
 # This is the sole cap on done_tasks; consumers rely on filter_task_tree to enforce it.
@@ -84,6 +88,7 @@ def id_key(t: dict) -> int:
 # Data model
 # --------------------------------------------------------------------------- #
 
+
 @dataclass
 class FilteredTaskTree:
     """Result of filter_task_tree(): active tasks plus aggregate counts.
@@ -111,6 +116,7 @@ class FilteredTaskTree:
 # --------------------------------------------------------------------------- #
 # Subtask flattening
 # --------------------------------------------------------------------------- #
+
 
 def _flatten_with_subtasks(raw_tasks: list[dict]) -> list[dict]:
     """Flatten a nested task list into a single flat list including all subtasks.
@@ -160,6 +166,7 @@ def _flatten_with_subtasks(raw_tasks: list[dict]) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Core filter
 # --------------------------------------------------------------------------- #
+
 
 def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     """Partition a raw get_tasks response into active vs. inactive tasks.
@@ -226,7 +233,8 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     # tiebreaker, guaranteeing stable selection for equal id_key values (mirrors
     # Python's stable sort: earlier-appearing tasks win ties).
     done_retained = [
-        t for _, t in heapq.nlargest(
+        t
+        for _, t in heapq.nlargest(
             MAX_DONE_TASKS_RETAINED,
             enumerate(done),
             key=lambda pair: (id_key(pair[1]), -pair[0]),
@@ -238,7 +246,8 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     # (that section is exempt from active-task truncation in format_filtered_task_tree).
     # Composite key tiebreaker guarantees stable selection for equal id_key values.
     cancelled_retained = [
-        t for _, t in heapq.nlargest(
+        t
+        for _, t in heapq.nlargest(
             MAX_CANCELLED_TASKS_RETAINED,
             enumerate(cancelled),
             key=lambda pair: (id_key(pair[1]), -pair[0]),
@@ -260,6 +269,7 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
 # --------------------------------------------------------------------------- #
 # Task-line rendering helpers
 # --------------------------------------------------------------------------- #
+
 
 def _render_task_line(task: dict) -> str:
     """Render a single task dict as a prompt-ready line string.
@@ -303,6 +313,29 @@ def format_task_list(tasks: list[Any]) -> str:
 # Surrounding-strings helper
 # --------------------------------------------------------------------------- #
 
+
+def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> str:
+    """Return just the header line for the Active Task Tree block.
+
+    Extracted so that _select_visible_active_with_body can rebuild the header
+    cheaply (varying only 'shown') without re-running the cancelled-section /
+    summary-line logic inside _build_surrounding.
+
+    Args:
+        shown: Number of active tasks actually rendered in the body.
+        omitted_active: Count of tasks omitted by the max_tasks cap only (not
+            by the max_chars clamp — those are reported via the truncation notice).
+        tree: FilteredTaskTree supplying the done/cancelled/other/total counts.
+    """
+    return (
+        f'### Active Task Tree\n'
+        f'({shown} active shown'
+        + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
+        + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
+        f'{tree.other_count} other, {tree.total_count} total)\n'
+    )
+
+
 def _build_surrounding(
     tree: FilteredTaskTree,
     max_tasks: int,
@@ -336,13 +369,7 @@ def _build_surrounding(
     shown = shown_override if shown_override is not None else len(active)
     omitted_active = len(tree.active_tasks) - len(active)
 
-    header = (
-        f'### Active Task Tree\n'
-        f'({shown} active shown'
-        + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
-        + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
-        f'{tree.other_count} other, {tree.total_count} total)\n'
-    )
+    header = _format_header(shown, omitted_active, tree)
 
     if tree.cancelled_tasks:
         cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
@@ -350,9 +377,7 @@ def _build_surrounding(
         summary_line = f'{tree.done_count} done — omitted'
     else:
         cancelled_section = ''
-        summary_line = (
-            f'{tree.done_count} done, {tree.cancelled_count} cancelled — omitted'
-        )
+        summary_line = f'{tree.done_count} done, {tree.cancelled_count} cancelled — omitted'
 
     return header, cancelled_section, summary_line
 
@@ -360,6 +385,7 @@ def _build_surrounding(
 # --------------------------------------------------------------------------- #
 # Visible-active selection helpers
 # --------------------------------------------------------------------------- #
+
 
 def _select_visible_active_with_body(
     tree: FilteredTaskTree,
@@ -392,6 +418,13 @@ def _select_visible_active_with_body(
     header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
 
     active = tree.active_tasks[:max_tasks]
+    # omitted_active is constant across this function (depends only on the
+    # max_tasks cap, not on how many lines survive the max_chars clamp).
+    # Pre-compute once so the three header-rebuild sites below can call
+    # _format_header directly without re-running the cancelled-section /
+    # summary-line logic inside _build_surrounding.
+    omitted_active = len(tree.active_tasks) - len(active)
+
     if not active:
         # Empty-active early return: shown count is unchanged (0 either way).
         return [], None, header, cancelled_section, summary_line
@@ -407,11 +440,13 @@ def _select_visible_active_with_body(
     # ── Budget-capped path ── #
     budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
     if budget <= 0:
-        # Rebuild header: pre-clamp shown overstates when budget is exhausted.
-        # Post-clamp shown <= pre-clamp shown, so digit count can only stay the
-        # same or decrease, keeping the rebuilt header <= pre-clamp header length
-        # (total assembly stays within max_chars without additional pop iterations).
-        header, _, _ = _build_surrounding(tree, max_tasks, shown_override=0)
+        # Rebuild header: pre-clamp shown overstates when the surrounding strings
+        # alone exhaust the budget.  The rebuilt header is monotonically <= the
+        # pre-clamp header (post-clamp shown=0 <= pre-clamp shown, so digit count
+        # can only stay the same or decrease), so it can only reduce the overrun —
+        # it does not guarantee the assembly fits max_chars (the assembly was already
+        # over budget before any body lines were added).
+        header = _format_header(0, omitted_active, tree)
         return [], None, header, cancelled_section, summary_line
 
     # Greedy fill.
@@ -438,16 +473,18 @@ def _select_visible_active_with_body(
 
     if not kept_lines:
         # Rebuild header: pre-clamp shown overstates when lazy loop drained all lines.
-        header, _, _ = _build_surrounding(tree, max_tasks, shown_override=0)
+        # Same monotonic-shrink guarantee as the budget<=0 path above.
+        header = _format_header(0, omitted_active, tree)
         return [], None, header, cancelled_section, summary_line
 
     # Rebuild header with the post-clamp visible count so the header's 'shown'
     # field agrees with the number of task lines actually in result_body.
+    # Use _format_header directly (cancelled_section / summary_line are unchanged).
     # This is safe because post-clamp shown <= pre-clamp shown, so the rebuilt
     # header is at most as long as the pre-clamp header; the lazy-pop loop above
     # already established len(result) <= max_chars with the strictly longer
     # pre-clamp header, so no additional pop iterations are needed.
-    header, _, _ = _build_surrounding(tree, max_tasks, shown_override=len(kept_lines))
+    header = _format_header(len(kept_lines), omitted_active, tree)
     return active[: len(kept_lines)], result_body, header, cancelled_section, summary_line
 
 
@@ -556,6 +593,7 @@ def render_active_section(
 # --------------------------------------------------------------------------- #
 # Formatter
 # --------------------------------------------------------------------------- #
+
 
 def format_filtered_task_tree(
     tree: FilteredTaskTree,
