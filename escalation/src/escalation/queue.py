@@ -383,6 +383,8 @@ class EscalationQueue:
         On a successful attach:
         - ``parent.dedupe_children`` gains *child_id* (appended).
         - ``parent.dedupe_count`` is incremented by 1.
+        - ``parent.severity`` is promoted via
+          ``_max_severity(parent.severity, child_severity)``; never demoted.
         - The updated parent is written back to disk via ``_rewrite()``.  Only
           this final file-replace step is atomic (``tempfile.mkstemp`` +
           ``os.rename``); the preceding in-memory mutations are not.
