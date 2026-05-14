@@ -84,6 +84,11 @@ class DashboardConfig:
         return self.project_root / 'data' / 'reconciliation' / 'reconciliation.db'
 
     @property
+    def tickets_db(self) -> Path:
+        """Canonical tickets.db path (sibling of reconciliation.db)."""
+        return self.project_root / 'data' / 'reconciliation' / 'tickets.db'
+
+    @property
     def write_queue_db(self) -> Path:
         return self.project_root / 'data' / 'queue' / 'write_queue.db'
 

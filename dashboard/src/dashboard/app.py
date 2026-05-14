@@ -169,6 +169,7 @@ async def _metrics_loop(
         pool: DbPool = app.state.db
         http_client: httpx.AsyncClient = app.state.http_client
         recon_db = await pool.get(config.reconciliation_db)
+        tickets_db = await pool.get(config.tickets_db)
         merge_dbs = await _project_scoped_dbs_labeled(
             config, pool, Path('data/orchestrator/runs.db'),
         )
@@ -178,6 +179,7 @@ async def _metrics_loop(
             http_client=http_client,
             recon_db=recon_db,
             merge_dbs=merge_dbs,
+            tickets_db=tickets_db,
         )
 
     try:
