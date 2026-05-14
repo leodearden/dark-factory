@@ -337,6 +337,12 @@ class TestCuratorUsageGateLeakGuard:
             f'got {cancel_close.await_count}'
         )
 
+        # Release the orphaned aiosqlite connection. Patches are now gone, so this
+        # invokes the real CostStore.close() (which the AsyncMock prevented inside
+        # the helper's rollback path). Without this line, the connection + WAL
+        # background thread would leak for the rest of the pytest session.
+        await opened_stores[0].close()
+
         # Leak probe: CostStore.open() raises RuntimeError('CostStore already opened')
         # if _conn is not None — proving the helper's rollback never released the
         # aiosqlite connection. Public-API probe (per task 1283/step-5 convention,
