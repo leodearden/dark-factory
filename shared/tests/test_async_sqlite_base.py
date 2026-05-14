@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
-from shared.async_sqlite_base import AsyncSqliteBase, CheckpointResult, apply_full_durability_pragmas
+from shared.async_sqlite_base import (
+    AsyncSqliteBase,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+)
 
 # ---------------------------------------------------------------------------
 # Step-1: apply_wal_pragmas
