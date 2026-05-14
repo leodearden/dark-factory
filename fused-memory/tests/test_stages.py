@@ -7780,3 +7780,38 @@ class TestStage2HintConversionDetection:
             assert f'[{tid}]' not in active_section, (
                 f'Task {tid} must NOT appear in Active Task Tree section.'
             )
+
+    @pytest.mark.asyncio
+    async def test_your_task_block_instructs_append_false_for_hint_section(
+        self, mock_deps, watermark
+    ):
+        """The ## Your Task numbered list must contain an append=False instruction.
+
+        The instruction must reference 'Tasks Needing Memory Hint Attention'
+        and 'append=False' within the Your Task block — not merely elsewhere in
+        the payload — to direct the LLM on the read-modify-write requirement.
+        """
+        task = self._make_task_with_hints(
+            11, 'in-progress', [{'entity': 'X', 'query': 'q'}]
+        )
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        stage.filtered_task_tree = self._make_tree([task])
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        your_task_block = _extract_section(payload, '## Your Task')
+        assert your_task_block, (
+            '## Your Task block must be present in the payload.'
+        )
+        assert 'Tasks Needing Memory Hint Attention' in your_task_block, (
+            f'"Tasks Needing Memory Hint Attention" must be referenced inside '
+            f'the ## Your Task block.\n'
+            f'Your Task block: {your_task_block!r}'
+        )
+        assert 'append=False' in your_task_block, (
+            f'"append=False" must appear inside the ## Your Task block '
+            f'to direct the LLM to use read-modify-write for hint conversion.\n'
+            f'Your Task block: {your_task_block!r}'
+        )
