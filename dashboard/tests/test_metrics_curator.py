@@ -364,7 +364,8 @@ async def test_sample_curator_happy_path(tmp_path: Path, config):
     from dashboard.data.metrics import _sample_curator
     from dashboard.data.stats_utils import percentile
 
-    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    # Use real current time so read_cap_intervals' 1-day internal cutoff is satisfied
+    now = datetime.now(UTC)
     t_base = now - timedelta(minutes=30)
 
     # tickets.db: 3 terminal tickets with durations 100ms, 200ms, 300ms
@@ -444,7 +445,8 @@ async def test_sample_curator_cap_overlap_subtraction(tmp_path: Path, config):
     from dashboard.data.memory import reset_sessions
     from dashboard.data.metrics import _sample_curator
 
-    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    # Use real current time so read_cap_intervals' 1-day internal cutoff is satisfied
+    now = datetime.now(UTC)
     t_base = now - timedelta(minutes=30)
 
     # One ticket: 300ms duration
@@ -512,7 +514,8 @@ async def test_sample_curator_capped_now_true(tmp_path: Path, config):
     from dashboard.data.memory import reset_sessions
     from dashboard.data.metrics import _sample_curator
 
-    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    # Use real current time so read_cap_intervals' 1-day internal cutoff is satisfied
+    now = datetime.now(UTC)
 
     tickets_path = tmp_path / 'tickets.db'
     conn_sync = sqlite3.connect(str(tickets_path))
@@ -559,7 +562,8 @@ async def test_sample_curator_capped_now_false_when_closed(tmp_path: Path, confi
     from dashboard.data.memory import reset_sessions
     from dashboard.data.metrics import _sample_curator
 
-    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    # Use real current time so read_cap_intervals' 1-day internal cutoff is satisfied
+    now = datetime.now(UTC)
 
     tickets_path = tmp_path / 'tickets.db'
     conn_sync = sqlite3.connect(str(tickets_path))

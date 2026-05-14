@@ -24,7 +24,12 @@ import aiosqlite
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.memory import get_memory_status, get_queue_stats
+from dashboard.data.cap_history import (
+    compute_overlap_ms,
+    merge_all_accounts_capped,
+    read_cap_intervals,
+)
+from dashboard.data.memory import get_memory_status, get_queue_stats, mcp_tool_call
 from dashboard.data.merge_queue import active_queued_merges
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
@@ -32,6 +37,7 @@ from dashboard.data.orchestrator import (
     find_running_orchestrators,
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
+from dashboard.data.stats_utils import percentile
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +158,124 @@ def _split_queue_stats(qstats: dict) -> tuple[int | None, int | None, int | None
     counts_raw = qstats.get('counts')
     counts = counts_raw if isinstance(counts_raw, dict) else {}
     return counts.get('pending'), counts.get('retry'), counts.get('dead')
+
+
+# ---------------------------------------------------------------------------
+# Curator sampler helper
+# ---------------------------------------------------------------------------
+
+
+async def _sample_curator(
+    http_client: httpx.AsyncClient,
+    config: DashboardConfig,
+    tickets_db: aiosqlite.Connection | None,
+    runs_dbs: list[aiosqlite.Connection | None],
+    *,
+    now: datetime | None = None,
+) -> dict | None:
+    """Sample curator queue depth, cap state, and terminal-ticket latency.
+
+    Args:
+        http_client: Shared AsyncClient for MCP HTTP calls.
+        config: Dashboard configuration (fused_memory_urls, known_project_roots).
+        tickets_db: Read-only aiosqlite connection to tickets.db. If None,
+            ticket latency fields are all None and only pending/capped are set.
+        runs_dbs: Per-project runs.db connections for cap-event lookup.
+        now: Reference time (defaults to datetime.now(UTC)). Used for the
+            1-hour ticket cutoff. Note: read_cap_intervals uses its own
+            internal datetime.now(UTC) for the cap-window query.
+
+    Returns:
+        Dict with keys: pending_total, capped_now, p50_active_ms,
+        p90_active_ms, p99_active_ms. Returns None on unrecoverable error
+        (individual sub-errors are swallowed and treated as 0/None).
+    """
+    effective_now = now if now is not None else datetime.now(UTC)
+
+    # 1. HTTP pending count: iterate (url × unique root), sum count.
+    pending_total = 0
+    seen_roots: set[str] = set()
+    all_roots: list[str] = []
+    for root in [config.project_root, *config.known_project_roots]:
+        key = str(root)
+        if key not in seen_roots:
+            seen_roots.add(key)
+            all_roots.append(key)
+    for url in config.fused_memory_urls:
+        for root_str in all_roots:
+            try:
+                result = await mcp_tool_call(
+                    http_client, url, 'list_tickets',
+                    {'project_root': root_str, 'status': 'pending', 'limit': 2000},
+                )
+                pending_total += result.get('count', 0) or 0
+            except Exception:
+                logger.debug('list_tickets failed for %s / %s', url, root_str, exc_info=True)
+
+    # 2. Cap intervals (last 24h).
+    try:
+        intervals = await read_cap_intervals(runs_dbs, days=1)
+    except Exception:
+        logger.debug('read_cap_intervals failed', exc_info=True)
+        intervals = []
+
+    # 3. All-accounts-capped merged windows.
+    account_names = list({iv.account_name for iv in intervals})
+    try:
+        capped_windows = merge_all_accounts_capped(intervals, account_names)
+    except Exception:
+        logger.debug('merge_all_accounts_capped failed', exc_info=True)
+        capped_windows = []
+    capped_now = 1 if any(end is None for _, end in capped_windows) else 0
+
+    # 4. Terminal tickets resolved in the last hour.
+    p50: int | None = None
+    p90: int | None = None
+    p99: int | None = None
+    if tickets_db is not None:
+        cutoff = (effective_now - timedelta(hours=1)).isoformat()
+        try:
+            async with tickets_db.execute(
+                "SELECT created_at, resolved_at FROM tickets "
+                "WHERE resolved_at >= ? AND status IN ('created', 'combined', 'cancelled', 'failed')",
+                (cutoff,),
+            ) as cur:
+                ticket_rows = await cur.fetchall()
+
+            # 5. Per-ticket active_ms with cap subtraction.
+            active_ms_list: list[float] = []
+            for row in ticket_rows:
+                created_str = row[0] if isinstance(row, (tuple, list)) else row['created_at']
+                resolved_str = row[1] if isinstance(row, (tuple, list)) else row['resolved_at']
+                if not created_str or not resolved_str:
+                    continue
+                created_dt = datetime.fromisoformat(created_str)
+                resolved_dt = datetime.fromisoformat(resolved_str)
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=UTC)
+                if resolved_dt.tzinfo is None:
+                    resolved_dt = resolved_dt.replace(tzinfo=UTC)
+                raw_ms = (resolved_dt - created_dt).total_seconds() * 1000
+                overlap = compute_overlap_ms(created_dt, resolved_dt, capped_windows)
+                active_ms = max(0.0, raw_ms - overlap)
+                active_ms_list.append(active_ms)
+
+            # 6. Centiles (None if no tickets).
+            if active_ms_list:
+                active_ms_list.sort()
+                p50 = int(percentile(active_ms_list, 50))
+                p90 = int(percentile(active_ms_list, 90))
+                p99 = int(percentile(active_ms_list, 99))
+        except Exception:
+            logger.debug('curator ticket query/centile failed', exc_info=True)
+
+    return {
+        'pending_total': pending_total,
+        'capped_now': capped_now,
+        'p50_active_ms': p50,
+        'p90_active_ms': p90,
+        'p99_active_ms': p99,
+    }
 
 
 # ---------------------------------------------------------------------------
