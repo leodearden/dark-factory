@@ -1,14 +1,15 @@
 """Integration tests that Harness wires OverrideStore into Scheduler correctly.
 
-These tests verify *behaviour*: overrides written to config.overrides_db_path
-before Harness construction are readable through the scheduler the Harness
-wires up.  That exercises the full wiring path (correct DB file, correct
-project_root key) without pinning the constructor signature.
+These tests verify *behaviour* through the public scheduler API: a pin
+pre-written to config.overrides_db_path drives Harness scheduler's dispatch
+order, proving the OverrideStore reaches the right SQLite file AND that
+Scheduler.acquire_next() consults overrides on its selection path.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -23,30 +24,62 @@ def config(tmp_path: Path) -> OrchestratorConfig:
 
 
 class TestHarnessOverrideStoreIntegration:
-    def test_scheduler_reads_overrides_from_canonical_db_path(
+    @pytest.mark.asyncio
+    async def test_scheduler_dispatches_pinned_override_through_canonical_db_path(
         self, config: OrchestratorConfig
     ):
-        """Overrides pre-written to config.overrides_db_path are visible to
-        the scheduler Harness wires up — confirms the store reaches the right
-        file without pinning the OverrideStore constructor argument."""
+        """A pin pre-written to config.overrides_db_path drives Harness
+        scheduler's dispatch order — proves the OverrideStore reaches the
+        right SQLite file AND that Scheduler.acquire_next() consults overrides
+        on its selection path.
+
+        Without override wiring: task-critical (critical priority) would score
+        higher and be dispatched first.
+        With correct wiring: task-pin (pinned, low priority) dispatches first
+        because the pin-dispatch loop in acquire_next() runs before scoring.
+        """
         project_root_str = str(config.project_root)
 
-        # Pre-populate an override at the canonical DB path.
+        # Pre-populate a pin at the canonical DB path using a separate store
+        # instance that the Harness cannot share.
         seed_store = OverrideStore(config.overrides_db_path)
-        seed_store.set_override(project_root_str, "task-999", boost_tier="critical")
+        seed_store.set_override(project_root_str, "task-pin", pinned=True)
 
         # Harness constructs its own OverrideStore at the same path.
         harness = Harness(config)
 
-        # The scheduler must be able to read the pre-written override, proving
-        # it was wired to the right SQLite file.
-        assert harness.scheduler._override_store is not None, (
-            "Harness did not wire an OverrideStore into the Scheduler"
+        # Two competing tasks: pinned-low vs unpinned-critical.
+        # Without overrides, task-critical would win on score alone.
+        # Only the pin-dispatch path can produce the asserted outcome.
+        pinned_task = {
+            "id": "task-pin",
+            "title": "Task pin (pinned, low)",
+            "status": "pending",
+            "dependencies": [],
+            "metadata": {"files": ["pin/src"]},
+            "priority": "low",
+        }
+        critical_task = {
+            "id": "task-critical",
+            "title": "Task critical (critical, not pinned)",
+            "status": "pending",
+            "dependencies": [],
+            "metadata": {"files": ["crit/src"]},
+            "priority": "critical",
+        }
+        harness.scheduler.get_tasks = AsyncMock(
+            return_value=[pinned_task, critical_task]
         )
-        overrides = harness.scheduler._override_store.get_overrides(project_root_str)
-        assert "task-999" in overrides, (
-            f"Scheduler did not see pre-written override; got keys: {list(overrides)}"
+
+        assignment = await harness.scheduler.acquire_next()
+
+        assert assignment is not None, (
+            "acquire_next() returned None — possible scheduling or wiring bug"
+            " unrelated to overrides"
         )
-        assert overrides["task-999"].boost_tier == "critical", (
-            f"boost_tier mismatch: {overrides['task-999'].boost_tier!r} != 'critical'"
+        assert assignment.task_id == "task-pin", (
+            f"Expected pinned task 'task-pin' to dispatch first, got"
+            f" {assignment.task_id!r}. Failure modes: (1) OverrideStore not"
+            " wired into Scheduler's selection path, or (2) canonical DB path"
+            " mismatch between Harness construction and the seed write."
         )
