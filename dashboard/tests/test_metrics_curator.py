@@ -1028,3 +1028,61 @@ async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
         "Expected at least one WARNING mentioning '50' (saturation at patched limit), "
         f"got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-3 (task-1280): TimeoutError in fan_out_list_tickets logs WARNING with root+url
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(
+    tmp_path: Path, caplog
+):
+    """fan_out_list_tickets must log a WARNING (not DEBUG) for TimeoutError.
+
+    Patches mcp_tool_call with AsyncMock(side_effect=TimeoutError()) so the
+    error is deterministic.  Single root (tmp_path), single URL
+    'http://localhost:18765'.
+
+    Assertions:
+    - no exception propagates (TimeoutError is swallowed)
+    - pending_total == 0
+    - at least one WARNING record whose getMessage() contains BOTH
+      str(tmp_path) AND 'http://localhost:18765'
+
+    Failing baseline: today's fan_out_list_tickets catches TimeoutError inside
+    the broad except (httpx.HTTPError, TimeoutError, ValueError) block at DEBUG
+    level — no WARNING record is emitted.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+
+    mock_mcp = AsyncMock(side_effect=TimeoutError())
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    reset_sessions()
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'), \
+         patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            _, pending_total = await fan_out_list_tickets(http_client, cfg)
+
+    assert pending_total == 0, f"Expected pending_total=0, got {pending_total}"
+
+    root_str = str(tmp_path)
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and root_str in r.getMessage()
+        and 'http://localhost:18765' in r.getMessage()
+    ]
+    assert warning_records, (
+        f"Expected at least one WARNING containing both '{root_str}' and "
+        f"'http://localhost:18765', got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+    )
