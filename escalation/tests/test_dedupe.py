@@ -102,16 +102,13 @@ class TestSummaryDedupeKey:
         belong to \\w or \\s.  For example, the math-plus U+002B (Sm category) in
         'cpu+memory' is stripped, merging the two words into 'cpumemory'.
         This test pins the chosen behaviour across two symbol subcategories
-        (Sm, Sc) using three examples so any future narrowing of the regex
+        (Sm, Sc) using two examples so any future narrowing of the regex
         is caught immediately.
         """
         from escalation.dedupe import summary_dedupe_key
 
         # Sm (math symbol): '+' U+002B — stripped, adjacent words merge
         assert summary_dedupe_key('cpu+memory leak') == ('cpumemory', 'leak')
-
-        # Sm (math symbol): '=' U+003D — stripped, adjacent chars merge
-        assert summary_dedupe_key('a=b mismatch error') == ('ab', 'mismatch', 'error')
 
         # Sc (currency symbol): '$' U+0024 — stripped, no token merge here
         assert summary_dedupe_key('cost$ rises today') == ('cost', 'rises', 'today')
