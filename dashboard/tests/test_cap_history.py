@@ -270,6 +270,46 @@ class TestReadCapIntervals:
         with pytest.raises(ValueError, match="positive"):
             await read_cap_intervals([cap_conn], days=-1)
 
+    @pytest.mark.asyncio
+    async def test_honors_now_parameter(self, tmp_path):
+        """now= shifts the cutoff so events outside the default window are included.
+
+        Inserts a single cap_hit at real_now - 30 days.
+
+        1. read_cap_intervals([conn], days=7) with default now: the event is
+           outside the 7-day window → result is [].
+        2. read_cap_intervals([conn], days=7, now=real_now - 28 days): the
+           synthetic now shifts the cutoff to real_now - 35 days, so the
+           30-day-old event IS within the window → result has 1 CapInterval.
+
+        Failing baseline: read_cap_intervals currently has signature
+        (dbs, *, days: int) — passing now=... raises TypeError.
+        """
+        real_now = datetime.now(UTC)
+        event_ts = real_now - timedelta(days=30)
+        db_path = _make_db_with_events(tmp_path, 'now_param.db', [
+            ('acc-x', 'cap_hit', event_ts),
+        ])
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            # 1. Default now: 30-day-old event outside 7-day window
+            result_default = await read_cap_intervals([conn], days=7)
+            assert result_default == [], (
+                f"Expected [] with default now (event 30d old, window 7d), "
+                f"got {result_default}"
+            )
+
+            # 2. Synthetic now 28 days ago: cutoff shifts to 35 days ago, includes event
+            synthetic_now = real_now - timedelta(days=28)
+            result_shifted = await read_cap_intervals([conn], days=7, now=synthetic_now)
+            assert len(result_shifted) == 1, (
+                f"Expected 1 interval with now=real_now-28d (cutoff 35d ago), "
+                f"got {result_shifted}"
+            )
+            assert result_shifted[0].account_name == 'acc-x'
+            assert result_shifted[0].end is None  # open-ended (no resumed)
+
 
 # ---------------------------------------------------------------------------
 # Step-3 tests: merge_all_accounts_capped
@@ -512,6 +552,78 @@ class TestComputeOverlapMs:
         c2_end = now - timedelta(minutes=30)  # 30 min
         expected = self._sec(3600)  # 30 + 30 min
         assert compute_overlap_ms(start, end, [(c1_start, c1_end), (c2_start, c2_end)]) == expected
+
+
+# ---------------------------------------------------------------------------
+# Step-9 (task-1280): compute_capped_now_and_windows helper
+# ---------------------------------------------------------------------------
+
+from dashboard.data.cap_history import compute_capped_now_and_windows  # noqa: E402
+
+
+class TestComputeCappedNowAndWindows:
+    """Tests for compute_capped_now_and_windows(intervals).
+
+    Failing baseline for all methods: compute_capped_now_and_windows doesn't
+    exist yet — the import above raises ImportError.
+    """
+
+    def test_empty_intervals_returns_zero_and_empty_windows(self):
+        """Empty input → (0, [])."""
+        capped_now, windows = compute_capped_now_and_windows([])
+        assert capped_now == 0, f"Expected capped_now=0 for empty, got {capped_now}"
+        assert windows == [], f"Expected [] windows for empty, got {windows}"
+
+    def test_all_closed_intervals_returns_capped_now_zero(self):
+        """All intervals closed → capped_now=0; windows may still be non-empty."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=2)
+        # Two accounts both capped [t1, t2] — same window, so merge yields [(t1, t2)]
+        intervals = [
+            CapInterval('alpha', t1, t2),
+            CapInterval('beta', t1, t2),
+        ]
+        capped_now, windows = compute_capped_now_and_windows(intervals)
+        assert capped_now == 0, (
+            f"Expected capped_now=0 (all closed), got {capped_now}"
+        )
+        assert len(windows) >= 1, (
+            f"Expected >=1 merged window (both accounts fully overlapping), got {windows}"
+        )
+
+    def test_any_open_ended_returns_capped_now_one(self):
+        """At least one open-ended interval → capped_now=1."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        # Simplified: just one open-ended is enough for capped_now=1
+        open_only = [CapInterval('alpha', t1, None)]
+        capped_now, windows = compute_capped_now_and_windows(open_only)
+        assert capped_now == 1, (
+            f"Expected capped_now=1 for open-ended interval, got {capped_now}"
+        )
+        assert len(windows) >= 1, (
+            f"Expected >=1 window (single open-ended account), got {windows}"
+        )
+
+    def test_sorted_account_names_deterministic(self):
+        """Two consecutive calls with differently-ordered inputs produce same windows."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=2)
+        # Three accounts in non-sorted insertion order
+        intervals_fwd = [
+            CapInterval('gamma', t1, t2),
+            CapInterval('alpha', t1, t2),
+            CapInterval('beta', t1, t2),
+        ]
+        intervals_rev = list(reversed(intervals_fwd))
+        _, windows1 = compute_capped_now_and_windows(intervals_fwd)
+        _, windows2 = compute_capped_now_and_windows(intervals_rev)
+        assert windows1 == windows2, (
+            f"Expected deterministic windows regardless of input order. "
+            f"Got {windows1} vs {windows2}"
+        )
 
 
 # ---------------------------------------------------------------------------

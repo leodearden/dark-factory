@@ -963,3 +963,290 @@ async def test_fan_out_list_tickets_warns_when_count_at_limit(tmp_path: Path, ca
         "Expected at least one WARNING log mentioning 'list_tickets' and '2000' "
         f"for saturation, got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (task-1280): _LIST_TICKETS_LIMIT constant flows into fan_out_list_tickets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
+    tmp_path: Path, caplog, monkeypatch
+):
+    """_LIST_TICKETS_LIMIT constant must flow into the outgoing request limit.
+
+    Monkeypatches _LIST_TICKETS_LIMIT to 50 and calls fan_out_list_tickets
+    WITHOUT a limit kwarg so
+    the function default is exercised.  count=50 == limit=50 triggers the
+    saturation WARNING.
+
+    Assertions:
+    - handler.calls[0]['params']['arguments']['limit'] == 50  (constant flowed in)
+    - pending_total == 50
+    - at least one WARNING record on the dashboard.data.metrics logger whose
+      getMessage() contains '50' (saturation warning uses the patched constant)
+
+    Failing baseline: _LIST_TICKETS_LIMIT doesn't exist today AND
+    fan_out_list_tickets's default is the literal 2000, so the patched value
+    never reaches the payload — handler.calls[0]['params']['arguments']['limit']
+    is 2000, not 50.
+    """
+    import dashboard.data.metrics as _metrics_mod
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    monkeypatch.setattr(_metrics_mod, '_LIST_TICKETS_LIMIT', 50)
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+    handler = _ListTicketsHandler(count=50)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            _, pending_total = await fan_out_list_tickets(http_client, cfg)
+
+    # (a) The patched constant flowed into the outgoing payload
+    assert handler.calls, "fan_out_list_tickets made no tool/call requests"
+    assert handler.calls[0]['params']['arguments']['limit'] == 50, (
+        f"Expected limit=50 in outgoing payload, got "
+        f"{handler.calls[0]['params']['arguments'].get('limit')}"
+    )
+    # (b) pending_total reflects the mocked count
+    assert pending_total == 50, f"Expected pending_total=50, got {pending_total}"
+    # (c) Saturation WARNING mentions the patched constant value
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and '50' in r.getMessage()
+    ]
+    assert warning_records, (
+        "Expected at least one WARNING mentioning '50' (saturation at patched limit), "
+        f"got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-3 (task-1280): TimeoutError in fan_out_list_tickets logs WARNING with root+url
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(
+    tmp_path: Path, caplog
+):
+    """fan_out_list_tickets must log a WARNING (not DEBUG) for TimeoutError.
+
+    Patches mcp_tool_call with AsyncMock(side_effect=TimeoutError()) so the
+    error is deterministic.  Single root (tmp_path), single URL
+    'http://localhost:18765'.
+
+    Assertions:
+    - no exception propagates (TimeoutError is swallowed)
+    - pending_total == 0
+    - at least one WARNING record whose getMessage() contains BOTH
+      str(tmp_path) AND 'http://localhost:18765'
+
+    Failing baseline: today's fan_out_list_tickets catches TimeoutError inside
+    the broad except (httpx.HTTPError, TimeoutError, ValueError) block at DEBUG
+    level — no WARNING record is emitted.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+
+    mock_mcp = AsyncMock(side_effect=TimeoutError())
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    reset_sessions()
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'), \
+         patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            _, pending_total = await fan_out_list_tickets(http_client, cfg)
+
+    assert pending_total == 0, f"Expected pending_total=0, got {pending_total}"
+
+    root_str = str(tmp_path)
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and root_str in r.getMessage()
+        and 'http://localhost:18765' in r.getMessage()
+    ]
+    assert warning_records, (
+        f"Expected at least one WARNING containing both '{root_str}' and "
+        f"'http://localhost:18765', got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-11 (task-1280): _sample_curator delegates to compute_capped_now_and_windows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_delegates_to_compute_capped_now_and_windows(
+    tmp_path: Path, config
+):
+    """_sample_curator must call compute_capped_now_and_windows and use its return.
+
+    Setup: cap_hit 30 min ago (open-ended interval), empty tickets.db.
+    Patches dashboard.data.metrics.compute_capped_now_and_windows with a
+    MagicMock returning sentinel (7, []) — capped_now=7 is impossible from
+    the real helper so its presence in the result proves the mock was used.
+
+    Assertions:
+    - result['capped_now'] == 7  (sentinel flowed through)
+    - mock was called exactly once
+    - mock's first positional arg is a non-empty list of CapInterval objects
+
+    Failing baseline: _sample_curator computes capped_now inline (line ~289),
+    never calling compute_capped_now_and_windows, so result['capped_now'] is
+    1 (real open-ended interval), not 7.
+    """
+    from dashboard.data.cap_history import CapInterval
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    # runs.db: one open-ended cap_hit 30 min ago
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc1', 'cap_hit', (now - timedelta(minutes=30)).isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    # tickets.db: empty
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = _ListTicketsHandler(count=0)
+    transport = httpx.MockTransport(handler)
+    mock_helper = MagicMock(return_value=(7, []))
+
+    reset_sessions()
+    with patch('dashboard.data.metrics.compute_capped_now_and_windows', mock_helper):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets_conn = await aiosqlite.connect(str(tickets_path))
+            tickets_conn.row_factory = aiosqlite.Row
+            runs_conn = await aiosqlite.connect(str(runs_path))
+            runs_conn.row_factory = aiosqlite.Row
+            try:
+                result = await _sample_curator(
+                    http_client, config, tickets_conn, [runs_conn], now=now,
+                )
+            finally:
+                await tickets_conn.close()
+                await runs_conn.close()
+
+    # (a) Sentinel capped_now flowed through
+    assert result['capped_now'] == 7, (
+        f"Expected capped_now=7 (sentinel from mock), got {result['capped_now']}. "
+        "This fails if _sample_curator computes capped_now inline instead of delegating."
+    )
+    # (b) Mock was called exactly once
+    assert mock_helper.call_count == 1, (
+        f"Expected compute_capped_now_and_windows called once, got {mock_helper.call_count}"
+    )
+    # (c) First arg is a non-empty list of CapInterval
+    call_arg = mock_helper.call_args.args[0]
+    assert len(call_arg) >= 1, f"Expected non-empty intervals arg, got {call_arg}"
+    assert all(isinstance(iv, CapInterval) for iv in call_arg), (
+        f"Expected list of CapInterval, got {call_arg}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-7 (task-1280): long-running open-ended cap is subtracted (days=7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_long_running_open_ended_cap_overlap_subtracted(
+    tmp_path: Path, config
+):
+    """A 2-day-old open-ended cap should be included after bumping lookback to days=7.
+
+    Setup: cap_hit 2 days ago, no resumed (open-ended). One ticket that ran
+    for 60 seconds entirely inside the open-ended cap window.
+
+    With days=1 (current): SQL cutoff filters out the 2-day-old cap_hit →
+    intervals=[], capped_windows=[], overlap=0, active_ms=60_000.
+    With days=7 (target): cap_hit is within the window → full 60_000ms
+    overlap is subtracted → p50_active_ms == 0.
+
+    Failing baseline: _sample_curator calls read_cap_intervals(days=1),
+    so the 2-day-old cap_hit is excluded → p50_active_ms == 60_000.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    # runs.db: open-ended cap 2 days ago
+    runs_path = tmp_path / 'runs.db'
+    conn_sync = sqlite3.connect(str(runs_path))
+    conn_sync.executescript(ACCOUNT_EVENTS_SCHEMA)
+    cap_start = now - timedelta(days=2)
+    conn_sync.execute(
+        'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
+        ('acc1', 'cap_hit', cap_start.isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    # tickets.db: one 60s ticket fully inside the open-ended cap window
+    tickets_path = tmp_path / 'tickets.db'
+    conn_sync = sqlite3.connect(str(tickets_path))
+    conn_sync.executescript(TICKETS_SCHEMA)
+    ticket_start = now - timedelta(minutes=5)
+    ticket_end = now - timedelta(minutes=4)
+    conn_sync.execute(
+        'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
+        ('t1', 'proj', 'created', ticket_start.isoformat(), ticket_end.isoformat()),
+    )
+    conn_sync.commit()
+    conn_sync.close()
+
+    handler = _ListTicketsHandler(count=0)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        tickets_conn = await aiosqlite.connect(str(tickets_path))
+        tickets_conn.row_factory = aiosqlite.Row
+        runs_conn = await aiosqlite.connect(str(runs_path))
+        runs_conn.row_factory = aiosqlite.Row
+        try:
+            result = await _sample_curator(
+                http_client, config, tickets_conn, [runs_conn], now=now,
+            )
+        finally:
+            await tickets_conn.close()
+            await runs_conn.close()
+
+    # With days=7: cap_hit is within window → 60s ticket fully capped → p50=0
+    assert result['p50_active_ms'] == 0, (
+        f"Expected p50_active_ms=0 (cap subtracted full 60s), got {result['p50_active_ms']}. "
+        "This fails if _sample_curator uses days=1 (excludes 2-day-old cap_hit)."
+    )
+    assert result['capped_now'] == 1, (
+        f"Expected capped_now=1 (open-ended interval), got {result['capped_now']}"
+    )

@@ -25,8 +25,8 @@ import httpx
 
 from dashboard.config import DashboardConfig
 from dashboard.data.cap_history import (
+    compute_capped_now_and_windows,
     compute_overlap_ms,
-    merge_all_accounts_capped,
     read_cap_intervals,
 )
 from dashboard.data.memory import get_memory_status, get_queue_stats, mcp_tool_call
@@ -46,13 +46,15 @@ logger = logging.getLogger(__name__)
 # not per-loop — worst-case latency for the pending-count accumulation loop
 # scales as N_roots × M_urls × 5s if all URLs hang for every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
+# Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
+_LIST_TICKETS_LIMIT = 2000
 
 
 async def fan_out_list_tickets(
     http_client: httpx.AsyncClient,
     config: DashboardConfig,
     *,
-    limit: int = 2000,
+    limit: int | None = None,
     timeout: float = _HTTP_SAMPLER_TIMEOUT_SECONDS,
 ) -> tuple[list[dict], int]:
     """Fan-out ``list_tickets`` across all project roots; first-success-per-root.
@@ -67,10 +69,14 @@ async def fan_out_list_tickets(
     If any per-root count saturates at *limit* the server may have clipped the
     real depth — a WARNING is logged so it surfaces in operator logs.
 
-    Per-(url, root) network/timeout/decode errors are swallowed at DEBUG level.
+    Per-(url, root) network/decode errors are swallowed at DEBUG level; timeouts
+    surface at WARNING so slow fused-memory instances are visible to operators.
     Unexpected exception types are logged at WARNING level so programming bugs
     don't silently vanish into the fan-out loop.
     """
+    # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
+    # takes effect without needing to pass an explicit kwarg.
+    effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
     seen_roots: set[str] = set()
     all_roots: list[str] = []
     for root in [config.project_root, *config.known_project_roots]:
@@ -87,17 +93,17 @@ async def fan_out_list_tickets(
                 result = await asyncio.wait_for(
                     mcp_tool_call(
                         http_client, url, 'list_tickets',
-                        {'project_root': root_str, 'status': 'pending', 'limit': limit},
+                        {'project_root': root_str, 'status': 'pending', 'limit': effective_limit},
                     ),
                     timeout=timeout,
                 )
                 count = result.get('count', 0) or 0
-                if count >= limit:
+                if count >= effective_limit:
                     logger.warning(
                         'list_tickets returned count=%d at-or-above the requested '
                         'limit of %d for %s / %s — '
                         'pending_total may be clipped at the server limit',
-                        count, limit, url, root_str,
+                        count, effective_limit, url, root_str,
                     )
                 pending_total += count
                 project_id = result.get('project_id', '')
@@ -106,7 +112,12 @@ async def fan_out_list_tickets(
                     for r in result.get('tickets', [])
                 )
                 break  # first success wins; avoid double-counting across failover URLs
-            except (httpx.HTTPError, TimeoutError, ValueError):
+            except TimeoutError:
+                logger.warning(
+                    'list_tickets timed out for project_root=%s url=%s after %.1fs',
+                    root_str, url, timeout,
+                )
+            except (httpx.HTTPError, ValueError):
                 logger.debug(
                     'list_tickets failed for %s / %s', url, root_str, exc_info=True,
                 )
@@ -254,9 +265,9 @@ async def _sample_curator(
         tickets_db: Read-only aiosqlite connection to tickets.db. If None,
             ticket latency fields are all None and only pending/capped are set.
         runs_dbs: Per-project runs.db connections for cap-event lookup.
-        now: Reference time (defaults to datetime.now(UTC)). Used for the
-            1-hour ticket cutoff. Note: read_cap_intervals uses its own
-            internal datetime.now(UTC) for the cap-window query.
+        now: Reference time (defaults to datetime.now(UTC)). Used for both
+            the 1-hour ticket cutoff AND threaded into read_cap_intervals so
+            the cap-window query anchors to the same clock.
 
     Returns:
         Always returns a dict with keys: pending_total, capped_now,
@@ -267,33 +278,31 @@ async def _sample_curator(
     effective_now = now if now is not None else datetime.now(UTC)
 
     # 1. HTTP pending count via fan_out_list_tickets (de-duped roots, first-success-per-root).
+    # Pass limit explicitly so _LIST_TICKETS_LIMIT is read at call time (not from the
+    # default arg which is bound at function definition time).
     _, pending_total = await fan_out_list_tickets(
         http_client, config,
-        limit=2000,
+        limit=_LIST_TICKETS_LIMIT,
         timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
     )
 
-    # 2. Cap intervals (last 24h).
+    # 2. Cap intervals (last 7 days — long enough to catch any plausible open-ended
+    # cap; account_events scan is cheap and indexed by created_at).
     try:
-        intervals = await read_cap_intervals(runs_dbs, days=1)
+        intervals = await read_cap_intervals(runs_dbs, days=7, now=effective_now)
     except Exception:
         logger.debug('read_cap_intervals failed', exc_info=True)
         intervals = []
 
-    # 3. capped_now: 1 if ANY account currently has an open-ended cap interval.
-    # Uses "any account capped" semantics — an open-ended CapInterval (end=None)
-    # means that account is still capped at query time, regardless of what other
-    # accounts are doing. This avoids the false-negative that would arise from the
-    # "all-accounts-simultaneously-capped" merge if some accounts had no events in
-    # the look-back window.
-    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
-
-    # Merged cap windows (needed for per-ticket overlap subtraction below).
-    account_names = list({iv.account_name for iv in intervals})
+    # 3. capped_now (any-account semantics) + capped_windows (all-accounts merge)
+    # derived together by compute_capped_now_and_windows — single source of truth
+    # shared with api_curator. See cap_history.py for the asymmetric semantics
+    # rationale and the sorted-account_names determinism guard.
     try:
-        capped_windows = merge_all_accounts_capped(intervals, account_names)
+        capped_now, capped_windows = compute_capped_now_and_windows(intervals)
     except Exception:
-        logger.debug('merge_all_accounts_capped failed', exc_info=True)
+        logger.debug('compute_capped_now_and_windows failed', exc_info=True)
+        capped_now = 1 if any(iv.end is None for iv in intervals) else 0
         capped_windows = []
 
     # 4. Terminal tickets resolved in the last hour.

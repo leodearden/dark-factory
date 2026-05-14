@@ -14,6 +14,8 @@ Public API
 - :func:`merge_all_accounts_capped` — intersect intervals across all accounts.
 - :func:`compute_overlap_ms` — sum capped-overlap milliseconds for a window.
 - :func:`bucketise_cap_sparkline` — produce a 0/1 :class:`ChartData` sparkline.
+- :func:`compute_capped_now_and_windows` — derive ``(capped_now, capped_windows)``
+  from a list of :class:`CapInterval`; shared by ``api_curator`` and ``_sample_curator``.
 
 Interval convention
 -------------------
@@ -63,6 +65,7 @@ async def read_cap_intervals(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int,
+    now: datetime | None = None,
 ) -> list[CapInterval]:
     """Return all cap intervals across *dbs* within the last *days* days.
 
@@ -76,13 +79,18 @@ async def read_cap_intervals(
         dbs: List of aiosqlite connections (``None`` entries are skipped).
         days: Look-back window in days.  Must be > 0; raises
             :exc:`ValueError` otherwise.
+        now: Reference instant for the look-back cutoff; defaults to
+            ``datetime.now(UTC)``.  Pass an explicit timestamp to anchor the
+            query to the same clock as the caller's other time computations
+            (e.g. ticket bounds in ``_sample_curator``).
 
     Returns:
         Flat list of :class:`CapInterval` objects across all DBs, unordered.
     """
     if days <= 0:
         raise ValueError("days must be positive")
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    effective_now = now if now is not None else datetime.now(UTC)
+    cutoff = (effective_now - timedelta(days=days)).isoformat()
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
         rows = await db.execute_fetchall(
@@ -325,3 +333,39 @@ def bucketise_cap_sparkline(
         values.append(value)
 
     return {'labels': labels, 'values': values}
+
+
+# ---------------------------------------------------------------------------
+# compute_capped_now_and_windows
+# ---------------------------------------------------------------------------
+
+def compute_capped_now_and_windows(
+    intervals: list[CapInterval],
+) -> tuple[int, list[tuple[datetime, datetime | None]]]:
+    """Derive (capped_now, capped_windows) from a single intervals list.
+
+    Consolidates logic that was previously duplicated in api_curator and
+    _sample_curator.  Uses asymmetric semantics intentionally:
+
+    - *capped_now* uses "any account currently capped" semantics — 1 if any
+      interval has ``end=None`` at query time.  This avoids false-negatives
+      when some accounts had no events in the look-back window.
+    - *capped_windows* uses "all accounts simultaneously capped" semantics via
+      :func:`merge_all_accounts_capped` on a **sorted** ``account_names`` list
+      for deterministic merge-event ordering across reruns.
+
+    Args:
+        intervals: List of :class:`CapInterval` objects.  Both call sites
+            (``api_curator``, ``_sample_curator``) already hold a
+            ``list[CapInterval]`` from :func:`read_cap_intervals`; the
+            ``list`` annotation matches reality and avoids the overhead of
+            a redundant materialisation pass.
+
+    Returns:
+        ``(capped_now, capped_windows)`` where ``capped_now`` is 0 or 1 and
+        ``capped_windows`` is the output of :func:`merge_all_accounts_capped`.
+    """
+    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+    account_names = sorted({iv.account_name for iv in intervals})
+    capped_windows = merge_all_accounts_capped(intervals, account_names)
+    return capped_now, capped_windows

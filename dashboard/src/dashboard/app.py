@@ -39,7 +39,7 @@ from dashboard.data.burndown import (
 from dashboard.data.cap_history import (
     CapInterval,
     bucketise_cap_sparkline,
-    merge_all_accounts_capped,
+    compute_capped_now_and_windows,
     read_cap_intervals,
 )
 from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
@@ -721,24 +721,18 @@ async def api_curator(request: Request) -> JSONResponse:
     curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
     intervals: list[CapInterval] = safe_gather_result(intervals_r, [], 'curator/intervals')
 
-    # capped_now: "any account currently capped" — one open-ended interval means
-    # the curator is effectively blocked right now.  Uses "any" semantics to avoid
-    # the false-negative that would arise if some accounts had no events in the
-    # look-back window (those accounts produce no intervals, so ALL-semantics would
-    # falsely report uncapped).  Matches _sample_curator's point-in-time check.
-    capped_now = 1 if any(iv.end is None for iv in intervals) else 0
-
-    # capped_spark: "all accounts simultaneously capped" via merge_all_accounts_capped.
-    # Intentionally stricter than capped_now — the sparkline shows periods of total
-    # saturation (every account blocked at once), while capped_now is a live badge
-    # that fires on the first open-ended interval.  With ≥2 accounts, capped_now=1
-    # while the sparkline stays flat is expected behaviour, not a bug.
+    # capped_now (any-account semantics) + capped_windows (all-accounts merge)
+    # come from one helper — single source of truth shared with _sample_curator.
+    # See dashboard.data.cap_history for the asymmetric semantics rationale.
+    # The sparkline downstream (bucketise_cap_sparkline) renders the strict
+    # all-accounts-capped window — a 1 in the sparkline means EVERY account was
+    # blocked at that bucket. capped_now flags any-account live state.
     try:
-        account_names = sorted({iv.account_name for iv in intervals})
-        capped_windows = merge_all_accounts_capped(intervals, account_names)
+        capped_now, capped_windows = compute_capped_now_and_windows(intervals)
         capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
     except Exception:
-        logger.debug('curator/capped_spark computation failed', exc_info=True)
+        logger.debug('curator/capped_now_and_spark computation failed', exc_info=True)
+        capped_now = 1 if any(iv.end is None for iv in intervals) else 0
         capped_spark = _empty_capped
 
     return JSONResponse(redux_api.shape_curator(
