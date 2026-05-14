@@ -617,10 +617,26 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
     errors: list[str] = []
-    # Assumption: cancel_ticket is idempotent and each ticket lives on exactly
-    # one fused-memory instance.  First-success-or-not_found semantics are
-    # correct; we do NOT fan out past a successful response to avoid
-    # double-cancelling.  Only network/transport errors trigger fallthrough.
+    # Single-Homed Ticket Invariant: each ticket lives on exactly one
+    # fused-memory instance, enforced at two independent levels:
+    #   • OS-wide singleton lock — fused-memory/src/fused_memory/server/
+    #     main.py:_acquire_singleton_lock binds abstract Unix socket
+    #     \0fused-memory-singleton; any second process exits immediately.
+    #   • Per-process SQLite store — fused-memory/src/fused_memory/
+    #     middleware/ticket_store.py persists tickets in <data_dir>/tickets.db
+    #     with no cross-instance replication.
+    # See DESIGN.md → Curator Tickets & Routing Invariant for the full
+    # audit trail including the failover-only role of fused_memory_urls.
+    #
+    # Because only one instance can own a ticket, cancel_ticket is idempotent
+    # and first-success-or-not_found semantics are correct.  A not_found from
+    # the first reachable instance is authoritative — we short-circuit to 404
+    # and do NOT fan out to avoid double-cancelling.  Only network/transport
+    # errors trigger fallthrough to the next URL.
+    #
+    # If a future infra change introduces ticket replication or multi-region
+    # deployment, this assumption must be re-evaluated and the loop relaxed to
+    # fan-out-then-quorum.
     for url in config.fused_memory_urls:
         try:
             result = await memory_data.mcp_tool_call(
