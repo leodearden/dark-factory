@@ -2336,7 +2336,7 @@ class TaskInterceptor:
         )
         if not resolved and status == 'created' and task_id is not None:
             logger.warning(
-                '_process_add_ticket: orphan-race for ticket %s — '
+                'orphan-race: ticket %s — '
                 'tm.add_task created task %s but ticket row was terminalized '
                 'by a concurrent writer (likely cancel_ticket); task is live '
                 'in tasks.json, recover via journal task_created event',
