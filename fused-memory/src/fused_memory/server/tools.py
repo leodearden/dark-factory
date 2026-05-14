@@ -11,9 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+import aiosqlite
+
 from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import resolve_main_checkout
+from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     validate_int_ids,
@@ -29,6 +31,43 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Scheduler-override constants
+#
+# These are intentional duplicates of orchestrator.overrides._SCHEMA and
+# orchestrator.config.PRIORITY_RANK.  fused-memory has no orchestrator
+# dependency in pyproject.toml; adding one would invert the dependency graph.
+# The same "ossified contract" pattern is used for TERMINAL_STATUSES, which
+# are duplicated at fused_memory/middleware/task_interceptor.py:108-112.
+# ---------------------------------------------------------------------------
+
+_OVERRIDE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS overrides (
+    project_root  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    boost_tier    TEXT,
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    pin_order     INTEGER,
+    reserve_now   INTEGER NOT NULL DEFAULT 0,
+    ttl_until     TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (project_root, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_overrides_pinned
+    ON overrides(project_root, pinned, pin_order);
+"""  # Source of truth: orchestrator/src/orchestrator/overrides.py:33-49
+
+# Mirrors orchestrator/src/orchestrator/config.py PRIORITY_RANK keys.
+# Source of truth: orchestrator/src/orchestrator/config.py:27.
+_PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
+
+# Valid field names for clear_task_priority_override.
+# Mirrors orchestrator.overrides.OverrideStore.clear_override validation at
+# orchestrator/src/orchestrator/overrides.py:258.
+_VALID_CLEAR_FIELDS: frozenset[str] = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl'})
 
 FUSED_MEMORY_INSTRUCTIONS = """\
 Fused Memory is a unified memory system that combines Graphiti (temporal knowledge graph)
@@ -2233,6 +2272,120 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'remove_dependency error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    # ------------------------------------------------------------------
+    # Scheduler-override tools
+    #
+    # These four tools operate on
+    # ``<project_root>/data/orchestrator/scheduler_overrides.db`` directly
+    # via aiosqlite.  They duplicate the SQL semantics from
+    # orchestrator.overrides.OverrideStore (no import) — the same
+    # ossified-contract pattern as TERMINAL_STATUSES at
+    # fused_memory/middleware/task_interceptor.py:108-112.
+    #
+    # Invariant: overrides live in scheduler_overrides.db, physically separate
+    # from the tasks store.  set_task_status writes to the tasks store and
+    # cannot affect override rows.
+    # See test_set_task_status_done_does_not_clear_override_row.
+    # ------------------------------------------------------------------
+
+    def _overrides_db_path(project_root: str) -> Path:
+        """Return the Path to the scheduler_overrides.db for project_root."""
+        from pathlib import Path as _Path
+        return _Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+
+    async def _open_overrides_db(project_root: str) -> aiosqlite.Connection:
+        """Open (and initialise) the scheduler_overrides.db for project_root.
+
+        Creates parent directories on first call, runs idempotent DDL, and
+        sets PRAGMA journal_mode=WAL / busy_timeout / synchronous=FULL.
+        """
+        from pathlib import Path as _Path
+        db_path = _Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = await aiosqlite.connect(str(db_path))
+        await db.execute('PRAGMA journal_mode=WAL')
+        await db.execute('PRAGMA busy_timeout=5000')
+        await db.execute('PRAGMA synchronous=FULL')
+        await db.executescript(_OVERRIDE_SCHEMA)
+        return db
+
+    async def _emit_override_audit(
+        project_root: str,
+        tool_name: str,
+        task_id: str | None,
+        content: str,
+        metadata: dict,
+    ) -> None:
+        """Fire-and-forget audit write to fused-memory.
+
+        Mirrors the _log_read pattern at tools.py:272 — audit failures log
+        a warning but never fail the user-visible tool response.
+        """
+        try:
+            pid = resolve_project_id(project_root)
+            await memory_service.add_memory(
+                content=content,
+                category='decisions_and_rationale',
+                project_id=pid,
+                agent_id='scheduler-overrides',
+                metadata=metadata,
+            )
+        except Exception as audit_exc:
+            logger.warning(
+                'override audit emit failed (tool=%s task_id=%s): %s',
+                tool_name, task_id, audit_exc,
+            )
+
+    @mcp.tool()
+    async def get_pin_queue(
+        project_root: str,
+    ) -> dict[str, Any]:
+        """Return the current pinned-task queue in ascending pin_order.
+
+        Read-only.  Does NOT emit an audit add_memory call.
+
+        Args:
+            project_root: Absolute path to project root.
+
+        Returns:
+            ``{'pin_queue': [{'task_id': ..., 'boost_tier': ..., 'pinned': ...,
+            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...}, ...]}``
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            db = await _open_overrides_db(project_root)
+            try:
+                cursor = await db.execute(
+                    'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                    'FROM overrides '
+                    'WHERE project_root=? AND pinned=1 '
+                    'ORDER BY pin_order ASC',
+                    (project_root,),
+                )
+                rows = await cursor.fetchall()
+                pin_queue = [
+                    {
+                        'task_id': r[0],
+                        'boost_tier': r[1],
+                        'pinned': bool(r[2]),
+                        'pin_order': r[3],
+                        'reserve_now': bool(r[4]),
+                        'ttl_until': r[5],
+                    }
+                    for r in rows
+                ]
+                return {'pin_queue': pin_queue}
+            finally:
+                await db.close()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_pin_queue error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp
