@@ -729,7 +729,8 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     # connection.  This validates path-to-connection wiring, not just key presence.
     tickets_db_path = fixed_config.tickets_db
     tickets_db_path.parent.mkdir(parents=True, exist_ok=True)
-    sqlite3.connect(str(tickets_db_path)).close()
+    with sqlite3.connect(str(tickets_db_path)):
+        pass
 
     pool = DbPool()
     mock_app = MagicMock()
@@ -741,6 +742,7 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     await metrics_conn.executescript(METRICS_SCHEMA)
     await metrics_conn.commit()
 
+    expected_conn = None
     try:
         with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
             # _metrics_loop calls _run_once() immediately before entering the
@@ -753,6 +755,8 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        # Snapshot the pool entry before close_all() empties pool._conns.
+        expected_conn = pool._conns.get(fixed_config.tickets_db.resolve())
     finally:
         await metrics_conn.close()
         await pool.close_all()
@@ -763,12 +767,17 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         f"tickets_db not in kwargs: {call_kwargs}. "
         f"All calls: {mock_collect.call_args_list}"
     )
-    # tickets.db exists on disk, so DbPool.get() should return a live connection
-    # rather than None.  A wrong path in config.tickets_db would yield None here,
-    # catching path-to-connection regressions.
-    assert call_kwargs['tickets_db'] is not None, (
-        f"tickets_db should be a live connection (tickets.db was created at "
-        f"{fixed_config.tickets_db}) but got None. "
+    # tickets.db exists on disk so DbPool.get() opens a real connection stored in
+    # pool._conns keyed by the resolved path.  We assert object identity to pin
+    # path-to-connection wiring: a wrong-but-existing path yields a different
+    # connection object; a wrong-but-missing path leaves expected_conn as None.
+    assert expected_conn is not None, (
+        f"DbPool has no connection for {fixed_config.tickets_db.resolve()}; "
+        f"pool keys: {list(pool._conns)}"
+    )
+    assert call_kwargs['tickets_db'] is expected_conn, (
+        f"tickets_db should be the DbPool connection for {fixed_config.tickets_db} "
+        f"but got {call_kwargs['tickets_db']!r}. "
         f"All calls: {mock_collect.call_args_list}"
     )
 
