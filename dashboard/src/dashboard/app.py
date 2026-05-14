@@ -29,7 +29,6 @@ from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
 from dashboard.data.active_tasks import collect_active_tasks
-from dashboard.data.scheduler import collect_scheduler_state
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
     aggregate_burndown_projects,
@@ -88,6 +87,7 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
+from dashboard.data.scheduler import collect_scheduler_state
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
     get_memory_timeseries,

@@ -35,6 +35,7 @@ Shape contract (returned by collect_scheduler_state):
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -42,8 +43,6 @@ import httpx
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
 from dashboard.data.memory import invalidate_session, mcp_tool_call
-
-import logging
 
 logger = logging.getLogger(__name__)
 
