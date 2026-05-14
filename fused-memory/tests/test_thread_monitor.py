@@ -59,6 +59,34 @@ class TestSnapshotThreads:
             stop_event.set()
             t.join(timeout=2)
 
+    def test_threadpoolexecutor_thread_bucketed_as_executor(self):
+        """A thread named 'ThreadPoolExecutor-0_0' must land in executor, not asyncio_pool."""
+        barrier = threading.Barrier(2)
+        stop_event = threading.Event()
+
+        def worker():
+            barrier.wait()
+            stop_event.wait()
+
+        baseline = server_main._snapshot_threads()
+        t = threading.Thread(target=worker, name='ThreadPoolExecutor-0_0', daemon=True)
+        t.start()
+        barrier.wait()
+        try:
+            snapshot = server_main._snapshot_threads()
+            # executor bucket must grow by at least 1
+            assert snapshot.get('executor', 0) >= baseline.get('executor', 0) + 1, (
+                f"Expected executor to grow; baseline={baseline}, snapshot={snapshot}"
+            )
+            # asyncio_pool must not have grown from this thread
+            assert snapshot.get('asyncio_pool', 0) == baseline.get('asyncio_pool', 0), (
+                f"ThreadPoolExecutor thread must not count in asyncio_pool; "
+                f"baseline={baseline}, snapshot={snapshot}"
+            )
+        finally:
+            stop_event.set()
+            t.join(timeout=2)
+
 
 class TestThreadMonitorIteration:
     """_thread_monitor_iteration(prev, threshold) -> int decides log level."""
@@ -85,8 +113,19 @@ class TestThreadMonitorIteration:
         assert 'delta=+5' in monitor_records[0].getMessage()
 
     def test_above_threshold_emits_warning_with_snapshot(self, monkeypatch, caplog):
-        """count>threshold (delta=0) → WARNING with snapshot breakdown."""
+        """count>threshold (delta=0) → WARNING with snapshot breakdown.
+
+        Both threading.active_count and _snapshot_threads are patched so that
+        the WARNING line (threads=N) and the breakdown line (_total=N) derive
+        from the same controlled value — confirming the "snapshot first" logic
+        keeps them consistent.
+        """
+        fake_snapshot = {
+            '_total': 70, 'main': 1, 'asyncio_pool': 62, 'executor': 3,
+            'aiosqlite': 3, 'timer': 0, 'other': 1,
+        }
         monkeypatch.setattr(threading, 'active_count', lambda: 70)
+        monkeypatch.setattr(server_main, '_snapshot_threads', lambda: fake_snapshot)
         with caplog.at_level(logging.WARNING, logger='fused_memory.server.main'):
             result = server_main._thread_monitor_iteration(prev=70, threshold=60)
         assert result == 70
@@ -105,7 +144,12 @@ class TestThreadMonitorIteration:
 
     def test_above_threshold_and_delta_uses_warning_not_info(self, monkeypatch, caplog):
         """count>threshold AND delta!=0 → WARNING (not INFO)."""
+        fake_snapshot = {
+            '_total': 80, 'main': 1, 'asyncio_pool': 72, 'executor': 3,
+            'aiosqlite': 3, 'timer': 0, 'other': 1,
+        }
         monkeypatch.setattr(threading, 'active_count', lambda: 80)
+        monkeypatch.setattr(server_main, '_snapshot_threads', lambda: fake_snapshot)
         with caplog.at_level(logging.INFO, logger='fused_memory.server.main'):
             result = server_main._thread_monitor_iteration(prev=70, threshold=60)
         assert result == 80
