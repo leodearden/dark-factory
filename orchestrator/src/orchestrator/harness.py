@@ -216,6 +216,11 @@ class Harness:
         self.mcp = McpLifecycle(config)
         self.git_ops = GitOps(config.git, config.project_root)
         self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
+        # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
+        # This connects in-memory trip detection to the full pause bundle
+        # (persistence + event + log) defined on the Harness.  Sibling tasks
+        # (cost-ceiling 1323, EWA digest 1327) call pause_scheduler() directly.
+        self.scheduler._on_park_stop_trip = self.pause_scheduler
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
