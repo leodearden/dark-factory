@@ -21,8 +21,7 @@ from __future__ import annotations
 
 __all__ = ['DedupeConfig', 'find_dedupe_parent', 'summary_dedupe_key']
 
-import sys
-import unicodedata
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -31,13 +30,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
-# Covers all Unicode punctuation (Pc, Pd, Pe, Pf, Pi, Po, Ps), not just ASCII.
-# Precomputed once at import time; handles en/em dashes, curly quotes, etc.
-_PUNCT_TABLE = {
-    c: None
-    for c in range(sys.maxunicode + 1)
-    if unicodedata.category(chr(c)).startswith('P')
-}
+_NON_WORD_PATTERN = re.compile(r'[^\w\s]', flags=re.UNICODE)  # strips punctuation, symbols, control; keeps word chars and whitespace
 
 
 @dataclass
@@ -60,8 +53,9 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
 
     Normalisation steps:
     1. Casefold (Unicode-aware lower-case).
-    2. Strip all Unicode punctuation (categories Pc/Pd/Pe/Pf/Pi/Po/Ps),
-       including en/em dashes, curly quotes, and ASCII punctuation.
+    2. Strip all non-word, non-whitespace characters (Unicode punctuation,
+       symbols, controls), including en/em dashes, curly quotes, and ASCII
+       punctuation.
     3. Split on whitespace (collapses multiple spaces / tabs).
     4. Return the first three tokens as a tuple (fewer if the summary
        has fewer than three words).
@@ -77,7 +71,7 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
         >>> summary_dedupe_key("")
         ()
     """
-    normalised = summary.casefold().translate(_PUNCT_TABLE)
+    normalised = _NON_WORD_PATTERN.sub('', summary.casefold())
     tokens = normalised.split()
     return tuple(tokens[:3])
 
