@@ -5016,6 +5016,54 @@ class TestParkStopTrip:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_trip_does_not_re_fire_under_concurrent_transitions(self, monkeypatch):
+        """Regression test: concurrent blocked transitions must not cause duplicate callbacks.
+
+        Without the synchronous latch fix in _maybe_fire_park_stop_trip, coroutines
+        3..N all observe self._paused=False (the async callback hasn't set it yet) and
+        each schedule a duplicate ensure_future — so callback_args ends up with length 4+.
+        After the fix, the synchronous pause() call inside _maybe_fire_park_stop_trip
+        immediately sets _paused=True, so any concurrent coroutine that has already
+        reached the guard returns early.
+        """
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
+        )
+        scheduler = Scheduler(config)
+
+        callback_args: list[str] = []
+
+        async def recording_callback(reason: str) -> None:
+            # Mirror harness.pause_scheduler shape: call scheduler.pause()
+            # so any concurrent guard check sees _paused=True immediately.
+            scheduler.pause(reason)
+            callback_args.append(reason)
+
+        scheduler._on_park_stop_trip = recording_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Fire 6 concurrent blocked transitions (threshold=3, so calls 3-6 all
+        # observe n >= threshold if _paused is not set synchronously first).
+        await asyncio.gather(
+            *[scheduler.set_task_status(str(i), 'blocked') for i in range(6)]
+        )
+        # Yield so any ensure_future'd callbacks have a chance to run.
+        await asyncio.sleep(0)
+
+        assert len(callback_args) == 1, (
+            f'Callback must fire exactly once (synchronous latch prevents duplicates); '
+            f'got {len(callback_args)}: {callback_args!r}'
+        )
+        assert scheduler.is_paused, 'Scheduler must be paused after trip'
+        assert scheduler.pause_reason == callback_args[0], (
+            'pause_reason must equal the reason passed to the callback'
+        )
+
+
 class TestParkStopDisabled:
     """park_stop_enabled=False suppresses the trip but still records transitions."""
 
