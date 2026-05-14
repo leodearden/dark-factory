@@ -11,6 +11,7 @@ TDD steps:
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -23,7 +24,9 @@ from dashboard.data.metrics import METRICS_SCHEMA
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-_PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
+# fan_out_list_tickets (in metrics.py) resolves mcp_tool_call from the
+# dashboard.data.metrics namespace, so patch there — not dashboard.data.memory.
+_PATCH_TARGET = 'dashboard.data.metrics.mcp_tool_call'
 
 ACCOUNT_EVENTS_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS account_events (
@@ -48,13 +51,13 @@ def _make_config(tmp_path: Path, *, fused_memory_urls=None, known_project_roots=
     )
 
 
+@contextmanager
 def _override_client(config):
-    """Enter a TestClient and override app.state.config, returning the ctx."""
+    """Context manager: yield a TestClient with app.state.config overridden."""
     from dashboard.app import app
-    ctx = TestClient(app)
-    ctx.__enter__()
-    app.state.config = config
-    return ctx
+    with TestClient(app) as c:
+        app.state.config = config
+        yield c
 
 
 # ---------------------------------------------------------------------------
@@ -116,12 +119,8 @@ def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
 
     config = _make_config(tmp_path)
-    ctx = _override_client(config)
-    try:
-        with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
-            resp = ctx.get('/api/v2/dashboard/curator')
-    finally:
-        ctx.__exit__(None, None, None)
+    with _override_client(config) as c, patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+        resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
     cs = resp.json()['CURATOR_STATE']
@@ -171,12 +170,9 @@ def test_curator_latency_spark_from_metrics_db(tmp_path: Path):
     conn.close()
 
     config = _make_config(tmp_path)
-    ctx = _override_client(config)
-    try:
-        with patch(_PATCH_TARGET, new=AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})):
-            resp = ctx.get('/api/v2/dashboard/curator')
-    finally:
-        ctx.__exit__(None, None, None)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+        resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
     ls = resp.json()['CURATOR_STATE']['latency_spark']
@@ -223,12 +219,9 @@ def test_curator_capped_spark_from_runs_db(tmp_path: Path):
     conn.close()
 
     config = _make_config(tmp_path)
-    ctx = _override_client(config)
-    try:
-        with patch(_PATCH_TARGET, new=AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})):
-            resp = ctx.get('/api/v2/dashboard/curator')
-    finally:
-        ctx.__exit__(None, None, None)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+        resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
     cs = resp.json()['CURATOR_STATE']
@@ -262,12 +255,9 @@ def test_curator_capped_now_open_ended_interval(tmp_path: Path):
     conn.close()
 
     config = _make_config(tmp_path)
-    ctx = _override_client(config)
-    try:
-        with patch(_PATCH_TARGET, new=AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})):
-            resp = ctx.get('/api/v2/dashboard/curator')
-    finally:
-        ctx.__exit__(None, None, None)
+    empty_result = AsyncMock(return_value={'project_id': 'p', 'count': 0, 'tickets': []})
+    with _override_client(config) as c, patch(_PATCH_TARGET, new=empty_result):
+        resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
     assert resp.json()['CURATOR_STATE']['state']['capped_now'] == 1

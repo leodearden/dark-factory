@@ -47,6 +47,77 @@ logger = logging.getLogger(__name__)
 # scales as N_roots × M_urls × 5s if all URLs hang for every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 
+
+async def fan_out_list_tickets(
+    http_client: httpx.AsyncClient,
+    config: DashboardConfig,
+    *,
+    limit: int = 2000,
+    timeout: float = _HTTP_SAMPLER_TIMEOUT_SECONDS,
+) -> tuple[list[dict], int]:
+    """Fan-out ``list_tickets`` across all project roots; first-success-per-root.
+
+    Returns ``(tickets, pending_total)`` where:
+
+    * ``tickets`` — raw MCP ticket-row dicts augmented with a ``project_id``
+      key taken from the top-level response field.  Callers that only need the
+      count can ignore this list.
+    * ``pending_total`` — sum of the per-root ``count`` fields.
+
+    If any per-root count saturates at *limit* the server may have clipped the
+    real depth — a WARNING is logged so it surfaces in operator logs.
+
+    Per-(url, root) network/timeout/decode errors are swallowed at DEBUG level.
+    Unexpected exception types are logged at WARNING level so programming bugs
+    don't silently vanish into the fan-out loop.
+    """
+    seen_roots: set[str] = set()
+    all_roots: list[str] = []
+    for root in [config.project_root, *config.known_project_roots]:
+        key = str(root)
+        if key not in seen_roots:
+            seen_roots.add(key)
+            all_roots.append(key)
+
+    tickets: list[dict] = []
+    pending_total = 0
+    for root_str in all_roots:
+        for url in config.fused_memory_urls:
+            try:
+                result = await asyncio.wait_for(
+                    mcp_tool_call(
+                        http_client, url, 'list_tickets',
+                        {'project_root': root_str, 'status': 'pending', 'limit': limit},
+                    ),
+                    timeout=timeout,
+                )
+                count = result.get('count', 0) or 0
+                if count >= limit:
+                    logger.warning(
+                        'list_tickets returned count=%d at-or-above the requested '
+                        'limit of %d for %s / %s — '
+                        'pending_total may be clipped at the server limit',
+                        count, limit, url, root_str,
+                    )
+                pending_total += count
+                project_id = result.get('project_id', '')
+                tickets.extend(
+                    {**r, 'project_id': project_id}
+                    for r in result.get('tickets', [])
+                )
+                break  # first success wins; avoid double-counting across failover URLs
+            except (httpx.HTTPError, TimeoutError, ValueError):
+                logger.debug(
+                    'list_tickets failed for %s / %s', url, root_str, exc_info=True,
+                )
+            except Exception:
+                logger.warning(
+                    'list_tickets unexpected error for %s / %s', url, root_str, exc_info=True,
+                )
+
+    return tickets, pending_total
+
+
 METRICS_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS orchestrator_snapshots (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,42 +266,12 @@ async def _sample_curator(
     """
     effective_now = now if now is not None else datetime.now(UTC)
 
-    # 1. HTTP pending count: per project_root, try each URL in turn (failover).
-    # First success wins — summing across all URLs would double-count when
-    # multiple URLs serve the same project.
-    # NOTE: limit=2000 is the server-side ceiling; if real pending depth
-    # exceeds 2000 for a (url, root) pair, that project's count silently
-    # saturates at 2000 and pending_total will be understated.
-    pending_total = 0
-    seen_roots: set[str] = set()
-    all_roots: list[str] = []
-    for root in [config.project_root, *config.known_project_roots]:
-        key = str(root)
-        if key not in seen_roots:
-            seen_roots.add(key)
-            all_roots.append(key)
-    for root_str in all_roots:
-        for url in config.fused_memory_urls:
-            try:
-                result = await asyncio.wait_for(
-                    mcp_tool_call(
-                        http_client, url, 'list_tickets',
-                        {'project_root': root_str, 'status': 'pending', 'limit': 2000},
-                    ),
-                    timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
-                )
-                count = result.get('count', 0) or 0
-                if count >= 2000:
-                    logger.warning(
-                        'list_tickets returned count=%d at-or-above the requested '
-                        'limit of 2000 for %s / %s — '
-                        'pending_total may be clipped at the server limit',
-                        count, url, root_str,
-                    )
-                pending_total += count
-                break  # first success wins; avoid double-counting across failover URLs
-            except Exception:
-                logger.debug('list_tickets failed for %s / %s', url, root_str, exc_info=True)
+    # 1. HTTP pending count via fan_out_list_tickets (de-duped roots, first-success-per-root).
+    _, pending_total = await fan_out_list_tickets(
+        http_client, config,
+        limit=2000,
+        timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+    )
 
     # 2. Cap intervals (last 24h).
     try:

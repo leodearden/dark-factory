@@ -62,6 +62,7 @@ from dashboard.data.metrics import (
     METRICS_SCHEMA,
     collect_metrics_snapshot,
     downsample_metrics,
+    fan_out_list_tickets,
     get_curator_sparks,
     get_memory_24h_ago,
     get_memory_sparks,
@@ -652,78 +653,69 @@ async def api_curator(request: Request) -> JSONResponse:
     http_client: httpx.AsyncClient = request.app.state.http_client
     now = datetime.now(UTC)
 
-    # 1. Fan-out list_tickets across all project roots (de-duped).
-    #    First-success-per-root semantics — mirrors _sample_curator's loop.
+    # 1. Fan-out list_tickets across all project roots (de-duped, first-success-per-root).
+    #    limit=2000 matches _sample_curator so the live count and the stored
+    #    pending_total spark stay consistent.  fan_out_list_tickets logs a WARNING
+    #    when any root's count saturates at the limit.
+    raw_tickets, pending_total = await fan_out_list_tickets(
+        http_client, config,
+        limit=2000,
+        timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+    )
+    # Map raw MCP rows to the dashboard display shape (age_seconds, title, etc.).
     pending: list[dict] = []
-    pending_total = 0
-    seen_roots: set[str] = set()
-    all_roots: list[str] = []
-    for root in [config.project_root, *config.known_project_roots]:
-        key = str(root)
-        if key not in seen_roots:
-            seen_roots.add(key)
-            all_roots.append(key)
-
-    for root_str in all_roots:
-        for url in config.fused_memory_urls:
+    for r in raw_tickets:
+        created_at_str = r.get('created_at', '')
+        age_seconds: int | None = None
+        if created_at_str:
             try:
-                result = await asyncio.wait_for(
-                    memory_data.mcp_tool_call(
-                        http_client, url, 'list_tickets',
-                        {'project_root': root_str, 'status': 'pending', 'limit': 200},
-                    ),
-                    timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
-                )
-                project_id = result.get('project_id', '')
-                pending_total += result.get('count', 0) or 0
-                for r in result.get('tickets', []):
-                    created_at_str = r.get('created_at', '')
-                    age_seconds: int | None = None
-                    if created_at_str:
-                        try:
-                            created_dt = datetime.fromisoformat(created_at_str)
-                            if created_dt.tzinfo is None:
-                                created_dt = created_dt.replace(tzinfo=UTC)
-                            age_seconds = int((now - created_dt).total_seconds())
-                        except (ValueError, TypeError):
-                            age_seconds = None
-                    pending.append({
-                        'ticket_id': r.get('ticket_id', ''),
-                        'project_id': project_id,
-                        'title': r.get('candidate_title') or '',
-                        'files': r.get('files', []),
-                        'created_at': created_at_str,
-                        'age_seconds': age_seconds,
-                    })
-                break  # first success wins per root
-            except Exception:
-                logger.debug(
-                    'curator/list_tickets failed for %s / %s', url, root_str, exc_info=True,
-                )
+                created_dt = datetime.fromisoformat(created_at_str)
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=UTC)
+                age_seconds = int((now - created_dt).total_seconds())
+            except (ValueError, TypeError):
+                age_seconds = None
+        pending.append({
+            'ticket_id': r.get('ticket_id', ''),
+            'project_id': r.get('project_id', ''),
+            'title': r.get('candidate_title') or '',
+            'files': r.get('files', []),
+            'created_at': created_at_str,
+            'age_seconds': age_seconds,
+        })
 
-    # 2. Latency sparks from metrics.db (pass empty sparks on failure).
+    # 2 + 3. Latency sparks and cap intervals — independent queries, run concurrently.
     _empty_sparks: dict[str, dict[str, list]] = {
         'pending': {'labels': [], 'values': []},
         'p50': {'labels': [], 'values': []},
         'p90': {'labels': [], 'values': []},
         'p99': {'labels': [], 'values': []},
     }
-    metrics_db = await pool.get(config.metrics_db)
-    sparks_r, = await asyncio.gather(
-        get_curator_sparks(metrics_db, days=1),
-        return_exceptions=True,
-    )
-    curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
-
-    # 3. Capped sparkline + capped_now from runs.db(s).
     _empty_capped: ChartData = {'labels': [], 'values': []}
+
+    metrics_db = await pool.get(config.metrics_db)
     cost_dbs_raw = await _cost_dbs(config, pool)
-    intervals_r, = await asyncio.gather(
+
+    sparks_r, intervals_r = await asyncio.gather(
+        get_curator_sparks(metrics_db, days=1),
         read_cap_intervals(cost_dbs_raw, days=1),
         return_exceptions=True,
     )
+    curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
     intervals: list[CapInterval] = safe_gather_result(intervals_r, [], 'curator/intervals')
+
+    # capped_now: "any account currently capped" — one open-ended interval means
+    # the curator is effectively blocked right now.  Uses "any" semantics to avoid
+    # the false-negative that would arise if some accounts had no events in the
+    # look-back window (those accounts produce no intervals, so ALL-semantics would
+    # falsely report uncapped).  Matches _sample_curator's point-in-time check.
     capped_now = 1 if any(iv.end is None for iv in intervals) else 0
+
+    # capped_spark: "all accounts simultaneously capped" via merge_all_accounts_capped.
+    # Intentionally stricter than capped_now — the sparkline shows periods of total
+    # saturation (every account blocked at once), while capped_now is a live badge
+    # that fires on the first open-ended interval.  With ≥2 accounts, capped_now=1
+    # while the sparkline stays flat is expected behaviour, not a bug.
     try:
         account_names = sorted({iv.account_name for iv in intervals})
         capped_windows = merge_all_accounts_capped(intervals, account_names)
@@ -737,6 +729,9 @@ async def api_curator(request: Request) -> JSONResponse:
         curator_sparks=curator_sparks,
         capped_spark=cast(dict, capped_spark),
         capped_now=capped_now,
+        # paused_reason: the usage_gate's pause reason lives only in-memory and
+        # is not exposed by any current MCP tool.  Returns None until a follow-up
+        # task adds a snapshot column or a new get_curator_state MCP tool.
         paused_reason=None,
         pending_total=pending_total,
     ))
