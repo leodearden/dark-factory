@@ -672,8 +672,8 @@ async def _query_stage2_flags(
         # treated as absent and placed in the missing partition unconditionally.
         if meta.get('run_id') and str(meta['run_id']) == run_id_str:
             current_flags.append(flag_dict)
-        elif not meta.get('run_id'):
-            # Absent or falsy run_id — Stage 1 producer drift
+        elif meta.get('run_id') in (None, ''):
+            # Absent or empty run_id — Stage 1 producer drift (producer contract requires a non-empty string)
             stale_missing_run_id_ids.append(r.id)
         else:
             # Present and truthy but does not match current run_id — prior-cycle residue
