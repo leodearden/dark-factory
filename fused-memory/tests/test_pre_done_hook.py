@@ -75,3 +75,16 @@ async def test_run_hook_returns_rejected_error_on_nonzero_exit(monkeypatch):
     assert result['task_id'] == '1'
     assert result['exit_code'] != 0
     assert 'hint' in result
+
+
+@pytest.mark.asyncio
+async def test_run_hook_includes_stderr_in_error(monkeypatch):
+    """run_hook captures and includes stderr in the rejection error dict."""
+    monkeypatch.setenv(
+        'FUSED_MEMORY_PREDONE_HOOK_TMP',
+        "sh -c 'echo my-failure-reason >&2; exit 2'",
+    )
+    result = await run_hook('99', '/tmp')
+    assert result is not None
+    assert 'my-failure-reason' in result['stderr']
+    assert result['exit_code'] == 2
