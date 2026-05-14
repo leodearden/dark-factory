@@ -85,8 +85,15 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     assert resp.status_code == 200
     assert resp.json() == mcp_result
 
-    mock_mcp.assert_called_once()
-    _client_arg, url_arg, tool_arg, args_arg = mock_mcp.call_args.args
+    # The cancel handler must call cancel_ticket exactly once with the correct
+    # args.  Background tasks (metrics loop) may also call mcp_tool_call for
+    # get_status / get_queue_stats probes during the test window; filter those
+    # out so the assertion targets only the handler's own MCP call.
+    cancel_calls = [c for c in mock_mcp.call_args_list if c.args[2] == 'cancel_ticket']
+    assert len(cancel_calls) == 1, (
+        f'Expected exactly 1 cancel_ticket call, got {len(cancel_calls)}: {cancel_calls}'
+    )
+    _client_arg, url_arg, tool_arg, args_arg = cancel_calls[0].args
     assert tool_arg == 'cancel_ticket'
     assert args_arg == {'ticket_id': 'tkt_abc'}
     # The URL must be exactly the first entry in the default config
@@ -278,7 +285,7 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
     # (b) detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars
     detail = resp.json().get('detail', '')
     assert 'X' * _CANCEL_DETAIL_EXC_CHAR_LIMIT in detail, (
-        f'Expected first _CANCEL_DETAIL_EXC_CHAR_LIMIT X chars in detail'
+        'Expected first _CANCEL_DETAIL_EXC_CHAR_LIMIT X chars in detail'
     )
     assert 'X' * (_CANCEL_DETAIL_EXC_CHAR_LIMIT + 1) not in detail, (
         'Detail must not contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 X chars (leaked exc text)'
