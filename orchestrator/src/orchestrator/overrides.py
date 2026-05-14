@@ -154,6 +154,11 @@ class OverrideStore:
                 f'got pin_order={pin_order!r} with pinned={pinned!r}'
             )
 
+        if ttl_until is not None and ttl_until.tzinfo is None:
+            raise ValueError(
+                'ttl_until must be timezone-aware; got a naive datetime'
+            )
+
         now_iso = datetime.now(UTC).isoformat()
         conn = sqlite3.connect(str(self.db_path))
         try:
@@ -195,7 +200,7 @@ class OverrideStore:
             # Convert Python types to SQLite-friendly values.
             pinned_int = int(pinned) if pinned is not None else None
             reserve_now_int = int(reserve_now) if reserve_now is not None else None
-            ttl_iso = ttl_until.isoformat() if ttl_until is not None else None
+            ttl_iso = ttl_until.astimezone(UTC).isoformat() if ttl_until is not None else None
 
             conn.execute(
                 """
