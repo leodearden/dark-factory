@@ -555,6 +555,83 @@ class TestComputeOverlapMs:
 
 
 # ---------------------------------------------------------------------------
+# Step-9 (task-1280): compute_capped_now_and_windows helper
+# ---------------------------------------------------------------------------
+
+from dashboard.data.cap_history import compute_capped_now_and_windows  # noqa: E402
+
+
+class TestComputeCappedNowAndWindows:
+    """Tests for compute_capped_now_and_windows(intervals).
+
+    Failing baseline for all methods: compute_capped_now_and_windows doesn't
+    exist yet — the import above raises ImportError.
+    """
+
+    def test_empty_intervals_returns_zero_and_empty_windows(self):
+        """Empty input → (0, [])."""
+        capped_now, windows = compute_capped_now_and_windows([])
+        assert capped_now == 0, f"Expected capped_now=0 for empty, got {capped_now}"
+        assert windows == [], f"Expected [] windows for empty, got {windows}"
+
+    def test_all_closed_intervals_returns_capped_now_zero(self):
+        """All intervals closed → capped_now=0; windows may still be non-empty."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=2)
+        # Two accounts both capped [t1, t2] — same window, so merge yields [(t1, t2)]
+        intervals = [
+            CapInterval('alpha', t1, t2),
+            CapInterval('beta', t1, t2),
+        ]
+        capped_now, windows = compute_capped_now_and_windows(intervals)
+        assert capped_now == 0, (
+            f"Expected capped_now=0 (all closed), got {capped_now}"
+        )
+        assert len(windows) >= 1, (
+            f"Expected >=1 merged window (both accounts fully overlapping), got {windows}"
+        )
+
+    def test_any_open_ended_returns_capped_now_one(self):
+        """At least one open-ended interval → capped_now=1."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=2)
+        t2 = now - timedelta(hours=1)
+        intervals = [
+            CapInterval('alpha', t1, None),   # open-ended
+            CapInterval('alpha', t1, t2),     # closed (second interval same account — unusual but valid)
+        ]
+        # Simplified: just one open-ended is enough for capped_now=1
+        open_only = [CapInterval('alpha', t1, None)]
+        capped_now, windows = compute_capped_now_and_windows(open_only)
+        assert capped_now == 1, (
+            f"Expected capped_now=1 for open-ended interval, got {capped_now}"
+        )
+        assert len(windows) >= 1, (
+            f"Expected >=1 window (single open-ended account), got {windows}"
+        )
+
+    def test_sorted_account_names_deterministic(self):
+        """Two consecutive calls with differently-ordered inputs produce same windows."""
+        now = datetime.now(UTC)
+        t1 = now - timedelta(hours=3)
+        t2 = now - timedelta(hours=2)
+        # Three accounts in non-sorted insertion order
+        intervals_fwd = [
+            CapInterval('gamma', t1, t2),
+            CapInterval('alpha', t1, t2),
+            CapInterval('beta', t1, t2),
+        ]
+        intervals_rev = list(reversed(intervals_fwd))
+        _, windows1 = compute_capped_now_and_windows(intervals_fwd)
+        _, windows2 = compute_capped_now_and_windows(intervals_rev)
+        assert windows1 == windows2, (
+            f"Expected deterministic windows regardless of input order. "
+            f"Got {windows1} vs {windows2}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step-7 tests: bucketise_cap_sparkline
 # ---------------------------------------------------------------------------
 
