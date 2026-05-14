@@ -643,6 +643,37 @@ class OrchestratorConfig(BaseSettings):
     stranded_reconcile_enabled: bool = Field(default=True)
     stranded_reconcile_interval_secs: float = Field(default=900.0)
 
+    # Scheduler park-and-stop (AFK hardening, task 1322).
+    # When park_stop_parked_threshold tasks transition to 'blocked' within
+    # park_stop_parked_window_hours, the scheduler is paused automatically.
+    # Pause persists across orchestrator restart via the scheduler_state table
+    # in runs.db.  Resume is human-driven (Harness.resume_scheduler()).
+    # Sibling tasks 1323 (cost ceiling) and 1327 (EWA digest) call
+    # Harness.pause_scheduler(reason) directly to use the same mechanism.
+    park_stop_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the park-and-stop trip mechanism. When disabled, blocked '
+            'transitions are still recorded in the deque (so a runtime '
+            'flip-on takes effect immediately) but the trip callback never fires.'
+        ),
+    )
+    park_stop_parked_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Number of tasks transitioned to blocked within '
+            'park_stop_parked_window_hours to trip the scheduler park-stop pause.'
+        ),
+    )
+    park_stop_parked_window_hours: float = Field(
+        default=1.0,
+        gt=0,
+        description=(
+            'Rolling-window length (hours) for the park-stop parked-count threshold.'
+        ),
+    )
+
     # Legacy scalar — ignored if `timeouts` section is present in config.
     # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)

@@ -663,9 +663,16 @@ class Scheduler:
         mcp_session: McpSessionLike | None = None,
         time_source: Callable[[], float] | None = None,
         override_store: OverrideStore | None = None,
+        wall_clock_source: Callable[[], float] | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
+        # Wall-clock time source for park-stop transition recording.  Separate
+        # from the monotonic _time_source used by module-lock GC and dispatch
+        # cooldowns — injectable for deterministic tests.
+        self._wall_clock_source: Callable[[], float] = (
+            wall_clock_source if wall_clock_source is not None else time.time
+        )
         self.lock_table = ModuleLockTable(config, time_source=self._time_source)
         self.event_store = event_store
         self._mcp_session = mcp_session
@@ -717,6 +724,12 @@ class Scheduler:
         # --- Park-and-stop pause state (task 1322) ---
         self._paused: bool = False
         self._pause_reason: str | None = None
+        # Rolling deque of wall-clock timestamps for each successful blocked
+        # transition.  Entries older than park_stop_parked_window_hours * 3600s
+        # are lazily evicted on each _record_blocked_transition() call.
+        self._blocked_transitions: deque[float] = deque()
+        # Callback installed by the Harness so trip → persistence + event.
+        self._on_park_stop_trip: Callable[[str], Any] | None = None
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -759,6 +772,19 @@ class Scheduler:
         self._paused = False
         self._pause_reason = None
         logger.info('Scheduler resumed')
+
+    def _record_blocked_transition(self) -> None:
+        """Record a successful blocked transition in the rolling deque.
+
+        Appends the current wall-clock timestamp then evicts entries older than
+        ``park_stop_parked_window_hours * 3600`` seconds from the left side.
+        O(k) where k is the number of expired entries (typically tiny).
+        """
+        now = self._wall_clock_source()
+        self._blocked_transitions.append(now)
+        cutoff = now - self.config.park_stop_parked_window_hours * 3600
+        while self._blocked_transitions and self._blocked_transitions[0] <= cutoff:
+            self._blocked_transitions.popleft()
 
     async def dispatch_tool(
         self,
