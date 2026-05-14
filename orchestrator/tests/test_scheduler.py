@@ -3999,10 +3999,23 @@ class TestReserveNowShortCircuit:
             # Must NOT propagate either RuntimeError.
             await scheduler.acquire_next()
 
-        # At least one WARNING must have been emitted.
+        # Both the outer install_parks-failure warning and the inner restore-failure
+        # warning must have been emitted, so that removing the inner-except branch
+        # in Scheduler.acquire_next()'s reserve_now install_parks handler would
+        # cause this test to fail.
         warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
-        assert warnings, (
-            f'Expected WARNING log(s). Records: {[r.getMessage() for r in caplog.records]}'
+        assert len(warnings) >= 2, (
+            f'Expected at least 2 WARNING log(s). Records: {[r.getMessage() for r in caplog.records]}'
+        )
+
+        warning_messages = [r.getMessage() for r in warnings]
+        outer_warn = any('install_parks failed' in m for m in warning_messages)
+        assert outer_warn, (
+            f'Expected an outer install_parks-failure WARNING. Got: {warning_messages!r}'
+        )
+        inner_warn = any('failed to restore reserve_now flag' in m for m in warning_messages)
+        assert inner_warn, (
+            f'Expected an inner restore-failure WARNING. Got: {warning_messages!r}'
         )
 
         # No reservation_installed event must be emitted.
