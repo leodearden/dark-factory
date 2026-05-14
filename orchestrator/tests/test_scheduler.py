@@ -3042,6 +3042,73 @@ class TestPriorityInheritance:
         assert eff['10'] == 'medium'
 
 
+class TestPriorityOverrideBoostOverlay:
+    """Boost overlay composes with the existing min-rank race in _compute_effective_priorities."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        return Scheduler(OrchestratorConfig(max_per_module=1))
+
+    def test_boost_overlay_lifts_own_priority(self, scheduler: Scheduler):
+        """A boost_tier above the task's own tier becomes the effective priority."""
+        task_a = _pending_task('A', priority='medium')
+        by_id = {'A': task_a}
+        rev = scheduler._build_reverse_index([task_a])
+        status_map = {'A': 'pending'}
+
+        eff = scheduler._compute_effective_priorities(
+            by_id, rev, status_map, override_boosts={'A': 'critical'}
+        )
+        assert eff['A'] == 'critical'
+
+    def test_boost_overlay_composes_with_inheritance(self, scheduler: Scheduler):
+        """Boost + own + inherited priority all race; highest-rank wins.
+
+        base='medium', dependent='critical', boost='high':
+        best-rank = min(rank[medium], rank[critical], rank[high]) = rank[critical]
+        """
+        base = _pending_task('base', priority='medium')
+        consumer = _pending_task('consumer', priority='critical', deps=['base'])
+        tasks = [base, consumer]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+
+        eff = scheduler._compute_effective_priorities(
+            by_id, rev, status_map, override_boosts={'base': 'high'}
+        )
+        # inherited 'critical' beats own 'medium' and boost 'high'
+        assert eff['base'] == 'critical'
+
+    def test_boost_overlay_loses_to_higher_own(self, scheduler: Scheduler):
+        """A boost lower than the task's own tier has no effect."""
+        task_a = _pending_task('A', priority='critical')
+        by_id = {'A': task_a}
+        rev = scheduler._build_reverse_index([task_a])
+        status_map = {'A': 'pending'}
+
+        eff = scheduler._compute_effective_priorities(
+            by_id, rev, status_map, override_boosts={'A': 'high'}
+        )
+        assert eff['A'] == 'critical'
+
+    def test_compute_effective_priorities_default_overrides_none(
+        self, scheduler: Scheduler
+    ):
+        """Omitting override_boosts (default None) preserves existing behavior."""
+        base = _pending_task('10', priority='medium')
+        consumer = _pending_task('11', priority='critical', deps=['10'])
+        tasks = [base, consumer]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+
+        # No override_boosts kwarg — must not raise
+        eff = scheduler._compute_effective_priorities(by_id, rev, status_map)
+        assert eff['10'] == 'critical'
+        assert eff['11'] == 'critical'
+
+
 class TestTransitiveDependents:
     """P3: BFS over the reverse-dependency graph, no double-count."""
 
