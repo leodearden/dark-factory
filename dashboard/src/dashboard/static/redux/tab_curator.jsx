@@ -84,6 +84,27 @@ function CappedPanel({ capped_spark }) {
   );
 }
 
+// ── Pending panel — smooth sparkline for pending_spark ──
+function PendingPanel({ pending_spark }) {
+  const { values = [] } = pending_spark || {};
+  return (
+    <div className="panel" style={{ flex: 1, minWidth: 0 }}>
+      <div className="panel-head">
+        <span className="title">Pending over time</span>
+      </div>
+      <div className="panel-body tight">
+        {values.length === 0 ? (
+          <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>No pending data yet</span>
+        ) : (
+          <div style={{ height: 56, position: 'relative' }}>
+            <Sparkline values={values} color={PALETTE.accent} strokeWidth={1.5} area={true} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Queue table row ──
 function QueueRow({ ticket, onCancel }) {
   const { ticket_id, title, files, project_id, age_seconds, created_at } = ticket;
@@ -128,7 +149,7 @@ function QueueRow({ ticket, onCancel }) {
 // ── Main CuratorTab component ──
 function CuratorTab({ projectFilter = [] }) {
   const cs = D.CURATOR_STATE || {};
-  const { pending = [], latency_spark, capped_spark, state = {} } = cs;
+  const { pending = [], latency_spark, pending_spark, capped_spark, state = {} } = cs;
   const { capped_now = 0, paused_reason = null, pending_total = 0 } = state;
 
   // Optimistic cancellation: set of ticket_ids removed from local view
@@ -220,6 +241,7 @@ function CuratorTab({ projectFilter = [] }) {
       {/* Spark panels row */}
       <div style={{ display: 'flex', gap: 12 }}>
         <LatencyPanel latency_spark={latency_spark} />
+        <PendingPanel pending_spark={pending_spark} />
         <CappedPanel capped_spark={capped_spark} />
       </div>
 
