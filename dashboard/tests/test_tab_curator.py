@@ -237,6 +237,25 @@ def test_app_jsx_wires_curator_tab(app_jsx_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# task-1306 step-1: projectFilter defaults to []
+# ---------------------------------------------------------------------------
+
+def test_curator_tab_defaults_project_filter_to_empty_list(tab_curator_jsx_body: str) -> None:
+    """CuratorTab must destructure projectFilter with a default of [].
+
+    Without the default, `projectFilter.length` on line 192 (the filter
+    expression) throws a TypeError if the prop is ever undefined — the
+    component has no fallback.  This test pins the defensive default.
+    """
+    assert 'function CuratorTab({ projectFilter = [] })' in tab_curator_jsx_body, (
+        'tab_curator.jsx CuratorTab signature does not default projectFilter to [] '
+        '— change `function CuratorTab({ projectFilter })` to '
+        '`function CuratorTab({ projectFilter = [] })` so that calling the '
+        'component without the prop does not throw on `.length`.'
+    )
+
+
+# ---------------------------------------------------------------------------
 # meta-test: _extract_curator_state_block scoping
 # ---------------------------------------------------------------------------
 
