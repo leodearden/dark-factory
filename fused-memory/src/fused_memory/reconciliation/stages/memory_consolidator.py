@@ -431,6 +431,7 @@ def format_snapshot_fact(
 
     Raises:
         ValueError: If *as_of* is timezone-naive.
+        ValueError: If *counts* is empty.
 
     Note:
         This helper has no in-tree caller yet — it is exported for future harness-side
@@ -444,6 +445,8 @@ def format_snapshot_fact(
             'format_snapshot_fact requires tz-aware as_of; got a naive datetime. '
             'Pass e.g. datetime(..., tzinfo=UTC).'
         )
+    if not counts:
+        raise ValueError('format_snapshot_fact requires non-empty counts mapping')
     iso_date = as_of.date().isoformat()
     count_parts = ', '.join(
         f'{v} {k}' for k, v in sorted(counts.items())
