@@ -1651,14 +1651,11 @@ class TestReconcileStrandedInProgress:
     async def test_get_task_fetched_once_when_neither_fastpath_fires(
         self, harness: Harness
     ):
-        """Regression: scheduler.get_task is awaited exactly once per stranded
-        task even when neither the is_ancestor nor the find_merge_marker
-        fast-path fires (e.g. the lock-state revert path).
-
-        With the two per-branch get_task calls (current code), count==0 when
-        neither fast-path reaches its local ``task = await self.scheduler.get_task``
-        line.  After the hoist, get_task is called unconditionally at the top of
-        _reconcile_one_stranded, so count==1 for every stranded task.
+        """Invariant: get_task is awaited exactly once per stranded task,
+        including on paths where neither fast-path fires (e.g. the lock-state
+        revert path).  The unconditional hoist at the top of
+        _reconcile_one_stranded ensures a single MCP fetch per task regardless
+        of which branch wins.
         """
         # Fixture defaults: is_ancestor=False, find_merge_marker=None
         # → neither fast-path fires; task '90' has no worktree → no-lock revert.
@@ -1673,6 +1670,37 @@ class TestReconcileStrandedInProgress:
         )
         # Confirm the no-lock revert path still fires: task reverted to pending.
         harness.scheduler.set_task_status.assert_awaited_once_with('90', 'pending')  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        'is_ancestor_val, marker_sha_val',
+        [
+            pytest.param(True, None, id='is-ancestor-path'),
+            pytest.param(False, 'cafebabe' + 'c' * 32, id='merge-marker-path'),
+            pytest.param(False, None, id='neither-path'),
+        ],
+    )
+    async def test_get_task_fetched_exactly_once_regardless_of_path(
+        self,
+        harness: Harness,
+        is_ancestor_val: bool,
+        marker_sha_val: str | None,
+    ):
+        """Invariant: scheduler.get_task is awaited exactly once per stranded task
+        regardless of which branch wins — is_ancestor fast-path, merge-marker
+        fast-path, or neither.  The hoisted fetch at the top of
+        _reconcile_one_stranded must never be duplicated by a fast-path.
+        """
+        harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.git_ops.is_ancestor = AsyncMock(return_value=is_ancestor_val)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha_val)
+
+        await harness._reconcile_stranded_in_progress()
+
+        assert harness.scheduler.get_task.await_count == 1, (  # type: ignore[attr-defined]
+            f'Expected get_task awaited once (path: is_ancestor={is_ancestor_val!r}, '
+            f'marker={marker_sha_val!r}); '
+            f'got {harness.scheduler.get_task.await_count}'  # type: ignore[attr-defined]
+        )
 
 
 # ---------------------------------------------------------------------------
