@@ -5,11 +5,13 @@ Task 1322 — AFK hardening: Scheduler park-and-stop with configurable trip cond
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -207,4 +209,98 @@ class TestHarnessRestartPersistence:
         # Assert no re-persist.
         assert save_call_count == 0, (
             f'save_scheduler_pause must not be called on restart load; got {save_call_count} calls'
+        )
+
+
+class TestParkStopE2E:
+    """End-to-end integration tests for the park-stop trip → persist → restart lifecycle.
+
+    Mirrors the task description test plan verbatim:
+    "Mark 5 tasks blocked within 1h, assert scheduler.acquire_next() returns None,
+    pause_reason is set. Restart orchestrator, assert pause survives."
+    """
+
+    @pytest.mark.asyncio
+    async def test_park_stop_e2e_marks_blocked_pauses_and_survives_restart(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """5 blocked transitions within 1h trip the scheduler; pause survives restart.
+
+        Step-by-step:
+        1. Harness1 — threshold=5, window=1h; mock mcp_call for set_task_status success.
+        2. Mark task-1..task-5 as blocked → trip fires via asyncio.ensure_future.
+        3. Yield the event loop so the trip callback executes.
+        4. Assert harness1.scheduler.is_paused is True and reason format matches.
+        5. Assert acquire_next() returns None.
+        6. Harness2 from same runs.db — simulates orchestrator restart.
+        7. Call _load_persisted_scheduler_pause() and assert pause is restored.
+        """
+        # Arrange: set up shared runs.db directory.
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True)
+        db_path = db_dir / 'runs.db'
+
+        # Mock mcp_call so set_task_status returns a clean success response.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value={}),
+        )
+
+        # --- Harness1 ---
+        config1 = OrchestratorConfig(
+            project_root=tmp_path,
+            park_stop_parked_threshold=5,
+            park_stop_parked_window_hours=1.0,
+        )
+        harness1 = Harness(config1)
+        # Wire a real RunStore so persistence works.
+        run_store1 = RunStore(db_path)
+        harness1._run_store = run_store1
+        harness1._run_id = 'run-e2e-0001'
+        # _on_park_stop_trip is already wired to harness1.pause_scheduler by __init__.
+
+        # Act: mark 5 tasks blocked — trip fires on the 5th.
+        for i in range(1, 6):
+            await harness1.scheduler.set_task_status(f'task-{i}', 'blocked')
+
+        # Yield the event loop so the fire-and-forget asyncio.ensure_future task runs.
+        await asyncio.sleep(0)
+
+        # Assert harness1 is paused with a park-stop reason.
+        assert harness1.scheduler.is_paused is True, (
+            'Scheduler must be paused after 5 blocked transitions'
+        )
+        assert harness1.scheduler.pause_reason is not None
+        assert re.search(
+            r'park-stop.*5.*blocked.*1\.0h',
+            harness1.scheduler.pause_reason,
+        ), (
+            f'Expected park-stop reason format; got {harness1.scheduler.pause_reason!r}'
+        )
+
+        # Assert acquire_next() returns None when paused.
+        result = await harness1.scheduler.acquire_next()
+        assert result is None, (
+            f'acquire_next() must return None when scheduler is paused; got {result!r}'
+        )
+
+        # Capture the reason for comparison after restart.
+        persisted_reason = harness1.scheduler.pause_reason
+
+        # --- Harness2 (restart simulation) ---
+        config2 = OrchestratorConfig(project_root=tmp_path)
+        harness2 = Harness(config2)
+        run_store2 = RunStore(db_path)
+        harness2._run_store = run_store2
+        harness2._run_id = 'run-e2e-0002'
+
+        # Load persisted pause — simulates the call in Harness.run() startup.
+        await harness2._load_persisted_scheduler_pause()
+
+        assert harness2.scheduler.is_paused is True, (
+            'Scheduler pause must survive restart (persist → reload)'
+        )
+        assert harness2.scheduler.pause_reason == persisted_reason, (
+            f'Expected persisted reason {persisted_reason!r}; '
+            f'got {harness2.scheduler.pause_reason!r}'
         )
