@@ -651,3 +651,36 @@ def test_reorder_pin_queue_returns_502_when_all_unreachable(client):
         )
 
     assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# step-23: index.html references new scheduler JSX files + cache-buster bumped
+# ---------------------------------------------------------------------------
+
+
+def test_index_html_references_new_scheduler_jsx_files(client):
+    """index.html must include script tags for the three new scheduler JSX files.
+
+    Also asserts all ?v= cache-busters on /static/redux/* assets share the same
+    version number and that number is ≥ 10 (the bump from the previous max of 11).
+    """
+    import re
+
+    resp = client.get('/static/redux/index.html')
+    assert resp.status_code == 200
+    body = resp.text
+
+    for jsx in ('tab_scheduler.jsx', 'scheduler_heatmap.jsx', 'scheduler_drawer.jsx'):
+        assert jsx in body, f'index.html missing script tag for {jsx}'
+
+    # Extract all ?v=NNN suffixes from /static/redux/ asset URLs
+    versions = re.findall(r'/static/redux/[^"\']+\?v=(\d+)', body)
+    assert versions, 'No ?v= version strings found in index.html'
+    unique = set(versions)
+    assert len(unique) == 1, (
+        f'Multiple different ?v= versions in index.html: {unique!r}. '
+        'All assets must share one version string.'
+    )
+    version = int(unique.pop())
+    # Pin: version must be at least 10 (bumped from previous max of 11)
+    assert version >= 10, f'Expected ?v= ≥ 10, got {version}'
