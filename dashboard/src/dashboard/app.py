@@ -645,7 +645,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
         except (httpx.ConnectError, httpx.TimeoutException,
                 httpx.HTTPStatusError, ValueError) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            errors.append(f'{url}: {type(exc).__name__}: {exc}')
+            errors.append(f'{url}: {type(exc).__name__}: {str(exc)[:200]}')
             # Invalidate the cached MCP session so the next caller retries
             # session initialisation — mirrors get_memory_status/get_queue_stats.
             memory_data.invalidate_session(url)

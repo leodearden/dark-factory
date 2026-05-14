@@ -235,6 +235,54 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
     assert exc_msg in detail, f'Expected "{exc_msg}" in detail, got: {detail!r}'
 
 
+def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
+    """502 detail is capped at 200 chars; WARNING log keeps full exception text.
+
+    Guards against arbitrary-length response-body leakage via the 502 detail
+    field: the cancel handler interpolates str(exc) in the detail string, which
+    can be unbounded when the upstream MCP server returns a large error body
+    (e.g. httpx.HTTPStatusError whose message is the full response body).
+
+    Assertions:
+      (a) response is 502
+      (b) detail contains the first 200 chars of the exception message
+          AND does NOT contain 201 consecutive 'X' chars (i.e. is truncated)
+      (c) the WARNING log record still has the FULL 300-char message
+          (ops log must not lose information)
+    """
+    long_msg = 'X' * 300
+    exc = httpx.HTTPStatusError(
+        long_msg,
+        request=httpx.Request('POST', 'http://x'),
+        response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
+    )
+    with patch(
+        _PATCH_TARGET,
+        new=AsyncMock(side_effect=exc),
+    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+        resp = client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    # (a) 502
+    assert resp.status_code == 502
+
+    # (b) detail is capped at 200 chars
+    detail = resp.json().get('detail', '')
+    assert 'X' * 200 in detail, 'Expected first 200 X chars in detail'
+    assert 'X' * 201 not in detail, 'Detail must not contain 201+ X chars (leaked exc text)'
+
+    # (c) WARNING log retains full exception text
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+    ]
+    assert warning_records, 'Expected at least one WARNING from dashboard.app'
+    combined_msg = ' '.join(r.getMessage() for r in warning_records)
+    assert long_msg in combined_msg, 'WARNING log must contain full (untruncated) exception text'
+
+
 def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
     """URL[0] raises ConnectError; URL[1] returns cancelled → overall 200.
 
@@ -281,7 +329,12 @@ def test_two_url_not_found_short_circuits_loop(two_url_client):
 
 
 def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
-    """Both URLs raise ConnectError → 502 with detail mentioning both URLs."""
+    """Both URLs raise ConnectError → 502 with detail mentioning both URLs.
+
+    Verifies the fan-out exhaustion path: all configured fused-memory servers
+    are unreachable, so the handler returns 502 with the error key
+    'fused_memory_unreachable' and includes each server URL in the detail string.
+    """
     with patch(
         _PATCH_TARGET,
         new=AsyncMock(side_effect=httpx.ConnectError('refused')),
@@ -299,3 +352,31 @@ def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     assert 'localhost:9000' in detail
     assert 'localhost:9001' in detail
     assert mock_mcp.call_count == 2
+
+
+def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_client):
+    """Regression pin: per-URL invalidate_session is called once per failing URL, in order.
+
+    For each URL that raises a transport error the handler must call
+    memory_data.invalidate_session(url) exactly once before moving to the
+    next server.  Any future refactor that batches these calls (e.g. moves
+    invalidation to after the loop), removes them, or skips them for certain
+    error types will fail this assertion immediately.
+    """
+    _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
+    with (
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+        ),
+        patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
+    ):
+        two_url_client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_xyz'},
+        )
+
+    assert mock_invalidate.call_args_list == [
+        call('http://localhost:9000'),
+        call('http://localhost:9001'),
+    ]
