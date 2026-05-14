@@ -217,7 +217,14 @@ async def _sample_curator(
                     ),
                     timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
                 )
-                pending_total += result.get('count', 0) or 0
+                count = result.get('count', 0) or 0
+                if count >= 2000:
+                    logger.warning(
+                        'list_tickets returned cap of 2000 for %s / %s — '
+                        'pending_total is clipped at the server limit',
+                        url, root_str,
+                    )
+                pending_total += count
                 break  # first success wins; avoid double-counting across failover URLs
             except Exception:
                 logger.debug('list_tickets failed for %s / %s', url, root_str, exc_info=True)
