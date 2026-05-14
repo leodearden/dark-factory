@@ -60,6 +60,23 @@ class TestSummaryDedupeKey:
         k2 = summary_dedupe_key('upper lower mixed')
         assert k1 == k2
 
+    def test_unicode_punctuation_stripped(self):
+        """En-dash, em-dash, and curly quotes are stripped like ASCII punctuation."""
+        from escalation.dedupe import summary_dedupe_key
+
+        # ASCII hyphen (Pd): "fused-memory connection timeout"
+        k_ascii = summary_dedupe_key('fused-memory connection timeout')
+        # En-dash U+2013 (Pd): "fused–memory connection timeout"
+        k_en_dash = summary_dedupe_key('fused–memory connection timeout')
+        # Em-dash U+2014 (Pd): "fused—memory connection timeout"
+        k_em_dash = summary_dedupe_key('fused—memory connection timeout')
+        # Curly double quotes U+201C/U+201D (Pi/Pf): "fused“memory” connection timeout"
+        k_curly = summary_dedupe_key('fused“memory” connection timeout')
+
+        # All four variants must produce the same normalised key
+        assert k_ascii == k_en_dash == k_em_dash == k_curly
+        assert k_ascii == ('fusedmemory', 'connection', 'timeout')
+
 
 class TestEscalationDedupeFields:
     """Escalation dataclass gains dedupe_count and dedupe_children fields."""
