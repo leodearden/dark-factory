@@ -29,6 +29,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
 from dashboard.data.active_tasks import collect_active_tasks
+from dashboard.data.scheduler import collect_scheduler_state
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
     aggregate_burndown_projects,
@@ -761,6 +762,23 @@ async def api_curator(request: Request) -> JSONResponse:
         # task adds a snapshot column or a new get_curator_state MCP tool.
         paused_reason=None,
         pending_total=pending_total,
+    ))
+
+
+@app.get('/api/v2/dashboard/scheduler')
+async def api_scheduler(request: Request) -> JSONResponse:
+    """SCHEDULER — task contention, parks, overrides, and event sparklines."""
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    rows, modules, pin_queue, events_by_task, offline_projects = \
+        await collect_scheduler_state(http_client, config)
+    return JSONResponse(redux_api.shape_scheduler(
+        rows=rows,
+        modules=modules,
+        pin_queue=pin_queue,
+        events_by_task=events_by_task,
+        offline_projects=offline_projects,
+        snapshot_at=None,
     ))
 
 
