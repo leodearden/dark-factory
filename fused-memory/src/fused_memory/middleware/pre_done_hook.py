@@ -22,6 +22,14 @@ argv is empty, or the subprocess cannot be launched at all (binary missing,
 not executable, or any other OSError).  This prevents a misconfiguration
 from silently disabling the gate.
 
+Lock-hold implication: the hook runs inside the per-project write lock held
+by ``task_interceptor._apply_status_transition``, so a slow or hung hook
+blocks every other task mutation on that project for up to its full timeout
+(30 s default).  Choose the timeout with two bounds in mind: a lower bound
+set by the hook's expected latency budget, and an upper bound set by the
+tolerable head-of-line blocking on concurrent ``set_task_status``,
+``update_task``, and dependency calls for the same project.
+
 Error shapes mirror ``_terminal_exit_error`` / ``_done_gate_error`` in
 ``task_interceptor.py`` — same ``{'success': False, 'error': …, 'task_id':
 …, 'hint': …}`` skeleton so MCP callers can handle them uniformly.

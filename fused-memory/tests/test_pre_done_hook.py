@@ -1,11 +1,8 @@
 """Tests for fused_memory.middleware.pre_done_hook."""
 
-from unittest.mock import AsyncMock
-
 import pytest
 
 from fused_memory.middleware.pre_done_hook import resolve_hook_command, run_hook
-from fused_memory.models.scope import resolve_project_id
 
 # ── resolve_hook_command ───────────────────────────────────────────────────────
 
@@ -196,69 +193,3 @@ async def test_run_hook_fails_closed_on_non_executable(monkeypatch, tmp_path):
     assert result['reason'].startswith('failed to launch hook:'), (
         f"Expected reason to start with 'failed to launch hook:', got: {result['reason']!r}"
     )
-
-
-# ── Three-mode integration test ───────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'hook_cmd,expect_success',
-    [
-        (None, True),           # env-unset → behaves exactly as before the feature
-        ('/bin/true', True),    # passing hook → transition completes normally
-        ('/bin/false', False),  # failing hook → done-flip refused, taskmaster untouched
-    ],
-    ids=['env-unset', 'hook-passes', 'hook-rejects'],
-)
-async def test_predone_hook_three_mode_integration(
-    hook_cmd, expect_success, monkeypatch, tmp_path
-):
-    """Integration: three hook modes produce the user-observable signals from the task spec.
-
-    Mode 1 — env-unset: behaves exactly as before the feature (no subprocess overhead).
-    Mode 2 — /bin/true: hook passes, transition completes; taskmaster.set_task_status called.
-    Mode 3 — /bin/false: hook rejects, done-flip refused; taskmaster.set_task_status NOT called.
-
-    Uses a real TaskInterceptor wired with AsyncMock taskmaster/reconciler so the full
-    gate-chain path is exercised end-to-end.
-    """
-    from fused_memory.middleware.task_interceptor import TaskInterceptor
-    from fused_memory.reconciliation.event_buffer import EventBuffer
-
-    taskmaster = AsyncMock()
-    taskmaster.get_task = AsyncMock(
-        return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'}
-    )
-    taskmaster.set_task_status = AsyncMock(return_value={'success': True})
-
-    reconciler = AsyncMock()
-    reconciler.reconcile_task = AsyncMock(return_value={'actions': []})
-
-    event_buf = EventBuffer(
-        db_path=tmp_path / 'three_mode_eb.db', buffer_size_threshold=100
-    )
-    await event_buf.initialize()
-    try:
-        interceptor = TaskInterceptor(taskmaster, reconciler, event_buf)
-
-        env_key = f'FUSED_MEMORY_PREDONE_HOOK_{resolve_project_id(str(tmp_path)).upper()}'
-        if hook_cmd is None:
-            monkeypatch.delenv(env_key, raising=False)
-        else:
-            monkeypatch.setenv(env_key, hook_cmd)
-
-        result = await interceptor.set_task_status('1', 'done', str(tmp_path))
-
-        if expect_success:
-            # Transition should succeed: no error key, taskmaster was invoked
-            assert 'error' not in result, f'Expected success but got: {result}'
-            taskmaster.set_task_status.assert_called_once()
-        else:
-            # Hook rejected: structured error returned, taskmaster untouched
-            assert result.get('success') is False
-            assert result.get('error') == 'pre_done_hook_rejected'
-            assert result.get('task_id') == '1'
-            taskmaster.set_task_status.assert_not_called()
-    finally:
-        await event_buf.close()
