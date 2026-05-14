@@ -65,8 +65,7 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
 
        Symbols (Unicode categories Sm/Sc/Sk/So such as ``+``, ``=``,
        ``$``) are also stripped, which can merge adjacent tokens (e.g.
-       ``cpu+memory`` → ``cpumemory``); see ``test_unicode_symbols_stripped``
-       in ``test_dedupe.py``.
+       ``cpu+memory`` → ``cpumemory``).
     3. Split on whitespace (collapses multiple spaces / tabs).
     4. Return the first three tokens as a tuple (fewer if the summary
        has fewer than three words).
