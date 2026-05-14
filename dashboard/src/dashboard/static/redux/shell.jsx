@@ -99,6 +99,7 @@ const Glyph = ({ kind }) => {
     case 'merge':    return <svg {...props}><circle cx="3" cy="3" r="1.5"/><circle cx="3" cy="11" r="1.5"/><circle cx="11" cy="7" r="1.5"/><path d="M3 4.5v5 M3 4.5 a 5 2.5 0 0 0 7.5 2.5 M3 9.5 a 5 2.5 0 0 1 7.5 -2.5"/></svg>;
     case 'cost':     return <svg {...props}><circle cx="7" cy="7" r="5"/><path d="M7 4v6 M5.5 5.5h2.5 a1.2 1.2 0 0 1 0 2.5 h-2 a1.2 1.2 0 0 0 0 2.5 h3"/></svg>;
     case 'burn':     return <svg {...props}><path d="M2 11 L5 8 L8 10 L12 4"/><path d="M2 12.5 L12 12.5"/><circle cx="12" cy="4" r="0.6" fill="currentColor"/></svg>;
+    case 'curator':  return <svg {...props}><path d="M2 3.5h10 M2 7h10 M2 10.5h6"/><path d="M10 8.5v4 M12 8.5v4"/></svg>;
     case 'search':   return <svg {...props}><circle cx="6" cy="6" r="3.5"/><path d="M8.5 8.5 L12 12"/></svg>;
     case 'filter':   return <svg {...props}><path d="M2 3h10 M3.5 7h7 M5 11h4"/></svg>;
     case 'chev':     return <svg {...props}><path d="M4 5l3 3 3-3"/></svg>;
@@ -330,6 +331,7 @@ function Rail({ active, onSelect, counts }) {
     { id: 'overview',  label: 'Overview',     glyph: 'overview', count: '' },
     { id: 'orch',      label: 'Orchestrators', glyph: 'orch',     count: counts.orch },
     { id: 'tasks',     label: 'Tasks',        glyph: 'tasks',    count: counts.tasks },
+    { id: 'curator',   label: 'Curator',      glyph: 'curator',  count: counts.curator ?? '' },
     { id: 'perf',      label: 'Performance',  glyph: 'perf',     count: '' },
     { id: 'memory',    label: 'Memory',       glyph: 'memory',   count: '' },
     { id: 'recon',     label: 'Reconciliation', glyph: 'recon',  count: counts.recon },
