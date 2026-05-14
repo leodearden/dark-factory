@@ -41,8 +41,10 @@ from dashboard.data.stats_utils import percentile
 
 logger = logging.getLogger(__name__)
 
-# 5s ceiling on any fused-memory HTTP call so a hung MCP cannot extend
-# the 10-minute sampling cycle.
+# 5s ceiling on any individual fused-memory HTTP call so a hung MCP cannot
+# extend the 10-minute sampling cycle.  Note: this is per-(root, url) call,
+# not per-loop — worst-case latency for the pending-count accumulation loop
+# scales as N_roots × M_urls × 5s if all URLs hang for every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 
 METRICS_SCHEMA = """\
@@ -210,11 +212,22 @@ async def _sample_curator(
     for root_str in all_roots:
         for url in config.fused_memory_urls:
             try:
-                result = await mcp_tool_call(
-                    http_client, url, 'list_tickets',
-                    {'project_root': root_str, 'status': 'pending', 'limit': 2000},
+                result = await asyncio.wait_for(
+                    mcp_tool_call(
+                        http_client, url, 'list_tickets',
+                        {'project_root': root_str, 'status': 'pending', 'limit': 2000},
+                    ),
+                    timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
                 )
-                pending_total += result.get('count', 0) or 0
+                count = result.get('count', 0) or 0
+                if count >= 2000:
+                    logger.warning(
+                        'list_tickets returned count=%d at-or-above the requested '
+                        'limit of 2000 for %s / %s — '
+                        'pending_total may be clipped at the server limit',
+                        count, url, root_str,
+                    )
+                pending_total += count
                 break  # first success wins; avoid double-counting across failover URLs
             except Exception:
                 logger.debug('list_tickets failed for %s / %s', url, root_str, exc_info=True)

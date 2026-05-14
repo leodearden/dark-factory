@@ -5,7 +5,9 @@ Built incrementally — one step at a time in TDD order.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -728,4 +730,124 @@ async def test_app_wiring_tickets_db_passed_to_collect_metrics_snapshot(tmp_path
     assert 'tickets_db' in call_kwargs, (
         f"tickets_db not in kwargs: {call_kwargs}. "
         f"All calls: {mock_collect.call_args_list}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-1 (task-1279): wait_for ceiling — timeout returns partial pending_total
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_http_timeout_partial_pending_total(
+    tmp_path: Path, monkeypatch,
+):
+    """_sample_curator wraps each per-(url,root) mcp_tool_call in asyncio.wait_for.
+
+    Setup: two distinct project roots (r1, r2), one fused_memory_url.
+    The first call returns count=3 immediately; the second awaits asyncio.sleep(5)
+    — longer than the real timeout — which proves wait_for is in place (not just
+    a pre-cooked TimeoutError).
+
+    Monkeypatching _HTTP_SAMPLER_TIMEOUT_SECONDS to 0.05 keeps the test fast.
+
+    Assertions:
+    - no exception propagates
+    - result['pending_total'] == 3 (partial accumulation from r1 only)
+    - mcp_tool_call was called at least twice (loop reached r2)
+    - wall-clock elapsed < 3s (timeout was honoured, not the un-capped 5s sleep)
+    """
+    import time
+
+    import dashboard.data.metrics as metrics_mod
+    from dashboard.config import DashboardConfig
+    from dashboard.data.metrics import _sample_curator
+
+    # Patch the timeout constant to keep the test fast
+    monkeypatch.setattr(metrics_mod, '_HTTP_SAMPLER_TIMEOUT_SECONDS', 0.05)
+
+    # Build config with two distinct roots
+    r1 = tmp_path / 'r1'
+    r2 = tmp_path / 'r2'
+    r1.mkdir()
+    r2.mkdir()
+    cfg = DashboardConfig(
+        project_root=r1,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[r2],
+    )
+
+    call_count = 0
+
+    async def _side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {'count': 3}
+        # Subsequent calls hang — they should be cancelled by wait_for
+        await asyncio.sleep(5)
+        return {'count': 99}  # unreachable
+
+    mock_mcp = AsyncMock(side_effect=_side_effect)
+
+    now = datetime.now(UTC)
+    # A no-op transport so httpx.AsyncClient builds without error
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+    t0 = time.monotonic()
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            result = await _sample_curator(
+                http_client, cfg, tickets_db=None, runs_dbs=[], now=now,
+            )
+    elapsed = time.monotonic() - t0
+
+    assert result is not None
+    assert result['pending_total'] == 3, f"Expected 3, got {result['pending_total']}"
+    assert call_count >= 2, f"Expected at least 2 mcp_tool_call invocations, got {call_count}"
+    assert elapsed < 3.0, (
+        f"Elapsed {elapsed:.3f}s ≥ 3s — wait_for ceiling does not appear to be in place"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-3 (task-1279): Saturation warning when list_tickets returns count==2000
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_saturation_warning_at_cap(tmp_path: Path, config, caplog):
+    """_sample_curator logs a WARNING when list_tickets returns the server cap (2000).
+
+    Uses _ListTicketsHandler(count=2000) so the mock returns count=2000,
+    which is the server-side ceiling.  The warning must:
+    - mention the cap value ('2000') in its message
+    - NOT suppress the count (pending_total == 2000)
+
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import _sample_curator
+
+    now = datetime.now(UTC)
+
+    handler = _ListTicketsHandler(count=2000)
+    transport = httpx.MockTransport(handler)
+
+    reset_sessions()
+    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            result = await _sample_curator(
+                http_client, config, tickets_db=None, runs_dbs=[], now=now,
+            )
+
+    assert result is not None
+    assert result['pending_total'] == 2000, (
+        f"Expected pending_total=2000, got {result['pending_total']}"
+    )
+    warning_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and '2000' in r.getMessage()
+    ]
+    assert warning_records, (
+        "Expected at least one WARNING log mentioning '2000' for saturation, "
+        f"got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
