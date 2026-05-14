@@ -49,6 +49,13 @@ CREATE TABLE IF NOT EXISTS task_results (
 
 CREATE INDEX IF NOT EXISTS idx_task_results_project
     ON task_results(project_id, completed_at);
+
+CREATE TABLE IF NOT EXISTS scheduler_state (
+    project_id     TEXT PRIMARY KEY,
+    pause_reason   TEXT NOT NULL,
+    pause_at       TEXT NOT NULL,
+    set_by_run_id  TEXT NOT NULL
+);
 """
 
 
@@ -256,3 +263,66 @@ class RunStore:
             f'for project {project_id}'
         )
         return run_id
+
+    # ------------------------------------------------------------------ #
+    # Scheduler park-and-stop pause persistence (task 1322)               #
+    # ------------------------------------------------------------------ #
+
+    def save_scheduler_pause(
+        self,
+        project_id: str,
+        reason: str,
+        pause_at_iso: str,
+        set_by_run_id: str,
+    ) -> None:
+        """Persist (or replace) the scheduler pause state for *project_id*.
+
+        Uses INSERT OR REPLACE so repeated saves are idempotent — the most
+        recent call wins, matching UPSERT semantics.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                'INSERT OR REPLACE INTO scheduler_state '
+                '(project_id, pause_reason, pause_at, set_by_run_id) '
+                'VALUES (?, ?, ?, ?)',
+                (project_id, reason, pause_at_iso, set_by_run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_scheduler_pause(self, project_id: str) -> dict | None:
+        """Return the persisted pause record for *project_id*, or ``None``.
+
+        Returns a dict with keys ``reason``, ``pause_at``, ``set_by_run_id``.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT pause_reason, pause_at, set_by_run_id '
+                'FROM scheduler_state WHERE project_id = ?',
+                (project_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {
+            'reason': row['pause_reason'],
+            'pause_at': row['pause_at'],
+            'set_by_run_id': row['set_by_run_id'],
+        }
+
+    def clear_scheduler_pause(self, project_id: str) -> None:
+        """Remove any persisted pause state for *project_id*."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                'DELETE FROM scheduler_state WHERE project_id = ?',
+                (project_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
