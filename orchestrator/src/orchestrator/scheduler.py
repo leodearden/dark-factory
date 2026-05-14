@@ -1297,15 +1297,22 @@ class Scheduler:
         tasks_by_id: dict[str, dict],
         reverse_index: dict[str, set[str]],
         status_map: dict[str, str],
+        override_boosts: dict[str, str] | None = None,
     ) -> dict[str, str]:
-        """Priority inheritance (P1).
+        """Priority inheritance (P1) with optional boost overlay.
 
-        ``effective_priority(t) = min-rank(own, effective(d) for d in dependents(t))``
+        ``effective_priority(t) = min-rank(own, boost, effective(d) for d in dependents(t))``
         walking only undone dependents (``status not in {done, cancelled}``).
+
+        ``override_boosts`` maps ``task_id -> boost_tier`` for tasks with an
+        active priority-override boost.  When provided, the boost tier competes
+        in the same min-rank race as the task's own tier and inherited tiers
+        from dependents.  Defaults to None (no boost overlay).
 
         Tri-state DFS guards against dependency cycles: on a cycle the task
         contributes only its own priority and a WARN is logged.
         """
+        _boosts: dict[str, str] = override_boosts or {}
         memo: dict[str, str] = {}
         visiting: set[str] = set()
         walked: set[str] = set()
@@ -1324,6 +1331,12 @@ class Scheduler:
             task = tasks_by_id.get(tid, {})
             own = coerce_tier(task.get('priority'))
             best_rank = PRIORITY_RANK[own]
+            # Fold in boost overlay before the inheritance race.
+            boost_tier = _boosts.get(tid)
+            if boost_tier is not None:
+                boost_rank = PRIORITY_RANK[coerce_tier(boost_tier)]
+                if boost_rank < best_rank:
+                    best_rank = boost_rank
             for parent_id in reverse_index.get(tid, ()):
                 parent_status = status_map.get(parent_id, '')
                 if parent_status in ('done', 'cancelled'):
