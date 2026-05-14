@@ -4611,3 +4611,130 @@ class TestOverrideEventEmission:
         ]
         assert len(unpinned_events) == 1
         assert unpinned_events[0][1]['task_id'] == 'A'
+
+
+class TestRequeueCooldownGc:
+    """Unit tests for the _gc_expired_cooldowns helper and the now-pure
+    _eligible_for_dispatch predicate, plus an integration test that pins
+    acquire_next as the GC owner."""
+
+    def test_gc_expired_cooldowns_removes_only_expired(self):
+        """_gc_expired_cooldowns must remove entries whose deadline <= now
+        (past *and* exactly-at-now boundary) and leave future entries intact.
+
+        Uses a controllable time_source so the test is deterministic.
+        This test will fail until _gc_expired_cooldowns is implemented.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        # Seed three entries:
+        # 'past'     — deadline in the past → should be removed
+        # 'boundary' — deadline exactly at now → treated as expired (>= semantics)
+        # 'future'   — deadline in the future → must survive
+        scheduler._requeue_until['past'] = now - 1.0
+        scheduler._requeue_until['boundary'] = now
+        scheduler._requeue_until['future'] = now + 30.0
+
+        scheduler._gc_expired_cooldowns()
+
+        assert scheduler._requeue_until == {'future': now + 30.0}, (
+            f'Expected only the future entry to survive GC; '
+            f'got: {scheduler._requeue_until}'
+        )
+
+    def test_eligible_for_dispatch_does_not_mutate_requeue_until(self):
+        """_eligible_for_dispatch must be a pure predicate: calling it with an
+        expired entry in _requeue_until must NOT delete that entry.
+
+        The per-tick GC (_gc_expired_cooldowns) is the only place allowed to
+        mutate _requeue_until.  This test will fail on current code because
+        _eligible_for_dispatch still contains `del self._requeue_until[tid]`.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        # Seed an expired entry for task '7'.
+        scheduler._requeue_until['7'] = now - 5.0
+
+        task = {
+            'id': '7',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {},
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '7', status_map)
+
+        # Predicate should pass (cooldown has elapsed, no other gates fire).
+        assert result == (True, None), (
+            f'Expected (True, None) for expired cooldown; got: {result}'
+        )
+        # The expired entry must still be in _requeue_until — the predicate
+        # must NOT have removed it.
+        assert '7' in scheduler._requeue_until, (
+            '_eligible_for_dispatch must not delete the expired _requeue_until entry; '
+            'that is the responsibility of _gc_expired_cooldowns'
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_invokes_requeue_cooldown_gc(self, monkeypatch):
+        """acquire_next must call _gc_expired_cooldowns once per tick, clearing
+        both the dispatched task's expired entry and an orphan entry (a task id
+        that doesn't appear in the current task list).
+
+        This pins the invariant that acquire_next is the sole GC owner for
+        _requeue_until — expired entries are guaranteed to be removed by the
+        end of any tick that calls acquire_next.
+        """
+        import json as _json
+
+        base_time = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
+        scheduler = Scheduler(config, time_source=lambda: base_time)
+
+        pending_task = {
+            'id': '99',
+            'title': 'GC integration test task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend']},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"tasks": [' + _json.dumps(pending_task) + ']}',
+                    }
+                ]
+            }
+        }
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Seed two expired entries:
+        # '99'   — the task that will be dispatched; its cooldown has elapsed
+        # 'ghost' — an orphan id with no corresponding task in the MCP response;
+        #           exercises that GC is independent of task presence
+        scheduler._requeue_until['99'] = base_time - 1.0
+        scheduler._requeue_until['ghost'] = base_time - 1.0
+
+        result = await scheduler.acquire_next()
+
+        # (a) The task should be dispatched successfully — eligibility is
+        #     preserved after the refactor because GC runs before the loops.
+        assert result is not None and result.task_id == '99', (
+            f'Expected TaskAssignment for task 99; got: {result}'
+        )
+
+        # (b) Both expired entries must be gone — _gc_expired_cooldowns ran
+        #     and cleaned up the dispatched task's entry and the orphan.
+        assert scheduler._requeue_until == {}, (
+            f'Expected _requeue_until to be empty after acquire_next GC sweep; '
+            f'got: {scheduler._requeue_until}'
+        )
