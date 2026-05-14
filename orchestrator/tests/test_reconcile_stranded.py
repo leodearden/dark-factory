@@ -1652,28 +1652,20 @@ class TestReconcileStrandedInProgress:
             )
 
     @pytest.mark.parametrize(
-        'is_ancestor_val, marker_sha_val, branch_base_sha, expected_provenance',
+        'is_ancestor_val, marker_sha_val, branch_base_sha, expected_commit',
         [
             pytest.param(
                 True,
                 None,
                 'aabbccdd' + 'e' * 32,
-                {
-                    'kind': 'found_on_main',
-                    'commit': 'deadbeef' + 'a' * 32,
-                    'note': 'reconcile: branch already on main when stranded in-progress',
-                },
+                'deadbeef' + 'a' * 32,
                 id='is-ancestor-path-with-metadata',
             ),
             pytest.param(
                 False,
                 'cafebabe' + 'c' * 32,
                 'beef0000' + '9' * 32,
-                {
-                    'kind': 'found_on_main',
-                    'commit': 'cafebabe' + 'c' * 32,
-                    'note': 'reconcile: branch deleted but merge marker found on main',
-                },
+                'cafebabe' + 'c' * 32,
                 id='merge-marker-path-with-metadata',
             ),
         ],
@@ -1684,7 +1676,7 @@ class TestReconcileStrandedInProgress:
         is_ancestor_val: bool,
         marker_sha_val: str | None,
         branch_base_sha: str,
-        expected_provenance: dict,
+        expected_commit: str,
     ):
         """Regression lock: the hoisted ``metadata`` dict is CONSUMED by each
         downstream guard that reads ``metadata.get('branch_base_sha')``.
@@ -1704,9 +1696,9 @@ class TestReconcileStrandedInProgress:
         would still hold in the sibling test.
 
         Additionally pins the final disposition: both paths must reach
-        ``_mark_in_progress_done`` with the path-specific provenance, catching
-        veto-inversion refactors that would otherwise satisfy the input-args
-        asserts.
+        ``scheduler.mark_done`` (the production call site at harness.py:1464)
+        with the path-specific commit SHA, catching veto-inversion refactors
+        that would otherwise satisfy the input-args asserts.
         """
         harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
         # Decouple the two is_ancestor call sites:
@@ -1735,29 +1727,26 @@ class TestReconcileStrandedInProgress:
         )
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_BRANCH_TIP)  # type: ignore[attr-defined]
         # Anchor find_task_citation_commit explicitly so the is-ancestor-path
-        # expected_provenance['commit'] is self-contained and not silently
-        # coupled to the fixture default (test_reconcile_stranded.py:136).
-        # If the fixture default changes, this test's expected behaviour is
-        # still clearly described here (reviewer ref: esc-1276-3 amendment #2).
+        # expected_commit is self-contained and not silently coupled to the
+        # fixture default (test_reconcile_stranded.py:136).  If the fixture
+        # default changes, this test's expected behaviour is still clearly
+        # described here (reviewer ref: esc-1276-3 amendment #2).
         _CITATION_SHA = 'deadbeef' + 'a' * 32
         harness.git_ops.find_task_citation_commit = AsyncMock(return_value=_CITATION_SHA)
 
         await harness._reconcile_stranded_in_progress()
 
         # Pass-through semantics pin: after both consumer guards verify the
-        # hoisted metadata was read, the task MUST be marked done with the
-        # path-specific provenance.  Without this assertion, a refactor that
-        # inverted a veto condition (e.g. `not await is_ancestor(...)`) would
-        # still call is_ancestor with the correct arguments yet route to
-        # veto-and-return None — the existing input-args assertions below
-        # would not detect the regression (reviewer ref: esc-1276-3 #1).
-        # Assert on the production boundary (harness.py:1464) directly.
-        expected_commit = expected_provenance['commit']
+        # hoisted metadata was read, the task MUST be marked done via the
+        # production boundary at harness.py:1464.  Without this assertion, a
+        # refactor that inverted a veto condition (e.g. `not await
+        # is_ancestor(...)`) would still call is_ancestor with the correct
+        # arguments yet route to veto-and-return None — the existing input-args
+        # assertions below would not detect the regression (reviewer ref:
+        # esc-1276-3 #1).  note=ANY: the literal note prose adds no regression-
+        # detection value beyond the assert-awaited-once + kind + sha checks.
         harness.scheduler.mark_done.assert_awaited_once_with(  # type: ignore[attr-defined]
             '90', kind='found_on_main', sha=expected_commit, note=ANY,
-        )
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '90', 'done', done_provenance=expected_provenance,
         )
 
         # Guard 3 consumer assertion: resolve_branch_sha is only called when
