@@ -311,6 +311,20 @@ class TestClear:
         result = store.clear_override('proj', 'nonexistent')
         assert result is False
 
+    def test_clear_override_invalid_field_raises_value_error(self, tmp_path: Path) -> None:
+        """Regression: clear_override(field='bogus') must raise ValueError.
+
+        The ValueError path at overrides.py:257-260 was previously uncovered.
+        This test characterizes existing correct behavior — no impl change needed.
+        """
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', boost_tier='high')
+
+        with pytest.raises(ValueError, match='field must be one of'):
+            store.clear_override('proj', 'A', field='bogus')
+
 
 class TestReorder:
     def test_reorder_pin_queue_rewrites_pin_order(self, tmp_path: Path) -> None:
