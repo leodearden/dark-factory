@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -385,6 +386,8 @@ class ModuleLockTable:
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
         # normalized_module -> (owner_task_id, priority_rank)
         self._parked: dict[str, tuple[str, int]] = {}
+        # task_id -> ISO8601 timestamp of first install_parks call for that owner
+        self._park_install_at: dict[str, str] = {}
         self._config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
 
@@ -479,6 +482,8 @@ class ModuleLockTable:
             (owner, sorted(eviction_acc[owner]))
             for owner in eviction_order
         ]
+        if installed:
+            self._park_install_at.setdefault(task_id, datetime.now(UTC).isoformat())
         return installed, evicted
 
     def clear_parks_for(self, task_id: str) -> None:
@@ -488,6 +493,7 @@ class ModuleLockTable:
             for m, (owner, rank) in self._parked.items()
             if owner != task_id
         }
+        self._park_install_at.pop(task_id, None)
 
     def prune_owners(self, predicate: Callable[[str], bool]) -> list[str]:
         """Evict every park whose owner satisfies *predicate*.
@@ -515,7 +521,40 @@ class ModuleLockTable:
                 for m, (owner, rank) in self._parked.items()
                 if owner not in evicted_set
             }
+            for owner in evicted:
+                self._park_install_at.pop(owner, None)
         return evicted
+
+    # --- Snapshot helpers (public accessors for observability) ---
+
+    def snapshot_parks(self) -> dict[str, dict]:
+        """Return a snapshot of current parks: ``{task_id: {modules, installed_at}}``.
+
+        Builds a fresh dict from ``_parked`` and ``_park_install_at`` so callers
+        cannot mutate internal state.  Preferred over direct ``_parked`` access in
+        :meth:`Scheduler.get_state_snapshot`.
+        """
+        result: dict[str, dict] = {}
+        for module, (owner, _rank) in self._parked.items():
+            if owner not in result:
+                result[owner] = {
+                    'modules': [],
+                    'installed_at': self._park_install_at.get(owner, ''),
+                }
+            result[owner]['modules'].append(module)
+        return result
+
+    def snapshot_holders(self) -> dict[str, str]:
+        """Return a snapshot of current lock holders: ``{module: task_id}``.
+
+        Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
+        Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
+        """
+        result: dict[str, str] = {}
+        for task_id, modules in self._held.items():
+            for m in modules:
+                result[m] = task_id
+        return result
 
     # --- Limit lookup (unchanged) ---
 
@@ -660,6 +699,10 @@ class Scheduler:
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
+        # Effective-priority cache: populated at the end of each acquire_next tick
+        # so get_state_snapshot() can include it without re-fetching tasks.
+        # Empty dict before the first tick.
+        self._last_effective_priorities: dict[str, str] = {}
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
@@ -1609,6 +1652,17 @@ class Scheduler:
                 if prev_order != cur_order:
                     pin_queue_changed = True
 
+            # --- reserve_now diffs (False→True only; True→False is handled by
+            # --- reserve_now_consumed at the short-circuit emit site)
+            prev_rn = prev_row.reserve_now if prev_row else False
+            cur_rn = cur_row.reserve_now if cur_row else False
+            if not prev_rn and cur_rn:
+                self.event_store.emit(
+                    EventType.reserve_now_armed,
+                    task_id=tid,
+                    data={},
+                )
+
         # One ``pin_queue_reordered`` event per tick for any pin_order change.
         # Derive the new order from the in-memory ``cur`` snapshot (no second
         # SQLite round-trip — the post-GC snapshot is already authoritative).
@@ -1723,6 +1777,13 @@ class Scheduler:
             for tid in expired_overrides:
                 current_overrides.pop(tid, None)
 
+        # Snapshot pre-short-circuit overrides for diff-detection.  The
+        # short-circuit below mutates current_overrides (clears reserve_now) so
+        # the diff would otherwise never see a False→True transition for
+        # reserve_now.  The next tick's prev snapshot uses the post-short-circuit
+        # state (current_overrides), keeping the per-tick diff semantics correct.
+        overrides_for_diff = dict(current_overrides)
+
         # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
         # install parks on its modules then clear the flag.  This is single-tick
         # fire-and-forget — the parks will survive until the owner-GC sweep evicts
@@ -1757,13 +1818,9 @@ class Scheduler:
                     )
                     if self.event_store and installed:
                         self.event_store.emit(
-                            EventType.reservation_installed,
+                            EventType.reserve_now_consumed,
                             task_id=rid,
-                            data={
-                                'modules': installed,
-                                'priority': r_tier,
-                                'reason': 'reserve_now',
-                            },
+                            data={'modules': installed, 'priority': r_tier},
                         )
                     # Reflect the cleared flag in the in-memory snapshot so
                     # downstream diff-detection doesn't spuriously re-emit for
@@ -1804,8 +1861,9 @@ class Scheduler:
                     continue
 
         # Diff-detect override changes and emit priority_override_* events.
-        # The diff runs AFTER all in-memory mutations (GC + reserve_now clearing)
-        # so that the snapshot captures the true post-tick state.
+        # Uses the pre-short-circuit override snapshot (overrides_for_diff) so
+        # reserve_now False→True transitions are visible even though the
+        # short-circuit already cleared the flag in current_overrides.
         #
         # On the first tick after a scheduler restart the snapshot starts empty.
         # Diffing against {} would emit spurious priority_override_set / task_pinned
@@ -1813,7 +1871,7 @@ class Scheduler:
         # that interpret them as fresh user actions.  We skip the diff on the
         # first tick and seed the snapshot so subsequent ticks diff correctly.
         if self._overrides_initialized:
-            self._emit_override_diff_events(self._prev_overrides_snapshot, current_overrides)
+            self._emit_override_diff_events(self._prev_overrides_snapshot, overrides_for_diff)
         else:
             self._overrides_initialized = True
         self._prev_overrides_snapshot = dict(current_overrides)
@@ -1830,6 +1888,7 @@ class Scheduler:
             tasks_by_id, reverse_index, status_map,
             override_boosts=override_boosts or None,
         )
+        self._last_effective_priorities = dict(effective_priorities)
         transitive_counts = self._compute_transitive_counts(
             tasks_by_id, reverse_index, status_map
         )
@@ -1902,6 +1961,7 @@ class Scheduler:
                             task_id=pin_tid,
                             data={'modules': pin_modules, 'priority': pin_pri},
                         )
+                    await self._write_snapshot_best_effort()
                     return TaskAssignment(
                         task_id=pin_tid, task=pin_task, modules=pin_modules
                     )
@@ -1973,11 +2033,117 @@ class Scheduler:
                         task_id=task_id,
                         data={'modules': modules, 'priority': pri},
                     )
+                await self._write_snapshot_best_effort()
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
         # Loop exhausted with no acquire — top candidate was also skipped.
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+        await self._write_snapshot_best_effort()
         return None
+
+    def get_state_snapshot(self) -> dict:
+        """Return a deep-copy snapshot of current in-memory scheduler state.
+
+        Contains seven top-level keys:
+        - skip_counts: {task_id: int}
+        - parks: {task_id: {modules: [...], installed_at: str}}
+        - effective_priorities: {task_id: str}
+        - pin_queue: [{task_id: str, order: int}, ...]
+        - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
+        - current_holders: {module: task_id}
+        - snapshot_at: ISO8601 timestamp
+        """
+        # skip_counts — plain int values, safe to copy.
+        skip_counts = dict(self._skip_count)
+
+        # parks — delegate to the public accessor so ModuleLockTable owns its
+        # own representation (no private-attribute access from Scheduler).
+        parks = self.lock_table.snapshot_parks()
+
+        # effective_priorities — already a shallow dict of str→str.
+        effective_priorities = dict(self._last_effective_priorities)
+
+        # pin_queue — read from the override store if available.
+        pin_queue: list[dict] = []
+        if self._override_store:
+            try:
+                for tid, row in self._override_store.get_pin_queue(self._project_root):
+                    pin_queue.append({'task_id': tid, 'order': row.pin_order})
+            except Exception:
+                pass
+
+        # overrides — convert OverrideRow dataclasses to plain dicts.
+        overrides: dict[str, dict] = {}
+        if self._override_store:
+            try:
+                for tid, row in self._override_store.get_overrides(
+                    self._project_root
+                ).items():
+                    overrides[tid] = {
+                        'boost_tier': row.boost_tier,
+                        'pinned': row.pinned,
+                        'reserve_now': row.reserve_now,
+                        'ttl_until': row.ttl_until.isoformat() if row.ttl_until else None,
+                    }
+            except Exception:
+                pass
+
+        # current_holders — delegate to the public accessor.
+        current_holders = self.lock_table.snapshot_holders()
+
+        return {
+            'skip_counts': skip_counts,
+            'parks': parks,
+            'effective_priorities': effective_priorities,
+            'pin_queue': pin_queue,
+            'overrides': overrides,
+            'current_holders': current_holders,
+            'snapshot_at': datetime.now(UTC).isoformat(),
+        }
+
+    def write_state_snapshot(self, path: Path) -> None:
+        """Atomically write the current state snapshot to *path* as JSON.
+
+        Creates parent directories if missing.  Uses a tmp-file + os.replace
+        atomic rename so concurrent readers never see a partial write.
+
+        Best-effort: swallows all exceptions and logs a warning on failure so
+        the scheduler never stops ticking due to a disk issue.
+        """
+        try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix('.json.tmp')
+            payload = json.dumps(self.get_state_snapshot(), default=str)
+            tmp_path.write_text(payload, encoding='utf-8')
+            os.replace(tmp_path, path)
+        except Exception:
+            logger.warning(
+                'write_state_snapshot failed for path %s', path, exc_info=True
+            )
+
+    async def _write_snapshot_best_effort(self) -> None:
+        """Write the scheduler state snapshot to the default path off the event loop.
+
+        Derives the path from ``_project_root`` and offloads the JSON
+        serialise + atomic-rename to a thread via ``asyncio.to_thread`` so
+        the event loop is not blocked during disk I/O.
+
+        At the expected tick rate (~1 tick/s per agent, bursting to ~20/s
+        during pin-queue drains) and typical snapshot sizes (< 1 MB for
+        1 500 tasks), each write costs a few ms of disk I/O that is now
+        transparent to the event loop.
+
+        Swallows all exceptions so the scheduler never stops ticking due to
+        disk or serialisation errors.
+        """
+        try:
+            path = (
+                Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+            )
+            await asyncio.to_thread(self.write_state_snapshot, path)
+        except Exception:
+            logger.warning('_write_snapshot_best_effort failed', exc_info=True)
 
     async def handle_blast_radius_expansion(
         self,

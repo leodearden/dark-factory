@@ -8,11 +8,16 @@ import json
 import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 
+from fused_memory.mcp_tools.scheduler_state import (
+    read_scheduler_events,
+    read_scheduler_state,
+)
 from fused_memory.middleware.task_interceptor import _is_ticket_id, _looks_like_task_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
@@ -2799,6 +2804,80 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'get_pin_queue error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_scheduler_state(
+        project_root: str,
+    ) -> dict[str, Any]:
+        """Return the latest in-memory scheduler state snapshot.
+
+        The snapshot is written atomically by the orchestrator after every
+        ``acquire_next`` tick.  This tool reads the JSON file from disk;
+        it never touches the live scheduler process.
+
+        Read-only.  Does NOT emit an audit add_memory call.
+
+        Args:
+            project_root: Absolute path to project root.
+
+        Returns:
+            Snapshot dict with keys: skip_counts, parks, effective_priorities,
+            pin_queue, overrides, current_holders, snapshot_at.
+            Returns the empty skeleton when no snapshot file exists yet.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_scheduler_state error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_scheduler_events(
+        project_root: str,
+        since: str | None = None,
+        limit: int = 200,
+        event_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return a tail of scheduler events from runs.db, newest-first.
+
+        Reads ``<project_root>/data/orchestrator/runs.db`` in read-only mode
+        via aiosqlite.  Never mutates data.  Does NOT emit an audit add_memory
+        call.
+
+        Args:
+            project_root: Absolute path to project root.
+            since: Optional ISO8601 lower bound (inclusive) on event timestamp.
+            limit: Maximum number of events to return (default 200).
+            event_types: Optional list of EventType values to include; if
+                omitted all event types are returned.
+
+        Returns:
+            ``{'events': [...], 'count': <int>}`` where each event is a dict
+            with keys: id, timestamp, run_id, task_id, event_type, data.
+            Returns ``{'events': [], 'count': 0}`` when runs.db is missing.
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            return await read_scheduler_events(
+                Path(project_root),
+                since=since,
+                limit=limit,
+                event_types=event_types,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_scheduler_events error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp
