@@ -173,16 +173,16 @@ def test_tab_curator_jsx_served_and_exports_component(_client) -> None:
 # ---------------------------------------------------------------------------
 
 def test_tab_curator_jsx_renders_pending_spark(tab_curator_jsx_body: str) -> None:
-    """tab_curator.jsx source must reference pending_spark.
+    """tab_curator.jsx must destructure pending_spark in CuratorTab.
 
-    Proves the new CURATOR_STATE envelope key is wired through the React
-    component. Mirrors the structural wiring assertions in
-    test_tab_curator_jsx_served_and_exports_component.
+    A scoped regex verifies the key is actually used as a destructured binding
+    (followed by ',' or '}'), not merely mentioned in a comment or as an unused
+    identifier.  Mirrors the rf'\\b{key}\\s*:' scoped pattern used in
+    test_data_js_registers_curator_endpoint.
     """
-    assert 'pending_spark' in tab_curator_jsx_body, (
-        "tab_curator.jsx does not reference 'pending_spark' — add a PendingPanel "
-        "component that destructures pending_spark from CURATOR_STATE and renders "
-        "a Sparkline over pending_spark.values."
+    assert re.search(r'\bpending_spark\b\s*[,}]', tab_curator_jsx_body), (
+        "tab_curator.jsx does not destructure 'pending_spark' in CuratorTab — "
+        "add pending_spark to the destructuring of cs and pass it to PendingPanel."
     )
 
 
