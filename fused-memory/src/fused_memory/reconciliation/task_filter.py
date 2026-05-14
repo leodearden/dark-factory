@@ -437,6 +437,15 @@ def select_visible_active(
     same _select_visible_active_with_body worker so that the rendered Active
     Task Tree and the hint section always reference exactly the same set of tasks.
 
+    .. deprecated::
+        Prefer ``render_active_section`` when both the visible-task list *and*
+        the assembled prompt string are needed — that avoids a second call to
+        ``_select_visible_active_with_body`` (and the duplicate task-line
+        rendering it implies).  ``select_visible_active`` is retained for
+        callers that genuinely need *only* the visible list without the
+        assembled string (e.g. unit tests that assert on task membership rather
+        than rendered output).
+
     Algorithm:
       1. Slice active = tree.active_tasks[:max_tasks]; return [] if empty.
       2. Build header / cancelled_section / summary_line via _build_surrounding.
@@ -503,13 +512,18 @@ def render_active_section(
 
     if not visible or body is None:
         # Budget too tight for any task lines (budget<=0 or lazy loop drained all).
-        return visible, header + cancelled_section + summary_line
+        # visible is always [] in this branch (worker guarantees body is None iff
+        # visible is empty), but return [] explicitly to keep the contract clear:
+        # an empty assembled string → an empty visible list.
+        return [], header + cancelled_section + summary_line
 
     assembled = header + body + cancelled_section + summary_line
     # Defensive guard: mirrors the guard in the former format_filtered_task_tree
     # body — if the budget algorithm drifts from the assembly, fall back safely.
+    # Return [] for visible so callers never see tasks claimed present in a string
+    # that doesn't actually contain their rendered lines.
     if len(assembled) > max_chars:
-        return visible, header + cancelled_section + summary_line
+        return [], header + cancelled_section + summary_line
     return visible, assembled
 
 

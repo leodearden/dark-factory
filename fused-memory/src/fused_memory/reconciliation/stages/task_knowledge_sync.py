@@ -1412,6 +1412,8 @@ class TaskKnowledgeSync(BaseStage):
         # (above) because hint conversion is a general-sync activity, not a Stage 1
         # remediation task. Rendered conditionally within that gate — omitted on the
         # steady-state case where every active task already has valid dict-format hints.
+        # Note: visible_active is only consumed inside the gate; active_tree_text is
+        # always used for the prompt template slot regardless of remediation_mode.
         hint_conversion_section = ''
         if not self.remediation_mode:
             tasks_needing_hint_attention = [
