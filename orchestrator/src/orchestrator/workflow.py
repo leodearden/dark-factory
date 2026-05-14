@@ -24,7 +24,6 @@ from shared.cost_store import CostStore
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
-from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
     ALL_REVIEWERS,
@@ -39,6 +38,7 @@ from orchestrator.agents.roles import (
 )
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import (

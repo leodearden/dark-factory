@@ -9,7 +9,7 @@ Never mutates task state; all writes go through the parent process.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -192,7 +192,7 @@ async def run_dry_run_unblock(
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, Any]:
