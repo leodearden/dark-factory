@@ -682,3 +682,53 @@ class TestRunArmsWatchdog:
             'disarm() was called on the blocked>0 path — watchdog must remain armed to '
             'guard interpreter shutdown (threading._shutdown() joining non-daemon threads)'
         )
+
+
+class TestStatusCommandOverrideStoreWiring:
+    """Pins that cli `status` passes OverrideStore to Scheduler at construction."""
+
+    def test_status_command_wires_override_store(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.overrides import OverrideStore
+
+        # Minimal config YAML pointing project_root at tmp_path.
+        cfg_path = tmp_path / 'config.yaml'
+        cfg_path.write_text(f'project_root: {tmp_path}\n')
+
+        # Canonical expected overrides_db_path for this project_root.
+        expected_db_path = OrchestratorConfig(project_root=tmp_path).overrides_db_path
+
+        # Capture the kwargs Scheduler receives.
+        captured: dict = {}
+
+        def _stub_scheduler(config, **kwargs):
+            captured.update(kwargs)
+            mock = MagicMock()
+            mock.get_tasks = AsyncMock(return_value=[])
+            return mock
+
+        # Patch at the source so the lazy `from orchestrator.scheduler import Scheduler`
+        # inside the status function body picks up the stub.
+        monkeypatch.setattr('orchestrator.scheduler.Scheduler', _stub_scheduler)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ['status', '--config', str(cfg_path)])
+
+        assert result.exit_code == 0, (
+            f'status command failed (exit_code={result.exit_code}):\n{result.output}'
+        )
+        assert 'override_store' in captured, (
+            'Scheduler was not called with override_store kwarg — '
+            'cli.py status command must wire OverrideStore into Scheduler'
+        )
+        assert isinstance(captured['override_store'], OverrideStore), (
+            f"Expected OverrideStore, got {type(captured['override_store'])}"
+        )
+        assert captured['override_store'].db_path == expected_db_path, (
+            f"db_path mismatch: {captured['override_store'].db_path!r} "
+            f"!= {expected_db_path!r}"
+        )
