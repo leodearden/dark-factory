@@ -357,42 +357,46 @@ def _select_visible_active_with_body(
     tree: FilteredTaskTree,
     max_tasks: int = MAX_ACTIVE_TASKS_RENDERED,
     max_chars: int = 50_000,
-) -> tuple[list[dict], str | None]:
+) -> tuple[list[dict], str | None, str, str, str]:
     """Internal worker: select visible active tasks and return the pre-rendered body.
 
-    Returns (visible_tasks, body_str) where body_str is the fully rendered body
-    string (with truncation notice when partial), or None when no tasks fit the
-    budget.  Both the public select_visible_active helper and
-    format_filtered_task_tree call this worker, so task lines are rendered once
+    Returns (visible_tasks, body_str, header, cancelled_section, summary_line)
+    where body_str is the fully rendered body string (with truncation notice when
+    partial), or None when no tasks fit the budget.  The surroundings tuple
+    (header, cancelled_section, summary_line) is always populated so callers
+    never need to call _build_surrounding independently.
+
+    Both the public select_visible_active helper and format_filtered_task_tree
+    (via render_active_section) call this worker, so task lines are rendered once
     and reused rather than being computed independently in each caller.
 
     Algorithm:
-      1. Slice active = tree.active_tasks[:max_tasks]; return ([], None) if empty.
-      2. Build surroundings via _build_surrounding.
-      3. Render all lines; if full result fits, return (active, body).
-      4. Compute budget = max_chars - overhead; return ([], None) if budget <= 0.
+      1. Build surroundings via _build_surrounding (always, even for empty active).
+      2. Slice active = tree.active_tasks[:max_tasks]; return ([], None, ...) if empty.
+      3. Render all lines; if full result fits, return (active, body, ...).
+      4. Compute budget = max_chars - overhead; return ([], None, ...) if budget <= 0.
       5. Greedy fill kept_lines while cumulative cost <= budget.
       6. Lazy verification: pop lines until the realised result fits or
          kept_lines is drained.
-      7. Return (active[:kept], body_with_trunc_notice), or ([], None) if drained.
+      7. Return (active[:kept], body_with_trunc_notice, ...), or ([], None, ...) if drained.
     """
+    header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
+
     active = tree.active_tasks[:max_tasks]
     if not active:
-        return [], None
-
-    header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
+        return [], None, header, cancelled_section, summary_line
 
     # ── Fast path: full result fits in budget ── #
     lines = [_render_task_line(t) for t in active]
     body = '\n'.join(lines) + '\n'
     full = header + body + cancelled_section + summary_line
     if len(full) <= max_chars:
-        return active, body
+        return active, body, header, cancelled_section, summary_line
 
     # ── Budget-capped path ── #
     budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
     if budget <= 0:
-        return [], None
+        return [], None, header, cancelled_section, summary_line
 
     # Greedy fill.
     kept_lines: list[str] = []
@@ -417,8 +421,8 @@ def _select_visible_active_with_body(
         result = header + result_body + cancelled_section + summary_line
 
     if not kept_lines:
-        return [], None
-    return active[: len(kept_lines)], result_body
+        return [], None, header, cancelled_section, summary_line
+    return active[: len(kept_lines)], result_body, header, cancelled_section, summary_line
 
 
 def select_visible_active(
@@ -453,7 +457,9 @@ def select_visible_active(
         A (possibly empty) prefix list of task dicts that will all appear in
         the output of format_filtered_task_tree(tree, max_tasks, max_chars).
     """
-    visible, _ = _select_visible_active_with_body(tree, max_tasks, max_chars)
+    visible, _body, _header, _cancelled, _summary = _select_visible_active_with_body(
+        tree, max_tasks, max_chars
+    )
     return visible
 
 
@@ -501,20 +507,20 @@ def format_filtered_task_tree(
     Returns:
         Formatted string suitable for injection into a reconciliation prompt.
     """
-    # active_slice drives the header's "shown" count — reflects the max_tasks cap,
+    # active_slice drives the "No active tasks" branch — reflects the max_tasks cap,
     # NOT the secondary max_chars clamp (same as the pre-refactor behaviour).
     active_slice = tree.active_tasks[:max_tasks]
-    # _build_surrounding is also called inside _select_visible_active_with_body;
-    # both calls are cheap (pure string concatenation) relative to task-line rendering.
-    header, cancelled_section, summary_line = _build_surrounding(tree, max_tasks)
+
+    # Delegate to the shared internal worker — single source of truth for both the
+    # visible-window decision and the surroundings construction.  The worker calls
+    # _build_surrounding exactly once and returns its outputs alongside the
+    # pre-rendered body, so _build_surrounding is never called twice per invocation.
+    visible, body, header, cancelled_section, summary_line = _select_visible_active_with_body(
+        tree, max_tasks, max_chars
+    )
 
     if not active_slice:
         return header + 'No active tasks.\n' + cancelled_section + summary_line
-
-    # Delegate to the shared internal worker — single source of truth for the
-    # visible-window decision.  The worker returns the pre-rendered body so that
-    # task lines are not rendered a second time here.
-    visible, body = _select_visible_active_with_body(tree, max_tasks, max_chars)
 
     if not visible or body is None:
         # Budget too tight for any task lines (budget<=0 or lazy loop drained all).
