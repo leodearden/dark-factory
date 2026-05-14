@@ -196,3 +196,60 @@ class TestCrossTaskDedupeReengagement:
             'cross-task children receive no direct harness signal per '
             'DESIGN.md "Escalation cross-task dedupe" / server.py:88-90 contract.'
         )
+
+    @pytest.mark.asyncio
+    async def test_child_task_has_no_remaining_escalation_gates_after_resolve(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """After parent resolve, both A and B have clear scheduler-gate predicates.
+
+        Asserts the exact gates that Scheduler.acquire_next checks before
+        re-dispatching a task:
+          - get_by_task(task_id, status='pending', level=0) == []
+          - has_open_l1(task_id) is False
+
+        Both A (parent resolved/archived) and B (no file ever written under B)
+        must satisfy these gates, making them eligible for re-acquisition.
+        """
+        queue = harness._escalation_queue
+        server = create_server(queue)
+
+        # Submit parent from A, dedupe child from B, then resolve the parent.
+        first = await _blocker(
+            server,
+            task_id='A',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+
+        second = await _blocker(
+            server,
+            task_id='B',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+        assert second['status'] == 'dedup_skipped'
+
+        harness._escalation_queue.resolve(
+            parent_id, resolution='infra fixed', resolved_by='steward-test'
+        )
+
+        # B: no pending L0 — dedupe meant no file was ever written under task_id='B'.
+        assert harness._escalation_queue.get_by_task('B', status='pending', level=0) == [], (
+            'B must have no pending L0 escalations — cross-task dedupe wrote no '
+            'file under task_id=B, so the scheduler gate is clear.'
+        )
+        assert not harness._escalation_queue.has_open_l1('B'), (
+            'B must have no open L1 escalations after parent resolve.'
+        )
+
+        # A: parent archived on resolve — no pending L0 or L1 remains.
+        assert harness._escalation_queue.get_by_task('A', status='pending', level=0) == [], (
+            'A must have no pending L0 escalations after parent is resolved/archived.'
+        )
+        assert not harness._escalation_queue.has_open_l1('A'), (
+            'A must have no open L1 escalations after parent resolve.'
+        )
