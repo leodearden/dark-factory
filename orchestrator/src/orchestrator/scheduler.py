@@ -1532,6 +1532,20 @@ class Scheduler:
             else {}
         )
 
+        # Override GC: remove override rows for tasks that are terminal or missing.
+        # Runs alongside the park_gc sweep so the rest of the tick sees post-GC state.
+        if self._override_store and current_overrides:
+            terminal_or_missing_ids: set[str] = (
+                {tid for tid, st in status_map.items() if st in TERMINAL_STATUSES}
+                | (set(current_overrides.keys()) - set(tasks_by_id.keys()))
+            )
+            if terminal_or_missing_ids:
+                cleared_overrides = self._override_store.clear_terminal(
+                    self._project_root, terminal_or_missing_ids
+                )
+                for tid in cleared_overrides:
+                    current_overrides.pop(tid, None)
+
         # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
         # install parks on its modules then clear the flag.  This is single-tick
         # fire-and-forget — the parks will survive until the owner-GC sweep evicts
