@@ -410,3 +410,29 @@ def test_shape_scheduler_envelope():
         snapshot_at=snapshot_at,
     )
     assert result_online['SCHEDULER']['offline'] is False
+
+
+# ---------------------------------------------------------------------------
+# step-13: GET /api/v2/dashboard/scheduler envelope shape
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_endpoint_returns_envelope_shape(client):
+    """GET /scheduler returns 200 with SCHEDULER key containing the inner keys."""
+    from unittest.mock import AsyncMock, patch
+
+    empty_5tuple = ([], [], [], {}, [])
+    with patch('dashboard.app.collect_scheduler_state', new=AsyncMock(return_value=empty_5tuple)):
+        resp = client.get('/api/v2/dashboard/scheduler')
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert 'SCHEDULER' in data
+    inner = data['SCHEDULER']
+    assert 'rows' in inner
+    assert 'modules' in inner
+    assert 'pin_queue' in inner
+    assert 'events_by_task' in inner
+    assert 'snapshot_at' in inner
+    assert 'offline' in inner
+    assert 'offline_projects' in inner
