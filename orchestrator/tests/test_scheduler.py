@@ -4035,3 +4035,63 @@ class TestPinDispatch:
             if e[0] == EventType.task_skipped.value and e[1].get('task_id') == 'A'
         ]
         assert skipped_for_a == [], f'Unexpected task_skipped events for A: {skipped_for_a}'
+
+
+class TestOverrideGCIntegration:
+    """GC sweep clears overrides for terminal tasks and expired TTLs."""
+
+    @pytest.mark.asyncio
+    async def test_park_gc_pass_calls_clear_terminal_for_terminal_owners(
+        self, tmp_path
+    ):
+        """acquire_next() GC sweep removes overrides for done/cancelled tasks.
+
+        A = pending (boost override must survive).
+        B = done    (override must be removed by GC).
+        C = cancelled (override must be removed by GC).
+        """
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'A', boost_tier='high')
+        store.set_override('/proj', 'B', boost_tier='critical')
+        store.set_override('/proj', 'C', boost_tier='medium')
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+
+        task_a = {
+            'id': 'A',
+            'title': 'Task A',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['mod_a']},
+            'priority': 'medium',
+        }
+        task_b = {
+            'id': 'B',
+            'title': 'Task B',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'files': ['mod_b']},
+            'priority': 'medium',
+        }
+        task_c = {
+            'id': 'C',
+            'title': 'Task C',
+            'status': 'cancelled',
+            'dependencies': [],
+            'metadata': {'files': ['mod_c']},
+            'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b, task_c])
+
+        await scheduler.acquire_next()
+
+        overrides_after = store.get_overrides('/proj')
+        # A (pending) still has its override.
+        assert 'A' in overrides_after
+        # B (done) and C (cancelled) must have been swept.
+        assert 'B' not in overrides_after
+        assert 'C' not in overrides_after
