@@ -1648,29 +1648,6 @@ class TestReconcileStrandedInProgress:
             tid, 'done', done_provenance=expected_provenance
         )
 
-    async def test_get_task_fetched_once_when_neither_fastpath_fires(
-        self, harness: Harness
-    ):
-        """Invariant: get_task is awaited exactly once per stranded task,
-        including on paths where neither fast-path fires (e.g. the lock-state
-        revert path).  The unconditional hoist at the top of
-        _reconcile_one_stranded ensures a single MCP fetch per task regardless
-        of which branch wins.
-        """
-        # Fixture defaults: is_ancestor=False, find_merge_marker=None
-        # → neither fast-path fires; task '90' has no worktree → no-lock revert.
-        harness.scheduler.get_statuses.return_value = ({'90': 'in-progress'}, None)  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        # Hoisted fetch must have fired once, even though neither fast-path ran.
-        assert harness.scheduler.get_task.await_count == 1, (  # type: ignore[attr-defined]
-            f'Expected get_task awaited once; '
-            f'got {harness.scheduler.get_task.await_count}'  # type: ignore[attr-defined]
-        )
-        # Confirm the no-lock revert path still fires: task reverted to pending.
-        harness.scheduler.set_task_status.assert_awaited_once_with('90', 'pending')  # type: ignore[attr-defined]
-
     @pytest.mark.parametrize(
         'is_ancestor_val, marker_sha_val',
         [
@@ -1701,6 +1678,11 @@ class TestReconcileStrandedInProgress:
             f'marker={marker_sha_val!r}); '
             f'got {harness.scheduler.get_task.await_count}'  # type: ignore[attr-defined]
         )
+        # For the neither-path case, confirm the lock-state revert still fires.
+        if not is_ancestor_val and marker_sha_val is None:
+            harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+                '90', 'pending'
+            )
 
 
 # ---------------------------------------------------------------------------

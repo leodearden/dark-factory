@@ -1182,16 +1182,16 @@ Output JSON matching the schema. Every task must appear in the output.
 
         # Fetch task metadata once for both fast-paths (is_ancestor + find_merge_marker).
         # Scheduler.get_task normalises metadata at the boundary
-        # (scheduler.py:_normalize_task_metadata), so task['metadata'] is a dict
-        # whenever task is not None.  The .get() default ({}) is purely defensive
-        # against a future task dict that lacks the key; the only load-bearing
-        # guard here is `if task else {}` for the task-absent (None) case.
+        # (scheduler.py:_normalize_task_metadata), so task['metadata'] is always a
+        # dict whenever task is not None.  `or {}` collapses any residual None value
+        # (e.g. a manually-constructed task dict that bypasses normalisation); the
+        # load-bearing guard against task itself being absent is `if task else {}`.
         # The unconditional fetch is the deliberate trade-off: one MCP call per
         # stranded task even when neither fast-path fires (e.g. lock-state revert),
         # in exchange for a single source of truth for `metadata` shared by both
         # fast-paths (eliminating the duplicated per-branch get_task pattern).
         task = await self.scheduler.get_task(tid)
-        metadata = task.get('metadata', {}) if task else {}
+        metadata = (task.get('metadata') or {}) if task else {}
 
         # Already-on-main fast-path (is_ancestor == True).
         # NB: is_ancestor is degenerate for zero-commit branches whose tip
