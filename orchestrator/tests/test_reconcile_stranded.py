@@ -7,7 +7,7 @@ import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1751,6 +1751,11 @@ class TestReconcileStrandedInProgress:
         # still call is_ancestor with the correct arguments yet route to
         # veto-and-return None — the existing input-args assertions below
         # would not detect the regression (reviewer ref: esc-1276-3 #1).
+        # Assert on the production boundary (harness.py:1464) directly.
+        expected_commit = expected_provenance['commit']
+        harness.scheduler.mark_done.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '90', kind='found_on_main', sha=expected_commit, note=ANY,
+        )
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             '90', 'done', done_provenance=expected_provenance,
         )
