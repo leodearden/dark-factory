@@ -5064,6 +5064,62 @@ class TestParkStopTrip:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_resume_clears_blocked_transitions_deque(self, monkeypatch):
+        """Regression: resume() must clear the rolling _blocked_transitions deque.
+
+        Without this, the wall-clock 1h window can still hold ≥ threshold stale
+        timestamps after a human resume, so the very next blocked transition
+        (e.g. an in-flight workflow finishing shortly after resume) would
+        immediately re-trip the park-stop pause and silently undo the operator
+        action.  The flow: trip → resume → record one new blocked transition →
+        is_paused must still be False.
+        """
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
+        )
+        scheduler = Scheduler(config)
+
+        callback_count = [0]
+
+        async def trip_callback(reason: str) -> None:
+            callback_count[0] += 1
+            # Mirror harness.pause_scheduler — scheduler.pause is idempotent
+            # because the synchronous latch already set _paused=True.
+            scheduler.pause(reason)
+
+        scheduler._on_park_stop_trip = trip_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Trip the park-stop by marking threshold tasks blocked.
+        for i in range(3):
+            await scheduler.set_task_status(str(i), 'blocked')
+        await asyncio.sleep(0)  # let ensure_future callbacks settle
+        assert scheduler.is_paused, 'Trip must have fired and paused scheduler'
+        assert callback_count[0] == 1
+
+        # Operator resumes.
+        scheduler.resume()
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
+
+        # One new blocked transition arrives (e.g. an in-flight workflow
+        # finishing shortly after resume).  With the deque cleared on resume,
+        # the new count (=1) is far below threshold and must NOT re-trip.
+        await scheduler.set_task_status('post-resume', 'blocked')
+        await asyncio.sleep(0)
+        assert scheduler.is_paused is False, (
+            'Park-stop must not re-trip on a single post-resume transition '
+            '(deque should have been cleared on resume)'
+        )
+        assert callback_count[0] == 1, (
+            f'Callback must not fire a second time; fired {callback_count[0]}'
+        )
+
+
 class TestParkStopDisabled:
     """park_stop_enabled=False suppresses the trip but still records transitions."""
 

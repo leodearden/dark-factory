@@ -765,12 +765,22 @@ class Scheduler:
         """Resume the scheduler.  Next acquire_next() tick will dispatch normally.
 
         Idempotent: if not paused, this is a no-op.
+
+        Clears the rolling ``_blocked_transitions`` deque so the operator's
+        resume establishes a clean baseline.  Without this, a still-full deque
+        (the window is wall-clock 1h by default) would cause the next blocked
+        transition — e.g. an in-flight workflow finishing shortly after resume
+        — to immediately re-trip the park-stop pause, silently undoing the
+        operator's action.  Requiring fresh transitions post-resume keeps the
+        circuit breaker observable: trips correspond to bursts after resume,
+        not stale history from before it.
         """
         if not self._paused:
             logger.debug('Scheduler.resume() called while not paused — no-op')
             return
         self._paused = False
         self._pause_reason = None
+        self._blocked_transitions.clear()
         logger.info('Scheduler resumed')
 
     def _maybe_fire_park_stop_trip(self) -> None:
