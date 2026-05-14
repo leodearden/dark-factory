@@ -346,13 +346,15 @@ class TestSnapshotPerformance:
 
         result: dict = {}
         samples = []
-        for _ in range(10):
+        for i in range(10):
             t0 = time.perf_counter()
             result = await mcp_server._tool_manager.call_tool(
                 'get_scheduler_state',
                 {'project_root': str(tmp_path)},
             )
-            samples.append((time.perf_counter() - t0) * 1000)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            if i > 0:  # discard the first sample as a cold-start warm-up
+                samples.append(elapsed_ms)
 
         median_ms = statistics.median(samples)
         assert 'snapshot_at' in result, 'snapshot_at missing from result'

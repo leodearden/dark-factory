@@ -525,6 +525,37 @@ class ModuleLockTable:
                 self._park_install_at.pop(owner, None)
         return evicted
 
+    # --- Snapshot helpers (public accessors for observability) ---
+
+    def snapshot_parks(self) -> dict[str, dict]:
+        """Return a snapshot of current parks: ``{task_id: {modules, installed_at}}``.
+
+        Builds a fresh dict from ``_parked`` and ``_park_install_at`` so callers
+        cannot mutate internal state.  Preferred over direct ``_parked`` access in
+        :meth:`Scheduler.get_state_snapshot`.
+        """
+        result: dict[str, dict] = {}
+        for module, (owner, _rank) in self._parked.items():
+            if owner not in result:
+                result[owner] = {
+                    'modules': [],
+                    'installed_at': self._park_install_at.get(owner, ''),
+                }
+            result[owner]['modules'].append(module)
+        return result
+
+    def snapshot_holders(self) -> dict[str, str]:
+        """Return a snapshot of current lock holders: ``{module: task_id}``.
+
+        Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
+        Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
+        """
+        result: dict[str, str] = {}
+        for task_id, modules in self._held.items():
+            for m in modules:
+                result[m] = task_id
+        return result
+
     # --- Limit lookup (unchanged) ---
 
     def _limit_for(self, module: str) -> int:
@@ -1930,7 +1961,7 @@ class Scheduler:
                             task_id=pin_tid,
                             data={'modules': pin_modules, 'priority': pin_pri},
                         )
-                    self._write_snapshot_best_effort()
+                    await self._write_snapshot_best_effort()
                     return TaskAssignment(
                         task_id=pin_tid, task=pin_task, modules=pin_modules
                     )
@@ -2002,12 +2033,12 @@ class Scheduler:
                         task_id=task_id,
                         data={'modules': modules, 'priority': pri},
                     )
-                self._write_snapshot_best_effort()
+                await self._write_snapshot_best_effort()
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
         # Loop exhausted with no acquire — top candidate was also skipped.
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-        self._write_snapshot_best_effort()
+        await self._write_snapshot_best_effort()
         return None
 
     def get_state_snapshot(self) -> dict:
@@ -2025,15 +2056,9 @@ class Scheduler:
         # skip_counts — plain int values, safe to copy.
         skip_counts = dict(self._skip_count)
 
-        # parks — invert _parked (module→owner) to owner→{modules, installed_at}.
-        parks: dict[str, dict] = {}
-        for module, (owner, _rank) in self.lock_table._parked.items():
-            if owner not in parks:
-                parks[owner] = {
-                    'modules': [],
-                    'installed_at': self.lock_table._park_install_at.get(owner, ''),
-                }
-            parks[owner]['modules'].append(module)
+        # parks — delegate to the public accessor so ModuleLockTable owns its
+        # own representation (no private-attribute access from Scheduler).
+        parks = self.lock_table.snapshot_parks()
 
         # effective_priorities — already a shallow dict of str→str.
         effective_priorities = dict(self._last_effective_priorities)
@@ -2063,11 +2088,8 @@ class Scheduler:
             except Exception:
                 pass
 
-        # current_holders — invert _held (task→modules) to module→task.
-        current_holders: dict[str, str] = {}
-        for task_id, modules in self.lock_table._held.items():
-            for m in modules:
-                current_holders[m] = task_id
+        # current_holders — delegate to the public accessor.
+        current_holders = self.lock_table.snapshot_holders()
 
         return {
             'skip_counts': skip_counts,
@@ -2100,17 +2122,26 @@ class Scheduler:
                 'write_state_snapshot failed for path %s', path, exc_info=True
             )
 
-    def _write_snapshot_best_effort(self) -> None:
-        """Write the scheduler state snapshot to the default path.
+    async def _write_snapshot_best_effort(self) -> None:
+        """Write the scheduler state snapshot to the default path off the event loop.
 
-        Derives the path from ``_project_root`` and swallows all exceptions
-        so the scheduler never stops ticking due to disk or serialisation errors.
+        Derives the path from ``_project_root`` and offloads the JSON
+        serialise + atomic-rename to a thread via ``asyncio.to_thread`` so
+        the event loop is not blocked during disk I/O.
+
+        At the expected tick rate (~1 tick/s per agent, bursting to ~20/s
+        during pin-queue drains) and typical snapshot sizes (< 1 MB for
+        1 500 tasks), each write costs a few ms of disk I/O that is now
+        transparent to the event loop.
+
+        Swallows all exceptions so the scheduler never stops ticking due to
+        disk or serialisation errors.
         """
         try:
             path = (
                 Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
             )
-            self.write_state_snapshot(path)
+            await asyncio.to_thread(self.write_state_snapshot, path)
         except Exception:
             logger.warning('_write_snapshot_best_effort failed', exc_info=True)
 
