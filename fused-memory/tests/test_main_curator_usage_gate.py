@@ -203,8 +203,14 @@ class TestCuratorUsageGateLeakGuard:
             return await original_shutdown(self_gate)
 
         # Patch logger.info to raise only on the success-path gate log call.
+        # raiser_invoked tracks whether the raiser actually branched into the raise
+        # path, so the test fails loudly if the 'Curator usage gate:' substring
+        # ever drifts (rather than silently passing via a never-reached raise).
+        raiser_invoked: list[bool] = [False]
+
         def logger_info_raiser(msg: str, *args: object, **kwargs: object) -> None:
             if 'Curator usage gate:' in str(msg):
+                raiser_invoked[0] = True
                 raise RuntimeError('synthetic logger failure')
 
         with (
@@ -216,6 +222,10 @@ class TestCuratorUsageGateLeakGuard:
         ):
             await _setup_curator_usage_gate(config)
 
+        assert raiser_invoked[0], (
+            "logger_info_raiser was never triggered on 'Curator usage gate:' — "
+            'the log prefix may have drifted; update the substring match'
+        )
         assert close_count[0] == 1, (
             f'Expected CostStore.close() to be awaited exactly once, got {close_count[0]}'
         )
