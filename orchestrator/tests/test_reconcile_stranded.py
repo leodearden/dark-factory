@@ -1703,7 +1703,7 @@ class TestReconcileStrandedInProgress:
         # regardless of future fixture changes, ensuring the guard passes
         # through to _mark_in_progress_done.
         _BRANCH_TIP = 'c0ffee11' + '0' * 32
-        assert _BRANCH_TIP != branch_base_sha, (
+        assert branch_base_sha != _BRANCH_TIP, (
             'Test setup error: _BRANCH_TIP collides with branch_base_sha — '
             'update _BRANCH_TIP to a distinct 40-hex value'
         )
