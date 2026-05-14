@@ -45,25 +45,65 @@ DRY_RUN_PROPOSAL_SCHEMA: dict[str, Any] = {
 _RISK_LABELS: frozenset[str] = frozenset({'low', 'medium', 'human-review-required'})
 _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
 
+# Stable subtype values emitted by the CLI when the cost cap fires.
+# Mirrors the canonical value used in shared/src/shared/usage_gate.py and
+# fused-memory/src/fused_memory/middleware/task_curator.py — the Claude CLI
+# emits ``error_max_budget_usd`` (with the ``_usd`` suffix) on cost-cap
+# exhaustion, not ``error_max_budget``.
+_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
+
+
+def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
+    """Return True only when the agent's subtype explicitly signals budget exhaustion.
+
+    We avoid the ``cost >= budget_usd`` heuristic: an agent can spend close to
+    the cap before failing for an unrelated reason (e.g. max_turns, tool error),
+    which would mis-classify those failures as 'budget_exhausted' and produce
+    misleading operator-visible status fields in metadata.
+    """
+    subtype = getattr(result, 'subtype', '') or ''
+    return subtype in _BUDGET_SUBTYPES
+
+
 # Read-only tools the dry-run agent is allowed to use.
 # Bash(pytest:*) and Bash(cargo:*) are intentionally omitted: both can
 # write .pyc/__pycache__/target/ files or fetch from the network, which
 # contradicts the read-only safety contract advertised in SKILL.md.
 # The agent can read existing test output from .task/iterations.jsonl instead.
+# Explicit read-only git subcommands instead of a wildcard — Bash(git:*) would
+# permit mutating subcommands (commit, push, reset, checkout, restore, clean)
+# which contradict the read-only contract for this autonomous, no-human-
+# checkpoint invocation where the threat profile is higher than interactive use.
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
     'Grep',
-    'Bash(git:*)',
+    'Bash(git log:*)',
+    'Bash(git diff:*)',
+    'Bash(git status:*)',
+    'Bash(git show:*)',
+    'Bash(git rev-parse:*)',
+    'Bash(git branch:*)',
+    'Bash(git ls-files:*)',
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
 ]
 
-# Mutating tools explicitly blocked
+# Mutating tools explicitly blocked.
+# Defence-in-depth: list the most dangerous git mutations alongside the
+# write-capable MCP tools so the allowlist and denylist are consistent.
 _DISALLOWED_TOOLS: list[str] = [
     'Edit',
     'Write',
+    'Bash(git commit:*)',
+    'Bash(git push:*)',
+    'Bash(git reset:*)',
+    'Bash(git checkout:*)',
+    'Bash(git restore:*)',
+    'Bash(git clean:*)',
+    'Bash(git merge:*)',
+    'Bash(git rebase:*)',
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
@@ -96,9 +136,12 @@ def _load_skill_system_prompt() -> str:
             break
 
     if skill_path is None:
-        raise FileNotFoundError(
-            f'skills/unblock-auto/SKILL.md not found: searched upward from {here}'
+        msg = f'skills/unblock-auto/SKILL.md not found: searched upward from {here}'
+        logger.error(
+            'dry_run_unblock: %s — is the orchestrator installed outside the monorepo?',
+            msg,
         )
+        raise FileNotFoundError(msg)
 
     raw = skill_path.read_text()
     if not raw.startswith('---'):
@@ -171,6 +214,7 @@ async def run_dry_run_unblock(
             'risk_label': _HUMAN_REVIEW_REQUIRED,
             'files_referenced': [],
             'block_reason': reason,
+            'cost_usd': 0.0,
             'investigated_at': _now_iso(),
             'timestamp': _now_iso(),
         }
@@ -238,6 +282,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
             'risk_label': _HUMAN_REVIEW_REQUIRED,
             'files_referenced': [],
             'block_reason': reason,
+            'cost_usd': getattr(result, 'cost_usd', 0.0),
             'investigated_at': now,
             'timestamp': now,
         }
@@ -256,23 +301,3 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
         'investigated_at': now,
         'timestamp': now,
     }
-
-
-# Stable subtype values emitted by the CLI when the cost cap fires.
-# Mirrors the canonical value used in shared/src/shared/usage_gate.py and
-# fused-memory/src/fused_memory/middleware/task_curator.py — the Claude CLI
-# emits ``error_max_budget_usd`` (with the ``_usd`` suffix) on cost-cap
-# exhaustion, not ``error_max_budget``.
-_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
-
-
-def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
-    """Return True only when the agent's subtype explicitly signals budget exhaustion.
-
-    We avoid the ``cost >= budget_usd`` heuristic: an agent can spend close to
-    the cap before failing for an unrelated reason (e.g. max_turns, tool error),
-    which would mis-classify those failures as 'budget_exhausted' and produce
-    misleading operator-visible status fields in metadata.
-    """
-    subtype = getattr(result, 'subtype', '') or ''
-    return subtype in _BUDGET_SUBTYPES

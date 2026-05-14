@@ -4599,11 +4599,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         if not getattr(self.config, 'unblock_auto', None) or not self.config.unblock_auto.enabled:
             return
+        if self.worktree is None:
+            logger.debug(
+                'Task %s: skipping dry-run unblock hook — no worktree set',
+                self.task_id,
+            )
+            return
+        # Skip if an investigation for this task is already running (e.g. rapid
+        # re-blocks during steward retries).  Duplicate proposals are unhelpful
+        # and would multiply budget spend up to 600 s × N re-blocks.
+        _task_name = f'unblock-auto-{self.task_id}'
+        if any(t.get_name() == _task_name and not t.done() for t in self._background_tasks):
+            logger.debug(
+                'Task %s: dry-run investigation already in progress, skipping duplicate spawn',
+                self.task_id,
+            )
+            return
         try:
             _task = asyncio.create_task(
                 run_dry_run_unblock(
                     task_id=self.task_id,
-                    worktree=str(self.worktree) if self.worktree else '.',
+                    worktree=str(self.worktree),
                     reason=reason,
                     detail=detail,
                     scheduler=self.scheduler,
@@ -4611,7 +4627,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     config=self.config,
                     event_store=getattr(self, 'event_store', None),
                 ),
-                name=f'unblock-auto-{self.task_id}',
+                name=_task_name,
             )
             self._background_tasks.add(_task)
             _task.add_done_callback(self._background_tasks.discard)

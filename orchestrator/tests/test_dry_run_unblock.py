@@ -272,6 +272,9 @@ class TestAgentFailureFallback:
         assert entry['files_referenced'] == []
         assert 'investigated_at' in entry
         assert entry['block_reason'] == 'verify exhausted'
+        # cost_usd must be present on all fallback entries for dashboard queries
+        assert 'cost_usd' in entry
+        assert entry['cost_usd'] == pytest.approx(0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +353,16 @@ class TestEventTagging:
 
         event_store.emit.assert_called_once()
         emit_call = event_store.emit.call_args
-        # First positional arg is EventType; check data kwarg
+
+        # First positional arg must be EventType.invocation_end
+        from orchestrator.event_store import EventType
+        assert emit_call.args[0] == EventType.invocation_end
+
+        # Keyword args that operators filter on to find dry-run emissions
+        assert emit_call.kwargs.get('phase') == 'blocked'
+        assert emit_call.kwargs.get('role') == 'unblock_auto'
+
+        # data payload
         data = emit_call.kwargs.get('data', {})
         assert data.get('dry_run') is True
         assert 'risk_label' in data

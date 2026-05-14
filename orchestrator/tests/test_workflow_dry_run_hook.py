@@ -197,3 +197,76 @@ class TestMarkBlockedSkipsDryRunWhenFeatureDisabled:
 
         # but the 'blocked' status write still happened
         assert 'blocked' in scheduler.statuses.get('44', [])
+
+
+# ---------------------------------------------------------------------------
+# Suggestion 7: worktree=None skips the hook
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedSkipsDryRunWhenNoWorktree:
+    @pytest.mark.asyncio
+    async def test_mark_blocked_skips_dry_run_when_no_worktree(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='45', enabled=True)
+        # Simulate a workflow where no worktree has been set yet
+        wf.worktree = None
+
+        dry_run_calls = []
+
+        async def _spy_dry_run(**kwargs):
+            dry_run_calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked('verify exhausted')
+
+        await asyncio.sleep(0)
+
+        # hook was NOT called — no worktree means no meaningful investigation target
+        assert len(dry_run_calls) == 0
+
+        # but the 'blocked' status write still happened
+        assert 'blocked' in scheduler.statuses.get('45', [])
+
+
+# ---------------------------------------------------------------------------
+# Suggestion 5: deduplication — second _mark_blocked does not spawn again
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedDeduplicatesDryRun:
+    @pytest.mark.asyncio
+    async def test_mark_blocked_skips_duplicate_dry_run_when_one_already_running(
+        self, tmp_path
+    ):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='46', enabled=True)
+
+        calls = []
+        hang_event = asyncio.Event()
+
+        async def _hanging_dry_run(**kwargs):
+            calls.append(kwargs)
+            await hang_event.wait()
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_hanging_dry_run):
+            # First call — spawns a background task that hangs
+            await asyncio.wait_for(
+                wf._mark_blocked('verify exhausted', detail='attempt 1'),
+                timeout=2.0,
+            )
+            await asyncio.sleep(0)  # let the task register
+
+            # Second call while the first investigation is still running
+            await asyncio.wait_for(
+                wf._mark_blocked('verify exhausted', detail='attempt 2'),
+                timeout=2.0,
+            )
+            await asyncio.sleep(0)
+
+        # Only one investigation spawned despite two _mark_blocked calls
+        assert len(calls) == 1, (
+            f'Expected 1 dry-run invocation, got {len(calls)}'
+        )
+
+        # Clean up: release the hanging task
+        pending = list(wf._background_tasks)
+        hang_event.set()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
