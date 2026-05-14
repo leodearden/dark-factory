@@ -143,3 +143,136 @@ class TestEscalateBlockerDedupe:
             f'Expected notify callback to fire exactly once for parent; '
             f'got: {fired_ids}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestEscalateInfoDedupe
+# ---------------------------------------------------------------------------
+
+
+class TestEscalateInfoDedupe:
+    """escalate_info also gains dedupe behaviour via the same _submit_or_dedupe helper."""
+
+    @pytest.mark.asyncio
+    async def test_two_info_calls_fold(self, tmp_path: Path):
+        """(a) Two escalate_info calls with the same infra_issue summary fold to one file.
+
+        Second response: {id: parent_id, status: dedup_skipped, parent_id: parent_id}
+        Note: NO 'action' key — that is only on the blocker path.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        first = _info.__wrapped__ if hasattr(_info, '__wrapped__') else None  # defensive
+        first = await _info(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+        assert first['status'] == 'queued'
+        assert 'action' not in first, 'escalate_info must NOT return action key'
+
+        second = await _info(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+        assert 'action' not in second, 'escalate_info must NOT return action key'
+
+        # One file on disk; parent.dedupe_count == 1
+        files = _queue_root_files(queue)
+        assert len(files) == 1
+        from escalation.models import Escalation
+        parent = Escalation.from_json(files[0].read_text())
+        assert parent.dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cross_severity_blocker_then_info(self, tmp_path: Path):
+        """(b) Cross-severity: blocker creates parent, info dedupes against it.
+
+        Parent's severity stays 'blocking' — info call does not demote it.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        first = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+
+        second = await _info(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='Fused-memory  CONNECTION timeout!',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+
+        from escalation.models import Escalation
+        files = _queue_root_files(queue)
+        parent = Escalation.from_json(files[0].read_text())
+        assert parent.severity == 'blocking', (
+            'Parent severity must remain blocking after info dedupe'
+        )
+        assert parent.dedupe_count == 1
+
+
+# ---------------------------------------------------------------------------
+# TestCrossTaskDedupe
+# ---------------------------------------------------------------------------
+
+
+class TestCrossTaskDedupe:
+    """Cross-task infra_issue folding: two different task_ids, same summary -> same parent."""
+
+    @pytest.mark.asyncio
+    async def test_cross_task_blocker_dedupes(self, tmp_path: Path):
+        """escalate_blocker from task_id='42' then task_id='99' with same infra_issue summary:
+        second call dedupes to the parent id from task_id='42'.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = _make_server(queue)
+
+        first = await _blocker(
+            server,
+            task_id='42',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        parent_id = first['id']
+
+        second = await _blocker(
+            server,
+            task_id='99',
+            agent_role='implementer',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 9999',
+        )
+
+        assert second['status'] == 'dedup_skipped'
+        assert second['parent_id'] == parent_id
+
+        # Still exactly one file — the task-42 parent
+        files = _queue_root_files(queue)
+        assert len(files) == 1
+
+        from escalation.models import Escalation
+        parent = Escalation.from_json(files[0].read_text())
+        assert parent.task_id == '42'
+        assert parent.dedupe_count == 1
