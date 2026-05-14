@@ -3906,7 +3906,7 @@ class TestReserveNowShortCircuit:
         store.set_override('/proj', 'A', reserve_now=True)
 
         recording_store = _RecordingEventStore()
-        scheduler = Scheduler(config, override_store=store, event_store=recording_store)
+        scheduler = Scheduler(config, override_store=store, event_store=recording_store)  # type: ignore[arg-type]
         scheduler._project_root = '/proj'
 
         task_a = {
