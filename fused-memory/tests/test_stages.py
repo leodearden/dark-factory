@@ -91,6 +91,42 @@ def make_configured_task_knowledge_sync_stage(deps: dict, *, project_id: str, pr
     return stage
 
 
+class TestMakeConfiguredTaskKnowledgeSyncStage:
+    """Characterize the make_configured_task_knowledge_sync_stage factory contract."""
+
+    def test_returns_task_knowledge_sync_with_required_attributes(self):
+        """Factory returns a TaskKnowledgeSync with project_id, project_root, and _current_run_id set."""
+        deps = {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+        }
+        stage = make_configured_task_knowledge_sync_stage(
+            deps, project_id='reify', project_root='/home/leo/src/reify'
+        )
+        assert isinstance(stage, TaskKnowledgeSync)
+        assert stage.project_id == 'reify'
+        assert stage.project_root == '/home/leo/src/reify'
+        assert stage._current_run_id == 'test-run'
+
+    def test_mocks_are_wired_through(self):
+        """Factory passes deps kwargs directly to TaskKnowledgeSync constructor."""
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+        deps = {
+            'memory_service': memory_service,
+            'taskmaster': taskmaster,
+            'journal': AsyncMock(),
+            'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+        }
+        stage = make_configured_task_knowledge_sync_stage(
+            deps, project_id='dark_factory', project_root='/home/leo/src/dark-factory'
+        )
+        assert stage.memory is memory_service
+        assert stage.taskmaster is taskmaster
+
+
 class TestMockTypesConstant:
     """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
 
