@@ -282,3 +282,38 @@ class TestCuratorUsageGateLeakGuard:
 
         assert result == (None, None), f'Expected (None, None), got {result!r}'
 
+    @pytest.mark.asyncio
+    async def test_setup_preserves_original_error_when_cleanup_cancelled(self, tmp_path):
+        """Original UsageGate init error must survive even if CostStore.close() raises
+        CancelledError mid-cleanup.
+
+        On current main the inner ``except Exception:`` does NOT catch
+        ``asyncio.CancelledError`` (a BaseException since Python 3.8), so the
+        cancel escapes the inner guard and the caller sees CancelledError instead
+        of the original RuntimeError — this test will FAIL until step-4 widens
+        the inner handler to ``except BaseException:`` and wraps with
+        ``asyncio.shield``.
+        """
+        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+
+        acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
+        usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
+        config = MagicMock()
+        config.usage_cap = usage_cap_cfg
+        config.reconciliation = MagicMock(data_dir=str(tmp_path))
+
+        # close() raises CancelledError — simulates a cancel arriving mid-cleanup.
+        cancel_close = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with (
+            patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}),
+            patch.object(CostStore, 'close', cancel_close),
+            patch.object(
+                UsageGate,
+                '__init__',
+                side_effect=RuntimeError('original init failure'),
+            ),
+            pytest.raises(RuntimeError, match='original init failure'),
+        ):
+            await _setup_curator_usage_gate(config)
+
