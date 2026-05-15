@@ -521,3 +521,14 @@ pins this contract end-to-end using only the public escalation API.  It verifies
 that `get_by_task('99', status='pending', level=0)` returns `[]` before and
 after parent resolution, that the parent is properly archived, and that task 99
 can submit new escalations after the parent resolves with no lingering dedupe block.
+
+`orchestrator/tests/test_cross_task_dedupe_reengagement.py::TestCrossTaskDedupeReengagement`
+extends verification one layer up into the orchestrator integration boundary.
+It exercises the real `Harness._on_escalation_resolved` callback and asserts the
+per-task event fan-out directly: parent A's `asyncio.Event` is set on resolve;
+child B's event is not.  It also verifies that after resolve the
+`EscalationQueue` gates (`get_by_task(task_id, status='pending', level=0) == []`
+and `has_open_l1(task_id) is False`) are clear for both A and B, making both
+tasks eligible for re-acquisition by a natural scheduler sweep.  Together these
+two suites pin the contract end-to-end across both the escalation-API layer and
+the orchestrator-harness integration layer.
