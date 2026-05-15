@@ -87,6 +87,7 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
+from dashboard.data.scheduler import collect_scheduler_state
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
     get_memory_timeseries,
@@ -762,6 +763,244 @@ async def api_curator(request: Request) -> JSONResponse:
         paused_reason=None,
         pending_total=pending_total,
     ))
+
+
+@app.get('/api/v2/dashboard/scheduler')
+async def api_scheduler(request: Request) -> JSONResponse:
+    """SCHEDULER — task contention, parks, overrides, and event sparklines."""
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    rows, modules, pin_queue, events_by_task, offline_projects = \
+        await collect_scheduler_state(http_client, config)
+    return JSONResponse(redux_api.shape_scheduler(
+        rows=rows,
+        modules=modules,
+        pin_queue=pin_queue,
+        events_by_task=events_by_task,
+        offline_projects=offline_projects,
+        snapshot_at=None,
+    ))
+
+
+_VALID_BOOST_TIERS = frozenset({'critical', 'high', 'medium', 'low', 'polish'})
+# Dashboard boundary uses 'ttl_until' (matching the row/override shape).
+# The MCP tool expects 'ttl' — translation happens in api_scheduler_clear_override.
+_VALID_CLEAR_FIELDS = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl_until'})
+
+
+def _sched_fan_out_error(errors: list[str]) -> JSONResponse:
+    return JSONResponse(
+        {'error': 'fused_memory_unreachable', 'detail': '; '.join(errors)},
+        status_code=502,
+    )
+
+
+async def _scheduler_proxy(
+    http_client: httpx.AsyncClient,
+    config: DashboardConfig,
+    tool_name: str,
+    args: dict,
+    *,
+    treat_not_found_as_404: bool = True,
+) -> JSONResponse:
+    """Fan out an MCP tool call over all fused_memory_urls, return first success.
+
+    Validation and argument construction happen in the calling route handler;
+    this helper is responsible only for the fan-out, transport error handling,
+    and status-code mapping (502 when all URLs fail, optional 404 on not_found).
+    """
+    errors: list[str] = []
+    for url in config.fused_memory_urls:
+        try:
+            result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
+        except (httpx.ConnectError, httpx.TimeoutException,
+                httpx.HTTPStatusError, ValueError) as exc:
+            logger.warning('%s failed for %s: %s', tool_name, url, exc)
+            errors.append(f'{url}: {str(exc)[:200]}')
+            memory_data.invalidate_session(url)
+            continue
+        # Guard the not_found mapping with isinstance: an MCP tool that
+        # returns a list or None (buggy/older server) would AttributeError
+        # on `.get(...)` and escape as a 500.  Defensive at the single
+        # boundary that all override/clear/reorder endpoints share.
+        if (
+            treat_not_found_as_404
+            and isinstance(result, dict)
+            and result.get('error') == 'not_found'
+        ):
+            return JSONResponse(result, status_code=404)
+        return JSONResponse(result)
+    return _sched_fan_out_error(errors)
+
+
+@app.post('/api/v2/dashboard/scheduler/override')
+async def api_scheduler_override(request: Request) -> JSONResponse:
+    """Proxy POST /scheduler/override → set_task_priority_override MCP tool."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = None
+
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'invalid_body'}, status_code=400)
+
+    task_id = body.get('task_id')
+    if not isinstance(task_id, str) or not task_id:
+        return JSONResponse({'error': 'invalid_task_id'}, status_code=400)
+
+    project_root = body.get('project_root')
+    if not isinstance(project_root, str) or not project_root:
+        return JSONResponse({'error': 'invalid_project_root'}, status_code=400)
+
+    boost_tier = body.get('boost_tier')
+    if boost_tier is not None and boost_tier not in _VALID_BOOST_TIERS:
+        return JSONResponse(
+            {'error': 'invalid_boost_tier', 'detail': f'must be one of {sorted(_VALID_BOOST_TIERS)}'},
+            status_code=400,
+        )
+
+    # Type-check bool fields before forwarding — forwarding 'yes'/1 verbatim
+    # would surface whatever fused-memory chooses to return, inconsistent with
+    # the strict validation applied to boost_tier/ttl_minutes/task_id/project_root.
+    pinned = body.get('pinned')
+    if pinned is not None and not isinstance(pinned, bool):
+        return JSONResponse({'error': 'invalid_pinned'}, status_code=400)
+
+    reserve_now = body.get('reserve_now')
+    if reserve_now is not None and not isinstance(reserve_now, bool):
+        return JSONResponse({'error': 'invalid_reserve_now'}, status_code=400)
+
+    pin_order = body.get('pin_order')
+    # Reject non-integer pin_order (bool subclasses int in Python, so exclude it)
+    if pin_order is not None and not (isinstance(pin_order, int) and not isinstance(pin_order, bool)):
+        return JSONResponse(
+            {'error': 'invalid_pin_order', 'detail': 'pin_order must be an integer'},
+            status_code=400,
+        )
+    if pin_order is not None and pinned is not True:
+        return JSONResponse(
+            {'error': 'invalid_pin_order', 'detail': 'pin_order requires pinned=True'},
+            status_code=400,
+        )
+
+    # Validate and translate ttl_minutes → ttl_secs.
+    # Client (scheduler_drawer.jsx) sends ttl_minutes; the MCP tool takes ttl_secs.
+    # ttl_until is not forwarded — MCP uses ttl_secs, so passing ttl_until verbatim
+    # was always a no-op.
+    ttl_secs: int | None = None
+    if 'ttl_minutes' in body:
+        ttl_raw = body['ttl_minutes']
+        try:
+            ttl_val = float(ttl_raw)  # raises TypeError for None
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {'error': 'invalid_ttl_minutes', 'detail': 'ttl_minutes must be a positive number ≤ 1440'},
+                status_code=400,
+            )
+        if ttl_val <= 0 or ttl_val > 1440:
+            return JSONResponse(
+                {'error': 'invalid_ttl_minutes', 'detail': 'ttl_minutes must be a positive number ≤ 1440'},
+                status_code=400,
+            )
+        ttl_secs = int(round(ttl_val * 60))
+
+    args: dict = {'task_id': task_id, 'project_root': project_root}
+    # Forward recognised optional fields; exclude ttl_until (not a MCP param)
+    # and ttl_minutes (translated above into ttl_secs).
+    for key in ('boost_tier', 'pinned', 'pin_order', 'reserve_now'):
+        if key in body:
+            args[key] = body[key]
+    if ttl_secs is not None:
+        args['ttl_secs'] = ttl_secs
+
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    return await _scheduler_proxy(http_client, config, 'set_task_priority_override', args)
+
+
+@app.post('/api/v2/dashboard/scheduler/clear-override')
+async def api_scheduler_clear_override(request: Request) -> JSONResponse:
+    """Proxy POST /scheduler/clear-override → clear_task_priority_override MCP tool."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = None
+
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'invalid_body'}, status_code=400)
+
+    task_id = body.get('task_id')
+    if not isinstance(task_id, str) or not task_id:
+        return JSONResponse({'error': 'invalid_task_id'}, status_code=400)
+
+    project_root = body.get('project_root')
+    if not isinstance(project_root, str) or not project_root:
+        return JSONResponse({'error': 'invalid_project_root'}, status_code=400)
+
+    fields = body.get('fields')
+    if fields is not None:
+        if not isinstance(fields, list):
+            return JSONResponse({'error': 'invalid_fields', 'detail': 'fields must be a list'}, status_code=400)
+        invalid = [f for f in fields if f not in _VALID_CLEAR_FIELDS]
+        if invalid:
+            return JSONResponse(
+                {'error': 'invalid_fields', 'detail': f'unknown fields: {invalid}'},
+                status_code=400,
+            )
+
+    args: dict = {'task_id': task_id, 'project_root': project_root}
+    if fields is not None:
+        # Translate 'ttl_until' → 'ttl': the dashboard boundary speaks 'ttl_until'
+        # (matching the row shape), but the MCP tool's wire format uses 'ttl'.
+        args['fields'] = ['ttl' if f == 'ttl_until' else f for f in fields]
+
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    return await _scheduler_proxy(http_client, config, 'clear_task_priority_override', args)
+
+
+@app.post('/api/v2/dashboard/scheduler/reorder-pin-queue')
+async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
+    """Proxy POST /scheduler/reorder-pin-queue → reorder_pin_queue MCP tool."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = None
+
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'invalid_body'}, status_code=400)
+
+    task_ids = body.get('task_ids')
+    if not isinstance(task_ids, list):
+        return JSONResponse({'error': 'invalid_task_ids', 'detail': 'task_ids must be a list'}, status_code=400)
+
+    # Validate each element at the boundary — the override endpoint enforces
+    # str/non-empty for task_id, and reorder should match.  Without this a
+    # request like task_ids=[None, {}, []] would proceed past the duplicate
+    # check (str() of dissimilar non-string objects rarely collides) and the
+    # failure would surface from fused-memory rather than failing fast here.
+    if not all(isinstance(t, str) and t for t in task_ids):
+        return JSONResponse(
+            {'error': 'invalid_task_ids', 'detail': 'task_ids must be non-empty strings'},
+            status_code=400,
+        )
+
+    project_root = body.get('project_root')
+    if not isinstance(project_root, str) or not project_root:
+        return JSONResponse({'error': 'invalid_project_root'}, status_code=400)
+
+    if len(task_ids) != len(set(task_ids)):
+        return JSONResponse({'error': 'duplicate_task_ids'}, status_code=400)
+
+    config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    # reorder_pin_queue forwards MCP results verbatim (no not_found→404 mapping),
+    # so the React layer can toast on 'mismatch' without an extra round-trip.
+    return await _scheduler_proxy(
+        http_client, config, 'reorder_pin_queue',
+        {'task_ids': task_ids, 'project_root': project_root},
+        treat_not_found_as_404=False,
+    )
 
 
 @app.get('/api/v2/dashboard/burndown')
