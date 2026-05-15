@@ -872,7 +872,10 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
     If the snapshot's ``_total`` settles back to ≤ *threshold* and delta is
     zero (transient burst that resolved between the two reads), one INFO line
     with ``transient=true`` is emitted so operators can distinguish a resolved
-    spike from a sustained one.
+    spike from a sustained one.  When the spike resolves but delta is non-zero
+    (count changed relative to *prev*), the first branch emits an ordinary INFO
+    line — that is intentional, as the non-zero delta already distinguishes it
+    from steady-state silence.
 
     Extracted from the inline ``_thread_monitor`` async closure so unit tests
     can exercise the logging logic without mocking ``asyncio.sleep``.
@@ -892,7 +895,9 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
             logger.log(level, 'thread_monitor: breakdown %s', breakdown)
     elif snapshot is not None:
         # Transient spike: active_count exceeded threshold but settled by snapshot time.
-        logger.info('thread_monitor: threads=%d delta=%+d transient=true', count, delta)
+        # delta is always 0 here (the guarding `if` excludes delta != 0), so it is
+        # omitted from the message to avoid a misleading constant "delta=+0" token.
+        logger.info('thread_monitor: threads=%d transient=true', count)
     return count
 
 
