@@ -2022,7 +2022,7 @@ Output JSON matching the schema. Every task must appear in the output.
             cur = await conn.execute(sql, (*leading_params, cutoff))
             row = await cur.fetchone()
             await cur.close()
-            return row
+            return tuple(row) if row is not None else None
         except Exception as exc:  # noqa: BLE001 — never block dispatch on this
             logger.warning(
                 '%s: trailing-24h cost query failed (%s) — fail-open',

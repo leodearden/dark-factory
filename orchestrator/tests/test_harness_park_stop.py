@@ -641,7 +641,7 @@ class TestHarnessCostCeiling:
         result = await harness.scheduler.acquire_next()
         assert result is None, (
             'acquire_next must return None here because the task tree is empty, '
-            'NOT because the scheduler is paused; got %r' % (result,)
+            f'NOT because the scheduler is paused; got {result!r}'
         )
         assert harness.scheduler.is_paused is False, (
             'Sanity: scheduler must still be unpaused after acquire_next call'
