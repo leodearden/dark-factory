@@ -395,7 +395,7 @@ class TestParkStopE2E:
 
 
 class TestHarnessCostCeiling:
-    """Tests for cost-ceiling config fields, _trailing_24h_cost_usd, and _enforce_cost_ceilings.
+    """Tests for cost-ceiling config fields and _enforce_cost_ceilings.
 
     Task 1323 — AFK hardening: Daily cost ceiling with watcher + orch-wide budgets.
     """
@@ -425,120 +425,100 @@ class TestHarnessCostCeiling:
         assert config.orch_daily_cost_ceiling_usd == 99.5
 
     # ------------------------------------------------------------------
-    # Step 3 — _trailing_24h_cost_usd (all roles, watcher_only=False)
+    # _auto_eval_budget_used_24h real-SQL coverage
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_trailing_24h_cost_usd_sums_within_window(
+    async def test_auto_eval_budget_used_24h_real_sql_filters_by_task_id_and_window(
         self, tmp_path: Path, _cost_store_factory
     ) -> None:
-        """_trailing_24h_cost_usd sums rows within the 24h window and excludes older ones."""
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _cost_store_factory()
-        harness.cost_store = store
+        """_auto_eval_budget_used_24h sums only tracked task_ids within the 24h window.
 
-        # Within window: two rows, different roles
-        await store.save_invocation(
-            run_id='r1', task_id='t1', project_id='dark_factory',
-            account_name='acct', model='sonnet', role='orchestrator',
-            cost_usd=5.0, input_tokens=None, output_tokens=None,
-            cache_read_tokens=None, cache_create_tokens=None,
-            duration_ms=100, capped=False,
-            started_at=_iso(timedelta(hours=-1)),
-            completed_at=_iso(timedelta(hours=-1)),
-        )
-        await store.save_invocation(
-            run_id='r2', task_id='t2', project_id='dark_factory',
-            account_name='acct', model='sonnet', role='escalation-watcher-auto',
-            cost_usd=3.0, input_tokens=None, output_tokens=None,
-            cache_read_tokens=None, cache_create_tokens=None,
-            duration_ms=100, capped=False,
-            started_at=_iso(timedelta(hours=-2)),
-            completed_at=_iso(timedelta(hours=-2)),
-        )
-        # Outside window (25h ago — must be excluded)
-        await store.save_invocation(
-            run_id='r3', task_id='t3', project_id='dark_factory',
-            account_name='acct', model='sonnet', role='steward',
-            cost_usd=100.0, input_tokens=None, output_tokens=None,
-            cache_read_tokens=None, cache_create_tokens=None,
-            duration_ms=100, capped=False,
-            started_at=_iso(timedelta(hours=-25)),
-            completed_at=_iso(timedelta(hours=-25)),
-        )
-
-        result = await harness._trailing_24h_cost_usd(watcher_only=False)
-        assert result == pytest.approx(8.0), (
-            f'Expected 5.0 + 3.0 = 8.0 for rows within 24h; got {result!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_trailing_24h_cost_usd_no_cost_store(self, tmp_path: Path) -> None:
-        """_trailing_24h_cost_usd returns 0.0 when cost_store is None."""
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        harness.cost_store = None
-
-        result = await harness._trailing_24h_cost_usd(watcher_only=False)
-        assert result == 0.0, f'Expected 0.0 with no cost_store; got {result!r}'
-
-    @pytest.mark.asyncio
-    async def test_trailing_24h_cost_usd_empty_table(
-        self, tmp_path: Path, _cost_store_factory
-    ) -> None:
-        """_trailing_24h_cost_usd returns 0.0 when no rows exist."""
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _cost_store_factory()
-        harness.cost_store = store
-
-        result = await harness._trailing_24h_cost_usd(watcher_only=False)
-        assert result == 0.0, f'Expected 0.0 for empty table; got {result!r}'
-
-    # ------------------------------------------------------------------
-    # Step 5 — _trailing_24h_cost_usd(watcher_only=True) role filter
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_trailing_24h_cost_usd_watcher_only_filters_role(
-        self, tmp_path: Path, _cost_store_factory
-    ) -> None:
-        """watcher_only=True sums only rows with role matching '%watcher%'.
-
-        Seeds:
-          - role='escalation-watcher-auto'  cost=7.0  (within window) — INCLUDED
-          - role='terminal-status-watcher'  cost=3.0  (within window) — INCLUDED
-          - role='orchestrator'             cost=20.0 (within window) — EXCLUDED
-          - role='steward'                  cost=15.0 (within window) — EXCLUDED
-        Expects watcher_only=True → 10.0; watcher_only=False → 45.0.
+        Seeds three rows:
+          - task_id='redo-1', within 24h,  cost=4.0  — INCLUDED
+          - task_id='redo-2', outside 24h, cost=10.0 — EXCLUDED (too old)
+          - task_id='untracked-3', within 24h, cost=99.0 — EXCLUDED (not tracked)
+        harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'} (tracks redo-1 & redo-2).
+        Expected sum = 4.0 (only redo-1 qualifies on both axes).
         """
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         store = await _cost_store_factory()
         harness.cost_store = store
 
-        rows = [
-            ('escalation-watcher-auto', 7.0),
-            ('terminal-status-watcher', 3.0),
-            ('orchestrator', 20.0),
-            ('steward', 15.0),
-        ]
-        for i, (role, cost) in enumerate(rows):
-            await store.save_invocation(
-                run_id=f'r{i}', task_id=f't{i}', project_id='dark_factory',
-                account_name='acct', model='sonnet', role=role,
-                cost_usd=cost, input_tokens=None, output_tokens=None,
-                cache_read_tokens=None, cache_create_tokens=None,
-                duration_ms=100, capped=False,
-                started_at=_iso(timedelta(hours=-(i + 1))),
-                completed_at=_iso(timedelta(hours=-(i + 1))),
-            )
-
-        watcher_sum = await harness._trailing_24h_cost_usd(watcher_only=True)
-        assert watcher_sum == pytest.approx(10.0), (
-            f'Expected 7.0+3.0=10.0 for watcher_only=True; got {watcher_sum!r}'
+        # Row 1: tracked, within 24h — should be counted
+        await store.save_invocation(
+            run_id='r1', task_id='redo-1', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=4.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+        # Row 2: tracked, but outside 24h window — should be excluded
+        await store.save_invocation(
+            run_id='r2', task_id='redo-2', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=10.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-25)),
+            completed_at=_iso(timedelta(hours=-25)),
+        )
+        # Row 3: not tracked, within 24h — should be excluded
+        await store.save_invocation(
+            run_id='r3', task_id='untracked-3', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=99.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-2)),
+            completed_at=_iso(timedelta(hours=-2)),
         )
 
-        total_sum = await harness._trailing_24h_cost_usd(watcher_only=False)
-        assert total_sum == pytest.approx(45.0), (
-            f'Expected 45.0 for watcher_only=False; got {total_sum!r}'
+        harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'}
+
+        result = await harness._auto_eval_budget_used_24h()
+        assert result == pytest.approx(4.0), (
+            f'Expected 4.0 (only redo-1: tracked AND within 24h); '
+            f'redo-2 is outside window, untracked-3 is not in tracked set. '
+            f'Got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_eval_budget_used_24h_returns_zero_when_no_tracked_ids(
+        self, tmp_path: Path
+    ) -> None:
+        """_auto_eval_budget_used_24h returns 0.0 immediately when redo set is empty.
+
+        The short-circuit must fire before touching cost_store, so cost_store=None
+        still returns 0.0 (no AttributeError).
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.cost_store = None  # ensure DB is not consulted
+        harness._auto_eval_redo_task_ids = set()
+
+        result = await harness._auto_eval_budget_used_24h()
+        assert result == 0.0, (
+            f'Expected 0.0 from empty redo set short-circuit; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_eval_budget_used_24h_returns_zero_when_cost_store_none(
+        self, tmp_path: Path
+    ) -> None:
+        """_auto_eval_budget_used_24h returns 0.0 when cost_store is None (fail-open).
+
+        Even with a non-empty redo set the helper-None → 0.0 path must fire
+        rather than raising AttributeError or blocking dispatch.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.cost_store = None  # simulate missing cost DB
+        harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'}
+
+        result = await harness._auto_eval_budget_used_24h()
+        assert result == 0.0, (
+            f'Expected 0.0 when cost_store is None (fail-open); got {result!r}'
         )
 
     # ------------------------------------------------------------------
@@ -676,9 +656,14 @@ class TestHarnessCostCeiling:
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
 
-        # acquire_next should return None only if paused; here it should proceed
-        # (returns None because no tasks, but NOT because paused).
-        assert not harness.scheduler.is_paused
+        result = await harness.scheduler.acquire_next()
+        assert result is None, (
+            'acquire_next must return None here because the task tree is empty, '
+            f'NOT because the scheduler is paused; got {result!r}'
+        )
+        assert harness.scheduler.is_paused is False, (
+            'Sanity: scheduler must still be unpaused after acquire_next call'
+        )
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_both_exceed_watcher_reason_wins(
@@ -808,32 +793,6 @@ class TestHarnessCostCeiling:
         assert result is None, (
             f'acquire_next() must return None after cost-ceiling trip; got {result!r}'
         )
-
-    # ------------------------------------------------------------------
-    # Suggestion 5 — exception-swallowing (fail-open) behavior
-    # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_trailing_24h_cost_usd_query_exception_returns_zero(
-        self, tmp_path: Path, _cost_store_factory
-    ) -> None:
-        """DB query failure in _trailing_24h_cost_usd returns 0.0 (fail-open).
-
-        Closing the store before the call forces _require_conn() to raise
-        RuntimeError, exercising the broad ``except Exception`` handler that
-        swallows errors so dispatch is never blocked by a transient DB issue.
-        Task 1323.
-        """
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _cost_store_factory()
-        harness.cost_store = store
-
-        # Closing the underlying connection forces _require_conn() to raise.
-        # The fixture teardown will call close() again, which is idempotent.
-        await store.close()
-
-        result = await harness._trailing_24h_cost_usd(watcher_only=False)
-        assert result == 0.0, f'Expected 0.0 on query failure; got {result!r}'
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_query_exception_no_pause(
