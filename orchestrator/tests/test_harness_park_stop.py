@@ -1018,8 +1018,8 @@ class TestHarnessCostCeiling:
         cutoff_iso = call.args[0] if call.args else call.kwargs.get('start_iso')
         now_iso = (call.args[1] if len(call.args) > 1 else call.kwargs.get('end_iso'))
 
-        assert cutoff_iso is not None, 'start_iso arg missing from aggregate_window call'
-        assert now_iso is not None, 'end_iso arg missing from aggregate_window call'
+        assert cutoff_iso is not None, 'start_iso arg missing from cost_totals_in_window call'
+        assert now_iso is not None, 'end_iso arg missing from cost_totals_in_window call'
         cutoff_dt = datetime.fromisoformat(cutoff_iso)
         now_dt = datetime.fromisoformat(now_iso)
 
