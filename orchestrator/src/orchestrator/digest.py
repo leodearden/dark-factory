@@ -285,46 +285,24 @@ async def cost_in_window(
 ) -> CostStats:
     """Return cost aggregation for the digest window and trailing-24h.
 
-    Mirrors the SQL pattern from Harness._enforce_cost_ceilings (single query
-    with conditional aggregation) issuing one query for the window and one for
-    trailing-24h.  Uses cost_store._require_conn() exactly as
-    Harness._enforce_cost_ceilings does.
+    Delegates to ``CostStore.aggregate_window`` — once for the explicit
+    window bounds and once for the trailing-24h window ending at now.
 
     Fail-open: cost_store is None or any exception → CostStats with all zeros.
     """
     if cost_store is None:
         return CostStats()
     try:
-        conn = cost_store._require_conn()  # type: ignore[attr-defined]
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        cutoff_24h_iso = (now - timedelta(hours=24)).isoformat()
 
-        # Window query: watcher cost + total cost inside [window_start, window_end]
-        cur = await conn.execute(
-            'SELECT '
-            '  COALESCE(SUM(cost_usd), 0.0), '
-            '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
-            'FROM invocations '
-            'WHERE completed_at BETWEEN ? AND ?',
-            ('%watcher%', window_start_iso, window_end_iso),
+        total_win, watcher_win = await cost_store.aggregate_window(
+            window_start_iso, window_end_iso
         )
-        row_win = await cur.fetchone()
-        await cur.close()
-        total_win = float(row_win[0]) if row_win and row_win[0] is not None else 0.0
-        watcher_win = float(row_win[1]) if row_win and row_win[1] is not None else 0.0
-
-        # Trailing-24h query
-        cutoff_24h = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        cur = await conn.execute(
-            'SELECT '
-            '  COALESCE(SUM(cost_usd), 0.0), '
-            '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
-            'FROM invocations '
-            'WHERE completed_at >= ?',
-            ('%watcher%', cutoff_24h),
+        total_24h, watcher_24h = await cost_store.aggregate_window(
+            cutoff_24h_iso, now_iso
         )
-        row_24h = await cur.fetchone()
-        await cur.close()
-        total_24h = float(row_24h[0]) if row_24h and row_24h[0] is not None else 0.0
-        watcher_24h = float(row_24h[1]) if row_24h and row_24h[1] is not None else 0.0
 
         return CostStats(
             watcher_cost_in_window=watcher_win,
