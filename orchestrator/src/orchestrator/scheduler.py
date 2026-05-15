@@ -2485,13 +2485,22 @@ class Scheduler:
         Swallows all exceptions so the scheduler never stops ticking due to
         disk or serialisation errors.
         """
-        # Guard: when config.project_root is None, scheduler.py:692 produces
-        # self._project_root = str(None) == 'None'.  Without this check,
-        # Path('None') / 'data' / 'orchestrator' / 'scheduler_state.json'
-        # would silently create a directory literally named ./None/ under the
-        # process CWD.  Refuse the write instead.  This guard MUST run before
-        # any timestamp bookkeeping so a no-project-root scheduler does not
-        # advance _last_snapshot_write_ts for a write that never happens.
+        # Guard: defensive belt-and-suspenders against a _project_root that
+        # bypassed pydantic validation.  Under normal operation this branch is
+        # unreachable: config.py:875 types project_root as
+        #   Path = Field(default=Path('.'))
+        # with an after-validator at config.py:880-883 that calls .resolve(),
+        # and validate_assignment=True at config.py:948 — so pydantic rejects
+        # None on both construction and assignment.  The only path that produces
+        # 'None'/empty in _project_root (set at scheduler.py:692 via
+        # str(config.project_root)) is a value that bypassed pydantic
+        # validation entirely, e.g. via object.__setattr__ as the task-1334
+        # guard tests do.  Without this check, Path('None') / 'data' /
+        # 'orchestrator' / 'scheduler_state.json' would create a directory
+        # literally named ./None/ under the process CWD.  Refuse the write
+        # instead.  This guard MUST run before any timestamp bookkeeping so a
+        # no-project-root scheduler does not advance _last_snapshot_write_ts
+        # for a write that never happens.
         if not self._project_root or self._project_root == 'None':
             if not self._snapshot_guard_warned:
                 self._snapshot_guard_warned = True
