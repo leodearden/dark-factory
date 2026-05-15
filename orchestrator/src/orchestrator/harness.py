@@ -2060,12 +2060,40 @@ Output JSON matching the schema. Every task must appear in the output.
 
         The first ceiling that trips wins.  When the scheduler is already
         paused (from any source), returns immediately to avoid redundant
-        RunStore writes and duplicate log spam.  Task 1323.
+        RunStore writes and duplicate log spam.
+
+        Both totals are fetched in a single query using conditional aggregation
+        (``SUM(CASE WHEN role LIKE '%watcher%' THEN cost_usd END)``) so the
+        invocations table is scanned at most once per tick.  On any DB error the
+        method returns immediately without pausing (fail-open: a transient
+        query failure must never stop dispatch).  Task 1323.
         """
         if self.scheduler.is_paused:
             return
+        if self.cost_store is None:
+            return
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        try:
+            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
+            cur = await conn.execute(
+                'SELECT '
+                '  COALESCE(SUM(cost_usd), 0.0), '
+                '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
+                'FROM invocations '
+                'WHERE completed_at >= ?',
+                ('%watcher%', cutoff),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            total = float(row[0]) if row and row[0] is not None else 0.0
+            watcher = float(row[1]) if row and row[1] is not None else 0.0
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '_enforce_cost_ceilings: cost query failed (%s) — skip ceiling check',
+                exc,
+            )
+            return
 
-        watcher = await self._trailing_24h_cost_usd(watcher_only=True)
         if watcher >= self.config.watcher_daily_cost_ceiling_usd:
             logger.warning(
                 '_enforce_cost_ceilings: watcher 24h cost $%.2f >= ceiling $%.2f '
@@ -2075,7 +2103,6 @@ Output JSON matching the schema. Every task must appear in the output.
             await self.pause_scheduler('cost_ceiling_watcher_exceeded')
             return
 
-        total = await self._trailing_24h_cost_usd(watcher_only=False)
         if total >= self.config.orch_daily_cost_ceiling_usd:
             logger.warning(
                 '_enforce_cost_ceilings: orch-wide 24h cost $%.2f >= ceiling $%.2f '

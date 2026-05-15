@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 from shared.cost_store import CostStore
 
 from orchestrator.config import OrchestratorConfig
@@ -25,11 +26,30 @@ from orchestrator.run_store import RunStore
 # Helpers shared by cost-ceiling tests
 # ---------------------------------------------------------------------------
 
-async def _make_cost_store(tmp_path: Path, filename: str = 'cost.db') -> CostStore:
-    """Open a real CostStore in tmp_path; caller is responsible for close."""
-    store = CostStore(tmp_path / filename)
-    await store.open()
-    return store
+@pytest_asyncio.fixture
+async def _cost_store_factory(tmp_path: Path):
+    """Fixture factory that opens CostStore instances and closes them on teardown.
+
+    Usage within a test::
+
+        store = await _cost_store_factory()
+        store2 = await _cost_store_factory('other.db')
+
+    All opened stores are closed in a ``finally`` block when the test finishes,
+    preventing aiosqlite connection and background-thread leaks.
+    """
+    stores: list[CostStore] = []
+
+    async def _open(filename: str = 'cost.db') -> CostStore:
+        store = CostStore(tmp_path / filename)
+        await store.open()
+        stores.append(store)
+        return store
+
+    yield _open
+
+    for store in stores:
+        await store.close()
 
 
 def _iso(delta: timedelta) -> str:
@@ -409,10 +429,12 @@ class TestHarnessCostCeiling:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_trailing_24h_cost_usd_sums_within_window(self, tmp_path: Path) -> None:
+    async def test_trailing_24h_cost_usd_sums_within_window(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
         """_trailing_24h_cost_usd sums rows within the 24h window and excludes older ones."""
         harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         # Within window: two rows, different roles
@@ -460,10 +482,12 @@ class TestHarnessCostCeiling:
         assert result == 0.0, f'Expected 0.0 with no cost_store; got {result!r}'
 
     @pytest.mark.asyncio
-    async def test_trailing_24h_cost_usd_empty_table(self, tmp_path: Path) -> None:
+    async def test_trailing_24h_cost_usd_empty_table(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
         """_trailing_24h_cost_usd returns 0.0 when no rows exist."""
         harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         result = await harness._trailing_24h_cost_usd(watcher_only=False)
@@ -475,7 +499,7 @@ class TestHarnessCostCeiling:
 
     @pytest.mark.asyncio
     async def test_trailing_24h_cost_usd_watcher_only_filters_role(
-        self, tmp_path: Path
+        self, tmp_path: Path, _cost_store_factory
     ) -> None:
         """watcher_only=True sums only rows with role matching '%watcher%'.
 
@@ -487,7 +511,7 @@ class TestHarnessCostCeiling:
         Expects watcher_only=True → 10.0; watcher_only=False → 45.0.
         """
         harness, _, _ = _make_harness_with_mocks(tmp_path)
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         rows = [
@@ -522,7 +546,9 @@ class TestHarnessCostCeiling:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_enforce_cost_ceilings_watcher_trip(self, tmp_path: Path) -> None:
+    async def test_enforce_cost_ceilings_watcher_trip(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
         """Watcher cost exceeding watcher_daily_cost_ceiling_usd pauses the scheduler.
 
         Watcher sum > watcher ceiling; total still under orch ceiling.
@@ -538,7 +564,7 @@ class TestHarnessCostCeiling:
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
         harness._run_id = 'run-test-ceil-0001'
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         # Seed watcher rows summing to 11.0 (> ceiling of 10.0)
@@ -579,7 +605,9 @@ class TestHarnessCostCeiling:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_enforce_cost_ceilings_orch_wide_trip(self, tmp_path: Path) -> None:
+    async def test_enforce_cost_ceilings_orch_wide_trip(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
         """Orch-wide cost exceeding orch ceiling pauses with 'cost_ceiling_orch_exceeded'.
 
         Watcher cost is under its ceiling; total cost exceeds orch ceiling.
@@ -593,7 +621,7 @@ class TestHarnessCostCeiling:
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
         harness._run_id = 'run-test-orch-0001'
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         # Seed a non-watcher row summing to 25.0 > orch ceiling 20.0
@@ -615,7 +643,9 @@ class TestHarnessCostCeiling:
         )
 
     @pytest.mark.asyncio
-    async def test_enforce_cost_ceilings_both_under_no_pause(self, tmp_path: Path) -> None:
+    async def test_enforce_cost_ceilings_both_under_no_pause(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
         """When both ceilings are NOT exceeded, scheduler is not paused."""
         config = OrchestratorConfig(
             project_root=tmp_path,
@@ -626,7 +656,7 @@ class TestHarnessCostCeiling:
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
         harness._run_id = 'run-test-under-0001'
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         await store.save_invocation(
@@ -652,7 +682,7 @@ class TestHarnessCostCeiling:
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_both_exceed_watcher_reason_wins(
-        self, tmp_path: Path
+        self, tmp_path: Path, _cost_store_factory
     ) -> None:
         """When BOTH ceilings would be exceeded, watcher reason wins (checked first)."""
         config = OrchestratorConfig(
@@ -664,7 +694,7 @@ class TestHarnessCostCeiling:
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
         harness._run_id = 'run-test-both-0001'
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         # Watcher row: 8.0 > watcher ceiling 5.0 AND > orch ceiling 10? No — need
@@ -700,14 +730,14 @@ class TestHarnessCostCeiling:
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_already_paused_no_extra_call(
-        self, tmp_path: Path
+        self, tmp_path: Path, _cost_store_factory
     ) -> None:
         """When scheduler is already paused, _enforce_cost_ceilings() returns immediately.
 
         No additional RunStore.save_scheduler_pause call is made.
         """
         harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         # Pre-pause the scheduler.
@@ -727,10 +757,7 @@ class TestHarnessCostCeiling:
 
         await harness._enforce_cost_ceilings()
 
-        mock_run_store.save_scheduler_pause.assert_not_called(), (
-            'Already-paused scheduler: _enforce_cost_ceilings must NOT call '
-            'save_scheduler_pause again'
-        )
+        mock_run_store.save_scheduler_pause.assert_not_called()
         # Original pause reason must be preserved
         assert harness.scheduler.pause_reason == 'pre-existing-pause'
 
@@ -740,7 +767,7 @@ class TestHarnessCostCeiling:
 
     @pytest.mark.asyncio
     async def test_cost_ceiling_trip_acquire_next_returns_none(
-        self, tmp_path: Path
+        self, tmp_path: Path, _cost_store_factory
     ) -> None:
         """After _enforce_cost_ceilings trips, acquire_next() returns None.
 
@@ -757,7 +784,7 @@ class TestHarnessCostCeiling:
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
         harness._run_id = 'run-test-e2e-ceil-0001'
-        store = await _make_cost_store(tmp_path)
+        store = await _cost_store_factory()
         harness.cost_store = store
 
         # Seed watcher row exceeding ceiling.
@@ -781,3 +808,74 @@ class TestHarnessCostCeiling:
         assert result is None, (
             f'acquire_next() must return None after cost-ceiling trip; got {result!r}'
         )
+
+    # ------------------------------------------------------------------
+    # Suggestion 5 — exception-swallowing (fail-open) behavior
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_cost_usd_query_exception_returns_zero(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """DB query failure in _trailing_24h_cost_usd returns 0.0 (fail-open).
+
+        Closing the store before the call forces _require_conn() to raise
+        RuntimeError, exercising the broad ``except Exception`` handler that
+        swallows errors so dispatch is never blocked by a transient DB issue.
+        Task 1323.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _cost_store_factory()
+        harness.cost_store = store
+
+        # Closing the underlying connection forces _require_conn() to raise.
+        # The fixture teardown will call close() again, which is idempotent.
+        await store.close()
+
+        result = await harness._trailing_24h_cost_usd(watcher_only=False)
+        assert result == 0.0, f'Expected 0.0 on query failure; got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_query_exception_no_pause(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """DB query failure in _enforce_cost_ceilings does not pause the scheduler.
+
+        The watcher ceiling (10.0) would be exceeded by the seeded cost (15.0)
+        if the query succeeded, but closing the DB connection before the call
+        forces a query failure.  Fail-open is the intentional contract: a
+        transient DB error must never stop dispatch.  Task 1323.
+        """
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=10.0,
+            orch_daily_cost_ceiling_usd=100.0,
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-exc-0001'
+        store = await _cost_store_factory()
+        harness.cost_store = store
+
+        # Seed watcher cost that would exceed the ceiling …
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='dark_factory',
+            account_name='acct', model='opus', role='escalation-watcher-auto',
+            cost_usd=15.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+
+        # … then close the connection so the query will fail.
+        # The fixture teardown calls close() again, which is idempotent.
+        await store.close()
+
+        await harness._enforce_cost_ceilings()
+
+        assert harness.scheduler.is_paused is False, (
+            'Scheduler must NOT be paused when cost query fails (fail-open)'
+        )
+        mock_run_store.save_scheduler_pause.assert_not_called()
