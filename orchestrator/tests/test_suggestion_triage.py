@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
@@ -386,7 +385,7 @@ class TestRouteReviewSuggestionsToCurator:
         queue.submit.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_mcp_none_falls_back_to_memory_when_no_queue(self):
+    async def test_mcp_none_no_queue_does_not_call_write_to_memory(self):
         """When both self.mcp and escalation_queue are None, only the audit WARNING is emitted.
 
         _write_suggestions_to_memory is NOT called — the previous dead call (which
@@ -433,20 +432,23 @@ class TestRouteReviewSuggestionsToCurator:
         # Regression guard: must not attempt any HTTP against missing MCP
         mock_post.assert_not_called()
 
-        # The audit warning must be present
-        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        drop_keywords = {'drop', 'no-op', 'no sink'}
-        assert any(
-            'suggestion' in t.lower() and any(kw in t.lower() for kw in drop_keywords)
-            for t in warning_texts
-        ), f'Expected WARNING with "suggestion" + drop keyword, got: {warning_texts}'
-
-        # Must also mention the count of dropped suggestions as a standalone number.
-        # Use word-boundary regex so '2' in task_id '42' does not satisfy the check.
-        n = len(suggestions)
-        assert any(
-            re.search(rf'\b{n}\b', t) is not None for t in warning_texts
-        ), f'Expected WARNING mentioning standalone count {n}, got: {warning_texts}'
+        # The audit warning must be present — assert on record.args to avoid
+        # prose-pinning: any rewording of the message text is fine so long as the
+        # task_id and suggestion count are passed as format arguments.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'orchestrator.workflow'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly one WARNING on orchestrator.workflow, got: {warning_records}'
+        )
+        rec = warning_records[0]
+        assert wf.task_id in rec.args, (
+            f'Expected task_id {wf.task_id!r} in record.args, got: {rec.args}'
+        )
+        assert len(suggestions) in rec.args, (
+            f'Expected suggestion count {len(suggestions)} in record.args, got: {rec.args}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -592,12 +594,12 @@ class TestDoneBranchCallSiteViaWorkflow:
         outcome = await wf._execute_verify_review_loop()
 
         assert outcome == WorkflowOutcome.DONE
+        assert route_mock.await_count == route_n
+        assert write_mock.await_count == write_n
         if route_n:
             route_mock.assert_awaited_once_with(reviews)
-            assert write_mock.await_count == 0
         else:
             write_mock.assert_awaited_once_with(reviews)
-            assert route_mock.await_count == 0
 
 
 # ---------------------------------------------------------------------------
