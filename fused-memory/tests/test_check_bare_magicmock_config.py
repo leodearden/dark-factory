@@ -231,6 +231,58 @@ class TestFindViolationsExemption:
         assert len(violations) == 1
 
 
+class TestFindViolationsOutputOrder:
+    """find_violations() returns violations sorted ascending by (lineno, col_offset)."""
+
+    def test_violations_sorted_ascending_by_lineno(self):
+        """Violations at different nesting depths come out in source order, not BFS order.
+
+        ast.walk() is breadth-first: module-level nodes before function body nodes,
+        outer function body before inner function body.  If find_violations() returns
+        raw BFS order, top_config (line 1) comes first, then mid_config (line 3) and
+        nested_config (line 5) — which *happens* to be ascending here.
+
+        To make BFS vs. source-order observable we place the module-level assignment
+        LAST in the source so that BFS order (module scope → outer fn → inner fn)
+        differs from source line order (outer fn → inner fn → module level).
+        """
+        # Source order:   outer_fn body (line 3) → inner_fn body (line 6) → module level (line 9)
+        # BFS order:      module level (line 9) → outer_fn body (line 3) → inner_fn body (line 6)
+        # Expected order: [3, 6, 9]  (ascending source order)
+        source = (
+            'def outer():\n'                      # line 1
+            '    def inner():\n'                  # line 2
+            '        inner_config = MagicMock()\n'  # line 3
+            '    mid_config = MagicMock()\n'      # line 4
+            'top_config = MagicMock()\n'          # line 5
+        )
+        violations = find_violations(source, 'test_order.py')
+        assert len(violations) == 3, (
+            f'Expected 3 violations, got {len(violations)}: {violations}'
+        )
+        linenos = [v.lineno for v in violations]
+        assert linenos == sorted(linenos), (
+            f'find_violations() must return violations sorted ascending by lineno; '
+            f'got {linenos}'
+        )
+
+    def test_violations_sorted_ascending_by_col_offset_within_same_line(self):
+        """Within the same line, violations are ordered by col_offset ascending."""
+        # Two chained assignments on different lines — col_offset for each is 0.
+        # Main test: same-line, different col_offsets via two separate stmts
+        # sharing a line is not possible, so we test via a chained assign
+        # where two targets have different col_offsets on the same line.
+        # Python AST: 'config = cfg = MagicMock()' — both on line 1.
+        # config is at col_offset 0; cfg is at col_offset 9.
+        source = 'config = cfg = MagicMock()\n'
+        violations = find_violations(source, 'test_col_order.py')
+        assert len(violations) == 2
+        col_offsets = [v.col_offset for v in violations]
+        assert col_offsets == sorted(col_offsets), (
+            f'find_violations() must sort by col_offset within same line; got {col_offsets}'
+        )
+
+
 class TestFindViolationsMultiTarget:
     """Multi-target and chained assignment: each ast.Name config-target is evaluated independently."""
 
