@@ -261,6 +261,19 @@ class TestModuleConfigDiscovery:
         assert config._module_configs['backend'].test_command == 'cargo test'
         assert config._module_configs['backend'].max_per_module == 2
 
+    def test_discover_finds_nested_orchestrator_yaml_at_depth_2(self, tmp_path: Path):
+        """_discover_module_configs finds orchestrator.yaml at depth >= 2."""
+        nested = tmp_path / 'foo' / 'bar'
+        nested.mkdir(parents=True)
+        (nested / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'pytest foo/bar/',
+        }))
+        configs = _discover_module_configs(tmp_path)
+        assert 'foo/bar' in configs
+        mc = configs['foo/bar']
+        assert mc.prefix == 'foo/bar'
+        assert mc.test_command == 'pytest foo/bar/'
+
 
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
