@@ -2360,6 +2360,13 @@ class Scheduler:
         Swallows all exceptions so the scheduler never stops ticking due to
         disk or serialisation errors.
         """
+        # Guard: when config.project_root is None, scheduler.py:692 produces
+        # self._project_root = str(None) == 'None'.  Without this check,
+        # Path('None') / 'data' / 'orchestrator' / 'scheduler_state.json'
+        # would silently create a directory literally named ./None/ under the
+        # process CWD.  Refuse the write instead.
+        if not self._project_root or self._project_root == 'None':
+            return
         try:
             path = (
                 Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'

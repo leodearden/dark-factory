@@ -598,3 +598,75 @@ class TestAcquireNextWritesSnapshot:
             'acquire_next must return a TaskAssignment even if snapshot write fails'
         )
         assert result.task_id == 'A'
+
+
+# ===========================================================================
+# Step-1334: _write_snapshot_best_effort short-circuits when project_root unset
+# ===========================================================================
+
+class TestWriteSnapshotBestEffortProjectRootGuard:
+    """_write_snapshot_best_effort skips the write when _project_root is unset."""
+
+    @pytest.mark.asyncio
+    async def test_write_snapshot_best_effort_skips_when_config_project_root_none(
+        self, tmp_path, monkeypatch
+    ):
+        """Construction-path repro: str(None) produces '_project_root == "None"';
+        the snapshot write must be refused rather than creating ./None/ on disk.
+
+        write_state_snapshot is intentionally NOT mocked here so that the
+        directory-existence assertion is a genuine end-to-end regression check:
+        if the guard were removed, write_state_snapshot would call
+        path.parent.mkdir(parents=True, exist_ok=True) and create
+        tmp_path/None/data/orchestrator/, making the assertion fail.
+        """
+        config = OrchestratorConfig(max_per_module=1)
+        # Bypass pydantic validate_assignment=True: field_validator raises for
+        # config.project_root = None, so use object.__setattr__ to inject None
+        # directly, faithfully reproducing the str(None) path in scheduler.py:692.
+        object.__setattr__(config, 'project_root', None)
+
+        scheduler = Scheduler(config)
+        # Sanity: document the exact literal that str(None) produces.
+        assert scheduler._project_root == 'None', (
+            f"Expected '_project_root' to be the literal string 'None', "
+            f"got {scheduler._project_root!r}"
+        )
+
+        monkeypatch.chdir(tmp_path)
+
+        await scheduler._write_snapshot_best_effort()
+
+        # Real write_state_snapshot would create tmp_path/None/data/orchestrator/
+        # if the guard were absent; its non-existence proves the guard fired.
+        assert not (tmp_path / 'None').exists(), (
+            "A directory named 'None' must not be created under the CWD "
+            "when project_root is unset"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad_root', ['None', '', None])
+    async def test_write_snapshot_best_effort_skips_for_falsy_project_root(
+        self, bad_root, tmp_path, monkeypatch
+    ):
+        """Guard covers the literal 'None', empty string, and None itself.
+
+        write_state_snapshot is mocked so assert_not_called() is the sole
+        genuine assertion: it verifies the guard fires before the write is
+        attempted for each invalid _project_root value.
+        """
+        from unittest.mock import MagicMock
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        # Directly override _project_root, matching the test_scheduler_state.py
+        # direct-set pattern used at lines 565 and 586.
+        scheduler._project_root = bad_root
+
+        scheduler.write_state_snapshot = MagicMock()
+        monkeypatch.chdir(tmp_path)
+
+        await scheduler._write_snapshot_best_effort()
+
+        # assert_not_called() is the genuine regression check: the guard must
+        # prevent write_state_snapshot from being invoked for all bad root values.
+        scheduler.write_state_snapshot.assert_not_called()
