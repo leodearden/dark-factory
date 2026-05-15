@@ -31,8 +31,10 @@ def _make(
     task_id: str = '99',
     main_sha: str = 'mainSHA-1',
     metadata: dict | None = None,
+    backend_metadata: dict | None = None,
     update_task_raises: bool = False,
     get_main_sha_raises: bool = False,
+    get_task_raises: bool = False,
 ) -> _Fixture:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -58,10 +60,17 @@ def _make(
     else:
         get_main_sha = AsyncMock(return_value=main_sha)
 
+    # backend_metadata: what get_task returns (defaults to metadata if not set).
+    _backend_md = backend_metadata if backend_metadata is not None else (metadata or {})
+
     scheduler = MagicMock()
     scheduler.update_task = update_task
     scheduler.set_task_status = AsyncMock()
     scheduler.get_status = AsyncMock(return_value='in-progress')
+    if get_task_raises:
+        scheduler.get_task = AsyncMock(side_effect=RuntimeError('mcp down'))
+    else:
+        scheduler.get_task = AsyncMock(return_value={'id': task_id, 'metadata': _backend_md})
 
     git_ops = MagicMock()
     git_ops.get_main_sha = get_main_sha
@@ -329,3 +338,82 @@ async def test_corrupt_counter_metadata_treated_as_zero(tmp_path: Path):
     assert kwargs.get('escalate_to_human') is not True
     metadata = _persisted_metadata(f.update_task)
     assert metadata['consecutive_no_plan_failures'] == 1
+
+
+@pytest.mark.asyncio
+async def test_persists_memory_hints_from_fresh_backend_metadata(tmp_path: Path):
+    """memory_hints added by Stage-2 reconciliation after load survive the write.
+
+    The in-memory copy (self.task['metadata']) does NOT have memory_hints;
+    the backend's current metadata (scheduler.get_task) DOES.  After
+    _handle_no_plan_failure the persisted dict must contain BOTH the
+    incremented counter AND memory_hints from the fresh backend read.
+    """
+    in_memory_md: dict = {}  # no memory_hints in-memory
+    backend_md = {
+        'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+    }
+    f = _make(
+        project_root=tmp_path,
+        main_sha='SHA-A',
+        metadata=in_memory_md,
+        backend_metadata=backend_md,
+    )
+
+    outcome = await f.wf._handle_no_plan_failure('no plan', detail='')
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    metadata = _persisted_metadata(f.update_task)
+    assert metadata['consecutive_no_plan_failures'] == 1, (
+        f'Counter must have incremented to 1; got {metadata}'
+    )
+    assert metadata.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
+        f'memory_hints from backend read must survive the write; got {metadata}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_task_failure_falls_back_to_in_memory_metadata_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If scheduler.get_task raises, fall back to in-memory metadata.
+
+    The counter must still advance (no exception escapes), in-memory memory_hints
+    are preserved on the fallback path, and a WARNING is emitted mentioning the
+    failure so operators can see the degraded path.
+    """
+    import logging
+
+    f = _make(
+        project_root=tmp_path,
+        main_sha='SHA-A',
+        metadata={
+            'memory_hints': {'entities': ['E1']},
+        },
+        get_task_raises=True,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = await f.wf._handle_no_plan_failure('no plan', detail='')
+
+    # Must not raise; normal blocked outcome.
+    assert outcome == WorkflowOutcome.BLOCKED
+    # update_task must still be called once — persistence happens on the fallback path.
+    f.update_task.assert_awaited_once()
+    metadata = _persisted_metadata(f.update_task)
+    assert metadata['consecutive_no_plan_failures'] == 1, (
+        f'Counter must advance on fallback path; got {metadata}'
+    )
+    # In-memory memory_hints survive because we fell back to the in-memory copy.
+    assert metadata.get('memory_hints') == {'entities': ['E1']}, (
+        f'In-memory memory_hints must survive on fallback path; got {metadata}'
+    )
+    # A WARNING with the specific refresh-failure message must be logged.
+    warning_texts = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'failed to refresh metadata before no-plan counter' in t
+        for t in warning_texts
+    ), (
+        f'Expected warning about get_task refresh failure; got: {warning_texts}'
+    )
