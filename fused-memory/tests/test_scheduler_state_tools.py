@@ -369,6 +369,7 @@ class TestGetSchedulerEventsTool:
         assert captured_uri == expected_uri, (
             f'Expected URI {expected_uri!r}, got {captured_uri!r}'
         )
+        assert captured_uri is not None
         assert captured_uri.startswith('file:///'), (
             f'Expected file:/// form (Path.as_uri()), got {captured_uri!r}'
         )
