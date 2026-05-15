@@ -68,8 +68,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
 async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_blocker')
-    # escalate_blocker is a sync tool — tool.fn() returns dict directly
-    return tool.fn(**kwargs)
+    return await tool.fn(**kwargs)
 
 
 # ---------------------------------------------------------------------------

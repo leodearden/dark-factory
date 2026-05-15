@@ -1,6 +1,6 @@
 """Tests for escalation deduplication via the MCP server tools.
 
-Mirrors the FastMCP unit-test pattern from test_release_workflow.py:
+Uses the FastMCP async unit-test pattern from test_release_workflow.py:
     tool = await server.get_tool('escalate_blocker')
     result = await tool.fn(...)
 
@@ -29,14 +29,12 @@ def _make_server(queue: EscalationQueue, dedupe_config: DedupeConfig | None = No
 
 async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_blocker')
-    # escalate_blocker is a sync tool — tool.fn() returns dict directly
-    return tool.fn(**kwargs)
+    return await tool.fn(**kwargs)
 
 
 async def _info(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_info')
-    # escalate_info is a sync tool — tool.fn() returns dict directly
-    return tool.fn(**kwargs)
+    return await tool.fn(**kwargs)
 
 
 def _queue_root_files(queue: EscalationQueue) -> list[Path]:
