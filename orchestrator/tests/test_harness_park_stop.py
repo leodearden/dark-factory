@@ -1024,3 +1024,63 @@ class TestSchedulerDoneCounter:
         assert scheduler.done_transitions_total == 1, (
             f'Expected 1 after mark_done; got {scheduler.done_transitions_total}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessEscalationEventCounter (step-17)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_escalation(task_id: str = 't1') -> object:
+    """Build a minimal Escalation instance for callback tests."""
+    from escalation.models import Escalation
+    return Escalation(
+        id=f'esc-{task_id}-1',
+        task_id=task_id,
+        agent_role='r',
+        severity='info',
+        category='infra_issue',
+        summary='s',
+    )
+
+
+class TestHarnessEscalationEventCounter:
+    """Tests for Harness._escalation_event_count sync counter (step-18 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    def test_counter_starts_at_zero(self, tmp_path: Path) -> None:
+        """_escalation_event_count is zero on harness construction."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        assert harness._escalation_event_count == 0, (
+            f'Expected 0; got {harness._escalation_event_count}'
+        )
+
+    def test_on_escalation_increments_counter(self, tmp_path: Path) -> None:
+        """_on_escalation increments _escalation_event_count each call."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+
+        assert harness._escalation_event_count == 3, (
+            f'Expected 3; got {harness._escalation_event_count}'
+        )
+
+    def test_on_escalation_resolved_also_increments(self, tmp_path: Path) -> None:
+        """_on_escalation_resolved increments the same counter."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation_resolved(esc)
+        harness._on_escalation_resolved(esc)
+
+        assert harness._escalation_event_count == 5, (
+            f'Expected 5 (3 submit + 2 resolve); got {harness._escalation_event_count}'
+        )
