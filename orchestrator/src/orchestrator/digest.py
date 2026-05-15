@@ -288,7 +288,7 @@ async def cost_in_window(
     Mirrors the SQL pattern from Harness._enforce_cost_ceilings (single query
     with conditional aggregation) issuing one query for the window and one for
     trailing-24h.  Uses cost_store._require_conn() exactly as
-    Harness._enforce_cost_ceilings (via the shared _trailing_24h_fetch_one helper) does.
+    Harness._enforce_cost_ceilings does.
 
     Fail-open: cost_store is None or any exception → CostStats with all zeros.
     """
