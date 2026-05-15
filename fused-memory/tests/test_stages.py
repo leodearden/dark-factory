@@ -4355,7 +4355,7 @@ class TestAssumeUtc:
 
     def test_aware_non_utc_offset_unchanged(self):
         """An aware datetime with a non-UTC offset is returned unchanged (not coerced)."""
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         fn = self._import()
         plus5 = timezone(timedelta(hours=5))
         aware = datetime(2026, 5, 15, 15, 0, 0, tzinfo=plus5)
