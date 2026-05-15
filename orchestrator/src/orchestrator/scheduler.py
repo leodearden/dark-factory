@@ -762,6 +762,9 @@ class Scheduler:
         # Serialises concurrent _write_snapshot_best_effort invocations so that
         # tick writes and flush writes never race on the shared .json.tmp path.
         self._snapshot_write_lock: asyncio.Lock = asyncio.Lock()
+        # One-time dedup flag for the project_root guard warning so it logs at
+        # most once per scheduler instance, not every tick.
+        self._snapshot_guard_warned: bool = False
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -2490,6 +2493,12 @@ class Scheduler:
         # any timestamp bookkeeping so a no-project-root scheduler does not
         # advance _last_snapshot_write_ts for a write that never happens.
         if not self._project_root or self._project_root == 'None':
+            if not self._snapshot_guard_warned:
+                self._snapshot_guard_warned = True
+                logger.warning(
+                    'scheduler state snapshot skipped: project_root unset/invalid (%r)',
+                    self._project_root,
+                )
             return
         # Lock serialises the time-gate read → await → bookkeeping write section
         # so concurrent tick/flush callers never race on the stale timestamp or
