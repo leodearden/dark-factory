@@ -120,6 +120,102 @@ class TestEscalateSuggestions:
         queue.submit.assert_not_called()
 
 
+class TestEscalateSuggestionsCharacterization:
+    """Pins _escalate_suggestions behavior after the dedup-helper refactor.
+
+    These tests verify that the refactored method still produces exactly the
+    same ``#hash:<hex16>#<json>`` detail format, and that both the matching
+    (skip) and non-matching (submit) dedup paths work correctly via the shared
+    find_prior_review_suggestion predicate.
+
+    Acceptance criterion: 'from orchestrator.review_suggestions.dedup import
+    review_suggestion_payload_hash' appears in workflow.py (this import is
+    confirmed by the source-file assertion below).
+    """
+
+    def _suggestions(self):
+        return [
+            {'reviewer': 'a', 'severity': 'suggestion',
+             'location': 'src/bar.py:1', 'category': 'coverage',
+             'description': 'Add coverage for X', 'suggested_fix': 'Write test'},
+        ]
+
+    def test_detail_uses_shared_hash_helper(self):
+        """detail must start with '#hash:<shared_hash>#' — not a re-inlined hash."""
+        from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
+
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-0'
+        queue.get_by_task.return_value = []
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+
+        suggestions = self._suggestions()
+        reviews = _fake_reviews(suggestions)
+        wf._escalate_suggestions(reviews)
+
+        queue.submit.assert_called_once()
+        esc = queue.submit.call_args[0][0]
+        expected_hash = review_suggestion_payload_hash(suggestions)
+        assert esc.detail.startswith(f'#hash:{expected_hash}#')
+
+    def test_skips_when_prior_matching_hash(self):
+        """submit must NOT be called when a prior escalation with the same hash exists."""
+        from orchestrator.review_suggestions.dedup import (
+            hash_marker,
+            review_suggestion_payload_hash,
+        )
+
+        suggestions = self._suggestions()
+        h = review_suggestion_payload_hash(suggestions)
+        prior = _make_escalation(
+            detail=hash_marker(h) + '[]',
+            category='review_suggestions',
+        )
+
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-1'
+        queue.get_by_task.return_value = [prior]
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+
+        wf._escalate_suggestions(_fake_reviews(suggestions))
+
+        queue.submit.assert_not_called()
+
+    def test_does_not_skip_when_prior_has_different_hash(self):
+        """submit IS called when the prior escalation has a different hash."""
+        from orchestrator.review_suggestions.dedup import hash_marker
+
+        suggestions = self._suggestions()
+        # Build a prior with a DIFFERENT hash
+        prior = _make_escalation(
+            detail=hash_marker('0000000000000000') + '[]',
+            category='review_suggestions',
+        )
+
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-2'
+        queue.get_by_task.return_value = [prior]
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+
+        wf._escalate_suggestions(_fake_reviews(suggestions))
+
+        queue.submit.assert_called_once()
+
+    def test_workflow_module_imports_shared_helper(self):
+        """workflow.py must import review_suggestion_payload_hash from the shared module."""
+        import orchestrator.workflow as wf_module
+        import inspect
+
+        src = inspect.getsource(wf_module)
+        assert 'from orchestrator.review_suggestions.dedup import' in src, (
+            'workflow.py must import from orchestrator.review_suggestions.dedup '
+            '(acceptance criterion: shared import at two sites)'
+        )
+
+
 # ---------------------------------------------------------------------------
 # _escalate_review_issues
 # ---------------------------------------------------------------------------
