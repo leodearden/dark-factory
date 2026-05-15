@@ -4928,8 +4928,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         When ``self.mcp`` is not configured (e.g. CLI / dry-run / test contexts),
         falls back to ``_escalate_suggestions`` if an escalation queue is available,
-        or to ``_write_suggestions_to_memory`` otherwise — preserving suggestions in
-        all cases rather than silently dropping them.
+        or to ``_write_suggestions_to_memory`` otherwise. Note that
+        ``_write_suggestions_to_memory`` itself requires ``self.mcp`` to write, so the
+        ``(no mcp, no queue)`` case is a documented no-op — a WARNING is logged so the
+        drop is auditable, but the suggestions are not persisted to any sink.
         """
         from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
 
