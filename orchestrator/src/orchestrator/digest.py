@@ -54,11 +54,21 @@ def update_ewa(
     EWA(t+1) = alpha * (escalations_in_step / max(done_in_step, 1))
                + (1 - alpha) * prev_ewa
 
-    done_in_step == 0 uses denominator 1 so a step with escalations and zero
-    completions (the worst-case signal) pushes EWA up rather than crashing.
+    Short-circuit: when escalations_in_step == 0, return prev_ewa unchanged.
+    This makes the (esc=0, done=0) edge case explicitly safe and removes the
+    misleading "zero escalations pulls EWA toward zero" behaviour.  In normal
+    flow _maybe_write_digest only calls this when escalations_in_step >= N
+    (the digest gate), so esc=0 is unreachable via that path — the short-circuit
+    is a safety net for direct callers and future code paths.
+
+    done_in_step == 0 (with esc > 0) uses denominator 1 so a step with
+    escalations and zero completions (the worst-case signal) pushes EWA up
+    rather than crashing.
 
     No exception handling — pure arithmetic.
     """
+    if escalations_in_step == 0:
+        return prev_ewa
     ratio = escalations_in_step / max(done_in_step, 1)
     return alpha * ratio + (1 - alpha) * prev_ewa
 
