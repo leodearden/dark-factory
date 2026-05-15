@@ -36,7 +36,6 @@ are deliberately omitted — they would just duplicate literals from
 """
 
 import builtins
-import inspect
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -263,6 +262,7 @@ def test_pydantic_spec_does_not_reflect_basemodel_per_call(monkeypatch):
     """
     import _orch_helpers
     from pydantic import BaseModel
+
     from orchestrator.config import OrchestratorConfig
 
     basemodel_getmembers = 0
