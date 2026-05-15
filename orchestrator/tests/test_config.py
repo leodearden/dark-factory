@@ -261,6 +261,131 @@ class TestModuleConfigDiscovery:
         assert config._module_configs['backend'].test_command == 'cargo test'
         assert config._module_configs['backend'].max_per_module == 2
 
+    def test_discover_finds_nested_orchestrator_yaml_at_depth_2(self, tmp_path: Path):
+        """_discover_module_configs finds orchestrator.yaml at depth >= 2."""
+        nested = tmp_path / 'foo' / 'bar'
+        nested.mkdir(parents=True)
+        (nested / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'pytest foo/bar/',
+        }))
+        configs = _discover_module_configs(tmp_path)
+        assert 'foo/bar' in configs
+        mc = configs['foo/bar']
+        assert mc.prefix == 'foo/bar'
+        assert mc.test_command == 'pytest foo/bar/'
+
+    def test_discover_orders_results_by_depth_then_lex(self, tmp_path: Path):
+        """_discover_module_configs returns keys ordered by (depth, lex): depth-1 first, lex within depth."""
+        # Create four orchestrator.yaml files at varying depths
+        for parts in [
+            ('c',),
+            ('a',),
+            ('a', 'b'),
+            ('d', 'e', 'f'),
+        ]:
+            d = tmp_path.joinpath(*parts)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+        configs = _discover_module_configs(tmp_path)
+        assert list(configs.keys()) == ['a', 'c', 'a/b', 'd/e/f']
+
+    def test_discover_excludes_standard_dirs(self, tmp_path: Path):
+        """_discover_module_configs does not descend into standard build/VCS directories."""
+        excluded_dirs = [
+            '.git', '.venv', 'venv', '.worktrees', 'node_modules',
+            '__pycache__', 'build', 'target', '.gradle',
+        ]
+        # Create an orchestrator.yaml nested inside each excluded dir
+        for excluded in excluded_dirs:
+            nested = tmp_path / excluded / 'sub'
+            nested.mkdir(parents=True, exist_ok=True)
+            (nested / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+        # Also create a legitimate module that should be found
+        legit = tmp_path / 'legit'
+        legit.mkdir()
+        (legit / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest legit/'}))
+        configs = _discover_module_configs(tmp_path)
+        assert 'legit' in configs
+        for excluded in excluded_dirs:
+            for key in configs:
+                assert not key.startswith(excluded + '/') and key != excluded, (
+                    f"Excluded dir {excluded!r} leaked into results as key {key!r}"
+                )
+
+    def test_discover_handles_self_referencing_symlink_loop(self, tmp_path: Path):
+        """_discover_module_configs completes without infinite recursion when a symlink loop exists.
+
+        Regression guard: pins the followlinks=False behavior so a future refactor
+        that flips it is caught immediately.
+        """
+        import os as _os
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest sub/'}))
+        # Create a self-referencing symlink inside sub -> sub
+        try:
+            _os.symlink(str(sub), str(sub / 'loop'))
+        except OSError:
+            pytest.skip('Cannot create symlinks on this platform')
+        # With followlinks=False this must finish quickly and return exactly {'sub': ...}
+        configs = _discover_module_configs(tmp_path)
+        assert list(configs.keys()) == ['sub']
+        assert configs['sub'].test_command == 'pytest sub/'
+
+    def test_for_module_longest_prefix_match(self):
+        """for_module resolves nested configs by longest-matching prefix (deepest wins).
+
+        This is the regression test the reviewer requires: it retrieves a nested config
+        through for_module() (the workflow/scheduler consumption boundary), not just
+        through _discover_module_configs directly.
+        """
+        config = OrchestratorConfig()
+        config._module_configs = {
+            'foo': ModuleConfig(prefix='foo', test_command='pytest foo/'),
+            'foo/bar': ModuleConfig(prefix='foo/bar', test_command='pytest foo/bar/'),
+        }
+        # (a) Deeper path resolves to the deeper registered prefix
+        mc_deep = config.for_module('foo/bar/baz/app.py')
+        assert mc_deep is not None
+        assert mc_deep.prefix == 'foo/bar'
+        # (b) Exact prefix match — shape scheduler passes after normalize_lock(..., depth=2)
+        mc_exact = config.for_module('foo/bar')
+        assert mc_exact is not None
+        assert mc_exact.prefix == 'foo/bar'
+        # (c) Sibling falls back to the shallower ancestor prefix
+        mc_fallback = config.for_module('foo/qux/app.py')
+        assert mc_fallback is not None
+        assert mc_fallback.prefix == 'foo'
+        # (d) Exact top-level prefix match
+        mc_top = config.for_module('foo')
+        assert mc_top is not None
+        assert mc_top.prefix == 'foo'
+        # (e) Completely unrelated path returns None
+        assert config.for_module('unrelated/x.py') is None
+
+    def test_discover_skips_root_level_orchestrator_yaml(self, tmp_path: Path):
+        """A root-level orchestrator.yaml is NOT returned as a module config.
+
+        Regression guard for the explicit ``if prefix == '.': continue`` guard in
+        _discover_module_configs.  The old glob('*/orchestrator.yaml') excluded the
+        root by construction; the new os.walk relies on an explicit check.
+        """
+        # Root-level config — should be skipped
+        (tmp_path / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'pytest',
+        }))
+        # Sub-level config — should be found
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'pytest sub/',
+        }))
+        configs = _discover_module_configs(tmp_path)
+        assert 'sub' in configs, "sub-level config should be discovered"
+        assert '.' not in configs, "root-level (prefix '.') must not appear in results"
+        # Confirm no key for the root-level file leaked in any form
+        assert len(configs) == 1
+
 
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
