@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from urllib.parse import quote
 
 _log = logging.getLogger(__name__)
 
@@ -73,7 +72,7 @@ async def read_scheduler_events(
     """
     import aiosqlite
 
-    db_path = project_root / 'data' / 'orchestrator' / 'runs.db'
+    db_path = (project_root / 'data' / 'orchestrator' / 'runs.db').resolve()
     if not db_path.exists():
         return {'events': [], 'count': 0}
 
@@ -103,7 +102,7 @@ async def read_scheduler_events(
     )
     params.append(limit)
 
-    uri = f'file:{quote(str(db_path), safe="/")}?mode=ro'
+    uri = f'{db_path.as_uri()}?mode=ro'
     async with aiosqlite.connect(uri, uri=True) as db:
         cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()

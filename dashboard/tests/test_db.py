@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from unittest.mock import patch
-from urllib.parse import quote
 
 import aiosqlite
 import pytest
@@ -96,8 +95,8 @@ class TestDbPool:
         - ``%41``: literal percent-sequence — SQLite decodes it to ``A``, silently
           targeting a different path that does not exist.
 
-        All three cases return None pre-fix.  After the fix (``quote(str(resolved),
-        safe='/')``) all three open a real connection and ``SELECT 1`` returns ``(1,)``.
+        All three cases return None pre-fix.  After the fix (``resolved.as_uri()``)
+        all three open a real connection and ``SELECT 1`` returns ``(1,)``.
         """
         subdir = tmp_path / fragment
         subdir.mkdir()
@@ -176,11 +175,11 @@ class TestDbPool:
         event_b_done = asyncio.Event()
         connect_calls = 0
 
-        # Pre-compute the URI fragment the production code produces for path B so
-        # we can match it exactly.  Using quote() here mirrors the production
-        # encoding precisely, making the check robust to any tmp_path component
-        # that quote() would encode (spaces, special chars, etc.).
-        b_uri_fragment = quote(str(b_resolved), safe='/')
+        # Pre-compute the URI the production code produces for path B so we can
+        # match it exactly.  Using as_uri() here mirrors the production encoding
+        # precisely, making the check robust to any tmp_path component that
+        # as_uri() would percent-encode (spaces, special chars, etc.).
+        b_uri_fragment = b_resolved.as_uri()
 
         async def wrapper(*args, **kwargs):
             nonlocal connect_calls
@@ -209,6 +208,58 @@ class TestDbPool:
             assert results[0] is not results[1], 'disjoint paths must yield distinct connections'
             assert pool.open_count == 2
             assert connect_calls == 2
+        finally:
+            await pool.close_all()
+
+    async def test_get_builds_sqlite_uri_via_path_as_uri(self, tmp_path):
+        """DbPool.get must build the SQLite connect URI using Path.as_uri().
+
+        The connect string passed to aiosqlite.connect must be exactly
+        ``f'{resolved.as_uri()}?mode=ro'`` — the canonical ``file:///`` form
+        produced by stdlib Path.as_uri().  This is the behavioral contract test
+        for task 1351; it is RED on the old ``file:/...`` form and GREEN after
+        the swap to as_uri().
+        """
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        captured_uri = None
+        captured_uri_kwarg = None
+
+        async def spy(*args, **kwargs):
+            nonlocal captured_uri, captured_uri_kwarg
+            captured_uri = args[0] if args else None
+            captured_uri_kwarg = kwargs.get('uri')
+            return await real_connect(*args, **kwargs)
+
+        resolved = db_path.resolve()
+        expected = f'{resolved.as_uri()}?mode=ro'
+
+        try:
+            with patch('aiosqlite.connect', spy):
+                conn = await pool.get(db_path)
+            assert conn is not None, 'pool.get returned None — could not open db'
+            assert captured_uri == expected, (
+                f'Expected URI {expected!r}, got {captured_uri!r}'
+            )
+            assert captured_uri is not None
+            assert captured_uri.startswith('file:///'), (
+                f'Expected file:/// form (Path.as_uri()), got {captured_uri!r}'
+            )
+            assert captured_uri_kwarg is True, (
+                f'Expected uri=True kwarg, got uri={captured_uri_kwarg!r}'
+            )
+            # Implementation-independent checks (don't mirror as_uri() formula):
+            assert captured_uri.endswith('?mode=ro'), (
+                f'URI must end with ?mode=ro, got {captured_uri!r}'
+            )
+            # Path portion must not contain a literal '?' (reserved chars must be %-encoded).
+            path_portion = captured_uri.removesuffix('?mode=ro')
+            assert '?' not in path_portion, (
+                f'Unencoded ? in path portion of URI: {captured_uri!r}'
+            )
         finally:
             await pool.close_all()
 

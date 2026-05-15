@@ -313,6 +313,80 @@ class TestGetSchedulerEventsTool:
         )
 
     @pytest.mark.asyncio
+    async def test_read_scheduler_events_builds_uri_via_path_as_uri(
+        self, tmp_path, mcp_server
+    ):
+        """read_scheduler_events must build the SQLite connect URI using Path.as_uri().
+
+        The connect string passed to aiosqlite.connect must be exactly
+        ``f'{db_path.as_uri()}?mode=ro'`` — the canonical ``file:///`` form.
+        This is the behavioral contract test for task 1351; it is RED on the
+        old ``file:/...`` form and GREEN after the swap to as_uri().
+        """
+        from unittest.mock import patch
+
+        import aiosqlite as _aiosqlite
+
+        _seed_runs_db(
+            tmp_path,
+            [
+                {
+                    'timestamp': '2026-05-14T12:00:00+00:00',
+                    'event_type': 'lock_released',
+                    'task_id': 'T1',
+                    'data': {},
+                }
+            ],
+        )
+
+        db_path = tmp_path / 'data' / 'orchestrator' / 'runs.db'
+        expected_uri = f'{db_path.as_uri()}?mode=ro'
+
+        real_connect = _aiosqlite.connect
+        captured_uri = None
+        captured_uri_kwarg = None
+
+        # spy must be a plain function (not async): aiosqlite.connect() returns a
+        # _ConnectionContextManager that supports `async with`, not a coroutine.
+        # Wrapping in `async def` would return a coroutine instead, breaking __aexit__.
+        def spy(*args, **kwargs):
+            nonlocal captured_uri, captured_uri_kwarg
+            captured_uri = args[0] if args else None
+            captured_uri_kwarg = kwargs.get('uri')
+            return real_connect(*args, **kwargs)
+
+        with patch('aiosqlite.connect', spy):
+            result = await mcp_server._tool_manager.call_tool(
+                'get_scheduler_events',
+                {'project_root': str(tmp_path)},
+            )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)!r}'
+        assert 'count' in result, (
+            f"Expected 'count' key (got error envelope instead): {result!r}"
+        )
+        assert result['count'] == 1, f'Expected count=1, got {result!r}'
+        assert captured_uri == expected_uri, (
+            f'Expected URI {expected_uri!r}, got {captured_uri!r}'
+        )
+        assert captured_uri is not None
+        assert captured_uri.startswith('file:///'), (
+            f'Expected file:/// form (Path.as_uri()), got {captured_uri!r}'
+        )
+        assert captured_uri_kwarg is True, (
+            f'Expected uri=True kwarg, got uri={captured_uri_kwarg!r}'
+        )
+        # Implementation-independent checks (don't mirror as_uri() formula):
+        assert captured_uri.endswith('?mode=ro'), (
+            f'URI must end with ?mode=ro, got {captured_uri!r}'
+        )
+        # Path portion must not contain a literal '?' (reserved chars must be %-encoded).
+        path_portion = captured_uri.removesuffix('?mode=ro')
+        assert '?' not in path_portion, (
+            f'Unencoded ? in path portion of URI: {captured_uri!r}'
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('fragment', ['has?question', 'has#hash', 'has%41literal'])
     async def test_handles_uri_reserved_chars_in_project_root(
         self, tmp_path, mcp_server, fragment
