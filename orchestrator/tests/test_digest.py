@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
+from typing import Callable
 
 import pytest
+import pytest_asyncio
+from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.event_store import EventStore, EventType
@@ -239,3 +243,125 @@ class TestCountDoneInWindow:
             '2026-05-01T23:59:59+00:00',
         )
         assert count == 0, f"Expected 0 for empty window; got {count}"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for async CostStore tests
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime as _datetime
+
+
+def _iso_offset(delta: timedelta) -> str:
+    """Return an ISO timestamp offset from now by delta."""
+    return (_datetime.now(UTC) + delta).isoformat()
+
+
+@pytest_asyncio.fixture
+async def _cost_store(tmp_path: Path):
+    """Fixture: open a CostStore, yield it, close it."""
+    store = CostStore(tmp_path / 'cost.db')
+    await store.open()
+    yield store
+    await store.close()
+
+
+class TestCostInWindow:
+    """Tests for digest.cost_in_window(cost_store, window_start_iso, window_end_iso)."""
+
+    @pytest.mark.asyncio
+    async def test_window_cost_sums_correctly(
+        self, tmp_path: Path, _cost_store: CostStore
+    ) -> None:
+        """watcher_cost_in_window and total_cost_in_window are correct."""
+        store = _cost_store
+        # In-window watcher
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='p', account_name='a',
+            model='opus', role='escalation-watcher-auto',
+            cost_usd=5.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None, duration_ms=100, capped=False,
+            started_at='2026-05-10T08:00:00+00:00',
+            completed_at='2026-05-10T08:00:00+00:00',
+        )
+        # In-window non-watcher
+        await store.save_invocation(
+            run_id='r2', task_id='t2', project_id='p', account_name='a',
+            model='sonnet', role='orchestrator',
+            cost_usd=2.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None, duration_ms=100, capped=False,
+            started_at='2026-05-10T09:00:00+00:00',
+            completed_at='2026-05-10T09:00:00+00:00',
+        )
+        # Out-of-window
+        await store.save_invocation(
+            run_id='r3', task_id='t3', project_id='p', account_name='a',
+            model='sonnet', role='escalation-watcher-auto',
+            cost_usd=99.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None, duration_ms=100, capped=False,
+            started_at='2026-05-09T00:00:00+00:00',
+            completed_at='2026-05-09T00:00:00+00:00',
+        )
+
+        stats = await digest.cost_in_window(
+            store,
+            '2026-05-10T00:00:00+00:00',
+            '2026-05-10T23:59:59+00:00',
+        )
+        assert stats.watcher_cost_in_window == pytest.approx(5.0)
+        assert stats.total_cost_in_window == pytest.approx(7.0)
+
+    @pytest.mark.asyncio
+    async def test_none_store_returns_zeros(self) -> None:
+        """cost_store=None returns all zeros (fail-open)."""
+        stats = await digest.cost_in_window(
+            None,
+            '2026-05-10T00:00:00+00:00',
+            '2026-05-10T23:59:59+00:00',
+        )
+        assert stats.watcher_cost_in_window == pytest.approx(0.0)
+        assert stats.total_cost_in_window == pytest.approx(0.0)
+        assert stats.watcher_cost_24h == pytest.approx(0.0)
+        assert stats.total_cost_24h == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_cost_present(
+        self, tmp_path: Path, _cost_store: CostStore
+    ) -> None:
+        """watcher_cost_24h and total_cost_24h include trailing-24h rows."""
+        store = _cost_store
+        # Within 24h
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='p', account_name='a',
+            model='opus', role='escalation-watcher-auto',
+            cost_usd=3.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None, duration_ms=100, capped=False,
+            started_at=_iso_offset(timedelta(hours=-1)),
+            completed_at=_iso_offset(timedelta(hours=-1)),
+        )
+        await store.save_invocation(
+            run_id='r2', task_id='t2', project_id='p', account_name='a',
+            model='sonnet', role='orchestrator',
+            cost_usd=1.5, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None, duration_ms=100, capped=False,
+            started_at=_iso_offset(timedelta(hours=-2)),
+            completed_at=_iso_offset(timedelta(hours=-2)),
+        )
+        # Older than 24h — not in 24h window
+        await store.save_invocation(
+            run_id='r3', task_id='t3', project_id='p', account_name='a',
+            model='sonnet', role='escalation-watcher-auto',
+            cost_usd=50.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None, duration_ms=100, capped=False,
+            started_at=_iso_offset(timedelta(hours=-25)),
+            completed_at=_iso_offset(timedelta(hours=-25)),
+        )
+
+        stats = await digest.cost_in_window(
+            store,
+            '2026-05-10T00:00:00+00:00',  # window_start does not match recent rows
+            '2026-05-10T23:59:59+00:00',
+        )
+        # 24h figures are anchored to now, not the digest window
+        assert stats.watcher_cost_24h == pytest.approx(3.0)
+        assert stats.total_cost_24h == pytest.approx(4.5)
