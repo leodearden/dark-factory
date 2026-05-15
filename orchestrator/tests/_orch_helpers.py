@@ -48,6 +48,17 @@ def pydantic_spec(model: type[BaseModel]) -> type:
         if name in _basemodel_props:
             continue
         members[name] = None
+    # User-defined regular methods — exclude dunders, BaseModel API surface, and
+    # anything already collected as a @property above.
+    _basemodel_attrs = set(dir(BaseModel))
+    for name, _ in inspect.getmembers(model, callable):
+        if name.startswith('_'):
+            continue
+        if name in _basemodel_attrs:
+            continue
+        if isinstance(getattr(model, name, None), property):
+            continue  # already collected above (defence-in-depth)
+        members[name] = None
     return type(
         f'_{model.__name__}Spec',
         (),
