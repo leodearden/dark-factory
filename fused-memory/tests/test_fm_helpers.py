@@ -369,6 +369,44 @@ class TestParseRenderedIdTitlePairs:
         found = parse_rendered_id_title_pairs('No tasks here.', kind='provenance')
         assert found == {}
 
+    @pytest.mark.parametrize('bad_kind', ['actve', '', 'Active', 'provenence'])
+    def test_parse_raises_value_error_for_invalid_kind(self, bad_kind):
+        """parse_rendered_id_title_pairs raises ValueError for any kind that is not
+        'active' or 'provenance', and the error message includes repr(bad_kind)."""
+        from _fm_helpers import parse_rendered_id_title_pairs
+
+        with pytest.raises(ValueError) as excinfo:
+            parse_rendered_id_title_pairs('- [1369] Some title\n', kind=bad_kind)
+
+        assert repr(bad_kind) in str(excinfo.value), (
+            f"repr({bad_kind!r}) not found in error message: {excinfo.value!r}"
+        )
+
+    def test_parse_valid_kinds_do_not_raise(self):
+        """parse_rendered_id_title_pairs does NOT raise for the two valid kinds."""
+        from _fm_helpers import parse_rendered_id_title_pairs
+
+        # Should complete without raising
+        parse_rendered_id_title_pairs('No tasks.', kind='active')
+        parse_rendered_id_title_pairs('No tasks.', kind='provenance')
+
+    @pytest.mark.parametrize('bad_kind', ['actve', '', 'Active', 'provenence'])
+    def test_assert_id_title_pairing_raises_value_error_transitively(self, bad_kind):
+        """assert_id_title_pairing fires ValueError transitively for invalid kind
+        (it delegates to parse_rendered_id_title_pairs, so the guard covers both)."""
+        from _fm_helpers import assert_id_title_pairing
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_id_title_pairing(
+                '- [1369] Some title\n',
+                {1369: 'Some title'},
+                kind=bad_kind,
+            )
+
+        assert repr(bad_kind) in str(excinfo.value), (
+            f"repr({bad_kind!r}) not found in error message: {excinfo.value!r}"
+        )
+
 
 class TestAssertIdTitlePairing:
     """assert_id_title_pairing raises on mismatches and passes on correct renders."""
