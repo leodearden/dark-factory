@@ -146,6 +146,7 @@ Public API
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Literal, TypedDict
 
@@ -153,6 +154,10 @@ from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
 
 logger = logging.getLogger(__name__)
+
+# Module-local sleep binding — allows tests to patch sleep without touching the
+# global asyncio namespace (same pattern as harness.py).
+_sleep = asyncio.sleep
 
 
 class _SuppressionMetadata(TypedDict):
@@ -201,6 +206,16 @@ class SuppressionPayload(TypedDict):
 # design rationale.
 _CONFIRMATION_MISS_THRESHOLD: int = 5
 
+# Bounded delay (seconds) awaited between the first-search miss and the retry in
+# confirm_marker_persisted.  Default 0.0 = pure event-loop yield (asyncio.sleep(0)
+# semantics): yields control to the loop, costs nothing on happy paths, and preserves
+# the module docstring's "Mem0 writes assumed to be immediately visible" invariant.
+# Bump via monkeypatch in tests or via future config if production shows a Mem0
+# write-flush boundary — this is the knob the docstring "Mem0 read-after-write
+# consistency" paragraph anticipates ("If production evidence shows otherwise, add a
+# small bounded delay before the retry").
+_CONFIRM_RETRY_DELAY_SECS: float = 0.0
+
 
 def _marker_query(tid: str, ftype: str) -> str:
     """Build the canonical Mem0 search query for a stage1_flag_marker.
@@ -247,7 +262,9 @@ async def confirm_marker_persisted(
     1. Run a confirmation search via ``find_prior_memories`` with
        ``kind={'source':'stage1_flag_marker','flag_type':flag_type,'run_id':run_id}``.
     2. If matches are found, return ``True``.
-    3. On a miss, log a WARNING (task_id + flag_type) and retry the search once.
+    3. On a miss, log a WARNING (task_id + flag_type), await
+       ``_sleep(_CONFIRM_RETRY_DELAY_SECS)`` (default 0.0 = pure event-loop yield),
+       then retry the search once.
     4. Return ``True`` if the retry finds matches; otherwise log a final WARNING
        and return ``False``.
     5. Never raises — the whole body is wrapped in a best-effort try/except so
@@ -258,9 +275,10 @@ async def confirm_marker_persisted(
         to Mem0 (not Graphiti).  The indexing-lag caveat in ``prompts/stage1.py``
         (lines 189-196) is specific to Graphiti's async embedding pipeline and
         does NOT apply here — Mem0 writes on this path are assumed to be
-        immediately visible to a subsequent ``search``.  If production evidence
-        shows otherwise, add a small bounded delay before the retry and increase
-        the retry count.
+        immediately visible to a subsequent ``search``.  The configurable
+        ``_CONFIRM_RETRY_DELAY_SECS`` constant (default 0.0) is awaited between
+        the first miss and the retry; bump it if production shows a write-flush
+        boundary that requires a bounded wait before the index catches up.
 
     Args:
         memory_service: Mem0 service with an async ``search`` method.
@@ -300,12 +318,13 @@ async def confirm_marker_persisted(
         if matches:
             return True
 
-        # Miss on first attempt — log WARNING and retry once.
+        # Miss on first attempt — log WARNING, wait the configured delay, then retry once.
         log.warning(
             'confirm_marker_persisted: marker not found after write for task %s'
             ' flag_type %s run_id %s — retrying search',
             task_id, flag_type, run_id,
         )
+        await _sleep(_CONFIRM_RETRY_DELAY_SECS)
         retry_matches = await find_prior_memories(
             memory_service,
             project_id=project_id,
