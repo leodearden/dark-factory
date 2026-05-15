@@ -139,6 +139,114 @@ def _assert_valid_stage1_marker(
     assert meta.get('last_seen_run_id') == run_id
 
 
+# ---------------------------------------------------------------------------
+# TestMakeSearchStub — unit tests for the _make_search_stub helper (step-1/2)
+# ---------------------------------------------------------------------------
+
+
+class TestMakeSearchStub:
+    """Tests for _make_search_stub(*, suppression=None, marker=None).
+
+    All tests will fail with NameError until _make_search_stub is implemented (step-2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_suppression_returns_first_element_and_exhausts(self):
+        """(a) suppression=[[]] → first call returns []; second call raises AssertionError
+        mentioning 'suppression' and 'exhausted'.
+        """
+        stub = _make_search_stub(suppression=[[]])
+        result = await stub(query='stage1_flag_suppression')
+        assert result == []
+        with pytest.raises(AssertionError) as exc_info:
+            await stub(query='stage1_flag_suppression')
+        msg = str(exc_info.value).lower()
+        assert 'suppression' in msg
+        assert 'exhausted' in msg
+
+    @pytest.mark.asyncio
+    async def test_suppression_two_calls_return_in_order(self):
+        """(b) suppression=[[rec1], [rec2]] → successive calls return [rec1] then [rec2]."""
+        rec1 = _make_memory_result({'source': 'stage1_flag_marker'})
+        rec2 = _make_memory_result({'source': 'stage1_flag_marker'})
+        stub = _make_search_stub(suppression=[[rec1], [rec2]])
+        r1 = await stub(query='stage1_flag_suppression')
+        r2 = await stub(query='stage1_flag_suppression')
+        assert r1 == [rec1]
+        assert r2 == [rec2]
+
+    @pytest.mark.asyncio
+    async def test_marker_returns_queued_elements_in_order_and_exhausts(self):
+        """(c) marker queue returns elements in order; third call raises AssertionError
+        mentioning task_id='42', flag_type='missing_deliverable', and 'exhausted'.
+        """
+        prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+        })
+        new_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+        })
+        stub = _make_search_stub(
+            marker={('42', 'missing_deliverable'): [[prior], [new_marker]]}
+        )
+        r1 = await stub(query='stage1 flag marker task 42 type missing_deliverable')
+        r2 = await stub(query='stage1 flag marker task 42 type missing_deliverable')
+        assert r1 == [prior]
+        assert r2 == [new_marker]
+        with pytest.raises(AssertionError) as exc_info:
+            await stub(query='stage1 flag marker task 42 type missing_deliverable')
+        msg = str(exc_info.value)
+        assert '42' in msg
+        assert 'missing_deliverable' in msg
+        assert 'exhausted' in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_marker_raises_with_configured_keys(self):
+        """(d) Calling with unconfigured marker (task_id='99') raises AssertionError
+        mentioning the configured marker keys and the requested key.
+        """
+        stub = _make_search_stub(marker={('42', 'missing_deliverable'): [[]]})
+        with pytest.raises(AssertionError) as exc_info:
+            await stub(query='stage1 flag marker task 99 type stale_metadata')
+        msg = str(exc_info.value)
+        # Should mention what was requested
+        assert '99' in msg or 'stale_metadata' in msg
+        # Should mention what was configured so the caller knows what to add
+        assert '42' in msg or 'missing_deliverable' in msg
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_query_raises_with_patterns(self):
+        """(e) Totally unrecognised query raises AssertionError mentioning the
+        recognised patterns so the caller can diagnose the mismatch.
+        """
+        stub = _make_search_stub()
+        with pytest.raises(AssertionError) as exc_info:
+            await stub(query='garbage')
+        msg = str(exc_info.value)
+        assert 'garbage' in msg
+        assert 'stage1_flag_suppression' in msg or 'stage1 flag marker' in msg
+
+    @pytest.mark.asyncio
+    async def test_async_mock_integration(self):
+        """(f) Returned callable works as AsyncMock(side_effect=...) — awaiting
+        memory_service.search(...) returns the popped element.
+        """
+        rec = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+        })
+        stub = _make_search_stub(suppression=[[rec]])
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=stub)
+        result = await memory_service.search(query='stage1_flag_suppression', project_id='p')
+        assert result == [rec]
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id,
