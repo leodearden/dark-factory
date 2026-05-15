@@ -144,6 +144,41 @@ class CostStore(AsyncSqliteBase):
             ),
         )
 
+    # -- public read API ------------------------------------------------------
+
+    async def aggregate_window(
+        self,
+        start_iso: str,
+        end_iso: str,
+    ) -> tuple[float, float]:
+        """Return ``(total_usd, watcher_usd)`` for invocations completed in ``[start_iso, end_iso]``.
+
+        Uses a single SELECT with conditional aggregation so the invocations
+        table is scanned exactly once.  The ``%watcher%`` LIKE pattern is
+        hardcoded here so it lives in exactly one place.
+
+        Returns:
+            (total_usd, watcher_usd): total cost across all roles, and the
+            subset matching ``role LIKE '%watcher%'``.  Both values are 0.0
+            when the window contains no rows.
+
+        Raises:
+            RuntimeError: if the store has not been opened (via ``_require_conn()``).
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            'SELECT '
+            '  COALESCE(SUM(cost_usd), 0.0), '
+            '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
+            'FROM invocations '
+            'WHERE completed_at BETWEEN ? AND ?',
+            ('%watcher%', start_iso, end_iso),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return (0.0, 0.0)
+        return (float(row[0]), float(row[1]))
+
     async def save_account_event(
         self,
         *,
