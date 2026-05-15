@@ -156,6 +156,10 @@ ID_TITLE_LINE_RE: re.Pattern[str] = re.compile(
 #   commit branch:  "- [<id>] <title>" (no trailing token, just EOL or continuation)
 #   legacy branch:  "- [<id>] <title> — provenance: ..."
 # Capture everything up to the first "—" (em-dash) or end-of-line.
+# NOTE: task titles that themselves contain an em-dash ("—") are NOT supported.
+# The regex would silently truncate at the first "—", producing a misleading
+# mismatch failure rather than a clear message.  Future callers must use only
+# em-dash-free titles when relying on PROVENANCE_LINE_RE.
 PROVENANCE_LINE_RE: re.Pattern[str] = re.compile(
     r'^- \[(\d+)\] (.+?)(?:\s*—|\s*$)',
     re.MULTILINE,
@@ -251,8 +255,14 @@ def assert_id_title_pairing(
     Bundles three checks:
     1. Anti-vacuity: the regex found at least one match (zero matches → fail loudly).
     2. Own-title check: for each found id, rendered title == title_by_id[id].
-    3. No-neighbor-bleed check: if expected_ids is given, asserts found.keys() ==
-       expected_ids (all expected ids present, no extra ids).
+    3. No-neighbor-bleed / completeness check:
+       - When ``expected_ids`` is given, asserts ``found.keys() == expected_ids``
+         (all expected ids present, no extra ids).
+       - When ``expected_ids`` is ``None``, asserts every found id is present in
+         ``title_by_id`` — an id absent from the reference map is treated as a
+         stray/bleed id and fails loudly.  Callers must either include all
+         plausible rendered ids in ``title_by_id``, or pass ``expected_ids`` to
+         restrict the check to a known subset.
 
     Args:
         rendered: The formatter output string.
@@ -260,10 +270,12 @@ def assert_id_title_pairing(
             they are compared after normalising both sides to int.
         kind: ``'active'`` or ``'provenance'`` (forwarded to parse helper).
         expected_ids: Optional set of int ids expected to appear.  When None,
-            only asserts that at least one match was found.
+            every found id must be present in ``title_by_id`` (neighbor-bleed
+            protection is still enforced; see check 3 above).
 
     Raises:
-        AssertionError: On zero matches, wrong title, or unexpected ids.
+        AssertionError: On zero matches, wrong title, unexpected ids, or a
+            found id absent from ``title_by_id`` (when ``expected_ids`` is None).
     """
     found = parse_rendered_id_title_pairs(rendered, kind=kind)
 
@@ -279,6 +291,15 @@ def assert_id_title_pairing(
 
     # 2. Own-title check
     for tid, rendered_title in found.items():
+        # When no explicit expected_ids is given, treat any id absent from the
+        # reference map as a potential stray/bleed id (latent footgun if silent).
+        if expected_ids is None:
+            assert tid in norm_title_by_id, (
+                f'assert_id_title_pairing: id={tid} appeared in rendered output '
+                f'but is absent from title_by_id — possible stray/bleed id. '
+                f'Add it to title_by_id or pass expected_ids to restrict the check.\n'
+                f'Rendered:\n{rendered}'
+            )
         if tid in norm_title_by_id:
             expected_title = norm_title_by_id[tid]
             assert rendered_title == expected_title, (

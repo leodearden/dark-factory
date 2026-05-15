@@ -420,3 +420,19 @@ class TestAssertIdTitlePairing:
         }
         with pytest.raises(AssertionError):
             assert_id_title_pairing(rendered, title_by_id, kind='active')
+
+    def test_raises_on_unknown_id_when_expected_ids_not_given(self):
+        """assert_id_title_pairing fails when a rendered id is absent from title_by_id
+        and expected_ids is not provided — guards the latent stray/bleed-id footgun."""
+        from _fm_helpers import assert_id_title_pairing
+
+        # Rendered output includes id 9999 which is NOT in title_by_id.
+        rendered = (
+            '- [1369] (in-progress) Refactor event dispatch to async deps=[]\n'
+            '- [9999] (in-progress) Stray task from another context deps=[]\n'
+        )
+        title_by_id = {
+            1369: 'Refactor event dispatch to async',
+        }
+        with pytest.raises(AssertionError, match='9999.*absent|absent.*9999|stray|bleed'):
+            assert_id_title_pairing(rendered, title_by_id, kind='active')
