@@ -41,6 +41,47 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+# Per-caller cap-wait policy (post-1365 audit, task 1401)
+# ─────────────────────────────────────────────────────────────────────────────
+# _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
+# pass an explicit cap_wait_sanity_secs= override.  Each call site below has
+# been audited; the policy for each is documented here so future readers know
+# why an override is or is not present.
+#
+# Caller                                  Policy / WHY
+# ───────────────────────────────────────────────────────────────────────────
+# orchestrator/workflow.py                14-day default OK.  Per-task AFK
+#   (implementer/debugger invocation)     implementer/debugger; 14-day patient
+#                                         wait is the documented AFK A1 intent.
+#
+# orchestrator/steward.py                 14-day default OK.  Pre-triage; the
+#   (pre-triage invocation)               AllAccountsCappedException handler
+#                                         logs and falls back to inline triage.
+#
+# orchestrator/review_checkpoint.py       14-day default OK.  Deep reviewer;
+#   (deep reviewer invocation)            AllAccountsCappedException handler
+#                                         returns an empty report, no queue
+#                                         stall.
+#
+# orchestrator/harness.py                 14-day default OK for both sites.
+#   (module tagging + watcher rotation)   AllAccountsCappedException handlers
+#                                         log and return / supervisor-driven
+#                                         restart; neither blocks a queue.
+#
+# fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s.
+#   (LLM triage calls)                    Best-effort middleware, fast-fail/
+#                                         defer contract; 120 s is intentional.
+#
+# fused_memory/reconciliation/agent_loop  _AGENT_LOOP_CAP_WAIT_SANITY_SECS
+# fused_memory/reconciliation/judge       _JUDGE_CAP_WAIT_SANITY_SECS         = 1800 s (30 min).
+# fused_memory/reconciliation/cli_stage_runner  _STAGE_RUNNER_CAP_WAIT_SANITY_SECS
+#   (reconciliation stage runners)        Short-lived stage runners; expected
+#                                         to complete promptly within the
+#                                         reconciliation cycle.  14-day default
+#                                         would stall the queue indefinitely
+#                                         under sustained cap.  1800 s lets a
+#                                         brief cap window resolve in-band.
+# ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0        # emit at most one cap_wait log per ~10 min
 CAP_HIT_RESUME_PROMPT = (
