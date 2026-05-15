@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
