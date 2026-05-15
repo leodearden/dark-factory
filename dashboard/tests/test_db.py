@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from unittest.mock import patch
-from urllib.parse import quote
 
 import aiosqlite
 import pytest
@@ -96,8 +95,8 @@ class TestDbPool:
         - ``%41``: literal percent-sequence — SQLite decodes it to ``A``, silently
           targeting a different path that does not exist.
 
-        All three cases return None pre-fix.  After the fix (``quote(str(resolved),
-        safe='/')``) all three open a real connection and ``SELECT 1`` returns ``(1,)``.
+        All three cases return None pre-fix.  After the fix (``resolved.as_uri()``)
+        all three open a real connection and ``SELECT 1`` returns ``(1,)``.
         """
         subdir = tmp_path / fragment
         subdir.mkdir()
@@ -176,11 +175,11 @@ class TestDbPool:
         event_b_done = asyncio.Event()
         connect_calls = 0
 
-        # Pre-compute the URI fragment the production code produces for path B so
-        # we can match it exactly.  Using quote() here mirrors the production
-        # encoding precisely, making the check robust to any tmp_path component
-        # that quote() would encode (spaces, special chars, etc.).
-        b_uri_fragment = quote(str(b_resolved), safe='/')
+        # Pre-compute the URI the production code produces for path B so we can
+        # match it exactly.  Using as_uri() here mirrors the production encoding
+        # precisely, making the check robust to any tmp_path component that
+        # as_uri() would percent-encode (spaces, special chars, etc.).
+        b_uri_fragment = b_resolved.as_uri()
 
         async def wrapper(*args, **kwargs):
             nonlocal connect_calls
