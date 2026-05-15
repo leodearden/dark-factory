@@ -39,7 +39,18 @@ class TestSnapshotThreads:
         assert snapshot.get('main', 0) >= 1
 
     def test_named_asyncio_thread_bucketed(self):
-        """A thread named 'asyncio_test_X' must be counted in asyncio_pool."""
+        """A thread named 'asyncio_test_X' must be counted in asyncio_pool.
+
+        Counts the uniquely-named test thread via threading.enumerate() rather
+        than diffing the aggregate asyncio_pool bucket against a baseline.  The
+        baseline-diff approach was a flake vector: another asyncio_*-prefixed
+        thread terminating between the two _snapshot_threads() calls could net
+        the bucket delta to zero even though the test thread was correctly
+        bucketed.  By proving exactly one live thread named
+        'asyncio_test_snapshot_X' exists, the ``asyncio_pool >= 1`` assertion
+        is itself non-flaky (no baseline diff) yet still exercises the bucketing
+        logic directly.
+        """
         barrier = threading.Barrier(2)
         stop_event = threading.Event()
 
@@ -47,15 +58,18 @@ class TestSnapshotThreads:
             barrier.wait()
             stop_event.wait()
 
-        baseline = server_main._snapshot_threads()
         t = threading.Thread(target=worker, name='asyncio_test_snapshot_X', daemon=True)
         t.start()
         barrier.wait()  # ensure the thread is alive before snapshotting
         try:
             snapshot = server_main._snapshot_threads()
-            assert snapshot.get('asyncio_pool', 0) >= baseline.get('asyncio_pool', 0) + 1, (
-                f"Expected asyncio_pool to grow by at least 1; "
-                f"baseline={baseline}, snapshot={snapshot}"
+            named = [th for th in threading.enumerate() if th.name == 'asyncio_test_snapshot_X']
+            assert len(named) == 1, (
+                f"Expected exactly one live thread named 'asyncio_test_snapshot_X'; "
+                f"found {len(named)}: {sorted(th.name for th in threading.enumerate())}"
+            )
+            assert snapshot.get('asyncio_pool', 0) >= 1, (
+                f"Expected asyncio_pool >= 1; snapshot={snapshot}"
             )
         finally:
             stop_event.set()
