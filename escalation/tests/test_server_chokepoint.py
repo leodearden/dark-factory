@@ -35,13 +35,10 @@ _COMMON_KWARGS: dict[str, Any] = {
 
 async def _make_lookup(status: str | None):
     """Build a simple async stub that always returns *status*."""
-    calls: list[str] = []
 
     async def _lookup(task_id: str) -> str | None:
-        calls.append(task_id)
         return status
 
-    _lookup.calls = calls  # type: ignore[attr-defined]
     return _lookup
 
 
@@ -53,11 +50,6 @@ async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
 async def _info(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_info')
     return await tool.fn(**kwargs)
-
-
-def _queue_root_files(queue: EscalationQueue) -> list[Path]:
-    """Return all esc-*.json files in the queue root (excludes archive)."""
-    return sorted(queue.queue_dir.glob('esc-*.json'))
 
 
 # ---------------------------------------------------------------------------
@@ -265,23 +257,6 @@ class TestKeptOpenPaths:
         result = await _blocker(server, **_COMMON_KWARGS)
 
         assert result['status'] == 'queued'
-
-    @pytest.mark.asyncio
-    async def test_no_lookup_spy_not_called(self, tmp_path: Path):
-        """When task_status_lookup=None, no lookup is ever consulted."""
-        queue = EscalationQueue(tmp_path / 'esc')
-        spy_calls: list[str] = []
-
-        async def _spy_lookup(task_id: str) -> str:
-            spy_calls.append(task_id)
-            return 'done'
-
-        # Pass spy explicitly to verify it's NOT called when disabled via default
-        # i.e. test that the None-default path never consults the callable
-        server = create_server(queue)  # no task_status_lookup (None default)
-        await _blocker(server, **_COMMON_KWARGS)
-
-        assert spy_calls == [], f"Lookup was unexpectedly called: {spy_calls}"
 
     @pytest.mark.asyncio
     async def test_non_terminal_no_resolved_record(self, tmp_path: Path):
