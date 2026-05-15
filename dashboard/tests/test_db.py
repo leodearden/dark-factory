@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from unittest.mock import patch
 
@@ -110,6 +111,45 @@ class TestDbPool:
                 row = await cur.fetchone()
             assert row is not None
             assert row[0] == 1
+        finally:
+            await pool.close_all()
+
+    async def test_concurrent_get_same_path_opens_once(self, tmp_path):
+        """Concurrent get() calls for the same path must open exactly one connection.
+
+        Pre-fix: all N coroutines pass the membership check before the first
+        connect resolves, so aiosqlite.connect is called N times and N-1
+        connections are leaked.  Post-fix: only one connection is opened; the
+        rest reuse the cached result.
+        """
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        connect_calls = 0
+
+        async def wrapper(*args, **kwargs):
+            nonlocal connect_calls
+            connect_calls += 1
+            # Yield so every gathered coroutine can pass the membership check
+            # before the first connect resolves — this makes the race
+            # deterministic and observable.
+            await asyncio.sleep(0)
+            return await real_connect(*args, **kwargs)
+
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                results = await asyncio.gather(*[pool.get(db_path) for _ in range(8)])
+            assert connect_calls == 1, (
+                f'expected 1 connect call, got {connect_calls} — '
+                'concurrent gets opened duplicate connections'
+            )
+            assert all(r is not None for r in results), 'all results should be non-None'
+            assert all(r is results[0] for r in results), (
+                'all results should be the same cached connection object'
+            )
+            assert pool.open_count == 1
         finally:
             await pool.close_all()
 
