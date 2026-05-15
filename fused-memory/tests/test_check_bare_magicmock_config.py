@@ -8,10 +8,13 @@ See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -360,3 +363,71 @@ class TestCliErrorHandling:
         # Read failure from the broken file is reported on stderr.
         assert 'test_broken.py' in captured.err
         assert 'simulated transient read error' in captured.err
+
+
+class TestStdlibOnlyProof:
+    """Running the script under python3 -I -S proves it imports only stdlib modules.
+
+    ``python3 -I`` alone does NOT block venv site-packages on this machine (python 3.14,
+    uv-managed venv): ``-I`` only disables *user* site-packages (implies ``-s``), not system
+    or venv site-packages.  ``-I -S`` additionally skips site.py, so venv site-packages are
+    never added to sys.path — any accidental third-party import in the script would raise
+    ModuleNotFoundError at interpreter startup, loudly failing this test.
+
+    Three cases are exercised:
+      1. Empty directory: no test_*.py → exit 0, empty stdout (startup isolation).
+      2. Clean file: parse/scan runs → exit 0, empty stdout (scan path isolation).
+      3. Violation file: exit 1, stdout has violation + alternatives + 1339 (print path).
+    """
+
+    def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
+        """python3 -I -S three-case stdlib-only proof."""
+        if shutil.which('python3') is None:
+            pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
+
+        # --- Case 1: empty directory (startup + import isolation) ---
+        result = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f'Script exited non-zero under python3 -I -S:\n'
+            f'  stdout: {result.stdout!r}\n'
+            f'  stderr: {result.stderr!r}'
+        )
+        assert result.stdout == '', (
+            f'Expected empty stdout (no scan targets in empty dir), got: {result.stdout!r}'
+        )
+
+        # --- Case 2: clean file (parse/scan path isolation) ---
+        clean_file = tmp_path / 'test_clean.py'
+        clean_file.write_text(_CLEAN_SOURCE)
+        result2 = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result2.returncode == 0, (
+            f'Script exited non-zero (clean scan) under python3 -I -S:\n'
+            f'  stdout: {result2.stdout!r}\n'
+            f'  stderr: {result2.stderr!r}'
+        )
+        assert result2.stdout == '', (
+            f'Expected empty stdout (clean file), got: {result2.stdout!r}'
+        )
+
+        # --- Case 3: violation file (print-violations branch isolation) ---
+        bad_file = tmp_path / 'test_bad.py'
+        bad_file.write_text(_VIOLATION_SOURCE)
+        result3 = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result3.returncode == 1, (
+            f'Script should exit 1 under python3 -I -S, got {result3.returncode}:\n'
+            f'  stdout: {result3.stdout!r}\n'
+            f'  stderr: {result3.stderr!r}'
+        )
+        _assert_violation_output(result3.stdout, bad_file)
