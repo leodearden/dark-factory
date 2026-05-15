@@ -2832,9 +2832,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # --- Unclean exit path ---
-            # Wrapped in try/except so an unexpected error (e.g. pause_scheduler
-            # transiently raising) is logged and the loop degrades gracefully
-            # rather than dying unobserved with the scheduler still running.
+            # S2 fix: compute should_trip_crashloop INSIDE the broad try/except
+            # (so bookkeeping errors degrade gracefully to base-backoff rather than
+            # dying silently) but act on it OUTSIDE (so a pause_scheduler failure
+            # cannot defeat the safety stop — the original S2 defect).
+            should_trip_crashloop: bool = False
             try:
                 now = end  # reuse end timestamp (captured above); avoids extra monotonic call
                 self._watcher_unclean_exits.append(now)
@@ -2848,28 +2850,22 @@ Output JSON matching the schema. Every task must appear in the output.
                 ):
                     self._watcher_unclean_exits.popleft()
 
-                if len(self._watcher_unclean_exits) >= self.config.watcher_max_crashloop_restarts:
-                    logger.error(
-                        'Escalation-watcher-auto crashloop detected '
-                        '(%d unclean exits in %ds window) — pausing scheduler',
-                        len(self._watcher_unclean_exits),
-                        window,
+                should_trip_crashloop = (
+                    len(self._watcher_unclean_exits) >= self.config.watcher_max_crashloop_restarts
+                )
+                if not should_trip_crashloop:
+                    backoff = min(
+                        self.config.watcher_subprocess_restart_backoff_secs
+                        * (2 ** (consecutive_unclean - 1)),
+                        _WATCHER_MAX_BACKOFF_SECS,
                     )
-                    await self.pause_scheduler('watcher_crashloop')
-                    return  # stop supervising
-
-                backoff = min(
-                    self.config.watcher_subprocess_restart_backoff_secs
-                    * (2 ** (consecutive_unclean - 1)),
-                    _WATCHER_MAX_BACKOFF_SECS,
-                )
-                logger.warning(
-                    'Escalation-watcher-auto rotation exited uncleanly '
-                    '(consecutive=%d backoff=%.1fs)',
-                    consecutive_unclean,
-                    backoff,
-                )
-                await asyncio.sleep(backoff)
+                    logger.warning(
+                        'Escalation-watcher-auto rotation exited uncleanly '
+                        '(consecutive=%d backoff=%.1fs)',
+                        consecutive_unclean,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
             except asyncio.CancelledError:
                 raise  # clean shutdown
             except Exception:
@@ -2886,6 +2882,27 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
                 except asyncio.CancelledError:
                     raise
+
+            # Trip OUTSIDE the broad except so pause_scheduler failure cannot
+            # defeat the stop (S2 fix).  Defensive wrapper: CancelledError
+            # re-raises; any other exception is logged but the return still fires.
+            if should_trip_crashloop:
+                logger.error(
+                    'Escalation-watcher-auto crashloop detected '
+                    '(%d unclean exits in %ds window) — pausing scheduler',
+                    len(self._watcher_unclean_exits),
+                    self.config.watcher_crashloop_window_secs,
+                )
+                try:
+                    await self.pause_scheduler('watcher_crashloop')
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        'pause_scheduler raised on watcher_crashloop trip; '
+                        'stopping supervisor anyway'
+                    )
+                return  # stop supervising — always, even if pause_scheduler raised
 
     async def _scan_for_terminal_active_tasks(self) -> int:
         """Single pass: cancel any active workflow whose task is terminal.
