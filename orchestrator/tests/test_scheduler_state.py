@@ -670,3 +670,54 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         # assert_not_called() is the genuine regression check: the guard must
         # prevent write_state_snapshot from being invoked for all bad root values.
         scheduler.write_state_snapshot.assert_not_called()
+
+
+# ===========================================================================
+# Task-1332: _write_snapshot_best_effort throttle / coalesce
+# ===========================================================================
+
+class TestSnapshotWriteThrottle:
+    """Leading-edge time throttle coalesces writes within one interval window."""
+
+    @pytest.mark.asyncio
+    async def test_throttle_coalesces_ticks_within_interval(self, tmp_path):
+        """K ticks in the same throttle window produce exactly 1 disk write.
+
+        The first-ever write always proceeds (no prior timestamp).  The
+        subsequent K-1 ticks all fall within the same throttle window and must
+        be coalesced to zero extra writes.
+
+        The lock is released between each tick so task A is eligible every
+        time, ensuring acquire_next reaches _write_snapshot_best_effort on
+        every tick (state changes each tick, so the content-identity
+        optimisation does not mask the time-throttle assertion).
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = 1.0  # wide window
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+
+        # Provide a single pending task that can be acquired each tick.
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+
+        # Mock the disk-write seam to count real write attempts.
+        scheduler.write_state_snapshot = MagicMock()
+
+        # Run K=5 ticks WITHOUT advancing the clock.
+        # Release the lock between ticks so A is eligible each time.
+        # All ticks fall within [0.0, 0.0 + 1.0) — the first write proceeds
+        # (no prior ts), the next 4 must be coalesced.
+        K = 5
+        for _ in range(K):
+            await scheduler.acquire_next()
+            scheduler.release('A')  # make A eligible for the next tick
+
+        assert scheduler.write_state_snapshot.call_count == 1, (
+            f'Expected 1 disk write for {K} ticks within one throttle window, '
+            f'got {scheduler.write_state_snapshot.call_count}'
+        )
