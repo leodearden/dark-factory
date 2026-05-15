@@ -472,7 +472,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
 
 
 def test_shape_scheduler_envelope():
-    """shape_scheduler wraps inputs in SCHEDULER key with offline flag."""
+    """shape_scheduler wraps inputs in SCHEDULER key with offline and paused flags."""
     from dashboard.data.redux_api import shape_scheduler
 
     rows = [{'task_id': '1', 'title': 'T1'}]
@@ -480,14 +480,16 @@ def test_shape_scheduler_envelope():
     pin_queue = [{'task_id': '1', 'order': 0}]
     events_by_task = {'1': {'labels': [], 'values': []}}
     snapshot_at = '2026-01-01T00:00:00+00:00'
+    paused_entry = {'project': 'proj-a', 'reason': 'park-stop: 3 tasks'}
 
-    # Non-empty offline_projects → offline=True
+    # Non-empty offline_projects + non-empty paused_projects
     result_offline = shape_scheduler(
         rows=rows,
         modules=modules,
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=['proj-a'],
+        paused_projects=[paused_entry],
         snapshot_at=snapshot_at,
     )
     assert 'SCHEDULER' in result_offline
@@ -495,25 +497,31 @@ def test_shape_scheduler_envelope():
     assert set(inner.keys()) == {
         'rows', 'modules', 'pin_queue', 'events_by_task',
         'snapshot_at', 'offline', 'offline_projects',
+        'paused', 'paused_projects',
     }
     assert inner['offline'] is True
     assert inner['offline_projects'] == ['proj-a']
+    assert inner['paused'] is True
+    assert inner['paused_projects'] == [paused_entry]
     assert inner['rows'] == rows
     assert inner['modules'] == modules
     assert inner['pin_queue'] == pin_queue
     assert inner['events_by_task'] == events_by_task
     assert inner['snapshot_at'] == snapshot_at
 
-    # Empty offline_projects → offline=False
+    # Empty offline_projects + empty paused_projects → both False/[]
     result_online = shape_scheduler(
         rows=rows,
         modules=modules,
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=[],
+        paused_projects=[],
         snapshot_at=snapshot_at,
     )
     assert result_online['SCHEDULER']['offline'] is False
+    assert result_online['SCHEDULER']['paused'] is False
+    assert result_online['SCHEDULER']['paused_projects'] == []
 
 
 def test_shape_scheduler_top_level_lists_are_shallow_copies():
@@ -531,12 +539,14 @@ def test_shape_scheduler_top_level_lists_are_shallow_copies():
     pin_queue = [{'task_id': '1', 'order': 0}]
     events_by_task = {'1': {'labels': [], 'values': []}}
 
+    paused_projects = [{'project': 'p1', 'reason': 'park-stop: x'}]
     result = shape_scheduler(
         rows=rows,
         modules=modules,
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=[],
+        paused_projects=paused_projects,
         snapshot_at=None,
     )
     inner = result['SCHEDULER']
@@ -548,11 +558,13 @@ def test_shape_scheduler_top_level_lists_are_shallow_copies():
     inner['pin_queue'].append({'task_id': 'sentinel'})
     inner['events_by_task']['sentinel'] = {'labels': [], 'values': []}
     inner['offline_projects'].append('sentinel')
+    inner['paused_projects'].append({'project': 'sentinel', 'reason': None})
 
     assert rows == [{'task_id': '1'}], 'rows must not be mutated by caller'
     assert modules == [{'path': 'src/a.py'}], 'modules must not be mutated'
     assert pin_queue == [{'task_id': '1', 'order': 0}], 'pin_queue must not be mutated'
     assert 'sentinel' not in events_by_task, 'events_by_task must be a copy'
+    assert len(paused_projects) == 1, 'paused_projects must not be mutated by caller'
 
 
 # ---------------------------------------------------------------------------
