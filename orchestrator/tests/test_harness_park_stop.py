@@ -503,6 +503,24 @@ class TestHarnessCostCeiling:
             f'Expected 0.0 from empty redo set short-circuit; got {result!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_auto_eval_budget_used_24h_returns_zero_when_cost_store_none(
+        self, tmp_path: Path
+    ) -> None:
+        """_auto_eval_budget_used_24h returns 0.0 when cost_store is None (fail-open).
+
+        Even with a non-empty redo set the helper-None → 0.0 path must fire
+        rather than raising AttributeError or blocking dispatch.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.cost_store = None  # simulate missing cost DB
+        harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'}
+
+        result = await harness._auto_eval_budget_used_24h()
+        assert result == 0.0, (
+            f'Expected 0.0 when cost_store is None (fail-open); got {result!r}'
+        )
+
     # ------------------------------------------------------------------
     # Step 7 — _enforce_cost_ceilings: watcher ceiling trip
     # ------------------------------------------------------------------
