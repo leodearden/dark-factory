@@ -1248,8 +1248,6 @@ class TestHarnessMaybeWriteDigest:
         self, tmp_path: Path, _cost_store_factory
     ) -> None:
         """write_digest_entry raising does not propagate from _maybe_write_digest."""
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness.config = OrchestratorConfig(
             project_root=tmp_path,
@@ -1397,8 +1395,6 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
     @pytest.mark.asyncio
     async def test_clean_exit_triggers_maybe_write_digest(self, tmp_path: Path) -> None:
         """A clean rotation exit causes _maybe_write_digest to be awaited."""
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness._maybe_write_digest = AsyncMock()
 
@@ -1430,8 +1426,6 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
 
         Quiet days where the watcher crashes must not silence the digest.
         """
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness._maybe_write_digest = AsyncMock()
 
@@ -1463,8 +1457,6 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
 
         The supervisor must continue to the next rotation after a digest failure.
         """
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         # Replace with a raising async mock to simulate digest failure.
         harness._maybe_write_digest = AsyncMock(side_effect=RuntimeError('digest failure'))
@@ -1595,8 +1587,6 @@ class TestHarnessDigestEscalationCounterSnapshot:
         before the await points (cost_in_window, pause_scheduler) — the only
         locations where escalation callbacks can actually interleave.
         """
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness.config = OrchestratorConfig(
             project_root=tmp_path,
