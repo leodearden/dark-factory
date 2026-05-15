@@ -59,6 +59,11 @@ def pydantic_spec(model: type[BaseModel]) -> type:
         if isinstance(getattr(model, name, None), property):
             continue  # already collected above (defence-in-depth)
         members[name] = None
+    # Pydantic v2 PrivateAttr members — stored in __private_attributes__ dict,
+    # NOT in model_fields.  The underscore-name filter above intentionally skips
+    # these; walk them separately so PrivateAttrs bypass that filter.
+    for name in getattr(model, '__private_attributes__', {}):
+        members[name] = None
     return type(
         f'_{model.__name__}Spec',
         (),
