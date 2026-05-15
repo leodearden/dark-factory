@@ -147,17 +147,11 @@ async def test_submit_and_resolve_raises_when_no_result_json(row_value):
 
 
 # ---------------------------------------------------------------------------
-# Tests for 8df8bdcd shared scenario builder + parse helpers (step-1 RED)
+# Tests for 8df8bdcd shared scenario builder + parse helpers
 # ---------------------------------------------------------------------------
-# These tests will FAIL until the helpers are implemented in _fm_helpers.py.
-# The imports below are intentionally expected to fail with ImportError or
-# AttributeError until step-2 provides the implementation.
-# ---------------------------------------------------------------------------
-
-# We import the helpers lazily inside each test so that ImportError is the
-# failure mode rather than a collection error that breaks unrelated tests.
-# (If the names don't exist yet, the import will raise ImportError inside
-# the test body, which pytest reports as ERROR/FAILED as expected.)
+# Helpers are imported lazily inside each test (not at module level) so that
+# a future missing or renamed name surfaces as a localized test failure
+# rather than a collection error that breaks unrelated tests.
 
 
 class TestMake8df8Scenario:
