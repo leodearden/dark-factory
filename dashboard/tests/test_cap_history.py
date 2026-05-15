@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import aiosqlite
 import pytest
@@ -309,6 +309,137 @@ class TestReadCapIntervals:
             )
             assert result_shifted[0].account_name == 'acc-x'
             assert result_shifted[0].end is None  # open-ended (no resumed)
+
+    @pytest.mark.asyncio
+    async def test_naive_now_normalized_to_utc(self, tmp_path):
+        """A naive `now` must yield identical results to the equivalent tz-aware `now`.
+
+        WHY a naive DB row is inserted:
+        With tz-aware DB rows (production format), the lexicographic naive-vs-aware
+        cutoff mismatch coincidentally yields identical inclusion for all realistic
+        instants — so an aware-only test *cannot* go red.  The divergence is only
+        observable at a naive boundary row:
+
+        - naive `now` → cutoff is offset-less, e.g. ``"2026-05-08T12:00:00"``
+          The row's created_at is the *same* naive string → ``created_at >= cutoff``
+          is True (equal) → row is INCLUDED → 1 interval returned.
+        - tz-aware `now` → cutoff is ``"2026-05-08T12:00:00+00:00"``
+          That string sorts *after* the naive row string lexicographically → ``>=``
+          is False → row is EXCLUDED → 0 intervals returned.
+
+        Before the fix the two calls diverge (naive→1, aware→0) so the equivalence
+        assertion fails red.  After the fix both normalize to tz-aware before
+        computing cutoff → both yield 0 → assertion passes green.
+        """
+        real_now = datetime.now(UTC)
+        cutoff_instant = real_now - timedelta(days=7)
+
+        # Insert the boundary event as a NAIVE datetime so _make_db_with_events
+        # stores its isoformat without a +00:00 suffix — the only configuration
+        # where the lexicographic mismatch is detectable.
+        db_path = _make_db_with_events(tmp_path, 'naive_now.db', [
+            ('acc-n', 'cap_hit', cutoff_instant.replace(tzinfo=None)),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            result_naive = await read_cap_intervals(
+                [conn], days=7, now=real_now.replace(tzinfo=None)
+            )
+            result_aware = await read_cap_intervals(
+                [conn], days=7, now=real_now
+            )
+
+        # Both should be empty: the boundary-naive row is AT the cutoff, but
+        # with a consistent tz-aware cutoff ``created_at >= cutoff`` is False
+        # (the row string sorts before the +00:00 cutoff string).
+        assert len(result_naive) == len(result_aware), (
+            f"naive now → {len(result_naive)} interval(s), "
+            f"aware now → {len(result_aware)} interval(s); expected equal counts. "
+            f"Bug: naive cutoff has no +00:00 so it equals the naive boundary row "
+            f"(>= true), whereas aware cutoff sorts after it (>= false)."
+        )
+        assert {iv.account_name for iv in result_naive} == {iv.account_name for iv in result_aware}
+        assert result_aware == [], (
+            f"Expected 0 intervals with tz-aware now (boundary row at exact cutoff "
+            f"is excluded under half-open semantics), got {result_aware}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_utc_now_normalized_to_utc(self, tmp_path):
+        """A tz-aware but non-UTC ``now`` must produce the same cutoff as its UTC equivalent.
+
+        The divergence band:
+        Without ``astimezone(UTC)``, a ``now`` in ``-08:00`` produces a cutoff
+        string like ``"YYYY-MM-DDTHH:MM:SS-08:00"`` where the wall-clock hour
+        is 8 hours *earlier* than the UTC wall-clock hour.  A DB row stored as
+        ``"(Cwall-1h)...+00:00"`` — one UTC hour before the true cutoff — has
+        a wall-clock prefix 7 hours *after* the buggy cutoff's wall-clock prefix
+        (because 19 > 12 when UTC is 20 and the buggy -08:00 cutoff is at 12).
+        That 7-hour gap means the lexicographic comparison always resolves on the
+        fixed-width ``YYYY-MM-DDTHH:MM:SS`` prefix, never on the ``+``/``-``
+        suffix, so the comparison is deterministic regardless of date position.
+
+        RED/GREEN proof:
+        - ``result_utc`` (control): cutoff = ``Cwall...+00:00``; row
+          ``(Cwall-1h)...+00:00`` < cutoff (fixed-width prefix: "19" < "20") →
+          EXCLUDED → ``result_utc == []``, both pre- and post-fix.
+        - ``result_minus8`` (probe): PRE-FIX the buggy cutoff is
+          ``(Cwall-8h)...-08:00``; the row ``(Cwall-1h)...+00:00`` has prefix
+          "19" > "12" → row > cutoff → INCLUDED → ``len(result_minus8) == 1`` →
+          ``assert result_minus8 == []`` FAILS red.  POST-FIX ``astimezone(UTC)``
+          converts to UTC → cutoff = ``Cwall...+00:00`` → row excluded → green.
+
+        WHY a tz-aware (+00:00) DB row is used:
+        This exercises the *cutoff*-normalisation path, not the row-normalisation
+        path (the identical ``replace(tzinfo=UTC)`` idiom at cap_history.py:121).
+        """
+        # A UTC reference instant
+        real_now_utc = datetime.now(UTC)
+        cutoff_instant_utc = real_now_utc - timedelta(days=7)
+
+        # Equivalent now in a fixed -08:00 offset timezone
+        tz_minus8 = timezone(timedelta(hours=-8))
+        real_now_minus8 = real_now_utc.astimezone(tz_minus8)
+
+        # Probe row: strictly 1 hour INSIDE the divergence band (1 hour before
+        # the true cutoff).  This positions the row such that the correct UTC
+        # cutoff excludes it, while the buggy -08:00 cutoff includes it.
+        # The tz-aware (+00:00) format mirrors production DB rows, exercising
+        # the cutoff-normalisation branch rather than the row-normalisation branch.
+        probe_ts = cutoff_instant_utc - timedelta(hours=1)
+        db_path = _make_db_with_events(tmp_path, 'non_utc_now.db', [
+            ('acc-x', 'cap_hit', probe_ts),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            result_utc = await read_cap_intervals(
+                [conn], days=7, now=real_now_utc
+            )
+            result_minus8 = await read_cap_intervals(
+                [conn], days=7, now=real_now_minus8
+            )
+
+        # Load-bearing exact-count assertions:
+        # result_utc: correct UTC cutoff excludes probe row (pre- and post-fix)
+        assert result_utc == [], (
+            f"Expected [] with UTC now (probe row at cutoff-1h is before +00:00 "
+            f"cutoff string), got {result_utc}"
+        )
+        # result_minus8: pre-fix the buggy -08:00 cutoff includes probe row (→
+        # fails red); post-fix astimezone(UTC) normalises to UTC cutoff (→ green)
+        assert result_minus8 == [], (
+            f"Expected [] with -08:00 now (should normalize to UTC cutoff), "
+            f"got {result_minus8}. "
+            f"Bug: without astimezone(UTC), -08:00 cutoff string sorts before "
+            f"the probe row's +00:00 string, causing false inclusion."
+        )
+        # Supplementary inter-result consistency checks
+        assert len(result_utc) == len(result_minus8)
+        assert {iv.account_name for iv in result_utc} == {iv.account_name for iv in result_minus8}
 
 
 # ---------------------------------------------------------------------------
