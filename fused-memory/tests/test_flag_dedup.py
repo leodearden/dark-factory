@@ -2245,6 +2245,70 @@ class TestConfirmMarkerPersisted:
             f"but got: {warning_messages}"
         )
 
+    @pytest.mark.asyncio
+    async def test_ignores_stale_prior_with_different_run_id(self, caplog):
+        """Confirmation search must NOT accept a stale prior whose run_id differs from the current run.
+
+        The confirmation's job is 'did MY write for THIS run land?': a prior from an
+        earlier run must not masquerade as confirmation of the current write.
+
+        Setup: memory_service.search returns ONLY a stale prior with run_id='r0' on
+        BOTH the first call and the retry (side_effect=[[stale_prior],[stale_prior]]).
+        Call confirm_marker_persisted with run_id='r1'.
+
+        Asserts:
+        (a) Returns None — the prior's run_id 'r0' != current 'r1', must NOT be accepted.
+        (b) memory_service.search.call_count == 2 (miss → retry → miss).
+        (c) Final 'could not confirm' WARNING fires containing task_id + flag_type.
+
+        Fails until step-15 adds run_id to the confirmation kind filter so stale priors
+        are not incorrectly matched.
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
+
+        stale_prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'x',
+            'run_id': 'r0',  # OLD run — NOT the current run 'r1'
+        })
+        stale_prior.id = 'stale-prior'
+
+        memory_service = AsyncMock()
+        # Both calls return the stale prior (old run_id 'r0')
+        memory_service.search = AsyncMock(side_effect=[[stale_prior], [stale_prior]])
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await confirm_marker_persisted(
+                memory_service,
+                project_id='p',
+                task_id='42',
+                flag_type='x',
+                run_id='r1',
+                log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+            )
+
+        # (a) Returns None — stale prior must NOT be accepted as confirmation of 'r1' write
+        assert result is None, (
+            f"Expected None (stale prior run_id='r0' must not confirm run_id='r1') "
+            f"but got {result!r}"
+        )
+        # (b) Both attempts made: miss → retry → miss
+        assert memory_service.search.call_count == 2, (
+            f"Expected 2 search calls (initial + 1 retry) but got {memory_service.search.call_count}"
+        )
+        # (c) Final 'could not confirm' WARNING fires containing task_id + flag_type
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            '42' in m and 'x' in m and 'could not confirm' in m
+            for m in warning_messages
+        ), (
+            f"Expected final WARNING with 'could not confirm' + task_id '42' + flag_type 'x' "
+            f"but got: {warning_messages}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-1400 step-9 — dedup_flags HIT path: deletes priors only when confirmed
@@ -2603,3 +2667,91 @@ async def test_dedup_flags_miss_path_confirmation_miss_emits_noop_warning(caplog
     # Flag not annotated (MISS path)
     assert len(result) == 1
     assert 'persisted_from_run' not in result[0]
+
+
+# ---------------------------------------------------------------------------
+# task-1400 step-14(B) — HIT path silent no-op does not wipe priors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_path_silent_noop_does_not_wipe_priors(caplog):
+    """HIT path: when add_memory is a silent no-op the stale prior must NOT
+    masquerade as confirmation, and priors must be preserved.
+
+    Models the deceptive no-op: add_memory returns non-empty memory_ids (as if
+    the write succeeded), but the new marker was never indexed by Mem0.  The
+    confirmation search can only find the surviving stale prior (run_id='r0').
+
+    With run_id scoping in the confirmation kind filter (step-15):
+    - confirmation finds only the prior (run_id='r0', != 'r1') → miss
+    - confirmed_id = None → write_succeeded = False → priors NOT deleted
+    - flag annotated with persisted_from_run='r0' and last_seen_run_id='r1'
+
+    search side_effect: [[], [prior], [prior], [prior]]
+      [1] suppression sweep        → []
+      [2] per-flag pre-write HIT   → [prior run_id='r0']
+      [3] confirmation first       → [prior run_id='r0'] (stale only, no new marker)
+      [4] confirmation retry       → [prior run_id='r0'] (still stale only)
+
+    Asserts:
+    (a) delete_memory NOT called (priors preserved — silent no-op protection).
+    (b) WARNING fires that the replacement could not be confirmed.
+    (c) Flag annotated with persisted_from_run='r0' and last_seen_run_id='r1'
+        (annotation extracted before write attempt).
+
+    Fails until step-15 adds run_id to the confirmation kind filter so that
+    the stale prior with run_id='r0' is not wrongly accepted as proof that the
+    run_id='r1' write landed.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'aaa'
+
+    memory_service = AsyncMock()
+    # suppression=[], pre-write HIT=[prior], confirmation=[prior], retry=[prior]
+    memory_service.search = AsyncMock(
+        side_effect=[[], [prior_marker], [prior_marker], [prior_marker]]
+    )
+    memory_service.add_memory = AsyncMock(
+        return_value=AddMemoryResponse(memory_ids=['returned-id'])
+    )
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) delete_memory NOT called — priors preserved (silent no-op protection)
+    memory_service.delete_memory.assert_not_called()
+
+    # (b) WARNING fires that replacement could not be confirmed
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        ('42' in m or 'missing_deliverable' in m) and
+        ('could not confirm' in m or 'cannot confirm' in m or 'not confirmed' in m
+         or 'skipping' in m or 'skip' in m)
+        for m in warning_messages
+    ), (
+        f"Expected WARNING about unconfirmed replacement but got: {warning_messages}"
+    )
+
+    # (c) Flag annotated (annotation extracted before write attempt, from the prior)
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
