@@ -385,9 +385,11 @@ class TestDbPool:
         # `await getter` returns above.
         # Verified against aiosqlite >=0.22.x — bump and re-verify the
         # private-attribute lifecycle if this pin moves.
-        assert hasattr(opened[0], '_connection') and hasattr(opened[0], '_running'), (
-            'aiosqlite internal attribute names changed — update test'
-        )
+        assert (
+            hasattr(opened[0], '_connection')
+            and hasattr(opened[0], '_running')
+            and hasattr(opened[0], '_thread')
+        ), 'aiosqlite internal attribute names changed — update test'
         assert opened[0]._connection is None, (
             f'expected closed mid-flight connection (_connection is None), '
             f'got {opened[0]._connection!r}'
@@ -400,15 +402,12 @@ class TestDbPool:
         # that the state flags were flipped.  The thread exits after the STOP
         # sentinel is processed — which happens asynchronously after close()
         # returns — so join(timeout=2.0) is required before asserting is_alive().
-        # Guarded by hasattr so a future aiosqlite that renames _thread skips
-        # this block instead of raising AttributeError.
-        if hasattr(opened[0], '_thread'):
-            opened[0]._thread.join(timeout=2.0)
-            assert not opened[0]._thread.is_alive(), (
-                'aiosqlite worker thread did not exit after close '
-                '(mid-open connection was not properly closed by the '
-                'post-connect _closed re-check)'
-            )
+        opened[0]._thread.join(timeout=2.0)
+        assert not opened[0]._thread.is_alive(), (
+            'aiosqlite worker thread did not exit after close '
+            '(mid-open connection was not properly closed by the '
+            'post-connect _closed re-check)'
+        )
 
 
 class TestWithDb:
