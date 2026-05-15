@@ -2544,10 +2544,58 @@ Output JSON matching the schema. Every task must appear in the output.
     async def _watcher_supervisor_loop(self) -> None:
         """Supervisor loop — restart watcher rotations until shutdown.
 
-        Stub body; full implementation added in step-10/12.
+        Classification:
+          clean exit (success=True and not timed_out) → immediate restart,
+              reset consecutive-unclean counter.
+          unclean exit (success=False OR timed_out=True) → record timestamp,
+              apply exponential backoff, check crashloop guard (step-12).
+          asyncio.CancelledError → re-raise (clean shutdown signal).
+          generic Exception → treated as unclean (logged via logger.exception).
+
+        Crashloop detection is added in step-12.
         """
+        consecutive_unclean: int = 0
         while True:
-            await asyncio.sleep(9999)
+            try:
+                result = await self._run_watcher_rotation()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    'Escalation-watcher-auto rotation raised unexpected exception'
+                )
+                # Treat as unclean: backoff below
+                result = None  # sentinel for unclean path
+
+            clean = (
+                result is not None
+                and bool(getattr(result, 'success', False))
+                and not bool(getattr(result, 'timed_out', False))
+            )
+
+            if clean:
+                # Healthy rotation completed — reset backoff, restart immediately.
+                consecutive_unclean = 0
+                logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
+                continue
+
+            # --- Unclean exit path ---
+            import time as _time
+            self._watcher_unclean_exits.append(_time.monotonic())
+            consecutive_unclean += 1
+
+            backoff = min(
+                self.config.watcher_subprocess_restart_backoff_secs
+                * (2 ** (consecutive_unclean - 1)),
+                _WATCHER_MAX_BACKOFF_SECS,
+            )
+            logger.warning(
+                'Escalation-watcher-auto rotation exited uncleanly '
+                '(consecutive=%d backoff=%.1fs)',
+                consecutive_unclean,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
 
     async def _scan_for_terminal_active_tasks(self) -> int:
         """Single pass: cancel any active workflow whose task is terminal.
