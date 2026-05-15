@@ -1128,32 +1128,44 @@ class TestCapRetryMaxRetries:
     """max_cap_retries guard: raise AllAccountsCappedException after N cap hits."""
 
     async def test_raises_after_max_cap_retries(self):
-        """With max_cap_retries=3, raises AllAccountsCappedException after exactly 3 cap hits."""
+        """max_cap_retries is vestigial: cap hits do NOT raise on count.
+
+        Previously asserted that 3 cap hits with max_cap_retries=3 raised
+        AllAccountsCappedException. After the count guard is removed (step-2),
+        the guard no longer fires and the same cap hits + success produces a
+        successful result. This rewrite pins the new count-independent behaviour.
+        RED until step-2 removes the count guard.
+        """
         gate = _mock_gate(
             account_count=1,
-            before_invoke=AsyncMock(side_effect=['tok'] * 10),
-            detect_cap_hit=MagicMock(return_value=True),
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(side_effect=[True, True, True, False]),
             active_account_name='acct',
         )
         result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
-            pytest.raises(AllAccountsCappedException) as exc_info,
         ):
-            await invoke_with_cap_retry(
-                gate, 'Task-3', max_cap_retries=3, prompt='hi',
+            got = await invoke_with_cap_retry(
+                gate, 'Task-3',
+                max_cap_retries=3,
+                cap_retry_deadline_secs=None,  # disable deadline
+                prompt='hi',
             )
-        assert exc_info.value.retries == 3
-        assert 'Task-3' in str(exc_info.value)
-        assert mock_inv.await_count == 3
+        assert got.success is True
 
     async def test_no_exception_when_cap_hits_under_limit(self):
-        """2 cap hits with max_cap_retries=3 succeeds on the 3rd invocation."""
+        """Cap hits never raise on count (count guard is vestigial).
+
+        Rewritten from the old test that verified 2 < max_cap_retries=3 succeeds.
+        Now asserts count-independence: even 10 cap hits with max_cap_retries=3
+        succeed because the count guard no longer exists. RED until step-2.
+        """
         gate = _mock_gate(
             account_count=1,
-            before_invoke=AsyncMock(side_effect=['tok'] * 3),
-            detect_cap_hit=MagicMock(side_effect=[True, True, False]),
+            before_invoke=AsyncMock(side_effect=['tok'] * 12),
+            detect_cap_hit=MagicMock(side_effect=[True] * 10 + [False]),
             active_account_name='acct',
         )
         result = make_result()
@@ -1162,10 +1174,13 @@ class TestCapRetryMaxRetries:
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
         ):
             got = await invoke_with_cap_retry(
-                gate, 'lbl', max_cap_retries=3, prompt='hi',
+                gate, 'lbl',
+                max_cap_retries=3,
+                cap_retry_deadline_secs=None,
+                prompt='hi',
             )
         assert got.success is True
-        assert mock_inv.await_count == 3
+        assert mock_inv.await_count == 11  # 10 cap hits + 1 success
 
     async def test_none_disables_max_cap_retries(self):
         """max_cap_retries=None disables the retry count guard; 5 cap hits then success."""
@@ -1188,6 +1203,36 @@ class TestCapRetryMaxRetries:
             )
         assert got.success is True
         assert mock_inv.await_count == 6
+
+    async def test_exact_detect_ignores_max_cap_retries(self):
+        """Exact-detect branch: cap hits never raise on count even when N >> max_cap_retries.
+
+        5 cap hits with max_cap_retries=3 and no deadline must succeed (not raise).
+        cap_wait_sanity_secs=None disables the sanity bound (param added in step-4;
+        currently forwarded as an invoke kwarg — no-op today).
+        RED until step-2 removes the exact-detect count guard.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 7),
+            detect_cap_hit=MagicMock(side_effect=[True] * 5 + [False]),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl',
+                max_cap_retries=3,
+                cap_retry_deadline_secs=None,
+                cap_wait_sanity_secs=None,  # step-4 param; currently goes to **invoke_kwargs
+                prompt='hi',
+            )
+        assert got.success is True
+        assert mock_inv.await_count == 6  # 5 cap hits + 1 success
 
 
 # ===================================================================
@@ -1311,25 +1356,65 @@ class TestCapRetryHeuristicGuard:
         )
 
     async def test_heuristic_raises_after_max_retries(self):
-        """Heuristic cap hits count toward max_cap_retries and raise AllAccountsCappedException."""
+        """Heuristic branch: cap hits do NOT raise on count (count guard removed in step-2).
+
+        Previously asserted that heuristic cap hits count toward max_cap_retries.
+        Now asserts count-independence: 3 heuristic cap hits with max_cap_retries=2
+        must succeed (not raise). RED until step-2 removes the heuristic count guard.
+        """
         gate = _mock_gate(
             account_count=1,
             before_invoke=AsyncMock(side_effect=['tok'] * 5),
             detect_cap_hit=MagicMock(return_value=False),  # not caught by pattern
             active_account_name='acct',
         )
-        gate._handle_cap_detected = MagicMock()
+        gate._handle_cap_detected = MagicMock(return_value=True)
         heuristic_result = self._make_heuristic_result()
+        ok_result = make_result()
         with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=heuristic_result) as mock_inv,
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[heuristic_result, heuristic_result, heuristic_result, ok_result]),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
-            pytest.raises(AllAccountsCappedException) as exc_info,
         ):
-            await invoke_with_cap_retry(
-                gate, 'heuristic-task', max_cap_retries=2, prompt='hi',
+            got = await invoke_with_cap_retry(
+                gate, 'heuristic-task',
+                max_cap_retries=2,
+                cap_retry_deadline_secs=None,
+                prompt='hi',
             )
-        assert exc_info.value.retries == 2
-        assert mock_inv.await_count == 2
+        assert got.success is True
+
+    async def test_heuristic_branch_ignores_max_cap_retries(self):
+        """Heuristic branch: N >> max_cap_retries cap hits succeed (count-independence).
+
+        5 heuristic cap hits with max_cap_retries=3 and no deadline must succeed.
+        cap_wait_sanity_secs=None disables the sanity bound (step-4 param; currently
+        forwarded as an invoke kwarg — no-op today).
+        RED until step-2 removes the heuristic count guard.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 7),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        heuristic_result = self._make_heuristic_result()
+        ok_result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[heuristic_result] * 5 + [ok_result]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl',
+                max_cap_retries=3,
+                cap_retry_deadline_secs=None,
+                cap_wait_sanity_secs=None,  # step-4 param
+                prompt='hi',
+            )
+        assert got.success is True
 
     async def test_heuristic_succeeds_before_max_retries(self):
         """1 heuristic hit then success does not raise (under max_cap_retries=2)."""
@@ -1401,7 +1486,12 @@ class TestCapRetryGuardLogging:
     """Verify logger.error is emitted with diagnostic info before raising."""
 
     async def test_error_logged_before_max_retries_raise(self, caplog):
-        """logger.error includes label, retry count, and elapsed time on max_cap_retries hit."""
+        """logger.error includes label and elapsed time before AllAccountsCappedException.
+
+        Updated to use a deadline-based raise (not count-based) since the count
+        guard is removed in step-2.  The deadline guard still emits logger.error
+        before raising, which is the contract this test verifies.
+        """
         gate = _mock_gate(
             account_count=2,
             before_invoke=AsyncMock(side_effect=['tok'] * 5),
@@ -1409,16 +1499,20 @@ class TestCapRetryGuardLogging:
             active_account_name='acct',
         )
         result = make_result()
+        # First call → 0.0 (retry_start), all subsequent → 4000.0
+        # → elapsed = 4000.0 > cap_retry_deadline_secs=3600.0 after just 1 cap hit
+        monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
             caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
             pytest.raises(AllAccountsCappedException),
         ):
             await invoke_with_cap_retry(
                 gate, 'my-label',
-                max_cap_retries=2,
-                cap_retry_deadline_secs=None,
+                max_cap_retries=None,
+                cap_retry_deadline_secs=3600.0,
                 prompt='hi',
             )
         assert any(
@@ -1427,7 +1521,6 @@ class TestCapRetryGuardLogging:
         ), f'Expected error log with label. Got: {[r.message for r in caplog.records]}'
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
-        assert any('2' in m for m in error_msgs), 'Error log should include retry count'
 
     async def test_error_logged_before_deadline_raise(self, caplog):
         """logger.error includes label and elapsed time on deadline hit."""
@@ -1848,10 +1941,12 @@ class TestAuthFailure403Detection:
         )
 
     async def test_429_all_accounts_raises_all_accounts_capped(self):
-        """When every account answers HTTP 429 with a cap-message body, the
-        cap-retry budget exhausts and ``invoke_with_cap_retry`` must raise
-        ``AllAccountsCappedException`` — the signal the curator worker waits on
-        before deferring its batch via ``wait_for_open``.
+        """When every account answers HTTP 429 with a cap-message body,
+        ``invoke_with_cap_retry`` must raise ``AllAccountsCappedException``.
+
+        Uses a deadline-based raise (not count-based) so the test remains correct
+        after the count guard is removed in step-2.  Monotonic is patched to simulate
+        a large elapsed time so the deadline fires after the first cap hit.
         """
         gate = make_gate(['a', 'b'])
         cap_body = "You're out of extra usage · resets in 30m"
@@ -1862,13 +1957,18 @@ class TestAuthFailure403Detection:
                 api_error_status=429, cost_usd=0.0,
             )
 
+        # First call → 0.0 (retry_start), all subsequent → 4000.0
+        # → elapsed > cap_retry_deadline_secs=3600.0 after just one cap hit
+        monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
         with (
             patch(_INVOKE_PATCH, side_effect=fake_invoke),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
             pytest.raises(AllAccountsCappedException),
         ):
             await invoke_with_cap_retry(
-                gate, 'lbl', prompt='hi', max_cap_retries=4,
+                gate, 'lbl', prompt='hi',
+                cap_retry_deadline_secs=3600.0,
             )
 
     async def test_500_not_treated_as_auth_failure(self):
