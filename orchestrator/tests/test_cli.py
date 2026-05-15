@@ -9,6 +9,7 @@ import traceback as traceback_module
 from unittest.mock import MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 from click.testing import CliRunner
 
 import orchestrator.cli as cli_module
@@ -19,6 +20,7 @@ from orchestrator.cli import (
     _parse_duration,
     main,
 )
+from orchestrator.config import OrchestratorConfig
 
 
 class TestParseDuration:
@@ -448,7 +450,7 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         # Fake config so load_config doesn't need a real file
-        fake_config = MagicMock()
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
 
         # Fake Harness so we don't need a real one
@@ -492,7 +494,7 @@ class TestRunArmsWatchdog:
         state, fake_force_exit = self._fake_watchdog_factory()
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
-        fake_config = MagicMock()
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
@@ -536,7 +538,7 @@ class TestRunArmsWatchdog:
         state, fake_force_exit = self._fake_watchdog_factory()
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
-        fake_config = MagicMock()
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
@@ -596,7 +598,7 @@ class TestRunArmsWatchdog:
 
         monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
 
-        fake_config = MagicMock()
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
@@ -651,7 +653,7 @@ class TestRunArmsWatchdog:
         state, fake_force_exit = self._fake_watchdog_factory()
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
-        fake_config = MagicMock()
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()

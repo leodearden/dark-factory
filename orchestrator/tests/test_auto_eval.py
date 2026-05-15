@@ -12,7 +12,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import TaskAssignment
@@ -48,7 +50,7 @@ def _make(
     if auto_eval_phases is None:
         auto_eval_phases = {'plan', 'execute', 'verify', 'review'}
 
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = project_root
     config.auto_eval_enabled = auto_eval_enabled
     config.auto_eval_redo_budget_usd = redo_budget_usd

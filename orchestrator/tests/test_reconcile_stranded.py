@@ -10,8 +10,9 @@ from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.harness import Harness, _pid_alive
 
 # ---------------------------------------------------------------------------
@@ -1785,7 +1786,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
         remote='origin',
         worktree_dir='.worktrees',
     )
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.git = git_cfg
     config.project_root = tmp_path
     config.usage_cap.enabled = False

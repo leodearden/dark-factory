@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from _orch_helpers import pydantic_spec
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import (
     _MCP_BACKOFF_BASE,
     _MCP_MAX_RETRIES,
@@ -335,7 +337,7 @@ class TestMcpLifecycleProcessGroup:
     @pytest.fixture
     def mock_config(self, tmp_path: Path) -> MagicMock:
         """Minimal config-shaped mock for McpLifecycle."""
-        cfg = MagicMock()
+        cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         cfg.fused_memory.server_command = ['echo', 'ok']
         cfg.fused_memory.url = 'http://localhost:8002'
         cfg.fused_memory.config_path = 'fused-memory/config/config.yaml'

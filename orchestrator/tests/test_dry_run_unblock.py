@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
+from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 
@@ -82,7 +83,7 @@ class TestProposalSchemaShape:
 
 def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
                  model='sonnet', max_turns=50, effort='high', backend='claude'):
-    cfg = MagicMock()
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
     cfg.unblock_auto.timeout_seconds = timeout_seconds

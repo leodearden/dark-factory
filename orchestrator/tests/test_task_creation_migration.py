@@ -14,12 +14,15 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from _orch_helpers import pydantic_spec
+
 from orchestrator.agents.roles import (
     DEEP_REVIEWER,
     STEWARD,
     submit_only_instructions,
     submit_resolve_instructions,
 )
+from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
 
@@ -121,7 +124,7 @@ class TestAllowlists:
 
 def _make_review_checkpoint() -> ReviewCheckpoint:
     """Construct a minimal ReviewCheckpoint with mocked config for site-4 tests."""
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = Path('/tmp/pr')
     config.fused_memory.project_id = 'test-proj'
     config.escalation.host = 'localhost'

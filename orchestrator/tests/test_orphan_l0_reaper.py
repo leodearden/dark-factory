@@ -7,9 +7,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.review_checkpoint import ReviewCheckpoint
 
@@ -149,14 +151,14 @@ class TestReviewerEscalationPromotion:
 
     @pytest.fixture
     def checkpoint(self, tmp_path: Path) -> ReviewCheckpoint:
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.project_root = tmp_path
         cp = ReviewCheckpoint(config, mcp=MagicMock(), usage_gate=None)
         cp.escalation_queue = EscalationQueue(tmp_path / 'escalations')
         return cp
 
     def test_no_queue_is_noop(self, tmp_path: Path):
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.project_root = tmp_path
         cp = ReviewCheckpoint(config, mcp=MagicMock(), usage_gate=None)
         # escalation_queue defaults to None

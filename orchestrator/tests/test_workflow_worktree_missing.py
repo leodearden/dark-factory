@@ -15,8 +15,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import (
     WORKTREE_MISSING_REASON_PREFIX,
     MergeOutcome,
@@ -35,7 +37,9 @@ def _make_workflow(
     assignment.task = {'id': task_id, 'title': 'Tx', 'description': 'd'}
     assignment.modules = ['mod_a']
 
-    config = MagicMock()
+    _spec = pydantic_spec(OrchestratorConfig)
+    _spec.for_module = None  # custom method not in model_fields; expose to spec_set
+    config = MagicMock(spec_set=_spec)
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.max_review_cycles = 2
