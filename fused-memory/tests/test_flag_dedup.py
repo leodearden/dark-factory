@@ -2364,6 +2364,114 @@ async def test_dedup_flags_hit_path_deletes_when_confirmed(caplog):
 
 
 # ---------------------------------------------------------------------------
+# task-1400 step-11 — end-to-end integration: confirmation wired, full call sequence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_end_to_end_confirmation_wired():
+    """Integration regression: full call sequence with one MISS-happy and one HIT-happy flag.
+
+    Verifies the complete wired path so a later refactor cannot silently desync
+    the search-call sequence.
+
+    Flags:
+    - flag_A: no task_id/flag_type → no-signature, pass-through unchanged
+    - flag_B: MISS-happy (no prior); confirmation search finds the new marker
+    - flag_C: HIT-happy (prior exists); confirmation search confirms replacement
+
+    Search call sequence:
+    1. suppression sweep (filter_suppressed) → []
+    2. flag_B pre-write search → [] (MISS)
+    3. flag_B confirmation → [b_marker] (found)
+    4. flag_C pre-write search → [c_prior] (HIT)
+    5. flag_C confirmation → [c_new_marker] (found)
+
+    Asserts:
+    (a) flag_A returned unchanged (no-signature pass-through)
+    (b) flag_B NOT annotated (MISS → no persisted_from_run)
+    (c) flag_C annotated with persisted_from_run='r0' and last_seen_run_id='r1'
+    (d) add_memory called exactly twice (once for MISS, once for HIT replacement)
+    (e) delete_memory called exactly once (for C's prior)
+    (f) search called exactly 5 times (suppression + 2 pre-write + 2 confirmation)
+    (g) filter_suppressed still issues exactly one project-scoped sweep
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    b_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '10',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r1',
+    })
+    b_marker.id = 'b-canon'
+
+    c_prior = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '20',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    c_prior.id = 'c-prior'
+
+    c_new_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '20',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    c_new_marker.id = 'c-canon'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=[
+        [],          # (1) suppression sweep
+        [],          # (2) flag_B pre-write MISS
+        [b_marker],  # (3) flag_B confirmation hit
+        [c_prior],   # (4) flag_C pre-write HIT
+        [c_new_marker],  # (5) flag_C confirmation hit
+    ])
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flag_A = {'description': 'no-signature flag'}
+    flag_B = {'task_id': '10', 'flag_type': 'stale_metadata', 'description': 'B'}
+    flag_C = {'task_id': '20', 'flag_type': 'missing_deliverable', 'description': 'C'}
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=[flag_A, flag_B, flag_C],
+    )
+
+    # (a) flag_A unchanged (no-signature)
+    assert len(result) == 3
+    assert result[0] == flag_A
+
+    # (b) flag_B not annotated (MISS)
+    assert 'persisted_from_run' not in result[1]
+
+    # (c) flag_C annotated (HIT)
+    assert result[2].get('persisted_from_run') == 'r0'
+    assert result[2].get('last_seen_run_id') == 'r1'
+
+    # (d) add_memory called twice
+    assert memory_service.add_memory.call_count == 2, (
+        f"Expected 2 add_memory calls but got {memory_service.add_memory.call_count}"
+    )
+
+    # (e) delete_memory called once (for C's prior)
+    memory_service.delete_memory.assert_called_once()
+    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'c-prior'
+
+    # (f) search called exactly 5 times
+    assert memory_service.search.call_count == 5, (
+        f"Expected 5 search calls but got {memory_service.search.call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # task-1400 step-7 — dedup_flags MISS path: confirmation called after write
 # ---------------------------------------------------------------------------
 
