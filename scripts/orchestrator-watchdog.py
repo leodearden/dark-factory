@@ -2,9 +2,10 @@
 """Orchestrator escalation-MCP watchdog.
 
 Probes the escalation-MCP TCP ports for the dark-factory and reify
-orchestrators via ``ss``, then performs a two-phase
-``systemctl --user stop`` → ``systemctl --user start`` on any that are not
-listening.  Runs as a oneshot systemd service on a 60-second timer.
+orchestrators via ``ss``, then performs a three-phase
+``systemctl --user stop`` → ``systemctl --user reset-failed`` →
+``systemctl --user start`` on any that are not listening.
+Runs as a oneshot systemd service on a 60-second timer.
 
 Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
@@ -19,6 +20,23 @@ WATCHED = [
     (8102, "dark-factory-orchestrator.service"),
     (8100, "reify-orchestrator.service"),
 ]
+
+# Skip the port probe for a unit that started within this many seconds.
+# Prevents the watchdog from stop→starting an orchestrator that is still
+# binding its escalation-MCP port after a fresh (re)start — which would
+# produce an indefinite restart loop and quickly exhaust StartLimitBurst.
+# Value = 2 × probe interval (60s) to cover worst-case startup latency.
+STARTUP_GRACE_SECS = 120
+
+
+def log(msg: str) -> None:
+    """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``."""
+    subprocess.run(
+        ["systemd-cat", "-t", "orchestrator-watchdog"],
+        input=msg,
+        text=True,
+        check=False,
+    )
 
 
 def probe_port(port: int) -> bool:
@@ -35,6 +53,11 @@ def probe_port(port: int) -> bool:
     layout from iproute2-6.1.0 / systemd 255 (local addr at index 3); the
     peer ``0.0.0.0:*`` field is harmlessly skipped (``int('*')`` raises
     ValueError).
+
+    If ``ss`` exits non-zero (binary missing, permission issue, or
+    filter-syntax difference across iproute2 versions), a diagnostic is logged
+    and True is returned so a tooling failure is not misinterpreted as the
+    port being down, which would trigger a spurious restart on a healthy unit.
     """
     result = subprocess.run(
         ["ss", "-ltn", f"sport = :{port}"],
@@ -42,6 +65,12 @@ def probe_port(port: int) -> bool:
         text=True,
         timeout=5,
     )
+    if result.returncode != 0:
+        log(
+            f"ss probe for port {port} exited with code {result.returncode}; "
+            "assuming port is up to avoid a false restart"
+        )
+        return True
     for line in result.stdout.splitlines():
         if "LISTEN" not in line:
             continue
@@ -50,7 +79,7 @@ def probe_port(port: int) -> bool:
             if colon_idx == -1:
                 continue
             try:
-                if int(field[colon_idx + 1:]) == port:
+                if int(field[colon_idx + 1 :]) == port:
                     return True
             except ValueError:
                 continue
@@ -58,31 +87,104 @@ def probe_port(port: int) -> bool:
 
 
 def restart_unit(unit: str) -> None:
-    """Two-phase restart: stop then start *unit* via ``systemctl --user``.
+    """Three-phase restart: stop → reset-failed → start *unit* via ``systemctl --user``.
 
-    systemd's TimeoutStopSec=30 escalates SIGTERM→SIGKILL so in-flight work
-    gets a grace period; we never invoke ``systemctl kill`` directly.
-    check=False so a stop failure (e.g. unit already dead) does not abort the
-    subsequent start.
+    - ``stop`` allows systemd's TimeoutStopSec=30 to escalate SIGTERM→SIGKILL
+      gracefully so in-flight work gets a 30-second grace period; we never
+      invoke ``systemctl kill`` directly.
+    - ``reset-failed`` clears the StartLimit state (StartLimitBurst / start-limit-hit)
+      so the subsequent start is not a silent no-op on a rate-limited unit.
+    - ``start`` re-launches the unit.
+
+    An explicit timeout of 45s (comfortably above TimeoutStopSec=30) prevents
+    the oneshot watchdog from hanging indefinitely if systemctl blocks.
+    TimeoutExpired is caught and logged; the remaining phases still execute.
     """
-    subprocess.run(["systemctl", "--user", "stop", unit], check=False)
-    subprocess.run(["systemctl", "--user", "start", unit], check=False)
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "stop", unit], check=False, timeout=45
+        )
+    except subprocess.TimeoutExpired:
+        log(f"systemctl stop {unit} timed out after 45s")
 
-
-def log(msg: str) -> None:
-    """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``."""
+    # Always run reset-failed regardless of stop outcome so a rate-limited unit
+    # (StartLimitBurst exhausted) can be recovered even after the timeout path.
     subprocess.run(
-        ["systemd-cat", "-t", "orchestrator-watchdog"],
-        input=msg,
-        text=True,
-        check=False,
+        ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
     )
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "start", unit], check=False, timeout=45
+        )
+    except subprocess.TimeoutExpired:
+        log(f"systemctl start {unit} timed out after 45s")
+
+
+def _read_uptime_secs() -> float | None:
+    """Return current system uptime in seconds from /proc/uptime, or None."""
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except OSError:
+        return None
+
+
+def _unit_start_elapsed_secs(unit: str) -> float | None:
+    """Seconds since *unit*'s main process started (monotonic clock), or None.
+
+    Queries ``ExecMainStartTimestampMonotonic`` (microseconds since boot) via
+    ``systemctl --user show`` and compares it against ``/proc/uptime``.
+
+    Returns None if the unit has no recorded start time, the value cannot be
+    parsed, or any subprocess/OS error occurs — callers must treat None as
+    "grace window does not apply, proceed with probe".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=ExecMainStartTimestampMonotonic",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            val = line.split("=", 1)[1].strip()
+            try:
+                start_mono_us = int(val)
+            except ValueError:
+                return None
+            if start_mono_us == 0:
+                return None  # unit has never started (or no PID recorded)
+            now_secs = _read_uptime_secs()
+            if now_secs is None:
+                return None
+            return max(0.0, now_secs - start_mono_us / 1_000_000)
+        return None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
         try:
+            elapsed = _unit_start_elapsed_secs(unit)
+            if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+                log(
+                    f"{unit} started {elapsed:.0f}s ago; "
+                    f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
+                )
+                continue
             if not probe_port(port):
                 log(f"{unit} escalation port {port} not listening; restarting")
                 restart_unit(unit)
