@@ -3684,7 +3684,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if self.escalation_queue:
                 esc = self.config.escalation
                 escalation_url = f'http://{esc.host}:{esc.port}/mcp'
-            mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
+            if self.mcp is not None:
+                mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
         # Plan-tools stdio MCP server — architect builds plans, implementer/
         # debugger marks steps done.  Per-invocation isolation: each agent
@@ -4744,6 +4745,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         content = '\n'.join(parts)
 
+        if self.mcp is None:
+            return
         try:
             import httpx as httpx_mod
             async with httpx_mod.AsyncClient() as client:
@@ -4773,6 +4776,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         decisions = self.plan.get('design_decisions', [])
         if not decisions:
             return
+        if self.mcp is None:
+            return
         try:
             async with __import__('httpx').AsyncClient() as client:
                 for decision in decisions:
@@ -4801,6 +4806,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Write review suggestions (non-blocking) to memory as conventions."""
         suggestions = reviews.suggestions
         if not suggestions:
+            return
+        if self.mcp is None:
             return
         try:
             import httpx as httpx_mod
@@ -4838,6 +4845,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Per-POST exceptions are caught and logged as warnings; a failure on one
         suggestion does not abort the remaining submissions.
         """
+        if self.mcp is None:
+            return
         try:
             import httpx as httpx_mod
             async with httpx_mod.AsyncClient() as client:
