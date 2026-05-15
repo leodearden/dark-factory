@@ -281,18 +281,18 @@ class TestFindViolationsOutputOrder:
     def test_violations_sorted_ascending_by_lineno(self):
         """Violations at different nesting depths come out in source order, not BFS order.
 
-        ast.walk() is breadth-first: module-level nodes before function body nodes,
+        ast.walk() is breadth-first: module-level nodes before function-body nodes,
         outer function body before inner function body.  If find_violations() returns
-        raw BFS order, top_config (line 1) comes first, then mid_config (line 3) and
-        nested_config (line 5) — which *happens* to be ascending here.
+        raw BFS order, top_config (line 5) comes first, then mid_config (line 4) and
+        inner_config (line 3) — descending, which exposes the sort bug.
 
         To make BFS vs. source-order observable we place the module-level assignment
         LAST in the source so that BFS order (module scope → outer fn → inner fn)
-        differs from source line order (outer fn → inner fn → module level).
+        yields [5, 4, 3] while correct source order is [3, 4, 5].
         """
-        # Source order:   outer_fn body (line 3) → inner_fn body (line 6) → module level (line 9)
-        # BFS order:      module level (line 9) → outer_fn body (line 3) → inner_fn body (line 6)
-        # Expected order: [3, 6, 9]  (ascending source order)
+        # Source order:   inner_config (line 3) → mid_config (line 4) → top_config (line 5)
+        # BFS order:      top_config (line 5) → mid_config (line 4) → inner_config (line 3)
+        # Expected order: [3, 4, 5]  (ascending source order)
         source = (
             'def outer():\n'  # line 1
             '    def inner():\n'  # line 2
@@ -303,8 +303,8 @@ class TestFindViolationsOutputOrder:
         violations = find_violations(source, 'test_order.py')
         assert len(violations) == 3, f'Expected 3 violations, got {len(violations)}: {violations}'
         linenos = [v.lineno for v in violations]
-        assert linenos == sorted(linenos), (
-            f'find_violations() must return violations sorted ascending by lineno; got {linenos}'
+        assert linenos == [3, 4, 5], (
+            f'find_violations() must return violations in source order [3, 4, 5]; got {linenos}'
         )
 
     def test_violations_sorted_ascending_by_col_offset_within_same_line(self):

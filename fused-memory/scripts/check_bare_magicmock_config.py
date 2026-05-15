@@ -174,9 +174,12 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     """Parse *source* and return violations for bare MagicMock() config assignments.
 
     A violation is emitted for each ``<config_name> = MagicMock()`` call that:
-      - targets a single ast.Name whose id matches the config-name set,
+      - has at least one ast.Name target whose id matches the config-name set,
       - calls MagicMock (by name or attribute) with no spec/spec_set,
       - is NOT preceded (on the nearest non-blank source line) by a valid exemption comment.
+
+    For chained assignments (``mock = config = MagicMock()``), each ast.Name target
+    is evaluated independently and may produce a separate Violation.
 
     SyntaxError in *source* → returns an empty list.
     """
@@ -189,66 +192,57 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     violations: list[Violation] = []
 
     for node in ast.walk(tree):
-        # Determine the assignment target name and value.
+        # Normalise both ast.Assign (possibly multi-target) and ast.AnnAssign
+        # (single annotated target) into a uniform (targets, value, lineno) triple
+        # so the evaluation pipeline below can be written once.
         if isinstance(node, ast.Assign):
-            # Iterate all targets independently. Each ast.Name target that passes
-            # the config-name check is a candidate for its own Violation. Non-Name
-            # targets (ast.Tuple for unpacking, ast.Attribute for self.config, etc.)
-            # are skipped by the isinstance guard below — they are intentional non-goals.
+            # All ast.Name targets share the RHS value and the assignment lineno.
+            # Non-Name targets (ast.Tuple for unpacking, ast.Attribute for
+            # self.config, etc.) are intentional non-goals skipped by the
+            # isinstance guard in the loop below.
+            targets: list[ast.expr] = node.targets
             value = node.value
             assignment_lineno = node.lineno
-            if not _is_magicmock_call(value):
-                continue
-            if _is_specced(value):  # type: ignore[arg-type]
-                continue
-            exempted = _is_exempted(lines, assignment_lineno)
-            for target in node.targets:
-                if not isinstance(target, ast.Name):
-                    continue
-                name = target.id
-                if not _is_config_name(name):
-                    continue
-                if exempted:
-                    continue
-                violations.append(
-                    Violation(
-                        filename=filename,
-                        lineno=assignment_lineno,
-                        col_offset=target.col_offset,
-                        message=_VIOLATION_MSG,
-                    )
-                )
-            continue
         elif isinstance(node, ast.AnnAssign):
-            target = node.target
-            if not isinstance(target, ast.Name):
-                continue
             if node.value is None:
                 continue
-            name = target.id
+            targets = [node.target]
             value = node.value
             assignment_lineno = node.lineno
-            col_offset = target.col_offset
         else:
             continue
 
-        if not _is_config_name(name):
-            continue
+        # Shared upfront checks: both branches reject non-MagicMock or specced calls
+        # before iterating targets, so the (typically cheap) per-target name check
+        # does not run for irrelevant RHS expressions.
         if not _is_magicmock_call(value):
             continue
         if _is_specced(value):  # type: ignore[arg-type]
             continue
-        if _is_exempted(lines, assignment_lineno):
-            continue
 
-        violations.append(
-            Violation(
-                filename=filename,
-                lineno=assignment_lineno,
-                col_offset=col_offset,
-                message=_VIOLATION_MSG,
+        # _is_exempted is computed lazily — only on finding the first config-named
+        # ast.Name target — because the exemption check (an upward line walk + regex)
+        # is not free, and most assignments have no config-named targets.
+        exempted: bool | None = None
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if not _is_config_name(target.id):
+                continue
+            if exempted is None:
+                exempted = _is_exempted(lines, assignment_lineno)
+            if exempted:
+                # All targets of this node share the same lineno and therefore
+                # the same exemption status — no need to check further targets.
+                break
+            violations.append(
+                Violation(
+                    filename=filename,
+                    lineno=assignment_lineno,
+                    col_offset=target.col_offset,
+                    message=_VIOLATION_MSG,
+                )
             )
-        )
 
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
