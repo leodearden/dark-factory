@@ -1519,3 +1519,48 @@ async def test_call_claude_cli_failure_surfaces_stderr_and_summary_in_runtime_er
     assert msg.startswith('Claude CLI agent failed:'), f'unexpected prefix: {msg!r}'
     assert 'ENOENT: claude CLI binary not found' in msg, f'stderr missing from: {msg!r}'
     assert "subtype='error_unexpected'" in msg, f'subtype missing from: {msg!r}'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _AGENT_LOOP_CAP_WAIT_SANITY_SECS: minutes-scale override forwarded to
+# invoke_with_cap_retry (task 1401, post-1365 audit)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestAgentLoopCapWaitSanityBound:
+    """_AGENT_LOOP_CAP_WAIT_SANITY_SECS is minutes-scale and forwarded to
+    invoke_with_cap_retry; prevents stalling the reconciliation queue under cap."""
+
+    def test_constant_importable_and_minutes_scale(self):
+        """(a) _AGENT_LOOP_CAP_WAIT_SANITY_SECS is importable, >0, <14d, <=3600s."""
+        from fused_memory.reconciliation.agent_loop import _AGENT_LOOP_CAP_WAIT_SANITY_SECS
+
+        _FOURTEEN_DAYS_SECS = 14 * 86400
+        assert _AGENT_LOOP_CAP_WAIT_SANITY_SECS > 0
+        assert _AGENT_LOOP_CAP_WAIT_SANITY_SECS < _FOURTEEN_DAYS_SECS  # not the default 14d
+        assert _AGENT_LOOP_CAP_WAIT_SANITY_SECS <= 3600.0  # hours-scale upper bound
+
+    @pytest.mark.asyncio
+    async def test_call_claude_cli_forwards_cap_wait_sanity_secs(self):
+        """(b) _call_claude_cli forwards cap_wait_sanity_secs=_AGENT_LOOP_CAP_WAIT_SANITY_SECS."""
+        from fused_memory.reconciliation.agent_loop import _AGENT_LOOP_CAP_WAIT_SANITY_SECS
+
+        config = _make_cli_config()
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test system prompt',
+            tools={},
+            usage_gate=make_gate_mock(),
+        )
+        empty_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'thinking': '', 'tool_calls': []},
+        )
+        mock = AsyncMock(return_value=empty_result)
+        with patch(
+            'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await agent._call_claude_cli(prompt='p', tools=[])
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _AGENT_LOOP_CAP_WAIT_SANITY_SECS
