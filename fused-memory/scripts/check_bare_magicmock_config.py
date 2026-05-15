@@ -109,6 +109,9 @@ def _is_specced(call: ast.Call) -> bool:
     - ``MagicMock(*args)`` (ast.Starred positional): treated as NOT specced.
       The spread is opaque at AST-inspection time, so we cannot guarantee a spec
       is present; flagging is safer than a false negative.
+    - ``MagicMock(**kwargs)`` (double-starred keyword spread): treated as NOT specced.
+      Like ``*args``, the spread is opaque — even if the dict contains a ``spec`` key
+      we cannot verify it statically; conservative flagging mirrors the *args stance.
     - ``MagicMock(spec=None)`` / ``MagicMock(spec_set=None)``: treated as NOT specced.
       Passing None is semantically equivalent to omitting spec altogether and defeats
       the rule's intent.
