@@ -511,7 +511,7 @@ async def test_collect_scheduler_state_isolates_paused_across_projects(
         'pause_reason': None,
         'snapshot_at': '2026-05-15T00:00:00+00:00',
     }
-    snapshots = {str(p1): snap_A, str(p2): snap_B}
+    snapshots = {str(p1.resolve()): snap_A, str(p2.resolve()): snap_B}
 
     async def mock_mcp_call(client, url, tool, args):
         if tool == 'get_scheduler_state':
@@ -529,9 +529,6 @@ async def test_collect_scheduler_state_isolates_paused_across_projects(
 
     assert paused_projects == [{'project': p1.name, 'reason': pause_reason}], (
         f'Expected paused_projects with only project A; got {paused_projects!r}'
-    )
-    assert p2.name not in [p['project'] for p in paused_projects], (
-        f'Project B must not appear in paused_projects; got {paused_projects!r}'
     )
 
 
