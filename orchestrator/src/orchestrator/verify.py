@@ -1635,10 +1635,23 @@ async def run_full_verification(
     Unlike run_scoped_verification, this runs full (unscoped) test suites
     for every subproject that has an orchestrator.yaml. Used by review
     checkpoints to check integration health across the whole codebase.
+
+    Discovery reuse: when ``config._module_configs`` is already populated (as it
+    always is after ``load_config``) and *project_root* resolves to the same
+    absolute path as ``config.project_root``, the pre-discovered dict is reused
+    directly and no additional filesystem walk is performed.  A fresh walk via
+    ``_discover_module_configs`` is retained as a fallback for the cases where
+    *project_root* differs from ``config.project_root`` or where the config was
+    constructed without going through ``load_config`` (e.g. direct instantiation
+    in tests that leave ``_module_configs`` empty).
     """
     from orchestrator.config import _discover_module_configs
 
-    module_configs = _discover_module_configs(project_root)
+    resolved = project_root.resolve()
+    if config._module_configs and resolved == config.project_root:
+        module_configs = config._module_configs
+    else:
+        module_configs = _discover_module_configs(project_root)
     if not module_configs:
         logger.info('Full verification: no subproject configs — using global')
         return await run_verification(project_root, config)

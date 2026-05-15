@@ -456,11 +456,14 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
       deterministic regardless of filesystem order.
 
     Performance note:
-    This performs a full recursive walk of *project_root* on every call (once at startup via
-    ``load_config``, and again inside ``run_full_verification``).  On large repositories with
-    many non-excluded subdirectories this can be noticeable.  If discovery latency is a
-    concern, consider adding project-specific directories to ``_DISCOVERY_EXCLUDED_DIRS`` or
-    reducing the nesting depth of your module layout.
+    This performs a full recursive walk of *project_root* on every call.  In the normal flow
+    it is called once at startup via ``load_config``, which stores the result in
+    ``OrchestratorConfig._module_configs``.  ``run_full_verification`` reuses that cached dict
+    when its *project_root* arg resolves to the same absolute path as ``config.project_root``,
+    so no redundant walk occurs in the typical case.  On large repositories with many
+    non-excluded subdirectories the walk can be noticeable; adding project-specific directories
+    to ``_DISCOVERY_EXCLUDED_DIRS`` or reducing the nesting depth of your module layout will
+    help when the fallback walk path is exercised.
 
     Depth and scheduler coherence:
     ``OrchestratorConfig.for_module`` resolves configs via longest-matching prefix walk, but
