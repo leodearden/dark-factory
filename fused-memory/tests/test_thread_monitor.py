@@ -167,6 +167,41 @@ class TestThreadMonitorIteration:
             f"Unexpected breakdown in transient spike: {[r.getMessage() for r in monitor_records]}"
         )
 
+    def test_transient_spike_nonzero_delta_emits_plain_info(self, monkeypatch, caplog):
+        """active_count>threshold but snapshot._total settles ≤ threshold, delta != 0 → plain INFO (no transient marker, no breakdown).
+
+        Pins the sibling branch documented in main.py:875-878: when the spike
+        resolves (snapshot._total ≤ threshold) but the count changed relative to
+        *prev* (delta != 0), the first ``if delta != 0 or count > threshold``
+        branch is taken, emitting an ordinary INFO line.  The ``elif`` transient
+        branch (``transient=true`` marker) is only reached when delta == 0 — as
+        tested by ``test_transient_spike_emits_info_with_marker``.
+
+        This is a characterisation/coverage test: the production code already
+        implements and documents this branch correctly; the test pins it so
+        future changes cannot silently break the observable output.
+        """
+        fake_snapshot = {
+            '_total': 55, 'main': 1, 'asyncio_pool': 50, 'executor': 2,
+            'aiosqlite': 2, 'timer': 0, 'other': 0,
+        }
+        monkeypatch.setattr(threading, 'active_count', lambda: 70)
+        monkeypatch.setattr(server_main, '_snapshot_threads', lambda: fake_snapshot)
+        with caplog.at_level(logging.INFO, logger='fused_memory.server.main'):
+            result = server_main._thread_monitor_iteration(prev=50, threshold=60)
+        assert result == 55
+        monitor_records = [r for r in caplog.records if 'thread_monitor' in r.getMessage()]
+        assert len(monitor_records) == 1, (
+            f"Expected exactly one thread_monitor record; "
+            f"got {[r.getMessage() for r in monitor_records]}"
+        )
+        assert monitor_records[0].levelno == logging.INFO
+        assert 'threads=55 delta=+5' in monitor_records[0].getMessage()
+        assert 'transient=true' not in monitor_records[0].getMessage()
+        assert not any('_total=' in r.getMessage() for r in monitor_records), (
+            f"Unexpected breakdown in plain-INFO branch: {[r.getMessage() for r in monitor_records]}"
+        )
+
     def test_above_threshold_and_delta_uses_warning_not_info(self, monkeypatch, caplog):
         """count>threshold AND delta!=0 → WARNING (not INFO)."""
         fake_snapshot = {
