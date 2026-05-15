@@ -1506,7 +1506,7 @@ async def test_collect_scheduler_state_normalises_non_dict_snapshot(
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, modules, pin_queue, events, offline = \
+        rows, modules, pin_queue, events, offline, _paused = \
             await collect_scheduler_state(dummy_client, dummy_config)
 
     # The project is treated as online-but-empty, NOT offline.

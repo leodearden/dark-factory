@@ -33,6 +33,11 @@ Shape contract (returned by collect_scheduler_state):
         sparklines from get_scheduler_events; empty dict when no history
 
     offline_projects: list[str]  — project labels that failed to respond
+
+    paused_projects: list[dict]  — projects whose scheduler is park-stop paused.
+        Each entry: {'project': str, 'reason': str | None}
+        Empty list when no project is paused or snapshots lack the is_paused key
+        (safe degradation for pre-upgrade on-disk snapshots).
 """
 
 from __future__ import annotations
@@ -247,7 +252,7 @@ def _skip_event_sparkline(
 async def collect_scheduler_state(
     client: httpx.AsyncClient,
     config: DashboardConfig,
-) -> tuple[list[dict], list[dict], list[dict], dict[str, dict], list[str]]:
+) -> tuple[list[dict], list[dict], list[dict], dict[str, dict], list[str], list[dict]]:
     """Fan out over all configured project roots and aggregate scheduler state.
 
     For each project root:
@@ -257,13 +262,17 @@ async def collect_scheduler_state(
       - Composes rows, module contention list, and per-task event sparklines.
 
     Returns:
-        ``(rows, modules, pin_queue, events_by_task, offline_projects)``
+        ``(rows, modules, pin_queue, events_by_task, offline_projects, paused_projects)``
 
         rows:             Composed task rows (see module docstring).
         modules:          Sorted module-contention list.
         pin_queue:        Pin-queue list from snapshot.
         events_by_task:   ``{task_id: sparkline_dict}``; empty when no history.
         offline_projects: Project labels that failed to respond.
+        paused_projects:  List of ``{'project': label, 'reason': str|None}`` dicts
+                          for projects whose scheduler is park-stop paused.
+                          Empty list when no project is paused or the snapshot
+                          lacks ``is_paused`` (pre-upgrade on-disk degradation).
     """
     since = datetime.now(UTC) - timedelta(hours=1)
 
@@ -364,6 +373,7 @@ async def collect_scheduler_state(
     # multi-project dashboards).  The React lookup in tab_scheduler.jsx uses
     # `${row.project}/${row.task_id}` to match this key.
     all_events_by_task: dict[str, dict] = {}
+    all_paused_projects: list[dict] = []
 
     for result in per_project_results:
         if isinstance(result, BaseException):
@@ -375,6 +385,14 @@ async def collect_scheduler_state(
         if snapshot is None:
             offline_projects.append(label)
             continue
+
+        # Aggregate pause state — reads defensively so pre-upgrade snapshots
+        # (missing is_paused key) degrade to "not paused" without error.
+        if snapshot.get('is_paused'):
+            all_paused_projects.append({
+                'project': label,
+                'reason': snapshot.get('pause_reason'),
+            })
 
         # O(1) lookup via pre-built map (avoids O(n²) linear search per project)
         root = label_to_root.get(label)
@@ -443,7 +461,7 @@ async def collect_scheduler_state(
             composite_key = f'{label}/{tid}'
             all_events_by_task[composite_key] = _skip_event_sparkline(task_events, since=since)
 
-    return all_rows, all_modules, all_pin_queue, all_events_by_task, offline_projects
+    return all_rows, all_modules, all_pin_queue, all_events_by_task, offline_projects, all_paused_projects
 
 
 def _merge_module_lists(
