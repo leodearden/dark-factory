@@ -32,6 +32,7 @@ class DbPool:
 
     def __init__(self) -> None:
         self._conns: dict[Path, aiosqlite.Connection] = {}
+        self._closed: bool = False
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
         # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
@@ -57,13 +58,20 @@ class DbPool:
             # Re-check after acquiring: a racing coroutine may have opened it.
             if resolved in self._conns:
                 return self._conns[resolved]
+            # Refuse to open new connections once close_all() has been called.
+            # Fully aligns with SqliteTaskBackend._get_connection _closed convention:
+            # a concurrent get() that is mid-open when close_all() runs will see
+            # this flag after acquiring the per-path lock and abort cleanly.
+            if self._closed:
+                return None
             try:
                 if not resolved.exists():
                     return None
                 # safe='/' preserves POSIX path separators; dashboard is Linux-only.
                 # For Windows portability use pathlib.PurePath.as_uri() instead.
                 conn = await aiosqlite.connect(
-                    f'file:{quote(str(resolved), safe="/")}?mode=ro', uri=True,
+                    f'file:{quote(str(resolved), safe="/")}?mode=ro',
+                    uri=True,
                 )
                 conn.row_factory = aiosqlite.Row
                 self._conns[resolved] = conn
@@ -79,6 +87,10 @@ class DbPool:
 
     async def close_all(self) -> None:
         """Close every managed connection and clear the pool."""
+        # Set before iterating so any concurrent get() that acquires a per-path
+        # lock after we clear _conns will see _closed=True and return None rather
+        # than re-populating a pool that is supposed to be drained.
+        self._closed = True
         for conn in self._conns.values():
             try:
                 await conn.close()
