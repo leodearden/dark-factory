@@ -72,7 +72,7 @@ async def read_scheduler_events(
     """
     import aiosqlite
 
-    db_path = project_root / 'data' / 'orchestrator' / 'runs.db'
+    db_path = (project_root / 'data' / 'orchestrator' / 'runs.db').resolve()
     if not db_path.exists():
         return {'events': [], 'count': 0}
 

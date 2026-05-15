@@ -376,6 +376,15 @@ class TestGetSchedulerEventsTool:
         assert captured_uri_kwarg is True, (
             f'Expected uri=True kwarg, got uri={captured_uri_kwarg!r}'
         )
+        # Implementation-independent checks (don't mirror as_uri() formula):
+        assert captured_uri.endswith('?mode=ro'), (
+            f'URI must end with ?mode=ro, got {captured_uri!r}'
+        )
+        # Path portion must not contain a literal '?' (reserved chars must be %-encoded).
+        path_portion = captured_uri.removesuffix('?mode=ro')
+        assert '?' not in path_portion, (
+            f'Unencoded ? in path portion of URI: {captured_uri!r}'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('fragment', ['has?question', 'has#hash', 'has%41literal'])
