@@ -6465,8 +6465,7 @@ class TestAssemblePayloadRunWindowStart:
 
         # (2) run_window_start must NOT be None (guard NOT disabled), and must be
         # tz-aware UTC (normalized at the call site per Amendment 2 / task-1383).
-        from datetime import timezone as _tz
-        expected_aware = naive_started_at.replace(tzinfo=_tz.utc)
+        expected_aware = naive_started_at.replace(tzinfo=UTC)
         result_rws = captured_kwargs.get('run_window_start')
         assert result_rws is not None, (
             'assemble_payload must NOT drop run_window_start to None for a naive started_at'
