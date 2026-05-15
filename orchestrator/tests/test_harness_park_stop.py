@@ -638,9 +638,14 @@ class TestHarnessCostCeiling:
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
 
-        # acquire_next should return None only if paused; here it should proceed
-        # (returns None because no tasks, but NOT because paused).
-        assert not harness.scheduler.is_paused
+        result = await harness.scheduler.acquire_next()
+        assert result is None, (
+            'acquire_next must return None here because the task tree is empty, '
+            'NOT because the scheduler is paused; got %r' % (result,)
+        )
+        assert harness.scheduler.is_paused is False, (
+            'Sanity: scheduler must still be unpaused after acquire_next call'
+        )
 
     @pytest.mark.asyncio
     async def test_enforce_cost_ceilings_both_exceed_watcher_reason_wins(
