@@ -2344,10 +2344,10 @@ class TestCuratorCapWaitSanityBound:
     def test_constant_importable_and_minutes_scale(self):
         """(a) _CURATOR_CAP_WAIT_SANITY_SECS is importable, >0, <14d, <=600s."""
         from fused_memory.middleware.task_curator import _CURATOR_CAP_WAIT_SANITY_SECS
-        from shared.cli_invoke import _DEFAULT_CAP_WAIT_SANITY_SECS
 
+        _FOURTEEN_DAYS_SECS = 14 * 86400  # shared._DEFAULT_CAP_WAIT_SANITY_SECS value
         assert _CURATOR_CAP_WAIT_SANITY_SECS > 0
-        assert _CURATOR_CAP_WAIT_SANITY_SECS < _DEFAULT_CAP_WAIT_SANITY_SECS  # < 14 days
+        assert _CURATOR_CAP_WAIT_SANITY_SECS < _FOURTEEN_DAYS_SECS  # < 14 days
         assert _CURATOR_CAP_WAIT_SANITY_SECS <= 600.0  # minutes, not days
 
     @pytest.mark.asyncio

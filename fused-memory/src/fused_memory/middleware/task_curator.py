@@ -99,6 +99,14 @@ DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and b
 if DEFAULT_PRIORITY not in _PRIORITY_RANK:
     raise ValueError(f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK')
 
+# The curator is best-effort middleware: any AllAccountsCappedException triggers a
+# graceful-degradation handler (curate() → action='create', curate_batch() → re-raise
+# so the worker defers the whole batch via UsageGate.wait_for_open).  The shared
+# default of 14 days would silently convert that into a 14-day block on this
+# best-effort path — a real behavioural regression — so we override with a short
+# minutes-scale bound that preserves the fast-fail/defer contract.
+_CURATOR_CAP_WAIT_SANITY_SECS = 120.0  # 2 minutes; override for shared 14-day default
+
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
 CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -1399,7 +1407,7 @@ class TaskCurator:
             output_schema=CURATOR_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
-            max_cap_retries=3,
+            cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
         )
 
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -1478,7 +1486,7 @@ class TaskCurator:
             output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
-            max_cap_retries=3,
+            cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
         )
 
         latency_ms = int((time.monotonic() - start) * 1000)
