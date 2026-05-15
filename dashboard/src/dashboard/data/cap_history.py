@@ -116,11 +116,7 @@ async def read_cap_intervals(
     """
     if days <= 0:
         raise ValueError('days must be positive')
-    effective_now = now if now is not None else datetime.now(UTC)
-    if effective_now.tzinfo is None:
-        effective_now = effective_now.replace(tzinfo=UTC)
-    else:
-        effective_now = effective_now.astimezone(UTC)
+    effective_now = _normalize_now_utc(now)
     cutoff = (effective_now - timedelta(days=days)).isoformat()
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
@@ -137,9 +133,7 @@ async def read_cap_intervals(
         by_account: dict[str, list[tuple[str, datetime]]] = {}
         for row in rows:
             ts_str: str = row['created_at']
-            ts = datetime.fromisoformat(ts_str)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=UTC)
+            ts = _normalize_now_utc(datetime.fromisoformat(ts_str))
             by_account.setdefault(row['account_name'], []).append((row['event_type'], ts))
 
         intervals: list[CapInterval] = []
