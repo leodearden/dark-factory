@@ -78,3 +78,55 @@ class TestFindViolationsConfigNameDetection:
         source = 'mock = MagicMock()\n'
         violations = find_violations(source, 'test_generic.py')
         assert violations == []
+
+
+class TestFindViolationsSpecHandling:
+    """Spec-handling: specced calls are never violations; unspecced non-spec-kwarg calls are."""
+
+    def test_no_violation_for_spec_keyword(self):
+        """config = MagicMock(spec=OrchestratorConfig) → no violation."""
+        source = 'config = MagicMock(spec=OrchestratorConfig)\n'
+        violations = find_violations(source, 'test_spec.py')
+        assert violations == []
+
+    def test_no_violation_for_spec_set_keyword(self):
+        """config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig)) → no violation."""
+        source = 'config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))\n'
+        violations = find_violations(source, 'test_spec_set.py')
+        assert violations == []
+
+    def test_no_violation_for_positional_spec(self):
+        """config = MagicMock(SomeClass) → no violation (first positional IS spec)."""
+        source = 'config = MagicMock(SomeClass)\n'
+        violations = find_violations(source, 'test_positional.py')
+        assert violations == []
+
+    def test_violation_for_name_kwarg_only(self):
+        """config = MagicMock(name='cfg') → violation (name= is cosmetic, not a spec)."""
+        source = "config = MagicMock(name='cfg')\n"
+        violations = find_violations(source, 'test_name_only.py')
+        assert len(violations) == 1
+
+    def test_violation_for_attribute_form_mock_dot(self):
+        """config = mock.MagicMock() → violation (attribute form still targeted)."""
+        source = 'config = mock.MagicMock()\n'
+        violations = find_violations(source, 'test_attr.py')
+        assert len(violations) == 1
+
+    def test_violation_for_attribute_form_unittest_mock(self):
+        """config = unittest.mock.MagicMock() → violation (deep attribute form)."""
+        source = 'config = unittest.mock.MagicMock()\n'
+        violations = find_violations(source, 'test_attr_deep.py')
+        assert len(violations) == 1
+
+    def test_no_violation_for_plain_mock(self):
+        """config = Mock() → no violation (only MagicMock is targeted)."""
+        source = 'config = Mock()\n'
+        violations = find_violations(source, 'test_mock.py')
+        assert violations == []
+
+    def test_no_violation_for_create_autospec(self):
+        """config = create_autospec(X) → no violation (only MagicMock is targeted)."""
+        source = 'config = create_autospec(SomeClass)\n'
+        violations = find_violations(source, 'test_autospec.py')
+        assert violations == []
