@@ -374,11 +374,26 @@ class TestDbPool:
         assert len(opened) == 1, f'expected 1 opened connection, got {len(opened)}'
 
         # The post-connect re-check must have CLOSED the mid-flight connection so
-        # its aiosqlite worker thread is not stranded.  Attempting to use the
-        # connection after close() raises (proving the leak is fixed).
-        with pytest.raises((ValueError, sqlite3.ProgrammingError, RuntimeError)):
-            async with opened[0].execute('SELECT 1'):
-                pass
+        # its aiosqlite worker thread is not stranded.  Assert on observable state
+        # rather than `pytest.raises(...)` on a subsequent execute: which exception
+        # aiosqlite raises for use-after-close has shifted between versions
+        # (ValueError, sqlite3.ProgrammingError, RuntimeError, OperationalError,
+        # aiosqlite.Error have all been observed), and a stranded worker thread can
+        # hang on `await` rather than raise — defeating any exception-based check.
+        # Both flags are set synchronously inside `await conn.close()`, which runs
+        # in the resumed getter task — they are therefore settled by the time
+        # `await getter` returns above.
+        assert hasattr(opened[0], '_connection') and hasattr(opened[0], '_running'), (
+            'aiosqlite internal attribute names changed — update test'
+        )
+        assert opened[0]._connection is None, (
+            f'expected closed mid-flight connection (_connection is None), '
+            f'got {opened[0]._connection!r}'
+        )
+        assert opened[0]._running is False, (
+            f'expected worker-thread shutdown (_running is False), '
+            f'got {opened[0]._running!r}'
+        )
 
 
 class TestWithDb:
