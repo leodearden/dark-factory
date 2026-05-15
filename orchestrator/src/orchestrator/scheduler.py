@@ -2469,8 +2469,15 @@ class Scheduler:
 
         **Throttle (time gate)**: writes are coalesced to at most one per
         ``config.snapshot_min_write_interval_secs`` (default 250 ms).  The
-        first-ever write always proceeds.  Throttled ticks are O(1) — a
-        single monotonic subtraction, no JSON serialisation.  Pass
+        first-ever write always proceeds.  Throttled ticks are O(1) *when
+        ``self._snapshot_write_lock`` is uncontended*: ``asyncio.Lock.acquire``
+        does not yield when the lock is free, so the fast path is a single
+        monotonic subtraction with no JSON serialisation.  Under contention
+        (e.g. a throttled tick arriving while a concurrent flush holds the
+        lock), the tick must first acquire the lock and may briefly wait
+        behind the in-flight write before the throttle check coalesces it;
+        see the latency-tradeoff comment immediately above
+        ``async with self._snapshot_write_lock:`` below.  Pass
         ``force=True`` to bypass the throttle and guarantee an immediate
         write (used by ``flush_state_snapshot``).
 
