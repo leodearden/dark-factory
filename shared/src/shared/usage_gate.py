@@ -1139,6 +1139,20 @@ class UsageGate:
                 return acct.name
         return None
 
+    @property
+    def soonest_resets_at(self) -> datetime | None:
+        """Earliest ``resets_at`` across currently-capped accounts, or None if unknown.
+
+        Returns None when no account is capped, or when every capped account
+        has ``resets_at=None`` (i.e. the reset time is not yet known).
+        """
+        times = [
+            acct.resets_at
+            for acct in self._accounts
+            if acct.capped and acct.resets_at is not None
+        ]
+        return min(times) if times else None
+
     def confirm_account_ok(self, oauth_token: str | None) -> None:
         """Clear near_cap and (if applicable) the probing gate after a successful invocation.
 
