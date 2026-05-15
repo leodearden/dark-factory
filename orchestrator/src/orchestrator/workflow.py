@@ -1839,6 +1839,55 @@ class TaskWorkflow:
         )
         return False
 
+    async def _merge_fresh_metadata(
+        self,
+        in_memory_metadata: dict,
+        *,
+        log_context: str,
+    ) -> dict:
+        """Read-modify-write helper: merge in-memory metadata with the backend's.
+
+        Fetches the backend's current task metadata and overlays it onto
+        ``in_memory_metadata`` so that keys added after ``self.task`` was loaded
+        (e.g. ``memory_hints`` re-attached by Stage-2 reconciliation) survive the
+        next write.  Backend keys win on collision, which is the correct policy: a
+        backend-side addition represents an external write that must not be
+        discarded.
+
+        If ``get_task`` fails, logs a warning containing ``log_context`` and falls
+        back to ``in_memory_metadata`` alone.  Mirrors the boundary-normalisation
+        pattern used in ``_handle_terminal_exit_on_block``.
+
+        Args:
+            in_memory_metadata: The in-memory metadata dict (from
+                ``self.task.get('metadata') or {}``).
+            log_context: Short descriptor of the write site, used verbatim in the
+                fallback warning (e.g. ``'no-plan counter'``,
+                ``'infra-resume thrash counter'``).
+
+        Returns:
+            A new dict ready for counter-field assignment and persist.
+        """
+        try:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort, fall back to in-memory
+            logger.warning(
+                'Task %s: failed to refresh metadata before %s write; '
+                'falling back to in-memory metadata '
+                '(memory_hints may be clobbered): %s',
+                self.task_id, log_context, exc,
+            )
+            fresh_task = None
+        # Merge: start from in-memory metadata so that locally-set keys not yet
+        # persisted are preserved, then overlay fresh backend keys so that
+        # backend-side additions (e.g. memory_hints from Stage-2 reconciliation)
+        # win on collision.  When get_task failed (fresh_task is None) the
+        # backend overlay is empty and we fall back to the in-memory copy only.
+        return {
+            **in_memory_metadata,
+            **((fresh_task.get('metadata') or {}) if isinstance(fresh_task, dict) else {}),
+        }
+
     async def _handle_no_plan_failure(
         self, reason: str, *, detail: str,
     ) -> WorkflowOutcome:
@@ -1880,8 +1929,10 @@ class TaskWorkflow:
         # bug behind 16 successive Opus calls on task 917).
         total += 1
 
-        # Persist the new counters (best-effort — never block on this).
-        new_metadata = dict(metadata)
+        # Read-modify-write: see _merge_fresh_metadata for the merge policy.
+        new_metadata = dict(await self._merge_fresh_metadata(
+            metadata, log_context='no-plan counter',
+        ))
         new_metadata['last_no_plan_main_sha'] = current_main_sha
         new_metadata['consecutive_no_plan_failures'] = counter
         new_metadata['total_no_plan_failures'] = total
@@ -1989,30 +2040,10 @@ class TaskWorkflow:
             # the thrash signal does not apply; reset.
             counter = 0
 
-        # Read-modify-write: fetch the backend's current metadata so that keys
-        # added after self.task was loaded (e.g. memory_hints re-attached by
-        # Stage-2 reconciliation) survive the write.  Mirror the boundary-
-        # normalisation pattern used in _handle_terminal_exit_on_block (line ~4187).
-        try:
-            fresh_task = await self.scheduler.get_task(self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort, fall back to in-memory
-            logger.warning(
-                'Task %s: failed to refresh metadata before infra-resume thrash '
-                'counter write; falling back to in-memory metadata '
-                '(memory_hints may be clobbered): %s',
-                self.task_id, exc,
-            )
-            fresh_task = None
-        # Merge: start from in-memory metadata so that locally-set keys not yet
-        # persisted are preserved, then overlay fresh backend keys so that
-        # backend-side additions (e.g. memory_hints from Stage-2 reconciliation)
-        # win on collision.  When get_task failed (fresh_task is None) the
-        # backend overlay is empty and we fall back to the in-memory copy only.
-        base_metadata: dict = {
-            **metadata,
-            **((fresh_task.get('metadata') or {}) if isinstance(fresh_task, dict) else {}),
-        }
-        new_metadata = dict(base_metadata)
+        # Read-modify-write: see _merge_fresh_metadata for the merge policy.
+        new_metadata = dict(await self._merge_fresh_metadata(
+            metadata, log_context='infra-resume thrash counter',
+        ))
         new_metadata['consecutive_infra_resume_failures'] = counter
         new_metadata['last_infra_resume_iteration_count'] = current_iter_count
         self.task['metadata'] = new_metadata
