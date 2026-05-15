@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -272,6 +273,15 @@ class Harness:
         # event so the workflow exits cleanly without churning escalations.
         # See zombie-escalation fix Step 5.
         self._terminal_status_watcher_task: asyncio.Task | None = None
+
+        # Escalation-watcher-auto subprocess supervisor (task 1326).
+        # Keeps a fresh escalation-watcher-auto agent alive via invoke_with_cap_retry
+        # across multi-day AFK windows with rotation, exponential backoff, and a
+        # crashloop→pause_scheduler guard.  Mirrors _terminal_status_watcher_task.
+        self._watcher_supervisor_task: asyncio.Task | None = None
+        # Monotonic timestamps of unclean watcher exits; used by the crashloop guard
+        # to count failures within watcher_crashloop_window_secs.
+        self._watcher_unclean_exits: deque[float] = deque()
 
         # Background sweep: periodic re-run of the startup
         # ``_reconcile_stranded_in_progress`` pass during a long run, so
@@ -2427,6 +2437,52 @@ Output JSON matching the schema. Every task must appear in the output.
                 raise
             except Exception:
                 logger.exception('Terminal-status watcher pass failed')
+
+    # ------------------------------------------------------------------
+    # Escalation-watcher-auto subprocess supervisor (task 1326)
+    # ------------------------------------------------------------------
+
+    def _start_watcher_supervisor(self) -> None:
+        """Start the escalation-watcher-auto subprocess supervisor.
+
+        No-op when config.watcher_supervisor_enabled is False.
+        Idempotent: does nothing if the task is already alive.
+        Mirrors _start_terminal_status_watcher.
+        """
+        if not self.config.watcher_supervisor_enabled:
+            return
+        if (
+            self._watcher_supervisor_task is not None
+            and not self._watcher_supervisor_task.done()
+        ):
+            return
+        self._watcher_supervisor_task = asyncio.create_task(
+            self._watcher_supervisor_loop(),
+            name='watcher-supervisor',
+        )
+        logger.info(
+            'Escalation-watcher-auto supervisor started '
+            '(rotation_escalations=%d rotation_hours=%.1f)',
+            self.config.watcher_rotation_escalations,
+            self.config.watcher_rotation_hours,
+        )
+
+    async def _stop_watcher_supervisor(self) -> None:
+        """Cancel the watcher supervisor loop. Mirrors _stop_terminal_status_watcher."""
+        if self._watcher_supervisor_task is not None:
+            self._watcher_supervisor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._watcher_supervisor_task
+            self._watcher_supervisor_task = None
+            logger.info('Escalation-watcher-auto supervisor stopped')
+
+    async def _watcher_supervisor_loop(self) -> None:
+        """Supervisor loop — restart watcher rotations until shutdown.
+
+        Stub body; full implementation added in step-10/12.
+        """
+        while True:
+            await asyncio.sleep(9999)
 
     async def _scan_for_terminal_active_tasks(self) -> int:
         """Single pass: cancel any active workflow whose task is terminal.
