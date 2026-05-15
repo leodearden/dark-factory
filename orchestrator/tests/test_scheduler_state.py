@@ -675,6 +675,43 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         # prevent write_state_snapshot from being invoked for all bad root values.
         scheduler.write_state_snapshot.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_project_root_guard_logs_once_and_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Guard emits a WARNING exactly once across repeated calls (dedup).
+
+        The new instance flag ``_snapshot_guard_warned`` must suppress
+        duplicate log lines on subsequent guard trips — a misconfigured
+        project_root is a static deployment issue, not a per-tick event.
+        Best-effort no-raise contract must also hold: the guard returns
+        without raising, and write_state_snapshot is never called.
+        """
+        import logging
+        from unittest.mock import MagicMock
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler._project_root = 'None'
+        scheduler.write_state_snapshot = MagicMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler._write_snapshot_best_effort()
+            await scheduler._write_snapshot_best_effort()
+
+        # (a) Guard still short-circuits — write_state_snapshot never called.
+        scheduler.write_state_snapshot.assert_not_called()
+        # (b) Exactly ONE WARNING across BOTH calls (dedup via instance flag).
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.scheduler'
+            and ('project_root' in r.getMessage() or 'snapshot' in r.getMessage())
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 WARNING (dedup), got {len(matching)}: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
 
 # ===========================================================================
 # Task-1332: _write_snapshot_best_effort throttle / coalesce
