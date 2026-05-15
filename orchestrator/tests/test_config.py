@@ -25,6 +25,53 @@ def _load_package_defaults() -> dict:
     return yaml.safe_load(defaults_file.read_text())
 
 
+# Shared diagnostic phrase used by both lock_depth boundary tests.
+# Hoisted to module scope so both the positive and negative tests reference one
+# source of truth, and any future sibling tests can reuse it without duplication.
+DISTINCTIVE_PHRASE = 'unreachable through the scheduler/workflow path'
+
+
+def _load_config_with_nested_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prefix: str,
+    lock_depth: int = 2,
+) -> OrchestratorConfig:
+    """Write a minimal global config + a nested module config and return load_config().
+
+    Single-sources the env-isolation contract (ORCH_LOCK_DEPTH / ORCH_CONFIG_PATH)
+    and the config-yaml + nested-orchestrator-yaml setup shared by the two
+    lock_depth boundary tests.
+
+    Args:
+        tmp_path: pytest tmp_path fixture — used as project_root.
+        monkeypatch: pytest monkeypatch fixture — owns env-var teardown.
+        prefix: Relative path of the nested module (e.g. 'foo/bar' or 'foo/bar/baz').
+        lock_depth: lock_depth value written to the global config.yaml (default 2).
+
+    Returns:
+        The OrchestratorConfig produced by load_config() after discovery.
+    """
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text(yaml.dump({
+        'project_root': str(tmp_path),
+        'lock_depth': lock_depth,
+    }))
+    # Isolate ORCH_LOCK_DEPTH so a stray env var cannot override lock_depth and
+    # silently invalidate the depth-comparison boundary being tested.  Route
+    # ORCH_CONFIG_PATH through monkeypatch so load_config's write is auto-restored.
+    monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+    # Create the nested module config; 'test_command' is an overridable field so
+    # _discover_module_configs registers the prefix (non-overridable fields are silently
+    # ignored and would leave the prefix unregistered — the step-1 helper test guards this).
+    nested = tmp_path / Path(prefix)
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+    return load_config(config_path)
+
+
 class TestDefaults:
     """Tests for OrchestratorConfig defaults — isolated from real config files."""
 
@@ -258,6 +305,7 @@ class TestModuleConfigDiscovery:
             'max_per_module': 2,
         }))
         config = load_config(config_path)
+        assert config._module_configs is not None
         assert 'backend' in config._module_configs
         assert config._module_configs['backend'].test_command == 'cargo test'
         assert config._module_configs['backend'].max_per_module == 2
@@ -445,41 +493,35 @@ class TestModuleConfigDiscovery:
             f"got: {[r.getMessage() for r in pruned_warnings]}"
         )
 
+    def test_nested_module_helper_registers_prefix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Shared helper _load_config_with_nested_module must register the nested
+        prefix in config._module_configs so the depth-boundary tests are non-vacuous.
+        """
+        config = _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar')
+        assert config._module_configs is not None
+        assert 'foo/bar' in config._module_configs, (
+            "Helper must register 'foo/bar' via _discover_module_configs; "
+            "if this fails the boundary tests silently pass even when discovery is broken"
+        )
+
     def test_load_config_warns_when_module_prefix_deeper_than_lock_depth(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ):
         """load_config emits a WARNING when a discovered module-config prefix has more
         path components than lock_depth.
 
-        Regression guard for task 1328 operator diagnostic (config.py:1034-1042).
+        Regression guard for task 1328 operator diagnostic (the depth-mismatch warning loop in load_config).
         Acceptance criteria — the WARNING record from orchestrator.config must pin:
           (a) the prefix 'foo/bar/baz'
           (b) the prefix depth 'prefix depth 3'
           (c) the configured depth 'lock_depth=2'
           (d) the consequence phrase 'unreachable through the scheduler/workflow path'
         """
-        # Global config: lock_depth set explicitly so test is self-documenting and
-        # immune to future changes in OrchestratorConfig default values.
-        config_path = tmp_path / 'config.yaml'
-        config_path.write_text(yaml.dump({
-            'project_root': str(tmp_path),
-            'lock_depth': 2,
-        }))
-        # Isolate ORCH_LOCK_DEPTH so a stray env var cannot override lock_depth: 2 and
-        # silently invalidate the depth-comparison boundary being tested. Route
-        # ORCH_CONFIG_PATH through monkeypatch so load_config's unconditional write is
-        # auto-restored at teardown (no stale tmp_path leaks into subsequent tests).
-        monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
         # Nested module config at depth 3 (foo/bar/baz) > lock_depth 2 → must warn.
-        nested = tmp_path / 'foo' / 'bar' / 'baz'
-        nested.mkdir(parents=True)
-        (nested / 'orchestrator.yaml').write_text(yaml.dump({
-            'test_command': 'pytest',  # overridable field required so prefix registers
-        }))
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
-            load_config(config_path)
+            _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar/baz')
 
         warning_records = [
             r for r in caplog.records
@@ -490,7 +532,6 @@ class TestModuleConfigDiscovery:
         # unreachability consequence. The exact remediation prose is intentionally omitted
         # here — it is runtime log output, so coupling tests to its verbatim wording adds
         # breakage risk without additional regression-detection value.
-        DISTINCTIVE_PHRASE = 'unreachable through the scheduler/workflow path'
         matching = [r for r in warning_records if DISTINCTIVE_PHRASE in r.getMessage()]
         assert matching, (
             f"Expected a WARNING from orchestrator.config containing "
@@ -513,29 +554,24 @@ class TestModuleConfigDiscovery:
         """load_config does NOT emit the depth-mismatch WARNING when prefix depth ==
         lock_depth (the boundary: strictly-greater-than triggers the warning, not >=).
 
-        False-positive guard for task 1328 operator diagnostic (config.py:1036).
+        False-positive guard for task 1328 operator diagnostic (the depth-mismatch warning loop in load_config).
         """
-        # Global config: lock_depth 2 explicitly set — same reasoning as positive test.
-        config_path = tmp_path / 'config.yaml'
-        config_path.write_text(yaml.dump({
-            'project_root': str(tmp_path),
-            'lock_depth': 2,
-        }))
-        # Isolate ORCH_LOCK_DEPTH so a stray env var cannot silently override lock_depth:
-        # 2 and invalidate the == boundary this test exercises.
-        monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
         # Nested module config at depth 2 (foo/bar) == lock_depth 2 → must NOT warn.
-        nested = tmp_path / 'foo' / 'bar'
-        nested.mkdir(parents=True)
-        (nested / 'orchestrator.yaml').write_text(yaml.dump({
-            'test_command': 'pytest',  # overridable field required so prefix registers
-        }))
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
-            load_config(config_path)
+            config = _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar')
 
-        DISTINCTIVE_PHRASE = 'unreachable through the scheduler/workflow path'
+        # Non-vacuity guard: 'foo/bar' must be registered so the depth comparison in
+        # the depth-mismatch warning loop is actually evaluated at the == boundary.  If
+        # discovery is broken, the loop has zero iterations, no warning is emitted, and
+        # this test would silently pass without exercising the boundary it claims to guard.
+        # (test_nested_module_helper_registers_prefix isolates the failure cause if this
+        # assertion fires, so the duplication is intentional rather than accidental.)
+        assert config._module_configs is not None
+        assert 'foo/bar' in config._module_configs, (
+            "'foo/bar' must appear in config._module_configs; "
+            "if missing, the depth-comparison loop never runs and the warning-absence "
+            "check is vacuously true (the boundary is not actually exercised)"
+        )
         depth_mismatch_warnings = [
             r for r in caplog.records
             if r.levelno >= logging.WARNING and DISTINCTIVE_PHRASE in r.getMessage()
