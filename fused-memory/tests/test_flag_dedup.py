@@ -369,10 +369,10 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     new_marker_r1.id = 'new-42-r1'
 
     memory_service = AsyncMock()
-    # task-1400: side_effect: suppression=[], pre-write HIT=[prior], confirmation=[new_marker_r1].
-    # Confirmation uses run_id-scoped kind filter (step-15) so it finds the new marker,
-    # not the stale prior (run_id='r0').  confirmed_id is set → delete proceeds.
-    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('42', 'missing_deliverable'): [[prior_marker], [new_marker_r1]]},
+    ))
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -436,15 +436,14 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
     })
 
     memory_service = AsyncMock()
-    # task-1400: supply side_effect list to satisfy the post-write confirmation search.
-    # The wrong-metadata rows are not stage1_flag_markers, so confirmation also misses.
-    # suppression filter, per-flag pre-write, confirmation first, confirmation retry:
-    memory_service.search = AsyncMock(side_effect=[
-        [wrong_source, wrong_flag_type, both_wrong],  # suppression filter (kind mismatch → no suppression)
-        [wrong_source, wrong_flag_type, both_wrong],  # per-flag search (all filtered → MISS)
-        [],  # confirmation search (miss — no stage1_flag_marker match)
-        [],  # confirmation retry (miss)
-    ])
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[wrong_source, wrong_flag_type, both_wrong]],
+        marker={('42', 'missing_deliverable'): [
+            [wrong_source, wrong_flag_type, both_wrong],  # pre-write search (all filtered → MISS)
+            [],  # confirmation search (miss)
+            [],  # confirmation retry (miss)
+        ]},
+    ))
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
@@ -650,8 +649,10 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
     new_marker_r1.id = 'new-malformed-r1'
 
     memory_service = AsyncMock()
-    # suppression=[], pre-write HIT=[prior_malformed], confirmation=[new_marker_r1]
-    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('42', 'missing_deliverable'): [[prior_marker], [new_marker_r1]]},
+    ))
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -776,8 +777,10 @@ async def test_dedup_flags_prior_marker_atomic_replace_writes_new_and_deletes_pr
     new_marker_r1.id = 'new-123-r1'
 
     memory_service = AsyncMock()
-    # suppression=[], pre-write HIT=[prior], confirmation=[new_marker_r1]
-    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('42', 'missing_deliverable'): [[prior_marker], [new_marker_r1]]},
+    ))
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -867,11 +870,10 @@ async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
     new_marker_r1.id = 'new-multi-r1'
 
     memory_service = AsyncMock()
-    # suppression=[], pre-write HIT=[prior2, prior3, prior1] (exercises lex-sort),
-    # confirmation=[new_marker_r1] (current run, confirmed → delete proceeds)
-    memory_service.search = AsyncMock(
-        side_effect=[[], [prior2, prior3, prior1], [new_marker_r1]]
-    )
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('42', 'missing_deliverable'): [[prior2, prior3, prior1], [new_marker_r1]]},
+    ))
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1019,8 +1021,10 @@ async def test_dedup_flags_atomic_replace_per_prior_delete_failure_logs_warning_
         # p-2 succeeds — return None (AsyncMock awaitable returns None by default)
 
     memory_service = AsyncMock()
-    # suppression=[], pre-write HIT=[prior1, prior2], confirmation=[new_marker_r1]
-    memory_service.search = AsyncMock(side_effect=[[], [prior1, prior2], [new_marker_r1]])
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('42', 'missing_deliverable'): [[prior1, prior2], [new_marker_r1]]},
+    ))
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(side_effect=_delete_side_effect)
 
@@ -1155,10 +1159,10 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
 
     # Run 1: search returns [zzz, aaa, mmm] — aaa is NOT first
     memory_service_1 = AsyncMock()
-    # suppression=[], pre-write=[zzz,aaa,mmm] (exercises lex-sort), confirmation=[new_r1]
-    memory_service_1.search = AsyncMock(
-        side_effect=[[], [prior_zzz, prior_aaa, prior_mmm], [new_marker_r1]]
-    )
+    memory_service_1.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('99', 'stale_metadata'): [[prior_zzz, prior_aaa, prior_mmm], [new_marker_r1]]},
+    ))
     memory_service_1.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_1.delete_memory = AsyncMock(return_value=None)
 
@@ -1171,10 +1175,10 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
 
     # Run 2: search returns [mmm, zzz, aaa] — different order
     memory_service_2 = AsyncMock()
-    # suppression=[], pre-write=[mmm,zzz,aaa] (different order), confirmation=[new_r2]
-    memory_service_2.search = AsyncMock(
-        side_effect=[[], [prior_mmm, prior_zzz, prior_aaa], [new_marker_r2]]
-    )
+    memory_service_2.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('99', 'stale_metadata'): [[prior_mmm, prior_zzz, prior_aaa], [new_marker_r2]]},
+    ))
     memory_service_2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_2.delete_memory = AsyncMock(return_value=None)
 
@@ -1350,7 +1354,14 @@ async def test_dedup_flags_hit_delete_gated_on_confirmation_not_memory_ids(
     #              → supply a fresh marker with run_id='r1' for confirmation.
     #              Prior has run_id='r0' and does NOT match confirmation filter.
     if add_memory_response == 'empty':
-        search_side_effect = [[], [prior_marker], [], []]  # conf miss + retry miss
+        search_stub = _make_search_stub(
+            suppression=[[]],
+            marker={('42', 'missing_deliverable'): [
+                [prior_marker],
+                [],   # confirmation search (miss)
+                [],   # confirmation retry (miss)
+            ]},
+        )
     else:
         new_marker_r1 = _make_memory_result({
             'source': 'stage1_flag_marker',
@@ -1359,10 +1370,13 @@ async def test_dedup_flags_hit_delete_gated_on_confirmation_not_memory_ids(
             'run_id': 'r1',  # current run — matches confirmation kind filter
         })
         new_marker_r1.id = 'new-hit-resp-r1'
-        search_side_effect = [[], [prior_marker], [new_marker_r1]]  # conf finds new marker
+        search_stub = _make_search_stub(
+            suppression=[[]],
+            marker={('42', 'missing_deliverable'): [[prior_marker], [new_marker_r1]]},
+        )
 
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(side_effect=search_side_effect)
+    memory_service.search = AsyncMock(side_effect=search_stub)
     memory_service.add_memory = AsyncMock(return_value=response)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
