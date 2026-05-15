@@ -8,6 +8,7 @@ import enum
 import hashlib
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -189,6 +190,15 @@ class WorkflowOutcome(enum.Enum):
     BLOCKED = 'blocked'
     REQUEUED = 'requeued'
     ESCALATED = 'escalated'
+
+
+# Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
+# fires.  When this is the only cause hint there is no actionable signal for
+# the debugger; the verify-retry loop short-circuits to BLOCKED instead of
+# burning ``max_verify_attempts × verify_command_timeout_secs``.  After the
+# streamed-stdout fix in ``_run_cmd`` (Change 2) a real cause hint should
+# surface on attempt 1 for any genuine in-test hang.
+_OPAQUE_TIMEOUT_CAUSE_RE = re.compile(r'^Command timed out after \d+(\.\d+)?s:')
 
 
 @dataclass
@@ -2748,6 +2758,28 @@ class TaskWorkflow:
                 return WorkflowOutcome.DONE
 
             verify_attempt += 1
+            # Fast-fail: when the verifier's own injected ``Command timed out
+            # after Ns: …`` wrapper string is the only signal, retrying gives
+            # the debugger nothing actionable.  Escalate to L1 after
+            # ``max_opaque_timeout_attempts`` instead of burning the full
+            # ``max_verify_attempts × verify_command_timeout_secs`` budget.
+            # The streamed-stdout fix in ``_run_cmd`` means a real cause hint
+            # should appear on attempt 1 for any genuine in-test hang;
+            # persistent opaque timeouts indicate infrastructure the debugger
+            # can't fix.
+            if (
+                result.category == 'infra_timeout'
+                and _OPAQUE_TIMEOUT_CAUSE_RE.match(result.cause_hint or '')
+                and verify_attempt >= self.config.max_opaque_timeout_attempts
+            ):
+                logger.warning(
+                    'Task %s: opaque infra_timeout cap hit at attempt %d/%d '
+                    '(cause_hint=%r) — escalating to L1',
+                    self.task_id, verify_attempt,
+                    self.config.max_opaque_timeout_attempts,
+                    (result.cause_hint or '')[:120],
+                )
+                return WorkflowOutcome.BLOCKED
             if verify_attempt >= self.config.max_verify_attempts:
                 return WorkflowOutcome.BLOCKED
 

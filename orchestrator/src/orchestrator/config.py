@@ -518,6 +518,14 @@ class OrchestratorConfig(BaseSettings):
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
     max_verify_attempts: int = Field(default=5)
+    # Fast-fail cap for ``infra_timeout`` results whose cause_hint is the
+    # verifier's own injected ``Command timed out after Ns: …`` wrapper string
+    # — there is no actionable signal for the debugger to chase, so retrying
+    # up to ``max_verify_attempts`` just burns ~50 min of budget per task.
+    # After the streamed-output fix in ``_run_cmd`` a real cause hint should
+    # surface on attempt 1 for any genuine in-test hang; default 2 leaves
+    # one free retry to absorb stray transient infra blips.
+    max_opaque_timeout_attempts: int = Field(default=2, ge=1)
     max_review_cycles: int = Field(default=2)
     reviewer_stagger_secs: float = Field(default=2.0)
     max_reviewer_retries: int = Field(default=4)
