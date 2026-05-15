@@ -281,6 +281,8 @@ class TestCountDoneInWindow:
         db_path = tmp_path / 'no-such.db'
         assert not db_path.exists(), "pre-condition: file must not exist"
 
+        # side_effect is a tripwire if the Path.exists() short-circuit regresses;
+        # assert_not_called() below is the primary contract.
         mock_connect = MagicMock(side_effect=sqlite3.OperationalError('could not open database'))
         monkeypatch.setattr(sqlite3, 'connect', mock_connect)
 
