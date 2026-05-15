@@ -425,6 +425,85 @@ class TestHarnessCostCeiling:
         assert config.orch_daily_cost_ceiling_usd == 99.5
 
     # ------------------------------------------------------------------
+    # _auto_eval_budget_used_24h real-SQL coverage
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_auto_eval_budget_used_24h_real_sql_filters_by_task_id_and_window(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """_auto_eval_budget_used_24h sums only tracked task_ids within the 24h window.
+
+        Seeds three rows:
+          - task_id='redo-1', within 24h,  cost=4.0  — INCLUDED
+          - task_id='redo-2', outside 24h, cost=10.0 — EXCLUDED (too old)
+          - task_id='untracked-3', within 24h, cost=99.0 — EXCLUDED (not tracked)
+        harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'} (tracks redo-1 & redo-2).
+        Expected sum = 4.0 (only redo-1 qualifies on both axes).
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _cost_store_factory()
+        harness.cost_store = store
+
+        # Row 1: tracked, within 24h — should be counted
+        await store.save_invocation(
+            run_id='r1', task_id='redo-1', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=4.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+        # Row 2: tracked, but outside 24h window — should be excluded
+        await store.save_invocation(
+            run_id='r2', task_id='redo-2', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=10.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-25)),
+            completed_at=_iso(timedelta(hours=-25)),
+        )
+        # Row 3: not tracked, within 24h — should be excluded
+        await store.save_invocation(
+            run_id='r3', task_id='untracked-3', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=99.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-2)),
+            completed_at=_iso(timedelta(hours=-2)),
+        )
+
+        harness._auto_eval_redo_task_ids = {'redo-1', 'redo-2'}
+
+        result = await harness._auto_eval_budget_used_24h()
+        assert result == pytest.approx(4.0), (
+            f'Expected 4.0 (only redo-1: tracked AND within 24h); '
+            f'redo-2 is outside window, untracked-3 is not in tracked set. '
+            f'Got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_eval_budget_used_24h_returns_zero_when_no_tracked_ids(
+        self, tmp_path: Path
+    ) -> None:
+        """_auto_eval_budget_used_24h returns 0.0 immediately when redo set is empty.
+
+        The short-circuit must fire before touching cost_store, so cost_store=None
+        still returns 0.0 (no AttributeError).
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.cost_store = None  # ensure DB is not consulted
+        harness._auto_eval_redo_task_ids = set()
+
+        result = await harness._auto_eval_budget_used_24h()
+        assert result == 0.0, (
+            f'Expected 0.0 from empty redo set short-circuit; got {result!r}'
+        )
+
+    # ------------------------------------------------------------------
     # Step 3 — _trailing_24h_cost_usd (all roles, watcher_only=False)
     # ------------------------------------------------------------------
 
