@@ -981,3 +981,52 @@ class TestStateSnapshotOverrideStoreLogging:
         assert record.exc_info[0] is RuntimeError, (
             f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
         )
+
+    def test_get_overrides_failure_logs_warning_and_returns_empty_overrides(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """overrides path: exception must be logged, fallback {} preserved.
+
+        scheduler.py:2358-2359 is currently a bare ``except Exception: pass``
+        that swallows failures silently.  This test confirms a WARNING is
+        emitted with exc_info and the empty-dict fallback is returned.
+        """
+        import logging
+        from unittest.mock import MagicMock
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        mock_store = MagicMock()
+        # pin_queue returns an empty iterator (the for-loop consumes it fine).
+        mock_store.get_pin_queue.return_value = iter([])
+        mock_store.get_overrides.side_effect = RuntimeError('boom')
+        scheduler._override_store = mock_store
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            snap = scheduler.get_state_snapshot()
+
+        # (a) Fallback preserved: overrides is empty dict.
+        assert snap['overrides'] == {}, (
+            f"Expected overrides == {{}}, got {snap['overrides']!r}"
+        )
+        # (b) pin_queue fallback also preserved.
+        assert snap['pin_queue'] == [], (
+            f"Expected pin_queue == [], got {snap['pin_queue']!r}"
+        )
+        # (c) Exactly one WARNING record from orchestrator.scheduler mentioning
+        # get_overrides or overrides.
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.scheduler'
+            and ('get_overrides' in r.getMessage() or 'overrides' in r.getMessage())
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 WARNING mentioning overrides, '
+            f'got {len(matching)}: {[r.getMessage() for r in caplog.records]}'
+        )
+        # (d) exc_info must carry the RuntimeError (proves exc_info=True was used).
+        record = matching[0]
+        assert record.exc_info is not None, 'Expected exc_info to be set on the WARNING record'
+        assert record.exc_info[0] is RuntimeError, (
+            f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
+        )
