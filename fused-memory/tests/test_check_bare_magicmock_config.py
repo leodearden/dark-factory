@@ -231,6 +231,52 @@ class TestFindViolationsExemption:
         assert len(violations) == 1
 
 
+class TestFindViolationsMultiTarget:
+    """Multi-target and chained assignment: each ast.Name config-target is evaluated independently."""
+
+    def test_chained_assign_mock_then_config_yields_one_violation(self):
+        """mock = config = MagicMock() → exactly 1 violation for the 'config' binding."""
+        source = 'mock = config = MagicMock()\n'
+        violations = find_violations(source, 'test_chained.py')
+        assert len(violations) == 1, (
+            'mock = config = MagicMock() should produce exactly 1 violation (for config); '
+            f'got {len(violations)}'
+        )
+        v = violations[0]
+        assert v.lineno == 1
+        assert 'mock_orch_config' in v.message
+
+    def test_chained_assign_two_config_names_yields_two_violations(self):
+        """config = cfg = MagicMock() → exactly 2 violations (one per config-named target)."""
+        source = 'config = cfg = MagicMock()\n'
+        violations = find_violations(source, 'test_chained_two.py')
+        assert len(violations) == 2, (
+            'config = cfg = MagicMock() should produce 2 violations (one per config target); '
+            f'got {len(violations)}'
+        )
+
+    def test_chained_assign_no_config_names_yields_zero_violations(self):
+        """mock = other = MagicMock() → 0 violations (neither name matches config-name set)."""
+        source = 'mock = other = MagicMock()\n'
+        violations = find_violations(source, 'test_chained_none.py')
+        assert violations == [], (
+            'mock = other = MagicMock() should produce no violations (no config names); '
+            f'got {violations}'
+        )
+
+    def test_exemption_above_chained_assign_suppresses_violation(self):
+        """# noqa exemption above mock = config = MagicMock() → 0 violations (shared value/exemption)."""
+        source = (
+            '# noqa: bare-magicmock — needed for legacy fixture migration\n'
+            'mock = config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_chained_exempt.py')
+        assert violations == [], (
+            'Exemption comment above a chained assign should suppress all config-target violations; '
+            f'got {violations}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Reusable source snippets for CLI tests
 # ---------------------------------------------------------------------------
