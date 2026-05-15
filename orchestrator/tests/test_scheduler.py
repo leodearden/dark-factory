@@ -4613,6 +4613,143 @@ class TestOverrideEventEmission:
         assert len(unpinned_events) == 1
         assert unpinned_events[0][1]['task_id'] == 'A'
 
+    @pytest.mark.asyncio
+    async def test_pin_order_recomposition_contract(self, tmp_path):
+        """Executable contract: event-only recomposition equals OverrideStore.get_pin_queue.
+
+        Drives a mixed sequence through acquire_next():
+          seed → pin A → pin B → reorder [B,A] → unpin A → pin C
+
+        Asserts three invariants of the decided Path-A contract (task 1290):
+
+        (a) NO pin_queue_reordered event is emitted on add ticks (pin A, pin B,
+            pin C) or the remove tick (unpin A) — the change is already fully
+            described by task_pinned / task_unpinned.
+        (b) EXACTLY ONE pin_queue_reordered event is emitted across the whole
+            sequence — on the pure-reorder tick (reorder [B,A]) — and its
+            data['new_order'] carries the complete post-reorder ordering ['B','A'].
+        (c) Recomposing pin order solely from the three event types —
+            task_pinned (append), task_unpinned (remove), pin_queue_reordered
+            (replace with new_order) — applied in emission order produces the
+            same ordering as OverrideStore.get_pin_queue('/proj').  This is the
+            executable proof that the documented consumer strategy is correct.
+
+        This test asserts on emitted events and snapshot output only (pure
+        runtime behavior).  It never inspects docstrings or comment text.
+        Net-new coverage: existing tests assert pin events individually but
+        never the recomposition-equals-snapshot invariant.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        store = OverrideStore(tmp_path / 'o.db')
+
+        scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler._project_root = '/proj'
+
+        # Pre-hold all module files so nothing dispatches — focus is on events.
+        scheduler.lock_table._held['seed'] = {'a/src', 'b/src', 'c/src'}
+        scheduler._dispatched.add('seed')
+
+        task_a = _pending_task('A', priority='medium', files=['a/src'])
+        task_b = _pending_task('B', priority='medium', files=['b/src'])
+        task_c = _pending_task('C', priority='medium', files=['c/src'])
+
+        scheduler.get_tasks = AsyncMock(return_value=[task_a, task_b, task_c])
+
+        def count_events(et: EventType) -> int:
+            return sum(1 for e in event_store.events if e[0] == et.value)
+
+        # Seed tick: initialise the override snapshot; no overrides exist yet
+        # so no events should fire.  Subsequent ticks diff-detect from this
+        # baseline.
+        await scheduler.acquire_next()
+        assert count_events(EventType.pin_queue_reordered) == 0, \
+            'Seed tick must not emit pin_queue_reordered'
+
+        # --- Tick 1: pin A (add) ---
+        store.set_override('/proj', 'A', pinned=True)
+        await scheduler.acquire_next()
+        # (a) No pin_queue_reordered on add
+        assert count_events(EventType.pin_queue_reordered) == 0, \
+            'Pinning A must not emit pin_queue_reordered'
+        assert count_events(EventType.task_pinned) == 1, \
+            'Pinning A must emit exactly 1 task_pinned'
+
+        # --- Tick 2: pin B (add) ---
+        store.set_override('/proj', 'B', pinned=True)
+        await scheduler.acquire_next()
+        # (a) Still no pin_queue_reordered after second add
+        assert count_events(EventType.pin_queue_reordered) == 0, \
+            'Pinning B must not emit pin_queue_reordered'
+        assert count_events(EventType.task_pinned) == 2, \
+            'Pinning B must bring total task_pinned count to 2'
+
+        # --- Tick 3: reorder [B, A] (pure reorder — both already pinned) ---
+        store.reorder_pin_queue('/proj', ['B', 'A'])
+        await scheduler.acquire_next()
+        # (b) Exactly one pin_queue_reordered with full new_order
+        reorder_events = [
+            e for e in event_store.events
+            if e[0] == EventType.pin_queue_reordered.value
+        ]
+        assert len(reorder_events) == 1, (
+            f'Expected exactly 1 pin_queue_reordered on the reorder tick; '
+            f'got {len(reorder_events)}: {reorder_events}'
+        )
+        assert reorder_events[0][1]['data']['new_order'] == ['B', 'A'], (
+            f"new_order must be ['B','A']; "
+            f"got {reorder_events[0][1]['data']['new_order']!r}"
+        )
+
+        # --- Tick 4: unpin A (remove) ---
+        store.clear_override('/proj', 'A', field='pinned')
+        await scheduler.acquire_next()
+        # (a) No additional pin_queue_reordered on remove
+        assert count_events(EventType.pin_queue_reordered) == 1, \
+            'Unpinning A must not emit additional pin_queue_reordered'
+        assert count_events(EventType.task_unpinned) == 1, \
+            'Unpinning A must emit exactly 1 task_unpinned'
+
+        # --- Tick 5: pin C (add) ---
+        store.set_override('/proj', 'C', pinned=True)
+        await scheduler.acquire_next()
+        # (a) No additional pin_queue_reordered on add
+        assert count_events(EventType.pin_queue_reordered) == 1, \
+            'Pinning C must not emit additional pin_queue_reordered'
+        assert count_events(EventType.task_pinned) == 3, \
+            'Pinning C must bring total task_pinned count to 3'
+
+        # --- (c) Recompose pin order from events, compare to authoritative snapshot ---
+        # Apply events in emission order using the documented consumer strategy:
+        #   task_pinned        → append task_id to the ordered list
+        #   task_unpinned      → remove task_id from the ordered list
+        #   pin_queue_reordered → replace list with data['new_order']
+        recomposed: list[str] = []
+        for etype, payload in event_store.events:
+            if etype == EventType.task_pinned.value:
+                recomposed.append(payload['task_id'])
+            elif etype == EventType.task_unpinned.value:
+                tid = payload['task_id']
+                if tid in recomposed:
+                    recomposed.remove(tid)
+            elif etype == EventType.pin_queue_reordered.value:
+                recomposed = list(payload['data']['new_order'])
+
+        authoritative = [tid for tid, _ in store.get_pin_queue('/proj')]
+
+        assert recomposed == authoritative, (
+            f'Event-only recomposition {recomposed!r} must equal '
+            f'OverrideStore.get_pin_queue {authoritative!r}'
+        )
+        # Sanity-check the expected final state: B and C pinned (A was removed).
+        assert authoritative == ['B', 'C'], (
+            f"Expected final authoritative pin order ['B','C']; "
+            f'got {authoritative!r}'
+        )
+
 
 class TestRequeueCooldownGc:
     """Unit tests for the _gc_expired_cooldowns helper and the now-pure

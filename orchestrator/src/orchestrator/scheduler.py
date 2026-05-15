@@ -1802,6 +1802,40 @@ class Scheduler:
         Each change in ``boost_tier`` emits exactly one event per task per tick.
         Pin-state diffs emit ``task_pinned`` / ``task_unpinned`` per task, and a
         SINGLE ``pin_queue_reordered`` event per tick when any ``pin_order`` shifts.
+
+        **Pin-order observation contract** (decided in task 1290)
+
+        These pin/override events are **observability-only** and may lag
+        OverrideStore / MCP writes by one tick (they are emitted at the end of
+        the first ``acquire_next()`` call that follows an override mutation).
+
+        ``pin_queue_reordered`` is emitted **only** when a pure reorder occurs
+        — that is, when one or more tasks that were already pinned shift to a
+        different ``pin_order`` via ``reorder_pin_queue()``.  It carries the
+        complete post-change ordering in ``data['new_order']`` (a list of
+        task-ids, ascending by new pin_order).
+
+        ``pin_queue_reordered`` is intentionally **NOT** emitted on pin add
+        (``task_pinned``) or pin remove (``task_unpinned``): the add/remove is
+        already fully described by those events, and emitting a reorder event
+        on top would be redundant noise with no additional information.
+
+        Consumer strategies for determining current pin order:
+
+        (i)  **Event recomposition** — replay events in emission order:
+             ``task_pinned`` → append ``task_id`` to the ordered list;
+             ``task_unpinned`` → remove ``task_id`` from the list;
+             ``pin_queue_reordered`` → replace the list with ``new_order``.
+             This strategy is eventually consistent (lags by at most one tick).
+
+        (ii) **Authoritative snapshot** (preferred for "always-current" needs)
+             — call ``OverrideStore.get_pin_queue(project_root)`` or read
+             ``snapshot.pin_queue`` from the scheduler's public API directly.
+             No event recomposition needed; used by consumers such as MCP
+             ``get_pin_queue`` tools and dashboard scheduler pages.
+
+        See also: ``EventType`` pin-events comment block in ``event_store.py``
+        for the same contract at the taxonomy definition.
         """
         if not self.event_store:
             return
@@ -1833,12 +1867,10 @@ class Scheduler:
             cur_pinned = cur_row.pinned if cur_row else False
             if prev_pinned != cur_pinned:
                 # A task was pinned or unpinned.  Emit task_pinned / task_unpinned
-                # for the individual task but do NOT set pin_queue_changed for a
-                # pin_queue_reordered event.  Rationale: the add/remove is already
-                # described by task_pinned / task_unpinned, and emitting a
-                # pin_queue_reordered on top would be redundant noise.  Consumers
-                # that need the new order can re-query get_pin_queue after receiving
-                # the task_pinned / task_unpinned event.
+                # for the individual task but do NOT set pin_queue_changed.
+                # pin_queue_reordered is deliberately withheld on add/remove —
+                # see the "Pin-order observation contract" in the method docstring
+                # for the full rationale and consumer guidance (task 1290).
                 if cur_pinned:
                     self.event_store.emit(
                         EventType.task_pinned,
