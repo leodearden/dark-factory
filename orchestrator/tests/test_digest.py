@@ -511,3 +511,78 @@ class TestRenderDigestMarkdown:
         md = digest.render_digest_markdown(inputs)
         assert '## Dry-run proposals' in md
         assert 'none queued' in md
+
+
+# ---------------------------------------------------------------------------
+# TestWriteDigestEntry (step-13)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteDigestEntry:
+    """Tests for digest.write_digest_entry(digest_dir, inputs) -> DigestResult."""
+
+    def test_single_call_creates_one_file(self, tmp_path: Path) -> None:
+        """write_digest_entry writes exactly one .md file in digest_dir."""
+        digest_dir = tmp_path / 'digests'
+        result = digest.write_digest_entry(digest_dir, _make_digest_inputs())
+
+        md_files = list(digest_dir.glob('digest-*.md'))
+        assert len(md_files) == 1, f"Expected 1 .md file; got {len(md_files)}"
+        assert result.path == md_files[0]
+        assert result.path is not None
+
+    def test_result_contains_rendered_markdown(self, tmp_path: Path) -> None:
+        """The written file contains the rendered markdown (# Digest header)."""
+        digest_dir = tmp_path / 'digests'
+        result = digest.write_digest_entry(digest_dir, _make_digest_inputs())
+        assert result.path is not None
+        content = result.path.read_text()
+        assert '# Digest' in content
+
+    def test_filename_has_timestamp_prefix(self, tmp_path: Path) -> None:
+        """File is named digest-<timestamp>.md."""
+        digest_dir = tmp_path / 'digests'
+        result = digest.write_digest_entry(digest_dir, _make_digest_inputs())
+        assert result.path is not None
+        assert result.path.name.startswith('digest-')
+        assert result.path.suffix == '.md'
+
+    def test_two_calls_create_two_files(self, tmp_path: Path) -> None:
+        """Append-only: two calls create two separate files (never overwrites)."""
+        import time
+        digest_dir = tmp_path / 'digests'
+        digest.write_digest_entry(digest_dir, _make_digest_inputs())
+        time.sleep(0.01)  # ensure microsecond suffix differs
+        digest.write_digest_entry(digest_dir, _make_digest_inputs())
+
+        md_files = list(digest_dir.glob('digest-*.md'))
+        assert len(md_files) == 2, f"Expected 2 files (append-only); got {len(md_files)}"
+
+    def test_digest_dir_auto_created(self, tmp_path: Path) -> None:
+        """digest_dir is created if it does not exist."""
+        digest_dir = tmp_path / 'nested' / 'digests'
+        assert not digest_dir.exists()
+        digest.write_digest_entry(digest_dir, _make_digest_inputs())
+        assert digest_dir.is_dir()
+
+    def test_result_tripped_and_ewa_value(self, tmp_path: Path) -> None:
+        """DigestResult.tripped and .ewa_value mirror inputs."""
+        inputs = _make_digest_inputs(tripped=True)
+        result = digest.write_digest_entry(tmp_path / 'digests', inputs)
+        assert result.tripped is True
+        assert result.ewa_value == pytest.approx(inputs.ewa_value)
+
+    def test_read_only_dir_never_raises(self, tmp_path: Path) -> None:
+        """write_digest_entry returns DigestResult(path=None) for an unwritable dir.
+
+        Never raises — digest is best-effort observability.
+        """
+        import os
+        digest_dir = tmp_path / 'ro_digests'
+        digest_dir.mkdir()
+        os.chmod(digest_dir, 0o500)
+        try:
+            result = digest.write_digest_entry(digest_dir, _make_digest_inputs())
+            assert result.path is None, "Expected path=None on write failure"
+        finally:
+            os.chmod(digest_dir, 0o700)  # restore so tmp_path cleanup works
