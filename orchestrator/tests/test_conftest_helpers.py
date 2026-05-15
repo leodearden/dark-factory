@@ -146,18 +146,78 @@ def test_pydantic_spec_excludes_basemodel_inherited_members():
     only contains model_fields names — none of which are BaseModel API.  After
     step-2's fix (broader @property enumeration with BaseModel-inherited
     filtering), it must continue to pass.
+
+    Both read *and* write are checked so that a regression that accidentally
+    removes the ``_basemodel_attrs`` filter (e.g. a misspelling of the variable
+    name) is caught on the write path as well as the read path.
     """
     from _orch_helpers import pydantic_spec
 
     from orchestrator.config import OrchestratorConfig
 
     m = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    # --- read-side checks ---
     with pytest.raises(AttributeError):
         _ = m.model_dump            # BaseModel method
     with pytest.raises(AttributeError):
         _ = m.model_extra           # BaseModel @property
     with pytest.raises(AttributeError):
         _ = m.model_fields_set      # BaseModel @property
+    # --- write-side checks (guard against _basemodel_attrs filter regression) ---
+    with pytest.raises(AttributeError):
+        m.model_dump = MagicMock()      # BaseModel method — write must also raise
+    with pytest.raises(AttributeError):
+        m.model_validate = MagicMock()  # BaseModel classmethod — write must also raise
+
+
+def test_pydantic_spec_exposes_user_defined_methods():
+    """pydantic_spec exposes user-defined regular methods on the pydantic model.
+
+    Regression pin for the ~18 ad-hoc ``_spec.for_module = None`` patches
+    scattered across orchestrator tests.  Without this exposure,
+    ``MagicMock(spec_set=pydantic_spec(OrchestratorConfig))`` rejects any
+    access to ``OrchestratorConfig.for_module`` — a regular method at
+    config.py:991 that is not in ``model_fields`` and is not a ``@property``.
+    The patches were needed purely to work around the spec_set gap; once
+    ``pydantic_spec`` includes user-defined methods, they are unnecessary.
+
+    This test FAILS on pre-fix ``pydantic_spec`` (model_fields + properties
+    only) with ``AttributeError: Mock object has no attribute 'for_module'``.
+    """
+    from _orch_helpers import pydantic_spec
+
+    from orchestrator.config import OrchestratorConfig
+
+    spec = pydantic_spec(OrchestratorConfig)
+    m = MagicMock(spec_set=spec)
+    # for_module is a regular method on OrchestratorConfig — not in model_fields.
+    _ = m.for_module('mod_a')          # read/call must not raise AttributeError
+    m.for_module = MagicMock()         # write must not raise AttributeError
+
+
+def test_pydantic_spec_exposes_private_attributes():
+    """pydantic_spec exposes Pydantic v2 PrivateAttr members on the pydantic model.
+
+    Regression pin for the ``_spec._module_configs = None`` patch in
+    ``test_merge_queue.py``.  ``OrchestratorConfig._module_configs`` is a
+    Pydantic v2 ``PrivateAttr(default=None)`` (config.py:971) declared via
+    Pydantic's ``__private_attributes__`` registry, NOT via ``model_fields``.
+    Without this exposure, ``MagicMock(spec_set=pydantic_spec(OrchestratorConfig))``
+    rejects access to ``_module_configs``.
+
+    This test FAILS on the state after step-2 (methods exposed but PrivateAttrs
+    still missing) with ``AttributeError: Mock object has no attribute
+    '_module_configs'``.
+    """
+    from _orch_helpers import pydantic_spec
+
+    from orchestrator.config import OrchestratorConfig
+
+    spec = pydantic_spec(OrchestratorConfig)
+    m = MagicMock(spec_set=spec)
+    # _module_configs is a PrivateAttr on OrchestratorConfig — not in model_fields.
+    _ = m._module_configs              # read must not raise AttributeError
+    m._module_configs = {}             # write must not raise AttributeError
 
 
 def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):

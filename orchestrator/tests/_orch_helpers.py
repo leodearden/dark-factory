@@ -31,8 +31,28 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     are excluded to preserve the invariant that BaseModel API surface is NOT
     exposed.
 
-    Pydantic methods (model_dump, model_validate, …) are intentionally NOT
-    exposed; if a test needs them, mock them explicitly.
+    User-defined regular methods (callables on ``model`` not inherited from
+    ``BaseModel``, not dunder names, not ``@property`` descriptors) are also
+    included.  The canonical example is ``OrchestratorConfig.for_module``
+    (config.py:991): a plain instance method absent from ``model_fields``.
+    This removes the need for the ~18 ad-hoc ``_spec.for_module = None``
+    patches that previously worked around the spec_set gap.  The method walk
+    covers the full MRO down to (but not including) ``BaseModel``, so methods
+    inherited from any intermediate base class (e.g. a shared mixin) are also
+    included — spec_set should permit access to any non-BaseModel callable the
+    real object exposes.
+
+    Pydantic v2 ``PrivateAttr`` members (e.g. ``OrchestratorConfig._module_configs``
+    at config.py:971) are also included by walking ``model.__private_attributes__``.
+    PrivateAttr names begin with ``_`` and are therefore excluded by the regular
+    method walk's underscore filter; this separate walk re-includes them because
+    they are legitimate mock assignment targets.
+
+    BaseModel API (``model_dump``, ``model_validate``, ``model_construct``,
+    ``model_copy``, ``model_json_schema``, ``model_post_init``, …) remains
+    explicitly excluded via a ``set(dir(BaseModel))`` filter applied to the
+    method walk.  This preserves the invariant established by task 1064: writing
+    ``mock.model_dump = ...`` must still raise ``AttributeError``.
     """
     members: dict[str, None] = {f: None for f in model.model_fields}
     # @property descriptors declared on the user's class (e.g.
@@ -47,6 +67,32 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     for name, _ in inspect.getmembers(model, lambda v: isinstance(v, property)):
         if name in _basemodel_props:
             continue
+        members[name] = None
+    # User-defined regular methods — exclude dunders, BaseModel API surface, and
+    # anything already collected as a @property above.
+    # The walk covers the *full* MRO down to (but not including) BaseModel, so
+    # methods inherited from any intermediate base class (e.g. a shared mixin
+    # between BaseModel and the target model) are also included.  This is
+    # intentional: spec_set should permit access to any non-BaseModel callable
+    # the real object exposes, including helpers inherited from mixins.
+    _basemodel_attrs = set(dir(BaseModel))
+    for name, _ in inspect.getmembers(model, callable):
+        if name.startswith('_'):
+            continue
+        if name in _basemodel_attrs:
+            continue
+        if isinstance(getattr(model, name, None), property):
+            # Belt-and-braces: plain properties fail callable() and are already
+            # excluded by the predicate above.  This guard catches exotic
+            # descriptors that subclass property AND implement __call__, which
+            # would slip through the callable() filter but belong in the
+            # @property walk (already collected), not here.
+            continue
+        members[name] = None
+    # Pydantic v2 PrivateAttr members — stored in __private_attributes__ dict,
+    # NOT in model_fields.  The underscore-name filter above intentionally skips
+    # these; walk them separately so PrivateAttrs bypass that filter.
+    for name in getattr(model, '__private_attributes__', {}):
         members[name] = None
     return type(
         f'_{model.__name__}Spec',

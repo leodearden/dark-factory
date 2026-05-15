@@ -32,7 +32,6 @@ def _make_workflow(*, escalation_queue=None) -> TaskWorkflow:
     assignment.modules = ['some/module']
 
     _spec = pydantic_spec(OrchestratorConfig)
-    _spec.for_module = None  # custom method not in model_fields; expose to spec_set
     cfg = MagicMock(spec_set=_spec)
     cfg.fused_memory.project_id = 'dark_factory'
     cfg.fused_memory.url = 'http://localhost:8002'
