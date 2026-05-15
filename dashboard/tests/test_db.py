@@ -380,8 +380,12 @@ class TestDbPool:
         # (ValueError, sqlite3.ProgrammingError, RuntimeError, OperationalError,
         # aiosqlite.Error have all been observed), and a stranded worker thread can
         # hang on `await` rather than raise — defeating any exception-based check.
-        # Both flags are set synchronously inside `await conn.close()` so they are
-        # already settled by the time `pool.close_all()` returns above.
+        # Both flags are set synchronously inside `await conn.close()`, which runs
+        # in the resumed getter task — they are therefore settled by the time
+        # `await getter` returns above.
+        assert hasattr(opened[0], '_connection') and hasattr(opened[0], '_running'), (
+            'aiosqlite internal attribute names changed — update test'
+        )
         assert opened[0]._connection is None, (
             f'expected closed mid-flight connection (_connection is None), '
             f'got {opened[0]._connection!r}'
