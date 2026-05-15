@@ -1084,3 +1084,119 @@ class TestHarnessEscalationEventCounter:
         assert harness._escalation_event_count == 5, (
             f'Expected 5 (3 submit + 2 resolve); got {harness._escalation_event_count}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessMaybeWriteDigest (step-19)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessMaybeWriteDigest:
+    """Tests for Harness._maybe_write_digest (step-20 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    @pytest.mark.asyncio
+    async def test_writes_digest_file_when_threshold_met(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When escalation diff >= N, _maybe_write_digest writes a digest file."""
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,  # high threshold — no trip
+        )
+        harness.cost_store = await _cost_store_factory()
+        # diff=5 >= 3 → should trigger
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md'))
+        assert len(files) == 1, f'Expected 1 digest file; got {files}'
+        assert harness._last_digest_event_count == 5, (
+            f'Expected _last_digest_event_count=5; got {harness._last_digest_event_count}'
+        )
+        assert harness._ewa_value != 0.0, (
+            f'Expected _ewa_value to be updated (non-zero); got {harness._ewa_value}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_skips_write(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When digest_enabled=False, _maybe_write_digest returns without writing."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_enabled=False,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 100
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md')) if digest_dir.exists() else []
+        assert files == [], 'Expected no digest file when digest_enabled=False'
+        assert harness._last_digest_event_count == 0, (
+            f'Expected _last_digest_event_count unchanged at 0; '
+            f'got {harness._last_digest_event_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_skips_write(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When diff < N, _maybe_write_digest returns without writing."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 2   # diff=2 < 3 → no trigger
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md')) if digest_dir.exists() else []
+        assert files == [], 'Expected no digest file when diff < N'
+        assert harness._last_digest_event_count == 0, (
+            f'Expected _last_digest_event_count unchanged; '
+            f'got {harness._last_digest_event_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_best_effort_does_not_propagate_exception(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """write_digest_entry raising does not propagate from _maybe_write_digest."""
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+
+        # Patch write_digest_entry to raise — the outer try/except must swallow it.
+        with patch('orchestrator.digest.write_digest_entry', side_effect=RuntimeError('boom')):
+            # Must not raise.
+            await harness._maybe_write_digest()
+
+        # Scheduler must not be paused after a write failure (fail-open).
+        assert harness.scheduler.is_paused is False, (
+            'Scheduler must not be paused when write_digest_entry raises (fail-open)'
+        )
