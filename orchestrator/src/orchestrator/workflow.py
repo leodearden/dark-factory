@@ -4824,33 +4824,38 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             logger.warning(f'Failed to write suggestions to memory: {e}')
 
     def _escalate_suggestions(self, reviews) -> None:
-        """Submit review suggestions as an info escalation for steward triage."""
+        """Submit review suggestions as an info escalation for steward triage.
+
+        Retained as the steward-escalation fallback even though the primary
+        call site now routes via ``_route_review_suggestions_to_curator``.
+        The dedup helpers are shared with the curator path — both sites import
+        from ``orchestrator.review_suggestions.dedup``.
+        """
         from escalation.models import Escalation
+        from orchestrator.review_suggestions.dedup import (
+            find_prior_review_suggestion,
+            hash_marker,
+            review_suggestion_payload_hash,
+        )
 
         suggestions = reviews.suggestions
         if not suggestions or not self.escalation_queue:
             return
 
-        # Content fingerprint: skip if identical suggestions already escalated
-        content_hash = hashlib.sha256(
-            json.dumps(suggestions, sort_keys=True).encode(),
-        ).hexdigest()[:16]
+        # Content fingerprint: skip if identical suggestions already escalated.
+        content_hash = review_suggestion_payload_hash(suggestions)
 
         existing = self.escalation_queue.get_by_task(self.task_id)
-        for prev in existing:
-            if (
-                prev.category == 'review_suggestions'
-                and prev.detail
-                and prev.detail.startswith(f'#hash:{content_hash}#')
-            ):
-                logger.info(
-                    'Task %s: skipping duplicate review_suggestions escalation '
-                    '(content hash %s matches %s)',
-                    self.task_id, content_hash, prev.id,
-                )
-                return
+        prior = find_prior_review_suggestion(existing, content_hash)
+        if prior is not None:
+            logger.info(
+                'Task %s: skipping duplicate review_suggestions escalation '
+                '(content hash %s matches %s)',
+                self.task_id, content_hash, prior.id,
+            )
+            return
 
-        detail = f'#hash:{content_hash}#' + json.dumps(suggestions)
+        detail = hash_marker(content_hash) + json.dumps(suggestions)
 
         esc = Escalation(
             id=self.escalation_queue.make_id(self.task_id),
