@@ -297,3 +297,23 @@ watcher_rotation_budget_usd: 40.0
 watcher_max_turns: 400
 watcher_effort: high
 watcher_backend: claude
+
+# Daily cost ceilings (AFK hardening, task 1323)
+#
+# Two trailing-24h cost sums from the invocations table that trip the
+# scheduler-pause mechanism when exceeded.  Both checks run every
+# Harness.run() loop tick, immediately before scheduler.acquire_next().
+# Resume is human-driven (same as park-and-stop — no auto-resume).
+#
+# watcher_daily_cost_ceiling_usd: ceiling for escalation-watcher invocations
+#   only (role LIKE '%watcher%').  This is the early-warning trip — runaway
+#   watcher dispatch is the most likely cost source during AFK windows.
+#   Trip reason: cost_ceiling_watcher_exceeded (default 50.0).
+#
+# orch_daily_cost_ceiling_usd: ceiling for ALL orchestrator invocations
+#   (entire invocations table, trailing 24h).  Final safety net.
+#   Trip reason: cost_ceiling_orch_exceeded (default 200.0).
+#
+# Disable a ceiling by setting it to a very high value.
+watcher_daily_cost_ceiling_usd: 50.0
+orch_daily_cost_ceiling_usd: 200.0

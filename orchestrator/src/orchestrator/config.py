@@ -703,6 +703,33 @@ class OrchestratorConfig(BaseSettings):
     watcher_effort: str = Field(default='high')
     watcher_backend: str = Field(default='claude')
 
+    # Daily cost ceilings (AFK hardening, task 1323).
+    # Both measure the trailing-24h SUM(cost_usd) from the invocations table.
+    # The watcher ceiling is the early-warning trip (runaway dispatch is the
+    # most likely cost source); the orch-wide ceiling is the final safety net.
+    # On breach, Harness.pause_scheduler() is called with reason
+    # 'cost_ceiling_watcher_exceeded' or 'cost_ceiling_orch_exceeded'.
+    # Watcher check runs first; when both would trip, the watcher reason wins.
+    # Disable either ceiling by setting to a very high value (no enable-flag
+    # needed — mirrors auto_eval_redo_budget_usd pattern).
+    watcher_daily_cost_ceiling_usd: float = Field(
+        default=50.0,
+        description=(
+            'Daily USD ceiling for escalation-watcher invocations (trailing 24h '
+            'sum of cost_usd WHERE role LIKE \'%watcher%\'). On breach, '
+            'pause_scheduler is called with reason cost_ceiling_watcher_exceeded. '
+            'Task 1323.'
+        ),
+    )
+    orch_daily_cost_ceiling_usd: float = Field(
+        default=200.0,
+        description=(
+            'Daily USD ceiling for ALL orchestrator invocations (trailing 24h '
+            'sum of all cost_usd rows). On breach, pause_scheduler is called '
+            'with reason cost_ceiling_orch_exceeded. Task 1323.'
+        ),
+    )
+
     # Legacy scalar — ignored if `timeouts` section is present in config.
     # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)
