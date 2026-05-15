@@ -3580,10 +3580,13 @@ class TestConfirmationCircuitBreaker:
         # (c) All 3 flags returned (exceptions are logged, not raised)
         assert len(result) == 3
 
-        # (d) Per-flag write-failure WARNINGs emitted (one per flag)
+        # (d) Per-flag write-failure WARNINGs emitted (one per flag).
+        # The unified _write_and_confirm_marker exception handler emits
+        # 'flag_dedup: failed to write marker for task %s flag_type %s: %s'
+        # for both HIT and MISS branches.
         write_fail_warnings = [
             m for m in all_warnings
-            if 'failed to write replacement marker' in m or 'flag_dedup failed' in m
+            if 'failed to write marker' in m
         ]
         assert len(write_fail_warnings) == 3, (
             f'Expected 3 per-flag write-failure WARNINGs but got: {write_fail_warnings}'
