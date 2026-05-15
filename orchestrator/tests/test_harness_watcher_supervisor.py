@@ -76,6 +76,17 @@ class TestWatcherConfig:
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.watcher_backend == 'claude'
 
+    # Misconfigured-clean-exit cost-runaway guard (task 1388)
+    def test_watcher_misconfigured_min_rotation_secs_default(self, tmp_path: Path) -> None:
+        """Clean rotations shorter than this are classified as degenerate (misconfigured)."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.watcher_misconfigured_min_rotation_secs == 120.0
+
+    def test_watcher_max_misconfigured_clean_exits_default(self, tmp_path: Path) -> None:
+        """After this many degenerate clean exits in the window, trip watcher_misconfigured."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.watcher_max_misconfigured_clean_exits == 5
+
 
 # ---------------------------------------------------------------------------
 # step-5: Supervisor lifecycle — start / stop / idempotent
@@ -802,6 +813,15 @@ class TestWatcherSupervisorWiring:
         h = _make_real_harness(tmp_path)
         assert isinstance(h._watcher_unclean_exits, deque)
         assert len(h._watcher_unclean_exits) == 0
+
+    def test_init_sets_watcher_degenerate_clean_exits_empty_deque(self, tmp_path: Path) -> None:
+        """Real Harness.__init__ sets _watcher_degenerate_clean_exits to an empty deque.
+
+        This deque is the cost-runaway guard for fast-clean exits (task 1388).
+        """
+        h = _make_real_harness(tmp_path)
+        assert isinstance(h._watcher_degenerate_clean_exits, deque)
+        assert len(h._watcher_degenerate_clean_exits) == 0
 
     def test_start_and_stop_are_bound_methods(self, tmp_path: Path) -> None:
         """_start_watcher_supervisor and _stop_watcher_supervisor are callable."""
