@@ -72,9 +72,8 @@ _MAX_CAP_COOLDOWN_SECS = 300.0
 #   (LLM triage calls)                    Best-effort middleware, fast-fail/
 #                                         defer contract; 120 s is intentional.
 #
-# fused_memory/reconciliation/agent_loop  _AGENT_LOOP_CAP_WAIT_SANITY_SECS
-# fused_memory/reconciliation/judge       _JUDGE_CAP_WAIT_SANITY_SECS         = 1800 s (30 min).
-# fused_memory/reconciliation/cli_stage_runner  _STAGE_RUNNER_CAP_WAIT_SANITY_SECS
+# fused_memory/reconciliation             _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
+#   (agent_loop, judge, cli_stage_runner) Shared by all three stage runners.
 #   (reconciliation stage runners)        Short-lived stage runners; expected
 #                                         to complete promptly within the
 #                                         reconciliation cycle.  14-day default
