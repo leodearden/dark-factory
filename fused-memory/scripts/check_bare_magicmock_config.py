@@ -12,6 +12,13 @@ Config-name set: exact ``config`` and ``cfg``, plus any name ending with ``_conf
 ``_cfg`` (e.g. ``orch_config``, ``mock_cfg``).  Generic names like ``mcp``, ``mock``, ``m``
 are intentionally excluded — this rule targets config objects only (non-goal: no scope creep).
 
+Attribute target exclusion: only ``ast.Name`` assignment targets are detected (i.e.,
+module-level and local ``config = MagicMock()``).  Attribute assignments such as
+``self.config = MagicMock()`` or ``obj.cfg = MagicMock()`` are intentionally excluded —
+resolving attribute targets requires class/instance context that is not available during
+AST inspection.  This exclusion is an intentional non-goal; it is documented here so the
+scope limit is discoverable.
+
 Preferred alternatives named in the rejection message:
   • ``mock_orch_config`` fixture (orchestrator/tests/conftest.py:91)
   • ``MagicMock(spec_set=pydantic_spec(...))`` (orchestrator/tests/_orch_helpers.py:19)
@@ -74,11 +81,28 @@ def _is_magicmock_call(node: ast.expr) -> bool:
 
 
 def _is_specced(call: ast.Call) -> bool:
-    """Return True if *call* provides a spec via positional arg or spec/spec_set kwarg."""
-    if call.args:
+    """Return True if *call* provides a real spec via positional arg or spec/spec_set kwarg.
+
+    Edge cases handled explicitly:
+    - ``MagicMock(*args)`` (ast.Starred positional): treated as NOT specced.
+      The spread is opaque at AST-inspection time, so we cannot guarantee a spec
+      is present; flagging is safer than a false negative.
+    - ``MagicMock(spec=None)`` / ``MagicMock(spec_set=None)``: treated as NOT specced.
+      Passing None is semantically equivalent to omitting spec altogether and defeats
+      the rule's intent.
+    """
+    # Concrete (non-Starred) positional args only — *args spread cannot be inspected.
+    concrete_args = [a for a in call.args if not isinstance(a, ast.Starred)]
+    if concrete_args:
         # First positional parameter of MagicMock IS spec.
         return True
-    return any(kw.arg in ('spec', 'spec_set') for kw in call.keywords)
+    # spec/spec_set keyword args — but only when the value is not the literal None.
+    for kw in call.keywords:
+        if kw.arg in ('spec', 'spec_set') and not (
+            isinstance(kw.value, ast.Constant) and kw.value.value is None
+        ):
+            return True
+    return False
 
 
 # Exemption comment regex.
@@ -220,11 +244,14 @@ def main(argv: list[str] | None = None) -> int:
     # so a transient OSError on one file never discards violations already
     # collected from earlier files.
     all_violations: list[Violation] = []
-    read_errors: list[tuple[Path, OSError]] = []
+    read_errors: list[tuple[Path, Exception]] = []
     for file_path in files_to_scan:
         try:
             source = file_path.read_text(encoding='utf-8')
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError is a ValueError subclass, not an OSError,
+            # but a malformed file must be reported via the read_errors channel
+            # rather than crashing with an unhandled traceback.
             read_errors.append((file_path, exc))
             continue
 
