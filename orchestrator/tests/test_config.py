@@ -517,28 +517,9 @@ class TestModuleConfigDiscovery:
           (c) the configured depth 'lock_depth=2'
           (d) the consequence phrase 'unreachable through the scheduler/workflow path'
         """
-        # Global config: lock_depth set explicitly so test is self-documenting and
-        # immune to future changes in OrchestratorConfig default values.
-        config_path = tmp_path / 'config.yaml'
-        config_path.write_text(yaml.dump({
-            'project_root': str(tmp_path),
-            'lock_depth': 2,
-        }))
-        # Isolate ORCH_LOCK_DEPTH so a stray env var cannot override lock_depth: 2 and
-        # silently invalidate the depth-comparison boundary being tested. Route
-        # ORCH_CONFIG_PATH through monkeypatch so load_config's unconditional write is
-        # auto-restored at teardown (no stale tmp_path leaks into subsequent tests).
-        monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
         # Nested module config at depth 3 (foo/bar/baz) > lock_depth 2 → must warn.
-        nested = tmp_path / 'foo' / 'bar' / 'baz'
-        nested.mkdir(parents=True)
-        (nested / 'orchestrator.yaml').write_text(yaml.dump({
-            'test_command': 'pytest',  # overridable field required so prefix registers
-        }))
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
-            load_config(config_path)
+            _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar/baz')
 
         warning_records = [
             r for r in caplog.records
@@ -549,7 +530,6 @@ class TestModuleConfigDiscovery:
         # unreachability consequence. The exact remediation prose is intentionally omitted
         # here — it is runtime log output, so coupling tests to its verbatim wording adds
         # breakage risk without additional regression-detection value.
-        DISTINCTIVE_PHRASE = 'unreachable through the scheduler/workflow path'
         matching = [r for r in warning_records if DISTINCTIVE_PHRASE in r.getMessage()]
         assert matching, (
             f"Expected a WARNING from orchestrator.config containing "
