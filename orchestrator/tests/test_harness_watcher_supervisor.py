@@ -119,7 +119,14 @@ class TestWatcherSupervisorLifecycle:
         mock_task.done.return_value = False
         mock_task.get_name.return_value = 'watcher-supervisor'
 
-        with patch('orchestrator.harness.asyncio.create_task', return_value=mock_task) as mock_ct:
+        # side_effect closes the coroutine immediately to prevent
+        # "coroutine was never awaited" RuntimeWarning (which pytest 3.13 turns
+        # into a test failure via PytestUnraisableExceptionWarning).
+        def _create_task(coro, *, name=None):
+            coro.close()
+            return mock_task
+
+        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task) as mock_ct:
             h._start_watcher_supervisor()
 
         assert h._watcher_supervisor_task is mock_task
@@ -133,7 +140,11 @@ class TestWatcherSupervisorLifecycle:
         mock_task = MagicMock(spec=asyncio.Task)
         mock_task.done.return_value = False  # task is alive
 
-        with patch('orchestrator.harness.asyncio.create_task', return_value=mock_task) as mock_ct:
+        def _create_task(coro, *, name=None):
+            coro.close()
+            return mock_task
+
+        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task) as mock_ct:
             h._start_watcher_supervisor()
             h._start_watcher_supervisor()  # second call: no-op
 
@@ -145,15 +156,18 @@ class TestWatcherSupervisorLifecycle:
     async def test_stop_cancels_and_resets(self, tmp_path: Path) -> None:
         """_stop_watcher_supervisor cancels the task and resets to None."""
         h = _make_lifecycle_harness(tmp_path, enabled=True)
-        mock_task = MagicMock(spec=asyncio.Task)
-        mock_task.done.return_value = False
-        # Make await mock_task return immediately (no-op)
-        mock_task.__await__ = lambda self: iter([])
 
-        h._watcher_supervisor_task = mock_task
+        # Use a real asyncio Task so await-on-cancel works without
+        # triggering unawaited-coroutine warnings (instance-level __await__
+        # is ignored by Python's dunder lookup which always goes through type).
+        async def _eternal() -> None:
+            await asyncio.sleep(10_000)
+
+        task = asyncio.create_task(_eternal())
+        h._watcher_supervisor_task = task
         await h._stop_watcher_supervisor()
 
-        mock_task.cancel.assert_called_once()
+        assert task.cancelled()
         assert h._watcher_supervisor_task is None
 
     @pytest.mark.asyncio
