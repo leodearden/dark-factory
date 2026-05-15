@@ -19,6 +19,21 @@ resolving attribute targets requires class/instance context that is not availabl
 AST inspection.  This exclusion is an intentional non-goal; it is documented here so the
 scope limit is discoverable.
 
+Tuple/list-unpacking non-goal: ``a, b = MagicMock()`` uses an ``ast.Tuple`` target, not
+an ``ast.Name``, so it is excluded by the same ast.Name-only rule.  Inspecting unpacked
+targets would require data-flow analysis to identify which element ends up in a
+config-named binding; this is intentionally out of scope.
+
+Chained/multi-target assignment: ``mock = config = MagicMock()`` is an ``ast.Assign``
+with ``len(node.targets) == 2``.  Each ``ast.Name`` target is evaluated independently
+against the shared RHS value (a single MagicMock call).  One Violation is emitted per
+config-named ``ast.Name`` target:
+  • ``mock = config = MagicMock()``  → 1 violation  (``config`` only)
+  • ``config = cfg = MagicMock()``   → 2 violations (both config-named)
+  • ``mock = other = MagicMock()``   → 0 violations (no config-named targets)
+Spec and exemption checks apply once per target (shared value/lineno; per-target
+``col_offset``).
+
 Preferred alternatives named in the rejection message:
   • ``mock_orch_config`` fixture (orchestrator/tests/conftest.py:91)
   • ``MagicMock(spec_set=pydantic_spec(...))`` (orchestrator/tests/_orch_helpers.py:19)
@@ -160,16 +175,34 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     for node in ast.walk(tree):
         # Determine the assignment target name and value.
         if isinstance(node, ast.Assign):
-            # Only single-name targets: skip tuple/list unpacking.
-            if len(node.targets) != 1:
-                continue
-            target = node.targets[0]
-            if not isinstance(target, ast.Name):
-                continue
-            name = target.id
+            # Iterate all targets independently. Each ast.Name target that passes
+            # the config-name check is a candidate for its own Violation. Non-Name
+            # targets (ast.Tuple for unpacking, ast.Attribute for self.config, etc.)
+            # are skipped by the isinstance guard below — they are intentional non-goals.
             value = node.value
             assignment_lineno = node.lineno
-            col_offset = target.col_offset
+            if not _is_magicmock_call(value):
+                continue
+            if _is_specced(value):  # type: ignore[arg-type]
+                continue
+            exempted = _is_exempted(lines, assignment_lineno)
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                name = target.id
+                if not _is_config_name(name):
+                    continue
+                if exempted:
+                    continue
+                violations.append(
+                    Violation(
+                        filename=filename,
+                        lineno=assignment_lineno,
+                        col_offset=target.col_offset,
+                        message=_VIOLATION_MSG,
+                    )
+                )
+            continue
         elif isinstance(node, ast.AnnAssign):
             target = node.target
             if not isinstance(target, ast.Name):
