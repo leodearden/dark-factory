@@ -76,6 +76,54 @@ THIS run land?" (must be run_id-scoped).  Scoping confirmation by run_id is
 correct on both paths — HIT (new marker run_id=current matches; priors'
 older run_ids do not) and MISS (new marker still matches).
 
+Confirmation circuit-breaker (task-1412)
+-----------------------------------------
+During a sustained Mem0 brownout every flag in the batch incurs the worst-case
+confirmation cost (initial search miss + retry = 2 search calls per flag),
+compounding pressure on the already-failing backend.  To limit this, ``dedup_flags``
+maintains a **per-invocation** circuit-breaker:
+
+- ``consecutive_confirmation_misses`` counts strictly-consecutive ``confirm_marker_persisted``
+  misses (``None`` return).  The counter resets to 0 on any successful confirmation
+  (non-``None`` id) so sporadic misses during otherwise-healthy operation do **not**
+  accumulate toward the threshold.
+- ``confirmation_disabled`` starts ``False`` and is set ``True`` the first time
+  ``consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD``.
+- At the moment of trip, exactly **one** breaker WARNING is logged (format:
+  ``"flag_dedup: confirmation circuit-breaker tripped after N consecutive misses;
+  falling back to memory_ids gate for remainder of batch"``).  Subsequent flags
+  do **not** re-emit the WARNING even if they also miss.
+- Once tripped, both HIT and MISS branches skip ``confirm_marker_persisted``
+  entirely and fall back to the cheaper pre-task-1400 gate:
+
+  * **HIT branch**: ``write_succeeded = bool(response.memory_ids)``.  Deletion
+    of prior markers proceeds if ``True``; is skipped (with a per-flag
+    "skipping prior deletion" WARNING) if ``False``.
+  * **MISS branch**: the "will not be detected next cycle" WARNING fires only
+    if ``bool(miss_response.memory_ids) is False``; silent if ``True``.
+
+- Both branches share **one counter** (same local variable), so a HIT-branch
+  trip persists into MISS-branch flags later in the same batch and vice versa.
+- The counter and disabled flag are **function-local**, so a subsequent
+  ``dedup_flags`` invocation (next reconciliation cycle) gets a fresh budget.
+  This is intentional — a transient brownout should not permanently disable
+  confirmation for future healthy cycles.
+- **Write failures** (``add_memory`` exceptions) do **NOT** count toward the
+  threshold.  The circuit-breaker targets specifically the *confirmation* cost
+  — the extra search round-trip that ``confirm_marker_persisted`` performs
+  after a successful write.  When ``add_memory`` itself raises, the
+  confirmation call is never reached, so neither the counter nor the disabled
+  flag is touched; the except branch logs a WARNING and moves on.  A sustained
+  brownout that manifests as write failures therefore never trips the breaker —
+  this is intentional because there is no confirmation overhead to shed when
+  writes are failing outright.
+
+The breaker is an **internal load-shedding mechanism** operating entirely within
+``dedup_flags``.  It does not change the contract documented in the LLM-side
+``stage1.py`` prompt (which mirrors the confirmation contract under normal
+conditions).  No change to ``confirm_marker_persisted`` itself is required —
+only the call-site within ``dedup_flags`` is gated.
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
@@ -122,6 +170,27 @@ class SuppressionPayload(TypedDict):
     content: str
     category: Literal['observations_and_summaries']
     metadata: _SuppressionMetadata
+
+
+# Number of *consecutive* confirm_marker_persisted misses within one dedup_flags
+# call that triggers the confirmation circuit-breaker.  Once tripped the
+# remaining flags in the batch skip confirm_marker_persisted and fall back to
+# bool(response.memory_ids) as the write-succeeded gate.  Counter is
+# function-local so each dedup_flags invocation starts with a fresh budget.
+# Tests monkeypatch this down to 2 (same idiom as test_durable_queue.py:635
+# with _DELETE_DEAD_BATCH_SIZE).  See "Confirmation circuit-breaker (task-1412)"
+# section in the module docstring for the full design rationale.
+#
+# 5 was chosen as the default: during a sustained brownout confirm_marker_persisted
+# always misses (initial miss + one retry = 2 search calls per flag), so 5
+# consecutive misses manifest quickly and indicate a real backend failure.  Under
+# healthy-but-slow indexing, strictly-consecutive miss runs of 5 are rare because
+# any single successful confirmation resets the counter.  Note: write failures
+# (add_memory exceptions) do NOT count toward this threshold — the counter only
+# advances on confirmation misses from successful writes; see the module docstring
+# "Confirmation circuit-breaker" section for the "write failures do not count"
+# design rationale.
+_CONFIRMATION_MISS_THRESHOLD: int = 5
 
 
 async def confirm_marker_persisted(
@@ -358,6 +427,76 @@ async def dedup_flags(
     # prior-marker write path.
     flags = await filter_suppressed(memory_service, project_id, flags)
 
+    # --- Confirmation circuit-breaker (task-1412) ---
+    # Per-invocation counter: strictly consecutive miss count.  Reset to 0 on any
+    # successful confirmation (non-None id).  When the count reaches
+    # _CONFIRMATION_MISS_THRESHOLD, log ONE breaker WARNING and set
+    # confirmation_disabled = True so the remainder of the batch skips
+    # confirm_marker_persisted entirely and gates on bool(response.memory_ids).
+    # Being function-local, these reset automatically at each dedup_flags call.
+    # See: "Confirmation circuit-breaker (task-1412)" section in module docstring.
+    consecutive_confirmation_misses: int = 0
+    confirmation_disabled: bool = False
+
+    async def _confirm_and_track(
+        response_memory_ids: list[str],
+        miss_warning_msg: str,
+        *msg_args: object,
+    ) -> tuple[str | None, bool]:
+        """Shared circuit-breaker helper for HIT and MISS branches.
+
+        When the breaker is ACTIVE (``confirmation_disabled`` is False):
+        - Calls ``confirm_marker_persisted``; on miss emits ``miss_warning_msg``,
+          increments the consecutive miss counter, and trips the breaker when the
+          threshold is reached (one breaker WARNING logged at trip-time only).
+        - On hit: resets the counter so sporadic misses don't accumulate.
+        - Returns ``(confirmed_id, write_succeeded)`` where
+          ``write_succeeded = confirmed_id is not None``.
+
+        When the breaker is TRIPPED (``confirmation_disabled`` is True):
+        - Skips ``confirm_marker_persisted``; gates on ``bool(response_memory_ids)``.
+        - Emits ``miss_warning_msg`` iff ``bool(response_memory_ids)`` is False.
+        - Returns ``(None, bool(response_memory_ids))``.
+
+        Mutates nonlocal ``consecutive_confirmation_misses`` and
+        ``confirmation_disabled``; captures ``memory_service``, ``project_id``,
+        ``run_id``, and ``logger`` from the enclosing ``dedup_flags`` scope; and
+        reads ``tid``/``ftype`` from the enclosing for-loop's current iteration.
+        """
+        nonlocal consecutive_confirmation_misses, confirmation_disabled
+        if not confirmation_disabled:
+            c_id = await confirm_marker_persisted(
+                memory_service,
+                project_id=project_id,
+                task_id=tid,
+                flag_type=ftype,
+                run_id=run_id,
+                log=logger,
+            )
+            if c_id is None:
+                logger.warning(miss_warning_msg, *msg_args)
+                consecutive_confirmation_misses += 1
+                if consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD:
+                    logger.warning(
+                        'flag_dedup: confirmation circuit-breaker tripped after %d'
+                        ' consecutive misses; falling back to memory_ids gate for'
+                        ' remainder of batch',
+                        consecutive_confirmation_misses,
+                    )
+                    confirmation_disabled = True
+            else:
+                # Strictly consecutive: any successful confirmation resets the
+                # counter so sporadic misses don't accumulate toward threshold.
+                # Reset ONLY inside `if not confirmation_disabled` so a tripped
+                # breaker can't be un-tripped mid-batch.
+                consecutive_confirmation_misses = 0
+            return c_id, c_id is not None
+        else:
+            write_succeeded = bool(response_memory_ids)
+            if not write_succeeded:
+                logger.warning(miss_warning_msg, *msg_args)
+            return None, write_succeeded
+
     result: list[dict[str, Any]] = []
     for flag in flags:
         sig = compute_flag_signature(flag)
@@ -407,9 +546,16 @@ async def dedup_flags(
             #     proves the new marker is findable by the next cycle's search.
             #     An unconfirmed write (write exception OR confirmation miss)
             #     preserves priors for next cycle (best-effort at-least-one-marker).
+            #
+            #     Circuit-breaker (task-1412): _confirm_and_track encapsulates the
+            #     confirm_marker_persisted call and counter management; falls back to
+            #     bool(response.memory_ids) when the breaker is tripped.
+            # See: _confirm_and_track docstring and "Confirmation circuit-breaker"
+            # section in the module docstring.
             confirmed_id: str | None = None
+            write_succeeded: bool = False
             try:
-                await memory_service.add_memory(
+                response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -423,33 +569,22 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                confirmed_id = await confirm_marker_persisted(
-                    memory_service,
-                    project_id=project_id,
-                    task_id=tid,
-                    flag_type=ftype,
-                    run_id=run_id,
-                    log=logger,
+                confirmed_id, write_succeeded = await _confirm_and_track(
+                    response.memory_ids,
+                    'flag_dedup: replacement marker for task %s flag_type %s could not'
+                    ' be confirmed findable — skipping prior deletion',
+                    tid, ftype,
                 )
-                if confirmed_id is None:
-                    logger.warning(
-                        'flag_dedup: replacement marker for task %s flag_type %s could not'
-                        ' be confirmed findable — skipping prior deletion',
-                        tid, ftype,
-                    )
             except Exception as e:
                 logger.warning(
                     'flag_dedup: failed to write replacement marker for task %s flag_type %s: %s',
                     tid, ftype, e,
                 )
 
-            # (3) Delete ALL priors only if the new marker was confirmed FINDABLE.
-            #     Gating on confirmed findability (not just memory_ids non-empty)
-            #     prevents a write whose returned id differs from the canonical id
-            #     from wiping priors with nothing recoverable next cycle.
+            # (3) Delete ALL priors only if the new marker was confirmed FINDABLE
+            #     (or, after circuit-breaker trip, if bool(response.memory_ids) is True).
             #     Each delete is wrapped individually so one bad delete does not
             #     abort the batch (self-healing: leftovers are retried next cycle).
-            write_succeeded = confirmed_id is not None
             if write_succeeded:
                 for prior in priors:
                     try:
@@ -483,8 +618,13 @@ async def dedup_flags(
             # marker is findable via a read-back search.  The WARNING is driven
             # off the confirmed canonical id (None = unfindable), not off the
             # unverified add_memory response.memory_ids.
+            #
+            # Circuit-breaker (task-1412): shares the same _confirm_and_track helper
+            # (and therefore the same counter / disabled flag) as the HIT branch.
+            # When the breaker is tripped, _confirm_and_track drives the "will not be
+            # detected next cycle" WARNING off bool(miss_response.memory_ids) instead.
             try:
-                await memory_service.add_memory(
+                miss_response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -498,20 +638,12 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                confirmed_id = await confirm_marker_persisted(
-                    memory_service,
-                    project_id=project_id,
-                    task_id=tid,
-                    flag_type=ftype,
-                    run_id=run_id,
-                    log=logger,
+                await _confirm_and_track(
+                    miss_response.memory_ids,
+                    'flag_dedup: MISS marker for task %s flag_type %s could not be'
+                    ' confirmed findable — recurring flag will not be detected next cycle',
+                    tid, ftype,
                 )
-                if confirmed_id is None:
-                    logger.warning(
-                        'flag_dedup: MISS marker for task %s flag_type %s could not be'
-                        ' confirmed findable — recurring flag will not be detected next cycle',
-                        tid, ftype,
-                    )
             except Exception as e:
                 logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
         result.append(flag)
