@@ -44,6 +44,7 @@ from dashboard.data.db import with_db
 # CapInterval dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class CapInterval:
     """A contiguous period during which an account was capped.
@@ -58,8 +59,27 @@ class CapInterval:
 
 
 # ---------------------------------------------------------------------------
+# _normalize_now_utc
+# ---------------------------------------------------------------------------
+
+
+def _normalize_now_utc(now: datetime | None) -> datetime:
+    """Return a UTC-aware datetime from *now*.
+
+    - ``None`` → ``datetime.now(UTC)``
+    - naive (no ``tzinfo``) → assumed UTC, attached via ``replace(tzinfo=UTC)``
+    - tz-aware but non-UTC → converted via ``astimezone(UTC)``
+    """
+    effective = now if now is not None else datetime.now(UTC)
+    if effective.tzinfo is None:
+        return effective.replace(tzinfo=UTC)
+    return effective.astimezone(UTC)
+
+
+# ---------------------------------------------------------------------------
 # read_cap_intervals
 # ---------------------------------------------------------------------------
+
 
 async def read_cap_intervals(
     dbs: list[aiosqlite.Connection | None],
@@ -95,7 +115,7 @@ async def read_cap_intervals(
         Flat list of :class:`CapInterval` objects across all DBs, unordered.
     """
     if days <= 0:
-        raise ValueError("days must be positive")
+        raise ValueError('days must be positive')
     effective_now = now if now is not None else datetime.now(UTC)
     if effective_now.tzinfo is None:
         effective_now = effective_now.replace(tzinfo=UTC)
@@ -105,11 +125,11 @@ async def read_cap_intervals(
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
         rows = await db.execute_fetchall(
-            "SELECT account_name, event_type, created_at "
-            "  FROM account_events "
+            'SELECT account_name, event_type, created_at '
+            '  FROM account_events '
             " WHERE event_type IN ('cap_hit', 'resumed') "
-            "   AND created_at >= ? "
-            " ORDER BY account_name, created_at",
+            '   AND created_at >= ? '
+            ' ORDER BY account_name, created_at',
             (cutoff,),
         )
 
@@ -120,9 +140,7 @@ async def read_cap_intervals(
             ts = datetime.fromisoformat(ts_str)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=UTC)
-            by_account.setdefault(row['account_name'], []).append(
-                (row['event_type'], ts)
-            )
+            by_account.setdefault(row['account_name'], []).append((row['event_type'], ts))
 
         intervals: list[CapInterval] = []
         for account_name, events in by_account.items():
@@ -151,6 +169,7 @@ async def read_cap_intervals(
 # ---------------------------------------------------------------------------
 # merge_all_accounts_capped
 # ---------------------------------------------------------------------------
+
 
 def merge_all_accounts_capped(
     intervals: list[CapInterval],
@@ -254,8 +273,8 @@ def merge_all_accounts_capped(
     if currently_all_capped and window_start is not None:
         all_open = all(open_ended_by_account[a] for a in account_set)
         assert all_open, (
-            "BUG: all accounts active at sweep end but not all have open-ended "
-            "intervals — event-emission invariant violated"
+            'BUG: all accounts active at sweep end but not all have open-ended '
+            'intervals — event-emission invariant violated'
         )
         merged.append((window_start, None))
 
@@ -267,6 +286,7 @@ def merge_all_accounts_capped(
 # ---------------------------------------------------------------------------
 # compute_overlap_ms
 # ---------------------------------------------------------------------------
+
 
 def compute_overlap_ms(
     start: datetime,
@@ -297,6 +317,7 @@ def compute_overlap_ms(
 # bucketise_cap_sparkline
 # ---------------------------------------------------------------------------
 
+
 def bucketise_cap_sparkline(
     capped: list[tuple[datetime, datetime | None]],
     *,
@@ -317,13 +338,17 @@ def bucketise_cap_sparkline(
         capped: List of ``(start, end)`` tuples (``end=None`` = still open).
         bucket_seconds: Bucket width in seconds (default 600 = 10 min).
         window_hours: Look-back window in hours (default 24).
-        now: Reference time; defaults to ``datetime.now(UTC)``.
+        now: Reference time; defaults to ``datetime.now(UTC)``.  Any *now*
+            value is normalised to UTC before computing the window: naive
+            datetimes (no ``tzinfo``) are assumed to be UTC
+            (``replace(tzinfo=UTC)``); tz-aware but non-UTC datetimes are
+            converted via ``astimezone(UTC)``.
 
     Returns:
         :class:`ChartData` with ``labels`` (ISO right-edge timestamps) and
         ``values`` (list of 0 or 1).
     """
-    effective_now = now if now is not None else datetime.now(UTC)
+    effective_now = _normalize_now_utc(now)
     start_at = effective_now - timedelta(hours=window_hours)
     num_buckets = (window_hours * 3600) // bucket_seconds
 
@@ -336,10 +361,14 @@ def bucketise_cap_sparkline(
     for i in range(num_buckets):
         right_edge = start_at + timedelta(seconds=bucket_seconds * (i + 1))
         label = right_edge.isoformat()
-        value = 1 if any(
-            c_start <= right_edge and (c_end is None or right_edge < c_end)
-            for c_start, c_end in capped
-        ) else 0
+        value = (
+            1
+            if any(
+                c_start <= right_edge and (c_end is None or right_edge < c_end)
+                for c_start, c_end in capped
+            )
+            else 0
+        )
         labels.append(label)
         values.append(value)
 
@@ -349,6 +378,7 @@ def bucketise_cap_sparkline(
 # ---------------------------------------------------------------------------
 # compute_capped_now_and_windows
 # ---------------------------------------------------------------------------
+
 
 def compute_capped_now_and_windows(
     intervals: list[CapInterval],
