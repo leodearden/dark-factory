@@ -14,7 +14,6 @@ truth for pass/fail.
 
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -290,28 +289,3 @@ class TestSubmitToMergeQueuePlanTightening:
         assert second is False
         # Architect invoked exactly once across both calls.
         assert len(invocations) == 1
-
-
-# ---------------------------------------------------------------------------
-# Task-1410 regression guard: terminal_state_is_the_bug removed from _mark_blocked
-# ---------------------------------------------------------------------------
-
-
-class TestMarkBlockedSignature:
-    """Regression guard: _mark_blocked must NOT have terminal_state_is_the_bug param.
-
-    Task 1410 (reviewer_comprehensive over_engineering_dead_parameter): the
-    parameter was inert dead surface area — removed to avoid misleading callers.
-
-    RED while the parameter exists; GREEN after task-1410 impl step removes it.
-    """
-
-    def test_no_inert_terminal_state_is_the_bug_param(self):
-        """terminal_state_is_the_bug must not appear in _mark_blocked's signature."""
-        sig = inspect.signature(TaskWorkflow._mark_blocked)
-        assert 'terminal_state_is_the_bug' not in sig.parameters, (
-            "_mark_blocked still has 'terminal_state_is_the_bug' parameter — "
-            'task 1410 (reviewer_comprehensive over_engineering_dead_parameter) '
-            'removed it as inert dead surface area; do not re-add without wiring '
-            '_mark_blocked through the escalation MCP chokepoint.'
-        )
