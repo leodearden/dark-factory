@@ -1239,6 +1239,7 @@ class TestHarnessEwaTrip:
             'Scheduler must be paused after EWA trip'
         )
         reason = harness.scheduler.pause_reason
+        assert reason is not None, 'pause_reason must not be None'
         assert re.match(r'^ewa_trip_\d+\.\d+$', reason), (
             f'pause_reason must match ewa_trip_<float>; got {reason!r}'
         )
@@ -1347,9 +1348,8 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         async def fast_sleep(_secs):
             pass  # no-op — skip real delays
 
-        with patch('asyncio.sleep', side_effect=fast_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await harness._watcher_supervisor_loop()
+        with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
+            await harness._watcher_supervisor_loop()
 
         harness._maybe_write_digest.assert_awaited_once()
 
@@ -1381,9 +1381,8 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         async def fast_sleep(_secs):
             pass  # no-op
 
-        with patch('asyncio.sleep', side_effect=fast_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await harness._watcher_supervisor_loop()
+        with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
+            await harness._watcher_supervisor_loop()
 
         harness._maybe_write_digest.assert_awaited_once()
 
@@ -1416,9 +1415,8 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         async def fast_sleep(_secs):
             pass  # no-op
 
-        with patch('asyncio.sleep', side_effect=fast_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await harness._watcher_supervisor_loop()
+        with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
+            await harness._watcher_supervisor_loop()
 
         # Supervisor ran two rotations — proving it continued past the digest failure.
         assert rotation_count == 2, (

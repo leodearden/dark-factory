@@ -19,6 +19,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
 
+from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -34,7 +35,6 @@ from orchestrator.scheduler import (
     SetTaskStatusRejected,
     files_to_modules,
 )
-from orchestrator import digest as digest_mod
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 

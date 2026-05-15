@@ -17,12 +17,11 @@ Design decisions (see plan.json):
 from __future__ import annotations
 
 import logging
-import math
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore

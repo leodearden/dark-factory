@@ -7,16 +7,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import UTC, timedelta
+from datetime import datetime as _datetime
 from pathlib import Path
-from typing import Callable
 
 import pytest
 import pytest_asyncio
 from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore
 
 
 class TestUpdateEwa:
@@ -74,7 +74,7 @@ def _write_esc(path: Path, esc_id: str, **kwargs: object) -> None:
         'worktree': None,
         'workflow_state': None,
         'level': kwargs.get('level', 0),
-        'resolved_at': kwargs.get('resolved_at', None),
+        'resolved_at': kwargs.get('resolved_at'),
         'resolved_by': None,
         'resolution_turns': None,
         'dedupe_count': 0,
@@ -248,9 +248,6 @@ class TestCountDoneInWindow:
 # ---------------------------------------------------------------------------
 # Fixtures for async CostStore tests
 # ---------------------------------------------------------------------------
-
-from datetime import UTC, datetime as _datetime
-
 
 def _iso_offset(delta: timedelta) -> str:
     """Return an ISO timestamp offset from now by delta."""
