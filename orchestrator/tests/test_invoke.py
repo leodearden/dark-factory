@@ -474,6 +474,7 @@ class TestReleaseProbeSlotOnException:
         gate.on_agent_complete = MagicMock()
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=RuntimeError('subprocess failed'))
@@ -493,6 +494,7 @@ class TestReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
@@ -512,6 +514,7 @@ class TestReleaseProbeSlotOnException:
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
@@ -530,6 +533,7 @@ class TestReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=asyncio.CancelledError())
