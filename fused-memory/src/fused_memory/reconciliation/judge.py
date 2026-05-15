@@ -15,14 +15,11 @@ from fused_memory.models.reconciliation import (
     VerdictAction,
     VerdictSeverity,
 )
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SECS
+from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
-
-# Per-caller cap-wait policy: see shared/src/shared/cli_invoke.py and plans/afk-A1-cap-wait.md.
-_JUDGE_CAP_WAIT_SANITY_SECS = _RECONCILIATION_STAGE_CAP_WAIT_SECS
 
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
@@ -258,7 +255,7 @@ Review this run and provide your verdict as JSON.
             permission_mode='bypassPermissions',
             timeout_seconds=float(self.config.judge_cli_timeout_seconds),
             cwd=Path(self.config.explore_codebase_root),
-            cap_wait_sanity_secs=_JUDGE_CAP_WAIT_SANITY_SECS,
+            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
 
         # Preserve legacy "empty stdout = valid empty verdict" semantics.

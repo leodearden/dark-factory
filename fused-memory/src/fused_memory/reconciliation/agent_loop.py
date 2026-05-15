@@ -20,12 +20,9 @@ from shared.cli_invoke import AgentResult, build_failure_message, invoke_with_ca
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SECS
+from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 logger = logging.getLogger(__name__)
-
-# Per-caller cap-wait policy: see shared/src/shared/cli_invoke.py and plans/afk-A1-cap-wait.md.
-_AGENT_LOOP_CAP_WAIT_SANITY_SECS = _RECONCILIATION_STAGE_CAP_WAIT_SECS
 
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
@@ -360,7 +357,7 @@ class AgentLoop:
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
                 cwd=Path(self.config.explore_codebase_root),
-                cap_wait_sanity_secs=_AGENT_LOOP_CAP_WAIT_SANITY_SECS,
+                cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
 
             if not result.success:

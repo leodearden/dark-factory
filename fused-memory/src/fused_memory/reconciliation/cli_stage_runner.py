@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SECS
+from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
@@ -19,9 +19,6 @@ if TYPE_CHECKING:
     from fused_memory.config.schema import ReconciliationConfig
 
 logger = logging.getLogger(__name__)
-
-# Per-caller cap-wait policy: see shared/src/shared/cli_invoke.py and plans/afk-A1-cap-wait.md.
-_STAGE_RUNNER_CAP_WAIT_SANITY_SECS = _RECONCILIATION_STAGE_CAP_WAIT_SECS
 
 # ── Disallowed tool lists ──────────────────────────────────────────────
 
@@ -196,7 +193,7 @@ async def run_stage_via_cli(
             output_schema=output_schema if output_schema is not None else STAGE_REPORT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
-            cap_wait_sanity_secs=_STAGE_RUNNER_CAP_WAIT_SANITY_SECS,
+            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )
     except AllAccountsCappedException:
         logger.warning(
