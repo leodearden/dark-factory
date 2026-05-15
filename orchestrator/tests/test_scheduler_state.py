@@ -571,7 +571,10 @@ class TestWriteStateSnapshot:
 
         # Inject a disk-full error at the os.replace boundary so the test
         # exercises the propagation path inside the primitive itself.
-        monkeypatch.setattr(scheduler_module.os, 'replace', lambda *_: (_ for _ in ()).throw(OSError('disk full')))
+        def _boom(*_args, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(scheduler_module.os, 'replace', _boom)
 
         with pytest.raises(OSError):
             scheduler._write_state_snapshot_raw(path)
