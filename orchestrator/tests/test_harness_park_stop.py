@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -861,6 +862,119 @@ class TestHarnessCostCeiling:
         )
         with pytest.raises(ValueError, match=r'_trailing_24h_fetch_one: sql must end with'):
             await harness._trailing_24h_fetch_one(bad_sql, (), label='bad-sql-test')
+
+    # ------------------------------------------------------------------
+    # Direct tests for _trailing_24h_fetch_one: fail-open contract
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_fetch_one_returns_none_and_warns_on_exception(
+        self, tmp_path: Path, _cost_store_factory, caplog
+    ) -> None:
+        """_trailing_24h_fetch_one returns None and logs a warning when the query raises.
+
+        Closing the store before calling the helper forces _require_conn() to
+        raise RuntimeError — exercising the fail-open except Exception branch.
+        Both call sites (_auto_eval_budget_used_24h, _enforce_cost_ceilings)
+        treat None as "skip / assume zero"; dispatch must never be blocked by a
+        transient cost-DB error.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _cost_store_factory()
+        harness.cost_store = store
+
+        # Force _require_conn() to raise RuntimeError on the next call.
+        # The fixture teardown calls close() again, which is idempotent.
+        await store.close()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._trailing_24h_fetch_one(
+                'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations WHERE completed_at >= ?',
+                (),
+                label='fail-open-test',
+            )
+
+        assert result is None, (
+            'fail-open contract: _trailing_24h_fetch_one must return None when '
+            f'the query raises; got {result!r}'
+        )
+        matching = [
+            r for r in caplog.records
+            if 'fail-open-test' in r.getMessage()
+            and 'trailing-24h cost query failed' in r.getMessage()
+        ]
+        assert matching, (
+            "Expected at least one WARNING containing 'fail-open-test' and "
+            "'trailing-24h cost query failed'. Records: "
+            + repr([r.getMessage() for r in caplog.records])
+        )
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_fetch_one_binds_leading_params_before_cutoff(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """_trailing_24h_fetch_one passes leading_params before the cutoff timestamp.
+
+        Seeds task-a (3.0), task-b (2.0), and a noise row untracked-c (99.0) —
+        all within the 24h window.  Queries with IN(?,?) for task-a and task-b.
+        Expected sum = 5.0.
+
+        If leading_params were appended AFTER the cutoff (reversed order), the
+        cutoff ISO string would be bound to the first IN slot — no rows would
+        match and the sum would be 0.0.  The noise row rules out a false-positive
+        "wildcard match" scenario where everything was included.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _cost_store_factory()
+        harness.cost_store = store
+
+        # Row A: task-a, within 24h window
+        await store.save_invocation(
+            run_id='r-a', task_id='task-a', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=3.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+        # Row B: task-b, within 24h window
+        await store.save_invocation(
+            run_id='r-b', task_id='task-b', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=2.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+        # Row C: noise — within 24h but NOT in leading_params
+        await store.save_invocation(
+            run_id='r-c', task_id='untracked-c', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=99.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+
+        row = await harness._trailing_24h_fetch_one(
+            'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+            'WHERE task_id IN (?,?) AND completed_at >= ?',
+            ('task-a', 'task-b'),
+            label='ordering-test',
+        )
+
+        assert row is not None, (
+            '_trailing_24h_fetch_one must return a row (not None) for a valid store'
+        )
+        assert float(row[0]) == pytest.approx(5.0), (
+            f'Expected sum 5.0 (task-a 3.0 + task-b 2.0). Got {row[0]!r}. '
+            '0.0 would indicate reversed param ordering (cutoff bound to IN slot, '
+            'no task-id match); ~104.0 or similar would indicate noise row leaked in '
+            '(IN clause matched everything).'
+        )
 
 
 class TestDigestConfig:
