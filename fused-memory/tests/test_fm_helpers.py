@@ -154,8 +154,6 @@ async def test_submit_and_resolve_raises_when_no_result_json(row_value):
 # AttributeError until step-2 provides the implementation.
 # ---------------------------------------------------------------------------
 
-import pytest
-
 # We import the helpers lazily inside each test so that ImportError is the
 # failure mode rather than a collection error that breaks unrelated tests.
 # (If the names don't exist yet, the import will raise ImportError inside

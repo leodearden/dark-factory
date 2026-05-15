@@ -3,10 +3,9 @@
 import re
 from unittest.mock import AsyncMock
 
-from _fm_helpers import make_8df8_scenario
-
 import pytest
 import pytest_asyncio
+from _fm_helpers import make_8df8_scenario
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore

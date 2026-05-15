@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import assert_id_title_pairing, make_8df8_scenario, parse_rendered_id_title_pairs
+from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
