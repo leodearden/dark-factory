@@ -426,8 +426,11 @@ async def test_get_task_failure_falls_back_to_in_memory_metadata_and_warns(caplo
     assert md.get('memory_hints') == {'entities': ['E1']}, (
         f'In-memory memory_hints must survive on fallback path; got {md}'
     )
-    # A WARNING mentioning the failure must be logged.
-    warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any('refresh' in t or 'get_task' in t or 'metadata' in t for t in warning_texts), (
-        f'Expected a warning about get_task failure; got: {warning_texts}'
+    # A WARNING with the specific refresh-failure message must be logged.
+    warning_texts = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'failed to refresh metadata before infra-resume thrash' in t
+        for t in warning_texts
+    ), (
+        f'Expected warning about get_task refresh failure; got: {warning_texts}'
     )
