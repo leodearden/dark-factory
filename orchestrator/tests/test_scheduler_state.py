@@ -689,8 +689,12 @@ class TestSnapshotWriteThrottle:
 
         The lock is released between each tick so task A is eligible every
         time, ensuring acquire_next reaches _write_snapshot_best_effort on
-        every tick (state changes each tick, so the content-identity
-        optimisation does not mask the time-throttle assertion).
+        every tick.  Note: the dedup payload happens to be byte-identical
+        across all K ticks (task A is the holder each time), so both the
+        time-throttle gate and the content-dedup gate coincide here — both
+        mechanisms independently produce the same outcome (1 write).  The
+        dedicated ``test_content_identical_payload_skips_disk_write`` isolates
+        the content-dedup path; this test exercises the time-throttle gate.
         """
         from unittest.mock import AsyncMock, MagicMock
 
