@@ -2580,8 +2580,27 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # --- Unclean exit path ---
-            self._watcher_unclean_exits.append(time.monotonic())
+            now = time.monotonic()
+            self._watcher_unclean_exits.append(now)
             consecutive_unclean += 1
+
+            # Crashloop guard: evict entries older than the window, then check.
+            window = self.config.watcher_crashloop_window_secs
+            while (
+                self._watcher_unclean_exits
+                and self._watcher_unclean_exits[0] < now - window
+            ):
+                self._watcher_unclean_exits.popleft()
+
+            if len(self._watcher_unclean_exits) >= self.config.watcher_max_crashloop_restarts:
+                logger.error(
+                    'Escalation-watcher-auto crashloop detected '
+                    '(%d unclean exits in %ds window) — pausing scheduler',
+                    len(self._watcher_unclean_exits),
+                    window,
+                )
+                await self.pause_scheduler('watcher_crashloop')
+                return  # stop supervising
 
             backoff = min(
                 self.config.watcher_subprocess_restart_backoff_secs
