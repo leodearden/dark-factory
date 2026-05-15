@@ -818,10 +818,13 @@ def _snapshot_threads() -> dict[str, int]:
     Buckets:
       - ``main``        — the MainThread
       - ``asyncio_pool`` — asyncio loop-internal workers (names start with
-                           ``asyncio_``; CPython names these ``asyncio_N``)
-      - ``executor``    — :class:`concurrent.futures.ThreadPoolExecutor` workers
-                           (names start with ``ThreadPoolExecutor``; includes
-                           asyncio's default executor on Python ≥ 3.9)
+                           ``asyncio_``; since CPython 3.9 asyncio's default
+                           :class:`~concurrent.futures.ThreadPoolExecutor` uses
+                           ``thread_name_prefix='asyncio'``, so its workers are
+                           counted here, not in ``executor``)
+      - ``executor``    — user-created :class:`concurrent.futures.ThreadPoolExecutor`
+                           workers that retain the default ``'ThreadPoolExecutor'``
+                           thread name prefix (names start with ``ThreadPoolExecutor``)
       - ``aiosqlite``   — aiosqlite connection worker threads (name starts with
                            ``aiosqlite``)
       - ``timer``       — :class:`threading.Timer` instances (short-lived)
@@ -866,6 +869,14 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
     logging so the ``threads=N`` WARNING line and the ``breakdown=`` line
     are guaranteed to derive from the same :func:`threading.enumerate` call.
 
+    If the snapshot's ``_total`` settles back to ≤ *threshold* and delta is
+    zero (transient burst that resolved between the two reads), one INFO line
+    with ``transient=true`` is emitted so operators can distinguish a resolved
+    spike from a sustained one.  When the spike resolves but delta is non-zero
+    (count changed relative to *prev*), the first branch emits an ordinary INFO
+    line — that is intentional, as the non-zero delta already distinguishes it
+    from steady-state silence.
+
     Extracted from the inline ``_thread_monitor`` async closure so unit tests
     can exercise the logging logic without mocking ``asyncio.sleep``.
     """
@@ -882,6 +893,11 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
         if count > threshold and snapshot is not None:
             breakdown = ' '.join(f'{k}={v}' for k, v in sorted(snapshot.items()))
             logger.log(level, 'thread_monitor: breakdown %s', breakdown)
+    elif snapshot is not None:
+        # Transient spike: active_count exceeded threshold but settled by snapshot time.
+        # delta is always 0 here (the guarding `if` excludes delta != 0), so it is
+        # omitted from the message to avoid a misleading constant "delta=+0" token.
+        logger.info('thread_monitor: threads=%d transient=true', count)
     return count
 
 

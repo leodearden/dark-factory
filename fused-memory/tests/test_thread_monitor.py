@@ -47,13 +47,15 @@ class TestSnapshotThreads:
             barrier.wait()
             stop_event.wait()
 
+        baseline = server_main._snapshot_threads()
         t = threading.Thread(target=worker, name='asyncio_test_snapshot_X', daemon=True)
         t.start()
         barrier.wait()  # ensure the thread is alive before snapshotting
         try:
             snapshot = server_main._snapshot_threads()
-            assert snapshot.get('asyncio_pool', 0) >= 1, (
-                f"Expected asyncio_pool >= 1, got snapshot={snapshot}"
+            assert snapshot.get('asyncio_pool', 0) >= baseline.get('asyncio_pool', 0) + 1, (
+                f"Expected asyncio_pool to grow by at least 1; "
+                f"baseline={baseline}, snapshot={snapshot}"
             )
         finally:
             stop_event.set()
@@ -140,6 +142,29 @@ class TestThreadMonitorIteration:
         all_records = [r for r in caplog.records if 'thread_monitor' in r.getMessage()]
         assert any('_total=' in r.getMessage() for r in all_records), (
             f"Expected snapshot breakdown in records: {[r.getMessage() for r in all_records]}"
+        )
+
+    def test_transient_spike_emits_info_with_marker(self, monkeypatch, caplog):
+        """active_count>threshold but snapshot._total settles ≤ threshold, delta==0 → INFO with transient=true."""
+        fake_snapshot = {
+            '_total': 55, 'main': 1, 'asyncio_pool': 50, 'executor': 2,
+            'aiosqlite': 2, 'timer': 0, 'other': 0,
+        }
+        monkeypatch.setattr(threading, 'active_count', lambda: 70)
+        monkeypatch.setattr(server_main, '_snapshot_threads', lambda: fake_snapshot)
+        with caplog.at_level(logging.INFO, logger='fused_memory.server.main'):
+            result = server_main._thread_monitor_iteration(prev=55, threshold=60)
+        assert result == 55
+        monitor_records = [r for r in caplog.records if 'thread_monitor' in r.getMessage()]
+        transient_records = [r for r in monitor_records if 'transient=true' in r.getMessage()]
+        assert len(transient_records) == 1, (
+            f"Expected exactly one transient=true record; got {[r.getMessage() for r in monitor_records]}"
+        )
+        assert transient_records[0].levelno == logging.INFO
+        assert 'threads=55' in transient_records[0].getMessage()
+        # No breakdown line — the spike already passed
+        assert not any('_total=' in r.getMessage() for r in monitor_records), (
+            f"Unexpected breakdown in transient spike: {[r.getMessage() for r in monitor_records]}"
         )
 
     def test_above_threshold_and_delta_uses_warning_not_info(self, monkeypatch, caplog):
