@@ -10,6 +10,7 @@ import json
 import logging
 import sys
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -550,6 +551,30 @@ def _check_flag_counter_completeness(
     }
 
 
+def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
+    """Return True iff *created_at* falls within the current run window.
+
+    A marker is considered within the run window when *run_window_start* is a
+    :class:`~datetime.datetime` instance AND *created_at* is a non-empty string
+    that parses as an ISO-8601 datetime that is >= *run_window_start*.
+
+    Naive parsed datetimes are assumed UTC (``replace(tzinfo=UTC)``).  Any type
+    mismatch or parse failure returns ``False`` (fail-open: falls back to the
+    existing pure run_id partition behaviour).
+    """
+    if not isinstance(run_window_start, datetime):
+        return False
+    if not created_at or not isinstance(created_at, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(created_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed >= run_window_start
+    except (ValueError, TypeError):
+        return False
+
+
 class Stage2FlagPartition(NamedTuple):
     """Partition result from :func:`_query_stage2_flags`.
 
@@ -558,18 +583,22 @@ class Stage2FlagPartition(NamedTuple):
 
     Attributes:
         current: Full dict records whose ``metadata.run_id`` matches the active
-            run.  Rendered to the Stage 2 LLM for FIX-C processing.
+            run, OR whose Mem0 ``created_at`` timestamp falls within the current
+            run window (run-window guard, task-1369).  Rendered to the Stage 2
+            LLM for FIX-C processing.
         stale_missing_run_id_ids: ``id`` strings for records whose
-            ``metadata.run_id`` is absent or falsy (empty string).  These
-            indicate Stage 1 producer drift — the LLM wrote a flag without the
-            required ``run_id`` field (see prompts/stage1.py).  A
-            WARNING is logged by :func:`_query_stage2_flags` when this bucket
-            is non-empty.  Caller sweeps these via
-            :func:`_sweep_stale_fixc_markers`.
+            ``metadata.run_id`` is absent or falsy (empty string) AND whose
+            ``created_at`` is out of the run window (or unknown).  These
+            indicate Stage 1 producer drift from a prior cycle — the LLM wrote
+            a flag without the required ``run_id`` field (see
+            prompts/stage1.py).  A WARNING is logged by
+            :func:`_query_stage2_flags` when this bucket is non-empty.  Caller
+            sweeps these via :func:`_sweep_stale_fixc_markers`.
         stale_mismatched_run_id_ids: ``id`` strings for records whose
             ``metadata.run_id`` is present and truthy but does not match the
-            current ``run_id``.  These are normal prior-cycle residue.  Caller
-            sweeps these via :func:`_sweep_stale_fixc_markers`.
+            current ``run_id`` AND whose ``created_at`` is out of the run
+            window.  These are normal prior-cycle residue.  Caller sweeps these
+            via :func:`_sweep_stale_fixc_markers`.
     """
 
     current: list[dict]
@@ -586,6 +615,7 @@ async def _query_stage2_flags(
     memory_service,
     project_id: str,
     current_run_id: str,
+    run_window_start: datetime | None = None,
 ) -> Stage2FlagPartition:
     """Query Mem0 for active Stage-2-destined flags and partition by run_id.
 
@@ -598,17 +628,27 @@ async def _query_stage2_flags(
 
     * **current** — full dict records whose ``metadata.run_id`` is present,
       non-empty, and matches ``current_run_id`` after ``str()`` coercion.
-      These are rendered to the Stage 2 LLM for FIX-C processing.
+      These are rendered to the Stage 2 LLM for FIX-C processing.  Markers
+      with a stale or absent ``run_id`` that were written during the current
+      run window (``created_at >= run_window_start``) are also routed here —
+      the run-window guard rescues same-cycle Stage-1 writes whose
+      ``metadata.run_id`` was omitted or mis-stamped by the LLM producer.
     * **stale_missing_run_id_ids** — ``id`` strings for records whose
-      ``metadata.run_id`` is absent or falsy (empty string).  These indicate
-      Stage 1 producer drift — the LLM omitted the required ``run_id`` field.
-      A WARNING is logged when this bucket is non-empty.
+      ``metadata.run_id`` is absent or falsy (empty string) AND whose
+      ``created_at`` is either absent, unparseable, or before
+      ``run_window_start``.  These indicate Stage 1 producer drift from a
+      prior cycle.  A WARNING is logged when this bucket is non-empty.
     * **stale_mismatched_run_id_ids** — ``id`` strings for records whose
       ``metadata.run_id`` is present and truthy but does not match
-      ``current_run_id``.  These are normal prior-cycle residue.
+      ``current_run_id`` AND whose ``created_at`` is out of the run window.
+      These are normal prior-cycle residue.
 
     Both stale buckets must be swept by the caller via
     :func:`_sweep_stale_fixc_markers`.
+
+    The *run_window_start* parameter is optional and defaults to ``None``
+    (backward-compatible: window guard dormant, pure run_id partition applies).
+    When supplied it must be a tz-aware :class:`~datetime.datetime`.
 
     .. note::
         The partition check requires ``metadata.run_id`` to be **truthy**
@@ -676,7 +716,12 @@ async def _query_stage2_flags(
             # None or empty-string only; other non-string types (0, False, [], {}) fall through to
             # the mismatched bucket where the type-violation warning at line ~683 fires.
             # Producer drift = missing-bucket warning; protocol violation = mismatched-bucket type warning.
-            stale_missing_run_id_ids.append(r.id)
+            # Run-window guard: if the marker was written during this run's window, rescue it to
+            # current so Stage 2 can process it this cycle (task-1369 same-cycle Stage-1 write fix).
+            if _marker_is_within_run_window(getattr(r, 'created_at', None), run_window_start):
+                current_flags.append(flag_dict)
+            else:
+                stale_missing_run_id_ids.append(r.id)
         else:
             # Present but does not match current run_id — prior-cycle residue (or unexpected type).
             # Log a warning when run_id is not a string: producer contract requires a non-empty
@@ -690,7 +735,11 @@ async def _query_stage2_flags(
                     _rid_val,
                     extra={'project_id': project_id, 'current_run_id': run_id_str},
                 )
-            stale_mismatched_run_id_ids.append(r.id)
+            # Run-window guard: same-cycle marker with a mis-stamped run_id — rescue to current.
+            if _marker_is_within_run_window(getattr(r, 'created_at', None), run_window_start):
+                current_flags.append(flag_dict)
+            else:
+                stale_mismatched_run_id_ids.append(r.id)
     if stale_missing_run_id_ids:
         logger.warning(
             'reconciliation._query_stage2_flags: %d Stage 2 marker(s) missing '
