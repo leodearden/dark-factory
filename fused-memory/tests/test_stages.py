@@ -4821,113 +4821,85 @@ class TestQueryStage2Flags:
         assert not any(f['id'] == 'outside-grace' for f in partition.current)
 
     @pytest.mark.asyncio
-    async def test_naive_no_offset_created_at_in_window_routes_to_current(self):
-        """Naive (no-offset) created_at string is normalised to UTC via replace(tzinfo=UTC).
+    @pytest.mark.parametrize('case_id, created_at, metadata, in_window', [
+        pytest.param(
+            'naive-no-offset',
+            '2026-05-15T10:00:05',  # no offset, no Z — triggers replace(tzinfo=UTC) branch
+            {'flag_for_stage2': True, 'task_id': '101'},  # no run_id → stale-missing absent guard
+            True,   # 10:00:05 UTC > 09:59:30 threshold → in-window
+            id='naive_no_offset',
+        ),
+        pytest.param(
+            'non-utc-offset',
+            '2026-05-15T10:00:10+05:00',  # = 05:00:10 UTC — BEFORE the 09:59:30 threshold
+            {'flag_for_stage2': True, 'task_id': '102', 'run_id': 'wrong-run'},  # mismatched → stale absent guard
+            False,  # 05:00:10 UTC < 09:59:30 threshold → out-of-window; stays stale
+            id='non_utc_offset_out_of_window',
+        ),
+        pytest.param(
+            'z-suffixed',
+            '2026-05-15T10:00:05Z',  # Z suffix — fromisoformat returns tz-aware UTC directly
+            {'flag_for_stage2': True, 'task_id': '103'},  # no run_id → stale-missing absent guard
+            True,   # 10:00:05 UTC > 09:59:30 threshold → in-window
+            id='z_suffix',
+        ),
+    ])
+    async def test_created_at_timestamp_format_normalisation(
+        self, case_id, created_at, metadata, in_window
+    ):
+        """_marker_is_within_run_window normalises created_at regardless of ISO 8601 format.
 
-        Exercises the `if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=UTC)` branch
-        at task_knowledge_sync.py lines 595-596.  The marker has no run_id so it would
-        route to stale_missing_run_id_ids without the run-window guard; the naive timestamp
-        '2026-05-15T10:00:05' (5 s after window start, well inside the 30 s grace) must be
-        normalised to 10:00:05+00:00 and therefore rescued to partition.current.
+        Three timestamp formats correspond to distinct parse paths, each tested via a
+        parametrised case using run_window_start=2026-05-15T10:00:00+00:00
+        (threshold = window_start - _CLOCK_SKEW_GRACE = 09:59:30 UTC):
 
-        Regression guard: locks in already-correct behaviour against future refactors of the
-        naive-parse normalisation branch.
+          naive_no_offset — '2026-05-15T10:00:05' (no offset, no Z suffix):
+            fromisoformat returns a naive datetime; the ``if parsed.tzinfo is None``
+            branch inside _marker_is_within_run_window normalises it to 10:00:05+00:00.
+            The marker (no run_id) is trivially after window start → in-window →
+            rescued to partition.current.
+
+          non_utc_offset_out_of_window — '2026-05-15T10:00:10+05:00' = 05:00:10 UTC:
+            fromisoformat returns an offset-aware datetime. 05:00:10 UTC is *before*
+            the 09:59:30 threshold, so the marker (mismatched run_id) stays in
+            stale_mismatched_run_id_ids. A naive-stripping regression would read
+            the wall-clock digits as 10:00:10 UTC (> threshold) and wrongly rescue
+            it — making this the decisive differentiator between correct offset-aware
+            comparison and a buggy naive-stripping implementation. Mirrors the
+            MemoryResult.created_at contract: "UTC offset is not guaranteed — Mem0
+            may stamp in any offset".
+
+          z_suffix — '2026-05-15T10:00:05Z':
+            fromisoformat on Python >= 3.11 returns tz-aware UTC directly (project
+            requires-python >=3.11,<4), so the ``tzinfo is None`` branch is NOT
+            entered. 10:00:05+00:00 is after window start → in-window → rescued to
+            partition.current.
+
+        Regression guard: locks in already-correct behaviour against future refactors
+        of _marker_is_within_run_window.
         """
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
 
         run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
         memory_service = AsyncMock()
         memory_service.search.return_value = [
-            self._make_result(
-                'naive-no-offset',
-                'same-cycle flag naive ts',
-                {'flag_for_stage2': True, 'task_id': '101'},  # no run_id -> stale-missing absent guard
-                created_at='2026-05-15T10:00:05',  # naive string: no offset, no Z
-            ),
+            self._make_result(case_id, 'ts-format normalisation test', metadata, created_at=created_at),
         ]
         partition = await _query_stage2_flags(
             memory_service, 'reify', 'r-current', run_window_start=run_window_start
         )
-        assert any(f['id'] == 'naive-no-offset' for f in partition.current), (
-            'Naive created_at must be normalised to UTC and rescue the marker to current'
-        )
-        assert 'naive-no-offset' not in partition.stale_missing_run_id_ids
-        assert 'naive-no-offset' not in partition.stale_mismatched_run_id_ids
-
-    @pytest.mark.asyncio
-    async def test_non_utc_offset_created_at_in_window_after_normalization_routes_to_current(self):
-        """Non-UTC offset created_at is compared offset-aware (not lexically) and rescues in-window markers.
-
-        The timestamp '2026-05-15T15:00:00+05:00' equals 10:00:00 UTC — exactly the
-        run_window_start, which is >= the threshold (run_window_start - 30 s grace).
-        The marker carries run_id='wrong-run' so it would route to stale_mismatched_run_id_ids
-        without the guard.  Correct offset-aware normalisation (not a raw string compare)
-        must recognise this as in-window and rescue it to partition.current.
-
-        Contract reference: MemoryResult.created_at docstring (models/memory.py:39-43)
-        warns that "UTC offset is not guaranteed — Mem0 may stamp in any offset", so the
-        implementation must handle arbitrary-offset ISO strings correctly.
-
-        Regression guard: locks in already-correct behaviour against future refactors.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
-
-        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
-        memory_service = AsyncMock()
-        memory_service.search.return_value = [
-            self._make_result(
-                'non-utc-offset',
-                'cross-offset same-cycle flag',
-                {'flag_for_stage2': True, 'task_id': '102', 'run_id': 'wrong-run'},
-                created_at='2026-05-15T15:00:00+05:00',  # == 10:00:00 UTC; mismatch -> stale absent guard
-            ),
-        ]
-        partition = await _query_stage2_flags(
-            memory_service, 'reify', 'r-current', run_window_start=run_window_start
-        )
-        assert any(f['id'] == 'non-utc-offset' for f in partition.current), (
-            'Non-UTC-offset created_at equal to window start (offset-aware) must rescue marker to current'
-        )
-        assert 'non-utc-offset' not in partition.stale_mismatched_run_id_ids
-        assert 'non-utc-offset' not in partition.stale_missing_run_id_ids
-
-    @pytest.mark.asyncio
-    async def test_z_suffixed_created_at_in_window_routes_to_current(self):
-        """Z-suffixed created_at is parsed as tz-aware UTC by fromisoformat (Python >= 3.11).
-
-        '2026-05-15T10:00:05Z' takes a distinct code path from the naive-string case:
-        fromisoformat returns an offset-aware datetime (tzinfo=UTC) so the
-        `if parsed.tzinfo is None` branch is NOT entered, but the result is still
-        >= threshold and must rescue the marker to partition.current.
-
-        The marker has no run_id so it would route to stale_missing_run_id_ids without the
-        run-window guard.  'Z' is the UTC form Mem0 may emit per the MemoryResult.created_at
-        docstring (models/memory.py:39-43).
-
-        Requires Python >= 3.11 (project requires-python >=3.11,<4 per pyproject.toml).
-
-        Regression guard: locks in already-correct behaviour against future refactors.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
-
-        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
-        memory_service = AsyncMock()
-        memory_service.search.return_value = [
-            self._make_result(
-                'z-suffixed',
-                'Z-suffixed same-cycle flag',
-                {'flag_for_stage2': True, 'task_id': '103'},  # no run_id -> stale-missing absent guard
-                created_at='2026-05-15T10:00:05Z',  # Z-suffix UTC form
-            ),
-        ]
-        partition = await _query_stage2_flags(
-            memory_service, 'reify', 'r-current', run_window_start=run_window_start
-        )
-        assert any(f['id'] == 'z-suffixed' for f in partition.current), (
-            'Z-suffixed created_at must parse as tz-aware UTC and rescue the marker to current'
-        )
-        assert 'z-suffixed' not in partition.stale_missing_run_id_ids
-        assert 'z-suffixed' not in partition.stale_mismatched_run_id_ids
+        if in_window:
+            assert any(f['id'] == case_id for f in partition.current), (
+                f'{case_id!r}: in-window created_at must rescue marker to partition.current'
+            )
+            assert case_id not in partition.stale_missing_run_id_ids
+            assert case_id not in partition.stale_mismatched_run_id_ids
+        else:
+            assert not any(f['id'] == case_id for f in partition.current), (
+                f'{case_id!r}: out-of-window created_at must NOT rescue marker to current'
+            )
+            # run_id='wrong-run' routes to stale_mismatched when not rescued
+            assert case_id in partition.stale_mismatched_run_id_ids
 
     @pytest.mark.asyncio
     async def test_info_log_emitted_when_missing_run_id_marker_rescued(self, caplog):
