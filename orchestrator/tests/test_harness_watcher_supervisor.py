@@ -1322,6 +1322,79 @@ class TestWatcherMisconfiguredGuard:
             f'degenerate-clean exits; got {sleep_durations}'
         )
 
+    @pytest.mark.asyncio
+    async def test_healthy_clean_resets_degenerate_floor(self, tmp_path: Path) -> None:
+        """A healthy-duration clean rotation resets the degenerate-clean floor counter.
+
+        Sequence: degenerate (1s), degenerate (1s), HEALTHY (200s), degenerate (1s).
+        With watcher_subprocess_restart_backoff_secs=1.0 and min_rotation_secs=120.0:
+          sleep[0] = 1.0  (consecutive_degenerate=1)
+          sleep[1] = 2.0  (consecutive_degenerate=2, escalated)
+          sleep[2] = 1.0  (healthy flat base — queue had real work)
+          sleep[3] = 1.0  (key assertion: reset to consecutive_degenerate=1, NOT 3)
+
+        Without the reset, sleep[3] would be 4.0 (counter continuing from 3).
+
+        RED: after step-2 the counter is never zeroed on a healthy rotation, so
+        sleep[3] == 4.0 instead of 1.0.
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,   # disable trip
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_max_crashloop_restarts': 99,          # disable crashloop trip
+        })
+
+        sleep_durations: list[float] = []
+        rotation_calls = 0
+
+        t0 = _time_mod.monotonic()
+        # Paired (start, end) per rotation:
+        #   iters 1, 2: degenerate (1s < 120s threshold)
+        #   iter  3:    healthy    (200s > 120s threshold)
+        #   iter  4:    degenerate (1s < 120s threshold)
+        #   iter  5:    start only (CancelledError before end)
+        monotonic_sequence = iter([
+            t0, t0 + 1.0,    # iter 1 — degenerate clean
+            t0, t0 + 1.0,    # iter 2 — degenerate clean
+            t0, t0 + 200.0,  # iter 3 — healthy clean
+            t0, t0 + 1.0,    # iter 4 — degenerate clean (key: counter must be reset)
+            t0,               # iter 5 start (CancelledError before end)
+        ])
+
+        def fake_monotonic() -> float:
+            return next(monotonic_sequence)
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > 4:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def recording_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert sleep_durations == pytest.approx([1.0, 2.0, 1.0, 1.0]), (
+            f'Expected [1.0, 2.0, 1.0, 1.0] — healthy rotation at index 2 must reset '
+            f'the degenerate counter so index 3 is base (not 4.0); got {sleep_durations}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-13: Wiring — __init__ attrs + run() source guard
