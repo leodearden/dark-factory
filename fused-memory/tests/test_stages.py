@@ -6495,6 +6495,66 @@ class TestRescuedInWindowMarkersStat:
             'rescued_in_window_markers must be explicitly 0, not absent, when no rescue fires'
         )
 
+    @pytest.mark.asyncio
+    async def test_rescued_in_window_count_reads_partition_rescued_ids_not_rederived(self, mock_deps):
+        """rescued_in_window_markers must equal len(partition.rescued_ids), not a re-derived
+        predicate over active_flags metadata.
+
+        Injects a hand-built partition where `current` contains TWO flags whose
+        metadata.run_id does NOT match the run_id ('mismatch' != 'test-run'), but
+        rescued_ids contains only ONE id ('rescued-1').  The old re-derivation
+        (sum over active_flags whose run_id != current) would yield 2; the single-source
+        contract (len(partition.rescued_ids)) must yield 1.
+
+        This test fails against the re-derivation at assemble_payload lines 1656-1660 and
+        passes only once the consumer reads partition.rescued_ids directly.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            TaskKnowledgeSync,
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal down'))
+
+        # Inject a partition where current has 2 non-matching-run_id flags but rescued_ids
+        # has only 1 entry — old re-derivation yields 2, single-source yields 1.
+        injected_partition = Stage2FlagPartition(
+            current=[
+                {'id': 'rescued-1', 'content': 'flag 1', 'metadata': {'run_id': 'mismatch'}, 'task_id': '1'},
+                {'id': 'not-rescued', 'content': 'flag 2', 'metadata': {'run_id': 'mismatch'}, 'task_id': '2'},
+            ],
+            stale_missing_run_id_ids=[],
+            stale_mismatched_run_id_ids=[],
+            rescued_ids=['rescued-1'],  # only 1, even though both flags have non-matching run_id
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+                new=AsyncMock(return_value=injected_partition),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='test-run',
+            )
+
+        assert report.stats['rescued_in_window_markers'] == 1, (
+            f"rescued_in_window_markers must equal len(partition.rescued_ids)==1, "
+            f"not a re-derived predicate over active_flags (which would yield 2); "
+            f"got: {report.stats.get('rescued_in_window_markers')}"
+        )
+
 
 class TestStage3PayloadIncludesProjectRoot:
     """IntegrityCheck.assemble_payload() must emit a Use project_root="..." directive.
