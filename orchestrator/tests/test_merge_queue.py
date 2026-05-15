@@ -4207,7 +4207,6 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         assignment.modules = []
 
         _spec = pydantic_spec(OrchestratorConfig)
-        _spec.for_module = None  # custom method not in model_fields; expose to spec_set
         wf_config = MagicMock(spec_set=_spec)
         wf_config.fused_memory.project_id = 'test'
         wf_config.fused_memory.url = 'http://localhost'
@@ -4289,7 +4288,6 @@ class TestEscalationServerUsesEnqueueHelper:
 
         # Stub orch_config — _module_configs is a PrivateAttr, not in model_fields
         _spec2 = pydantic_spec(OrchestratorConfig)
-        _spec2._module_configs = None  # PrivateAttr not in model_fields; expose to spec_set
         stub_config = MagicMock(spec_set=_spec2)
         stub_config._module_configs = {}
 
