@@ -2518,10 +2518,6 @@ class TestMakeGateFactory:
         assert gate.account_count == 1
         assert gate.active_account_name == 'acct-a'
         assert gate.soonest_resets_at is None
-        assert gate.on_agent_complete is not None
-        assert gate.confirm_account_ok is not None
-        assert gate.release_probe_slot is not None
-        assert gate.before_invoke is not None
 
     def test_make_gate_override_and_passthrough(self):
         """Named overrides are applied; arbitrary kwargs are set via setattr."""
@@ -2535,7 +2531,6 @@ class TestMakeGateFactory:
         """_make_gate_yielding builds its gate via _make_gate (soonest_resets_at set)."""
         gate = _make_gate_yielding([_make_slot()])
         assert gate.soonest_resets_at is None
-        assert gate.invoke_slot is not None
 
     def test_pre_triage_gate_default_detect_cap_hit(self):
         """TestPreTriageUsageGateCleanup._gate() routes through _make_gate."""

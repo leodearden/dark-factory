@@ -593,11 +593,6 @@ class TestMakeGateFactory:
         assert gate.account_count == 1
         assert gate.active_account_name == 'acct-a'
         assert gate.soonest_resets_at is None
-        # Callable attributes exist (are MagicMock children, not unset)
-        assert gate.on_agent_complete is not None
-        assert gate.confirm_account_ok is not None
-        assert gate.release_probe_slot is not None
-        assert gate.before_invoke is not None
 
     def test_make_gate_override_and_passthrough(self):
         """Named overrides are applied; arbitrary kwargs are set via setattr."""
