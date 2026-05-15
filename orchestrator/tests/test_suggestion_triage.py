@@ -711,6 +711,24 @@ class TestRouteReviewSuggestionsIntegration:
         with patch('httpx.AsyncClient.post', side_effect=slow_post):
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
 
+        # PRIMARY: structural contract — exactly one background task was scheduled and
+        # has not yet finished.  This directly verifies the fire-and-forget shape:
+        # `create_task` adds to _background_tasks; a synchronous `await` would exhaust
+        # the task before returning, making `.done()` True (or raising before we get
+        # here).  A future refactor that adds a *legitimate* await before create_task
+        # (e.g. an MCP probe) would still satisfy this check if the task is added and
+        # not yet done — unlike the event check, which relies on no yield occurring.
+        assert len(wf._background_tasks) == 1, (
+            '_route_review_suggestions_to_curator must schedule exactly one background '
+            'task via create_task — got %d' % len(wf._background_tasks)
+        )
+        assert not next(iter(wf._background_tasks)).done(), (
+            'background task must not be done yet — fire-and-forget means it runs '
+            'after the route call returns, not before'
+        )
+
+        # SECONDARY safety-net: the slow_post sentinel must not have been set, which
+        # would only happen if the impl synchronously awaited the 2s sleep.
         # The POST must not have completed — it should still be running (or not yet
         # started) as a background task.  If post_completed is set it means the route
         # call synchronously awaited slow_post's 2s sleep before returning, which
@@ -721,9 +739,13 @@ class TestRouteReviewSuggestionsIntegration:
             'completed before the route call returned'
         )
 
-        # Cancel background tasks so they don't leak into the next test
-        for t in list(wf._background_tasks):
+        # Cancel background tasks and await their completion to drain them
+        # deterministically, preventing 'Task was destroyed but it is pending'
+        # warnings at pytest-asyncio fixture teardown.
+        tasks = list(wf._background_tasks)
+        for t in tasks:
             t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
