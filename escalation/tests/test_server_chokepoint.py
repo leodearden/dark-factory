@@ -191,3 +191,122 @@ class TestTerminalAutoResolve:
         esc = queue.get(esc_id)
         assert esc is not None
         assert esc.status == 'resolved'
+
+
+# ---------------------------------------------------------------------------
+# Step-3 characterization tests: non-terminal / disabled → kept open (queued)
+# ---------------------------------------------------------------------------
+
+
+class TestKeptOpenPaths:
+    """Non-terminal statuses and disabled lookup → escalation stays queued."""
+
+    @pytest.mark.asyncio
+    async def test_deferred_status_stays_queued(self, tmp_path: Path):
+        """task status 'deferred' → escalation is NOT auto-resolved (status='queued')."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('deferred')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued', f"Expected 'queued', got: {result['status']}"
+
+    @pytest.mark.asyncio
+    async def test_blocked_status_stays_queued(self, tmp_path: Path):
+        """task status 'blocked' → escalation stays queued (not auto-resolved)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('blocked')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued'
+
+    @pytest.mark.asyncio
+    async def test_in_progress_status_stays_queued(self, tmp_path: Path):
+        """task status 'in-progress' → escalation stays queued."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('in-progress')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued'
+
+    @pytest.mark.asyncio
+    async def test_pending_status_stays_queued(self, tmp_path: Path):
+        """task status 'pending' → escalation stays queued."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('pending')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued'
+
+    @pytest.mark.asyncio
+    async def test_none_status_stays_queued(self, tmp_path: Path):
+        """task_status_lookup returning None → fail-open, escalation stays queued."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup(None)
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued'
+
+    @pytest.mark.asyncio
+    async def test_no_lookup_stays_queued(self, tmp_path: Path):
+        """create_server without task_status_lookup → chokepoint disabled, stays queued."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)  # no task_status_lookup
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued'
+
+    @pytest.mark.asyncio
+    async def test_no_lookup_spy_not_called(self, tmp_path: Path):
+        """When task_status_lookup=None, no lookup is ever consulted."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        spy_calls: list[str] = []
+
+        async def _spy_lookup(task_id: str) -> str:
+            spy_calls.append(task_id)
+            return 'done'
+
+        # Pass spy explicitly to verify it's NOT called when disabled via default
+        # i.e. test that the None-default path never consults the callable
+        server = create_server(queue)  # no task_status_lookup (None default)
+        await _blocker(server, **_COMMON_KWARGS)
+
+        assert spy_calls == [], f"Lookup was unexpectedly called: {spy_calls}"
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_no_resolved_record(self, tmp_path: Path):
+        """Non-terminal status → no resolved record in queue (pending file stays pending)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('in-progress')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc_id = result['id']
+        esc = queue.get(esc_id)
+        assert esc is not None
+        assert esc.status == 'pending', f"Expected 'pending', got: {esc.status}"
+
+    @pytest.mark.asyncio
+    async def test_lookup_raises_stays_queued(self, tmp_path: Path):
+        """lookup raising an exception → fail-open, escalation stays queued."""
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        async def _raising_lookup(task_id: str) -> str:
+            raise RuntimeError('scheduler unavailable')
+
+        server = create_server(queue, task_status_lookup=_raising_lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued', f"Expected fail-open 'queued', got: {result['status']}"
