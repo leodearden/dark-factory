@@ -23,7 +23,6 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 
-
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
 # ---------------------------------------------------------------------------
@@ -90,7 +89,7 @@ def _make_lifecycle_harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
     config = config.model_copy(update={'watcher_supervisor_enabled': enabled})
     h.config = config
     h._watcher_supervisor_task = None
-    h._watcher_unclean_exits: deque = deque()
+    h._watcher_unclean_exits = deque()
     return h
 
 
@@ -190,7 +189,7 @@ def _make_rotation_harness(tmp_path: Path) -> Harness:
     config = OrchestratorConfig(project_root=tmp_path)
     h.config = config
     h._watcher_supervisor_task = None
-    h._watcher_unclean_exits: deque = deque()
+    h._watcher_unclean_exits = deque()
     h.usage_gate = None
     h.cost_store = MagicMock()
     h._run_id = 'run-test-rotation-001'
@@ -249,8 +248,9 @@ class TestRunWatcherRotation:
     @pytest.mark.asyncio
     async def test_invoke_fn_is_invoke_agent(self, tmp_path: Path) -> None:
         """invoke_fn must be the orchestrator's invoke_agent."""
-        from orchestrator.agents.invoke import invoke_agent
         from shared.cli_invoke import AgentResult
+
+        from orchestrator.agents.invoke import invoke_agent
 
         h = _make_rotation_harness(tmp_path)
         captured: dict = {}
@@ -342,7 +342,7 @@ class TestRunWatcherRotation:
             await h._run_watcher_rotation()
 
         expected_url = f'http://{h.config.escalation.host}:{h.config.escalation.port}/mcp'
-        h.mcp.mcp_config_json.assert_called_once_with(escalation_url=expected_url)
+        h.mcp.mcp_config_json.assert_called_once_with(escalation_url=expected_url)  # type: ignore[union-attr]
         assert captured.get('mcp_config') == {'mcp': 'config-sentinel'}
 
 
@@ -358,7 +358,7 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     config = OrchestratorConfig(project_root=tmp_path)
     h.config = config
     h._watcher_supervisor_task = None
-    h._watcher_unclean_exits: deque = deque()
+    h._watcher_unclean_exits = deque()
     h.usage_gate = None
     h.cost_store = MagicMock()
     h._run_id = 'run-loop-test-001'
@@ -397,9 +397,8 @@ class TestWatcherSupervisorLoopClassification:
 
         h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
 
-        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await h._watcher_supervisor_loop()
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
 
         # At least one rotation ran
         assert rotation_calls >= 1
@@ -431,9 +430,8 @@ class TestWatcherSupervisorLoopClassification:
 
         h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
 
-        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await h._watcher_supervisor_loop()
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
 
         base = h.config.watcher_subprocess_restart_backoff_secs
         assert len(sleep_durations) >= 1, 'Expected backoff sleep after unclean exit'
@@ -464,9 +462,8 @@ class TestWatcherSupervisorLoopClassification:
 
         h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
 
-        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await h._watcher_supervisor_loop()
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
 
         assert len(sleep_durations) >= 1, 'timed_out exit must trigger backoff'
         assert len(h._watcher_unclean_exits) >= 1
@@ -497,9 +494,8 @@ class TestWatcherSupervisorLoopClassification:
 
         h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
 
-        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await h._watcher_supervisor_loop()
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
 
         assert len(sleep_durations) >= 2, (
             f'Expected 2 backoff sleeps for 2 unclean exits; got {sleep_durations}'
@@ -543,9 +539,8 @@ class TestWatcherSupervisorLoopClassification:
 
         h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
 
-        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                await h._watcher_supervisor_loop()
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
 
         base = h.config.watcher_subprocess_restart_backoff_secs
         # Should have 2 backoff sleeps (from rotation 1 and rotation 3)
@@ -643,9 +638,8 @@ class TestWatcherCrashloopTrip:
         h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
         h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
 
-        with patch('orchestrator.harness.asyncio.sleep', AsyncMock()):
-            with pytest.raises(asyncio.CancelledError):
-                await h._watcher_supervisor_loop()
+        with patch('orchestrator.harness.asyncio.sleep', AsyncMock()), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
 
         assert pause_calls == [], (
             f'pause_scheduler should NOT be called below threshold; got {pause_calls}'
@@ -655,8 +649,9 @@ class TestWatcherCrashloopTrip:
     async def test_old_exits_outside_window_are_evicted(self, tmp_path: Path) -> None:
         """Unclean exits older than watcher_crashloop_window_secs are evicted
         so they do not contribute to the crashloop count."""
-        from shared.cli_invoke import AgentResult
         import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
 
         max_restarts = 3
         window = 600
@@ -699,11 +694,13 @@ class TestWatcherCrashloopTrip:
             except StopIteration:
                 return new_time
 
-        with patch('orchestrator.harness.asyncio.sleep', AsyncMock()), \
-             patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic):
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
             # Loop should cancel (not trip) because old exits are evicted
-            with pytest.raises(asyncio.CancelledError):
-                await h._watcher_supervisor_loop()
+            await h._watcher_supervisor_loop()
 
         assert pause_calls == [], (
             'Old exits outside window should be evicted; pause_scheduler must NOT trip'

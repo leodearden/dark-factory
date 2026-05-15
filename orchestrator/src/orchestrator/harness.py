@@ -2509,7 +2509,6 @@ Output JSON matching the schema. Every task must appear in the output.
         own rotation instructions is force-killed (classified as unclean, feeds
         the crashloop guard).
         """
-        from shared.cli_invoke import AgentResult  # local import to match test patching
 
         cfg = self.config
         user_prompt = (
