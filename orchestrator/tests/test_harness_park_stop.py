@@ -9,7 +9,7 @@ import asyncio
 import json
 import re
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,6 +19,23 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
+from shared.cost_store import CostStore
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by cost-ceiling tests
+# ---------------------------------------------------------------------------
+
+async def _make_cost_store(tmp_path: Path, filename: str = 'cost.db') -> CostStore:
+    """Open a real CostStore in tmp_path; caller is responsible for close."""
+    store = CostStore(tmp_path / filename)
+    await store.open()
+    return store
+
+
+def _iso(delta: timedelta) -> str:
+    """Return an ISO timestamp offset from *now* by delta (negative = in the past)."""
+    return (datetime.now(UTC) + delta).isoformat()
 
 
 def _make_harness_with_mocks(tmp_path: Path) -> tuple[Harness, MagicMock, EventStore]:
@@ -387,3 +404,68 @@ class TestHarnessCostCeiling:
         )
         assert config.watcher_daily_cost_ceiling_usd == 7.0
         assert config.orch_daily_cost_ceiling_usd == 99.5
+
+    # ------------------------------------------------------------------
+    # Step 3 — _trailing_24h_cost_usd (all roles, watcher_only=False)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_cost_usd_sums_within_window(self, tmp_path: Path) -> None:
+        """_trailing_24h_cost_usd sums rows within the 24h window and excludes older ones."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        # Within window: two rows, different roles
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=5.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+        await store.save_invocation(
+            run_id='r2', task_id='t2', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='escalation-watcher-auto',
+            cost_usd=3.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-2)),
+            completed_at=_iso(timedelta(hours=-2)),
+        )
+        # Outside window (25h ago — must be excluded)
+        await store.save_invocation(
+            run_id='r3', task_id='t3', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='steward',
+            cost_usd=100.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-25)),
+            completed_at=_iso(timedelta(hours=-25)),
+        )
+
+        result = await harness._trailing_24h_cost_usd(watcher_only=False)
+        assert result == pytest.approx(8.0), (
+            f'Expected 5.0 + 3.0 = 8.0 for rows within 24h; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_cost_usd_no_cost_store(self, tmp_path: Path) -> None:
+        """_trailing_24h_cost_usd returns 0.0 when cost_store is None."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.cost_store = None
+
+        result = await harness._trailing_24h_cost_usd(watcher_only=False)
+        assert result == 0.0, f'Expected 0.0 with no cost_store; got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_cost_usd_empty_table(self, tmp_path: Path) -> None:
+        """_trailing_24h_cost_usd returns 0.0 when no rows exist."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        result = await harness._trailing_24h_cost_usd(watcher_only=False)
+        assert result == 0.0, f'Expected 0.0 for empty table; got {result!r}'
