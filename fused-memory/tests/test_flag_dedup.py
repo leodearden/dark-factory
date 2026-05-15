@@ -3592,6 +3592,267 @@ class TestConfirmationCircuitBreaker:
             f'Expected 3 per-flag write-failure WARNINGs but got: {write_fail_warnings}'
         )
 
+    # -----------------------------------------------------------------------
+    # Fix 3 regression-pin tests (task-1413, step-1)
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_breaker_stays_tripped_no_un_trip_invariant(
+        self, monkeypatch, caplog,
+    ):
+        """Once tripped, a later flag whose confirmation WOULD succeed does NOT un-trip the breaker.
+
+        Pins the invariant that ``confirmation_disabled`` is only ever set to True
+        (never reset to False mid-batch once tripped).  The ``else`` branch in
+        ``_confirm_and_track`` does NOT call ``confirm_marker_persisted`` and does NOT
+        touch the counter, so a queued successful search result is never consumed.
+
+        Setup: threshold=2, 3 HIT-path flags.
+        - Flags 1 and 2 each miss confirmation → counter reaches 2 → TRIP.
+        - Flag 3's pre-write HIT is returned but its confirmation search entries
+          [8] and [9] would succeed — they are NOT consumed (breaker is tripped).
+
+        Asserts:
+          (a) search.call_count == 8 — sentinel entries [8] and [9] not consumed.
+          (b) Exactly ONE breaker WARNING (``'tripped after'`` substring); no re-trip.
+          (c) All three flags annotated with ``persisted_from_run`` (HIT-path).
+          (d) delete_memory called only once with memory_id='prior-c'.
+              (flags 1+2 active-miss → write_succeeded=False; flag 3 tripped-branch
+               → write_succeeded=bool(memory_ids)=True)
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 2)
+
+        run_id = 'r1'
+
+        prior_a = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '1101',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_a.id = 'prior-a'
+
+        prior_b = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '1102',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_b.id = 'prior-b'
+
+        prior_c = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '1103',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_c.id = 'prior-c'
+
+        # Sentinel entries [8] and [9]: if the breaker could un-trip, flag-3's
+        # confirm_marker_persisted would consume these and return a non-None id.
+        # Asserting search.call_count==8 proves these were NOT consumed.
+        would_succeed_marker = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '1103',
+            'flag_type': 'missing_deliverable', 'run_id': 'r1',
+        })
+        would_succeed_marker.id = 'would-succeed'
+
+        # 10-element side_effect; entries [8] and [9] are non-consumption sentinels.
+        #   [0]  suppression filter → []
+        #   [1]  flag-1 pre-write   → [prior_a]  (HIT)
+        #   [2]  flag-1 confirmation initial miss
+        #   [3]  flag-1 confirmation retry miss  → counter = 1
+        #   [4]  flag-2 pre-write   → [prior_b]  (HIT)
+        #   [5]  flag-2 confirmation initial miss
+        #   [6]  flag-2 confirmation retry miss  → counter = 2 → TRIP
+        #   [7]  flag-3 pre-write   → [prior_c]  (HIT)
+        #   [8]  (sentinel: would confirm flag-3 if NOT tripped — must not be consumed)
+        #   [9]  (sentinel: would confirm flag-3 if NOT tripped — must not be consumed)
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            [],                      # [0] suppression
+            [prior_a],               # [1] flag-1 pre-write HIT
+            [],                      # [2] flag-1 confirmation initial miss
+            [],                      # [3] flag-1 confirmation retry miss → counter=1
+            [prior_b],               # [4] flag-2 pre-write HIT
+            [],                      # [5] flag-2 confirmation initial miss
+            [],                      # [6] flag-2 confirmation retry miss → counter=2 → TRIP
+            [prior_c],               # [7] flag-3 pre-write HIT
+            [would_succeed_marker],  # [8] sentinel: NOT consumed (breaker tripped)
+            [would_succeed_marker],  # [9] sentinel: NOT consumed (breaker tripped)
+        ])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        flags = [
+            {'task_id': 1101, 'flag_type': 'missing_deliverable', 'description': 'A'},
+            {'task_id': 1102, 'flag_type': 'missing_deliverable', 'description': 'B'},
+            {'task_id': 1103, 'flag_type': 'missing_deliverable', 'description': 'C'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id=run_id,
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (a) Sentinel entries [8] and [9] NOT consumed — breaker stays tripped.
+        # A count of 10 would prove the breaker un-tripped and consumed them.
+        assert memory_service.search.call_count == 8, (
+            f'Expected 8 search calls (1 suppression + 3 pre-write + 2+2 confirmation '
+            f'for flags 1+2, none for flag 3); got: {memory_service.search.call_count}. '
+            f'Count of 10 would indicate the breaker failed to stay tripped.'
+        )
+
+        # (b) Exactly ONE trip WARNING — no re-trip on flag-3's tripped-branch pass.
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
+        assert len(breaker_warnings) == 1, (
+            f'Expected exactly 1 breaker trip WARNING; got '
+            f'{len(breaker_warnings)}: {breaker_warnings}'
+        )
+
+        # (c) All 3 flags annotated as HIT-path (annotation extracted before write).
+        assert len(result) == 3
+        for f in result:
+            assert 'persisted_from_run' in f, f'Expected HIT-path annotation: {f}'
+
+        # (d) Only prior-c deleted: flags 1+2 active-miss → write_succeeded=False;
+        # flag-3 tripped-branch → write_succeeded=bool(memory_ids)=True.
+        deleted_ids = [
+            c.kwargs.get('memory_id') for c in memory_service.delete_memory.call_args_list
+        ]
+        assert deleted_ids == ['prior-c'], (
+            f'Expected only prior-c to be deleted; got: {deleted_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_hit_path_add_memory_exception_does_not_advance_miss_counter(
+        self, monkeypatch, caplog,
+    ):
+        """HIT-path write failures do NOT advance the circuit-breaker miss counter.
+
+        Complements ``test_add_memory_exceptions_do_not_count_toward_threshold``
+        (which covers MISS-path flags).  Because HIT and MISS branches share the
+        same ``_write_and_confirm_marker`` try/except, a future refactor that splits
+        them could independently regress one without the other.
+
+        When ``add_memory`` raises, ``_write_and_confirm_marker`` returns False
+        immediately without calling ``_confirm_and_track``, so neither the miss
+        counter nor ``confirmation_disabled`` is touched.
+
+        Setup: threshold=2, 3 HIT-path flags, add_memory always raises RuntimeError.
+        search side_effect: 1 suppression + 3 pre-write HITs; zero confirmation
+        searches (add_memory always fails before _confirm_and_track is called).
+
+        Asserts:
+          (a) No breaker WARNING (``'tripped after'`` substring) — counter stays 0.
+          (b) search.call_count == 4 (1 suppression + 3 pre-write only).
+          (c) All 3 flags returned (exceptions logged, not raised).
+          (d) 3 per-flag ``'failed to write marker'`` WARNINGs emitted.
+          (e) All 3 flags annotated with ``persisted_from_run`` (extracted before write).
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 2)
+
+        prior_a = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '1201',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_a.id = 'prior-a'
+
+        prior_b = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '1202',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_b.id = 'prior-b'
+
+        prior_c = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '1203',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_c.id = 'prior-c'
+
+        # search side_effect: suppression + 3 pre-write HITs.
+        # No confirmation searches because add_memory always raises before
+        # _confirm_and_track is ever called.
+        #   [0]  suppression filter → []
+        #   [1]  flag-1 pre-write   → [prior_a]  (HIT)
+        #   [2]  flag-2 pre-write   → [prior_b]  (HIT)
+        #   [3]  flag-3 pre-write   → [prior_c]  (HIT)
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            [],        # [0] suppression
+            [prior_a], # [1] flag-1 pre-write HIT
+            [prior_b], # [2] flag-2 pre-write HIT
+            [prior_c], # [3] flag-3 pre-write HIT
+        ])
+        memory_service.add_memory = AsyncMock(
+            side_effect=RuntimeError('Mem0 write failure'),
+        )
+
+        flags = [
+            {'task_id': 1201, 'flag_type': 'missing_deliverable', 'description': 'A'},
+            {'task_id': 1202, 'flag_type': 'missing_deliverable', 'description': 'B'},
+            {'task_id': 1203, 'flag_type': 'missing_deliverable', 'description': 'C'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (a) No breaker WARNING — counter not advanced by HIT-path write failures.
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
+        assert len(breaker_warnings) == 0, (
+            f'Breaker must not trip on HIT-path write-only failures; got: {breaker_warnings}'
+        )
+
+        # (b) Only 4 search calls: suppression + 3 pre-write; no confirmation.
+        assert memory_service.search.call_count == 4, (
+            f'Expected 4 searches (1 suppression + 3 pre-write) but got: '
+            f'{memory_service.search.call_count}'
+        )
+
+        # (c) All 3 flags returned (exceptions are logged, not raised).
+        assert len(result) == 3
+
+        # (d) Per-flag write-failure WARNINGs emitted (one per flag).
+        write_fail_warnings = [m for m in all_warnings if 'failed to write marker' in m]
+        assert len(write_fail_warnings) == 3, (
+            f'Expected 3 per-flag write-failure WARNINGs but got: {write_fail_warnings}'
+        )
+
+        # (e) All 3 flags annotated with persisted_from_run: annotation is extracted
+        # from priors BEFORE the write attempt (lines 622-632 of flag_dedup.py), so
+        # write failure does not suppress it.
+        for f in result:
+            assert 'persisted_from_run' in f, f'Expected HIT-path annotation: {f}'
+
+    def test_confirmation_miss_threshold_constant_is_pinned_to_5(self):
+        """Regression-pin: _CONFIRMATION_MISS_THRESHOLD was chosen at task-1412 as 5.
+
+        A change to this constant affects how aggressively the circuit-breaker
+        fires during a Mem0 brownout.  Changing it should be a deliberate
+        decision with an accompanying test update, not a silent shift.
+        """
+        from fused_memory.reconciliation.flag_dedup import _CONFIRMATION_MISS_THRESHOLD
+        assert _CONFIRMATION_MISS_THRESHOLD == 5, (
+            'Threshold was chosen at task-1412 default; a change should be a '
+            'deliberate decision with a test update, not a silent shift.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # _marker_query builder (step-1 / step-2)
