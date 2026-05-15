@@ -869,6 +869,11 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
     logging so the ``threads=N`` WARNING line and the ``breakdown=`` line
     are guaranteed to derive from the same :func:`threading.enumerate` call.
 
+    If the snapshot's ``_total`` settles back to ≤ *threshold* and delta is
+    zero (transient burst that resolved between the two reads), one INFO line
+    with ``transient=true`` is emitted so operators can distinguish a resolved
+    spike from a sustained one.
+
     Extracted from the inline ``_thread_monitor`` async closure so unit tests
     can exercise the logging logic without mocking ``asyncio.sleep``.
     """
@@ -885,6 +890,9 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
         if count > threshold and snapshot is not None:
             breakdown = ' '.join(f'{k}={v}' for k, v in sorted(snapshot.items()))
             logger.log(level, 'thread_monitor: breakdown %s', breakdown)
+    elif snapshot is not None:
+        # Transient spike: active_count exceeded threshold but settled by snapshot time.
+        logger.info('thread_monitor: threads=%d delta=%+d transient=true', count, delta)
     return count
 
 
