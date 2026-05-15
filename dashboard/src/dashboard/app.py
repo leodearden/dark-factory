@@ -744,10 +744,18 @@ async def api_curator(request: Request) -> JSONResponse:
         'p99': {'labels': [], 'values': []},
     }
 
-    # Resolve DB connections before the gather (pool.get is cheap; the
-    # coroutine objects below need them as arguments).
-    metrics_db = await pool.get(config.metrics_db)
-    cost_dbs_raw = await _cost_dbs(config, pool)
+    # Each leg resolves its own DB connection inside the gather so that a
+    # transient pool.get failure (OSError, etc.) degrades only that leg —
+    # safe_gather_result (applied below) absorbs the failure per-leg rather
+    # than propagating out of api_curator and producing a 500.  The fan-out
+    # leg uses mcp_tool_call (not pool.get) and is therefore unaffected.
+    async def _sparks_leg() -> dict[str, dict[str, list]]:
+        md = await pool.get(config.metrics_db)
+        return await get_curator_sparks(md, days=1)
+
+    async def _intervals_leg() -> list[CapInterval]:
+        cd = await _cost_dbs(config, pool)
+        return await read_cap_intervals(cd, days=1)
 
     fanout_r, sparks_r, intervals_r = await asyncio.gather(
         fan_out_list_tickets(
@@ -755,8 +763,8 @@ async def api_curator(request: Request) -> JSONResponse:
             config,
             timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
         ),
-        get_curator_sparks(metrics_db, days=1),
-        read_cap_intervals(cost_dbs_raw, days=1),
+        _sparks_leg(),
+        _intervals_leg(),
         return_exceptions=True,
     )
     # fan_out_list_tickets never raises today (all exceptions are swallowed

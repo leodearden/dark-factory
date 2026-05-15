@@ -653,7 +653,11 @@ def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
     ps = cs['pending_spark']
     assert ps['labels'] == []
     assert ps['values'] == []
+    # capped_spark always generates the full 24h time-bucket grid (144 labels)
+    # even for empty intervals; what matters is that no bucket shows a cap event
+    # and capped_now is 0 (no open-ended interval from a DB that failed to load).
     capped = cs['capped_spark']
-    assert capped['labels'] == []
-    assert capped['values'] == []
+    assert 1 not in capped['values'], (
+        'Expected no cap events (all zeros) when intervals leg failed'
+    )
     assert cs['state']['capped_now'] == 0
