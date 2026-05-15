@@ -2520,6 +2520,98 @@ class TestConfirmMarkerPersisted:
             f"but got: {warning_messages}"
         )
 
+    @pytest.mark.asyncio
+    async def test_confirm_marker_retry_waits_for_configured_delay(self, monkeypatch):
+        """On first-search miss, _sleep(_CONFIRM_RETRY_DELAY_SECS) is called before the retry.
+
+        RED (step-1 task-1415): _sleep and _CONFIRM_RETRY_DELAY_SECS do not yet exist
+        in flag_dedup — the import will FAIL with AttributeError until step-2 adds them.
+
+        Test strategy:
+        - Monkeypatch _CONFIRM_RETRY_DELAY_SECS to a sentinel value 0.123.
+        - Install a recording coroutine as _sleep to capture calls and their order
+          relative to memory_service.search calls.
+        - search side_effect: [[] (miss), [retry_marker]] (miss then retry-hit).
+        - Call confirm_marker_persisted and assert:
+          (a) _sleep was called exactly once with 0.123 (the sentinel).
+          (b) _sleep was called AFTER the first search miss and BEFORE the retry search
+              (verify via ordered event log capturing both search and sleep events).
+          (c) Function returns True (retry found the marker).
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import (
+            _CONFIRM_RETRY_DELAY_SECS,  # noqa: F401 — AttributeError if absent (RED)
+            _sleep,                      # noqa: F401 — AttributeError if absent (RED)
+            confirm_marker_persisted,
+        )
+
+        # Sentinel delay so the test pins the exact value forwarded to _sleep.
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRM_RETRY_DELAY_SECS', 0.123)
+
+        retry_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '77',
+            'flag_type': 'stale_metadata',
+            'run_id': 'rX',
+        })
+        retry_marker.id = 'retry-canonical'
+
+        # Shared ordered log: each event is ('search', call_count) or ('sleep', delay).
+        event_log: list[tuple[str, object]] = []
+
+        memory_service = AsyncMock()
+
+        # Wrap search to record events with a running counter.
+        _search_call_count = 0
+
+        async def recording_search(*args, **kwargs):
+            nonlocal _search_call_count
+            _search_call_count += 1
+            n = _search_call_count
+            event_log.append(('search', n))
+            if n == 1:
+                return []
+            return [retry_marker]
+
+        memory_service.search = recording_search
+
+        # Recording sleep coroutine.
+        async def recording_sleep(delay: float) -> None:
+            event_log.append(('sleep', delay))
+
+        monkeypatch.setattr(_flag_dedup_mod, '_sleep', recording_sleep)
+
+        result = await confirm_marker_persisted(
+            memory_service,
+            project_id='p',
+            task_id='77',
+            flag_type='stale_metadata',
+            run_id='rX',
+            log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+        )
+
+        # (a) Returns True — retry found the marker.
+        assert result is True, f"Expected True (retry found marker) but got {result!r}"
+        assert isinstance(result, bool), (
+            f"confirm_marker_persisted must return bool, not {type(result)!r}"
+        )
+
+        # (b) _sleep was called exactly once with the sentinel value 0.123.
+        sleep_events = [(name, val) for name, val in event_log if name == 'sleep']
+        assert len(sleep_events) == 1, (
+            f"Expected _sleep called exactly once; event_log: {event_log}"
+        )
+        assert sleep_events[0][1] == 0.123, (
+            f"_sleep must be called with sentinel 0.123; got: {sleep_events[0][1]}"
+        )
+
+        # (c) Order: search-1 (miss) → sleep → search-2 (retry hit).
+        assert event_log == [('search', 1), ('sleep', 0.123), ('search', 2)], (
+            f"Expected ordered events [search-1, sleep, search-2]; got: {event_log}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-1400 step-9 — dedup_flags HIT path: deletes priors only when confirmed
