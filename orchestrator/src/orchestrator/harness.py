@@ -2801,6 +2801,32 @@ Output JSON matching the schema. Every task must appear in the output.
                 duration = end - start
                 if duration < self.config.watcher_misconfigured_min_rotation_secs:
                     self._watcher_degenerate_clean_exits.append(end)
+                    # Evict entries older than the burst-detection window.
+                    # Reuses watcher_crashloop_window_secs — semantically identical
+                    # burst-detection window for both failure modes.
+                    window = self.config.watcher_crashloop_window_secs
+                    while (
+                        self._watcher_degenerate_clean_exits
+                        and self._watcher_degenerate_clean_exits[0] < end - window
+                    ):
+                        self._watcher_degenerate_clean_exits.popleft()
+                    if len(self._watcher_degenerate_clean_exits) >= self.config.watcher_max_misconfigured_clean_exits:
+                        logger.error(
+                            'Escalation-watcher-auto misconfigured-exit guard tripped '
+                            '(%d degenerate-clean exits in %ds window) — pausing scheduler',
+                            len(self._watcher_degenerate_clean_exits),
+                            window,
+                        )
+                        try:
+                            await self.pause_scheduler('watcher_misconfigured')
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                'pause_scheduler raised on watcher_misconfigured trip; '
+                                'stopping supervisor anyway'
+                            )
+                        return  # stop supervising — always, even if pause_scheduler raised
                 logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
                 await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
