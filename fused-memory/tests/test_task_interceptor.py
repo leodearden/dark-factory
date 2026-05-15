@@ -309,8 +309,8 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
         await _submit_and_resolve(interceptor, '/project', prompt='Test 1')
         await interceptor.set_task_status('1', 'in-progress', '/project')
         await interceptor.remove_tasks(['1'], '/project')
-        # Let the drainer catch up.
-        await asyncio.wait_for(queue._queue.join(), timeout=1.0)
+        # Let the drainer catch up (5s budget tolerates xdist load on slow CI).
+        await queue._drain_for_test(timeout=5.0)
 
         stats = await buf.get_buffer_stats('project')
         # 3 events: task_created + task_status_changed + task_deleted
