@@ -4329,6 +4329,61 @@ class TestShouldSkipKnownBug1139Flag:
         assert fn({'content': 'mentions Stage 1 but not the bug'}) is False
 
 
+class TestAssumeUtc:
+    """_assume_utc: naive datetimes get UTC attached; aware datetimes pass through unchanged."""
+
+    def _import(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _assume_utc
+        return _assume_utc
+
+    def test_naive_datetime_gets_utc(self):
+        """A naive datetime has UTC tzinfo attached."""
+        from datetime import UTC, datetime
+        fn = self._import()
+        naive = datetime(2026, 5, 15, 10, 0, 0)
+        result = fn(naive)
+        assert result.tzinfo is UTC
+        assert result == datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+
+    def test_aware_utc_datetime_unchanged(self):
+        """An already-UTC-aware datetime is returned unchanged."""
+        from datetime import UTC, datetime
+        fn = self._import()
+        aware = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        result = fn(aware)
+        assert result is aware
+
+    def test_aware_non_utc_offset_unchanged(self):
+        """An aware datetime with a non-UTC offset is returned unchanged (not coerced)."""
+        from datetime import datetime, timedelta, timezone
+        fn = self._import()
+        plus5 = timezone(timedelta(hours=5))
+        aware = datetime(2026, 5, 15, 15, 0, 0, tzinfo=plus5)
+        result = fn(aware)
+        assert result is aware
+        assert result.tzinfo is plus5
+
+    def test_naive_wall_clock_digits_preserved(self):
+        """replace(tzinfo=UTC) is used — wall-clock digits are unchanged, not converted."""
+        from datetime import UTC, datetime
+        fn = self._import()
+        naive = datetime(2026, 5, 15, 14, 30, 0)
+        result = fn(naive)
+        assert result.hour == 14
+        assert result.minute == 30
+        assert result.tzinfo is UTC
+
+    def test_idempotent_on_naive(self):
+        """Calling _assume_utc twice on a naive datetime yields the same result."""
+        from datetime import UTC, datetime
+        fn = self._import()
+        naive = datetime(2026, 5, 15, 10, 0, 0)
+        once = fn(naive)
+        twice = fn(once)
+        assert once == twice
+        assert twice.tzinfo is UTC
+
+
 class TestQueryStage2Flags:
     """_query_stage2_flags retrieves and filters Mem0 active-query flags."""
 

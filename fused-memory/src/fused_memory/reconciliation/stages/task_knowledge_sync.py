@@ -99,6 +99,15 @@ STAGE2_FLAG_PERSISTENCE_THRESHOLD: int = 3
 _CLOCK_SKEW_GRACE: timedelta = timedelta(seconds=30)
 
 
+def _assume_utc(dt: datetime) -> datetime:
+    """Return *dt* with UTC timezone attached if it is naive; return *dt* unchanged otherwise.
+
+    Centralises the ``"naive datetimes from our journal/Mem0 are UTC"`` convention so
+    that the assumed-timezone behaviour has a single source of truth.
+    """
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
 def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
     """Return True iff *flag* describes the task-1139 flag-relay bug mechanics.
 
@@ -574,12 +583,13 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
     (which stamps ``created_at``).  Without it, a legitimate same-cycle marker
     written fractionally before the persisted start time would be swept.
 
-    Naive datetimes are assumed UTC on **both** sides of the comparison:
+    Naive datetimes are assumed UTC on **both** sides of the comparison via
+    :func:`_assume_utc`:
 
-    * A naive parsed *created_at* is normalized via ``replace(tzinfo=UTC)``
-      (existing behaviour, documented convention).
-    * A naive *run_window_start* is also normalized via ``replace(tzinfo=UTC)``
-      (task-1383 hardening).  Without this, the comparison
+    * A naive parsed *created_at* is normalised (existing behaviour, documented
+      convention).
+    * A naive *run_window_start* is also normalised (task-1383 hardening).
+      Without this, the comparison
       ``parsed(tz-aware) >= run_window_start(naive) - _CLOCK_SKEW_GRACE`` raises
       ``TypeError``, which the ``except`` clause silently swallows, causing the
       guard to return ``False`` for *every* marker and disabling the run-window
@@ -599,15 +609,12 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
     """
     if not isinstance(run_window_start, datetime):
         return False
-    if run_window_start.tzinfo is None:
-        run_window_start = run_window_start.replace(tzinfo=UTC)
+    run_window_start = _assume_utc(run_window_start)
     if not created_at or not isinstance(created_at, str):
         return False
     try:
         parsed = datetime.fromisoformat(created_at)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed >= run_window_start - _CLOCK_SKEW_GRACE
+        return _assume_utc(parsed) >= run_window_start - _CLOCK_SKEW_GRACE
     except (ValueError, TypeError):
         return False
 
@@ -1688,8 +1695,7 @@ class TaskKnowledgeSync(BaseStage):
                         'as defence-in-depth so the run-window sweep guard remains active',
                         extra={'project_id': self.project_id, 'run_id': self._current_run_id},
                     )
-                    _sa = _sa.replace(tzinfo=UTC)
-                run_window_start = _sa
+                run_window_start = _assume_utc(_sa)
         except Exception:
             logger.warning(
                 'reconciliation.assemble_payload: journal.get_run failed; '
