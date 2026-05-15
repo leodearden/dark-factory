@@ -218,7 +218,7 @@ def count_done_in_window(
     Missing DB returns 0.
     """
     try:
-        conn = sqlite3.connect(str(events_db))
+        conn = sqlite3.connect(f"file:{events_db}?mode=ro", uri=True)
         try:
             (count,) = conn.execute(
                 "SELECT COUNT(*) FROM events "
