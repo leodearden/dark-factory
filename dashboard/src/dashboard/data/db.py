@@ -32,7 +32,11 @@ class DbPool:
 
     def __init__(self) -> None:
         self._conns: dict[Path, aiosqlite.Connection] = {}
-        self._open_lock: asyncio.Lock = asyncio.Lock()
+        # Per-path open locks — prevents duplicate opens for the same path while
+        # allowing disjoint paths to open concurrently (no serialisation between
+        # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
+        self._open_locks: dict[Path, asyncio.Lock] = {}
+        self._open_locks_lock: asyncio.Lock = asyncio.Lock()
 
     async def get(self, db_path: Path) -> aiosqlite.Connection | None:
         """Return a cached connection, opening one lazily if needed.
@@ -44,8 +48,12 @@ class DbPool:
         # Lock-free fast path — common case when connection is already cached.
         if resolved in self._conns:
             return self._conns[resolved]
-        # Serialize same-path opens so only one connection is created.
-        async with self._open_lock:
+        # Acquire (or create) the per-path lock.  The meta-lock is held only
+        # for the synchronous setdefault call and released before any await.
+        async with self._open_locks_lock:
+            lock = self._open_locks.setdefault(resolved, asyncio.Lock())
+        # Serialize same-path opens; disjoint paths use independent locks.
+        async with lock:
             # Re-check after acquiring: a racing coroutine may have opened it.
             if resolved in self._conns:
                 return self._conns[resolved]
@@ -77,6 +85,8 @@ class DbPool:
             except Exception:
                 logger.debug('DbPool: error closing connection', exc_info=True)
         self._conns.clear()
+        # Clear per-path locks to prevent unbounded growth across distinct paths.
+        self._open_locks.clear()
 
 
 async def with_db(
