@@ -2156,3 +2156,63 @@ class TestConfirmMarkerPersisted:
         assert any('42' in m and 'x' in m for m in warning_messages), (
             f"Expected WARNING containing task_id '42' and flag_type 'x' but got: {warning_messages}"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('search_side_effect,label', [
+        pytest.param([[], []], 'both_miss', id='both_miss'),
+        pytest.param(RuntimeError('search exploded'), 'exception', id='exception'),
+    ])
+    async def test_miss_after_retry_returns_none_and_warns_never_raises(
+        self, search_side_effect, label, caplog
+    ):
+        """On double-miss (or search exception), returns None without raising; final WARNING emitted.
+
+        Step-5 RED: current impl already handles both-miss → None path (should pass),
+        but the exception path (side_effect=RuntimeError) needs verification that
+        find_prior_memories degrades it to [] so helper still returns None not raises.
+
+        Two parametrizations:
+        - both_miss:  search returns [] twice → final WARNING + None
+        - exception:  search raises RuntimeError → find_prior_memories catches it → []
+                      → first miss → WARNING + retry → [] → final WARNING + None
+
+        Asserts:
+        (a) Returns None.
+        (b) Does NOT raise.
+        (c) A final WARNING is emitted containing task_id AND flag_type
+            with phrasing like 'could not confirm' (ops-greppable).
+        """
+        import logging
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
+
+        memory_service = AsyncMock()
+        if isinstance(search_side_effect, list):
+            memory_service.search = AsyncMock(side_effect=search_side_effect)
+        else:
+            # RuntimeError — find_prior_memories catches this and returns []
+            memory_service.search = AsyncMock(side_effect=search_side_effect)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await confirm_marker_persisted(
+                memory_service,
+                project_id='p',
+                task_id='55',
+                flag_type='stale_metadata',
+                run_id='r2',
+                log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+            )
+
+        # (a) Returns None
+        assert result is None, f"[{label}] Expected None but got {result!r}"
+
+        # (b) Does NOT raise (no exception propagated — verified by reaching here)
+
+        # (c) Final WARNING mentioning task_id AND flag_type with 'could not confirm'
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            '55' in m and 'stale_metadata' in m and 'could not confirm' in m
+            for m in warning_messages
+        ), (
+            f"[{label}] Expected final WARNING with 'could not confirm' + task_id + flag_type "
+            f"but got: {warning_messages}"
+        )
