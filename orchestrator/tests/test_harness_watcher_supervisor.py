@@ -1126,6 +1126,74 @@ class TestWatcherMisconfiguredGuard:
             'pause_scheduler must NOT trip'
         )
 
+    @pytest.mark.asyncio
+    async def test_misconfigured_pause_scheduler_failure_still_stops_supervisor(
+        self, tmp_path: Path
+    ) -> None:
+        """When pause_scheduler raises on a misconfigured trip, the supervisor must
+        still stop (not silently continue).
+
+        Regression test (symmetry with S2/crashloop): the defensive try/except
+        added in step-6 around pause_scheduler('watcher_misconfigured') must
+        return regardless of whether pause_scheduler itself raises.
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_misconfig = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': max_misconfig,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        # Guard: cancel after max_misconfig * 2 iterations to prevent an infinite
+        # loop when the defensive wrapper is absent (makes failure fast).
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > max_misconfig * 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def raising_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+            raise RuntimeError('pause failed')
+
+        h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
+        h.pause_scheduler = raising_pause_scheduler          # type: ignore[method-assign]
+
+        t0 = _time_mod.monotonic()
+        call_count = 0
+
+        def fake_monotonic() -> float:
+            nonlocal call_count
+            call_count += 1
+            # odd call = start (t0), even call = end (t0 + 1.0s < 120s threshold)
+            return t0 if call_count % 2 == 1 else t0 + 1.0
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+        ):
+            # Supervisor must return even though pause_scheduler raises.
+            await h._watcher_supervisor_loop()
+
+        assert pause_calls == ['watcher_misconfigured'], (
+            f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
+        )
+        assert rotation_calls == max_misconfig, (
+            f'Expected exactly {max_misconfig} rotations; got {rotation_calls} '
+            f'(supervisor did not stop after failing pause)'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-13: Wiring — __init__ attrs + run() source guard
