@@ -4378,7 +4378,7 @@ class TestEscalationServerMergeRequestModuleConfigsNone:
         mock_helper.assert_called_once()
         call_queue, call_req, call_es = mock_helper.call_args.args
         assert isinstance(call_req, MergeRequest)
-        # (c) None sentinel must collapse to [] via the `or {}` fallback
+        # (c) None sentinel must collapse to [] via module_configs_or_empty property
         assert call_req.module_configs == []
 
 
