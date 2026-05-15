@@ -6390,6 +6390,84 @@ class TestAssemblePayloadRunWindowStart:
         mock_deps['journal'].get_run.assert_awaited_once_with('test-run')
         assert captured_kwargs.get('run_window_start') is None
 
+    @pytest.mark.asyncio
+    async def test_warns_when_journal_started_at_is_naive(self, mock_deps, caplog):
+        """assemble_payload emits a WARNING when journal.get_run().started_at is a naive datetime.
+
+        Root cause being detected: the orchestrator journal is expected to persist
+        ``started_at`` via ``datetime.now(UTC)`` (always tz-aware).  A naive
+        ``started_at`` indicates a journal contract violation.  Without a WARNING
+        the condition masquerades as a clean cycle — same-cycle-sweep regressions
+        (task-1369) that are caused by a naive ``started_at`` silently disabling
+        the run-window guard become invisible in logs.
+
+        Observability contract (this test):
+          1. A WARNING-level log record is emitted whose message mentions "naive"
+             and "started_at" (stable substrings of the message chosen in step-4).
+          2. The guard is NOT silently disabled — ``run_window_start`` is still
+             the datetime that was supplied (NOT forced to None), so the defensive
+             UTC normalization in ``_marker_is_within_run_window`` (step-2) keeps
+             the guard active.
+
+        This test FAILS before step-4: assemble_payload emits no WARNING today for
+        a naive ``started_at``.
+        """
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            TaskKnowledgeSync,
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        naive_started_at = datetime(2026, 5, 15, 10, 0, 0)  # NAIVE — no tzinfo
+        mock_run = MagicMock()
+        mock_run.started_at = naive_started_at
+        mock_deps['journal'].get_run = AsyncMock(return_value=mock_run)
+
+        captured_kwargs: dict = {}
+
+        async def capture_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return Stage2FlagPartition([], [], [], [])
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+                side_effect=capture_query,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            await stage.run(events=[], watermark=Watermark(project_id='reify'),
+                            prior_reports=[], run_id='test-run')
+
+        # (1) A WARNING must be emitted mentioning naive and started_at
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'naive' in r.getMessage()
+            and 'started_at' in r.getMessage()
+        ]
+        assert warning_records, (
+            'Expected a WARNING log mentioning "naive" and "started_at" when '
+            'journal.get_run().started_at is a naive datetime; got records: '
+            + str([r.getMessage() for r in caplog.records if r.levelno == logging.WARNING])
+        )
+
+        # (2) run_window_start must still be the naive datetime (guard NOT disabled)
+        assert captured_kwargs.get('run_window_start') == naive_started_at, (
+            'assemble_payload must NOT drop run_window_start to None for a naive started_at; '
+            f'expected {naive_started_at!r}, got {captured_kwargs.get("run_window_start")!r}'
+        )
+
 
 class TestSameCycleSweepFix:
     """step-7 (task-1369): end-to-end reproduction of cycle-00d1e252 defect.
