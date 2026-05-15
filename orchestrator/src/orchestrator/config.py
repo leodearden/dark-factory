@@ -834,6 +834,57 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # Digest + EWA trip (AFK hardening, task 1327).
+    # Every digest_every_n_escalations escalation events (counted in both
+    # _on_escalation and _on_escalation_resolved callbacks), _maybe_write_digest()
+    # writes an append-only markdown file to digest_dir summarising recent activity.
+    # The EWA of escalations/done is updated each digest step; when it exceeds
+    # digest_ewa_threshold, Harness.pause_scheduler('ewa_trip_<value>') is called.
+    # digest_ewa_alpha: smoothing factor for EWA(t+1) = alpha*(esc/max(done,1)) + (1-alpha)*EWA(t).
+    # digest_ewa_threshold default: reify 23-day baseline mean+2σ; see task 1327 completion notes.
+    # EWA state is process-local (reset on orchestrator restart — consistent with
+    # park-stop and watcher-supervisor counters, documented in design decisions).
+    digest_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the per-N-escalation digest and EWA trip mechanism. '
+            'When False, no digest files are written and EWA is not tracked. Task 1327.'
+        ),
+    )
+    digest_every_n_escalations: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            'Number of escalation events (submit + resolve) between digest writes. '
+            'Task 1327.'
+        ),
+    )
+    digest_dir: str = Field(
+        default='',
+        description=(
+            'Directory for digest markdown files. Empty string (default) resolves to '
+            '<project_root>/data/digests/. Task 1327.'
+        ),
+    )
+    digest_ewa_alpha: float = Field(
+        default=0.3,
+        gt=0.0,
+        le=1.0,
+        description=(
+            'Smoothing factor for the escalation/done EWA. '
+            'EWA(t+1) = alpha*(esc/max(done,1)) + (1-alpha)*EWA(t). Task 1327.'
+        ),
+    )
+    digest_ewa_threshold: float = Field(
+        default=24.555779,  # reify 23-day baseline mean+2σ; see task 1327 completion notes
+        gt=0.0,
+        description=(
+            'EWA threshold above which the scheduler is paused via '
+            'pause_scheduler(\'ewa_trip_<value>\'). Default derived from '
+            'reify 23-day escalation/done ratio history (mean+2σ=24.56). Task 1327.'
+        ),
+    )
+
     # Legacy scalar — ignored if `timeouts` section is present in config.
     # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)
