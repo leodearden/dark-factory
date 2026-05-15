@@ -124,6 +124,17 @@ class SuppressionPayload(TypedDict):
     metadata: _SuppressionMetadata
 
 
+# Number of *consecutive* confirm_marker_persisted misses within one dedup_flags
+# call that triggers the confirmation circuit-breaker.  Once tripped the
+# remaining flags in the batch skip confirm_marker_persisted and fall back to
+# bool(response.memory_ids) as the write-succeeded gate.  Counter is
+# function-local so each dedup_flags invocation starts with a fresh budget.
+# Tests monkeypatch this down to 2 (same idiom as test_durable_queue.py:635
+# with _DELETE_DEAD_BATCH_SIZE).  See "Confirmation circuit-breaker (task-1412)"
+# section in the module docstring for the full design rationale.
+_CONFIRMATION_MISS_THRESHOLD: int = 5
+
+
 async def confirm_marker_persisted(
     memory_service: Any,
     *,
@@ -358,6 +369,16 @@ async def dedup_flags(
     # prior-marker write path.
     flags = await filter_suppressed(memory_service, project_id, flags)
 
+    # --- Confirmation circuit-breaker (task-1412) ---
+    # Per-invocation counter: strictly consecutive miss count.  Reset to 0 on any
+    # successful confirmation (non-None id).  When the count reaches
+    # _CONFIRMATION_MISS_THRESHOLD, log ONE breaker WARNING and set
+    # confirmation_disabled = True so the remainder of the batch skips
+    # confirm_marker_persisted entirely and gates on bool(response.memory_ids).
+    # Being function-local, these reset automatically at each dedup_flags call.
+    consecutive_confirmation_misses: int = 0
+    confirmation_disabled: bool = False
+
     result: list[dict[str, Any]] = []
     for flag in flags:
         sig = compute_flag_signature(flag)
@@ -407,9 +428,14 @@ async def dedup_flags(
             #     proves the new marker is findable by the next cycle's search.
             #     An unconfirmed write (write exception OR confirmation miss)
             #     preserves priors for next cycle (best-effort at-least-one-marker).
+            #
+            #     Circuit-breaker (task-1412): if confirmation_disabled is True,
+            #     skip confirm_marker_persisted and fall back to bool(response.memory_ids).
+            # See: _CONFIRMATION_MISS_THRESHOLD and module docstring section.
             confirmed_id: str | None = None
+            write_succeeded: bool = False
             try:
-                await memory_service.add_memory(
+                response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -423,33 +449,55 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                confirmed_id = await confirm_marker_persisted(
-                    memory_service,
-                    project_id=project_id,
-                    task_id=tid,
-                    flag_type=ftype,
-                    run_id=run_id,
-                    log=logger,
-                )
-                if confirmed_id is None:
-                    logger.warning(
-                        'flag_dedup: replacement marker for task %s flag_type %s could not'
-                        ' be confirmed findable — skipping prior deletion',
-                        tid, ftype,
+                if not confirmation_disabled:
+                    confirmed_id = await confirm_marker_persisted(
+                        memory_service,
+                        project_id=project_id,
+                        task_id=tid,
+                        flag_type=ftype,
+                        run_id=run_id,
+                        log=logger,
                     )
+                    if confirmed_id is None:
+                        logger.warning(
+                            'flag_dedup: replacement marker for task %s flag_type %s could not'
+                            ' be confirmed findable — skipping prior deletion',
+                            tid, ftype,
+                        )
+                        consecutive_confirmation_misses += 1
+                        if (
+                            consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD
+                            and not confirmation_disabled
+                        ):
+                            logger.warning(
+                                'flag_dedup: confirmation circuit-breaker tripped after %d'
+                                ' consecutive misses; falling back to memory_ids gate for'
+                                ' remainder of batch',
+                                consecutive_confirmation_misses,
+                            )
+                            confirmation_disabled = True
+                    else:
+                        consecutive_confirmation_misses = 0
+                    write_succeeded = confirmed_id is not None
+                else:
+                    # Breaker tripped: gate on add_memory response directly.
+                    write_succeeded = bool(response.memory_ids)
+                    if not write_succeeded:
+                        logger.warning(
+                            'flag_dedup: replacement marker for task %s flag_type %s could not'
+                            ' be confirmed findable — skipping prior deletion',
+                            tid, ftype,
+                        )
             except Exception as e:
                 logger.warning(
                     'flag_dedup: failed to write replacement marker for task %s flag_type %s: %s',
                     tid, ftype, e,
                 )
 
-            # (3) Delete ALL priors only if the new marker was confirmed FINDABLE.
-            #     Gating on confirmed findability (not just memory_ids non-empty)
-            #     prevents a write whose returned id differs from the canonical id
-            #     from wiping priors with nothing recoverable next cycle.
+            # (3) Delete ALL priors only if the new marker was confirmed FINDABLE
+            #     (or, after circuit-breaker trip, if bool(response.memory_ids) is True).
             #     Each delete is wrapped individually so one bad delete does not
             #     abort the batch (self-healing: leftovers are retried next cycle).
-            write_succeeded = confirmed_id is not None
             if write_succeeded:
                 for prior in priors:
                     try:
