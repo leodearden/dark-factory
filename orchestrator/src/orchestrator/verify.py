@@ -405,11 +405,17 @@ def _persist_attempt_logs(
 
     written: list[Path] = []
 
-    # Write per-command log files.
+    # Write per-command log files.  When the file already exists on disk it
+    # was streamed there by ``_run_cmd`` (Change 2 — streaming variant): skip
+    # rewriting to avoid clobbering streamed-but-truncated output on a kill,
+    # but still record the path so summary.json and downstream archival see it.
     for run in runs:
         if run.get('cmd') is None:
             continue
         log_path = verify_dir / f'attempt-{attempt_id}{infix}.{run["label"]}.log'
+        if log_path.exists():
+            written.append(log_path)
+            continue
         try:
             log_path.write_text(run['output'], encoding='utf-8')
             written.append(log_path)
@@ -1017,18 +1023,36 @@ async def _run_cmd(
     cwd: Path,
     timeout: float,
     env: dict[str, str] | None = None,
+    log_path: 'Path | None' = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
 
     When *env* is non-None, it is merged on top of ``os.environ`` and passed
     to the subprocess so callers can inject build accelerators like
     ``RUSTC_WRAPPER=sccache`` without mutating the parent process's env.
+
+    When *log_path* is provided, subprocess output is streamed (read in 4 KiB
+    chunks and flushed) to that file as it arrives, so a timeout-killed child
+    leaves the partial buffer on disk instead of producing a 0-byte file.  The
+    accumulated buffer is also returned via the second tuple slot, identical
+    to the legacy ``proc.communicate()`` contract.  When *log_path* is None
+    no file is created.
+
+    ``PYTHONUNBUFFERED=1`` is unconditionally injected into the subprocess env
+    so that python children (pytest, ruff, pyright via uv) flush their stdout
+    per-line — necessary for the partial-log invariant under heavy buffering.
     """
+    # PYTHONUNBUFFERED is the cheap-but-decisive lever: without it pytest's
+    # progress dots stay in stdio buffers and never reach our streaming loop,
+    # so a hanging subprocess produces an opaque ``Command timed out after …``
+    # cause hint with no actionable signal.
+    subprocess_env: dict[str, str] = {**os.environ, 'PYTHONUNBUFFERED': '1'}
+    if env:
+        subprocess_env.update(env)
+
     proc = None
     pgid: int | None = None
-    subprocess_env: dict[str, str] | None = None
-    if env:
-        subprocess_env = {**os.environ, **env}
+    log_fh = None
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -1041,9 +1065,31 @@ async def _run_cmd(
         )
         # Capture pgid at spawn; start_new_session guarantees pgid == pid.
         pgid = proc.pid
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+        if log_path is None:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            rc = proc.returncode if proc.returncode is not None else 1
+            return rc, stdout.decode(errors='replace'), False
+
+        # Streamed path: chunked read + per-chunk flush so the kill on timeout
+        # cannot strand the partial output in kernel buffers.
+        log_fh = open(log_path, 'wb')
+        buf = bytearray()
+
+        async def _stream() -> None:
+            assert proc is not None and proc.stdout is not None
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                log_fh.write(chunk)
+                log_fh.flush()
+            await proc.wait()
+
+        await asyncio.wait_for(_stream(), timeout=timeout)
         rc = proc.returncode if proc.returncode is not None else 1
-        return rc, stdout.decode(), False
+        return rc, buf.decode(errors='replace'), False
     except TimeoutError:
         if proc is not None and pgid is not None:
             await terminate_process_group(proc, pgid, grace_secs=5.0)
@@ -1054,6 +1100,12 @@ async def _run_cmd(
         raise
     except Exception as e:
         return 1, f'Command failed: {e}', False
+    finally:
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except OSError:
+                pass
 
 
 # Marker file that records a worktree has completed at least one non-timeout verify.
@@ -1267,8 +1319,36 @@ async def run_verification(
             'concurrent' if concurrent else 'sequential',
         )
 
+    # Resolve the streaming log path for each label.  Identical to the
+    # filename computed in ``_persist_attempt_logs`` so that ``_run_cmd``'s
+    # streamed file is the same file ``_persist_attempt_logs`` would have
+    # written via ``write_text`` — the latter now skips the rewrite when the
+    # streamed file already exists on disk.  Returns None when ``.task/`` is
+    # absent (review-checkpoint / merge-queue paths), preserving the legacy
+    # buffered behaviour for those callers.
+    def _stream_log_path(label: str, current_attempt: int) -> 'Path | None':
+        if attempt_id is None:
+            return None
+        task_dir = worktree / '.task'
+        if not task_dir.is_dir():
+            return None
+        verify_dir = task_dir / 'verify'
+        try:
+            verify_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        if module_prefix is not None:
+            safe = module_prefix.replace('/', '_').replace(' ', '_')
+            infix = f'.{safe}'
+        else:
+            infix = ''
+        return verify_dir / f'attempt-{current_attempt}{infix}.{label}.log'
+
     async def _run_or_skip_timed(
         cmd: str | None,
+        *,
+        label: str,
+        current_attempt: int,
     ) -> tuple[int, str, bool, str | None, float]:
         """Like _run_cmd but returns (rc, out, timed_out, started_at_iso, duration_secs).
 
@@ -1278,7 +1358,13 @@ async def run_verification(
             return 0, '', False, None, 0.0
         started_at = datetime.now(UTC).isoformat()
         t0 = time.monotonic()
-        rc, out, timed_out_flag = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+        rc, out, timed_out_flag = await _run_cmd(
+            cmd,
+            worktree,
+            timeout,
+            env=verify_env or None,
+            log_path=_stream_log_path(label, current_attempt),
+        )
         return rc, out, timed_out_flag, started_at, time.monotonic() - t0
 
     # Pre-loop initialisation satisfies static analysis: mypy cannot prove that
@@ -1295,20 +1381,32 @@ async def run_verification(
 
     attempt = 0
     while True:
+        # attempt_id is the persistence ID handed in by the caller (or None for
+        # callers that don't persist).  We use it directly as the streaming
+        # attempt index so the streamed log path lines up with the path
+        # ``_persist_attempt_logs`` computes below; this loop's local
+        # ``attempt`` counter is for retry bookkeeping only.
+        current_attempt_id = attempt_id if attempt_id is not None else 0
         if concurrent:
             (
                 (test_rc, test_out, test_timed_out, test_started_at, test_duration),
                 (lint_rc, lint_out, lint_timed_out, lint_started_at, lint_duration),
                 (type_rc, type_out, type_timed_out, type_started_at, type_duration),
             ) = await asyncio.gather(
-                _run_or_skip_timed(test_cmd),
-                _run_or_skip_timed(lint_cmd),
-                _run_or_skip_timed(type_cmd),
+                _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
+                _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
+                _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
             )
         else:
-            test_rc, test_out, test_timed_out, test_started_at, test_duration = await _run_or_skip_timed(test_cmd)
-            lint_rc, lint_out, lint_timed_out, lint_started_at, lint_duration = await _run_or_skip_timed(lint_cmd)
-            type_rc, type_out, type_timed_out, type_started_at, type_duration = await _run_or_skip_timed(type_cmd)
+            test_rc, test_out, test_timed_out, test_started_at, test_duration = await _run_or_skip_timed(
+                test_cmd, label='test', current_attempt=current_attempt_id,
+            )
+            lint_rc, lint_out, lint_timed_out, lint_started_at, lint_duration = await _run_or_skip_timed(
+                lint_cmd, label='lint', current_attempt=current_attempt_id,
+            )
+            type_rc, type_out, type_timed_out, type_started_at, type_duration = await _run_or_skip_timed(
+                type_cmd, label='type', current_attempt=current_attempt_id,
+            )
 
         passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
         any_timed_out = test_timed_out or lint_timed_out or type_timed_out

@@ -426,7 +426,7 @@ class TestRunVerificationColdFirstUse:
         """AsyncMock that records timeout kwargs and returns (0, '', False) — success."""
         captured_timeouts: list[float] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             captured_timeouts.append(timeout)
             return 0, '', False
 
@@ -434,7 +434,7 @@ class TestRunVerificationColdFirstUse:
 
     def _make_timeout_mock(self):
         """AsyncMock that always returns a pure-timeout result (1, 'Command timed out…', True)."""
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             return 1, f'Command timed out after {timeout}s: {cmd}', True
 
         return fake_run_cmd
@@ -507,7 +507,7 @@ class TestRunVerificationColdFirstUse:
 
         config = self._make_config(warm=1800.0, cold=5400.0, retries=0)
 
-        async def fake_real_failure(cmd, cwd, timeout, env=None):
+        async def fake_real_failure(cmd, cwd, timeout, env=None, log_path=None):
             return 1, 'FAILED some_test', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_real_failure):
@@ -842,7 +842,7 @@ class TestRunScopedVerificationSkipsUntouched:
         # Spy on _run_cmd; pretend every command passes instantly.
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             calls.append(cmd)
             return 0, '', False
 
@@ -889,7 +889,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             calls.append(cmd)
             return 0, '', False
 
@@ -920,7 +920,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             calls.append(cmd)
             return 0, '', False
 
@@ -957,7 +957,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             calls.append(cmd)
             return 0, '', False
 
@@ -989,7 +989,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         calls: list[str] = []
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             calls.append(cmd)
             return 0, '', False
 
@@ -1024,7 +1024,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         test_calls = 0
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             nonlocal test_calls
             if cmd == '__test_cmd__':
                 test_calls += 1
@@ -1054,7 +1054,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
         test_calls = 0
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             nonlocal test_calls
             if cmd == '__test_cmd__':
                 test_calls += 1
@@ -1658,7 +1658,7 @@ class TestVerifyResultCauseHint:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -1684,7 +1684,7 @@ class TestVerifyResultCauseHint:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, 'error: cargo-bad', False
             if 'ruff' in cmd:
@@ -1737,7 +1737,7 @@ class TestVerifyResultCauseHint:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             return 0, '', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
@@ -1760,7 +1760,7 @@ class TestVerifyResultCauseHint:
             verify_command_timeout_secs=0.1,
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, f'Command timed out after {timeout}s: {cmd}', True
             return 0, '', False
@@ -1797,7 +1797,7 @@ class TestVerificationFailedLogCauseHint:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -1832,7 +1832,7 @@ class TestVerificationFailedLogCauseHint:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             return 0, '', False
 
         with (
@@ -1882,7 +1882,7 @@ class TestVerificationFailedLogIncludesPath:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, 'ok', False
@@ -1942,7 +1942,7 @@ class TestVerificationFailedLogIncludesPath:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -2455,7 +2455,7 @@ class TestVerifyResultCategoryAndPaths:
         )
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, '', False
@@ -2644,6 +2644,39 @@ class TestPersistAttemptLogs:
         # No .log files (only summary.json may exist)
         log_files = list(verify_dir.glob('*.log'))
         assert log_files == [], f'Expected no log files, got {log_files}'
+
+    def test_preserves_streamed_log_when_already_on_disk(self, tmp_path: Path):
+        """When a streamed log file exists, ``_persist_attempt_logs`` must NOT
+        overwrite it.
+
+        The verifier's streaming ``_run_cmd`` writes to the same path that
+        ``_persist_attempt_logs`` would otherwise compute; the persist helper
+        is the second writer in that chain.  After a timeout-killed subprocess
+        the in-memory ``output`` field is the wrapper's ``Command timed out
+        …`` message (no progress dots), but the on-disk file has the partial
+        pytest output.  Overwriting would discard the only actionable signal.
+        """
+        (tmp_path / '.task').mkdir()
+        verify_dir = tmp_path / '.task' / 'verify'
+        verify_dir.mkdir()
+        streamed_path = verify_dir / 'attempt-1.test.log'
+        streamed_path.write_text('STREAMED-PARTIAL-OUTPUT\n', encoding='utf-8')
+
+        runs = [
+            {
+                'label': 'test',
+                'cmd': 'pytest -q',
+                'rc': 1,
+                'output': 'Command timed out after 600.0s: pytest -q',
+                'timed_out': True,
+                'started_at': '2026-04-26T12:00:00+00:00',
+                'duration_secs': 600.0,
+            },
+        ]
+        self._persist(tmp_path, attempt_id=1, runs=runs)
+        assert streamed_path.read_text() == 'STREAMED-PARTIAL-OUTPUT\n', (
+            'streamed log was clobbered by _persist_attempt_logs'
+        )
 
 
 class TestArchiveAttemptLog:
@@ -2837,7 +2870,7 @@ class TestRunVerificationPersistence:
 
         test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, test_output, False
             return 0, 'ok', False
@@ -2890,7 +2923,7 @@ class TestRunVerificationPersistence:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, 'error: --exclude bad', False
             return 0, '', False
@@ -2919,7 +2952,7 @@ class TestRunVerificationPersistence:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cargo test' in cmd:
                 return 1, 'error: --exclude bad', False
             return 0, '', False
@@ -3104,7 +3137,7 @@ class TestRunScopedVerificationConcurrentNoClobber:
         config = self._make_config(tmp_path)
         module_configs = self._make_module_configs()
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cratea' in cmd:
                 return 1, 'cratea ERR\nfoo\nbar\n', False
             if 'crateb' in cmd:
@@ -3372,7 +3405,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         config = self._make_config(tmp_path)
         module_configs = self._make_module_configs()
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             if 'cratea' in cmd:
                 return 1, 'error: --exclude cratea\ncratea ERR\n', False
             if 'crateb' in cmd:
@@ -3405,7 +3438,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         config = self._make_config(tmp_path)
         module_configs = self._make_module_configs()
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             return 1, 'error: --exclude\n', False
 
         from orchestrator import verify  # noqa: PLC0415
@@ -3434,7 +3467,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         archive_root = tmp_path / 'data' / 'verify-logs'
         config = self._make_config(tmp_path)
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             return 1, 'error: --exclude\nfoo\n', False
 
         from orchestrator import verify  # noqa: PLC0415
@@ -3618,7 +3651,7 @@ class TestPruneArchiveThrottle:
             type_check_command='echo ok',
         )
 
-        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None):
             return 1, 'error: --exclude\nfoo\n', False
 
         wrapper_calls: list[object] = []
@@ -3650,3 +3683,64 @@ class TestPruneArchiveThrottle:
             f'_prune_archive should be called only once (throttled on second); '
             f'got {prune_spy.call_count}'
         )
+
+
+class TestRunCmdStreaming:
+    """Streamed-to-disk variant of ``_run_cmd``.
+
+    When ``log_path`` is provided, output is flushed to disk incrementally so
+    that a timeout-killed subprocess leaves a non-empty log behind (current
+    ``proc.communicate()`` path returns an empty buffer on TimeoutError).
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_cmd_streams_to_log_path_on_success(self, tmp_path: Path):
+        log_path = tmp_path / 'stream.log'
+        cmd = 'printf "a\\nb\\n"'
+        rc, stdout, timed_out = await _run_cmd(
+            cmd, tmp_path, timeout=5.0, log_path=log_path,
+        )
+        assert rc == 0
+        assert not timed_out
+        assert stdout == 'a\nb\n'
+        assert log_path.read_text() == 'a\nb\n'
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_run_cmd_preserves_partial_log_on_timeout(self, tmp_path: Path):
+        """The fix's core invariant: partial output survives the SIGKILL."""
+        log_path = tmp_path / 'partial.log'
+        # PYTHONUNBUFFERED is auto-injected; force python to flush its prints.
+        cmd = 'python3 -c "import time, sys; print(\\"START\\", flush=True); time.sleep(60)"'
+        rc, stdout, timed_out = await _run_cmd(
+            cmd, tmp_path, timeout=1.0, log_path=log_path,
+        )
+        assert timed_out is True
+        assert log_path.exists(), 'log file must persist after kill'
+        contents = log_path.read_text()
+        assert 'START' in contents, (
+            f'partial output missing from {log_path}: {contents!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_cmd_injects_pythonunbuffered(self, tmp_path: Path):
+        """``_run_cmd`` must export PYTHONUNBUFFERED=1 so python children flush."""
+        cmd = (
+            'python3 -c '
+            '"import os; print(os.environ.get(\\"PYTHONUNBUFFERED\\", \\"unset\\"))"'
+        )
+        rc, stdout, timed_out = await _run_cmd(cmd, tmp_path, timeout=5.0)
+        assert rc == 0
+        assert stdout.strip() == '1', (
+            f'expected PYTHONUNBUFFERED=1 in subprocess env, got {stdout!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_cmd_log_path_optional_default(self, tmp_path: Path):
+        """When ``log_path`` is None the disk side-effect must not fire."""
+        cmd = 'echo hello'
+        rc, stdout, timed_out = await _run_cmd(cmd, tmp_path, timeout=5.0)
+        assert rc == 0
+        assert 'hello' in stdout
+        # No log file should appear in tmp_path.
+        assert list(tmp_path.iterdir()) == []
