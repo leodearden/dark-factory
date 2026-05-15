@@ -413,6 +413,36 @@ class TestRouteReviewSuggestionsToCurator:
         )
 
     @pytest.mark.asyncio
+    async def test_identical_second_call_short_circuits_fallback(self):
+        """Cache check sits above mcp=None guard: identical re-entry skips queue.submit entirely.
+
+        When mcp is None and escalation_queue is set, the in-task cache must
+        short-circuit the second call BEFORE touching the fallback queue so
+        queue.submit.call_count == 1, not 2.
+        """
+        suggestions = self._suggestions()
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-0'
+        queue.get_by_task.return_value = []
+        wf = _make_workflow(escalation_queue=queue)
+        wf.mcp = None  # simulate missing MCP transport
+        wf.state = MagicMock(value='review')
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post:
+            # First call — falls back to queue.submit
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            # Second call — identical, must be short-circuited before queue
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        # HTTP must never be attempted (mcp is None)
+        mock_post.assert_not_called()
+        # Queue submit must be called exactly once (cache blocks second call)
+        assert queue.submit.call_count == 1, (
+            f'Expected queue.submit called once, got {queue.submit.call_count}: '
+            'the in-task cache must short-circuit before reaching the fallback'
+        )
+
+    @pytest.mark.asyncio
     async def test_mcp_none_falls_back_to_escalation_queue(self):
         """When self.mcp is None and escalation_queue is set, _escalate_suggestions is called."""
         suggestions = self._suggestions()
