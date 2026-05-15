@@ -88,6 +88,9 @@ class TestDismissStaleEscalations:
 
         assert '5' in caplog.text
 
+    # Pin to a single xdist worker: this test hard-codes localhost:9999 on
+    # harness.mcp.url; concurrent siblings sharing the same port would race.
+    @pytest.mark.xdist_group('fixed_mcp_port')
     async def test_called_after_start_escalation_server_before_task_loop(
         self, harness: Harness, tmp_path: Path
     ):
@@ -166,6 +169,7 @@ class TestDismissStaleEscalations:
 class TestDismissStaleEscalationsFatal:
     """_dismiss_stale_escalations() failure must not prevent harness cleanup."""
 
+    @pytest.mark.xdist_group('fixed_mcp_port')
     async def test_dismiss_failure_does_not_prevent_finally(
         self, harness: Harness, tmp_path: Path
     ):
@@ -198,6 +202,7 @@ class TestDismissStaleEscalationsFatal:
         harness._stop_escalation_server.assert_called_once()
         harness.mcp.stop.assert_called_once()
 
+    @pytest.mark.xdist_group('fixed_mcp_port')
     async def test_dismiss_failure_logged_as_warning(
         self, harness: Harness, tmp_path: Path, caplog
     ):

@@ -78,10 +78,20 @@ filterwarnings = [
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
 # Slow tests opt out with @pytest.mark.timeout(N).
-# signal method matches shared/pyproject.toml. If xdist is ever added here,
-# switch to thread — see fused-memory/pyproject.toml for that divergence.
+# timeout_method: signal mode was paired with serial execution; once xdist
+# was enabled here (matching fused-memory/pyproject.toml) the worker
+# subprocesses run pytest in a thread, so signal-based interruption is no
+# longer reliable inside the worker — switch to thread mode like fused-memory.
 timeout = 60
-timeout_method = "signal"
+timeout_method = "thread"
+# Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
+# count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
+# xdist_group on a single worker (see test_cargo_scope.py /
+# test_stale_escalation_cleanup.py for the unsafe-to-share fixtures).
+addopts = "-n auto --dist loadgroup"
+markers = [
+    "exercise_dry_run_unblock: allow workflow._mark_blocked to spawn the real run_dry_run_unblock hook (fire-and-forget Claude CLI). Default: autouse no-op installed in conftest.py.",
+]
 
 [dependency-groups]
 dev = [
@@ -89,5 +99,6 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.0",
     "ruff>=0.7.1",
 ]

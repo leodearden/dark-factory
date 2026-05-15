@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from orchestrator.cargo_scope import (
     _clear_cache,
     discover_workspace_crates,
@@ -23,6 +25,10 @@ def _write_workspace(root: Path, crates: dict[str, str]) -> None:
         )
 
 
+# discover_workspace_crates carries a module-level cache that _clear_cache()
+# resets between tests.  Under xdist that shared state is unsafe to spread
+# across workers — keep this whole class on one worker.
+@pytest.mark.xdist_group('cargo_scope_cache')
 class TestDiscoverWorkspaceCrates:
     def test_single_crate(self, tmp_path: Path):
         _clear_cache()
@@ -77,6 +83,10 @@ class TestDiscoverWorkspaceCrates:
         assert discover_workspace_crates(tmp_path) == {}
 
 
+# Pinned to the same worker as TestDiscoverWorkspaceCrates: ``files_to_crates``
+# does not touch the cache itself, but staying on the same worker keeps these
+# closely-coupled tests grouped for easier failure diagnosis.
+@pytest.mark.xdist_group('cargo_scope_cache')
 class TestFilesToCrates:
     def test_single_file_single_crate(self):
         crates = {'crates/reify-eval': 'reify-eval'}

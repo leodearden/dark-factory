@@ -48,27 +48,30 @@ detector_pid_alive = _detector_mod._pid_alive
 # (1) Real os.kill — both copies must agree for these PID values
 # ---------------------------------------------------------------------------
 
-# Known absolute answers for deterministic PID inputs — evaluated at
-# collection time so os.getpid() is stable for the full test session.
-_KNOWN_PID_ANSWERS: dict[int, bool] = {
+# Deterministic PID-input → expected answer.  The sentinel ``'SELF'`` is
+# resolved to ``os.getpid()`` inside the test body so the parametrize id
+# stays stable across xdist workers (each worker has a different PID, which
+# would otherwise trip xdist's "Different tests were collected" guard).
+_KNOWN_PID_ANSWERS: dict[int | str, bool] = {
     0: False,
     -1: False,
-    os.getpid(): True,
+    'SELF': True,
     2 ** 31 - 1: False,  # ~2.1 B — not a valid live PID on any standard Linux
 }
 
 
-@pytest.mark.parametrize('pid', list(_KNOWN_PID_ANSWERS))
-def test_matching_return_for_real_pids(pid: int):
+@pytest.mark.parametrize('pid_key', list(_KNOWN_PID_ANSWERS))
+def test_matching_return_for_real_pids(pid_key):
     """Both _pid_alive copies return the same bool for the given pid,
     and the result matches the known-correct answer for each deterministic input."""
+    pid = os.getpid() if pid_key == 'SELF' else pid_key
     harness_result = harness_pid_alive(pid)
     detector_result = detector_pid_alive(pid)
     assert harness_result == detector_result, (
         f'_pid_alive({pid!r}) diverged: '
         f'harness={harness_result!r}, detector={detector_result!r}'
     )
-    expected = _KNOWN_PID_ANSWERS[pid]
+    expected = _KNOWN_PID_ANSWERS[pid_key]
     assert harness_result is expected, (
         f'harness _pid_alive({pid!r}): expected {expected!r}, got {harness_result!r}'
     )
