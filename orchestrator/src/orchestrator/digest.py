@@ -20,9 +20,12 @@ import logging
 import math
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from shared.cost_store import CostStore
 
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
@@ -159,3 +162,80 @@ def count_done_in_window(
     except Exception:
         logger.debug('count_done_in_window: failed (fail-open)', exc_info=True)
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Cost statistics from CostStore
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CostStats:
+    """Cost aggregation for a digest window and trailing-24h."""
+
+    watcher_cost_in_window: float = 0.0
+    total_cost_in_window: float = 0.0
+    watcher_cost_24h: float = 0.0
+    total_cost_24h: float = 0.0
+
+
+_ZERO_COST = CostStats()
+
+
+async def cost_in_window(
+    cost_store: CostStore | None,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> CostStats:
+    """Return cost aggregation for the digest window and trailing-24h.
+
+    Mirrors the SQL pattern from Harness._enforce_cost_ceilings (single query
+    with conditional aggregation) issuing one query for the window and one for
+    trailing-24h.  Uses cost_store._require_conn() exactly as
+    _trailing_24h_cost_usd does.
+
+    Fail-open: cost_store is None or any exception → CostStats with all zeros.
+    """
+    if cost_store is None:
+        return CostStats()
+    try:
+        conn = cost_store._require_conn()  # type: ignore[attr-defined]
+
+        # Window query: watcher cost + total cost inside [window_start, window_end]
+        cur = await conn.execute(
+            'SELECT '
+            '  COALESCE(SUM(cost_usd), 0.0), '
+            '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
+            'FROM invocations '
+            'WHERE completed_at BETWEEN ? AND ?',
+            ('%watcher%', window_start_iso, window_end_iso),
+        )
+        row_win = await cur.fetchone()
+        await cur.close()
+        total_win = float(row_win[0]) if row_win and row_win[0] is not None else 0.0
+        watcher_win = float(row_win[1]) if row_win and row_win[1] is not None else 0.0
+
+        # Trailing-24h query
+        cutoff_24h = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        cur = await conn.execute(
+            'SELECT '
+            '  COALESCE(SUM(cost_usd), 0.0), '
+            '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
+            'FROM invocations '
+            'WHERE completed_at >= ?',
+            ('%watcher%', cutoff_24h),
+        )
+        row_24h = await cur.fetchone()
+        await cur.close()
+        total_24h = float(row_24h[0]) if row_24h and row_24h[0] is not None else 0.0
+        watcher_24h = float(row_24h[1]) if row_24h and row_24h[1] is not None else 0.0
+
+        return CostStats(
+            watcher_cost_in_window=watcher_win,
+            total_cost_in_window=total_win,
+            watcher_cost_24h=watcher_24h,
+            total_cost_24h=total_24h,
+        )
+    except Exception:
+        logger.warning('cost_in_window: query failed (fail-open)', exc_info=True)
+        return CostStats()
