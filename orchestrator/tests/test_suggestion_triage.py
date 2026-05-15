@@ -562,6 +562,104 @@ class TestRouteReviewSuggestionsToCurator:
             f'Expected suggestion count {len(suggestions)} in record.args, got: {rec.args}'
         )
 
+    @pytest.mark.asyncio
+    async def test_A_B_A_sequence_resubmits_A(self):
+        """A→B→A: the third call re-submits A because B overwrote the scalar cache.
+
+        The in-task cache stores only the *most recently* routed hash (a scalar,
+        not a set).  This means it only eliminates *consecutive* duplicates:
+
+            call 1 (A) → submitted,  cache = hash(A)
+            call 2 (B) → submitted,  cache = hash(B)   [hash(A) evicted]
+            call 3 (A) → submitted,  cache = hash(A)   [NOT a duplicate vs B]
+
+        Total POSTs == len(A) + len(B) + len(A) = 2*len(A) + len(B).
+
+        This boundary is intentional — the server-side curator R4 idempotency
+        gate (task_interceptor._check_escalation_idempotency) is the durable
+        source-of-truth dedup for non-consecutive repeats.
+        """
+        suggestions_a = self._suggestions()  # 2 items
+        suggestions_b = [
+            {
+                'reviewer': 'security',
+                'severity': 'suggestion',
+                'location': 'src/auth.py:5',
+                'category': 'security',
+                'description': 'Validate input before use',
+                'suggested_fix': 'Add input validation',
+            },
+        ]  # 1 item, different hash
+
+        wf = _make_workflow()
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            # Call 1: A — submitted, cache = hash(A)
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Call 2: B — submitted (different hash), cache = hash(B)
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Call 3: A again — hash(A) != hash(B) so NOT short-circuited;
+            # re-submitted, cache = hash(A) again.
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        expected = len(suggestions_a) + len(suggestions_b) + len(suggestions_a)
+        assert len(posted_bodies) == expected, (
+            f'A→B→A: expected {expected} POSTs (A={len(suggestions_a)}, '
+            f'B={len(suggestions_b)}, A again={len(suggestions_a)}), '
+            f'got {len(posted_bodies)}.  The scalar cache must not suppress '
+            'non-consecutive repeats — that is the server-side R4 gate\'s job.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_no_queue_drop_warning_fires_on_every_call(
+        self, caplog
+    ):
+        """(mcp=None, queue=None) drop branch: WARNING fires on every call, not just the first.
+
+        Unlike the curator and escalation-queue paths, the drop branch does NOT
+        record the dedup hash.  Suggestions were never routed; suppressing the
+        WARNING on subsequent identical calls would hide repeated data loss from
+        audit logs.
+        """
+        suggestions = self._suggestions()
+        wf = _make_workflow(escalation_queue=None)
+        wf.mcp = None  # simulate CLI/dry-run/test context
+
+        with (
+            patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post,
+            caplog.at_level(logging.WARNING, logger='orchestrator.workflow'),
+        ):
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        mock_post.assert_not_called()
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'orchestrator.workflow'
+        ]
+        assert len(warning_records) == 2, (
+            f'Expected two WARNINGs (one per drop call), got {len(warning_records)}: '
+            'the drop branch must not cache the hash — repeated drops must remain '
+            'auditable.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Integration: stall guard + call-site routing
