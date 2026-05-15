@@ -3086,10 +3086,7 @@ class TestConfirmationCircuitBreaker:
 
         # (a) Exactly ONE circuit-breaker WARNING mentioning the count '2'
         all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        breaker_warnings = [
-            m for m in all_warnings
-            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
-        ]
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
         assert len(breaker_warnings) == 1, (
             f"Expected exactly 1 circuit-breaker WARNING but got "
             f"{len(breaker_warnings)}: {breaker_warnings}\nAll WARNINGs: {all_warnings}"
@@ -3235,10 +3232,7 @@ class TestConfirmationCircuitBreaker:
         all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
 
         # (a) NO circuit-breaker WARNING (counter resets on flag-3 hit)
-        breaker_warnings = [
-            m for m in all_warnings
-            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
-        ]
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
         assert len(breaker_warnings) == 0, (
             f"Expected NO circuit-breaker WARNING but got: {breaker_warnings}\n"
             f"All WARNINGs: {all_warnings}"
@@ -3357,10 +3351,7 @@ class TestConfirmationCircuitBreaker:
         all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
 
         # (i) Exactly ONE circuit-breaker WARNING
-        breaker_warnings = [
-            m for m in all_warnings
-            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
-        ]
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
         assert len(breaker_warnings) == 1, (
             f"Expected 1 breaker WARNING but got {len(breaker_warnings)}: "
             f"{breaker_warnings}\nAll WARNINGs: {all_warnings}"
@@ -3492,10 +3483,7 @@ class TestConfirmationCircuitBreaker:
         all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
 
         # (a) Exactly TWO breaker WARNINGs (one per invocation)
-        breaker_warnings = [
-            m for m in all_warnings
-            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
-        ]
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
         assert len(breaker_warnings) == 2, (
             f"Expected exactly 2 breaker WARNINGs (one per invocation) but got "
             f"{len(breaker_warnings)}: {breaker_warnings}"
@@ -3572,10 +3560,7 @@ class TestConfirmationCircuitBreaker:
         all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
 
         # (a) No breaker WARNING — counter never advanced via write failures
-        breaker_warnings = [
-            m for m in all_warnings
-            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
-        ]
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
         assert len(breaker_warnings) == 0, (
             f'Breaker must not trip on write-only failures; got: {breaker_warnings}'
         )
@@ -3861,6 +3846,171 @@ class TestConfirmationCircuitBreaker:
             'Threshold was chosen at task-1412 default; a change should be a '
             'deliberate decision with a test update, not a silent shift.'
         )
+
+    # -----------------------------------------------------------------------
+    # Fix 2 disambiguation test (task-1413, step-4)
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('branch', ['hit', 'miss'])
+    async def test_active_vs_tripped_branch_warnings_are_disambiguated(
+        self, branch, monkeypatch, caplog,
+    ):
+        """ACTIVE-branch and TRIPPED-branch per-flag WARNINGs use distinct wording.
+
+        Pins the disambiguation contract (task-1413 Fix 2): when the breaker is
+        ACTIVE (confirmation search attempted and missed), the per-flag WARNING
+        must contain ``'could not be confirmed findable'``.  When the breaker is
+        TRIPPED (no confirmation search attempted), the WARNING must contain
+        ``'confirmation skipped (circuit-breaker open)'`` and
+        ``'relying on memory_ids gate only'``.
+
+        Setup: threshold=2, 3 flags (task_ids 901/902/903).
+        - Flags 901 and 902: ACTIVE-branch confirmation miss → counter reaches 2 → TRIP.
+        - Flag 903: TRIPPED branch; add_memory returns empty memory_ids → WARNING fires.
+
+        Parametrized over branch='hit' (priors found on pre-write, consequence
+        ``'skipping prior deletion'``) and branch='miss' (no priors, consequence
+        ``'will not be detected next cycle'``).
+
+        search side_effect (8 entries for both branches):
+          [0]  suppression filter → []
+          [1]  flag-901 pre-write → HIT/MISS
+          [2]  flag-901 confirmation initial miss
+          [3]  flag-901 confirmation retry miss → counter = 1
+          [4]  flag-902 pre-write → HIT/MISS
+          [5]  flag-902 confirmation initial miss
+          [6]  flag-902 confirmation retry miss → counter = 2 → TRIP
+          [7]  flag-903 pre-write → HIT/MISS (no confirmation — breaker tripped)
+
+        Fails against the post-step-3 impl because _confirm_and_track emits the
+        same ``miss_warning_msg`` in both ACTIVE and TRIPPED branches, so
+        bucket_903 has ``'could not be confirmed findable'`` rather than
+        ``'confirmation skipped (circuit-breaker open)'``.
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 2)
+
+        run_id = 'r1'
+
+        prior_a = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '901',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_a.id = 'prior-a'
+
+        prior_b = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '902',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_b.id = 'prior-b'
+
+        prior_c = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '903',
+            'flag_type': 'missing_deliverable', 'run_id': 'r0',
+        })
+        prior_c.id = 'prior-c'
+
+        # For 'hit': entries [1],[4],[7] return priors; for 'miss' they return [].
+        if branch == 'hit':
+            priors_901, priors_902, priors_903 = [prior_a], [prior_b], [prior_c]
+        else:
+            priors_901 = priors_902 = priors_903 = []
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            [],          # [0] suppression
+            priors_901,  # [1] flag-901 pre-write
+            [],          # [2] flag-901 confirmation initial miss
+            [],          # [3] flag-901 confirmation retry miss → counter=1
+            priors_902,  # [4] flag-902 pre-write
+            [],          # [5] flag-902 confirmation initial miss
+            [],          # [6] flag-902 confirmation retry miss → counter=2 → TRIP
+            priors_903,  # [7] flag-903 pre-write (no confirmation — breaker tripped)
+        ])
+        # flag-903 gets empty memory_ids so the tripped-skip WARNING fires.
+        memory_service.add_memory = AsyncMock(side_effect=[
+            _STUB_ADD_MEMORY_RESPONSE,        # flag-901 (non-empty)
+            _STUB_ADD_MEMORY_RESPONSE,        # flag-902 (non-empty)
+            AddMemoryResponse(memory_ids=[]), # flag-903 (empty → tripped-skip WARNING)
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        flags = [
+            {'task_id': 901, 'flag_type': 'missing_deliverable'},
+            {'task_id': 902, 'flag_type': 'missing_deliverable'},
+            {'task_id': 903, 'flag_type': 'missing_deliverable'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id=run_id,
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        def per_flag(task_id_str: str) -> list[str]:
+            """WARNINGs containing task_id_str, excluding the one-time trip line."""
+            return [m for m in all_warnings if task_id_str in m and 'tripped after' not in m]
+
+        bucket_901 = per_flag('901')
+        bucket_902 = per_flag('902')
+        bucket_903 = per_flag('903')
+
+        # Exactly ONE trip WARNING in the whole batch.
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
+        assert len(breaker_warnings) == 1, (
+            f'[branch={branch}] Expected exactly 1 trip WARNING; got: {breaker_warnings}'
+        )
+
+        # Flags 901 and 902 — ACTIVE-branch miss: confirmation was attempted and missed.
+        # Must have 'could not be confirmed findable'; must NOT have tripped-skip wording.
+        for tid, bucket in [('901', bucket_901), ('902', bucket_902)]:
+            assert any('could not be confirmed findable' in m for m in bucket), (
+                f'[branch={branch}] task {tid}: expected ACTIVE-miss WARNING '
+                f"'could not be confirmed findable'; got: {bucket}"
+            )
+            assert not any(
+                'confirmation skipped (circuit-breaker open)' in m for m in bucket
+            ), (
+                f'[branch={branch}] task {tid}: TRIPPED-skip wording must NOT appear '
+                f'in ACTIVE-branch bucket; got: {bucket}'
+            )
+
+        # Flag 903 — TRIPPED-branch skip: no confirmation attempted; breaker open.
+        # Must have tripped-skip wording; must NOT have active-miss wording.
+        assert any(
+            'confirmation skipped (circuit-breaker open)' in m and
+            'relying on memory_ids gate only' in m
+            for m in bucket_903
+        ), (
+            f'[branch={branch}] task 903: expected TRIPPED-skip WARNING with '
+            f"'confirmation skipped (circuit-breaker open)' + "
+            f"'relying on memory_ids gate only'; got: {bucket_903}"
+        )
+        assert not any('could not be confirmed findable' in m for m in bucket_903), (
+            f'[branch={branch}] task 903: ACTIVE-miss wording must NOT appear in '
+            f'TRIPPED-skip bucket; got: {bucket_903}'
+        )
+
+        # Branch-specific consequence suffix preserved in per-flag WARNINGs.
+        if branch == 'hit':
+            consequence = 'skipping prior deletion'
+        else:
+            consequence = 'will not be detected next cycle'
+
+        for tid, bucket in [('901', bucket_901), ('902', bucket_902), ('903', bucket_903)]:
+            assert any(consequence in m for m in bucket), (
+                f'[branch={branch}] task {tid}: expected consequence '
+                f'{consequence!r} in WARNING; got: {bucket}'
+            )
 
 
 # ---------------------------------------------------------------------------
