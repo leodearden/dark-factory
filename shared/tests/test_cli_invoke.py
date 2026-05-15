@@ -1528,11 +1528,11 @@ class TestHeuristicCapGating:
             patch('shared.cli_invoke.asyncio') as mock_asyncio,
         ):
             mock_asyncio.sleep = AsyncMock()
-            # With max_cap_retries=1 the bug raises AllAccountsCappedException
-            # on the first heuristic hit.  The fix should return without raising.
+            # Previously tested with max_cap_retries=1; param removed in task-1401.
+            # The fix should return without raising.
             got = await invoke_with_cap_retry(
                 gate, 'test-label',
-                prompt='hi', max_cap_retries=1,
+                prompt='hi',
             )
 
         assert got.success is False
@@ -1585,7 +1585,7 @@ class TestHeuristicCapGating:
             caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
         ):
             mock_asyncio.sleep = AsyncMock()
-            await invoke_with_cap_retry(gate, 'test-label', prompt='hi', max_cap_retries=1)
+            await invoke_with_cap_retry(gate, 'test-label', prompt='hi')
 
         assert 'suspicious zero-cost instant exit' in caplog.text
         assert 'heuristic cap suspected but no account could be marked' in caplog.text
@@ -1612,7 +1612,7 @@ class TestHeuristicCapGating:
             # rather than hanging — faster and more descriptive failure.
             got = await invoke_with_cap_retry(
                 gate, 'test-label',
-                prompt='hi', max_cap_retries=None, cap_retry_deadline_secs=None,
+                prompt='hi',
             )
 
         # invoke_claude_agent called exactly once — no retry loop entered

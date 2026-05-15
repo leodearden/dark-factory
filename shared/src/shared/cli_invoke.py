@@ -41,8 +41,6 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
-_DEFAULT_MAX_CAP_RETRIES = 20
-_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0  # kept for back-compat; no branch checks it
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0        # emit at most one cap_wait log per ~10 min
 CAP_HIT_RESUME_PROMPT = (
@@ -65,9 +63,6 @@ __all__ = [
 
 class AllAccountsCappedException(Exception):
     """Raised when the cap-hit retry loop exceeds the sanity-bound wall-clock deadline.
-
-    The count-based guard (``max_cap_retries``) no longer triggers this exception;
-    it is kept in the ``invoke_with_cap_retry`` signature for back-compat only.
 
     Attributes:
     - ``retries``: number of consecutive cap hits before giving up
@@ -341,8 +336,6 @@ async def invoke_with_cap_retry(
     task_id: str = '',
     project_id: str = '',
     role: str = '',
-    max_cap_retries: int | None = None,
-    cap_retry_deadline_secs: float | None = None,
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
@@ -364,8 +357,7 @@ async def invoke_with_cap_retry(
     When total elapsed time since the first cap hit exceeds this value,
     ``AllAccountsCappedException`` is raised so the caller can escalate.
     Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).  Pass ``None``
-    to wait indefinitely.  ``cap_retry_deadline_secs`` is kept for
-    back-compat but is now vestigial — no branch checks it.
+    to wait indefinitely.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
