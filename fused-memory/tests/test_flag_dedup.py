@@ -2216,3 +2216,129 @@ class TestConfirmMarkerPersisted:
             f"[{label}] Expected final WARNING with 'could not confirm' + task_id + flag_type "
             f"but got: {warning_messages}"
         )
+
+
+# ---------------------------------------------------------------------------
+# task-1400 step-7 — dedup_flags MISS path: confirmation called after write
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_miss_path_confirmed_marker_no_noop_warning(caplog):
+    """MISS path: when confirmation succeeds (even if returned id != add_memory response id),
+    no 'will not be detected next cycle' WARNING is emitted.
+
+    search side_effect:
+      [1] [] → suppression filter (no suppression)
+      [2] [] → per-flag pre-write MISS (no prior)
+      [3] [confirmation_marker id='canon-1'] → post-write confirmation hit
+
+    add_memory returns memory_ids=['returned-DIFFERENT'] (different from canonical id).
+
+    Asserts:
+    (a) add_memory called once.
+    (b) search called 3 times (suppression + pre-write + confirmation).
+    (c) NO 'recurring flag will not be detected next cycle' WARNING (marker confirmed findable).
+    (d) Flag is NOT annotated (MISS path → no persisted_from_run).
+
+    Fails until step-8 wires confirmation into MISS branch.
+    """
+    import logging
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    confirmation_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '77',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r1',
+    })
+    confirmation_marker.id = 'canon-1'
+
+    memory_service = AsyncMock()
+    # [suppression filter=[], pre-write miss=[], confirmation hit=[marker]]
+    memory_service.search = AsyncMock(side_effect=[[], [], [confirmation_marker]])
+    memory_service.add_memory = AsyncMock(
+        return_value=AddMemoryResponse(memory_ids=['returned-DIFFERENT'])
+    )
+
+    flags = [{'task_id': '77', 'flag_type': 'stale_metadata', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) add_memory called once
+    memory_service.add_memory.assert_called_once()
+
+    # (b) search called 3 times: suppression + pre-write + confirmation
+    assert memory_service.search.call_count == 3, (
+        f"Expected 3 search calls (suppression+pre-write+confirmation) but got "
+        f"{memory_service.search.call_count}"
+    )
+
+    # (c) No 'will not be detected next cycle' WARNING (marker IS confirmed)
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any('will not be detected next cycle' in m for m in warning_messages), (
+        f"Expected no 'will not be detected next cycle' WARNING when confirmation "
+        f"succeeds, but got: {warning_messages}"
+    )
+
+    # (d) Flag not annotated (MISS path)
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_miss_path_confirmation_miss_emits_noop_warning(caplog):
+    """MISS path: when confirmation misses (double-miss), the 'will not be detected next cycle'
+    WARNING fires — driven off confirmation, not memory_ids.
+
+    search side_effect:
+      [1] [] → suppression filter
+      [2] [] → pre-write MISS
+      [3] [] → confirmation miss
+      [4] [] → confirmation retry miss
+
+    add_memory returns memory_ids=['stub-id'] (non-empty — old guard would have
+    suppressed the WARNING; confirmation-driven guard must still emit it).
+
+    Fails until step-8 wires confirmation into MISS branch.
+    """
+    import logging
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    # suppression + pre-write miss + confirmation miss + confirmation retry miss
+    memory_service.search = AsyncMock(side_effect=[[], [], [], []])
+    memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['stub-id']))
+
+    flags = [{'task_id': '88', 'flag_type': 'missing_deliverable', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # add_memory called once
+    memory_service.add_memory.assert_called_once()
+
+    # WARNING driven by confirmation failure (not just empty memory_ids)
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        ('88' in m or 'missing_deliverable' in m) and
+        ('detected next cycle' in m or 'could not confirm' in m or 'will not be detected' in m)
+        for m in warning_messages
+    ), (
+        f"Expected WARNING about confirmation failure for task 88 but got: {warning_messages}"
+    )
+
+    # Flag not annotated (MISS path)
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
