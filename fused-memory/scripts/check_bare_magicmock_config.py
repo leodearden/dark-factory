@@ -8,6 +8,13 @@ source line is a structured exemption comment:
 
     # noqa: bare-magicmock — <reason>   (em-dash or ASCII hyphen; reason must be non-empty)
 
+Inline trailing exemption NOT honored: a ``# noqa: bare-magicmock`` comment placed on
+the *same* line as the assignment (e.g. ``config = MagicMock()  # noqa: bare-magicmock — x``)
+is intentionally ignored.  Only the nearest preceding non-blank source line is consulted.
+Placing the exemption on the same line as the violating code is a common footgun with
+ruff-style suppressions; keeping the contract to a dedicated preceding line makes
+exemptions both auditable and deliberate.
+
 Config-name set: exact ``config`` and ``cfg``, plus any name ending with ``_config`` or
 ``_cfg`` (e.g. ``orch_config``, ``mock_cfg``).  Generic names like ``mcp``, ``mock``, ``m``
 are intentionally excluded — this rule targets config objects only (non-goal: no scope creep).
@@ -140,6 +147,11 @@ def _is_exempted(lines: list[str], lineno: int) -> bool:
     Walks upward from ``lineno - 1`` over blank lines to the nearest non-blank line.
     If that line matches _EXEMPT_RE the assignment is exempt.
     Any intervening non-blank, non-matching line breaks the exemption.
+
+    Inline trailing exemption NOT honored: only the nearest *preceding* non-blank line
+    is inspected.  A ``# noqa: bare-magicmock`` comment on the same line as the
+    assignment (inline trailing) is intentionally ignored.  This is by design — see
+    module-level docstring for rationale.
     """
     # lineno is 1-based; convert to 0-based index of the line ABOVE the assignment.
     idx = lineno - 2  # the line immediately above
