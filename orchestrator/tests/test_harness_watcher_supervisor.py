@@ -557,3 +557,154 @@ class TestWatcherSupervisorLoopClassification:
         assert sleep_durations[1] == pytest.approx(base), (
             f'Post-reset backoff should be base {base}s; got {sleep_durations[1]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-11: Crashloop trip — pause_scheduler + window eviction
+# ---------------------------------------------------------------------------
+
+class TestWatcherCrashloopTrip:
+    """Crashloop detection: N unclean exits in a window trips pause_scheduler."""
+
+    @pytest.mark.asyncio
+    async def test_crashloop_trips_pause_scheduler(self, tmp_path: Path) -> None:
+        """After max_crashloop_restarts unclean exits within the window, pause_scheduler
+        is called exactly once with reason='watcher_crashloop' and the loop exits."""
+        from shared.cli_invoke import AgentResult
+
+        max_restarts = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': max_restarts,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            return AgentResult(success=False, output='')
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        async def fake_sleep(duration: float) -> None:
+            pass  # instant, no blocking
+
+        h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
+        h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
+
+        # patch monotonic to return a stable time (all exits within the window)
+        import time as _time_mod
+        stable_time = _time_mod.monotonic()
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), \
+             patch('orchestrator.harness.time.monotonic', return_value=stable_time):
+            # Loop should exit after max_restarts unclean exits
+            await h._watcher_supervisor_loop()
+
+        # pause_scheduler called exactly once with the crashloop reason
+        assert pause_calls == ['watcher_crashloop'], (
+            f'Expected pause_scheduler("watcher_crashloop") once; got {pause_calls}'
+        )
+        # Loop exited (returned) — no further rotations after the trip
+        assert rotation_calls == max_restarts, (
+            f'Expected exactly {max_restarts} rotations before trip; got {rotation_calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_crashloop_does_not_trip_below_threshold(self, tmp_path: Path) -> None:
+        """Fewer than max_crashloop_restarts unclean exits do NOT trip pause_scheduler."""
+        from shared.cli_invoke import AgentResult
+
+        max_restarts = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': max_restarts,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= max_restarts:  # cancel before trip
+                raise asyncio.CancelledError()
+            return AgentResult(success=False, output='')
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
+        h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', AsyncMock()):
+            with pytest.raises(asyncio.CancelledError):
+                await h._watcher_supervisor_loop()
+
+        assert pause_calls == [], (
+            f'pause_scheduler should NOT be called below threshold; got {pause_calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_old_exits_outside_window_are_evicted(self, tmp_path: Path) -> None:
+        """Unclean exits older than watcher_crashloop_window_secs are evicted
+        so they do not contribute to the crashloop count."""
+        from shared.cli_invoke import AgentResult
+        import time as _time_mod
+
+        max_restarts = 3
+        window = 600
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': max_restarts,
+            'watcher_crashloop_window_secs': window,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        pause_calls: list[str] = []
+        rotation_calls = 0
+
+        # Monotonic clock advances to put first exits outside the window.
+        # Sequence: 2 old exits (at t=0), then clock jumps past window, then
+        # (max_restarts - 1) exits (insufficient alone to trip), then cancel.
+        old_time = _time_mod.monotonic()
+        new_time = old_time + window + 1  # beyond the window
+        time_sequence = iter(
+            [old_time, old_time]            # first 2 unclean exits: old
+            + [new_time] * (max_restarts)   # subsequent exits: recent
+        )
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > max_restarts + 1:
+                raise asyncio.CancelledError()
+            return AgentResult(success=False, output='')
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
+        h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
+
+        def fake_monotonic() -> float:
+            try:
+                return next(time_sequence)
+            except StopIteration:
+                return new_time
+
+        with patch('orchestrator.harness.asyncio.sleep', AsyncMock()), \
+             patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic):
+            # Loop should cancel (not trip) because old exits are evicted
+            with pytest.raises(asyncio.CancelledError):
+                await h._watcher_supervisor_loop()
+
+        assert pause_calls == [], (
+            'Old exits outside window should be evicted; pause_scheduler must NOT trip'
+        )

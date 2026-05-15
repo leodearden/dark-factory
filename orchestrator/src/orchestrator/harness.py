@@ -2580,8 +2580,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # --- Unclean exit path ---
-            import time as _time
-            self._watcher_unclean_exits.append(_time.monotonic())
+            self._watcher_unclean_exits.append(time.monotonic())
             consecutive_unclean += 1
 
             backoff = min(
