@@ -657,7 +657,7 @@ async def _query_stage2_flags(
     alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
 
-    Results are partitioned into three groups:
+    Results are partitioned into four groups:
 
     * **current** — full dict records whose ``metadata.run_id`` is present,
       non-empty, and matches ``current_run_id`` after ``str()`` coercion.
@@ -675,6 +675,13 @@ async def _query_stage2_flags(
       ``metadata.run_id`` is present and truthy but does not match
       ``current_run_id`` AND whose ``created_at`` is out of the run window.
       These are normal prior-cycle residue.
+    * **rescued_ids** — ``id`` strings for markers rescued by the run-window
+      guard (a subset of **current**).  Non-empty indicates Stage 1 producer
+      drift within the CURRENT cycle — the LLM omitted or mis-stamped
+      ``metadata.run_id`` on a flag it wrote during this run, but the marker
+      was still surfaced to Stage 2 (not swept).  Populated exclusively by
+      the run-window guard inside this function; this is the single source of
+      truth for the rescued count (task-1381).
 
     Both stale buckets must be swept by the caller via
     :func:`_sweep_stale_fixc_markers`.
