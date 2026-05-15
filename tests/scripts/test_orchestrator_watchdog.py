@@ -270,6 +270,37 @@ def test_restart_unit_handles_start_timeout(monkeypatch: pytest.MonkeyPatch) -> 
     assert len(log_messages) >= 1, "start timeout must be logged via log()"
 
 
+def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """restart_unit must not raise if systemctl reset-failed times out.
+
+    After a reset-failed timeout the start call must still execute so the
+    unit is not left in a permanently-down state (docstring: "remaining
+    phases still execute").
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "reset-failed"]:
+            raise subprocess.TimeoutExpired(cmd, 10)
+        if cmd[0] == "systemd-cat":
+            log_messages.append(" ".join(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Must not raise
+    wdog.restart_unit("dark-factory-orchestrator.service")
+
+    systemctl_cmds = [c for c in calls if c[0] == "systemctl"]
+    verbs = [c[2] for c in systemctl_cmds]
+    assert "start" in verbs, "start must be called even after reset-failed timeout"
+    assert len(log_messages) >= 1, "reset-failed timeout must be logged via log()"
+
+
 # ---------------------------------------------------------------------------
 # main() tests
 # ---------------------------------------------------------------------------
