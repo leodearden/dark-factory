@@ -670,3 +670,182 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         # assert_not_called() is the genuine regression check: the guard must
         # prevent write_state_snapshot from being invoked for all bad root values.
         scheduler.write_state_snapshot.assert_not_called()
+
+
+# ===========================================================================
+# Task-1332: _write_snapshot_best_effort throttle / coalesce
+# ===========================================================================
+
+class TestSnapshotWriteThrottle:
+    """Leading-edge time throttle coalesces writes within one interval window."""
+
+    @pytest.mark.asyncio
+    async def test_throttle_coalesces_ticks_within_interval(self, tmp_path):
+        """K ticks in the same throttle window produce exactly 1 disk write.
+
+        The first-ever write always proceeds (no prior timestamp).  The
+        subsequent K-1 ticks all fall within the same throttle window and must
+        be coalesced to zero extra writes.
+
+        The lock is released between each tick so task A is eligible every
+        time, ensuring acquire_next reaches _write_snapshot_best_effort on
+        every tick.  Note: the dedup payload happens to be byte-identical
+        across all K ticks (task A is the holder each time), so both the
+        time-throttle gate and the content-dedup gate coincide here — both
+        mechanisms independently produce the same outcome (1 write).  The
+        dedicated ``test_content_identical_payload_skips_disk_write`` isolates
+        the content-dedup path; this test exercises the time-throttle gate.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = 1.0  # wide window
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+
+        # Provide a single pending task that can be acquired each tick.
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+
+        # Mock the disk-write seam to count real write attempts.
+        scheduler.write_state_snapshot = MagicMock()
+
+        # Run K=5 ticks WITHOUT advancing the clock.
+        # Release the lock between ticks so A is eligible each time.
+        # All ticks fall within [0.0, 0.0 + 1.0) — the first write proceeds
+        # (no prior ts), the next 4 must be coalesced.
+        K = 5
+        for _ in range(K):
+            await scheduler.acquire_next()
+            scheduler.release('A')  # make A eligible for the next tick
+
+        assert scheduler.write_state_snapshot.call_count == 1, (
+            f'Expected 1 disk write for {K} ticks within one throttle window, '
+            f'got {scheduler.write_state_snapshot.call_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_acceptance_bound_writes_bounded_under_burst(self, tmp_path):
+        """Over N ticks, disk writes ≤ ceil(N * tick_interval / throttle_interval).
+
+        Simulates N=20 ticks at tick_interval=0.05 s with a
+        throttle_interval=0.25 s.  The acceptance bound is
+        ceil(20 * 0.05 / 0.25) = ceil(4.0) = 4.
+        """
+        import math
+        from unittest.mock import AsyncMock, MagicMock
+
+        throttle_interval = 0.25
+        tick_interval = 0.05
+        N = 20
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = throttle_interval
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        scheduler.write_state_snapshot = MagicMock()
+
+        for _ in range(N):
+            clock['t'] += tick_interval  # advance clock before each tick
+            await scheduler.acquire_next()
+            scheduler.release('A')
+
+        upper_bound = math.ceil(N * tick_interval / throttle_interval)
+        count = scheduler.write_state_snapshot.call_count
+        assert 1 <= count <= upper_bound, (
+            f'Expected 1 ≤ write_count ≤ {upper_bound}, got {count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_flush_state_snapshot_bypasses_throttle(self, tmp_path):
+        """flush_state_snapshot() forces a write even within the throttle window.
+
+        After throttled ticks, a flush must produce exactly one additional
+        write, proving the explicit final-flush capability persists the most
+        recent state regardless of the throttle interval.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = 1.0  # wide window
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        scheduler.write_state_snapshot = MagicMock()
+
+        # First tick writes (no prior timestamp).
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        # Three more ticks — all throttled (clock not advanced).
+        for _ in range(3):
+            await scheduler.acquire_next()
+            scheduler.release('A')
+        # Exactly 1 write so far (throttle held the rest).
+        assert scheduler.write_state_snapshot.call_count == 1
+
+        # Record count before flush, then flush.  The clock is still at 0.0
+        # (well within the 1.0 s window) so only force=True can bypass it.
+        count_before = scheduler.write_state_snapshot.call_count
+        await scheduler.flush_state_snapshot()
+
+        assert scheduler.write_state_snapshot.call_count == count_before + 1, (
+            'flush_state_snapshot() must produce exactly 1 additional write '
+            'even when the throttle window has not elapsed'
+        )
+
+    @pytest.mark.asyncio
+    async def test_content_identical_payload_skips_disk_write(self, tmp_path):
+        """With throttle disabled (0.0), identical payload skips the disk write.
+
+        Sequence:
+        1. First _write_snapshot_best_effort call → payload captured, count=1.
+        2. Second call with no state change → payload byte-identical → skip,
+           count stays 1.
+        3. Mutate state (scheduler._skip_count['Q'] = 1) and call again →
+           payload changed → write, count=2.
+
+        This test isolates the content-diff path from the time-throttle path
+        by disabling the throttle (interval=0.0).
+        """
+        from unittest.mock import MagicMock
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = 0.0  # throttle disabled
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+        scheduler.write_state_snapshot = MagicMock()
+
+        # First write: no prior payload → always writes.
+        clock['t'] = 1.0
+        await scheduler._write_snapshot_best_effort()
+        assert scheduler.write_state_snapshot.call_count == 1
+
+        # Second write: state unchanged → payload byte-identical → skip.
+        clock['t'] = 2.0
+        await scheduler._write_snapshot_best_effort()
+        assert scheduler.write_state_snapshot.call_count == 1, (
+            'Expected disk write to be skipped for byte-identical payload, '
+            f'got call_count={scheduler.write_state_snapshot.call_count}'
+        )
+
+        # Third write: state mutated → payload differs → writes.
+        scheduler._skip_count['Q'] = 1
+        clock['t'] = 3.0
+        await scheduler._write_snapshot_best_effort()
+        assert scheduler.write_state_snapshot.call_count == 2, (
+            'Expected disk write after state mutation (changed payload), '
+            f'got call_count={scheduler.write_state_snapshot.call_count}'
+        )

@@ -749,6 +749,16 @@ class Scheduler:
         self._blocked_task_ids_in_window: set[str] = set()
         # Callback installed by the Harness so trip → persistence + event.
         self._on_park_stop_trip: Callable[[str], Any] | None = None
+        # --- Snapshot write throttle (task 1332) ---
+        # Monotonic timestamp of the last successful _write_snapshot_best_effort
+        # disk write.  None before the first write; the first write always
+        # proceeds regardless of the throttle interval.
+        self._last_snapshot_write_ts: float | None = None
+        # Serialised payload from the last disk write.  Used for content-diff:
+        # if the new payload is byte-identical, the disk write is skipped even
+        # after the time gate passes (populated in step-6; kept here for
+        # structural completeness and future use).
+        self._last_snapshot_payload: str | None = None
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -2356,28 +2366,72 @@ class Scheduler:
             'snapshot_at': datetime.now(UTC).isoformat(),
         }
 
-    def write_state_snapshot(self, path: Path) -> None:
+    def _build_snapshot_payload(self, state: dict | None = None) -> str:
+        """Serialise the scheduler business state to a stable JSON string for dedup.
+
+        Excludes ``snapshot_at`` from the output because that field is derived
+        from ``datetime.now()`` and changes on every call — including it would
+        make two consecutive calls with identical business state byte-different,
+        defeating the content-dedup check in ``_write_snapshot_best_effort``.
+
+        The ``snapshot_at`` field is included in the separate disk payload
+        built by ``_write_snapshot_best_effort`` (via ``json.dumps(state, ...)``)
+        or by ``write_state_snapshot`` when called directly without a pre-built
+        payload.
+
+        Args:
+            state: Pre-fetched snapshot dict from ``get_state_snapshot()``.
+                When provided, avoids a redundant ``get_state_snapshot()``
+                call (the caller already has the state and will build the disk
+                payload from it).  When ``None``, calls ``get_state_snapshot()``
+                internally.
+
+        Returns a sorted-keys JSON string of the snapshot minus ``snapshot_at``.
+        Sorted keys ensure deterministic output regardless of insertion order.
+        Does not mutate the passed-in ``state`` dict.
+        """
+        if state is None:
+            state = self.get_state_snapshot()
+        # Exclude snapshot_at without mutating the caller's dict.
+        dedup_state = {k: v for k, v in state.items() if k != 'snapshot_at'}
+        return json.dumps(dedup_state, default=str, sort_keys=True)
+
+    def write_state_snapshot(self, path: Path, payload: str | None = None) -> None:
         """Atomically write the current state snapshot to *path* as JSON.
 
         Creates parent directories if missing.  Uses a tmp-file + os.replace
         atomic rename so concurrent readers never see a partial write.
 
-        Best-effort: swallows all exceptions and logs a warning on failure so
-        the scheduler never stops ticking due to a disk issue.
-        """
-        try:
-            path = Path(path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = path.with_suffix('.json.tmp')
-            payload = json.dumps(self.get_state_snapshot(), default=str)
-            tmp_path.write_text(payload, encoding='utf-8')
-            os.replace(tmp_path, path)
-        except Exception:
-            logger.warning(
-                'write_state_snapshot failed for path %s', path, exc_info=True
-            )
+        Exceptions propagate to the caller (``_write_snapshot_best_effort``),
+        which swallows them via its own try/except so the scheduler never stops
+        ticking due to a disk issue.  Propagating rather than swallowing here
+        ensures bookkeeping (``_last_snapshot_payload``,
+        ``_last_snapshot_write_ts``) is only advanced when the write actually
+        succeeds — a swallowed failure would silently record a stale snapshot
+        as the last-written state, causing subsequent content-identical checks
+        to skip a write that never actually persisted.
 
-    async def _write_snapshot_best_effort(self) -> None:
+        Args:
+            path: Destination path for the snapshot file.
+            payload: Pre-serialised JSON string to write.  When provided
+                (the normal path from ``_write_snapshot_best_effort``), avoids
+                a redundant ``get_state_snapshot()`` + serialisation call.
+                When ``None``, serialises the current state inline (used by
+                direct callers such as tests).
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix('.json.tmp')
+        # Serialise the full snapshot (including snapshot_at) for the on-disk
+        # record.  Note: this is independent of the dedup payload built in
+        # _write_snapshot_best_effort; when a pre-built payload is passed,
+        # no second get_state_snapshot() call is needed.
+        if payload is None:
+            payload = json.dumps(self.get_state_snapshot(), default=str)
+        tmp_path.write_text(payload, encoding='utf-8')
+        os.replace(tmp_path, path)
+
+    async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.
 
         Derives the path from ``_project_root`` and offloads the JSON
@@ -2389,6 +2443,29 @@ class Scheduler:
         1 500 tasks), each write costs a few ms of disk I/O that is now
         transparent to the event loop.
 
+        **Throttle (time gate)**: writes are coalesced to at most one per
+        ``config.snapshot_min_write_interval_secs`` (default 250 ms).  The
+        first-ever write always proceeds.  Throttled ticks are O(1) — a
+        single monotonic subtraction, no JSON serialisation.  Pass
+        ``force=True`` to bypass the throttle and guarantee an immediate
+        write (used by ``flush_state_snapshot``).
+
+        **Content dedup**: after the time gate passes, ``get_state_snapshot()``
+        is called once and the dedup payload (without ``snapshot_at``) is built
+        via ``_build_snapshot_payload(state)``.  If byte-identical to
+        ``_last_snapshot_payload``, the disk write is skipped but
+        ``_last_snapshot_write_ts`` is still updated to prevent
+        re-serialisation on every tick of an unchanged steady state.  The full
+        disk payload (with ``snapshot_at``) is only serialised when a write is
+        actually needed, avoiding redundant work on dedup hits.
+        ``force=True`` always writes regardless of content equality.
+
+        Bookkeeping (``_last_snapshot_payload``, ``_last_snapshot_write_ts``)
+        is advanced only after a confirmed successful write: exceptions from
+        ``write_state_snapshot`` propagate to the outer try/except, which logs
+        a warning and returns without touching bookkeeping — preventing a
+        failed write from being recorded as the last-written state.
+
         Swallows all exceptions so the scheduler never stops ticking due to
         disk or serialisation errors.
         """
@@ -2396,16 +2473,70 @@ class Scheduler:
         # self._project_root = str(None) == 'None'.  Without this check,
         # Path('None') / 'data' / 'orchestrator' / 'scheduler_state.json'
         # would silently create a directory literally named ./None/ under the
-        # process CWD.  Refuse the write instead.
+        # process CWD.  Refuse the write instead.  This guard MUST run before
+        # any timestamp bookkeeping so a no-project-root scheduler does not
+        # advance _last_snapshot_write_ts for a write that never happens.
         if not self._project_root or self._project_root == 'None':
             return
+        # Leading-edge time throttle.  Coalesces ticks within the configured
+        # minimum interval at O(1) cost (monotonic subtraction only).
+        # force=True bypasses the gate to guarantee a fresh write (e.g. flush
+        # on quiescence/shutdown).
+        now = self._time_source()
+        if not force:
+            interval = self.config.snapshot_min_write_interval_secs
+            if (
+                self._last_snapshot_write_ts is not None
+                and (now - self._last_snapshot_write_ts) < interval
+            ):
+                return  # throttled: within the coalesce window, no I/O
+        # Time gate passed (or force=True): build the payload once.
+        # Note: payload is built ONLY after the gate passes so throttled ticks
+        # remain O(1) — they never reach this serialisation point.
         try:
+            # Compute the state dict once; _build_snapshot_payload uses it for
+            # the dedup comparison and disk_payload carries it to disk — no
+            # second get_state_snapshot() call on the write path.
+            state = self.get_state_snapshot()
+            payload = self._build_snapshot_payload(state)
+            # Content dedup: skip the disk write if the business state has not
+            # changed since the last write.  Still advance the timestamp so the
+            # next throttle window starts from now (prevents re-serialisation
+            # every tick during an unchanged steady state).
+            # force=True always writes, regardless of content equality.
+            if not force and payload == self._last_snapshot_payload:
+                self._last_snapshot_write_ts = now
+                return
+            # Build the disk payload (full state including snapshot_at) only
+            # after the dedup check — avoids serialising when a dedup skip
+            # applies.  Passed directly to write_state_snapshot to avoid a
+            # second get_state_snapshot() call on the actual write path.
+            disk_payload = json.dumps(state, default=str)
             path = (
                 Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
             )
-            await asyncio.to_thread(self.write_state_snapshot, path)
+            await asyncio.to_thread(self.write_state_snapshot, path, disk_payload)
+            # Bookkeeping advanced only after a confirmed successful write.
+            # write_state_snapshot propagates exceptions so these lines are
+            # unreachable when the disk write fails — preventing a stale
+            # snapshot from being recorded as last-written.
+            self._last_snapshot_payload = payload
+            self._last_snapshot_write_ts = now
         except Exception:
             logger.warning('_write_snapshot_best_effort failed', exc_info=True)
+
+    async def flush_state_snapshot(self) -> None:
+        """Force an immediate state snapshot write, bypassing the throttle.
+
+        Guarantees that the on-disk snapshot reflects the most recent in-memory
+        state regardless of how recently the last throttled write occurred.
+        Intended for shutdown or quiescence paths where a stale-on-disk read
+        would be incorrect.
+
+        The project_root guard still applies: if ``_project_root`` is unset,
+        this is a no-op (there is nowhere to write, even under force).
+        """
+        await self._write_snapshot_best_effort(force=True)
 
     async def handle_blast_radius_expansion(
         self,
