@@ -1636,14 +1636,15 @@ async def run_full_verification(
     for every subproject that has an orchestrator.yaml. Used by review
     checkpoints to check integration health across the whole codebase.
 
-    Discovery reuse: when ``config._module_configs`` is already populated (as it
-    always is after ``load_config``) and *project_root* resolves to the same
-    absolute path as ``config.project_root``, the pre-discovered dict is reused
-    directly and no additional filesystem walk is performed.  A fresh walk via
-    ``_discover_module_configs`` is retained as a fallback for the cases where
-    *project_root* differs from ``config.project_root`` or where the config was
-    constructed without going through ``load_config`` (e.g. direct instantiation
-    in tests that leave ``_module_configs`` empty).
+    Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
+    mean "discovery never ran".  When it holds any dict (including ``{}``,
+    meaning discovery ran and found no subprojects) and *project_root* resolves
+    to the same absolute path as ``config.project_root``, the pre-discovered
+    dict is reused directly and no additional filesystem walk is performed.  A
+    fresh walk via ``_discover_module_configs`` is retained as a fallback for
+    two cases: (1) *project_root* differs from ``config.project_root``; or (2)
+    the config was constructed without going through ``load_config`` (e.g.
+    direct instantiation in tests) so ``_module_configs`` is still ``None``.
 
     **Staleness note**: because the reuse path reads a snapshot captured at
     process startup (by ``load_config``), a new subproject whose
@@ -1659,7 +1660,7 @@ async def run_full_verification(
     from orchestrator.config import _discover_module_configs
 
     resolved = project_root.resolve()
-    if config._module_configs and resolved == config.project_root:
+    if config._module_configs is not None and resolved == config.project_root:
         module_configs = config._module_configs
     else:
         module_configs = _discover_module_configs(project_root)

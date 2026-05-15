@@ -3812,15 +3812,16 @@ class TestRunFullVerificationReuse:
     async def test_falls_back_to_discovery_when_module_configs_empty(
         self, tmp_path: Path, monkeypatch
     ):
-        """run_full_verification calls _discover_module_configs when config._module_configs is empty.
+        """run_full_verification calls _discover_module_configs when config._module_configs is None.
 
+        None is the sentinel meaning "discovery never ran" (the PrivateAttr default).
         With no orchestrator.yaml files under tmp_path, discovery returns {} and
         the global-fallback branch fires (run_verification once with no module_config).
         """
         from orchestrator.config import _discover_module_configs as real_discover
 
         config = OrchestratorConfig(project_root=tmp_path)
-        # config._module_configs left as default empty dict
+        # config._module_configs left as default None (never-discovered sentinel)
 
         call_count = 0
 

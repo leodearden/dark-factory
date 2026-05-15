@@ -464,12 +464,15 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
 
     Performance note:
     This performs a full recursive walk of *project_root* on every call.  In the normal flow
-    it is called once at startup via ``load_config``, which stores the result in
-    ``OrchestratorConfig._module_configs``.  ``run_full_verification`` reuses that cached dict
-    when its *project_root* arg resolves to the same absolute path as ``config.project_root``,
-    so no redundant walk occurs in the typical case.  On large repositories with many
-    non-excluded subdirectories the walk can be noticeable; adding project-specific directories
-    to ``_DISCOVERY_EXCLUDED_DIRS`` or reducing the nesting depth of your module layout will
+    it is called once at startup via ``load_config``, which stores the result (even an empty
+    ``{}``) in ``OrchestratorConfig._module_configs``.  ``run_full_verification`` reuses that
+    cached dict whenever ``_module_configs is not None`` (the ``None`` sentinel means
+    "discovery never ran") and *project_root* resolves to the same absolute path as
+    ``config.project_root``.  This means the typical case — including a monorepo with no
+    subproject yamls, which stores ``{}`` — truly avoids the redundant walk on every
+    ``run_full_verification`` call.  On large repositories with many non-excluded
+    subdirectories the walk can be noticeable; adding project-specific directories to
+    ``_DISCOVERY_EXCLUDED_DIRS`` or reducing the nesting depth of your module layout will
     help when the fallback walk path is exercised.
 
     Depth and scheduler coherence:
@@ -898,8 +901,11 @@ class OrchestratorConfig(BaseSettings):
     # Project
     project_root: Path = Field(default=Path('.'))
 
-    # Per-module overrides (populated by load_config via _discover_module_configs)
-    _module_configs: dict[str, ModuleConfig] = PrivateAttr(default_factory=dict)
+    # Per-module overrides (populated by load_config via _discover_module_configs).
+    # None means "discovery never ran" (default); any dict (including {}) means
+    # "discovery ran" — the empty-dict case is treated as a valid discovered-empty
+    # result, not as uninitialized.  See run_full_verification for the reuse guard.
+    _module_configs: dict[str, ModuleConfig] | None = PrivateAttr(default=None)
 
     @field_validator('project_root', mode='after')
     @classmethod
