@@ -94,3 +94,111 @@ class TestHashMarker:
         marker = fn(h)
         detail = marker + json.dumps([{'k': 'v'}])
         assert detail.startswith(fn(h))
+
+
+# ---------------------------------------------------------------------------
+# find_prior_review_suggestion
+# ---------------------------------------------------------------------------
+
+
+def _make_escalation_for_dedup(**overrides):
+    """Build a minimal Escalation object for dedup tests."""
+    from escalation.models import Escalation
+
+    defaults: dict = dict(
+        id='esc-42-0',
+        task_id='42',
+        agent_role='orchestrator',
+        severity='info',
+        category='review_suggestions',
+        summary='3 review suggestion(s) for triage',
+        detail='[]',
+    )
+    defaults.update(overrides)
+    return Escalation(**defaults)  # type: ignore[arg-type]
+
+
+class TestFindPriorReviewSuggestion:
+    def _import(self):
+        from orchestrator.review_suggestions.dedup import (
+            find_prior_review_suggestion,
+            hash_marker,
+        )
+        return find_prior_review_suggestion, hash_marker
+
+    def test_returns_matching_record(self):
+        """Returns the record whose category and detail match."""
+        fn, marker = self._import()
+        h = 'abc1234567890abc'
+        esc = _make_escalation_for_dedup(
+            category='review_suggestions',
+            detail=marker(h) + '[]',
+        )
+        result = fn([esc], h)
+        assert result is esc
+
+    def test_none_when_category_differs(self):
+        """Returns None if category is not 'review_suggestions'."""
+        fn, marker = self._import()
+        h = 'abc1234567890abc'
+        esc = _make_escalation_for_dedup(
+            category='review_issues',
+            detail=marker(h) + '[]',
+        )
+        assert fn([esc], h) is None
+
+    def test_none_when_hash_differs(self):
+        """Returns None if hash in detail does not match."""
+        fn, marker = self._import()
+        h = 'abc1234567890abc'
+        other_h = 'ffff000011112222'
+        esc = _make_escalation_for_dedup(
+            category='review_suggestions',
+            detail=marker(other_h) + '[]',
+        )
+        assert fn([esc], h) is None
+
+    def test_none_for_empty_iterable(self):
+        """Returns None for an empty prior-escalations list."""
+        fn, _ = self._import()
+        assert fn([], 'abc1234567890abc') is None
+
+    def test_none_when_detail_is_none(self):
+        """Returns None when detail attribute is None (falsy guard)."""
+        fn, _ = self._import()
+        esc = _make_escalation_for_dedup(
+            category='review_suggestions',
+            detail='',  # empty string is falsy
+        )
+        assert fn([esc], 'abc1234567890abc') is None
+
+    def test_none_when_detail_is_empty(self):
+        """Returns None when detail is empty string."""
+        fn, _ = self._import()
+        esc = _make_escalation_for_dedup(
+            category='review_suggestions',
+            detail='',
+        )
+        assert fn([esc], 'abc1234567890abc') is None
+
+    def test_returns_first_match_when_multiple(self):
+        """Returns the first matching record, skipping non-matches before it."""
+        fn, marker = self._import()
+        h = 'abc1234567890abc'
+        non_match = _make_escalation_for_dedup(
+            id='esc-42-0',
+            category='review_issues',
+            detail='some other detail',
+        )
+        match1 = _make_escalation_for_dedup(
+            id='esc-42-1',
+            category='review_suggestions',
+            detail=marker(h) + '[]',
+        )
+        match2 = _make_escalation_for_dedup(
+            id='esc-42-2',
+            category='review_suggestions',
+            detail=marker(h) + '[{"extra": 1}]',
+        )
+        result = fn([non_match, match1, match2], h)
+        assert result is match1
