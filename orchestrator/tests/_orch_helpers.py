@@ -36,7 +36,11 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     included.  The canonical example is ``OrchestratorConfig.for_module``
     (config.py:991): a plain instance method absent from ``model_fields``.
     This removes the need for the ~18 ad-hoc ``_spec.for_module = None``
-    patches that previously worked around the spec_set gap.
+    patches that previously worked around the spec_set gap.  The method walk
+    covers the full MRO down to (but not including) ``BaseModel``, so methods
+    inherited from any intermediate base class (e.g. a shared mixin) are also
+    included — spec_set should permit access to any non-BaseModel callable the
+    real object exposes.
 
     Pydantic v2 ``PrivateAttr`` members (e.g. ``OrchestratorConfig._module_configs``
     at config.py:971) are also included by walking ``model.__private_attributes__``.
@@ -66,6 +70,11 @@ def pydantic_spec(model: type[BaseModel]) -> type:
         members[name] = None
     # User-defined regular methods — exclude dunders, BaseModel API surface, and
     # anything already collected as a @property above.
+    # The walk covers the *full* MRO down to (but not including) BaseModel, so
+    # methods inherited from any intermediate base class (e.g. a shared mixin
+    # between BaseModel and the target model) are also included.  This is
+    # intentional: spec_set should permit access to any non-BaseModel callable
+    # the real object exposes, including helpers inherited from mixins.
     _basemodel_attrs = set(dir(BaseModel))
     for name, _ in inspect.getmembers(model, callable):
         if name.startswith('_'):
@@ -73,7 +82,12 @@ def pydantic_spec(model: type[BaseModel]) -> type:
         if name in _basemodel_attrs:
             continue
         if isinstance(getattr(model, name, None), property):
-            continue  # already collected above (defence-in-depth)
+            # Belt-and-braces: plain properties fail callable() and are already
+            # excluded by the predicate above.  This guard catches exotic
+            # descriptors that subclass property AND implement __call__, which
+            # would slip through the callable() filter but belong in the
+            # @property walk (already collected), not here.
+            continue
         members[name] = None
     # Pydantic v2 PrivateAttr members — stored in __private_attributes__ dict,
     # NOT in model_fields.  The underscore-name filter above intentionally skips

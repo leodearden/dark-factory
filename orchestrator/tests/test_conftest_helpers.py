@@ -146,18 +146,28 @@ def test_pydantic_spec_excludes_basemodel_inherited_members():
     only contains model_fields names — none of which are BaseModel API.  After
     step-2's fix (broader @property enumeration with BaseModel-inherited
     filtering), it must continue to pass.
+
+    Both read *and* write are checked so that a regression that accidentally
+    removes the ``_basemodel_attrs`` filter (e.g. a misspelling of the variable
+    name) is caught on the write path as well as the read path.
     """
     from _orch_helpers import pydantic_spec
 
     from orchestrator.config import OrchestratorConfig
 
     m = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    # --- read-side checks ---
     with pytest.raises(AttributeError):
         _ = m.model_dump            # BaseModel method
     with pytest.raises(AttributeError):
         _ = m.model_extra           # BaseModel @property
     with pytest.raises(AttributeError):
         _ = m.model_fields_set      # BaseModel @property
+    # --- write-side checks (guard against _basemodel_attrs filter regression) ---
+    with pytest.raises(AttributeError):
+        m.model_dump = MagicMock()      # BaseModel method — write must also raise
+    with pytest.raises(AttributeError):
+        m.model_validate = MagicMock()  # BaseModel classmethod — write must also raise
 
 
 def test_pydantic_spec_exposes_user_defined_methods():
