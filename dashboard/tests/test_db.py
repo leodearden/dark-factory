@@ -212,6 +212,48 @@ class TestDbPool:
         finally:
             await pool.close_all()
 
+    async def test_get_builds_sqlite_uri_via_path_as_uri(self, tmp_path):
+        """DbPool.get must build the SQLite connect URI using Path.as_uri().
+
+        The connect string passed to aiosqlite.connect must be exactly
+        ``f'{resolved.as_uri()}?mode=ro'`` — the canonical ``file:///`` form
+        produced by stdlib Path.as_uri().  This is the behavioral contract test
+        for task 1351; it is RED on the old ``file:/...`` form and GREEN after
+        the swap to as_uri().
+        """
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        captured_uri = None
+        captured_uri_kwarg = None
+
+        async def spy(*args, **kwargs):
+            nonlocal captured_uri, captured_uri_kwarg
+            captured_uri = args[0] if args else None
+            captured_uri_kwarg = kwargs.get('uri')
+            return await real_connect(*args, **kwargs)
+
+        resolved = db_path.resolve()
+        expected = f'{resolved.as_uri()}?mode=ro'
+
+        try:
+            with patch('aiosqlite.connect', spy):
+                conn = await pool.get(db_path)
+            assert conn is not None, 'pool.get returned None — could not open db'
+            assert captured_uri == expected, (
+                f'Expected URI {expected!r}, got {captured_uri!r}'
+            )
+            assert captured_uri.startswith('file:///'), (
+                f'Expected file:/// form (Path.as_uri()), got {captured_uri!r}'
+            )
+            assert captured_uri_kwarg is True, (
+                f'Expected uri=True kwarg, got uri={captured_uri_kwarg!r}'
+            )
+        finally:
+            await pool.close_all()
+
     async def test_close_all_clears_open_locks(self, tmp_path):
         """close_all() must drain _open_locks to prevent unbounded lock growth.
 
