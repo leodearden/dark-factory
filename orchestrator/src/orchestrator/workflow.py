@@ -2042,9 +2042,10 @@ class TaskWorkflow:
             counter = 0
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
-        new_metadata = dict(await self._merge_fresh_metadata(
+        new_metadata = await self._merge_fresh_metadata(
             metadata, log_context='infra-resume thrash counter',
-        ))
+        )
+        # Counters intentionally sourced from in-memory metadata; backend overlay is only for non-counter keys (e.g. memory_hints).
         new_metadata['consecutive_infra_resume_failures'] = counter
         new_metadata['last_infra_resume_iteration_count'] = current_iter_count
         self.task['metadata'] = new_metadata
