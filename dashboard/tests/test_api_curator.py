@@ -607,11 +607,17 @@ def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
     → 500.  The fix moves these resolutions into per-leg wrapper coroutines
     inside the gather so safe_gather_result absorbs the failure per-leg.
 
-    DbPool.get is patched at the class (dashboard.data.db.DbPool.get) with
-    AsyncMock(side_effect=OSError) because api_curator resolves pool.get on
-    the app.state.db instance — patching the instance method is cumbersome;
-    patching the class method covers metrics_db AND _cost_dbs→_project_scoped_dbs
-    in one shot.
+    NOTE: This is a *structural* regression guard, not a production-realistic
+    failure scenario.  In production, DbPool.get already catches OSError
+    internally (db.py:55) and returns None, so OSError from pool.get cannot
+    reach api_curator.  The test patches the entire DbPool.get method, bypassing
+    its own error handling, to verify that any unguarded exception raised by the
+    DB resolution code (from whatever cause) stays contained to the affected leg
+    rather than propagating as a 500.
+
+    DbPool.get is patched at the class (dashboard.data.db.DbPool.get) because
+    api_curator resolves pool.get on the app.state.db instance — patching the
+    class method covers metrics_db AND _cost_dbs→_project_scoped_dbs in one shot.
 
     Expected post-fix behaviour:
     - status 200 (no 500)

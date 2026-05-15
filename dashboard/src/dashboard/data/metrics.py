@@ -18,7 +18,7 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
 import httpx
@@ -49,10 +49,6 @@ logger = logging.getLogger(__name__)
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 # Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
 _LIST_TICKETS_LIMIT = 2000
-# Typed default for safe_gather_result in the fan_out_list_tickets per-root reducer.
-# Explicit annotation keeps pyright happy because the inferred type of (0, []) is
-# tuple[int, list[...]] which may not match the list[tuple[int, list[dict]]] annotation.
-_FAN_OUT_ROOT_DEFAULT: tuple[int, list[dict]] = (0, [])
 
 
 async def fan_out_list_tickets(
@@ -158,7 +154,8 @@ async def fan_out_list_tickets(
     # (0, []) default and logged at WARNING — same convention as the sibling legs
     # in api_curator (curator/sparks, curator/intervals, curator/fan_out).
     per_root_results: list[tuple[int, list[dict]]] = [
-        safe_gather_result(r, _FAN_OUT_ROOT_DEFAULT, 'curator/fan_out_root') for r in raw_results
+        safe_gather_result(r, cast('tuple[int, list[dict]]', (0, [])), 'curator/fan_out_root')
+        for r in raw_results
     ]
     pending_total = sum(c for c, _ in per_root_results)
     tickets: list[dict] = [t for _, ts in per_root_results for t in ts]

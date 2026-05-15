@@ -767,9 +767,10 @@ async def api_curator(request: Request) -> JSONResponse:
         _intervals_leg(),
         return_exceptions=True,
     )
-    # fan_out_list_tickets never raises today (all exceptions are swallowed
-    # internally), but safe_gather_result with a tuple default is used for
-    # consistency with the sibling legs and robustness against future changes.
+    # fan_out_list_tickets never raises a normal Exception (per-root failures are
+    # swallowed internally), but non-Exception BaseExceptions (CancelledError,
+    # KeyboardInterrupt, SystemExit) intentionally propagate via safe_gather_result
+    # so asyncio cancellation and process signals are not silenced during shutdown.
     raw_tickets, pending_total = safe_gather_result(fanout_r, ([], 0), 'curator/fan_out')
     curator_sparks = safe_gather_result(sparks_r, _empty_sparks, 'curator/sparks')
     intervals: list[CapInterval] = safe_gather_result(intervals_r, [], 'curator/intervals')
