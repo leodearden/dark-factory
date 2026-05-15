@@ -3946,6 +3946,7 @@ class TestRunFullVerificationReuse:
         Currently raises TypeError: unexpected keyword argument 'force_rediscover'.
         """
         import yaml
+
         from orchestrator.config import _discover_module_configs as real_discover
 
         # Populate the snapshot with only 'dashboard'
@@ -4007,6 +4008,7 @@ class TestRunFullVerificationReuse:
         an explicit force_rediscover=True call.
         """
         import yaml
+
         from orchestrator.config import _discover_module_configs as real_discover
 
         # Populate the snapshot with only 'dashboard' — BEFORE writing the second yaml
