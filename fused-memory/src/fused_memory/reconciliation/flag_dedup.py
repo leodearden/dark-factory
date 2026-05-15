@@ -55,14 +55,37 @@ the number of outage cycles (transient Mem0 failures) and is expected to
 remain far below 50; the self-healing property still holds over multiple
 cycles.
 
+Post-write confirmation (task-1400, corrected in task-1400 step-15)
+--------------------------------------------------------------------
+``add_memory`` returns an id in ``memory_ids``, but Mem0 may store the content
+under a DIFFERENT canonical id.  ``confirm_marker_persisted`` performs a
+read-back search immediately after each write to verify the marker is
+*findable* (not just written).  It returns the CANONICAL id from the matched
+``MemoryResult.id`` — not the unverified ``response.memory_ids[0]``.  On a
+miss it logs a WARNING and retries the search exactly once; returns ``None``
+after a failed retry, never raises.  The HIT-branch prior-deletion gate and
+the MISS-branch no-op WARNING are both driven off this confirmed id.
+
+Confirmation kind filter is intentionally ASYMMETRIC with the pre-write dedup
+search (design decision #6): it additionally includes ``run_id`` (the current
+run's id) so that surviving priors from earlier runs cannot masquerade as
+confirmation of the current write.  The two searches have different jobs:
+the pre-write dedup search asks "does ANY prior exist across all runs?"
+(must be run_id-agnostic); the confirmation search asks "did MY write for
+THIS run land?" (must be run_id-scoped).  Scoping confirmation by run_id is
+correct on both paths — HIT (new marker run_id=current matches; priors'
+older run_ids do not) and MISS (new marker still matches).
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
+- ``confirm_marker_persisted(memory_service, *, project_id, task_id, flag_type, run_id, log)``
+  — async, post-write confirmation search; returns canonical id or None.
 - ``filter_suppressed(memory_service, project_id, flags)`` — async, one
   project-scoped Mem0 search; drops suppressed flags before signature dedup.
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
-  ``filter_suppressed`` first then does Mem0 search + write + delete per flag;
-  best-effort (exceptions are logged, not raised).
+  ``filter_suppressed`` first then does Mem0 search + write + confirm + delete
+  per flag; best-effort (exceptions are logged, not raised).
 """
 from __future__ import annotations
 
@@ -99,6 +122,125 @@ class SuppressionPayload(TypedDict):
     content: str
     category: Literal['observations_and_summaries']
     metadata: _SuppressionMetadata
+
+
+async def confirm_marker_persisted(
+    memory_service: Any,
+    *,
+    project_id: str,
+    task_id: str,
+    flag_type: str,
+    run_id: str,
+    log: logging.Logger,
+) -> str | None:
+    """Confirm a just-written ``stage1_flag_marker`` is findable by a subsequent search.
+
+    Addresses the root-cause ID-mismatch bug: ``add_memory`` returns an id in
+    ``memory_ids``, but Mem0 may store the content under a DIFFERENT canonical
+    id.  This helper returns the CANONICAL id from ``MemoryResult.id`` — not
+    the unverified ``response.memory_ids[0]``.
+
+    The confirmation kind filter includes ``run_id`` (the current run) so that
+    surviving priors from earlier runs cannot masquerade as confirmation of this
+    write.  This is intentionally ASYMMETRIC with the pre-write dedup search
+    (which omits ``run_id`` so it can find priors from any earlier run).
+    The two searches have different jobs:
+
+    - Pre-write dedup: "does ANY prior exist across all runs?" → run_id-agnostic.
+    - Confirmation:    "did MY write for THIS run land?"       → run_id-scoped.
+
+    Strategy:
+    1. Run a confirmation search via ``find_prior_memories`` with
+       ``kind={'source':'stage1_flag_marker','flag_type':flag_type,'run_id':run_id}``.
+    2. If matches are found, lex-sort by id and return ``matches[0].id``
+       (deterministic canonical id; matches the module's lex-sort convention
+       and the LLM-side directive to emit a confirmed canonical id).
+    3. On a miss, log a WARNING (task_id + flag_type) and retry the search once.
+    4. Return the retry's lowest-lex id if found; otherwise log a final WARNING
+       and return ``None``.
+    5. Never raises — the whole body is wrapped in a best-effort try/except so
+       a non-search error path cannot abort ``dedup_flags``.
+
+    Mem0 read-after-write consistency:
+        Flag markers use ``category='observations_and_summaries'`` which routes
+        to Mem0 (not Graphiti).  The indexing-lag caveat in ``prompts/stage1.py``
+        (lines 189-196) is specific to Graphiti's async embedding pipeline and
+        does NOT apply here — Mem0 writes on this path are assumed to be
+        immediately visible to a subsequent ``search``.  If production evidence
+        shows otherwise, add a small bounded delay before the retry and increase
+        the retry count.
+
+    Args:
+        memory_service: Mem0 service with an async ``search`` method.
+        project_id: Project scope forwarded to ``find_prior_memories``.
+        task_id: Task identifier (str-coerced by ``find_prior_memories``).
+        flag_type: Flag type; used in both the ``kind`` filter and the WARNING.
+        run_id: Current run identifier; scoped into the kind filter so only
+             the marker written by THIS run is returned (not stale priors).
+        log: Logger to use (should be the ``flag_dedup`` module logger so
+             caplog-based tests can capture WARNINGs under the right namespace).
+
+    Returns:
+        The canonical ``MemoryResult.id`` (lowest lex) from the confirmation
+        search, or ``None`` if the marker could not be confirmed findable after
+        one retry.  Within ``dedup_flags`` this value is consumed only as a
+        truthy presence sentinel; the id string itself is not used for deletion
+        (deletion iterates the pre-write ``priors`` list directly).
+    """
+    try:
+        query = f'stage1 flag marker task {task_id} type {flag_type}'
+        # run_id is included so that stale priors from earlier runs do NOT match.
+        # Intentionally asymmetric with the pre-write dedup search (which omits
+        # run_id to find priors from any earlier run).  The confirmation's job is
+        # 'did MY write for THIS run land?' — a prior from an older run must not
+        # masquerade as confirmation of the current write.
+        kind = {'source': 'stage1_flag_marker', 'flag_type': flag_type, 'run_id': run_id}
+
+        matches = await find_prior_memories(
+            memory_service,
+            project_id=project_id,
+            task_id=task_id,
+            kind=kind,
+            query=query,
+            categories=['observations_and_summaries'],
+            limit=50,
+            log=log,
+        )
+        if matches:
+            return sorted(matches, key=lambda m: m.id)[0].id
+
+        # Miss on first attempt — log WARNING and retry once.
+        log.warning(
+            'confirm_marker_persisted: marker not found after write for task %s'
+            ' flag_type %s run_id %s — retrying search',
+            task_id, flag_type, run_id,
+        )
+        retry_matches = await find_prior_memories(
+            memory_service,
+            project_id=project_id,
+            task_id=task_id,
+            kind=kind,
+            query=query,
+            categories=['observations_and_summaries'],
+            limit=50,
+            log=log,
+        )
+        if retry_matches:
+            return sorted(retry_matches, key=lambda m: m.id)[0].id
+
+        # Retry also missed — log final WARNING and return None.
+        log.warning(
+            'confirm_marker_persisted: could not confirm flag marker for task %s'
+            ' flag_type %s run_id %s after retry — marker may be unfindable next cycle',
+            task_id, flag_type, run_id,
+        )
+        return None
+    except Exception as e:
+        log.warning(
+            'confirm_marker_persisted: unexpected error for task %s flag_type %s: %s',
+            task_id, flag_type, e,
+        )
+        return None
 
 
 async def filter_suppressed(
@@ -259,12 +401,15 @@ async def dedup_flags(
 
             # (2) Write replacement marker first.  If this fails, skip the
             #     delete so all priors remain intact for next cycle.
-            #     Also check that Mem0 actually persisted the write (non-empty
-            #     memory_ids); a silent no-op (empty memory_ids) skips deletion
-            #     so priors are preserved for the next cycle.
-            write_succeeded = False
+            #     After writing, confirm the marker is findable via a read-back
+            #     search (task-1400): add_memory may return a different id than
+            #     the one Mem0 actually stores.  Only a confirmed canonical id
+            #     proves the new marker is findable by the next cycle's search.
+            #     An unconfirmed write (write exception OR confirmation miss)
+            #     preserves priors for next cycle (best-effort at-least-one-marker).
+            confirmed_id: str | None = None
             try:
-                response = await memory_service.add_memory(
+                await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -278,12 +423,18 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                if getattr(response, 'memory_ids', None):
-                    write_succeeded = True
-                else:
+                confirmed_id = await confirm_marker_persisted(
+                    memory_service,
+                    project_id=project_id,
+                    task_id=tid,
+                    flag_type=ftype,
+                    run_id=run_id,
+                    log=logger,
+                )
+                if confirmed_id is None:
                     logger.warning(
-                        'flag_dedup: add_memory returned no memory_ids on HIT for task %s'
-                        ' flag_type %s — skipping prior deletion',
+                        'flag_dedup: replacement marker for task %s flag_type %s could not'
+                        ' be confirmed findable — skipping prior deletion',
                         tid, ftype,
                     )
             except Exception as e:
@@ -292,9 +443,13 @@ async def dedup_flags(
                     tid, ftype, e,
                 )
 
-            # (3) Delete ALL priors only if the new marker was successfully written.
+            # (3) Delete ALL priors only if the new marker was confirmed FINDABLE.
+            #     Gating on confirmed findability (not just memory_ids non-empty)
+            #     prevents a write whose returned id differs from the canonical id
+            #     from wiping priors with nothing recoverable next cycle.
             #     Each delete is wrapped individually so one bad delete does not
             #     abort the batch (self-healing: leftovers are retried next cycle).
+            write_succeeded = confirmed_id is not None
             if write_succeeded:
                 for prior in priors:
                     try:
@@ -323,8 +478,13 @@ async def dedup_flags(
             # per-(task_id, flag_type) bound.  The best-effort replacement
             # pattern on the HIT path ensures that once search recovers, the
             # next cycle collapses any accumulated duplicates back to a single row.
+            #
+            # Post-write confirmation (task-1400): after writing, confirm the
+            # marker is findable via a read-back search.  The WARNING is driven
+            # off the confirmed canonical id (None = unfindable), not off the
+            # unverified add_memory response.memory_ids.
             try:
-                miss_response = await memory_service.add_memory(
+                await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -338,10 +498,18 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                if not getattr(miss_response, 'memory_ids', None):
+                confirmed_id = await confirm_marker_persisted(
+                    memory_service,
+                    project_id=project_id,
+                    task_id=tid,
+                    flag_type=ftype,
+                    run_id=run_id,
+                    log=logger,
+                )
+                if confirmed_id is None:
                     logger.warning(
-                        'flag_dedup: add_memory returned no memory_ids on MISS for task %s'
-                        ' flag_type %s — recurring flag will not be detected next cycle',
+                        'flag_dedup: MISS marker for task %s flag_type %s could not be'
+                        ' confirmed findable — recurring flag will not be detected next cycle',
                         tid, ftype,
                     )
             except Exception as e:

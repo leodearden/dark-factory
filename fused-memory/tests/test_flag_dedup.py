@@ -158,8 +158,21 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     })
     prior_marker.id = 'prior-42'
 
+    # task-1400 step-16: confirmation must find a marker with the CURRENT run_id='r1'
+    # (the prior has run_id='r0' and does not match the run_id-scoped confirmation kind filter)
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-42-r1'
+
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    # task-1400: side_effect: suppression=[], pre-write HIT=[prior], confirmation=[new_marker_r1].
+    # Confirmation uses run_id-scoped kind filter (step-15) so it finds the new marker,
+    # not the stale prior (run_id='r0').  confirmed_id is set → delete proceeds.
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -177,10 +190,10 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     assert result[0]['persisted_from_run'] == 'r0'
     assert result[0]['last_seen_run_id'] == 'r1'
 
-    # (b) search was called twice: once for the suppression filter (filter_suppressed)
-    #     and once for the per-flag prior-marker lookup.  call_args refers to the last
-    #     call (per-flag), which must contain project_id='p' and mention task_id+flag_type.
-    assert memory_service.search.call_count == 2  # 1 suppression + 1 per-flag
+    # (b) search was called 3 times: suppression filter + per-flag prior-marker + confirmation.
+    #     call_args refers to the LAST call (confirmation search), which must mention
+    #     task_id+flag_type and use project_id='p'.
+    assert memory_service.search.call_count == 3  # 1 suppression + 1 per-flag + 1 confirmation
     # project_id must be passed as a kwarg (production code uses kwargs throughout)
     assert memory_service.search.call_args.kwargs['project_id'] == 'p'
     # query must strictly mention both the task_id and the flag_type (no permissive 'or')
@@ -223,7 +236,15 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
     })
 
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[wrong_source, wrong_flag_type, both_wrong])
+    # task-1400: supply side_effect list to satisfy the post-write confirmation search.
+    # The wrong-metadata rows are not stage1_flag_markers, so confirmation also misses.
+    # suppression filter, per-flag pre-write, confirmation first, confirmation retry:
+    memory_service.search = AsyncMock(side_effect=[
+        [wrong_source, wrong_flag_type, both_wrong],  # suppression filter (kind mismatch → no suppression)
+        [wrong_source, wrong_flag_type, both_wrong],  # per-flag search (all filtered → MISS)
+        [],  # confirmation search (miss — no stage1_flag_marker match)
+        [],  # confirmation retry (miss)
+    ])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
@@ -248,8 +269,8 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
         task_id='42', flag_type='missing_deliverable', run_id='r1',
     )
 
-    # Two search calls: 1 for the suppression filter (filter_suppressed) + 1 per-flag.
-    assert memory_service.search.call_count == 2
+    # Four search calls: 1 suppression + 1 per-flag + 2 confirmation (miss+retry).
+    assert memory_service.search.call_count == 4
 
 
 # ---------------------------------------------------------------------------
@@ -417,8 +438,20 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
     prior_marker = _make_memory_result(prior_metadata)
     prior_marker.id = 'prior-malformed'
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # The prior has a malformed run_id (None/''/ absent) so it does NOT match.
+    # Supply a separate well-formed replacement marker with run_id='r1'.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-malformed-r1'
+
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    # suppression=[], pre-write HIT=[prior_malformed], confirmation=[new_marker_r1]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -532,8 +565,19 @@ async def test_dedup_flags_prior_marker_atomic_replace_writes_new_and_deletes_pr
     })
     prior_marker.id = 'prior-123'
 
+    # task-1400 step-16: confirmation needs a marker with current run_id='r1'.
+    # Prior has run_id='r0' and does not match the run_id-scoped confirmation filter.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-123-r1'
+
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    # suppression=[], pre-write HIT=[prior], confirmation=[new_marker_r1]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -611,9 +655,23 @@ async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
     prior2 = _prior('p-2', 'r-prev')
     prior3 = _prior('p-3', 'r-earlier')
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # All priors have older run_ids so they won't match confirmation.
+    # Supply a separate new marker with run_id='r1' for the confirmation element.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-multi-r1'
+
     memory_service = AsyncMock()
-    # Return [prior2, prior3, prior1] to exercise lex-sort — p-1 is NOT first in this order
-    memory_service.search = AsyncMock(return_value=[prior2, prior3, prior1])
+    # suppression=[], pre-write HIT=[prior2, prior3, prior1] (exercises lex-sort),
+    # confirmation=[new_marker_r1] (current run, confirmed → delete proceeds)
+    memory_service.search = AsyncMock(
+        side_effect=[[], [prior2, prior3, prior1], [new_marker_r1]]
+    )
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -744,13 +802,25 @@ async def test_dedup_flags_atomic_replace_per_prior_delete_failure_logs_warning_
     prior1 = _prior('p-1', 'r0')
     prior2 = _prior('p-2', 'r-prev')
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # Both priors have older run_ids so they won't match confirmation.
+    # Supply a well-formed new marker with run_id='r1'.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-del-fail-r1'
+
     def _delete_side_effect(**kwargs):
         if kwargs.get('memory_id') == 'p-1':
             raise RuntimeError('delete p-1 failed')
         # p-2 succeeds — return None (AsyncMock awaitable returns None by default)
 
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior1, prior2])
+    # suppression=[], pre-write HIT=[prior1, prior2], confirmation=[new_marker_r1]
+    memory_service.search = AsyncMock(side_effect=[[], [prior1, prior2], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(side_effect=_delete_side_effect)
 
@@ -864,9 +934,31 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
 
     flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'test'}]
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id.
+    # All priors have their own run_ids (r-aaa, r-mmm, r-zzz) — none match the
+    # current run_id ('r1' or 'r2').  Supply well-formed new markers for each run.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '99',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-det-r1'
+
+    new_marker_r2 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '99',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r2',
+    })
+    new_marker_r2.id = 'new-det-r2'
+
     # Run 1: search returns [zzz, aaa, mmm] — aaa is NOT first
     memory_service_1 = AsyncMock()
-    memory_service_1.search = AsyncMock(return_value=[prior_zzz, prior_aaa, prior_mmm])
+    # suppression=[], pre-write=[zzz,aaa,mmm] (exercises lex-sort), confirmation=[new_r1]
+    memory_service_1.search = AsyncMock(
+        side_effect=[[], [prior_zzz, prior_aaa, prior_mmm], [new_marker_r1]]
+    )
     memory_service_1.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_1.delete_memory = AsyncMock(return_value=None)
 
@@ -879,7 +971,10 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
 
     # Run 2: search returns [mmm, zzz, aaa] — different order
     memory_service_2 = AsyncMock()
-    memory_service_2.search = AsyncMock(return_value=[prior_mmm, prior_zzz, prior_aaa])
+    # suppression=[], pre-write=[mmm,zzz,aaa] (different order), confirmation=[new_r2]
+    memory_service_2.search = AsyncMock(
+        side_effect=[[], [prior_mmm, prior_zzz, prior_aaa], [new_marker_r2]]
+    )
     memory_service_2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_2.delete_memory = AsyncMock(return_value=None)
 
@@ -993,7 +1088,7 @@ async def test_dedup_flags_miss_respects_add_memory_response_memory_ids(
 
 
 # ---------------------------------------------------------------------------
-# task-1165 step-1 — HIT path: respects add_memory response memory_ids
+# task-1165 step-1 / task-1400 amend — HIT path: delete gated on confirmation
 # ---------------------------------------------------------------------------
 
 
@@ -1015,16 +1110,17 @@ async def test_dedup_flags_miss_respects_add_memory_response_memory_ids(
     ],
 )
 @pytest.mark.asyncio
-async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
+async def test_dedup_flags_hit_delete_gated_on_confirmation_not_memory_ids(
     add_memory_response, expect_delete, expect_noop_warning, caplog
 ):
-    """HIT path: dedup_flags must inspect add_memory's return value.
+    """HIT path: prior deletion is gated on post-write confirmation, not memory_ids.
 
-    When add_memory returns an empty memory_ids list:
+    When add_memory is a silent no-op (confirmation misses, empty memory_ids):
     - delete_memory must NOT be called (priors preserved for next cycle)
     - a WARNING must be emitted containing task_id and flag_type
 
-    When add_memory returns a non-empty memory_ids list:
+    When add_memory succeeds and the marker is confirmed findable (non-empty memory_ids
+    is a proxy; the real gate is whether confirm_marker_persisted returns a canonical id):
     - delete_memory MUST be called once for the prior
     - no no-op WARNING should be emitted
     """
@@ -1046,8 +1142,27 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
     else:
         response = AddMemoryResponse(memory_ids=['new-marker-id'])
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # 'empty': add_memory is a no-op → no new marker with run_id='r1' indexed
+    #          → confirmation misses (only stale prior with run_id='r0' present)
+    #          → confirmed_id=None → write_succeeded=False → delete skipped.
+    # 'non_empty': add_memory wrote a marker with run_id='r1'
+    #              → supply a fresh marker with run_id='r1' for confirmation.
+    #              Prior has run_id='r0' and does NOT match confirmation filter.
+    if add_memory_response == 'empty':
+        search_side_effect = [[], [prior_marker], [], []]  # conf miss + retry miss
+    else:
+        new_marker_r1 = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r1',  # current run — matches confirmation kind filter
+        })
+        new_marker_r1.id = 'new-hit-resp-r1'
+        search_side_effect = [[], [prior_marker], [new_marker_r1]]  # conf finds new marker
+
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.search = AsyncMock(side_effect=search_side_effect)
     memory_service.add_memory = AsyncMock(return_value=response)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1070,15 +1185,15 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
     memory_service.add_memory.assert_called_once()
 
     if expect_delete:
-        # Non-empty memory_ids: delete should proceed
+        # Confirmation succeeded: delete should proceed
         memory_service.delete_memory.assert_called_once()
         del_kwargs = memory_service.delete_memory.call_args.kwargs
         assert del_kwargs.get('memory_id') == 'prior-hit-resp-test'
     else:
-        # Empty memory_ids: delete must be skipped
+        # Confirmation missed (no findable marker): delete must be skipped
         memory_service.delete_memory.assert_not_called()
 
-    # Check WARNING for no-op case
+    # Check WARNING for no-op case (task-1400: WARNING now comes from confirmation failure)
     warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     if expect_noop_warning:
         assert any('42' in m for m in warning_messages), (
@@ -1088,10 +1203,10 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
             f'Expected WARNING mentioning flag_type but got: {warning_messages}'
         )
     else:
-        # No no-op warning expected when memory_ids is non-empty
+        # No no-op warning expected when confirmation succeeded
         noop_warnings = [m for m in warning_messages if 'no memory_ids' in m or 'returned no memory_ids' in m]
         assert not noop_warnings, (
-            f'Unexpected no-op WARNING on non-empty memory_ids path: {noop_warnings}'
+            f'Unexpected no-op WARNING on confirmed path: {noop_warnings}'
         )
 
 
@@ -1434,7 +1549,9 @@ async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
     (a) Result has exactly one item — the task_id=99 flag.
     (b) task_id=42 flag was dropped.
     (c) add_memory called exactly once (MISS path for task_id=99 only).
-    (d) search called exactly twice (1 suppression + 1 per-flag-marker for task_id=99).
+    (d) search called exactly 4 times: 1 suppression + 1 per-flag-marker for task_id=99
+        + 2 confirmation searches (first + retry, both miss — no stage1_flag_marker written
+        yet from the perspective of the confirmation search).
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
@@ -1450,7 +1567,7 @@ async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
         if call_count[0] == 1:
             # First call is the filter_suppressed project-scoped query
             return [suppression_record]
-        # Subsequent calls are per-flag prior-marker queries (MISS path)
+        # Subsequent calls: per-flag prior-marker (MISS) and confirmation searches
         return []
 
     memory_service = AsyncMock()
@@ -1480,9 +1597,9 @@ async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
         f'Expected exactly 1 add_memory call (task_id=99 MISS) but got '
         f'{memory_service.add_memory.call_count}'
     )
-    # (d) search called exactly twice: 1 suppression + 1 per-flag-marker
-    assert memory_service.search.call_count == 2, (
-        f'Expected 2 search calls (1 suppression + 1 per-flag-marker) but got '
+    # (d) search called exactly 4 times: 1 suppression + 1 per-flag-marker + 2 confirmation
+    assert memory_service.search.call_count == 4, (
+        f'Expected 4 search calls (1 suppression + 1 per-flag + 2 confirmation) but got '
         f'{memory_service.search.call_count}'
     )
 
@@ -2051,3 +2168,684 @@ def test_write_suppression_record_importable_from_canonical_path():
     (see STAGE1_SYSTEM_PROMPT ## Flag Suppression Check section).
     """
     from fused_memory.reconciliation.flag_dedup import write_suppression_record  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# TestConfirmMarkerPersisted (task-1400 step-1+) — post-write confirmation helper
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmMarkerPersisted:
+    """Tests for confirm_marker_persisted(memory_service, *, project_id, task_id,
+    flag_type, run_id, log) — the canonical-id confirmation helper.
+
+    step-1: test_returns_canonical_id_from_search_not_response
+    step-3: test_miss_then_retry_finds_marker
+    step-5: test_miss_after_retry_returns_none_and_warns_never_raises
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_canonical_id_from_search_not_response(self):
+        """Returns MemoryResult.id from the search (canonical id), NOT any add_memory response id.
+
+        Step-1 RED: confirm_marker_persisted does not exist yet → ImportError.
+        When the confirmation search finds a matching marker, the returned id is
+        the MemoryResult.id ('canonical-XYZ'), not any id from an add_memory
+        response (which is the root-cause vector for the ID-mismatch bug).
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            confirm_marker_persisted,  # step-1: ImportError
+        )
+
+        confirmed_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'x',
+            'run_id': 'r1',
+        })
+        confirmed_marker.id = 'canonical-XYZ'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[confirmed_marker])
+
+        result = await confirm_marker_persisted(
+            memory_service,
+            project_id='p',
+            task_id='42',
+            flag_type='x',
+            run_id='r1',
+            log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+        )
+
+        assert result == 'canonical-XYZ', (
+            f"confirm_marker_persisted must return the canonical MemoryResult.id "
+            f"('canonical-XYZ'), not any add_memory response id; got {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_miss_then_retry_finds_marker(self, caplog):
+        """On a first-search miss, one WARNING is emitted and a retry search is performed.
+
+        Step-3 RED: current impl only does one search → on miss returns None immediately,
+        no WARNING emitted, no retry.
+
+        search side_effect: [[] (miss), [marker with id='retry-canon']] (retry hit)
+
+        Asserts:
+        (a) Returns the canonical id from the retry result ('retry-canon').
+        (b) memory_service.search was called exactly 2 times.
+        (c) Exactly one WARNING emitted BEFORE the retry containing task_id AND flag_type.
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
+
+        retry_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'x',
+            'run_id': 'r1',
+        })
+        retry_marker.id = 'retry-canon'
+
+        memory_service = AsyncMock()
+        # First call: miss ([]); second call (retry): hit
+        memory_service.search = AsyncMock(side_effect=[[], [retry_marker]])
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await confirm_marker_persisted(
+                memory_service,
+                project_id='p',
+                task_id='42',
+                flag_type='x',
+                run_id='r1',
+                log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+            )
+
+        # (a) Returns canonical id from retry result
+        assert result == 'retry-canon', (
+            f"Expected 'retry-canon' from retry but got {result!r}"
+        )
+        # (b) Exactly 2 search calls (initial + 1 retry)
+        assert memory_service.search.call_count == 2, (
+            f"Expected 2 search calls but got {memory_service.search.call_count}"
+        )
+        # (c) One WARNING mentioning task_id AND flag_type before the retry
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('42' in m and 'x' in m for m in warning_messages), (
+            f"Expected WARNING containing task_id '42' and flag_type 'x' but got: {warning_messages}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('search_side_effect,label', [
+        pytest.param([[], []], 'both_miss', id='both_miss'),
+        pytest.param(RuntimeError('search exploded'), 'exception', id='exception'),
+    ])
+    async def test_miss_after_retry_returns_none_and_warns_never_raises(
+        self, search_side_effect, label, caplog
+    ):
+        """On double-miss (or search exception), returns None without raising; final WARNING emitted.
+
+        Step-5 RED: current impl already handles both-miss → None path (should pass),
+        but the exception path (side_effect=RuntimeError) needs verification that
+        find_prior_memories degrades it to [] so helper still returns None not raises.
+
+        Two parametrizations:
+        - both_miss:  search returns [] twice → final WARNING + None
+        - exception:  search raises RuntimeError → find_prior_memories catches it → []
+                      → first miss → WARNING + retry → [] → final WARNING + None
+
+        Asserts:
+        (a) Returns None.
+        (b) Does NOT raise.
+        (c) A final WARNING is emitted containing task_id AND flag_type
+            with phrasing like 'could not confirm' (ops-greppable).
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
+
+        memory_service = AsyncMock()
+        if isinstance(search_side_effect, list):
+            memory_service.search = AsyncMock(side_effect=search_side_effect)
+        else:
+            # RuntimeError — find_prior_memories catches this and returns []
+            memory_service.search = AsyncMock(side_effect=search_side_effect)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await confirm_marker_persisted(
+                memory_service,
+                project_id='p',
+                task_id='55',
+                flag_type='stale_metadata',
+                run_id='r2',
+                log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+            )
+
+        # (a) Returns None
+        assert result is None, f"[{label}] Expected None but got {result!r}"
+
+        # (b) Does NOT raise (no exception propagated — verified by reaching here)
+
+        # (c) Final WARNING mentioning task_id AND flag_type with 'could not confirm'
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            '55' in m and 'stale_metadata' in m and 'could not confirm' in m
+            for m in warning_messages
+        ), (
+            f"[{label}] Expected final WARNING with 'could not confirm' + task_id + flag_type "
+            f"but got: {warning_messages}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ignores_stale_prior_with_different_run_id(self, caplog):
+        """Confirmation search must NOT accept a stale prior whose run_id differs from the current run.
+
+        The confirmation's job is 'did MY write for THIS run land?': a prior from an
+        earlier run must not masquerade as confirmation of the current write.
+
+        Setup: memory_service.search returns ONLY a stale prior with run_id='r0' on
+        BOTH the first call and the retry (side_effect=[[stale_prior],[stale_prior]]).
+        Call confirm_marker_persisted with run_id='r1'.
+
+        Asserts:
+        (a) Returns None — the prior's run_id 'r0' != current 'r1', must NOT be accepted.
+        (b) memory_service.search.call_count == 2 (miss → retry → miss).
+        (c) Final 'could not confirm' WARNING fires containing task_id + flag_type.
+
+        Fails until step-15 adds run_id to the confirmation kind filter so stale priors
+        are not incorrectly matched.
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
+
+        stale_prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'x',
+            'run_id': 'r0',  # OLD run — NOT the current run 'r1'
+        })
+        stale_prior.id = 'stale-prior'
+
+        memory_service = AsyncMock()
+        # Both calls return the stale prior (old run_id 'r0')
+        memory_service.search = AsyncMock(side_effect=[[stale_prior], [stale_prior]])
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await confirm_marker_persisted(
+                memory_service,
+                project_id='p',
+                task_id='42',
+                flag_type='x',
+                run_id='r1',
+                log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+            )
+
+        # (a) Returns None — stale prior must NOT be accepted as confirmation of 'r1' write
+        assert result is None, (
+            f"Expected None (stale prior run_id='r0' must not confirm run_id='r1') "
+            f"but got {result!r}"
+        )
+        # (b) Both attempts made: miss → retry → miss
+        assert memory_service.search.call_count == 2, (
+            f"Expected 2 search calls (initial + 1 retry) but got {memory_service.search.call_count}"
+        )
+        # (c) Final 'could not confirm' WARNING fires containing task_id + flag_type
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            '42' in m and 'x' in m and 'could not confirm' in m
+            for m in warning_messages
+        ), (
+            f"Expected final WARNING with 'could not confirm' + task_id '42' + flag_type 'x' "
+            f"but got: {warning_messages}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-1400 step-9 — dedup_flags HIT path: deletes priors only when confirmed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_path_no_delete_when_confirmation_misses(caplog):
+    """HIT path: when confirmation misses (marker not findable), priors are NOT deleted
+    and a WARNING is emitted.
+
+    Prior: [prior id='aaa']; add_memory returns memory_ids=['returned-id'];
+    confirmation: search side_effect = [[], []] (both miss — not findable).
+
+    Asserts:
+    (a) delete_memory NOT called (priors preserved — self-healing intact).
+    (b) WARNING mentioning task_id AND flag_type that the replacement could not be confirmed.
+    (c) Flag IS annotated with persisted_from_run (annotation extracted before write).
+
+    Fails until step-10 switches HIT gate from memory_ids to confirmed_id.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'aaa'
+
+    memory_service = AsyncMock()
+    # suppression=[], pre-write HIT=[prior], confirmation miss=[], confirmation retry=[]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [], []])
+    memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['returned-id']))
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) delete_memory NOT called — priors preserved when replacement unfindable
+    memory_service.delete_memory.assert_not_called()
+
+    # (b) WARNING that replacement could not be confirmed
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        ('42' in m or 'missing_deliverable' in m) and
+        ('could not confirm' in m or 'cannot confirm' in m or 'not confirmed' in m
+         or 'skipping' in m or 'skip' in m)
+        for m in warning_messages
+    ), (
+        f"Expected WARNING about unconfirmed replacement for task 42 but got: {warning_messages}"
+    )
+
+    # (c) Flag IS annotated (annotation extracted before write attempt)
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_path_deletes_when_confirmed(caplog):
+    """HIT path: when confirmation succeeds (marker findable), all priors are deleted.
+
+    Converse of the above: add_memory returns memory_ids=['returned-id'] (different
+    from canonical); confirmation search returns [new_marker id='canon-new'].
+    Priors must be deleted exactly as before (existing atomic-replace contract).
+
+    Fails until step-10 switches HIT gate from memory_ids to confirmed_id.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'aaa'
+
+    new_confirmed_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_confirmed_marker.id = 'canon-new'
+
+    memory_service = AsyncMock()
+    # suppression=[], pre-write HIT=[prior], confirmation hit=[new_marker]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_confirmed_marker]])
+    memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['returned-DIFFERENT']))
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # Prior deleted (atomic-replace contract holds when confirmed)
+    memory_service.delete_memory.assert_called_once()
+    del_kwargs = memory_service.delete_memory.call_args.kwargs
+    assert del_kwargs.get('memory_id') == 'aaa'
+
+    # Flag annotated
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+
+# ---------------------------------------------------------------------------
+# task-1400 step-11 — end-to-end integration: confirmation wired, full call sequence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_end_to_end_confirmation_wired():
+    """Integration regression: full call sequence with one MISS-happy and one HIT-happy flag.
+
+    Verifies the complete wired path so a later refactor cannot silently desync
+    the search-call sequence.
+
+    Flags:
+    - flag_A: no task_id/flag_type → no-signature, pass-through unchanged
+    - flag_B: MISS-happy (no prior); confirmation search finds the new marker
+    - flag_C: HIT-happy (prior exists); confirmation search confirms replacement
+
+    Search call sequence:
+    1. suppression sweep (filter_suppressed) → []
+    2. flag_B pre-write search → [] (MISS)
+    3. flag_B confirmation → [b_marker] (found)
+    4. flag_C pre-write search → [c_prior] (HIT)
+    5. flag_C confirmation → [c_new_marker] (found)
+
+    Asserts:
+    (a) flag_A returned unchanged (no-signature pass-through)
+    (b) flag_B NOT annotated (MISS → no persisted_from_run)
+    (c) flag_C annotated with persisted_from_run='r0' and last_seen_run_id='r1'
+    (d) add_memory called exactly twice (once for MISS, once for HIT replacement)
+    (e) delete_memory called exactly once (for C's prior)
+    (f) search called exactly 5 times (suppression + 2 pre-write + 2 confirmation)
+    (g) filter_suppressed still issues exactly one project-scoped sweep
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    b_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '10',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r1',
+    })
+    b_marker.id = 'b-canon'
+
+    c_prior = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '20',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    c_prior.id = 'c-prior'
+
+    c_new_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '20',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    c_new_marker.id = 'c-canon'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=[
+        [],          # (1) suppression sweep
+        [],          # (2) flag_B pre-write MISS
+        [b_marker],  # (3) flag_B confirmation hit
+        [c_prior],   # (4) flag_C pre-write HIT
+        [c_new_marker],  # (5) flag_C confirmation hit
+    ])
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flag_A = {'description': 'no-signature flag'}
+    flag_B = {'task_id': '10', 'flag_type': 'stale_metadata', 'description': 'B'}
+    flag_C = {'task_id': '20', 'flag_type': 'missing_deliverable', 'description': 'C'}
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=[flag_A, flag_B, flag_C],
+    )
+
+    # (a) flag_A unchanged (no-signature)
+    assert len(result) == 3
+    assert result[0] == flag_A
+
+    # (b) flag_B not annotated (MISS)
+    assert 'persisted_from_run' not in result[1]
+
+    # (c) flag_C annotated (HIT)
+    assert result[2].get('persisted_from_run') == 'r0'
+    assert result[2].get('last_seen_run_id') == 'r1'
+
+    # (d) add_memory called twice
+    assert memory_service.add_memory.call_count == 2, (
+        f"Expected 2 add_memory calls but got {memory_service.add_memory.call_count}"
+    )
+
+    # (e) delete_memory called once (for C's prior)
+    memory_service.delete_memory.assert_called_once()
+    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'c-prior'
+
+    # (f) search called exactly 5 times
+    assert memory_service.search.call_count == 5, (
+        f"Expected 5 search calls but got {memory_service.search.call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1400 step-7 — dedup_flags MISS path: confirmation called after write
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_miss_path_confirmed_marker_no_noop_warning(caplog):
+    """MISS path: when confirmation succeeds (even if returned id != add_memory response id),
+    no 'will not be detected next cycle' WARNING is emitted.
+
+    search side_effect:
+      [1] [] → suppression filter (no suppression)
+      [2] [] → per-flag pre-write MISS (no prior)
+      [3] [confirmation_marker id='canon-1'] → post-write confirmation hit
+
+    add_memory returns memory_ids=['returned-DIFFERENT'] (different from canonical id).
+
+    Asserts:
+    (a) add_memory called once.
+    (b) search called 3 times (suppression + pre-write + confirmation).
+    (c) NO 'recurring flag will not be detected next cycle' WARNING (marker confirmed findable).
+    (d) Flag is NOT annotated (MISS path → no persisted_from_run).
+
+    Fails until step-8 wires confirmation into MISS branch.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    confirmation_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '77',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r1',
+    })
+    confirmation_marker.id = 'canon-1'
+
+    memory_service = AsyncMock()
+    # [suppression filter=[], pre-write miss=[], confirmation hit=[marker]]
+    memory_service.search = AsyncMock(side_effect=[[], [], [confirmation_marker]])
+    memory_service.add_memory = AsyncMock(
+        return_value=AddMemoryResponse(memory_ids=['returned-DIFFERENT'])
+    )
+
+    flags = [{'task_id': '77', 'flag_type': 'stale_metadata', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) add_memory called once
+    memory_service.add_memory.assert_called_once()
+
+    # (b) search called 3 times: suppression + pre-write + confirmation
+    assert memory_service.search.call_count == 3, (
+        f"Expected 3 search calls (suppression+pre-write+confirmation) but got "
+        f"{memory_service.search.call_count}"
+    )
+
+    # (c) No 'will not be detected next cycle' WARNING (marker IS confirmed)
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any('will not be detected next cycle' in m for m in warning_messages), (
+        f"Expected no 'will not be detected next cycle' WARNING when confirmation "
+        f"succeeds, but got: {warning_messages}"
+    )
+
+    # (d) Flag not annotated (MISS path)
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_miss_path_confirmation_miss_emits_noop_warning(caplog):
+    """MISS path: when confirmation misses (double-miss), the 'will not be detected next cycle'
+    WARNING fires — driven off confirmation, not memory_ids.
+
+    search side_effect:
+      [1] [] → suppression filter
+      [2] [] → pre-write MISS
+      [3] [] → confirmation miss
+      [4] [] → confirmation retry miss
+
+    add_memory returns memory_ids=['stub-id'] (non-empty — old guard would have
+    suppressed the WARNING; confirmation-driven guard must still emit it).
+
+    Fails until step-8 wires confirmation into MISS branch.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    # suppression + pre-write miss + confirmation miss + confirmation retry miss
+    memory_service.search = AsyncMock(side_effect=[[], [], [], []])
+    memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['stub-id']))
+
+    flags = [{'task_id': '88', 'flag_type': 'missing_deliverable', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # add_memory called once
+    memory_service.add_memory.assert_called_once()
+
+    # WARNING driven by confirmation failure (not just empty memory_ids)
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        ('88' in m or 'missing_deliverable' in m) and
+        ('detected next cycle' in m or 'could not confirm' in m or 'will not be detected' in m)
+        for m in warning_messages
+    ), (
+        f"Expected WARNING about confirmation failure for task 88 but got: {warning_messages}"
+    )
+
+    # Flag not annotated (MISS path)
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+
+
+# ---------------------------------------------------------------------------
+# task-1400 step-14(B) — HIT path silent no-op does not wipe priors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_path_silent_noop_does_not_wipe_priors(caplog):
+    """HIT path: when add_memory is a silent no-op the stale prior must NOT
+    masquerade as confirmation, and priors must be preserved.
+
+    Models the deceptive no-op: add_memory returns non-empty memory_ids (as if
+    the write succeeded), but the new marker was never indexed by Mem0.  The
+    confirmation search can only find the surviving stale prior (run_id='r0').
+
+    With run_id scoping in the confirmation kind filter (step-15):
+    - confirmation finds only the prior (run_id='r0', != 'r1') → miss
+    - confirmed_id = None → write_succeeded = False → priors NOT deleted
+    - flag annotated with persisted_from_run='r0' and last_seen_run_id='r1'
+
+    search side_effect: [[], [prior], [prior], [prior]]
+      [1] suppression sweep        → []
+      [2] per-flag pre-write HIT   → [prior run_id='r0']
+      [3] confirmation first       → [prior run_id='r0'] (stale only, no new marker)
+      [4] confirmation retry       → [prior run_id='r0'] (still stale only)
+
+    Asserts:
+    (a) delete_memory NOT called (priors preserved — silent no-op protection).
+    (b) WARNING fires that the replacement could not be confirmed.
+    (c) Flag annotated with persisted_from_run='r0' and last_seen_run_id='r1'
+        (annotation extracted before write attempt).
+
+    Fails until step-15 adds run_id to the confirmation kind filter so that
+    the stale prior with run_id='r0' is not wrongly accepted as proof that the
+    run_id='r1' write landed.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'aaa'
+
+    memory_service = AsyncMock()
+    # suppression=[], pre-write HIT=[prior], confirmation=[prior], retry=[prior]
+    memory_service.search = AsyncMock(
+        side_effect=[[], [prior_marker], [prior_marker], [prior_marker]]
+    )
+    memory_service.add_memory = AsyncMock(
+        return_value=AddMemoryResponse(memory_ids=['returned-id'])
+    )
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) delete_memory NOT called — priors preserved (silent no-op protection)
+    memory_service.delete_memory.assert_not_called()
+
+    # (b) WARNING fires that replacement could not be confirmed
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        ('42' in m or 'missing_deliverable' in m) and
+        ('could not confirm' in m or 'cannot confirm' in m or 'not confirmed' in m
+         or 'skipping' in m or 'skip' in m)
+        for m in warning_messages
+    ), (
+        f"Expected WARNING about unconfirmed replacement but got: {warning_messages}"
+    )
+
+    # (c) Flag annotated (annotation extracted before write attempt, from the prior)
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
