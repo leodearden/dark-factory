@@ -3233,13 +3233,14 @@ Output JSON matching the schema. Every task must appear in the output.
             function do not silently skip counted events.
         14. If tripped and not already paused, call pause_scheduler (post-write).
 
-        Note on _escalation_event_count: incremented from _on_escalation and
-        _on_escalation_resolved callbacks without a lock (Python GIL prevents
-        torn writes, but the logical sequence here is still non-atomic).
-        Snapshotting once at step 2 makes the threshold check and the advance
-        consistent — concurrent callbacks cannot cause a "double-skip" where
-        the advance overshoots the events that triggered this digest.  The
-        counter is best-effort observability; a small drift under concurrency
+        Note on _escalation_event_count: callbacks fire inline on the asyncio
+        event loop thread, so there are no real concurrent writers — the
+        snapshot at step 2 guards against the logical interleaving where a
+        callback runs at an await point inside this function, not against torn
+        integer writes.  Snapshotting once at step 2 makes the threshold check
+        and the advance consistent — concurrent callbacks cannot cause a
+        "double-skip" where the advance overshoots the events that triggered
+        this digest.  The counter is best-effort observability; a small drift
         is acceptable.
 
         Task 1327 AFK hardening.
@@ -3262,14 +3263,14 @@ Output JSON matching the schema. Every task must appear in the output.
             # (4) Snapshot escalation delta.
             escalations_in_step = diff
 
-            # (4) Compute window timestamps.
+            # (5) Compute window timestamps.
             window_end = datetime.now(UTC).isoformat()
             window_start = self._last_digest_window_end_iso
             if not window_start:
                 # First digest: use 24h ago as window start.
                 window_start = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
 
-            # (5) Gather escalation stats (fail-open via aggregate_escalations).
+            # (6) Gather escalation stats (fail-open via aggregate_escalations).
             escalations_dir = (
                 Path(self.config.project_root) / self.config.escalation.queue_dir
             )
@@ -3277,7 +3278,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 escalations_dir, window_start, window_end
             )
 
-            # (6) Count done tasks in window (fail-open via count_done_in_window).
+            # (7) Count done tasks in window (fail-open via count_done_in_window).
             events_db_path = self.event_store.db_path if self.event_store else None
             done_count = (
                 digest_mod.count_done_in_window(
@@ -3287,16 +3288,16 @@ Output JSON matching the schema. Every task must appear in the output.
                 else 0
             )
 
-            # (7) Cost stats (fail-open via cost_in_window).
+            # (8) Cost stats (fail-open via cost_in_window).
             cost_stats = await digest_mod.cost_in_window(
                 self.cost_store, window_start, window_end
             )
 
-            # (8) Parked-task counts via public Scheduler properties (task 1327).
+            # (9) Parked-task counts via public Scheduler properties (task 1327).
             parked_live = self.scheduler.parked_live_count
             parked_window_churn = self.scheduler.parked_window_churn_count
 
-            # (9) Update EWA — done_count from EventStore (step 6) is the single
+            # (10) Update EWA — done_count from EventStore (step 7) is the single
             # source of truth so the EWA input matches the rendered digest figure.
             new_ewa = digest_mod.update_ewa(
                 prev_ewa=self._ewa_value,
@@ -3305,7 +3306,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 alpha=self.config.digest_ewa_alpha,
             )
 
-            # (10) Trip flag and anomaly flags.
+            # (11) Trip flag and anomaly flags.
             tripped = new_ewa >= self.config.digest_ewa_threshold
             anomaly_flags = {
                 'cost_spike': (
@@ -3319,7 +3320,8 @@ Output JSON matching the schema. Every task must appear in the output.
                 'infra_dedupe_active': escalation_stats.dedupe_children_total > 0,
             }
 
-            # (11) Resolve digest directory.
+            # (12) Resolve digest directory, assemble inputs, and write digest file
+            # (fail-open via write_digest_entry — never raises).
             if self.config.digest_dir:
                 digest_dir = Path(self.config.digest_dir)
             else:
@@ -3341,7 +3343,6 @@ Output JSON matching the schema. Every task must appear in the output.
                 dry_run_proposals=[],
             )
 
-            # Write the digest file (never raises — fail-open).
             digest_mod.write_digest_entry(digest_dir, inputs)
 
             # (13) Advance EWA state and counters.
@@ -3352,7 +3353,7 @@ Output JSON matching the schema. Every task must appear in the output.
             self._last_digest_event_count = event_count_snapshot
             self._last_digest_window_end_iso = window_end
 
-            # (13) EWA trip: pause scheduler AFTER the digest is written so the
+            # (14) EWA trip: pause scheduler AFTER the digest is written so the
             # markdown captures the trip-causing state.
             if tripped and not self.scheduler.is_paused:
                 await self.pause_scheduler(f'ewa_trip_{new_ewa:.4f}')

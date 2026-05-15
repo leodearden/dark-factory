@@ -39,27 +39,24 @@ class TestUpdateEwa:
         result = digest.update_ewa(prev_ewa=0.0, escalations_in_step=4, done_in_step=0, alpha=0.3)
         assert result == pytest.approx(1.2), f"Expected 1.2; got {result}"
 
-    def test_esc_zero_returns_prev_unchanged(self) -> None:
-        """esc==0 short-circuits: returns prev_ewa unchanged regardless of done_in_step.
+    def test_esc_zero_raises_value_error(self) -> None:
+        """esc==0 raises ValueError — caller contract violation.
 
-        When escalations_in_step == 0 there is no escalation signal to mix in.
-        Short-circuiting preserves the previous EWA rather than pulling it
-        toward zero with a vacuous 0/done ratio.
-        esc=0, done=5, prev=1.0, alpha=0.3 → 1.0 (no update).
+        The digest gate guarantees escalations_in_step >= N >= 1 before
+        calling update_ewa, so esc=0 is always a caller error.  Raising keeps
+        the unreachable path loud rather than silently returning a stale EWA.
         """
-        result = digest.update_ewa(prev_ewa=1.0, escalations_in_step=0, done_in_step=5, alpha=0.3)
-        assert result == pytest.approx(1.0), f"Expected 1.0 (prev unchanged); got {result}"
+        with pytest.raises(ValueError, match='escalations_in_step must be > 0'):
+            digest.update_ewa(prev_ewa=1.0, escalations_in_step=0, done_in_step=5, alpha=0.3)
 
-    def test_esc_zero_done_zero_returns_prev_unchanged(self) -> None:
-        """(esc=0, done=0) edge case: short-circuit keeps prev_ewa; does NOT divide by zero.
+    def test_esc_zero_done_zero_raises_value_error(self) -> None:
+        """(esc=0, done=0) edge case raises ValueError — not a divide-by-zero path.
 
-        This is the formerly dangerous (0, 0) case — max(done, 1)=1 would give
-        ratio=0 which is fine mathematically, but the short-circuit is reached
-        first and the denominator guard is never exercised.
-        esc=0, done=0, prev=0.42, alpha=0.3 → 0.42 (no update).
+        max(done, 1) would handle (esc=0, done=0) mathematically but the
+        ValueError guard fires first, keeping the caller contract explicit.
         """
-        result = digest.update_ewa(prev_ewa=0.42, escalations_in_step=0, done_in_step=0, alpha=0.3)
-        assert result == pytest.approx(0.42), f"Expected 0.42 (prev unchanged); got {result}"
+        with pytest.raises(ValueError, match='escalations_in_step must be > 0'):
+            digest.update_ewa(prev_ewa=0.42, escalations_in_step=0, done_in_step=0, alpha=0.3)
 
     def test_alpha_zero_returns_prev_unchanged(self) -> None:
         """alpha=0.0: EWA is never updated — returns prev unchanged.
