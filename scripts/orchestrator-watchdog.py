@@ -12,6 +12,7 @@ scripts/orchestrator-watchdog.timer).
 """
 
 import subprocess
+import time
 
 # (port, systemd unit name) pairs to watch.  Port order matches the
 # config files: dark-factory=8102 (orchestrator/config.yaml:38),
@@ -134,20 +135,14 @@ def restart_unit(unit: str) -> None:
         log(f"systemctl start {unit} timed out after 45s")
 
 
-def _read_uptime_secs() -> float | None:
-    """Return current system uptime in seconds from /proc/uptime, or None."""
-    try:
-        with open("/proc/uptime") as f:
-            return float(f.read().split()[0])
-    except OSError:
-        return None
-
-
 def _unit_start_elapsed_secs(unit: str) -> float | None:
     """Seconds since *unit*'s main process started (monotonic clock), or None.
 
     Queries ``ExecMainStartTimestampMonotonic`` (microseconds since boot) via
-    ``systemctl --user show`` and compares it against ``/proc/uptime``.
+    ``systemctl --user show`` and compares it against
+    ``time.clock_gettime(time.CLOCK_MONOTONIC)`` — the same CLOCK_MONOTONIC
+    source systemd uses — so a host suspend no longer skews the elapsed
+    estimate (unlike /proc/uptime which advances during suspend).
 
     Returns None if the unit has no recorded start time, the value cannot be
     parsed, or any subprocess/OS error occurs — callers must treat None as
@@ -178,8 +173,9 @@ def _unit_start_elapsed_secs(unit: str) -> float | None:
                 return None
             if start_mono_us == 0:
                 return None  # unit has never started (or no PID recorded)
-            now_secs = _read_uptime_secs()
-            if now_secs is None:
+            try:
+                now_secs = time.clock_gettime(time.CLOCK_MONOTONIC)
+            except OSError:
                 return None
             return max(0.0, now_secs - start_mono_us / 1_000_000)
         return None
