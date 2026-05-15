@@ -939,3 +939,88 @@ class TestDigestConfig:
         assert config.digest_ewa_alpha == pytest.approx(0.5)
         assert isinstance(config.digest_ewa_threshold, float)
         assert config.digest_ewa_threshold == pytest.approx(99.9)
+
+
+# ---------------------------------------------------------------------------
+# TestSchedulerDoneCounter (step-15)
+# ---------------------------------------------------------------------------
+
+# A minimal success response — extract_rejection({}) returns None (success).
+_MCP_SUCCESS = {}
+
+# A non-transient, non-terminal-exit rejection that causes SetTaskStatusRejected.
+_MCP_REJECTION = {
+    'result': {
+        'structuredContent': {
+            'error': 'some_rejection',
+            'success': False,
+        }
+    }
+}
+
+
+class TestSchedulerDoneCounter:
+    """Tests for Scheduler.done_transitions_total monotonic counter (step-16 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    @pytest.mark.asyncio
+    async def test_done_transitions_increments_on_done(self, tmp_path: Path) -> None:
+        """set_task_status('tX', 'done') increments done_transitions_total."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
+
+        assert scheduler.done_transitions_total == 0
+
+        await scheduler.set_task_status('t1', 'done')
+        await scheduler.set_task_status('t2', 'done')
+        await scheduler.set_task_status('t3', 'done')
+
+        assert scheduler.done_transitions_total == 3, (
+            f'Expected 3 after three done transitions; got {scheduler.done_transitions_total}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_done_status_does_not_increment(self, tmp_path: Path) -> None:
+        """Non-done status (e.g. 'in-progress') does NOT increment the counter."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
+
+        await scheduler.set_task_status('t1', 'in-progress')
+        await scheduler.set_task_status('t2', 'blocked')
+
+        assert scheduler.done_transitions_total == 0, (
+            f'Expected 0 for non-done statuses; got {scheduler.done_transitions_total}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejected_done_does_not_increment(self, tmp_path: Path) -> None:
+        """A rejected set_task_status('t1', 'done') does NOT increment the counter."""
+        from orchestrator.scheduler import SetTaskStatusRejected
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_REJECTION)
+
+        with pytest.raises(SetTaskStatusRejected):
+            await scheduler.set_task_status('t1', 'done')
+
+        assert scheduler.done_transitions_total == 0, (
+            f'Expected 0 after a rejected done; got {scheduler.done_transitions_total}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mark_done_increments_counter(self, tmp_path: Path) -> None:
+        """mark_done routes through set_task_status and increments done_transitions_total."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
+
+        await scheduler.mark_done('t42', kind='merged', sha='abc123')
+
+        assert scheduler.done_transitions_total == 1, (
+            f'Expected 1 after mark_done; got {scheduler.done_transitions_total}'
+        )
