@@ -392,6 +392,7 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 'Internal: SUCCESS without merge_sha — provenance unconstructable',
                 escalate_to_human=True,
+                # Marker only — no runtime effect on direct-submit path; see _mark_blocked docstring.
                 terminal_state_is_the_bug=True,
             )
         try:
@@ -409,6 +410,7 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                # Marker only — no runtime effect on direct-submit path; see _mark_blocked docstring.
                 terminal_state_is_the_bug=True,
             )
         logger.info(
@@ -1054,6 +1056,7 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 f'Unhandled set_task_status rejection: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                # Marker only — no runtime effect on direct-submit path; see _mark_blocked docstring.
                 terminal_state_is_the_bug=True,
             )
 
@@ -4135,6 +4138,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return await self._mark_blocked(
                 f'Pre-PLAN recovery rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                # Marker only — no runtime effect on direct-submit path; see _mark_blocked docstring.
                 terminal_state_is_the_bug=True,
             )
         return WorkflowOutcome.DONE
