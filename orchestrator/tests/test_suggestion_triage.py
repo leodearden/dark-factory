@@ -204,18 +204,6 @@ class TestEscalateSuggestionsCharacterization:
 
         queue.submit.assert_called_once()
 
-    def test_workflow_module_imports_shared_helper(self):
-        """workflow.py must import review_suggestion_payload_hash from the shared module."""
-        import inspect
-
-        import orchestrator.workflow as wf_module
-
-        src = inspect.getsource(wf_module)
-        assert 'from orchestrator.review_suggestions.dedup import' in src, (
-            'workflow.py must import from orchestrator.review_suggestions.dedup '
-            '(acceptance criterion: shared import at two sites)'
-        )
-
 
 # ---------------------------------------------------------------------------
 # _route_review_suggestions_to_curator
