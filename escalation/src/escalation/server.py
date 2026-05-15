@@ -158,6 +158,17 @@ def create_server(
                 f'auto-resolved: task already terminal (status={status})',
                 resolved_by='escalation-mcp-pre-submit-check',
             )
+            if resolved is None:
+                # resolve() could not re-read the record immediately after submit.
+                # Unlikely in practice, but the escalation may remain pending.
+                # Fail-safe: return esc.to_dict() (status='pending') rather than
+                # dropping the escalation.  The inconsistency is logged here.
+                logger.warning(
+                    'task %s: queue.resolve() returned None after terminal auto-resolve '
+                    'submit for escalation %s; escalation may remain pending. '
+                    'Returning pre-resolve record as fallback.',
+                    esc.task_id, esc.id,
+                )
             return (resolved or esc).to_dict()
 
         # Non-terminal or unknown status → submit normally
