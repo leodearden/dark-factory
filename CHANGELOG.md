@@ -79,6 +79,9 @@ reads) — the dashboard does **not** consume `reservation_installed` events fro
 the event_store.  No `scripts/`, SQL, JS/TS, or documentation file consumes or
 filters the event.
 
-No emit site in this repo has ever set `data.reason` on `reservation_installed`.
-The renamed event's pre-1230 form (`reservation_installed` +
+No emit site in the current (post-task-1230) tree sets `data.reason` on
+`reservation_installed`.  (Before task 1230 the reserve-now short-circuit did
+emit `reservation_installed` with `reason='reserve_now'`; removed in
+`deb8f426ab` — historical event-store rows predating task 1230 may still
+contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 `data.reason='reserve_now'`) had zero in-repo consumers.
