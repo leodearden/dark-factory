@@ -1831,8 +1831,8 @@ class Scheduler:
         (ii) **Authoritative snapshot** (preferred for "always-current" needs)
              — call ``OverrideStore.get_pin_queue(project_root)`` or read
              ``snapshot.pin_queue`` from the scheduler's public API directly.
-             This is what the 1229b MCP ``get_pin_queue`` tool and the
-             dashboard scheduler page both use; no event recomposition needed.
+             No event recomposition needed; used by consumers such as MCP
+             ``get_pin_queue`` tools and dashboard scheduler pages.
 
         See also: ``EventType`` pin-events comment block in ``event_store.py``
         for the same contract at the taxonomy definition.
