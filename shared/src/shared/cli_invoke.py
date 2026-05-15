@@ -411,7 +411,7 @@ async def invoke_with_cap_retry(
                     if usage_gate and usage_gate.soonest_resets_at else None
                 ),
                 'next_probe_in_s': round(cooldown, 1),
-            }))
+            }, default=str))
             last_cap_wait_log_at = now
 
     account_name = ''
