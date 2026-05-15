@@ -324,28 +324,31 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
 
 
 def test_cancel_handler_502_detail_bounded_for_httpstatuserror(client):
-    """HTTPStatusError with a large response body yields a bounded 502 detail.
+    """HTTPStatusError with a long message arg yields a truncated 502 detail.
 
-    httpx.HTTPStatusError.__str__ embeds the response body in its string
-    representation, so a large upstream error response could leak through the
-    502 detail field.  This test verifies that _CANCEL_DETAIL_EXC_CHAR_LIMIT
-    bounds the detail length without asserting on the exact HTTPStatusError
-    __str__ format (which is not part of the httpx public contract and could
-    change across httpx versions).
+    Pins truncation of str(exc) for httpx.HTTPStatusError, complementing the
+    sibling test_cancel_handler_502_detail_truncates_exception_text (which uses
+    ValueError).  Both exception types are caught by the handler; this test
+    confirms the cap is applied uniformly.
 
-    Complements test_cancel_handler_502_detail_truncates_exception_text (which
-    uses ValueError for a stable contract) by exercising the actual upstream
-    scenario the truncation cap was designed to defend against.
+    Important: httpx.HTTPStatusError.__str__ (inherited from BaseException)
+    returns self.args[0] verbatim for the single-arg construction — i.e. just
+    the message string, NOT the response body.  The response body is NOT
+    embedded in str(exc).  Therefore the fixture puts the long string in the
+    MESSAGE arg ('X' * 300), not in the response body; the response object is
+    constructed minimally only to satisfy the HTTPStatusError constructor.
+
+    Assertions (mirror the ValueError sibling at test_cancel_handler_502_detail_truncates_exception_text):
+      (a) response is 502
+      (b) detail contains exactly _CANCEL_DETAIL_EXC_CHAR_LIMIT consecutive 'X'
+          chars AND does NOT contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 consecutive
+          'X' chars (i.e. is truncated at the cap)
     """
-    large_body = b'E' * 10000
+    long_msg = 'X' * 300
     exc = httpx.HTTPStatusError(
-        'Server Error',
+        long_msg,
         request=httpx.Request('POST', 'http://x'),
-        response=httpx.Response(
-            500,
-            content=large_body,
-            request=httpx.Request('POST', 'http://x'),
-        ),
+        response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
     )
     with patch(_PATCH_TARGET, new=AsyncMock(side_effect=exc)):
         resp = client.post(
@@ -355,14 +358,12 @@ def test_cancel_handler_502_detail_bounded_for_httpstatuserror(client):
 
     assert resp.status_code == 502
     detail = resp.json().get('detail', '')
-    # Each per-URL error segment is '{url}: {typename}: {str(exc)[:LIMIT]}'.
-    # With the default single-URL config the total is bounded by the limit
-    # plus a small fixed overhead (URL + type name + separators).  Use 3×
-    # the limit as a generous ceiling so the assertion catches truncation
-    # failures without depending on URL/typename lengths.
-    max_detail = 3 * _CANCEL_DETAIL_EXC_CHAR_LIMIT
-    assert len(detail) <= max_detail, (
-        f'502 detail must be bounded (≤{max_detail} chars); got {len(detail)} chars'
+    # (b) truncation-pinning dual assertion (mirrors ValueError sibling)
+    assert 'X' * _CANCEL_DETAIL_EXC_CHAR_LIMIT in detail, (
+        'Expected first _CANCEL_DETAIL_EXC_CHAR_LIMIT X chars in detail'
+    )
+    assert 'X' * (_CANCEL_DETAIL_EXC_CHAR_LIMIT + 1) not in detail, (
+        'Detail must not contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 X chars (exc text not truncated)'
     )
 
 
