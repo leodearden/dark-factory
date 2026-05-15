@@ -27,6 +27,26 @@ class DbPool:
     Call :meth:`get` to obtain a connection for a given path.  The connection
     is created on first access and reused thereafter.  Call :meth:`close_all`
     during shutdown.
+
+    **_open_locks growth is bounded by construction.**
+    Every path passed to :meth:`get` is ``root / <fixed-rel-path>`` where
+    ``root`` ∈ ``{config.project_root} ∪ config.known_project_roots``.
+    Both sets are fixed once at startup (``DashboardConfig.from_env`` reads
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS``; ``__post_init__`` resolves them; they
+    are never mutated at runtime).  The ``rel-path`` values are fixed literals
+    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``) plus the
+    six fixed ``@property`` paths on ``DashboardConfig``.  Therefore::
+
+        |_open_locks| ≤ (1 + len(known_project_roots)) × 2 + 6
+
+    Per-path lock entries are retained for the process lifetime (cleared only
+    in :meth:`close_all`) — this is *intentional*: evicting an entry while
+    another coroutine holds the lock reintroduces an absent→present race that
+    would require refcount machinery to make safe.
+
+    **Guardrail**: any future caller that passes per-run or otherwise-unbounded
+    paths to :meth:`get` MUST revisit lock eviction with a refcount-gated
+    scheme, because naive per-path deletion is not safe under concurrent access.
     """
 
     def __init__(self) -> None:
@@ -35,6 +55,7 @@ class DbPool:
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
         # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
+        # Growth is bounded; see class docstring for the structural argument.
         self._open_locks: dict[Path, asyncio.Lock] = {}
         self._open_locks_lock: asyncio.Lock = asyncio.Lock()
 
