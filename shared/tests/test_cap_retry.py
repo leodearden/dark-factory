@@ -1123,22 +1123,25 @@ class TestAllAccountsCappedException:
 
 
 # ===================================================================
-# TestCapRetryMaxRetries
+# TestCapRetryCountGuardVestigial
 # ===================================================================
 
 
 @pytest.mark.asyncio
-class TestCapRetryMaxRetries:
-    """max_cap_retries guard: raise AllAccountsCappedException after N cap hits."""
+class TestCapRetryCountGuardVestigial:
+    """max_cap_retries is vestigial: the count guard was removed in task-1365.
 
-    async def test_raises_after_max_cap_retries(self):
+    All methods assert count-independent behaviour: cap hits never raise on
+    count alone. The only raising bound is cap_wait_sanity_secs.
+    """
+
+    async def test_count_guard_is_vestigial(self):
         """max_cap_retries is vestigial: cap hits do NOT raise on count.
 
         Previously asserted that 3 cap hits with max_cap_retries=3 raised
-        AllAccountsCappedException. After the count guard is removed (step-2),
-        the guard no longer fires and the same cap hits + success produces a
-        successful result. This rewrite pins the new count-independent behaviour.
-        RED until step-2 removes the count guard.
+        AllAccountsCappedException. After the count guard was removed, the guard
+        no longer fires and the same cap hits + success produces a successful
+        result. Pins the count-independent behaviour post-task-1365.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1159,12 +1162,12 @@ class TestCapRetryMaxRetries:
             )
         assert got.success is True
 
-    async def test_no_exception_when_cap_hits_under_limit(self):
+    async def test_excess_cap_hits_succeed_count_independent(self):
         """Cap hits never raise on count (count guard is vestigial).
 
         Rewritten from the old test that verified 2 < max_cap_retries=3 succeeds.
         Now asserts count-independence: even 10 cap hits with max_cap_retries=3
-        succeed because the count guard no longer exists. RED until step-2.
+        succeed because the count guard no longer exists.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1186,8 +1189,8 @@ class TestCapRetryMaxRetries:
         assert got.success is True
         assert mock_inv.await_count == 11  # 10 cap hits + 1 success
 
-    async def test_none_disables_max_cap_retries(self):
-        """max_cap_retries=None disables the retry count guard; 5 cap hits then success."""
+    async def test_max_cap_retries_none_is_vestigial(self):
+        """max_cap_retries=None: count guard was removed; 5 cap hits then success."""
         gate = _mock_gate(
             account_count=1,
             before_invoke=AsyncMock(side_effect=['tok'] * 6),
@@ -1240,20 +1243,20 @@ class TestCapRetryMaxRetries:
 
 
 # ===================================================================
-# TestCapRetryDeadline
+# TestCapRetrySanityBound
 # ===================================================================
 
 
 @pytest.mark.asyncio
-class TestCapRetryDeadline:
+class TestCapRetrySanityBound:
     """cap_wait_sanity_secs guard: raise AllAccountsCappedException when elapsed exceeds limit.
 
-    Tests rewritten in step-3 to use cap_wait_sanity_secs (added in step-4).
-    cap_retry_deadline_secs=None is passed explicitly to prevent the old deadline
-    from masking the new-parameter test.  RED until step-4 adds the parameter.
+    Tests use cap_wait_sanity_secs (added in task-1365/step-4).
+    cap_retry_deadline_secs=None is passed explicitly because that parameter
+    is now vestigial and must not mask the sanity-bound check.
     """
 
-    async def test_raises_when_deadline_exceeded(self):
+    async def test_raises_when_sanity_exceeded(self):
         """When elapsed > cap_wait_sanity_secs, raises AllAccountsCappedException."""
         gate = _mock_gate(
             account_count=1,
@@ -1284,11 +1287,10 @@ class TestCapRetryDeadline:
         assert exc.label == 'deadline-task'
         assert exc.retries == 1
 
-    async def test_deadline_fires_before_max_retries(self):
+    async def test_sanity_bound_fires_independent_of_max_retries(self):
         """Sanity bound fires after 1 cap hit even when max_cap_retries=100 is untouched.
 
-        cap_wait_sanity_secs is checked independently; whichever limit triggers first wins.
-        RED until step-4 adds the cap_wait_sanity_secs check.
+        cap_wait_sanity_secs is checked independently of the vestigial count guard.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1319,7 +1321,7 @@ class TestCapRetryDeadline:
         assert exc.elapsed_secs > 10.0, f'elapsed_secs should exceed sanity_secs, got {exc.elapsed_secs}'
         assert exc.label == 'deadline-first-task'
 
-    async def test_no_exception_when_within_deadline(self):
+    async def test_no_exception_when_within_sanity_bound(self):
         """When elapsed is well under cap_wait_sanity_secs, no exception is raised."""
         gate = _mock_gate(
             account_count=1,
@@ -1459,13 +1461,18 @@ class TestCapWaitSanitySecs:
 
 
 # ===================================================================
-# TestCapRetryHeuristicGuard
+# TestCapRetryHeuristicBranch
 # ===================================================================
 
 
 @pytest.mark.asyncio
-class TestCapRetryHeuristicGuard:
-    """Heuristic cap-hit branch (zero-cost instant exit) also respects max_cap_retries."""
+class TestCapRetryHeuristicBranch:
+    """Heuristic cap-hit branch (zero-cost instant exit): count-independent after task-1365.
+
+    The count guard (max_cap_retries) was removed; the only raising bound is
+    cap_wait_sanity_secs. These tests pin that count-independent behaviour for
+    the heuristic branch.
+    """
 
     def _make_heuristic_result(self) -> AgentResult:
         """Zero-cost instant exit result that triggers the heuristic branch."""
@@ -1477,12 +1484,12 @@ class TestCapRetryHeuristicGuard:
             duration_ms=100,
         )
 
-    async def test_heuristic_raises_after_max_retries(self):
-        """Heuristic branch: cap hits do NOT raise on count (count guard removed in step-2).
+    async def test_heuristic_count_guard_is_vestigial(self):
+        """Heuristic branch: cap hits do NOT raise on count (count guard removed in task-1365).
 
         Previously asserted that heuristic cap hits count toward max_cap_retries.
         Now asserts count-independence: 3 heuristic cap hits with max_cap_retries=2
-        must succeed (not raise). RED until step-2 removes the heuristic count guard.
+        must succeed (not raise).
         """
         gate = _mock_gate(
             account_count=1,
@@ -1538,8 +1545,8 @@ class TestCapRetryHeuristicGuard:
             )
         assert got.success is True
 
-    async def test_heuristic_succeeds_before_max_retries(self):
-        """1 heuristic hit then success does not raise (under max_cap_retries=2)."""
+    async def test_heuristic_succeeds_count_independent(self):
+        """1 heuristic hit then success does not raise (count guard is vestigial)."""
         gate = _mock_gate(
             account_count=1,
             before_invoke=AsyncMock(side_effect=['tok'] * 2),
@@ -1559,12 +1566,11 @@ class TestCapRetryHeuristicGuard:
         assert got.success is True
         assert mock_inv.await_count == 2
 
-    async def test_heuristic_deadline_exceeded(self):
-        """Heuristic branch respects cap_wait_sanity_secs independently of max_cap_retries.
+    async def test_heuristic_sanity_exceeded(self):
+        """Heuristic branch raises when elapsed > cap_wait_sanity_secs.
 
-        Rewritten in step-3 to use cap_wait_sanity_secs (added in step-4).
-        cap_retry_deadline_secs=None prevents the old deadline from masking the test.
-        RED until step-4 adds the cap_wait_sanity_secs check to the heuristic branch.
+        cap_wait_sanity_secs is the only raising bound; count guard is vestigial.
+        cap_retry_deadline_secs=None confirms that old deadline param is inert.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1600,20 +1606,19 @@ class TestCapRetryHeuristicGuard:
 
 
 # ===================================================================
-# TestCapRetryGuardLogging
+# TestCapRetrySanityGuardLogging
 # ===================================================================
 
 
 @pytest.mark.asyncio
-class TestCapRetryGuardLogging:
+class TestCapRetrySanityGuardLogging:
     """Verify logger.error is emitted with diagnostic info before raising."""
 
-    async def test_error_logged_before_max_retries_raise(self, caplog):
+    async def test_error_logged_before_sanity_raise(self, caplog):
         """logger.error includes label and elapsed time before AllAccountsCappedException.
 
-        Updated in step-3 to use cap_wait_sanity_secs (added in step-4).
-        cap_retry_deadline_secs=None ensures the old deadline doesn't mask the test.
-        RED until step-4 adds the cap_wait_sanity_secs check.
+        Uses cap_wait_sanity_secs (the only raising bound post-task-1365).
+        cap_retry_deadline_secs=None confirms that old deadline param is inert.
         """
         gate = _mock_gate(
             account_count=2,
@@ -1646,10 +1651,14 @@ class TestCapRetryGuardLogging:
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
 
-    async def test_error_logged_before_deadline_raise(self, caplog):
-        """logger.error includes label and elapsed time on sanity-bound raise.
+    async def test_error_log_includes_label_on_sanity_raise(self, caplog):
+        """logger.error includes elapsed-time diagnostic info on sanity-bound raise.
 
-        Updated in step-3 to use cap_wait_sanity_secs.  RED until step-4.
+        Distinct from test_error_logged_before_sanity_raise (which checks label +
+        level): this test verifies that the error message body contains the
+        elapsed-time diagnostic (e.g. '4000.0s') produced by
+        ``_check_cap_wait``'s format string
+        ``'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s ...'``.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1658,7 +1667,7 @@ class TestCapRetryGuardLogging:
             active_account_name='acct',
         )
         result = make_result()
-        # First call → 0.0, all subsequent → 4000.0
+        # First call → 0.0, all subsequent → 4000.0 → elapsed = 4000.0s
         monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
@@ -1676,8 +1685,9 @@ class TestCapRetryGuardLogging:
             )
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
-        assert any('deadline-label' in m for m in error_msgs), (
-            f'Error log should include label. Got: {error_msgs}'
+        # Verify the diagnostic elapsed-time content (not just the label):
+        assert any('4000.0s' in m for m in error_msgs), (
+            f'Error log should include elapsed time (4000.0s). Got: {error_msgs}'
         )
 
 
