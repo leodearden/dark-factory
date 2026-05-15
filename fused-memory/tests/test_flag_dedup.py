@@ -2103,3 +2103,56 @@ class TestConfirmMarkerPersisted:
             f"confirm_marker_persisted must return the canonical MemoryResult.id "
             f"('canonical-XYZ'), not any add_memory response id; got {result!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_miss_then_retry_finds_marker(self, caplog):
+        """On a first-search miss, one WARNING is emitted and a retry search is performed.
+
+        Step-3 RED: current impl only does one search → on miss returns None immediately,
+        no WARNING emitted, no retry.
+
+        search side_effect: [[] (miss), [marker with id='retry-canon']] (retry hit)
+
+        Asserts:
+        (a) Returns the canonical id from the retry result ('retry-canon').
+        (b) memory_service.search was called exactly 2 times.
+        (c) Exactly one WARNING emitted BEFORE the retry containing task_id AND flag_type.
+        """
+        import logging
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
+
+        retry_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'x',
+            'run_id': 'r1',
+        })
+        retry_marker.id = 'retry-canon'
+
+        memory_service = AsyncMock()
+        # First call: miss ([]); second call (retry): hit
+        memory_service.search = AsyncMock(side_effect=[[], [retry_marker]])
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await confirm_marker_persisted(
+                memory_service,
+                project_id='p',
+                task_id='42',
+                flag_type='x',
+                run_id='r1',
+                log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+            )
+
+        # (a) Returns canonical id from retry result
+        assert result == 'retry-canon', (
+            f"Expected 'retry-canon' from retry but got {result!r}"
+        )
+        # (b) Exactly 2 search calls (initial + 1 retry)
+        assert memory_service.search.call_count == 2, (
+            f"Expected 2 search calls but got {memory_service.search.call_count}"
+        )
+        # (c) One WARNING mentioning task_id AND flag_type before the retry
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('42' in m and 'x' in m for m in warning_messages), (
+            f"Expected WARNING containing task_id '42' and flag_type 'x' but got: {warning_messages}"
+        )
