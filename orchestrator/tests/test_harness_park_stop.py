@@ -14,13 +14,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from shared.cost_store import CostStore
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
-from shared.cost_store import CostStore
-
 
 # ---------------------------------------------------------------------------
 # Helpers shared by cost-ceiling tests
