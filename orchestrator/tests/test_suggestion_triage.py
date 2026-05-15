@@ -359,6 +359,42 @@ class TestRouteReviewSuggestionsToCurator:
             tool_name = (body.get('params') or {}).get('name', '')
             assert tool_name != 'curate_batch', 'curate_batch must never be called'
 
+    @pytest.mark.asyncio
+    async def test_mcp_none_falls_back_to_escalation_queue(self):
+        """When self.mcp is None and escalation_queue is set, _escalate_suggestions is called."""
+        suggestions = self._suggestions()
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-0'
+        queue.get_by_task.return_value = []
+        wf = _make_workflow(escalation_queue=queue)
+        wf.mcp = None  # simulate missing MCP transport
+        wf.state = MagicMock(value='review')
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post:
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        # Must not attempt HTTP calls against a missing MCP
+        mock_post.assert_not_called()
+        # Must fall back to the steward escalation path
+        queue.submit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_falls_back_to_memory_when_no_queue(self):
+        """When both self.mcp and escalation_queue are None, _write_suggestions_to_memory is used."""
+        suggestions = self._suggestions()
+        wf = _make_workflow(escalation_queue=None)
+        wf.mcp = None  # simulate missing MCP transport
+
+        write_mock = AsyncMock()
+        with (
+            patch.object(wf, '_write_suggestions_to_memory', write_mock),
+            patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post,
+        ):
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        mock_post.assert_not_called()
+        write_mock.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Integration: stall guard + call-site routing

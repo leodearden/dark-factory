@@ -4827,41 +4827,52 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         except Exception as e:
             logger.warning(f'Failed to write suggestions to memory: {e}')
 
-    async def _post_submit_task(self, arguments: dict) -> None:
-        """Fire-and-forget helper: POST a submit_task call to the fused-memory MCP.
+    async def _post_submit_tasks(self, arguments_list: list[dict]) -> None:
+        """Fire-and-forget: POST all submit_task calls to the fused-memory MCP.
 
-        Runs inside an asyncio.create_task so the caller returns immediately.
-        Exceptions are caught and logged as warnings (fire-and-forget tolerance).
+        Uses a single shared ``httpx.AsyncClient`` for the entire batch so only
+        one TCP connection pool is opened per routing call regardless of how many
+        suggestions are being submitted.  Runs inside ``asyncio.create_task`` so
+        the caller returns immediately.
+
+        Per-POST exceptions are caught and logged as warnings; a failure on one
+        suggestion does not abort the remaining submissions.
         """
         try:
             import httpx as httpx_mod
             async with httpx_mod.AsyncClient() as client:
-                await client.post(
-                    f'{self.mcp.url}/mcp/',
-                    json={
-                        'jsonrpc': '2.0',
-                        'id': 1,
-                        'method': 'tools/call',
-                        'params': {
-                            'name': 'submit_task',
-                            'arguments': arguments,
-                        },
-                    },
-                    timeout=10,
-                )
+                for arguments in arguments_list:
+                    try:
+                        await client.post(
+                            f'{self.mcp.url}/mcp/',
+                            json={
+                                'jsonrpc': '2.0',
+                                'id': 1,
+                                'method': 'tools/call',
+                                'params': {
+                                    'name': 'submit_task',
+                                    'arguments': arguments,
+                                },
+                            },
+                            timeout=10,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            'Task %s: failed to submit curator task (fire-and-forget): %s',
+                            self.task_id, exc,
+                        )
         except Exception as exc:
             logger.warning(
-                'Task %s: failed to submit curator task (fire-and-forget): %s',
+                'Task %s: failed to open HTTP client for curator submits: %s',
                 self.task_id, exc,
             )
 
     async def _route_review_suggestions_to_curator(self, reviews) -> None:
         """Route review suggestions directly to the curator intake (fire-and-forget).
 
-        Replaces the steward-escalation call site so suggestions are inserted
-        directly as CandidateTask tickets via ``submit_task`` MCP calls.  The
-        curator's ``_curator_worker`` drains the tickets asynchronously; this
-        method returns immediately after scheduling, regardless of curator speed.
+        Inserts suggestions as CandidateTask tickets via ``submit_task`` MCP calls.
+        The curator's ``_curator_worker`` drains tickets asynchronously; this method
+        returns immediately after scheduling regardless of curator speed.
 
         Cross-submission dedup is handled by the curator R4 gate
         ``_check_escalation_idempotency`` which matches
@@ -4872,6 +4883,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Must NOT call curate_batch — that dispatches invoke_with_cap_retry and
         can stall up to 31 minutes.  Uses asyncio.create_task +
         ``self._background_tasks`` (mirrors ``_spawn_dry_run_unblock``).
+
+        When ``self.mcp`` is not configured (e.g. CLI / dry-run / test contexts),
+        falls back to ``_escalate_suggestions`` if an escalation queue is available,
+        or to ``_write_suggestions_to_memory`` otherwise — preserving suggestions in
+        all cases rather than silently dropping them.
         """
         from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
 
@@ -4879,17 +4895,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not suggestions:
             return
 
+        # Guard: fall back if MCP transport is unavailable so suggestions are
+        # never silently dropped.  _escalate_suggestions is the real caller of
+        # the steward-escalation fallback path.
+        if self.mcp is None:
+            if self.escalation_queue:
+                self._escalate_suggestions(reviews)
+            else:
+                await self._write_suggestions_to_memory(reviews)
+            return
+
         content_hash = review_suggestion_payload_hash(suggestions)
         task_id = self.task_id
         project_root = str(self.config.project_root)
 
-        for i, suggestion in enumerate(suggestions):
+        all_arguments = []
+        for suggestion in suggestions:
             cat = suggestion.get('category', '')
             loc = suggestion.get('location', '')
             desc = suggestion.get('description', '')
             title = f'[{cat}] {loc}: {desc[:60]}'
 
-            arguments = {
+            all_arguments.append({
                 'title': title,
                 'description': desc,
                 'details': json.dumps(suggestion),
@@ -4901,20 +4928,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     'escalation_id': f'review-suggestions-{task_id}',
                     'suggestion_hash': content_hash,
                 },
-            }
+            })
 
-            try:
-                _task = asyncio.create_task(
-                    self._post_submit_task(arguments),
-                    name=f'route-suggestion-{task_id}-{i}',
-                )
-                self._background_tasks.add(_task)
-                _task.add_done_callback(self._background_tasks.discard)
-            except Exception as exc:
-                logger.warning(
-                    'Task %s: failed to schedule curator submit for suggestion %d: %s',
-                    task_id, i, exc,
-                )
+        # Schedule the entire batch as one background task with a shared HTTP
+        # client — avoids opening N separate connection pools for N suggestions.
+        try:
+            _task = asyncio.create_task(
+                self._post_submit_tasks(all_arguments),
+                name=f'route-suggestions-{task_id}',
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to schedule curator submits: %s',
+                task_id, exc,
+            )
 
         logger.info(
             'Task %s: scheduled %d suggestion(s) for direct curator intake '

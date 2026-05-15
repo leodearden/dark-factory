@@ -5,21 +5,17 @@ These three functions are the single canonical owner of the
 (``_escalate_suggestions`` in workflow.py) and the new fire-and-forget
 curator path (``_route_review_suggestions_to_curator``).
 
-Import site contract:  every call site that participates in review-suggestion
-dedup **must** import from this module — that is the acceptance criterion for
-the shared-helper requirement.
+Convention:  every call site that participates in review-suggestion dedup
+should import from this module to avoid re-inlining the hash shape.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from orchestrator.agents.triage import sha256_16
-
-if TYPE_CHECKING:
-    pass
 
 
 def review_suggestion_payload_hash(suggestions: list) -> str:
