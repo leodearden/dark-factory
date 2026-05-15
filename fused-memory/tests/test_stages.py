@@ -4869,6 +4869,89 @@ class TestQueryStage2Flags:
         assert isinstance(partition, Stage2FlagPartition)
         assert len(partition) == 3
 
+    @pytest.mark.asyncio
+    async def test_rescued_ids_field_collects_window_guard_rescued_marker_ids(self):
+        """Stage2FlagPartition exposes a rescued_ids field tracking markers rescued by the
+        run-window guard in BOTH branches (missing run_id + mismatched run_id), but NOT
+        clean markers or genuinely-stale out-of-window markers.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _query_stage2_flags,
+        )
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # (a) clean matching run_id — in partition.current, NOT rescued
+            self._make_result(
+                'clean-current',
+                'clean current flag',
+                {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-current'},
+                created_at=None,
+            ),
+            # (b) missing run_id, created_at in-window — rescued by window guard
+            self._make_result(
+                'rescued-missing',
+                'rescued missing run_id flag',
+                {'flag_for_stage2': True, 'task_id': '2'},
+                created_at='2026-05-15T10:00:05+00:00',
+            ),
+            # (c) mismatched run_id, created_at in-window — rescued by window guard
+            self._make_result(
+                'rescued-mismatch',
+                'rescued mismatched run_id flag',
+                {'flag_for_stage2': True, 'task_id': '3', 'run_id': 'r-other'},
+                created_at='2026-05-15T10:00:10+00:00',
+            ),
+            # (d) missing run_id, created_at out-of-window — genuinely stale, NOT rescued
+            self._make_result(
+                'stale-out-of-window',
+                'genuinely stale out-of-window flag',
+                {'flag_for_stage2': True, 'task_id': '4'},
+                created_at='2026-05-15T08:00:00+00:00',
+            ),
+        ]
+
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+
+        # The partition must expose the rescued_ids field (4th field of Stage2FlagPartition)
+        assert hasattr(partition, 'rescued_ids'), (
+            "Stage2FlagPartition must expose a 'rescued_ids' field populated by "
+            "the run-window guard branches"
+        )
+
+        # (b) and (c) must appear in rescued_ids (both rescue branches)
+        assert set(partition.rescued_ids) == {'rescued-missing', 'rescued-mismatch'}, (
+            f"rescued_ids should contain exactly the two window-guard-rescued markers; "
+            f"got: {partition.rescued_ids}"
+        )
+
+        # (a) clean marker is NOT in rescued_ids (it matched run_id cleanly)
+        assert 'clean-current' not in partition.rescued_ids, (
+            "Clean matching-run_id marker must NOT be in rescued_ids"
+        )
+
+        # (d) genuinely stale marker is NOT in rescued_ids
+        assert 'stale-out-of-window' not in partition.rescued_ids, (
+            "Out-of-window genuinely stale marker must NOT be in rescued_ids"
+        )
+
+        # (b) and (c) must still be in partition.current (rescue routes them to current)
+        current_ids = {f['id'] for f in partition.current}
+        assert 'rescued-missing' in current_ids, (
+            "Rescued missing-run_id marker must still appear in partition.current"
+        )
+        assert 'rescued-mismatch' in current_ids, (
+            "Rescued mismatched-run_id marker must still appear in partition.current"
+        )
+
+        # (d) stale out-of-window marker goes to stale_missing_run_id_ids
+        assert 'stale-out-of-window' in partition.stale_missing_run_id_ids, (
+            "Out-of-window missing-run_id marker must be in stale_missing_run_id_ids"
+        )
+
 
 class TestSweepStaleFixcMarkers:
     """_sweep_stale_fixc_markers deletes stale fixc markers in parallel and returns count."""
