@@ -5918,8 +5918,6 @@ class TestAssemblePayloadRunWindowStart:
     @pytest.mark.asyncio
     async def test_run_window_start_sourced_from_journal_started_at(self, mock_deps):
         """(a) journal.get_run(run_id).started_at is passed as run_window_start to _query_stage2_flags."""
-        from types import SimpleNamespace
-
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             Stage2FlagPartition,
             TaskKnowledgeSync,
@@ -5942,16 +5940,18 @@ class TestAssemblePayloadRunWindowStart:
             captured_kwargs.update(kwargs)
             return Stage2FlagPartition([], [], [])
 
-        with patch(
-            'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
-            side_effect=capture_query,
-        ):
-            with patch(
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+                side_effect=capture_query,
+            ),
+            patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                 new=AsyncMock(return_value=self._fake_cli_result()),
-            ):
-                await stage.run(events=[], watermark=Watermark(project_id='reify'),
-                                prior_reports=[], run_id='test-run')
+            ),
+        ):
+            await stage.run(events=[], watermark=Watermark(project_id='reify'),
+                            prior_reports=[], run_id='test-run')
 
         # journal.get_run must be called with the current run_id
         mock_deps['journal'].get_run.assert_awaited_once_with('test-run')
@@ -5982,17 +5982,19 @@ class TestAssemblePayloadRunWindowStart:
             captured_kwargs.update(kwargs)
             return Stage2FlagPartition([], [], [])
 
-        with patch(
-            'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
-            side_effect=capture_query,
-        ):
-            with patch(
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+                side_effect=capture_query,
+            ),
+            patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                 new=AsyncMock(return_value=self._fake_cli_result()),
-            ):
-                # Must not raise even though journal.get_run raises
-                await stage.run(events=[], watermark=Watermark(project_id='reify'),
-                                prior_reports=[], run_id='test-run')
+            ),
+        ):
+            # Must not raise even though journal.get_run raises
+            await stage.run(events=[], watermark=Watermark(project_id='reify'),
+                            prior_reports=[], run_id='test-run')
 
         # journal.get_run was still attempted
         mock_deps['journal'].get_run.assert_awaited_once_with('test-run')
@@ -6022,16 +6024,18 @@ class TestAssemblePayloadRunWindowStart:
             captured_kwargs.update(kwargs)
             return Stage2FlagPartition([], [], [])
 
-        with patch(
-            'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
-            side_effect=capture_query,
-        ):
-            with patch(
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+                side_effect=capture_query,
+            ),
+            patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
                 new=AsyncMock(return_value=self._fake_cli_result()),
-            ):
-                await stage.run(events=[], watermark=Watermark(project_id='reify'),
-                                prior_reports=[], run_id='test-run')
+            ),
+        ):
+            await stage.run(events=[], watermark=Watermark(project_id='reify'),
+                            prior_reports=[], run_id='test-run')
 
         mock_deps['journal'].get_run.assert_awaited_once_with('test-run')
         assert captured_kwargs.get('run_window_start') is None
