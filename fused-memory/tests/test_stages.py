@@ -5035,6 +5035,88 @@ class TestQueryStage2Flags:
             "Out-of-window missing-run_id marker must be in stale_missing_run_id_ids"
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('case_id, created_at, metadata, naive_window_start, expect_rescued', [
+        pytest.param(
+            'naive-window-in-window',
+            '2026-05-15T10:00:05+00:00',   # tz-aware, 5 s after window start
+            {'flag_for_stage2': True, 'task_id': '201'},  # no run_id → triggers missing-run_id branch
+            datetime(2026, 5, 15, 10, 0, 0),              # NAIVE: no tzinfo
+            True,   # must be rescued (guard must stay active after normalization)
+            id='in_window_with_naive_run_window_start',
+        ),
+        pytest.param(
+            'naive-window-out-of-window',
+            '2026-05-15T10:00:05+00:00',   # tz-aware, 10:00:05 UTC — ~1 h before threshold
+            {'flag_for_stage2': True, 'task_id': '202', 'run_id': 'wrong-run'},  # mismatched
+            datetime(2026, 5, 15, 11, 0, 0),              # NAIVE: 1 h later → threshold = 10:59:30 UTC
+            False,  # 10:00:05 UTC < 10:59:30 threshold → out-of-window; must NOT be rescued
+            id='out_of_window_with_naive_run_window_start',
+        ),
+    ])
+    async def test_naive_run_window_start_does_not_disable_window_guard(
+        self, case_id, created_at, metadata, naive_window_start, expect_rescued
+    ):
+        """Naive run_window_start must NOT silently disable the run-window sweep guard.
+
+        Root cause (pre-fix): ``_marker_is_within_run_window`` normalizes the
+        parsed *created_at* to UTC when naive but does NOT normalize
+        *run_window_start*.  When *run_window_start* is naive the comparison
+        ``parsed(tz-aware) >= run_window_start(naive) - _CLOCK_SKEW_GRACE`` raises
+        ``TypeError: can't compare offset-naive and offset-aware datetimes``, which
+        the ``except (ValueError, TypeError)`` clause swallows by returning ``False``
+        for *every* marker.  The run-window guard is thereby silently disabled for
+        the entire cycle — same-cycle Stage-1 markers whose run_id was
+        omitted/mis-stamped are swept instead of rescued (the task-1369 regression).
+
+        Fix (step-2): normalize a naive ``run_window_start`` to UTC immediately
+        after the ``isinstance(run_window_start, datetime)`` guard (mirroring the
+        existing ``parsed`` normalization convention documented in the docstring).
+
+        Two parametrised cases both use a NAIVE ``run_window_start`` (no tzinfo):
+
+          in_window_with_naive_run_window_start:
+            run_window_start = datetime(2026-05-15 10:00:00) [naive, assumed UTC after fix]
+            created_at = '2026-05-15T10:00:05+00:00' (5 s after window start, in-window)
+            metadata has no run_id → triggers the missing-run_id guard branch.
+            Before fix: guard disabled (TypeError swallowed) → marker swept, NOT rescued.
+            After fix:  guard active → marker rescued to partition.current.
+
+          out_of_window_with_naive_run_window_start:
+            run_window_start = datetime(2026-05-15 11:00:00) [naive, assumed UTC after fix]
+            threshold = 11:00:00 - 30 s = 10:59:30 UTC
+            created_at = '2026-05-15T10:00:05+00:00' = 10:00:05 UTC (< threshold, out-of-window)
+            metadata has mismatched run_id → stale_mismatched_run_id_ids when not rescued.
+            Before fix: guard disabled → marker incorrectly swept (stale_mismatched).
+            After fix:  guard active AND ordering preserved → marker correctly stays stale.
+            Proves normalization does not over-rescue (window ordering is maintained).
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(case_id, 'naive-window-guard test', metadata, created_at=created_at),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=naive_window_start
+        )
+        if expect_rescued:
+            assert any(f['id'] == case_id for f in partition.current), (
+                f'{case_id!r}: in-window marker must be rescued to partition.current '
+                f'even when run_window_start is naive (was guard silently disabled?)'
+            )
+            assert case_id not in partition.stale_missing_run_id_ids
+            assert case_id not in partition.stale_mismatched_run_id_ids
+        else:
+            assert not any(f['id'] == case_id for f in partition.current), (
+                f'{case_id!r}: out-of-window marker must NOT be rescued to partition.current'
+            )
+            # mismatched run_id routes to stale_mismatched when not rescued
+            assert case_id in partition.stale_mismatched_run_id_ids, (
+                f'{case_id!r}: out-of-window mismatched-run_id marker must stay in '
+                f'stale_mismatched_run_id_ids (normalization must preserve ordering)'
+            )
+
 
 class TestSweepStaleFixcMarkers:
     """_sweep_stale_fixc_markers deletes stale fixc markers in parallel and returns count."""
