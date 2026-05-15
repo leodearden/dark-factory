@@ -193,6 +193,23 @@ class SuppressionPayload(TypedDict):
 _CONFIRMATION_MISS_THRESHOLD: int = 5
 
 
+def _marker_query(tid: str, ftype: str) -> str:
+    """Build the canonical Mem0 search query for a stage1_flag_marker.
+
+    Single source of truth used by BOTH:
+    - The pre-write dedup search in ``dedup_flags`` (asks "does any prior exist
+      across all runs?"; run_id-agnostic).
+    - The post-write confirmation search in ``confirm_marker_persisted``
+      (asks "did MY write for THIS run land?"; run_id-scoped via a separate
+      ``kind`` filter — see that helper for details).
+
+    The two callers differ in their ``kind`` filter but use the SAME query
+    string.  Tests rely on this equality to dispatch a single marker-search
+    stub from two call sites.
+    """
+    return f'stage1 flag marker task {tid} type {ftype}'
+
+
 async def confirm_marker_persisted(
     memory_service: Any,
     *,
@@ -257,7 +274,7 @@ async def confirm_marker_persisted(
         (deletion iterates the pre-write ``priors`` list directly).
     """
     try:
-        query = f'stage1 flag marker task {task_id} type {flag_type}'
+        query = _marker_query(task_id, flag_type)
         # run_id is included so that stale priors from earlier runs do NOT match.
         # Intentionally asymmetric with the pre-write dedup search (which omits
         # run_id to find priors from any earlier run).  The confirmation's job is
@@ -391,6 +408,74 @@ async def filter_suppressed(
     return [f for f in flags if _keep(f)]
 
 
+async def _write_and_confirm_marker(
+    memory_service: Any,
+    *,
+    project_id: str,
+    run_id: str,
+    tid: str,
+    ftype: str,
+    log: logging.Logger,
+    confirm_and_track,  # async callable: (response_memory_ids, miss_warning_msg, *, tid, ftype) -> tuple[str|None, bool]
+    miss_warning_template: str,
+) -> tuple[str | None, bool]:
+    """Write a stage1_flag_marker memory and confirm it is findable.
+
+    Single source of truth for the canonical marker payload contract:
+    - ``content``: ``f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}'``
+    - ``category='observations_and_summaries'``
+    - ``metadata={'source':'stage1_flag_marker', 'task_id':tid, 'flag_type':ftype,
+                  'run_id':run_id, 'last_seen_run_id':run_id}``
+    - ``_source='stage1_flag_dedup'`` sentinel
+
+    On add_memory exception: logs a unified WARNING and returns ``(None, False)``.
+
+    On success: delegates to ``confirm_and_track`` (the circuit-breaker-aware
+    inner closure from ``dedup_flags``) and propagates its
+    ``(confirmed_id, write_succeeded)`` tuple verbatim.  This means:
+
+    - Normal path: ``write_succeeded == (confirmed_id is not None)``.
+    - Breaker-tripped path: ``confirmed_id`` is None but ``write_succeeded`` may
+      be True if ``bool(response.memory_ids)`` was True; the gate degrades to
+      the cheaper memory_ids check.  The helper MUST NOT derive
+      ``write_succeeded`` locally — propagation is essential for the
+      circuit-breaker contract.
+
+    The ``miss_warning_template`` parameter is the branch-specific consequence
+    WARNING string (e.g. "skipping prior deletion" for HIT, "will not be
+    detected next cycle" for MISS).  It is forwarded to ``confirm_and_track``,
+    which logs it on confirmation miss.
+    """
+    try:
+        response = await memory_service.add_memory(
+            content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata={
+                'source': 'stage1_flag_marker',
+                'task_id': tid,
+                'flag_type': ftype,
+                'run_id': run_id,
+                'last_seen_run_id': run_id,
+            },
+            causation_id=run_id,
+            _source='stage1_flag_dedup',
+        )
+    except Exception as e:
+        log.warning(
+            'flag_dedup: failed to write marker for task %s flag_type %s: %s',
+            tid, ftype, e,
+        )
+        return None, False
+    # ``confirm_and_track`` is required to never raise (``confirm_marker_persisted``
+    # has its own internal try/except; the breaker counter mutations are non-raising).
+    # If that invariant is broken by a future refactor, the exception will propagate
+    # out of this helper and abort the ``dedup_flags`` for-loop iteration.
+    return await confirm_and_track(
+        response.memory_ids, miss_warning_template, tid=tid, ftype=ftype,
+    )
+
+
 async def dedup_flags(
     memory_service: Any,
     project_id: str,
@@ -441,7 +526,9 @@ async def dedup_flags(
     async def _confirm_and_track(
         response_memory_ids: list[str],
         miss_warning_msg: str,
-        *msg_args: object,
+        *,
+        tid: str,
+        ftype: str,
     ) -> tuple[str | None, bool]:
         """Shared circuit-breaker helper for HIT and MISS branches.
 
@@ -458,10 +545,14 @@ async def dedup_flags(
         - Emits ``miss_warning_msg`` iff ``bool(response_memory_ids)`` is False.
         - Returns ``(None, bool(response_memory_ids))``.
 
+        ``tid`` and ``ftype`` are explicit keyword-only parameters so this helper
+        is safe to schedule out-of-order (e.g. ``asyncio.gather``); the enclosing-
+        loop variables would otherwise be captured by free-variable lookup,
+        silently picking up the LAST iteration's values under concurrent scheduling.
+
         Mutates nonlocal ``consecutive_confirmation_misses`` and
         ``confirmation_disabled``; captures ``memory_service``, ``project_id``,
-        ``run_id``, and ``logger`` from the enclosing ``dedup_flags`` scope; and
-        reads ``tid``/``ftype`` from the enclosing for-loop's current iteration.
+        ``run_id``, and ``logger`` from the enclosing ``dedup_flags`` scope.
         """
         nonlocal consecutive_confirmation_misses, confirmation_disabled
         if not confirmation_disabled:
@@ -474,7 +565,9 @@ async def dedup_flags(
                 log=logger,
             )
             if c_id is None:
-                logger.warning(miss_warning_msg, *msg_args)
+                # ``miss_warning_msg`` MUST be a printf-style string with exactly
+                # two %s placeholders in order: (task_id, flag_type).
+                logger.warning(miss_warning_msg, tid, ftype)
                 consecutive_confirmation_misses += 1
                 if consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD:
                     logger.warning(
@@ -494,7 +587,7 @@ async def dedup_flags(
         else:
             write_succeeded = bool(response_memory_ids)
             if not write_succeeded:
-                logger.warning(miss_warning_msg, *msg_args)
+                logger.warning(miss_warning_msg, tid, ftype)
             return None, write_succeeded
 
     result: list[dict[str, Any]] = []
@@ -512,7 +605,7 @@ async def dedup_flags(
             project_id=project_id,
             task_id=tid,
             kind={'source': 'stage1_flag_marker', 'flag_type': ftype},
-            query=f'stage1 flag marker task {tid} type {ftype}',
+            query=_marker_query(tid, ftype),
             categories=['observations_and_summaries'],
             limit=50,
             log=logger,
@@ -547,39 +640,20 @@ async def dedup_flags(
             #     An unconfirmed write (write exception OR confirmation miss)
             #     preserves priors for next cycle (best-effort at-least-one-marker).
             #
-            #     Circuit-breaker (task-1412): _confirm_and_track encapsulates the
-            #     confirm_marker_persisted call and counter management; falls back to
-            #     bool(response.memory_ids) when the breaker is tripped.
+            #     _write_and_confirm_marker encapsulates the canonical payload,
+            #     the try/except, and the delegation to _confirm_and_track (which
+            #     encapsulates confirm_marker_persisted + circuit-breaker counter).
             # See: _confirm_and_track docstring and "Confirmation circuit-breaker"
             # section in the module docstring.
-            confirmed_id: str | None = None
-            write_succeeded: bool = False
-            try:
-                response = await memory_service.add_memory(
-                    content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
-                    category='observations_and_summaries',
-                    project_id=project_id,
-                    metadata={
-                        'source': 'stage1_flag_marker',
-                        'task_id': tid,
-                        'flag_type': ftype,
-                        'run_id': run_id,
-                        'last_seen_run_id': run_id,
-                    },
-                    causation_id=run_id,
-                    _source='stage1_flag_dedup',
-                )
-                confirmed_id, write_succeeded = await _confirm_and_track(
-                    response.memory_ids,
+            confirmed_id, write_succeeded = await _write_and_confirm_marker(
+                memory_service,
+                project_id=project_id, run_id=run_id, tid=tid, ftype=ftype, log=logger,
+                confirm_and_track=_confirm_and_track,
+                miss_warning_template=(
                     'flag_dedup: replacement marker for task %s flag_type %s could not'
-                    ' be confirmed findable — skipping prior deletion',
-                    tid, ftype,
-                )
-            except Exception as e:
-                logger.warning(
-                    'flag_dedup: failed to write replacement marker for task %s flag_type %s: %s',
-                    tid, ftype, e,
-                )
+                    ' be confirmed findable — skipping prior deletion'
+                ),
+            )
 
             # (3) Delete ALL priors only if the new marker was confirmed FINDABLE
             #     (or, after circuit-breaker trip, if bool(response.memory_ids) is True).
@@ -619,33 +693,20 @@ async def dedup_flags(
             # off the confirmed canonical id (None = unfindable), not off the
             # unverified add_memory response.memory_ids.
             #
-            # Circuit-breaker (task-1412): shares the same _confirm_and_track helper
-            # (and therefore the same counter / disabled flag) as the HIT branch.
+            # Circuit-breaker (task-1412): _write_and_confirm_marker delegates to
+            # _confirm_and_track (the same inner closure shared with the HIT branch),
+            # so both branches share the same counter / disabled flag.
             # When the breaker is tripped, _confirm_and_track drives the "will not be
-            # detected next cycle" WARNING off bool(miss_response.memory_ids) instead.
-            try:
-                miss_response = await memory_service.add_memory(
-                    content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
-                    category='observations_and_summaries',
-                    project_id=project_id,
-                    metadata={
-                        'source': 'stage1_flag_marker',
-                        'task_id': tid,
-                        'flag_type': ftype,
-                        'run_id': run_id,
-                        'last_seen_run_id': run_id,
-                    },
-                    causation_id=run_id,
-                    _source='stage1_flag_dedup',
-                )
-                await _confirm_and_track(
-                    miss_response.memory_ids,
+            # detected next cycle" WARNING off bool(response.memory_ids) instead.
+            await _write_and_confirm_marker(
+                memory_service,
+                project_id=project_id, run_id=run_id, tid=tid, ftype=ftype, log=logger,
+                confirm_and_track=_confirm_and_track,
+                miss_warning_template=(
                     'flag_dedup: MISS marker for task %s flag_type %s could not be'
-                    ' confirmed findable — recurring flag will not be detected next cycle',
-                    tid, ftype,
-                )
-            except Exception as e:
-                logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
+                    ' confirmed findable — recurring flag will not be detected next cycle'
+                ),
+            )
         result.append(flag)
     return result
 
