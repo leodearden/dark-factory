@@ -23,6 +23,14 @@ from fused_memory.models.reconciliation import JournalEntry
 
 logger = logging.getLogger(__name__)
 
+# Cap-wait policy override for the reconciliation agent loop.
+# This runner participates in a bounded reconciliation cycle (stage_timeout_seconds
+# defaults to 3600s; cycle_timeout_seconds to 21600s).  A 14-day wait (the shared
+# default) would stall the reconciliation queue under sustained cap, so we cap at
+# 30 minutes — long enough for a brief cap window to resolve in-band, short enough
+# to defer cleanly.  Mirrors the _CURATOR_CAP_WAIT_SANITY_SECS pattern.
+_AGENT_LOOP_CAP_WAIT_SANITY_SECS = 1800.0
+
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -356,6 +364,7 @@ class AgentLoop:
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
                 cwd=Path(self.config.explore_codebase_root),
+                cap_wait_sanity_secs=_AGENT_LOOP_CAP_WAIT_SANITY_SECS,
             )
 
             if not result.success:
