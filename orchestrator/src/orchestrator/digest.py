@@ -223,7 +223,10 @@ def count_done_in_window(
             return 0
         # Use Path.resolve().as_uri() so the path is always absolute (as_uri()
         # requires an absolute path) and special characters are percent-encoded
-        # before appending the ?mode=ro query string.
+        # before appending the ?mode=ro query string.  resolve() follows symlinks;
+        # this is intentional — the resolved target is what SQLite will open and
+        # callers that need symlink-identity preservation should pass an absolute
+        # path directly.
         db_uri = Path(events_db).resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(db_uri, uri=True)
         try:
@@ -238,7 +241,13 @@ def count_done_in_window(
         finally:
             conn.close()
     except Exception:
-        logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
+        # TOCTOU guard: if the file disappeared between the structural check
+        # above and sqlite3.connect(), re-detect that as a missing-DB (DEBUG)
+        # rather than an unexpected failure (WARNING).
+        if not Path(events_db).exists():
+            logger.debug('count_done_in_window: DB not found (fail-open): %s', events_db)
+        else:
+            logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
         return 0
 
 
