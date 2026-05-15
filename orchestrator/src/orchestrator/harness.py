@@ -3239,7 +3239,6 @@ Output JSON matching the schema. Every task must appear in the output.
            done_count from EventStore is the single source of truth for both
            the rendered digest figure and the update_ewa input — ensuring the
            operator sees exactly the number that drove the EWA decision.
-           (Task 1421: removed the scheduler.done_transitions_total delta path.)
         8. Query cost stats from CostStore (fail-open).
         9. Read parked-task counts from Scheduler state.
         10. Update EWA using EventStore done_count.
