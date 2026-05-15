@@ -799,3 +799,49 @@ class TestSnapshotWriteThrottle:
             'flush_state_snapshot() must produce exactly 1 additional write '
             'even when the throttle window has not elapsed'
         )
+
+    @pytest.mark.asyncio
+    async def test_content_identical_payload_skips_disk_write(self, tmp_path):
+        """With throttle disabled (0.0), identical payload skips the disk write.
+
+        Sequence:
+        1. First _write_snapshot_best_effort call → payload captured, count=1.
+        2. Second call with no state change → payload byte-identical → skip,
+           count stays 1.
+        3. Mutate state (scheduler._skip_count['Q'] = 1) and call again →
+           payload changed → write, count=2.
+
+        This test isolates the content-diff path from the time-throttle path
+        by disabling the throttle (interval=0.0).
+        """
+        from unittest.mock import MagicMock
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = 0.0  # throttle disabled
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+        scheduler.write_state_snapshot = MagicMock()
+
+        # First write: no prior payload → always writes.
+        clock['t'] = 1.0
+        await scheduler._write_snapshot_best_effort()
+        assert scheduler.write_state_snapshot.call_count == 1
+
+        # Second write: state unchanged → payload byte-identical → skip.
+        clock['t'] = 2.0
+        await scheduler._write_snapshot_best_effort()
+        assert scheduler.write_state_snapshot.call_count == 1, (
+            'Expected disk write to be skipped for byte-identical payload, '
+            f'got call_count={scheduler.write_state_snapshot.call_count}'
+        )
+
+        # Third write: state mutated → payload differs → writes.
+        scheduler._skip_count['Q'] = 1
+        clock['t'] = 3.0
+        await scheduler._write_snapshot_best_effort()
+        assert scheduler.write_state_snapshot.call_count == 2, (
+            'Expected disk write after state mutation (changed payload), '
+            f'got call_count={scheduler.write_state_snapshot.call_count}'
+        )
