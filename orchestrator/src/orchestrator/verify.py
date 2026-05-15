@@ -1052,7 +1052,6 @@ async def _run_cmd(
 
     proc = None
     pgid: int | None = None
-    log_fh = None
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -1072,22 +1071,24 @@ async def _run_cmd(
             return rc, stdout.decode(errors='replace'), False
 
         # Streamed path: chunked read + per-chunk flush so the kill on timeout
-        # cannot strand the partial output in kernel buffers.
-        log_fh = open(log_path, 'wb')
+        # cannot strand the partial output in kernel buffers.  The ``with``
+        # block guarantees the FD closes even when wait_for/CancelledError
+        # unwinds through the outer try; the close happens before the except
+        # handler runs, which is exactly what we want.
         buf = bytearray()
+        with open(log_path, 'wb') as log_fh:
+            async def _stream() -> None:
+                assert proc is not None and proc.stdout is not None
+                while True:
+                    chunk = await proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    log_fh.write(chunk)
+                    log_fh.flush()
+                await proc.wait()
 
-        async def _stream() -> None:
-            assert proc is not None and proc.stdout is not None
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                log_fh.write(chunk)
-                log_fh.flush()
-            await proc.wait()
-
-        await asyncio.wait_for(_stream(), timeout=timeout)
+            await asyncio.wait_for(_stream(), timeout=timeout)
         rc = proc.returncode if proc.returncode is not None else 1
         return rc, buf.decode(errors='replace'), False
     except TimeoutError:
@@ -1100,12 +1101,6 @@ async def _run_cmd(
         raise
     except Exception as e:
         return 1, f'Command failed: {e}', False
-    finally:
-        if log_fh is not None:
-            try:
-                log_fh.close()
-            except OSError:
-                pass
 
 
 # Marker file that records a worktree has completed at least one non-timeout verify.
