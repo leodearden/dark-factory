@@ -6404,10 +6404,11 @@ class TestAssemblePayloadRunWindowStart:
         Observability contract (this test):
           1. A WARNING-level log record is emitted whose message mentions "naive"
              and "started_at" (stable substrings of the message chosen in step-4).
-          2. The guard is NOT silently disabled — ``run_window_start`` is still
-             the datetime that was supplied (NOT forced to None), so the defensive
-             UTC normalization in ``_marker_is_within_run_window`` (step-2) keeps
-             the guard active.
+          2. The guard is NOT silently disabled — ``run_window_start`` is a
+             tz-aware UTC datetime (normalized at the call site per task-1383
+             Amendment 2), NOT forced to None, so the guard remains active.
+             ``_marker_is_within_run_window`` also normalizes as defence-in-depth
+             for any direct callers that bypass assemble_payload.
 
         This test FAILS before step-4: assemble_payload emits no WARNING today for
         a naive ``started_at``.
@@ -6462,10 +6463,20 @@ class TestAssemblePayloadRunWindowStart:
             + str([r.getMessage() for r in caplog.records if r.levelno == logging.WARNING])
         )
 
-        # (2) run_window_start must still be the naive datetime (guard NOT disabled)
-        assert captured_kwargs.get('run_window_start') == naive_started_at, (
-            'assemble_payload must NOT drop run_window_start to None for a naive started_at; '
-            f'expected {naive_started_at!r}, got {captured_kwargs.get("run_window_start")!r}'
+        # (2) run_window_start must NOT be None (guard NOT disabled), and must be
+        # tz-aware UTC (normalized at the call site per Amendment 2 / task-1383).
+        from datetime import timezone as _tz
+        expected_aware = naive_started_at.replace(tzinfo=_tz.utc)
+        result_rws = captured_kwargs.get('run_window_start')
+        assert result_rws is not None, (
+            'assemble_payload must NOT drop run_window_start to None for a naive started_at'
+        )
+        assert result_rws.tzinfo is not None, (
+            f'assemble_payload must normalize naive started_at to UTC; got tzinfo=None: {result_rws!r}'
+        )
+        assert result_rws == expected_aware, (
+            'assemble_payload must normalize naive started_at to tz-aware UTC; '
+            f'expected {expected_aware!r}, got {result_rws!r}'
         )
 
 

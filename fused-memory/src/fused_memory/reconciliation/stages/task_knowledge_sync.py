@@ -698,7 +698,9 @@ async def _query_stage2_flags(
 
     The *run_window_start* parameter is optional and defaults to ``None``
     (backward-compatible: window guard dormant, pure run_id partition applies).
-    When supplied it must be a tz-aware :class:`~datetime.datetime`.
+    When supplied a tz-aware :class:`~datetime.datetime` is preferred; a naive
+    value is defensively normalized to UTC by :func:`_marker_is_within_run_window`
+    (task-1383 hardening) so the guard remains active regardless.
 
     .. note::
         The partition check requires ``metadata.run_id`` to be **truthy**
@@ -1682,10 +1684,11 @@ class TaskKnowledgeSync(BaseStage):
                     logger.warning(
                         'reconciliation.assemble_payload: journal.get_run().started_at is a '
                         'naive datetime (tzinfo=None) — journal contract requires a tz-aware '
-                        'UTC datetime; run-window sweep guard remains active via defensive '
-                        'UTC normalization in _marker_is_within_run_window',
+                        'UTC datetime; normalizing to UTC here and in _marker_is_within_run_window '
+                        'as defence-in-depth so the run-window sweep guard remains active',
                         extra={'project_id': self.project_id, 'run_id': self._current_run_id},
                     )
+                    _sa = _sa.replace(tzinfo=UTC)
                 run_window_start = _sa
         except Exception:
             logger.warning(
