@@ -292,6 +292,12 @@ watcher_rotation_escalations: 50
 watcher_rotation_hours: 4.0
 watcher_max_crashloop_restarts: 5
 watcher_crashloop_window_secs: 600
+# Cost-runaway guard: a clean rotation shorter than watcher_misconfigured_min_rotation_secs
+# seconds is classified as degenerate (empty queue, SKILL.md drift, misconfigured env).
+# After watcher_max_misconfigured_clean_exits such exits within watcher_crashloop_window_secs,
+# the supervisor trips pause_scheduler('watcher_misconfigured') and stops.
+watcher_misconfigured_min_rotation_secs: 120
+watcher_max_misconfigured_clean_exits: 5
 watcher_model: opus
 watcher_rotation_budget_usd: 40.0
 watcher_max_turns: 400

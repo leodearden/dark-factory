@@ -348,6 +348,11 @@ class Harness:
         # Monotonic timestamps of unclean watcher exits; used by the crashloop guard
         # to count failures within watcher_crashloop_window_secs.
         self._watcher_unclean_exits: deque[float] = deque()
+        # Monotonic timestamps of degenerate-clean watcher exits (duration below
+        # watcher_misconfigured_min_rotation_secs); used by the cost-runaway guard
+        # (task 1388).  Separate from _watcher_unclean_exits so the trip reason
+        # ('watcher_misconfigured' vs 'watcher_crashloop') is unambiguous.
+        self._watcher_degenerate_clean_exits: deque[float] = deque()
 
         # Background sweep: periodic re-run of the startup
         # ``_reconcile_stranded_in_progress`` pass during a long run, so

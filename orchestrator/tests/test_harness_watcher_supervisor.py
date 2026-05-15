@@ -410,6 +410,7 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     h.config = config
     h._watcher_supervisor_task = None
     h._watcher_unclean_exits = deque()
+    h._watcher_degenerate_clean_exits = deque()  # cost-runaway guard (task 1388)
     h.usage_gate = None
     h.cost_store = MagicMock()
     h._run_id = 'run-loop-test-001'

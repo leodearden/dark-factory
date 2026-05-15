@@ -796,6 +796,15 @@ class OrchestratorConfig(BaseSettings):
     watcher_rotation_hours: float = Field(default=4.0)
     watcher_max_crashloop_restarts: int = Field(default=5)
     watcher_crashloop_window_secs: int = Field(default=600)
+    # Cost-runaway guard for degenerate-clean exits (task 1388).
+    # A clean rotation shorter than watcher_misconfigured_min_rotation_secs seconds
+    # is classified as degenerate (empty queue, SKILL.md drift, misconfigured env).
+    # After watcher_max_misconfigured_clean_exits such exits within
+    # watcher_crashloop_window_secs, pause_scheduler('watcher_misconfigured') is
+    # called and the supervisor stops.  Reuses watcher_crashloop_window_secs as the
+    # burst-detection window — semantically identical for both failure modes.
+    watcher_misconfigured_min_rotation_secs: float = Field(default=120.0)
+    watcher_max_misconfigured_clean_exits: int = Field(default=5)
 
     # Invocation knobs for each watcher rotation (per UnblockAutoConfig precedent).
     # watcher_rotation_budget_usd is sized for a full 4h rotation at opus rates;
