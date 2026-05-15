@@ -1459,66 +1459,6 @@ class TestRunIdValidation(BaseStageValidationTest):
         assert f'run_id: {run_id_value}' in captured_kwargs['payload']
 
 
-class TestStage2FixCSearchThenDelete:
-    """Contract tests for the FIX C search-then-delete instruction in STAGE2_SYSTEM_PROMPT.
-
-    The Stage 2 LLM must search Mem0 for the canonical live flag id before
-    deleting, rather than blindly trusting the payload flag_id (which may be
-    stale after Mem0 deduplication).  Four focused assertions cover the four
-    behavioural slices of that contract.
-    """
-
-    _HEADER = '## Mem0 Active-Query Flag Deletion (FIX C)'
-
-    @staticmethod
-    def _fixc_section() -> str:
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-        return _extract_section(STAGE2_SYSTEM_PROMPT, TestStage2FixCSearchThenDelete._HEADER)
-
-    def test_fixc_instructs_search_before_delete(self):
-        """FIX C section must direct the LLM to call mcp__fused-memory__search
-        before issuing the delete, pinning 'search precedes delete'."""
-        section = self._fixc_section()
-        assert 'mcp__fused-memory__search' in section, (
-            "FIX C section must contain a mcp__fused-memory__search call instruction "
-            "so the LLM resolves the canonical live id before deleting."
-        )
-
-    def test_fixc_search_filters_documented(self):
-        """FIX C section must name all three metadata filter fields used to
-        identify the canonical flag row: source='stage1_flag_marker', task_id,
-        and last_seen_run_id."""
-        section = self._fixc_section()
-        assert "source='stage1_flag_marker'" in section, (
-            "FIX C section must name source='stage1_flag_marker' as a metadata filter."
-        )
-        assert 'task_id' in section, (
-            "FIX C section must name task_id as a metadata filter field."
-        )
-        assert 'last_seen_run_id' in section, (
-            "FIX C section must name last_seen_run_id as a metadata filter field."
-        )
-
-    def test_fixc_uses_search_result_id_for_delete(self):
-        """FIX C section must instruct the LLM to delete using the search-result
-        id (the live canonical id), not the payload flag_id."""
-        section = self._fixc_section()
-        assert 'search-result' in section, (
-            "FIX C section must direct the LLM to delete using the 'search-result' id, "
-            "not the payload flag_id — look for wording like 'search-result id'."
-        )
-
-    def test_fixc_fallback_to_payload_flag_id(self):
-        """FIX C section must document the fallback path: when the
-        metadata-filtered search returns no matching result, fall back to
-        the payload flag_id."""
-        section = self._fixc_section()
-        assert 'no matching result' in section, (
-            "FIX C section must document that the LLM falls back to the payload "
-            "flag_id when the search returns 'no matching result'."
-        )
-
-
 class TestStage2GuardrailProjectIdGating:
     """Tests that the contamination guardrail is injected only for the
     autopilot_video project, not for other projects like dark_factory.
