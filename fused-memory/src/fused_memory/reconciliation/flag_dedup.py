@@ -129,7 +129,7 @@ templates for the ACTIVE-breaker miss path (a confirmation search was attempted
 and returned no result) versus the TRIPPED-breaker skip path (no search
 attempted because the breaker is open).  The ACTIVE wording is
 ``'could not be confirmed findable'``; the TRIPPED wording is
-``'confirmation skipped (circuit-breaker open); relying on memory_ids gate only'``.
+``'confirmation skipped (circuit-breaker open) and memory_ids gate failed'``.
 During a brownout this lets operators distinguish genuine confirmation misses
 from gate-only flags raised purely from the memory_ids check.
 
@@ -666,8 +666,8 @@ async def dedup_flags(
                 ),
                 tripped_skip_warning_template=(
                     'flag_dedup: replacement marker for task %s flag_type %s —'
-                    ' confirmation skipped (circuit-breaker open); relying on'
-                    ' memory_ids gate only; memory_ids empty —'
+                    ' confirmation skipped (circuit-breaker open) and'
+                    ' memory_ids gate failed —'
                     ' skipping prior deletion'
                 ),
             )
@@ -707,8 +707,8 @@ async def dedup_flags(
             #
             # Post-write confirmation (task-1400): after writing, confirm the
             # marker is findable via a read-back search.  The WARNING is driven
-            # off the confirmed canonical id (None = unfindable), not off the
-            # unverified add_memory response.memory_ids.
+            # off the bool return from _confirm_and_track (False = unfindable in
+            # ACTIVE branch, or bool(response.memory_ids)==False in TRIPPED branch).
             #
             # Circuit-breaker (task-1412): _write_and_confirm_marker delegates to
             # _confirm_and_track (the same inner closure shared with the HIT branch),
@@ -725,8 +725,8 @@ async def dedup_flags(
                 ),
                 tripped_skip_warning_template=(
                     'flag_dedup: MISS marker for task %s flag_type %s —'
-                    ' confirmation skipped (circuit-breaker open); relying on'
-                    ' memory_ids gate only; memory_ids empty —'
+                    ' confirmation skipped (circuit-breaker open) and'
+                    ' memory_ids gate failed —'
                     ' recurring flag will not be detected next cycle'
                 ),
             )

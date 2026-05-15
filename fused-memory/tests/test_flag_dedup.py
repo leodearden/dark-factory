@@ -3694,11 +3694,12 @@ class TestConfirmationCircuitBreaker:
         all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
 
         # (a) Sentinel entries [8] and [9] NOT consumed — breaker stays tripped.
-        # A count of 10 would prove the breaker un-tripped and consumed them.
+        # A count of 9 (or 10) would prove the breaker un-tripped and flag-3
+        # consumed sentinel entry [8] (no retry needed when confirmation hits).
         assert memory_service.search.call_count == 8, (
             f'Expected 8 search calls (1 suppression + 3 pre-write + 2+2 confirmation '
             f'for flags 1+2, none for flag 3); got: {memory_service.search.call_count}. '
-            f'Count of 10 would indicate the breaker failed to stay tripped.'
+            f'Count of 9 or 10 would indicate the breaker failed to stay tripped.'
         )
 
         # (b) Exactly ONE trip WARNING — no re-trip on flag-3's tripped-branch pass.
@@ -3863,7 +3864,7 @@ class TestConfirmationCircuitBreaker:
         must contain ``'could not be confirmed findable'``.  When the breaker is
         TRIPPED (no confirmation search attempted), the WARNING must contain
         ``'confirmation skipped (circuit-breaker open)'`` and
-        ``'relying on memory_ids gate only'``.
+        ``'memory_ids gate failed'``.
 
         Setup: threshold=2, 3 flags (task_ids 901/902/903).
         - Flags 901 and 902: ACTIVE-branch confirmation miss → counter reaches 2 → TRIP.
@@ -3988,12 +3989,12 @@ class TestConfirmationCircuitBreaker:
         # Must have tripped-skip wording; must NOT have active-miss wording.
         assert any(
             'confirmation skipped (circuit-breaker open)' in m and
-            'relying on memory_ids gate only' in m
+            'memory_ids gate failed' in m
             for m in bucket_903
         ), (
             f'[branch={branch}] task 903: expected TRIPPED-skip WARNING with '
             f"'confirmation skipped (circuit-breaker open)' + "
-            f"'relying on memory_ids gate only'; got: {bucket_903}"
+            f"'memory_ids gate failed'; got: {bucket_903}"
         )
         assert not any('could not be confirmed findable' in m for m in bucket_903), (
             f'[branch={branch}] task 903: ACTIVE-miss wording must NOT appear in '
