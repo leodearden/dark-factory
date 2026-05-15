@@ -2085,7 +2085,7 @@ class TestAuthFailure403Detection:
             )
 
         # First call → 0.0 (retry_start), all subsequent → 4000.0
-        # → elapsed > cap_retry_deadline_secs=3600.0 after just one cap hit
+        # → elapsed > cap_wait_sanity_secs=3600.0 after just one cap hit
         monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
         with (
             patch(_INVOKE_PATCH, side_effect=fake_invoke),
@@ -2095,7 +2095,8 @@ class TestAuthFailure403Detection:
         ):
             await invoke_with_cap_retry(
                 gate, 'lbl', prompt='hi',
-                cap_retry_deadline_secs=3600.0,
+                cap_wait_sanity_secs=3600.0,
+                cap_retry_deadline_secs=None,
             )
 
     async def test_500_not_treated_as_auth_failure(self):

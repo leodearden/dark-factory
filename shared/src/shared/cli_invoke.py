@@ -42,7 +42,8 @@ logger = logging.getLogger(__name__)
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
 _DEFAULT_MAX_CAP_RETRIES = 20
-_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0
+_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0  # kept for back-compat; no branch checks it
+_DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -341,6 +342,7 @@ async def invoke_with_cap_retry(
     role: str = '',
     max_cap_retries: int | None = _DEFAULT_MAX_CAP_RETRIES,
     cap_retry_deadline_secs: float | None = _DEFAULT_CAP_RETRY_DEADLINE_SECS,
+    cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     **invoke_kwargs,
@@ -356,6 +358,13 @@ async def invoke_with_cap_retry(
     This preserves all agent progress (tool calls, reasoning) across
     account switches.  If resume itself fails (non-cap-hit error), falls
     back to a fresh invocation with the original prompt.
+
+    *cap_wait_sanity_secs* is the outer wall-clock bound for cap-hit patience.
+    When total elapsed time since the first cap hit exceeds this value,
+    ``AllAccountsCappedException`` is raised so the caller can escalate.
+    Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).  Pass ``None``
+    to wait indefinitely.  ``cap_retry_deadline_secs`` is kept for
+    back-compat but is now vestigial — no branch checks it.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -472,14 +481,13 @@ async def invoke_with_cap_retry(
                             f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
                         )
 
-                    # Guard: raise before sleeping if wall-clock deadline exceeded.
-                    # max_cap_retries is vestigial — kept in the signature for
-                    # back-compat (task_curator.py passes max_cap_retries=3) but
-                    # no branch checks it any more.
+                    # Guard: raise before sleeping if the 14-day sanity bound is exceeded.
+                    # max_cap_retries and cap_retry_deadline_secs are vestigial —
+                    # kept in the signature for back-compat but no branch checks them.
                     elapsed = time.monotonic() - retry_start
-                    if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                    if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
                         logger.error(
-                            f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                            f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
                             f'({consecutive_cap_hits} retries, {num_accounts} account(s))',
                         )
                         raise AllAccountsCappedException(
@@ -534,12 +542,12 @@ async def invoke_with_cap_retry(
                             f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
                         )
 
-                        # Guard: raise before sleeping if wall-clock deadline exceeded.
-                        # max_cap_retries is vestigial — no branch checks it any more.
+                        # Guard: raise before sleeping if the 14-day sanity bound is exceeded.
+                        # max_cap_retries and cap_retry_deadline_secs are vestigial.
                         elapsed = time.monotonic() - retry_start
-                        if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                        if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
                             logger.error(
-                                f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                                f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
                                 f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
                             )
                             raise AllAccountsCappedException(
