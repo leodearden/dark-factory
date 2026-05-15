@@ -1801,6 +1801,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
 
     with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
          patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.OverrideStore'), \
          patch('orchestrator.harness.BriefingAssembler'):
         h = Harness(config)
 

@@ -27,8 +27,9 @@ def pydantic_spec(model: type[BaseModel]) -> type:
 
     User-defined ``@property`` descriptors (e.g. ``OrchestratorConfig.overrides_db_path``)
     are also included in the proxy so ``spec_set`` accepts both read and write.
-    BaseModel-inherited properties (``model_extra``, ``model_fields_set``, …) are
-    excluded to preserve the invariant that BaseModel API surface is NOT exposed.
+    BaseModel-inherited properties (``model_extra``, ``model_fields_set``, …)
+    are excluded to preserve the invariant that BaseModel API surface is NOT
+    exposed.
 
     Pydantic methods (model_dump, model_validate, …) are intentionally NOT
     exposed; if a test needs them, mock them explicitly.
