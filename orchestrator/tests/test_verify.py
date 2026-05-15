@@ -3989,3 +3989,76 @@ class TestRunFullVerificationReuse:
             f"Expected run_verification to be called for the on-disk 'newmod' module "
             f"after force_rediscover; found prefixes: {prefixes!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_midrun_added_orchestrator_yaml_excluded_from_snapshot(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Mid-run staleness lock-in: a subproject yaml added after snapshot is NOT discovered.
+
+        This is a characterization test that locks the intentional default behaviour:
+        run_full_verification without force_rediscover reuses the load_config-time snapshot,
+        so a new orchestrator.yaml written to disk after config._module_configs was populated
+        is silently excluded.  A future change cannot accidentally introduce a fresh walk or
+        drop the snapshot without this test turning RED.
+
+        The decided trade-off: snapshot eliminates the redundant walk on the hot production
+        review-checkpoint path; mid-run subproject additions are excluded until restart or
+        an explicit force_rediscover=True call.
+        """
+        import yaml
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        # Populate the snapshot with only 'dashboard' — BEFORE writing the second yaml
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+        }
+
+        # Write a SECOND orchestrator.yaml AFTER the snapshot was "taken"
+        newmod_dir = tmp_path / 'newmod'
+        newmod_dir.mkdir()
+        (newmod_dir / 'orchestrator.yaml').write_text(
+            yaml.dump({'test_command': 'echo newmod'})
+        )
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            # Default: no force_rediscover — snapshot must be reused
+            await run_full_verification(tmp_path, config)
+
+        # Snapshot reused → no walk
+        assert call_count == 0, (
+            f'Expected _discover_module_configs NOT to be called (snapshot reused); '
+            f'called {call_count} time(s). The intentional default is snapshot-reuse; '
+            f'a caller that needs fresh discovery must pass force_rediscover=True.'
+        )
+        # Only the snapshot's 'dashboard' should have been verified
+        assert mock_run_verification.call_count == 1, (
+            f'Expected run_verification to be called exactly once (snapshot has 1 module); '
+            f'called {mock_run_verification.call_count} time(s)'
+        )
+        called_mc = mock_run_verification.call_args[0][2]
+        assert called_mc.prefix == 'dashboard', (
+            f"Expected the snapshot 'dashboard' module to be verified; got {called_mc.prefix!r}"
+        )
+        # Lock: the mid-run 'newmod' must NOT appear
+        prefixes = {
+            call.args[2].prefix
+            for call in mock_run_verification.call_args_list
+            if len(call.args) >= 3
+        }
+        assert 'newmod' not in prefixes, (
+            f"Expected 'newmod' to be absent from snapshot run (mid-run staleness lock-in); "
+            f"found prefixes: {prefixes!r}.  Pass force_rediscover=True for fresh discovery."
+        )
