@@ -152,12 +152,23 @@ async def confirm_marker_persisted(
     Strategy:
     1. Run a confirmation search via ``find_prior_memories`` with
        ``kind={'source':'stage1_flag_marker','flag_type':flag_type,'run_id':run_id}``.
-    2. If a match is found, return ``match.id`` (the canonical id).
+    2. If matches are found, lex-sort by id and return ``matches[0].id``
+       (deterministic canonical id; matches the module's lex-sort convention
+       and the LLM-side directive to emit a confirmed canonical id).
     3. On a miss, log a WARNING (task_id + flag_type) and retry the search once.
-    4. Return the retry's first match id if found; otherwise log a final WARNING
+    4. Return the retry's lowest-lex id if found; otherwise log a final WARNING
        and return ``None``.
     5. Never raises — the whole body is wrapped in a best-effort try/except so
        a non-search error path cannot abort ``dedup_flags``.
+
+    Mem0 read-after-write consistency:
+        Flag markers use ``category='observations_and_summaries'`` which routes
+        to Mem0 (not Graphiti).  The indexing-lag caveat in ``prompts/stage1.py``
+        (lines 189-196) is specific to Graphiti's async embedding pipeline and
+        does NOT apply here — Mem0 writes on this path are assumed to be
+        immediately visible to a subsequent ``search``.  If production evidence
+        shows otherwise, add a small bounded delay before the retry and increase
+        the retry count.
 
     Args:
         memory_service: Mem0 service with an async ``search`` method.
@@ -170,8 +181,11 @@ async def confirm_marker_persisted(
              caplog-based tests can capture WARNINGs under the right namespace).
 
     Returns:
-        The canonical ``MemoryResult.id`` from the confirmation search, or
-        ``None`` if the marker could not be confirmed findable after one retry.
+        The canonical ``MemoryResult.id`` (lowest lex) from the confirmation
+        search, or ``None`` if the marker could not be confirmed findable after
+        one retry.  Within ``dedup_flags`` this value is consumed only as a
+        truthy presence sentinel; the id string itself is not used for deletion
+        (deletion iterates the pre-write ``priors`` list directly).
     """
     try:
         query = f'stage1 flag marker task {task_id} type {flag_type}'
@@ -193,7 +207,7 @@ async def confirm_marker_persisted(
             log=log,
         )
         if matches:
-            return matches[0].id
+            return sorted(matches, key=lambda m: m.id)[0].id
 
         # Miss on first attempt — log WARNING and retry once.
         log.warning(
@@ -212,7 +226,7 @@ async def confirm_marker_persisted(
             log=log,
         )
         if retry_matches:
-            return retry_matches[0].id
+            return sorted(retry_matches, key=lambda m: m.id)[0].id
 
         # Retry also missed — log final WARNING and return None.
         log.warning(

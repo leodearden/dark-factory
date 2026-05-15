@@ -1088,7 +1088,7 @@ async def test_dedup_flags_miss_respects_add_memory_response_memory_ids(
 
 
 # ---------------------------------------------------------------------------
-# task-1165 step-1 — HIT path: respects add_memory response memory_ids
+# task-1165 step-1 / task-1400 amend — HIT path: delete gated on confirmation
 # ---------------------------------------------------------------------------
 
 
@@ -1110,16 +1110,17 @@ async def test_dedup_flags_miss_respects_add_memory_response_memory_ids(
     ],
 )
 @pytest.mark.asyncio
-async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
+async def test_dedup_flags_hit_delete_gated_on_confirmation_not_memory_ids(
     add_memory_response, expect_delete, expect_noop_warning, caplog
 ):
-    """HIT path: dedup_flags must inspect add_memory's return value.
+    """HIT path: prior deletion is gated on post-write confirmation, not memory_ids.
 
-    When add_memory returns an empty memory_ids list:
+    When add_memory is a silent no-op (confirmation misses, empty memory_ids):
     - delete_memory must NOT be called (priors preserved for next cycle)
     - a WARNING must be emitted containing task_id and flag_type
 
-    When add_memory returns a non-empty memory_ids list:
+    When add_memory succeeds and the marker is confirmed findable (non-empty memory_ids
+    is a proxy; the real gate is whether confirm_marker_persisted returns a canonical id):
     - delete_memory MUST be called once for the prior
     - no no-op WARNING should be emitted
     """
