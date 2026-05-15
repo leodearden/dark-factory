@@ -14,6 +14,7 @@ truth for pass/fail.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -292,95 +293,25 @@ class TestSubmitToMergeQueuePlanTightening:
 
 
 # ---------------------------------------------------------------------------
-# Step-9 RED guard test: _mark_blocked accepts terminal_state_is_the_bug param
+# Task-1410 regression guard: terminal_state_is_the_bug removed from _mark_blocked
 # ---------------------------------------------------------------------------
 
 
-class TestMarkBlockedTerminalStateBugParam:
-    """Guard test for _mark_blocked(..., terminal_state_is_the_bug=True).
+class TestMarkBlockedSignature:
+    """Regression guard: _mark_blocked must NOT have terminal_state_is_the_bug param.
 
-    Step 10 of task 1366 (AFK A4a): add ``terminal_state_is_the_bug`` to
-    ``_mark_blocked``'s keyword-only signature as a semantic marker.
+    Task 1410 (reviewer_comprehensive over_engineering_dead_parameter): the
+    parameter was inert dead surface area — removed to avoid misleading callers.
 
-    Contracts pinned here:
-    - The param is accepted without TypeError.
-    - The marker does NOT suppress the orchestrator's own escalations —
-      _mark_blocked submits directly to queue.submit() (no MCP chokepoint).
-    - After escalate_to_human=True, both an L0 task_failure and an L1
-      escalation are open in the queue.
-
-    RED condition: ``_mark_blocked`` has no ``terminal_state_is_the_bug``
-    kwarg → call raises TypeError until step-10 adds it.
+    RED while the parameter exists; GREEN after task-1410 impl step removes it.
     """
 
-    @pytest.mark.asyncio
-    async def test_param_accepted_and_escalations_created(self, tmp_path: Path):
-        """terminal_state_is_the_bug=True is accepted; L0+L1 escalations are still open."""
-        from escalation.queue import EscalationQueue
-
-        from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-
-        task_id = 'tbug-9999'
-        queue = EscalationQueue(tmp_path / 'esc')
-
-        assignment = MagicMock()
-        assignment.task_id = task_id
-        assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
-        assignment.modules = ['mod_a']
-
-        _spec = pydantic_spec(OrchestratorConfig)
-        config = MagicMock(spec_set=_spec)
-        config.fused_memory.project_id = 'dark_factory'
-        config.fused_memory.url = 'http://localhost:8002'
-        config.max_review_cycles = 2
-        config.max_amendment_rounds = 1
-        config.lock_depth = 2
-        config.steward_completion_timeout = 300.0
-        config.project_root = tmp_path / 'proj'
-        # Disable dry-run hook so _mark_blocked doesn't spawn an asyncio task
-        config.unblock_auto.enabled = False
-
-        scheduler = MagicMock()
-        scheduler.set_task_status = AsyncMock()
-
-        wf = TaskWorkflow(
-            assignment=assignment,
-            config=config,
-            git_ops=MagicMock(),
-            scheduler=scheduler,
-            briefing=MagicMock(),
-            mcp=MagicMock(),
-            escalation_queue=queue,
-        )
-        wf.event_store = None
-        wf.plan = {'files': []}
-        wf._module_configs = []
-
-        # Must NOT raise TypeError — the param must exist in _mark_blocked's signature.
-        # escalate_to_human=True → L0 submitted + _ensure_l1_escalation_for_blocked called.
-        # terminal_state_is_the_bug=True is a semantic marker only; direct-submit path
-        # has no MCP chokepoint, so the marker does not suppress any escalation.
-        outcome = await wf._mark_blocked(
-            'boom',
-            escalate_to_human=True,
-            terminal_state_is_the_bug=True,
-        )
-
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Expected BLOCKED, got {outcome}'
-        )
-
-        # L0 task_failure escalation still created (marker does not suppress it)
-        l0_escs = queue.get_by_task(task_id, status='pending', level=0)
-        assert len(l0_escs) == 1, (
-            f'Expected exactly 1 pending L0 task_failure escalation; got {l0_escs}'
-        )
-        assert l0_escs[0].category == 'task_failure', (
-            f'Expected category task_failure; got {l0_escs[0].category}'
-        )
-
-        # L1 escalation submitted by _ensure_l1_escalation_for_blocked
-        assert queue.has_open_l1(task_id), (
-            'Expected has_open_l1 to be True after escalate_to_human=True; '
-            'marker must not suppress the L1 escalation'
+    def test_no_inert_terminal_state_is_the_bug_param(self):
+        """terminal_state_is_the_bug must not appear in _mark_blocked's signature."""
+        sig = inspect.signature(TaskWorkflow._mark_blocked)
+        assert 'terminal_state_is_the_bug' not in sig.parameters, (
+            "_mark_blocked still has 'terminal_state_is_the_bug' parameter — "
+            'task 1410 (reviewer_comprehensive over_engineering_dead_parameter) '
+            'removed it as inert dead surface area; do not re-add without wiring '
+            '_mark_blocked through the escalation MCP chokepoint.'
         )
