@@ -158,11 +158,21 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     })
     prior_marker.id = 'prior-42'
 
+    # task-1400 step-16: confirmation must find a marker with the CURRENT run_id='r1'
+    # (the prior has run_id='r0' and does not match the run_id-scoped confirmation kind filter)
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-42-r1'
+
     memory_service = AsyncMock()
-    # task-1400: supply side_effect list for the post-write confirmation search.
-    # [suppression=[], pre-write HIT=[prior], confirmation=[prior]] — confirmation
-    # finds the prior (same metadata) → confirmed_id = prior_marker.id → delete proceeds.
-    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [prior_marker]])
+    # task-1400: side_effect: suppression=[], pre-write HIT=[prior], confirmation=[new_marker_r1].
+    # Confirmation uses run_id-scoped kind filter (step-15) so it finds the new marker,
+    # not the stale prior (run_id='r0').  confirmed_id is set → delete proceeds.
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -428,8 +438,20 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
     prior_marker = _make_memory_result(prior_metadata)
     prior_marker.id = 'prior-malformed'
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # The prior has a malformed run_id (None/''/ absent) so it does NOT match.
+    # Supply a separate well-formed replacement marker with run_id='r1'.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-malformed-r1'
+
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    # suppression=[], pre-write HIT=[prior_malformed], confirmation=[new_marker_r1]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -543,8 +565,19 @@ async def test_dedup_flags_prior_marker_atomic_replace_writes_new_and_deletes_pr
     })
     prior_marker.id = 'prior-123'
 
+    # task-1400 step-16: confirmation needs a marker with current run_id='r1'.
+    # Prior has run_id='r0' and does not match the run_id-scoped confirmation filter.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-123-r1'
+
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    # suppression=[], pre-write HIT=[prior], confirmation=[new_marker_r1]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -622,9 +655,23 @@ async def test_dedup_flags_atomic_replace_handles_multiple_predecessors():
     prior2 = _prior('p-2', 'r-prev')
     prior3 = _prior('p-3', 'r-earlier')
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # All priors have older run_ids so they won't match confirmation.
+    # Supply a separate new marker with run_id='r1' for the confirmation element.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-multi-r1'
+
     memory_service = AsyncMock()
-    # Return [prior2, prior3, prior1] to exercise lex-sort — p-1 is NOT first in this order
-    memory_service.search = AsyncMock(return_value=[prior2, prior3, prior1])
+    # suppression=[], pre-write HIT=[prior2, prior3, prior1] (exercises lex-sort),
+    # confirmation=[new_marker_r1] (current run, confirmed → delete proceeds)
+    memory_service.search = AsyncMock(
+        side_effect=[[], [prior2, prior3, prior1], [new_marker_r1]]
+    )
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -755,13 +802,25 @@ async def test_dedup_flags_atomic_replace_per_prior_delete_failure_logs_warning_
     prior1 = _prior('p-1', 'r0')
     prior2 = _prior('p-2', 'r-prev')
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # Both priors have older run_ids so they won't match confirmation.
+    # Supply a well-formed new marker with run_id='r1'.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-del-fail-r1'
+
     def _delete_side_effect(**kwargs):
         if kwargs.get('memory_id') == 'p-1':
             raise RuntimeError('delete p-1 failed')
         # p-2 succeeds — return None (AsyncMock awaitable returns None by default)
 
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior1, prior2])
+    # suppression=[], pre-write HIT=[prior1, prior2], confirmation=[new_marker_r1]
+    memory_service.search = AsyncMock(side_effect=[[], [prior1, prior2], [new_marker_r1]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(side_effect=_delete_side_effect)
 
@@ -875,9 +934,31 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
 
     flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'test'}]
 
+    # task-1400 step-16: confirmation kind filter now scopes by run_id.
+    # All priors have their own run_ids (r-aaa, r-mmm, r-zzz) — none match the
+    # current run_id ('r1' or 'r2').  Supply well-formed new markers for each run.
+    new_marker_r1 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '99',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r1',
+    })
+    new_marker_r1.id = 'new-det-r1'
+
+    new_marker_r2 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '99',
+        'flag_type': 'stale_metadata',
+        'run_id': 'r2',
+    })
+    new_marker_r2.id = 'new-det-r2'
+
     # Run 1: search returns [zzz, aaa, mmm] — aaa is NOT first
     memory_service_1 = AsyncMock()
-    memory_service_1.search = AsyncMock(return_value=[prior_zzz, prior_aaa, prior_mmm])
+    # suppression=[], pre-write=[zzz,aaa,mmm] (exercises lex-sort), confirmation=[new_r1]
+    memory_service_1.search = AsyncMock(
+        side_effect=[[], [prior_zzz, prior_aaa, prior_mmm], [new_marker_r1]]
+    )
     memory_service_1.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_1.delete_memory = AsyncMock(return_value=None)
 
@@ -890,7 +971,10 @@ async def test_dedup_flags_hit_prior_selection_is_deterministic_across_search_or
 
     # Run 2: search returns [mmm, zzz, aaa] — different order
     memory_service_2 = AsyncMock()
-    memory_service_2.search = AsyncMock(return_value=[prior_mmm, prior_zzz, prior_aaa])
+    # suppression=[], pre-write=[mmm,zzz,aaa] (different order), confirmation=[new_r2]
+    memory_service_2.search = AsyncMock(
+        side_effect=[[], [prior_mmm, prior_zzz, prior_aaa], [new_marker_r2]]
+    )
     memory_service_2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service_2.delete_memory = AsyncMock(return_value=None)
 
@@ -1057,15 +1141,24 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
     else:
         response = AddMemoryResponse(memory_ids=['new-marker-id'])
 
-    # task-1400: switch to side_effect so confirmation search is explicit.
-    # 'empty': add_memory is a no-op → confirmation misses (no new findable marker)
+    # task-1400 step-16: confirmation kind filter now scopes by run_id='r1'.
+    # 'empty': add_memory is a no-op → no new marker with run_id='r1' indexed
+    #          → confirmation misses (only stale prior with run_id='r0' present)
     #          → confirmed_id=None → write_succeeded=False → delete skipped.
-    # 'non_empty': add_memory wrote a marker → confirmation finds the prior marker
-    #              (same metadata still present) → confirmed_id set → delete proceeds.
+    # 'non_empty': add_memory wrote a marker with run_id='r1'
+    #              → supply a fresh marker with run_id='r1' for confirmation.
+    #              Prior has run_id='r0' and does NOT match confirmation filter.
     if add_memory_response == 'empty':
         search_side_effect = [[], [prior_marker], [], []]  # conf miss + retry miss
     else:
-        search_side_effect = [[], [prior_marker], [prior_marker]]  # conf finds marker
+        new_marker_r1 = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r1',  # current run — matches confirmation kind filter
+        })
+        new_marker_r1.id = 'new-hit-resp-r1'
+        search_side_effect = [[], [prior_marker], [new_marker_r1]]  # conf finds new marker
 
     memory_service = AsyncMock()
     memory_service.search = AsyncMock(side_effect=search_side_effect)
