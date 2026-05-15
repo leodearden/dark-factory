@@ -2400,7 +2400,7 @@ class Scheduler:
 
         The ``snapshot_at`` field is included in the separate disk payload
         built by ``_write_snapshot_best_effort`` (via ``json.dumps(state, ...)``)
-        or by ``write_state_snapshot`` when called directly without a pre-built
+        or by ``_write_state_snapshot_raw`` when called directly without a pre-built
         payload.
 
         Args:
@@ -2420,7 +2420,7 @@ class Scheduler:
         dedup_state = {k: v for k, v in state.items() if k != 'snapshot_at'}
         return json.dumps(dedup_state, default=str, sort_keys=True)
 
-    def write_state_snapshot(self, path: Path, payload: str | None = None) -> None:
+    def _write_state_snapshot_raw(self, path: Path, payload: str | None = None) -> None:
         """Atomically write the current state snapshot to *path* as JSON.
 
         Creates parent directories if missing.  Uses a tmp-file + os.replace
@@ -2486,7 +2486,7 @@ class Scheduler:
 
         Bookkeeping (``_last_snapshot_payload``, ``_last_snapshot_write_ts``)
         is advanced only after a confirmed successful write: exceptions from
-        ``write_state_snapshot`` propagate to the outer try/except, which logs
+        ``_write_state_snapshot_raw`` propagate to the outer try/except, which logs
         a warning and returns without touching bookkeeping — preventing a
         failed write from being recorded as the last-written state.
 
@@ -2557,15 +2557,15 @@ class Scheduler:
                     return
                 # Build the disk payload (full state including snapshot_at) only
                 # after the dedup check — avoids serialising when a dedup skip
-                # applies.  Passed directly to write_state_snapshot to avoid a
+                # applies.  Passed directly to _write_state_snapshot_raw to avoid a
                 # second get_state_snapshot() call on the actual write path.
                 disk_payload = json.dumps(state, default=str)
                 path = (
                     Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
                 )
-                await asyncio.to_thread(self.write_state_snapshot, path, disk_payload)
+                await asyncio.to_thread(self._write_state_snapshot_raw, path, disk_payload)
                 # Bookkeeping advanced only after a confirmed successful write.
-                # write_state_snapshot propagates exceptions so these lines are
+                # _write_state_snapshot_raw propagates exceptions so these lines are
                 # unreachable when the disk write fails — preventing a stale
                 # snapshot from being recorded as last-written.
                 self._last_snapshot_payload = payload

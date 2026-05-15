@@ -507,17 +507,17 @@ class TestGetStateSnapshotPopulated:
 
 
 # ===========================================================================
-# Step-15: write_state_snapshot()
+# Step-15: _write_state_snapshot_raw()
 # ===========================================================================
 
 class TestWriteStateSnapshot:
-    """Scheduler.write_state_snapshot() writes a valid JSON file atomically."""
+    """Scheduler._write_state_snapshot_raw() writes a valid JSON file atomically."""
 
     def test_write_state_snapshot_creates_valid_json(self, tmp_path):
-        """write_state_snapshot writes the snapshot to disk as parseable JSON."""
+        """_write_state_snapshot_raw writes the snapshot to disk as parseable JSON."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         path = tmp_path / 'scheduler_state.json'
-        scheduler.write_state_snapshot(path)
+        scheduler._write_state_snapshot_raw(path)
 
         assert path.exists(), 'Expected snapshot file to be created'
         data = json.loads(path.read_text())
@@ -532,11 +532,11 @@ class TestWriteStateSnapshot:
 
         # First write: inject a sentinel skip count.
         scheduler._skip_count['first'] = 1
-        scheduler.write_state_snapshot(path)
+        scheduler._write_state_snapshot_raw(path)
         # Second write: clear skip_count and add a different sentinel.
         scheduler._skip_count.clear()
         scheduler._skip_count['second'] = 2
-        scheduler.write_state_snapshot(path)
+        scheduler._write_state_snapshot_raw(path)
         second_content = json.loads(path.read_text())
 
         assert 'first' not in second_content['skip_counts'], (
@@ -545,10 +545,10 @@ class TestWriteStateSnapshot:
         assert second_content['skip_counts'].get('second') == 2
 
     def test_write_state_snapshot_creates_parent_dirs(self, tmp_path):
-        """write_state_snapshot creates missing parent directories."""
+        """_write_state_snapshot_raw creates missing parent directories."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         path = tmp_path / 'deep' / 'nested' / 'dir' / 'scheduler_state.json'
-        scheduler.write_state_snapshot(path)
+        scheduler._write_state_snapshot_raw(path)
         assert path.exists(), (
             'Expected snapshot file to be created even when parent dirs are missing'
         )
@@ -607,7 +607,7 @@ class TestAcquireNextWritesSnapshot:
     async def test_snapshot_write_failure_does_not_break_acquire_next(
         self, tmp_path, monkeypatch
     ):
-        """If write_state_snapshot raises, acquire_next still dispatches tasks."""
+        """If _write_state_snapshot_raw raises, acquire_next still dispatches tasks."""
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
         scheduler._project_root = str(tmp_path)
@@ -615,9 +615,9 @@ class TestAcquireNextWritesSnapshot:
         task_a = _pending_task('A', files=['mod_a'])
         scheduler.get_tasks = AsyncMock(return_value=[task_a])
 
-        # Force write_state_snapshot to raise so we test fault isolation.
+        # Force _write_state_snapshot_raw to raise so we test fault isolation.
         from unittest.mock import MagicMock
-        scheduler.write_state_snapshot = MagicMock(side_effect=RuntimeError('disk full'))
+        scheduler._write_state_snapshot_raw = MagicMock(side_effect=RuntimeError('disk full'))
 
         result = await scheduler.acquire_next()
         # The dispatch must still succeed despite the snapshot write failure.
@@ -641,9 +641,9 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         """Construction-path repro: str(None) produces '_project_root == "None"';
         the snapshot write must be refused rather than creating ./None/ on disk.
 
-        write_state_snapshot is intentionally NOT mocked here so that the
+        _write_state_snapshot_raw is intentionally NOT mocked here so that the
         directory-existence assertion is a genuine end-to-end regression check:
-        if the guard were removed, write_state_snapshot would call
+        if the guard were removed, _write_state_snapshot_raw would call
         path.parent.mkdir(parents=True, exist_ok=True) and create
         tmp_path/None/data/orchestrator/, making the assertion fail.
         """
@@ -664,7 +664,7 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
 
         await scheduler._write_snapshot_best_effort()
 
-        # Real write_state_snapshot would create tmp_path/None/data/orchestrator/
+        # Real _write_state_snapshot_raw would create tmp_path/None/data/orchestrator/
         # if the guard were absent; its non-existence proves the guard fired.
         assert not (tmp_path / 'None').exists(), (
             "A directory named 'None' must not be created under the CWD "
@@ -678,7 +678,7 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
     ):
         """Guard covers the literal 'None', empty string, and None itself.
 
-        write_state_snapshot is mocked so assert_not_called() is the sole
+        _write_state_snapshot_raw is mocked so assert_not_called() is the sole
         genuine assertion: it verifies the guard fires before the write is
         attempted for each invalid _project_root value.
         """
@@ -689,14 +689,14 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         # direct-set pattern used at lines 565 and 586.
         scheduler._project_root = bad_root
 
-        scheduler.write_state_snapshot = MagicMock()
+        scheduler._write_state_snapshot_raw = MagicMock()
         monkeypatch.chdir(tmp_path)
 
         await scheduler._write_snapshot_best_effort()
 
         # assert_not_called() is the genuine regression check: the guard must
-        # prevent write_state_snapshot from being invoked for all bad root values.
-        scheduler.write_state_snapshot.assert_not_called()
+        # prevent _write_state_snapshot_raw from being invoked for all bad root values.
+        scheduler._write_state_snapshot_raw.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_project_root_guard_logs_once_and_does_not_raise(
@@ -708,21 +708,21 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         duplicate log lines on subsequent guard trips — a misconfigured
         project_root is a static deployment issue, not a per-tick event.
         Best-effort no-raise contract must also hold: the guard returns
-        without raising, and write_state_snapshot is never called.
+        without raising, and _write_state_snapshot_raw is never called.
         """
         import logging
         from unittest.mock import MagicMock
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler._project_root = 'None'
-        scheduler.write_state_snapshot = MagicMock()
+        scheduler._write_state_snapshot_raw = MagicMock()
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
             await scheduler._write_snapshot_best_effort()
             await scheduler._write_snapshot_best_effort()
 
-        # (a) Guard still short-circuits — write_state_snapshot never called.
-        scheduler.write_state_snapshot.assert_not_called()
+        # (a) Guard still short-circuits — _write_state_snapshot_raw never called.
+        scheduler._write_state_snapshot_raw.assert_not_called()
         # (b) Exactly ONE WARNING across BOTH calls (dedup via instance flag).
         matching = [
             r for r in caplog.records
@@ -774,7 +774,7 @@ class TestSnapshotWriteThrottle:
         scheduler.get_tasks = AsyncMock(return_value=[task_a])
 
         # Mock the disk-write seam to count real write attempts.
-        scheduler.write_state_snapshot = MagicMock()
+        scheduler._write_state_snapshot_raw = MagicMock()
 
         # Run K=5 ticks WITHOUT advancing the clock.
         # Release the lock between ticks so A is eligible each time.
@@ -785,9 +785,9 @@ class TestSnapshotWriteThrottle:
             await scheduler.acquire_next()
             scheduler.release('A')  # make A eligible for the next tick
 
-        assert scheduler.write_state_snapshot.call_count == 1, (
+        assert scheduler._write_state_snapshot_raw.call_count == 1, (
             f'Expected 1 disk write for {K} ticks within one throttle window, '
-            f'got {scheduler.write_state_snapshot.call_count}'
+            f'got {scheduler._write_state_snapshot_raw.call_count}'
         )
 
     @pytest.mark.asyncio
@@ -828,7 +828,7 @@ class TestSnapshotWriteThrottle:
 
         task_a = _pending_task('A', files=['mod_a'])
         scheduler.get_tasks = AsyncMock(return_value=[task_a])
-        scheduler.write_state_snapshot = MagicMock()
+        scheduler._write_state_snapshot_raw = MagicMock()
 
         for i in range(N):
             scheduler._skip_count[f'X{i}'] = i  # unique per tick → defeats content-dedup
@@ -837,7 +837,7 @@ class TestSnapshotWriteThrottle:
             scheduler.release('A')
 
         upper_bound = math.ceil(N * tick_interval / throttle_interval)
-        count = scheduler.write_state_snapshot.call_count
+        count = scheduler._write_state_snapshot_raw.call_count
         assert count == upper_bound, (
             f'Expected exactly {upper_bound} disk writes (time-throttle gate is '
             f'the sole bound; content-dedup defeated by per-tick unique state), '
@@ -863,7 +863,7 @@ class TestSnapshotWriteThrottle:
 
         task_a = _pending_task('A', files=['mod_a'])
         scheduler.get_tasks = AsyncMock(return_value=[task_a])
-        scheduler.write_state_snapshot = MagicMock()
+        scheduler._write_state_snapshot_raw = MagicMock()
 
         # First tick writes (no prior timestamp).
         await scheduler.acquire_next()
@@ -873,14 +873,14 @@ class TestSnapshotWriteThrottle:
             await scheduler.acquire_next()
             scheduler.release('A')
         # Exactly 1 write so far (throttle held the rest).
-        assert scheduler.write_state_snapshot.call_count == 1
+        assert scheduler._write_state_snapshot_raw.call_count == 1
 
         # Record count before flush, then flush.  The clock is still at 0.0
         # (well within the 1.0 s window) so only force=True can bypass it.
-        count_before = scheduler.write_state_snapshot.call_count
+        count_before = scheduler._write_state_snapshot_raw.call_count
         await scheduler.flush_state_snapshot()
 
-        assert scheduler.write_state_snapshot.call_count == count_before + 1, (
+        assert scheduler._write_state_snapshot_raw.call_count == count_before + 1, (
             'flush_state_snapshot() must produce exactly 1 additional write '
             'even when the throttle window has not elapsed'
         )
@@ -907,28 +907,28 @@ class TestSnapshotWriteThrottle:
 
         scheduler = Scheduler(config, time_source=lambda: clock['t'])
         scheduler._project_root = str(tmp_path)
-        scheduler.write_state_snapshot = MagicMock()
+        scheduler._write_state_snapshot_raw = MagicMock()
 
         # First write: no prior payload → always writes.
         clock['t'] = 1.0
         await scheduler._write_snapshot_best_effort()
-        assert scheduler.write_state_snapshot.call_count == 1
+        assert scheduler._write_state_snapshot_raw.call_count == 1
 
         # Second write: state unchanged → payload byte-identical → skip.
         clock['t'] = 2.0
         await scheduler._write_snapshot_best_effort()
-        assert scheduler.write_state_snapshot.call_count == 1, (
+        assert scheduler._write_state_snapshot_raw.call_count == 1, (
             'Expected disk write to be skipped for byte-identical payload, '
-            f'got call_count={scheduler.write_state_snapshot.call_count}'
+            f'got call_count={scheduler._write_state_snapshot_raw.call_count}'
         )
 
         # Third write: state mutated → payload differs → writes.
         scheduler._skip_count['Q'] = 1
         clock['t'] = 3.0
         await scheduler._write_snapshot_best_effort()
-        assert scheduler.write_state_snapshot.call_count == 2, (
+        assert scheduler._write_state_snapshot_raw.call_count == 2, (
             'Expected disk write after state mutation (changed payload), '
-            f'got call_count={scheduler.write_state_snapshot.call_count}'
+            f'got call_count={scheduler._write_state_snapshot_raw.call_count}'
         )
 
     @pytest.mark.asyncio
@@ -937,11 +937,11 @@ class TestSnapshotWriteThrottle:
 
         Without a lock, both coroutines can pass the time-gate simultaneously
         (the gate reads _last_snapshot_write_ts before the await, so both see
-        the stale value), reach asyncio.to_thread(write_state_snapshot, …)
+        the stale value), reach asyncio.to_thread(_write_state_snapshot_raw, …)
         concurrently, and write to the same .json.tmp path from two threads.
 
         With the lock, only one coroutine holds the gate at a time, so
-        write_state_snapshot is always called serially and max in-flight == 1.
+        _write_state_snapshot_raw is always called serially and max in-flight == 1.
         """
         import threading
         import time as _time
@@ -954,7 +954,7 @@ class TestSnapshotWriteThrottle:
         scheduler = Scheduler(config, time_source=lambda: clock['t'])
         scheduler._project_root = str(tmp_path)
 
-        # Spy on write_state_snapshot: tracks how many calls are in-flight simultaneously.
+        # Spy on _write_state_snapshot_raw: tracks how many calls are in-flight simultaneously.
         spy_lock = threading.Lock()
         in_flight = {'current': 0, 'max': 0}
 
@@ -967,7 +967,7 @@ class TestSnapshotWriteThrottle:
             with spy_lock:
                 in_flight['current'] -= 1
 
-        scheduler.write_state_snapshot = MagicMock(side_effect=spy_write)
+        scheduler._write_state_snapshot_raw = MagicMock(side_effect=spy_write)
 
         # Launch several concurrent invocations: mix of tick (force=False) and
         # flush (force=True).  Each mutates a unique _skip_count key so payloads
@@ -982,7 +982,7 @@ class TestSnapshotWriteThrottle:
         await _asyncio.gather(*[invoke(i) for i in range(N)])
 
         assert in_flight['max'] == 1, (
-            f'Expected max in-flight write_state_snapshot calls == 1 (serialised), '
+            f'Expected max in-flight _write_state_snapshot_raw calls == 1 (serialised), '
             f'got {in_flight["max"]} — lock is missing or not covering the critical section'
         )
 
