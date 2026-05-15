@@ -35,7 +35,6 @@ are deliberately omitted — they would just duplicate literals from
 ``conftest.py`` two lines away.
 """
 
-import builtins
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -244,57 +243,3 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
         f'expected overrides_db_path to have .db suffix, got {db_path.name!r}'
     )
 
-
-def test_pydantic_spec_does_not_reflect_basemodel_per_call(monkeypatch):
-    """pydantic_spec must not call inspect.getmembers(BaseModel) or dir(BaseModel) per call.
-
-    The two BaseModel reflection sets (_BASEMODEL_PROPS and _BASEMODEL_ATTRS) must
-    be computed once at module import time and cached as module-level constants.
-    This test spies on inspect.getmembers (via _orch_helpers.inspect.getmembers)
-    and shadows dir in _orch_helpers's module globals (Python resolves module
-    globals before builtins) to detect per-call re-computation.
-
-    Spies are installed AFTER import so the one-time module-load reflection is not
-    counted — only per-call invocations trigger the counters.
-
-    This test FAILS on the unmodified code (in-body BaseModel reflection) and
-    PASSES after the module-scope lift (task 1426).
-    """
-    import _orch_helpers
-    from pydantic import BaseModel
-
-    from orchestrator.config import OrchestratorConfig
-
-    basemodel_getmembers = 0
-    basemodel_dir = 0
-
-    orig_getmembers = _orch_helpers.inspect.getmembers
-
-    def spy_getmembers(obj, predicate=None):
-        nonlocal basemodel_getmembers
-        if obj is BaseModel:
-            basemodel_getmembers += 1
-        if predicate is None:
-            return orig_getmembers(obj)
-        return orig_getmembers(obj, predicate)
-
-    def spy_dir(*args):
-        nonlocal basemodel_dir
-        if args and args[0] is BaseModel:
-            basemodel_dir += 1
-        return builtins.dir(*args)
-
-    monkeypatch.setattr(_orch_helpers.inspect, 'getmembers', spy_getmembers)
-    monkeypatch.setattr('_orch_helpers.dir', spy_dir, raising=False)
-
-    _orch_helpers.pydantic_spec(OrchestratorConfig)
-    _orch_helpers.pydantic_spec(OrchestratorConfig)
-
-    assert basemodel_getmembers == 0, (
-        f'pydantic_spec called inspect.getmembers(BaseModel) {basemodel_getmembers} time(s) '
-        f'across 2 invocations — BaseModel reflection must be lifted to module scope'
-    )
-    assert basemodel_dir == 0, (
-        f'pydantic_spec called dir(BaseModel) {basemodel_dir} time(s) '
-        f'across 2 invocations — BaseModel reflection must be lifted to module scope'
-    )

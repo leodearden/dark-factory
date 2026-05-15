@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountState, UsageGate
 
-# Constant for the process lifetime — lifted out of pydantic_spec (task 1426)
+# Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
 _BASEMODEL_PROPS: frozenset[str] = frozenset(
     name for name, v in inspect.getmembers(BaseModel) if isinstance(v, property)
