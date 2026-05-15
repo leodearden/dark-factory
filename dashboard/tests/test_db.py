@@ -383,9 +383,13 @@ class TestDbPool:
         # Both flags are set synchronously inside `await conn.close()`, which runs
         # in the resumed getter task — they are therefore settled by the time
         # `await getter` returns above.
-        assert hasattr(opened[0], '_connection') and hasattr(opened[0], '_running'), (
-            'aiosqlite internal attribute names changed — update test'
-        )
+        # Verified against aiosqlite >=0.22.x — bump and re-verify the
+        # private-attribute lifecycle if this pin moves.
+        assert (
+            hasattr(opened[0], '_connection')
+            and hasattr(opened[0], '_running')
+            and hasattr(opened[0], '_thread')
+        ), 'aiosqlite internal attribute names changed — update test'
         assert opened[0]._connection is None, (
             f'expected closed mid-flight connection (_connection is None), '
             f'got {opened[0]._connection!r}'
@@ -393,6 +397,16 @@ class TestDbPool:
         assert opened[0]._running is False, (
             f'expected worker-thread shutdown (_running is False), '
             f'got {opened[0]._running!r}'
+        )
+        # Defense-in-depth: confirm the worker thread itself terminated, not just
+        # that the state flags were flipped.  The thread exits after the STOP
+        # sentinel is processed — which happens asynchronously after close()
+        # returns — so join(timeout=2.0) is required before asserting is_alive().
+        opened[0]._thread.join(timeout=2.0)
+        assert not opened[0]._thread.is_alive(), (
+            'aiosqlite worker thread did not exit after close '
+            '(mid-open connection was not properly closed by the '
+            'post-connect _closed re-check)'
         )
 
 
