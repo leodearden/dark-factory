@@ -249,6 +249,19 @@ class TestParkInstallAtTracking:
             '_park_install_at must not be set when install_parks installs nothing'
         )
 
+    def test_park_install_at_bounded_under_preemption_churn(self):
+        """_park_install_at must not accumulate stale entries under repeated evictions."""
+        lt = self._make_lock_table()
+        for i in range(50):
+            lt.install_parks(f'low{i}', ['mod/a'], 'medium')
+            lt.install_parks('high', ['mod/a'], 'critical')
+            lt.clear_parks_for('high')  # free mod/a for next iteration
+        # Every low{i} was fully evicted; 'high' was cleared each round.
+        assert len(lt._park_install_at) == 0, (
+            f'Expected empty _park_install_at after all evictions+clears, '
+            f'got {len(lt._park_install_at)} entries — without the fix this would be ~50'
+        )
+
     def test_install_parks_drops_install_at_for_fully_evicted_owner(self):
         """Full eviction must remove the owner from _park_install_at."""
         lt = self._make_lock_table()
