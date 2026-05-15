@@ -368,18 +368,32 @@ class TestReadCapIntervals:
 
     @pytest.mark.asyncio
     async def test_non_utc_now_normalized_to_utc(self, tmp_path):
-        """A tz-aware but non-UTC `now` must yield identical results to the UTC equivalent.
+        """A tz-aware but non-UTC ``now`` must produce the same cutoff as its UTC equivalent.
 
-        A non-UTC offset (e.g. ``-08:00``) produces a cutoff isoformat with a
-        non-UTC suffix (e.g. ``"2026-05-08T04:00:00-08:00"``).  That string
-        compares *incorrectly* against the ``+00:00``-suffixed ISO strings stored
-        in ``account_events.created_at`` via SQLite's lexicographic TEXT ordering:
-        the ``-`` in ``-08:00`` sorts *before* ``+``, so the offset-negative cutoff
-        string sorts before any ``+00:00`` string of the same UTC instant, causing
-        the window to appear larger than it is.
+        The divergence band:
+        Without ``astimezone(UTC)``, a ``now`` in ``-08:00`` produces a cutoff
+        string like ``"YYYY-MM-DDTHH:MM:SS-08:00"`` where the wall-clock hour
+        is 8 hours *earlier* than the UTC wall-clock hour.  A DB row stored as
+        ``"(Cwall-1h)...+00:00"`` — one UTC hour before the true cutoff — has
+        a wall-clock prefix 7 hours *after* the buggy cutoff's wall-clock prefix
+        (because 19 > 12 when UTC is 20 and the buggy -08:00 cutoff is at 12).
+        That 7-hour gap means the lexicographic comparison always resolves on the
+        fixed-width ``YYYY-MM-DDTHH:MM:SS`` prefix, never on the ``+``/``-``
+        suffix, so the comparison is deterministic regardless of date position.
 
-        After the fix, ``astimezone(UTC)`` converts any tz-aware ``now`` to UTC
-        before computing the cutoff, so the suffix is always ``+00:00``.
+        RED/GREEN proof:
+        - ``result_utc`` (control): cutoff = ``Cwall...+00:00``; row
+          ``(Cwall-1h)...+00:00`` < cutoff (fixed-width prefix: "19" < "20") →
+          EXCLUDED → ``result_utc == []``, both pre- and post-fix.
+        - ``result_minus8`` (probe): PRE-FIX the buggy cutoff is
+          ``(Cwall-8h)...-08:00``; the row ``(Cwall-1h)...+00:00`` has prefix
+          "19" > "12" → row > cutoff → INCLUDED → ``len(result_minus8) == 1`` →
+          ``assert result_minus8 == []`` FAILS red.  POST-FIX ``astimezone(UTC)``
+          converts to UTC → cutoff = ``Cwall...+00:00`` → row excluded → green.
+
+        WHY a tz-aware (+00:00) DB row is used:
+        This exercises the *cutoff*-normalisation path, not the row-normalisation
+        path (the identical ``replace(tzinfo=UTC)`` idiom at cap_history.py:121).
         """
         # A UTC reference instant
         real_now_utc = datetime.now(UTC)
@@ -389,11 +403,14 @@ class TestReadCapIntervals:
         tz_minus8 = timezone(timedelta(hours=-8))
         real_now_minus8 = real_now_utc.astimezone(tz_minus8)
 
-        # Insert one tz-aware boundary row (production format: +00:00 suffix).
-        # Using a tz-aware row here is intentional: we want to verify the
-        # *cutoff* normalisation is correct, not the row normalisation path.
+        # Probe row: strictly 1 hour INSIDE the divergence band (1 hour before
+        # the true cutoff).  This positions the row such that the correct UTC
+        # cutoff excludes it, while the buggy -08:00 cutoff includes it.
+        # The tz-aware (+00:00) format mirrors production DB rows, exercising
+        # the cutoff-normalisation branch rather than the row-normalisation branch.
+        probe_ts = cutoff_instant_utc - timedelta(hours=1)
         db_path = _make_db_with_events(tmp_path, 'non_utc_now.db', [
-            ('acc-x', 'cap_hit', cutoff_instant_utc),
+            ('acc-x', 'cap_hit', probe_ts),
         ])
 
         async with aiosqlite.connect(str(db_path)) as conn:
@@ -406,14 +423,22 @@ class TestReadCapIntervals:
                 [conn], days=7, now=real_now_minus8
             )
 
-        # Both should return the same set: the boundary row is at the exact
-        # cutoff edge, excluded by >=, so both calls should return 0 intervals.
-        assert len(result_utc) == len(result_minus8), (
-            f"UTC now → {len(result_utc)} interval(s), "
-            f"-08:00 now → {len(result_minus8)} interval(s); expected equal counts. "
-            f"Bug: non-UTC cutoff has a non-+00:00 suffix that compares incorrectly "
-            f"against tz-aware DB rows via lexicographic string ordering."
+        # Load-bearing exact-count assertions:
+        # result_utc: correct UTC cutoff excludes probe row (pre- and post-fix)
+        assert result_utc == [], (
+            f"Expected [] with UTC now (probe row at cutoff-1h is before +00:00 "
+            f"cutoff string), got {result_utc}"
         )
+        # result_minus8: pre-fix the buggy -08:00 cutoff includes probe row (→
+        # fails red); post-fix astimezone(UTC) normalises to UTC cutoff (→ green)
+        assert result_minus8 == [], (
+            f"Expected [] with -08:00 now (should normalize to UTC cutoff), "
+            f"got {result_minus8}. "
+            f"Bug: without astimezone(UTC), -08:00 cutoff string sorts before "
+            f"the probe row's +00:00 string, causing false inclusion."
+        )
+        # Supplementary inter-result consistency checks
+        assert len(result_utc) == len(result_minus8)
         assert {iv.account_name for iv in result_utc} == {iv.account_name for iv in result_minus8}
 
 
