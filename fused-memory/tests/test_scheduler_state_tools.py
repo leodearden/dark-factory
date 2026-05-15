@@ -70,6 +70,8 @@ _EMPTY_SKELETON = {
     'pin_queue': [],
     'overrides': {},
     'current_holders': {},
+    'is_paused': False,
+    'pause_reason': None,
     'snapshot_at': None,
 }
 
@@ -105,6 +107,8 @@ class TestGetSchedulerStateTool:
             'overrides': {'T1': {'boost_tier': 'high', 'pinned': False,
                                  'reserve_now': False, 'ttl_until': None}},
             'current_holders': {'m/src': 'T4'},
+            'is_paused': True,
+            'pause_reason': 'park-stop: 5 tasks parked in 1h',
             'snapshot_at': '2026-05-14T12:00:00+00:00',
         }
         _write_snapshot(tmp_path, synthetic)
