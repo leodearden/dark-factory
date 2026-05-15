@@ -731,6 +731,18 @@ async def _query_stage2_flags(
     stale_missing_run_id_ids: list[str] = []
     stale_mismatched_run_id_ids: list[str] = []
     rescued_ids: list[str] = []
+
+    def _rescue(flag: dict, rid: str) -> None:
+        """Route a rescued marker to current and record its id.
+
+        This is the ONLY place that should append to both current_flags and
+        rescued_ids so the two lists stay in sync.  Adding a new rescue path
+        means calling _rescue — forgetting rescued_ids is a compile-visible
+        error rather than a silent counter undercount.
+        """
+        current_flags.append(flag)
+        rescued_ids.append(rid)
+
     run_id_str = str(current_run_id)
     for r in results:
         meta = dict(r.metadata or {})
@@ -761,8 +773,7 @@ async def _query_stage2_flags(
                     _created_at_val,
                     extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
                 )
-                current_flags.append(flag_dict)
-                rescued_ids.append(r.id)
+                _rescue(flag_dict, r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
@@ -799,8 +810,7 @@ async def _query_stage2_flags(
                     _created_at_val,
                     extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
                 )
-                current_flags.append(flag_dict)
-                rescued_ids.append(r.id)
+                _rescue(flag_dict, r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
