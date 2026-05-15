@@ -36,9 +36,9 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _patch_dry_run_unblock(monkeypatch):
-    """Prevent _spawn_dry_run_unblock from hanging all BLOCKED-outcome tests.
+    """Prevent _spawn_dry_run_unblock from hanging BLOCKED-outcome tests.
 
     _mark_blocked fires asyncio.create_task(run_dry_run_unblock(...)) when
     unblock_auto.enabled=True (the default).  In e2e tests the real
@@ -49,10 +49,17 @@ def _patch_dry_run_unblock(monkeypatch):
     is what gets tested here.  test_workflow_dry_run_hook.py pins the hook
     behaviour with its own explicit patches.
 
-    NOTE: This fixture is autouse for the entire module.  If you need to test
-    dry-run-unblock behaviour from an e2e perspective, add that test to
-    test_workflow_dry_run_hook.py instead of this file, or the hook will be
-    silently suppressed here.
+    NOTE: This fixture is applied via class-level
+    ``@pytest.mark.usefixtures('_patch_dry_run_unblock')`` on each Test class
+    whose tests can drive the workflow into the BLOCKED state.  It is NOT
+    module-wide autouse, so the scope is explicit and auditable.
+
+    MAINTENANCE: If you add or edit a test class that drives the workflow to
+    BLOCKED and forget to add the marker, the failure is loud — the test hits
+    the 60 s pytest-timeout (timeout_method=thread) rather than hanging
+    silently.  Add ``@pytest.mark.usefixtures('_patch_dry_run_unblock')`` to
+    that class and re-run.  For dry-run-unblock behaviour tests, use
+    test_workflow_dry_run_hook.py instead of this file.
     """
     import orchestrator.workflow as _wf  # local import to avoid circular at module level
 
@@ -807,6 +814,7 @@ class TestCompletionJudge:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestVerifyDebugfixLoop:
     """Verification fails, debugger fixes, re-verify passes."""
 
@@ -1690,6 +1698,7 @@ def _make_resolve_then_dismiss_chained_steward(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestTaskFailureEscalation:
     """Blocked tasks create escalation entries in the queue."""
 
@@ -1982,6 +1991,7 @@ class TestCorruptedIterationLogEscalation:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestDoneIsTerminal:
     """_mark_blocked must be a no-op when workflow.state is already DONE."""
 
@@ -2048,6 +2058,7 @@ class TestDoneIsTerminal:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestReviewerErrors:
     """Reviewer failures are detected, retried, and escalated."""
 
@@ -2331,6 +2342,7 @@ class TestGhostLoopGuard:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestWipRecoveryNoAdvance:
     """wip_recovery_no_advance outcome creates L1 wip_conflict escalation and returns BLOCKED."""
 
@@ -2480,6 +2492,7 @@ class StringPrereqsArchitectStub(AgentStub):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestPrerequisitesValidation:
     """Workflow blocks with descriptive error when architect writes string prerequisites."""
 
@@ -2526,6 +2539,7 @@ class TestPrerequisitesValidation:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestMarkBlockedFalseDoneGuard:
     """_mark_blocked's requeue-on-steward-resolution contract.
 
@@ -4131,6 +4145,7 @@ class TestFileStructureInvariants:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestPlanDoneEarlyReturn:
     """workflow.run returns DONE when _plan returns DONE, without entering EXECUTE.
 
@@ -4227,6 +4242,7 @@ def _make_l1_escalating_steward(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestMarkBlockedPreservesStewardStatus:
     """Regression: _mark_blocked must not overwrite steward-set deferred/blocked.
 
@@ -4312,6 +4328,7 @@ class TestMarkBlockedPreservesStewardStatus:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestMarkBlockedRespectsOpenL1:
     """Regression: _mark_blocked must not auto-requeue when L1 is open.
 
@@ -4650,6 +4667,7 @@ class TestStaleL1DoesNotSinkRun:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestAllAccountsCappedExceptionBoundary:
     """Verify AllAccountsCappedException is caught at the workflow boundary.
 
@@ -4710,6 +4728,7 @@ class TestAllAccountsCappedExceptionBoundary:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestAllAccountsCappedEscalationLevel:
     """Verify AllAccountsCappedException creates an L0 (not L1) with
     suggested_action='cap_wait_exceeded_sanity_bound'.
@@ -4775,6 +4794,7 @@ class TestAllAccountsCappedEscalationLevel:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestSessionBudgetExhaustionEscalation:
     """Verify _SessionBudgetExhausted creates an L1 escalation with actionable budget metrics.
 
@@ -4894,6 +4914,7 @@ class TestSessionBudgetExhaustionEscalation:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestFirstInvocationBudgetExhaustion:
     """When SessionBudgetExhausted fires before any role completes, the escalation
     uses the 'last_completed_role' label and resolves to 'n/a' (None fallback).
@@ -4991,6 +5012,7 @@ def _make_done_setting_steward(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestMarkBlockedPhantomDone:
     """Regression: steward marking task done out-of-band must return DONE.
 
@@ -5034,6 +5056,7 @@ class TestMarkBlockedPhantomDone:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('_patch_dry_run_unblock')
 class TestMarkBlockedBypassDetection:
     """Detect ``update_task(status='done')`` bypass when set_task_status('blocked') is rejected.
 
