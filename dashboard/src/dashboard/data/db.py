@@ -7,6 +7,7 @@ path and reuses it across poll cycles.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable
@@ -31,6 +32,7 @@ class DbPool:
 
     def __init__(self) -> None:
         self._conns: dict[Path, aiosqlite.Connection] = {}
+        self._open_lock: asyncio.Lock = asyncio.Lock()
 
     async def get(self, db_path: Path) -> aiosqlite.Connection | None:
         """Return a cached connection, opening one lazily if needed.
@@ -39,22 +41,28 @@ class DbPool:
         opened (e.g. corrupt, locked exclusively).
         """
         resolved = db_path.resolve()
+        # Lock-free fast path — common case when connection is already cached.
         if resolved in self._conns:
             return self._conns[resolved]
-        try:
-            if not resolved.exists():
+        # Serialize same-path opens so only one connection is created.
+        async with self._open_lock:
+            # Re-check after acquiring: a racing coroutine may have opened it.
+            if resolved in self._conns:
+                return self._conns[resolved]
+            try:
+                if not resolved.exists():
+                    return None
+                # safe='/' preserves POSIX path separators; dashboard is Linux-only.
+                # For Windows portability use pathlib.PurePath.as_uri() instead.
+                conn = await aiosqlite.connect(
+                    f'file:{quote(str(resolved), safe="/")}?mode=ro', uri=True,
+                )
+                conn.row_factory = aiosqlite.Row
+                self._conns[resolved] = conn
+                return conn
+            except (FileNotFoundError, sqlite3.OperationalError, OSError):
+                logger.debug('DbPool: cannot open %s', resolved, exc_info=True)
                 return None
-            # safe='/' preserves POSIX path separators; dashboard is Linux-only.
-            # For Windows portability use pathlib.PurePath.as_uri() instead.
-            conn = await aiosqlite.connect(
-                f'file:{quote(str(resolved), safe="/")}?mode=ro', uri=True,
-            )
-            conn.row_factory = aiosqlite.Row
-            self._conns[resolved] = conn
-            return conn
-        except (FileNotFoundError, sqlite3.OperationalError, OSError):
-            logger.debug('DbPool: cannot open %s', resolved, exc_info=True)
-            return None
 
     @property
     def open_count(self) -> int:
