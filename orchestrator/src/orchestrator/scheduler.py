@@ -2490,6 +2490,9 @@ class Scheduler:
         # on the shared .json.tmp path.  The project-root guard above stays
         # outside: it is O(1), touches no shared state, and acquiring the lock
         # for a guaranteed no-op would needlessly block no-project-root callers.
+        # Latency tradeoff: a tick's snapshot attempt may briefly wait here
+        # behind an in-flight flush's disk write; that serialisation is the
+        # deliberate cost of preventing concurrent .json.tmp corruption.
         async with self._snapshot_write_lock:
             # Leading-edge time throttle.  Coalesces ticks within the configured
             # minimum interval at O(1) cost (monotonic subtraction only).

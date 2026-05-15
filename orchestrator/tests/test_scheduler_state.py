@@ -744,7 +744,13 @@ class TestSnapshotWriteThrottle:
         against future time-gate off-by-one regressions that the former
         1 ≤ count ≤ upper_bound assertion would have missed.
 
-        Manual trace: writes occur on ticks 1, 6, 11, 16 → exactly 4.
+        The clock is computed as ``(i+1) * tick_interval`` (not accumulated
+        via ``+=``) to eliminate IEEE-754 accumulation drift: repeated
+        addition shifts the 3rd/4th boundary write one tick later
+        (ticks 12/17 instead of 11/16), causing a mismatch between the
+        ``ceil()`` formula and the simulated write positions.  With the
+        multiplicative form the drift is removed and the trace is exact:
+        writes occur on ticks 1, 6, 11, 16 → exactly 4.
         """
         import math
         from unittest.mock import AsyncMock, MagicMock
@@ -766,7 +772,7 @@ class TestSnapshotWriteThrottle:
 
         for i in range(N):
             scheduler._skip_count[f'X{i}'] = i  # unique per tick → defeats content-dedup
-            clock['t'] += tick_interval  # advance clock before each tick
+            clock['t'] = (i + 1) * tick_interval  # multiplicative: no accumulation drift
             await scheduler.acquire_next()
             scheduler.release('A')
 
