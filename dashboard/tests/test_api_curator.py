@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS account_events (
 def _make_config(tmp_path: Path, *, fused_memory_urls=None, known_project_roots=None):
     """Build a DashboardConfig pointing at tmp_path."""
     from dashboard.config import DashboardConfig
+
     return DashboardConfig(
         project_root=tmp_path,
         fused_memory_urls=fused_memory_urls or ['http://localhost:18765'],
@@ -57,6 +58,7 @@ def _make_config(tmp_path: Path, *, fused_memory_urls=None, known_project_roots=
 def _override_client(config):
     """Context manager: yield a TestClient with app.state.config overridden."""
     from dashboard.app import app
+
     with TestClient(app) as c:
         app.state.config = config
         yield c
@@ -128,7 +130,10 @@ def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
 
     config = _make_config(tmp_path)
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
     assert resp.status_code == 200
@@ -439,7 +444,9 @@ def test_curator_pending_spark_from_metrics_db(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('created_at_value', ['not-an-iso-date', ''], ids=['malformed_iso', 'empty_string'])
+@pytest.mark.parametrize(
+    'created_at_value', ['not-an-iso-date', ''], ids=['malformed_iso', 'empty_string']
+)
 def test_curator_endpoint_bad_created_at_returns_age_seconds_none(
     tmp_path: Path, created_at_value: str
 ):
@@ -462,19 +469,22 @@ def test_curator_endpoint_bad_created_at_returns_age_seconds_none(
     mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
 
     config = _make_config(tmp_path)
-    with _override_client(config) as c, patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)):
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+    ):
         resp = c.get('/api/v2/dashboard/curator')
 
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+    assert resp.status_code == 200, f'Expected 200, got {resp.status_code}'
     cs = resp.json()['CURATOR_STATE']
-    assert len(cs['pending']) == 1, f"Expected 1 pending row, got {len(cs['pending'])}"
+    assert len(cs['pending']) == 1, f'Expected 1 pending row, got {len(cs["pending"])}'
     row = cs['pending'][0]
     assert row['ticket_id'] == 'tkt_x'
     assert row['created_at'] == created_at_value, (
-        f"created_at should be preserved verbatim, got {row['created_at']!r}"
+        f'created_at should be preserved verbatim, got {row["created_at"]!r}'
     )
     assert row['age_seconds'] is None, (
-        f"age_seconds should be None for bad created_at, got {row['age_seconds']!r}"
+        f'age_seconds should be None for bad created_at, got {row["age_seconds"]!r}'
     )
 
 
@@ -575,10 +585,10 @@ def test_api_curator_uses_LIST_TICKETS_LIMIT_constant(tmp_path: Path, monkeypatc
 
     assert resp.status_code == 200
     assert captured.get('limit') == 50, (
-        f"Expected captured limit == 50 (the monkeypatched _LIST_TICKETS_LIMIT), "
-        f"got {captured.get('limit')!r}. A non-50 value (e.g. 2000) means "
-        "app.py is passing a magic literal that overrides the constant — "
-        "remove the limit=2000 kwarg from the fan_out_list_tickets call in app.py."
+        f'Expected captured limit == 50 (the monkeypatched _LIST_TICKETS_LIMIT), '
+        f'got {captured.get("limit")!r}. A non-50 value (e.g. 2000) means '
+        'app.py is passing a magic literal that overrides the constant — '
+        'remove the limit=2000 kwarg from the fan_out_list_tickets call in app.py.'
     )
 
 
@@ -657,7 +667,5 @@ def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
     # even for empty intervals; what matters is that no bucket shows a cap event
     # and capped_now is 0 (no open-ended interval from a DB that failed to load).
     capped = cs['capped_spark']
-    assert 1 not in capped['values'], (
-        'Expected no cap events (all zeros) when intervals leg failed'
-    )
+    assert 1 not in capped['values'], 'Expected no cap events (all zeros) when intervals leg failed'
     assert cs['state']['capped_now'] == 0

@@ -105,7 +105,9 @@ async def fan_out_list_tickets(
             try:
                 result = await asyncio.wait_for(
                     mcp_tool_call(
-                        http_client, url, 'list_tickets',
+                        http_client,
+                        url,
+                        'list_tickets',
                         {'project_root': root_str, 'status': 'pending', 'limit': effective_limit},
                     ),
                     timeout=timeout,
@@ -116,26 +118,34 @@ async def fan_out_list_tickets(
                         'list_tickets returned count=%d at-or-above the requested '
                         'limit of %d for %s / %s — '
                         'pending_total may be clipped at the server limit',
-                        count, effective_limit, url, root_str,
+                        count,
+                        effective_limit,
+                        url,
+                        root_str,
                     )
                 project_id = result.get('project_id', '')
-                root_tickets = [
-                    {**r, 'project_id': project_id}
-                    for r in result.get('tickets', [])
-                ]
+                root_tickets = [{**r, 'project_id': project_id} for r in result.get('tickets', [])]
                 return count, root_tickets  # first success wins; skip remaining URLs
             except TimeoutError:
                 logger.warning(
                     'list_tickets timed out for project_root=%s url=%s after %.1fs',
-                    root_str, url, timeout,
+                    root_str,
+                    url,
+                    timeout,
                 )
             except (httpx.HTTPError, ValueError):
                 logger.debug(
-                    'list_tickets failed for %s / %s', url, root_str, exc_info=True,
+                    'list_tickets failed for %s / %s',
+                    url,
+                    root_str,
+                    exc_info=True,
                 )
             except Exception:
                 logger.warning(
-                    'list_tickets unexpected error for %s / %s', url, root_str, exc_info=True,
+                    'list_tickets unexpected error for %s / %s',
+                    url,
+                    root_str,
+                    exc_info=True,
                 )
         return 0, []
 
@@ -148,8 +158,7 @@ async def fan_out_list_tickets(
     # (0, []) default and logged at WARNING — same convention as the sibling legs
     # in api_curator (curator/sparks, curator/intervals, curator/fan_out).
     per_root_results: list[tuple[int, list[dict]]] = [
-        safe_gather_result(r, _FAN_OUT_ROOT_DEFAULT, 'curator/fan_out_root')
-        for r in raw_results
+        safe_gather_result(r, _FAN_OUT_ROOT_DEFAULT, 'curator/fan_out_root') for r in raw_results
     ]
     pending_total = sum(c for c, _ in per_root_results)
     tickets: list[dict] = [t for _, ts in per_root_results for t in ts]
@@ -306,7 +315,8 @@ async def _sample_curator(
 
     # 1. HTTP pending count via fan_out_list_tickets (de-duped roots, first-success-per-root).
     _, pending_total = await fan_out_list_tickets(
-        http_client, config,
+        http_client,
+        config,
         timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
     )
 
@@ -342,7 +352,7 @@ async def _sample_curator(
         cutoff = (effective_now - timedelta(hours=1)).isoformat()
         try:
             async with tickets_db.execute(
-                "SELECT created_at, resolved_at FROM tickets "
+                'SELECT created_at, resolved_at FROM tickets '
                 "WHERE resolved_at >= ? AND status IN ('created', 'combined', 'cancelled', 'failed')",
                 (cutoff,),
             ) as cur:
@@ -351,7 +361,7 @@ async def _sample_curator(
             # 5. Per-ticket active_ms with cap subtraction.
             active_ms_list: list[float] = []
             for row in ticket_rows:
-                created_str = row[0]   # positional access works for both aiosqlite.Row and tuple
+                created_str = row[0]  # positional access works for both aiosqlite.Row and tuple
                 resolved_str = row[1]
                 if not created_str or not resolved_str:
                     continue
@@ -501,7 +511,11 @@ async def collect_metrics_snapshot(
     try:
         runs_dbs = [db for _, db in merge_dbs]
         curator = await _sample_curator(
-            http_client, config, tickets_db, runs_dbs, now=now_dt,
+            http_client,
+            config,
+            tickets_db,
+            runs_dbs,
+            now=now_dt,
         )
         await conn.execute(
             'INSERT OR REPLACE INTO curator_snapshots '
@@ -692,10 +706,7 @@ async def get_memory_24h_ago(
     except Exception:
         logger.debug('memory 24h-ago query failed', exc_info=True)
         return {}
-    return {
-        r[0]: {'graphiti_nodes': r[1], 'mem0_memories': r[2]}
-        for r in rows
-    }
+    return {r[0]: {'graphiti_nodes': r[1], 'mem0_memories': r[2]} for r in rows}
 
 
 async def get_queue_pending_series(

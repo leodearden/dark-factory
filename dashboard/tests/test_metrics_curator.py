@@ -69,7 +69,8 @@ def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
         },
     }
     return httpx.Response(
-        200, json=body,
+        200,
+        json=body,
         headers={'mcp-session-id': 'test-session-id'},
     )
 
@@ -85,7 +86,8 @@ def _make_init_response(request_id: int = 1) -> httpx.Response:
         },
     }
     return httpx.Response(
-        200, json=body,
+        200,
+        json=body,
         headers={'mcp-session-id': 'test-session-id'},
     )
 
@@ -158,6 +160,7 @@ def runs_db_path(tmp_path: Path) -> Path:
 @pytest.fixture
 def config(tmp_path: Path):
     from dashboard.config import DashboardConfig
+
     return DashboardConfig(
         project_root=tmp_path,
         fused_memory_urls=['http://localhost:18765'],
@@ -181,17 +184,24 @@ def test_curator_snapshots_table_exists_after_schema_migration(tmp_path: Path):
     row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='curator_snapshots'"
     ).fetchone()
-    assert row is not None, "curator_snapshots table was not created by METRICS_SCHEMA"
+    assert row is not None, 'curator_snapshots table was not created by METRICS_SCHEMA'
 
     # Check expected columns
     col_info = conn.execute('PRAGMA table_info(curator_snapshots)').fetchall()
     cols = {r[1] for r in col_info}
-    expected = {'ts', 'pending_total', 'capped_now', 'p50_active_ms', 'p90_active_ms', 'p99_active_ms'}
-    assert expected <= cols, f"Missing columns: {expected - cols}"
+    expected = {
+        'ts',
+        'pending_total',
+        'capped_now',
+        'p50_active_ms',
+        'p90_active_ms',
+        'p99_active_ms',
+    }
+    assert expected <= cols, f'Missing columns: {expected - cols}'
 
     # Check ts is the PRIMARY KEY (pk=1 in PRAGMA table_info)
     pk_cols = {r[1] for r in col_info if r[5] == 1}
-    assert 'ts' in pk_cols, "ts is not the PRIMARY KEY of curator_snapshots"
+    assert 'ts' in pk_cols, 'ts is not the PRIMARY KEY of curator_snapshots'
 
     conn.close()
 
@@ -205,11 +215,13 @@ def test_curator_snapshots_table_exists_after_schema_migration(tmp_path: Path):
 async def test_get_curator_sparks_none_returns_empty_shape():
     """get_curator_sparks(None) must return 4-key empty shape."""
     from dashboard.data.metrics import get_curator_sparks
+
     result = await get_curator_sparks(None, days=1)
     assert set(result.keys()) == {'pending', 'p50', 'p90', 'p99'}
     for key in ('pending', 'p50', 'p90', 'p99'):
-        assert result[key] == {'labels': [], 'values': []}, \
+        assert result[key] == {'labels': [], 'values': []}, (
             f"Key '{key}' expected empty series, got {result[key]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -337,12 +349,10 @@ async def test_downsample_curator_snapshots_keeps_latest_per_hour(metrics_db_pat
         await rw.close()
 
     inspect = sqlite3.connect(str(metrics_db_path))
-    rows = inspect.execute(
-        'SELECT pending_total FROM curator_snapshots ORDER BY ts'
-    ).fetchall()
+    rows = inspect.execute('SELECT pending_total FROM curator_snapshots ORDER BY ts').fetchall()
     inspect.close()
 
-    assert rows == [(9,)], f"Expected [(9,)], got {rows}"
+    assert rows == [(9,)], f'Expected [(9,)], got {rows}'
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +363,7 @@ async def test_downsample_curator_snapshots_keeps_latest_per_hour(metrics_db_pat
 def test_dashboard_config_tickets_db_property(tmp_path: Path):
     """tickets_db property returns <project_root>/data/reconciliation/tickets.db."""
     from dashboard.config import DashboardConfig
+
     config = DashboardConfig(project_root=tmp_path)
     expected = tmp_path.resolve() / 'data' / 'reconciliation' / 'tickets.db'
     assert config.tickets_db == expected
@@ -380,29 +391,45 @@ async def test_sample_curator_happy_path(tmp_path: Path, config):
     conn_sync.executescript(TICKETS_SCHEMA)
     conn_sync.execute(
         'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
-        ('t1', 'proj', 'created',
-         t_base.isoformat(),
-         (t_base + timedelta(milliseconds=100)).isoformat()),
+        (
+            't1',
+            'proj',
+            'created',
+            t_base.isoformat(),
+            (t_base + timedelta(milliseconds=100)).isoformat(),
+        ),
     )
     conn_sync.execute(
         'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
-        ('t2', 'proj', 'combined',
-         t_base.isoformat(),
-         (t_base + timedelta(milliseconds=200)).isoformat()),
+        (
+            't2',
+            'proj',
+            'combined',
+            t_base.isoformat(),
+            (t_base + timedelta(milliseconds=200)).isoformat(),
+        ),
     )
     conn_sync.execute(
         'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
-        ('t3', 'proj', 'failed',
-         t_base.isoformat(),
-         (t_base + timedelta(milliseconds=300)).isoformat()),
+        (
+            't3',
+            'proj',
+            'failed',
+            t_base.isoformat(),
+            (t_base + timedelta(milliseconds=300)).isoformat(),
+        ),
     )
     # Ticket D: too old (> 1 hour ago), should not be counted
     old_t = now - timedelta(hours=2)
     conn_sync.execute(
         'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
-        ('t4', 'proj', 'failed',
-         old_t.isoformat(),
-         (old_t + timedelta(milliseconds=500)).isoformat()),
+        (
+            't4',
+            'proj',
+            'failed',
+            old_t.isoformat(),
+            (old_t + timedelta(milliseconds=500)).isoformat(),
+        ),
     )
     conn_sync.commit()
     conn_sync.close()
@@ -425,7 +452,11 @@ async def test_sample_curator_happy_path(tmp_path: Path, config):
         runs_conn.row_factory = aiosqlite.Row
         try:
             result = await _sample_curator(
-                http_client, config, tickets_conn, [runs_conn], now=now,
+                http_client,
+                config,
+                tickets_conn,
+                [runs_conn],
+                now=now,
             )
         finally:
             await tickets_conn.close()
@@ -496,7 +527,11 @@ async def test_sample_curator_cap_overlap_subtraction(tmp_path: Path, config):
         runs_conn.row_factory = aiosqlite.Row
         try:
             result = await _sample_curator(
-                http_client, config, tickets_conn, [runs_conn], now=now,
+                http_client,
+                config,
+                tickets_conn,
+                [runs_conn],
+                now=now,
             )
         finally:
             await tickets_conn.close()
@@ -552,7 +587,11 @@ async def test_sample_curator_capped_now_true(tmp_path: Path, config):
         runs_conn.row_factory = aiosqlite.Row
         try:
             result = await _sample_curator(
-                http_client, config, tickets_conn, [runs_conn], now=now,
+                http_client,
+                config,
+                tickets_conn,
+                [runs_conn],
+                now=now,
             )
         finally:
             await tickets_conn.close()
@@ -604,7 +643,11 @@ async def test_sample_curator_capped_now_false_when_closed(tmp_path: Path, confi
         runs_conn.row_factory = aiosqlite.Row
         try:
             result = await _sample_curator(
-                http_client, config, tickets_conn, [runs_conn], now=now,
+                http_client,
+                config,
+                tickets_conn,
+                [runs_conn],
+                now=now,
             )
         finally:
             await tickets_conn.close()
@@ -641,9 +684,13 @@ async def test_collect_metrics_snapshot_writes_curator_row(tmp_path: Path, confi
     for i, ms in enumerate([100, 200, 300], 1):
         conn_sync.execute(
             'INSERT INTO tickets (id, project_id, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)',
-            (f't{i}', 'proj', 'created',
-             t_base.isoformat(),
-             (t_base + timedelta(milliseconds=ms)).isoformat()),
+            (
+                f't{i}',
+                'proj',
+                'created',
+                t_base.isoformat(),
+                (t_base + timedelta(milliseconds=ms)).isoformat(),
+            ),
         )
     conn_sync.commit()
     conn_sync.close()
@@ -685,7 +732,7 @@ async def test_collect_metrics_snapshot_writes_curator_row(tmp_path: Path, confi
 
     await metrics_conn.close()
 
-    assert len(rows) == 1, f"Expected 1 row, got {len(rows)}"
+    assert len(rows) == 1, f'Expected 1 row, got {len(rows)}'
     pending_total, capped_now, p50, p90, p99 = rows[0]
     assert pending_total == 2
     assert capped_now == 0
@@ -736,7 +783,9 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     mock_app = MagicMock()
     mock_app.state.config = fixed_config
     mock_app.state.db = pool
-    mock_app.state.http_client = MagicMock()  # collect_metrics_snapshot is patched; client never used
+    mock_app.state.http_client = (
+        MagicMock()
+    )  # collect_metrics_snapshot is patched; client never used
 
     metrics_conn = await aiosqlite.connect(':memory:')
     await metrics_conn.executescript(METRICS_SCHEMA)
@@ -771,26 +820,25 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     assert mock_collect.called, 'collect_metrics_snapshot was never called'
     call_kwargs = mock_collect.call_args.kwargs if mock_collect.call_args else {}
     assert 'tickets_db' in call_kwargs, (
-        f"tickets_db not in kwargs: {call_kwargs}. "
-        f"All calls: {mock_collect.call_args_list}"
+        f'tickets_db not in kwargs: {call_kwargs}. All calls: {mock_collect.call_args_list}'
     )
     assert loop_opened, (
-        f"_metrics_loop._run_once() never called pool.get(); "
-        f"pool.open_count was 0 after the task ran — "
-        f"check that _run_once() uses the pool for {fixed_config.tickets_db}"
+        f'_metrics_loop._run_once() never called pool.get(); '
+        f'pool.open_count was 0 after the task ran — '
+        f'check that _run_once() uses the pool for {fixed_config.tickets_db}'
     )
     # tickets.db exists on disk so DbPool.get() returns the real connection it
     # cached during _metrics_loop._run_once().  We assert object identity to pin
     # path-to-connection wiring: a wrong-but-existing path yields a different
     # connection object; a wrong-but-missing path leaves expected_conn as None.
     assert expected_conn is not None, (
-        f"DbPool.get() returned None for {fixed_config.tickets_db}; "
-        f"file was created in test setup — check if the pool connection opened correctly"
+        f'DbPool.get() returned None for {fixed_config.tickets_db}; '
+        f'file was created in test setup — check if the pool connection opened correctly'
     )
     assert call_kwargs['tickets_db'] is expected_conn, (
-        f"tickets_db should be the DbPool connection for {fixed_config.tickets_db} "
-        f"but got {call_kwargs['tickets_db']!r}. "
-        f"All calls: {mock_collect.call_args_list}"
+        f'tickets_db should be the DbPool connection for {fixed_config.tickets_db} '
+        f'but got {call_kwargs["tickets_db"]!r}. '
+        f'All calls: {mock_collect.call_args_list}'
     )
 
 
@@ -801,7 +849,8 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_sample_curator_http_timeout_partial_pending_total(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ):
     """_sample_curator wraps each per-(url,root) mcp_tool_call in asyncio.wait_for.
 
@@ -858,17 +907,20 @@ async def test_sample_curator_http_timeout_partial_pending_total(
     with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
         async with httpx.AsyncClient(transport=transport) as http_client:
             result = await _sample_curator(
-                http_client, cfg, tickets_db=None, runs_dbs=[], now=now,
+                http_client,
+                cfg,
+                tickets_db=None,
+                runs_dbs=[],
+                now=now,
             )
     elapsed = time.monotonic() - t0
 
     assert result is not None
-    assert result['pending_total'] == 3, f"Expected 3, got {result['pending_total']}"
-    assert call_count >= 2, f"Expected at least 2 mcp_tool_call invocations, got {call_count}"
+    assert result['pending_total'] == 3, f'Expected 3, got {result["pending_total"]}'
+    assert call_count >= 2, f'Expected at least 2 mcp_tool_call invocations, got {call_count}'
     assert elapsed < 3.0, (
-        f"Elapsed {elapsed:.3f}s ≥ 3s — wait_for ceiling does not appear to be in place"
+        f'Elapsed {elapsed:.3f}s ≥ 3s — wait_for ceiling does not appear to be in place'
     )
-
 
 
 # ---------------------------------------------------------------------------
@@ -909,11 +961,11 @@ async def test_fan_out_list_tickets_failover_first_url_http_error(tmp_path: Path
         async with httpx.AsyncClient(transport=transport) as http_client:
             tickets, pending_total = await fan_out_list_tickets(http_client, cfg)
 
-    assert pending_total == 3, f"Expected pending_total=3, got {pending_total}"
+    assert pending_total == 3, f'Expected pending_total=3, got {pending_total}'
     assert mock_mcp.call_count == 2, (
-        f"Expected 2 mcp_tool_call invocations (both URLs tried), got {mock_mcp.call_count}"
+        f'Expected 2 mcp_tool_call invocations (both URLs tried), got {mock_mcp.call_count}'
     )
-    assert tickets == [], f"Expected empty tickets list, got {tickets}"
+    assert tickets == [], f'Expected empty tickets list, got {tickets}'
 
 
 # ---------------------------------------------------------------------------
@@ -945,23 +997,28 @@ async def test_fan_out_list_tickets_warns_when_count_at_limit(tmp_path: Path, ca
     mock_mcp = AsyncMock(return_value={'count': 2000, 'tickets': [], 'project_id': 'p'})
     transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
 
-    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'), \
-         patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+    with (
+        caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'),
+        patch('dashboard.data.metrics.mcp_tool_call', mock_mcp),
+    ):
         async with httpx.AsyncClient(transport=transport) as http_client:
             tickets, pending_total = await fan_out_list_tickets(
-                http_client, cfg, limit=2000,
+                http_client,
+                cfg,
+                limit=2000,
             )
 
-    assert pending_total == 2000, f"Expected pending_total=2000, got {pending_total}"
+    assert pending_total == 2000, f'Expected pending_total=2000, got {pending_total}'
     warning_records = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelno >= logging.WARNING
         and 'list_tickets' in r.getMessage()
         and '2000' in r.getMessage()
     ]
     assert warning_records, (
         "Expected at least one WARNING log mentioning 'list_tickets' and '2000' "
-        f"for saturation, got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        f'for saturation, got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}'
     )
 
 
@@ -1012,21 +1069,20 @@ async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
             _, pending_total = await fan_out_list_tickets(http_client, cfg)
 
     # (a) The patched constant flowed into the outgoing payload
-    assert handler.calls, "fan_out_list_tickets made no tool/call requests"
+    assert handler.calls, 'fan_out_list_tickets made no tool/call requests'
     assert handler.calls[0]['params']['arguments']['limit'] == 50, (
-        f"Expected limit=50 in outgoing payload, got "
-        f"{handler.calls[0]['params']['arguments'].get('limit')}"
+        f'Expected limit=50 in outgoing payload, got '
+        f'{handler.calls[0]["params"]["arguments"].get("limit")}'
     )
     # (b) pending_total reflects the mocked count
-    assert pending_total == 50, f"Expected pending_total=50, got {pending_total}"
+    assert pending_total == 50, f'Expected pending_total=50, got {pending_total}'
     # (c) Saturation WARNING mentions the patched constant value
     warning_records = [
-        r for r in caplog.records
-        if r.levelno >= logging.WARNING and '50' in r.getMessage()
+        r for r in caplog.records if r.levelno >= logging.WARNING and '50' in r.getMessage()
     ]
     assert warning_records, (
         "Expected at least one WARNING mentioning '50' (saturation at patched limit), "
-        f"got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        f'got: {[(r.levelname, r.getMessage()) for r in caplog.records]}'
     )
 
 
@@ -1036,9 +1092,7 @@ async def test_fan_out_list_tickets_uses_LIST_TICKETS_LIMIT_constant(
 
 
 @pytest.mark.asyncio
-async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(
-    tmp_path: Path, caplog
-):
+async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(tmp_path: Path, caplog):
     """fan_out_list_tickets must log a WARNING (not DEBUG) for TimeoutError.
 
     Patches mcp_tool_call with AsyncMock(side_effect=TimeoutError()) so the
@@ -1068,16 +1122,19 @@ async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(
     transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
 
     reset_sessions()
-    with caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'), \
-         patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+    with (
+        caplog.at_level(logging.WARNING, logger='dashboard.data.metrics'),
+        patch('dashboard.data.metrics.mcp_tool_call', mock_mcp),
+    ):
         async with httpx.AsyncClient(transport=transport) as http_client:
             _, pending_total = await fan_out_list_tickets(http_client, cfg)
 
-    assert pending_total == 0, f"Expected pending_total=0, got {pending_total}"
+    assert pending_total == 0, f'Expected pending_total=0, got {pending_total}'
 
     root_str = str(tmp_path)
     warning_records = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelno >= logging.WARNING
         and root_str in r.getMessage()
         and 'http://localhost:18765' in r.getMessage()
@@ -1094,9 +1151,7 @@ async def test_fan_out_list_tickets_timeout_logs_warning_with_root_and_url(
 
 
 @pytest.mark.asyncio
-async def test_sample_curator_delegates_to_compute_capped_now_and_windows(
-    tmp_path: Path, config
-):
+async def test_sample_curator_delegates_to_compute_capped_now_and_windows(tmp_path: Path, config):
     """_sample_curator must call compute_capped_now_and_windows and use its return.
 
     Setup: cap_hit 30 min ago (open-ended interval), empty tickets.db.
@@ -1150,7 +1205,11 @@ async def test_sample_curator_delegates_to_compute_capped_now_and_windows(
             runs_conn.row_factory = aiosqlite.Row
             try:
                 result = await _sample_curator(
-                    http_client, config, tickets_conn, [runs_conn], now=now,
+                    http_client,
+                    config,
+                    tickets_conn,
+                    [runs_conn],
+                    now=now,
                 )
             finally:
                 await tickets_conn.close()
@@ -1158,18 +1217,18 @@ async def test_sample_curator_delegates_to_compute_capped_now_and_windows(
 
     # (a) Sentinel capped_now flowed through
     assert result['capped_now'] == 7, (
-        f"Expected capped_now=7 (sentinel from mock), got {result['capped_now']}. "
-        "This fails if _sample_curator computes capped_now inline instead of delegating."
+        f'Expected capped_now=7 (sentinel from mock), got {result["capped_now"]}. '
+        'This fails if _sample_curator computes capped_now inline instead of delegating.'
     )
     # (b) Mock was called exactly once
     assert mock_helper.call_count == 1, (
-        f"Expected compute_capped_now_and_windows called once, got {mock_helper.call_count}"
+        f'Expected compute_capped_now_and_windows called once, got {mock_helper.call_count}'
     )
     # (c) First arg is a non-empty list of CapInterval
     call_arg = mock_helper.call_args.args[0]
-    assert len(call_arg) >= 1, f"Expected non-empty intervals arg, got {call_arg}"
+    assert len(call_arg) >= 1, f'Expected non-empty intervals arg, got {call_arg}'
     assert all(isinstance(iv, CapInterval) for iv in call_arg), (
-        f"Expected list of CapInterval, got {call_arg}"
+        f'Expected list of CapInterval, got {call_arg}'
     )
 
 
@@ -1236,7 +1295,11 @@ async def test_sample_curator_long_running_open_ended_cap_overlap_subtracted(
         runs_conn.row_factory = aiosqlite.Row
         try:
             result = await _sample_curator(
-                http_client, config, tickets_conn, [runs_conn], now=now,
+                http_client,
+                config,
+                tickets_conn,
+                [runs_conn],
+                now=now,
             )
         finally:
             await tickets_conn.close()
@@ -1244,11 +1307,11 @@ async def test_sample_curator_long_running_open_ended_cap_overlap_subtracted(
 
     # With days=7: cap_hit is within window → 60s ticket fully capped → p50=0
     assert result['p50_active_ms'] == 0, (
-        f"Expected p50_active_ms=0 (cap subtracted full 60s), got {result['p50_active_ms']}. "
-        "This fails if _sample_curator uses days=1 (excludes 2-day-old cap_hit)."
+        f'Expected p50_active_ms=0 (cap subtracted full 60s), got {result["p50_active_ms"]}. '
+        'This fails if _sample_curator uses days=1 (excludes 2-day-old cap_hit).'
     )
     assert result['capped_now'] == 1, (
-        f"Expected capped_now=1 (open-ended interval), got {result['capped_now']}"
+        f'Expected capped_now=1 (open-ended interval), got {result["capped_now"]}'
     )
 
 
@@ -1307,7 +1370,10 @@ async def test_fan_out_list_tickets_runs_roots_concurrently(tmp_path: Path):
     with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
         async with httpx.AsyncClient(transport=transport) as http_client:
             tickets, pending_total = await fan_out_list_tickets(
-                http_client, cfg, limit=2000, timeout=5.0,
+                http_client,
+                cfg,
+                limit=2000,
+                timeout=5.0,
             )
 
     assert pending_total == 2, (
@@ -1353,7 +1419,9 @@ async def test_fan_out_list_tickets_first_url_succeeds_skips_second(tmp_path: Pa
     with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
         async with httpx.AsyncClient(transport=transport) as http_client:
             tickets, pending_total = await fan_out_list_tickets(
-                http_client, cfg, limit=2000,
+                http_client,
+                cfg,
+                limit=2000,
             )
 
     assert mock_mcp.call_count == 1, (
@@ -1408,8 +1476,9 @@ async def test_fan_out_list_tickets_propagates_child_cancelled_error(tmp_path: P
     )
     transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
 
-    with patch('dashboard.data.metrics.mcp_tool_call',
-               new=AsyncMock(side_effect=asyncio.CancelledError())):
+    with patch(
+        'dashboard.data.metrics.mcp_tool_call', new=AsyncMock(side_effect=asyncio.CancelledError())
+    ):
         async with httpx.AsyncClient(transport=transport) as http_client:
             with pytest.raises(asyncio.CancelledError):
                 await fan_out_list_tickets(http_client, cfg, limit=2000, timeout=5.0)
