@@ -160,6 +160,17 @@ class TestFindViolationsSpecHandling:
             'MagicMock(spec_set=None) is equivalent to bare MagicMock(); should flag'
         )
 
+    def test_double_starred_kwargs_is_treated_as_unspecced(self):
+        """config = MagicMock(**spec_kwargs) → violation (**kwargs spread is opaque at AST time)."""
+        source = 'config = MagicMock(**spec_kwargs)\n'
+        violations = find_violations(source, 'test_double_starred.py')
+        assert len(violations) == 1, (
+            'MagicMock(**spec_kwargs) cannot be statically verified as specced; '
+            'a **kwargs spread is opaque at AST-inspection time so flagging is safer '
+            'than a false negative (mirrors the *args conservative stance). '
+            f'Got {len(violations)} violations (expected 1).'
+        )
+
 
 class TestFindViolationsExemption:
     """Exemption comment: # noqa: bare-magicmock — <reason> suppresses the violation."""
