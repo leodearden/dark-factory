@@ -2396,9 +2396,13 @@ class TaskWorkflow:
                     self.metrics.amendment_rounds += 1
                     continue  # re-loop: EXECUTE → VERIFY → REVIEW
 
-                # Cap exhausted or nothing in-scope — existing DONE path
-                if self.escalation_queue and reviews.suggestions:
-                    self._escalate_suggestions(reviews)
+                # Cap exhausted or nothing in-scope — existing DONE path.
+                # Route suggestions directly to the curator intake (fire-and-
+                # forget); fall back to memory write when there are none.
+                # _escalate_suggestions is retained as the steward fallback
+                # but is no longer called from this path.
+                if reviews.suggestions:
+                    await self._route_review_suggestions_to_curator(reviews)
                 else:
                     await self._write_suggestions_to_memory(reviews)
                 return WorkflowOutcome.DONE
