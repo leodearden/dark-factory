@@ -1425,3 +1425,68 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         )
         # _maybe_write_digest was called once (on the first rotation).
         harness._maybe_write_digest.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessDigestDoneCountSource (task 1421, step-3 test / step-4 impl)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessDigestDoneCountSource:
+    """Fix 1: EventStore done_count is the single source of truth for update_ewa.
+
+    Task 1421 cleanup — reconcile done_count sources.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ewa_uses_eventstore_done_count_not_scheduler_counter(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """EWA input done_in_step comes from EventStore, not scheduler.done_transitions_total.
+
+        Setup: alpha=1.0 so EWA == raw ratio; EventStore seeded with 4 done
+        rows in the last hour (inside the default 24h window); scheduler counter
+        set to 100 — a deliberately different value to prove the source.
+
+        If EWA uses EventStore count (4): EWA = 1/4 = 0.25  ← expected
+        If EWA uses scheduler delta (100): EWA = 1/100 = 0.01 ← current impl
+        """
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_alpha=1.0,        # EWA = raw ratio so result is unambiguous
+            digest_ewa_threshold=999.0,  # high — no trip in this test
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+        # Set scheduler counter to a value that would give a different EWA.
+        # After Fix 1 this value must NOT influence _ewa_value.
+        harness.scheduler._done_transitions_total = 100
+
+        # Seed EventStore with 4 task_completed rows with outcome='done' inside
+        # the 24h default window (timestamps 10–13 minutes in the past).
+        conn = sqlite3.connect(str(event_store.db_path))
+        try:
+            for i in range(4):
+                ts = (datetime.now(UTC) - timedelta(minutes=10 + i)).isoformat()
+                conn.execute(
+                    'INSERT INTO events (timestamp, run_id, task_id, event_type, data) '
+                    'VALUES (?, ?, ?, ?, ?)',
+                    (ts, 'run-test-0001', f't{i}', 'task_completed',
+                     json.dumps({'outcome': 'done'})),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        await harness._maybe_write_digest()
+
+        # alpha=1.0, escalations_in_step=1, done_from_eventstore=4 → EWA = 1/4 = 0.25
+        # (scheduler delta of 100 would give EWA = 1/100 = 0.01)
+        assert harness._ewa_value == pytest.approx(1 / 4), (
+            f'Expected _ewa_value=0.25 (EventStore done_count=4); '
+            f'got {harness._ewa_value!r} '
+            f'(scheduler counter=100 would give 0.01)'
+        )
