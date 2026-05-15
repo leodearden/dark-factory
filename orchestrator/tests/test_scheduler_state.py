@@ -721,3 +721,81 @@ class TestSnapshotWriteThrottle:
             f'Expected 1 disk write for {K} ticks within one throttle window, '
             f'got {scheduler.write_state_snapshot.call_count}'
         )
+
+    @pytest.mark.asyncio
+    async def test_acceptance_bound_writes_bounded_under_burst(self, tmp_path):
+        """Over N ticks, disk writes ≤ ceil(N * tick_interval / throttle_interval).
+
+        Simulates N=20 ticks at tick_interval=0.05 s with a
+        throttle_interval=0.25 s.  The acceptance bound is
+        ceil(20 * 0.05 / 0.25) = ceil(4.0) = 4.
+        """
+        import math
+        from unittest.mock import AsyncMock, MagicMock
+
+        throttle_interval = 0.25
+        tick_interval = 0.05
+        N = 20
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = throttle_interval
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        scheduler.write_state_snapshot = MagicMock()
+
+        for _ in range(N):
+            clock['t'] += tick_interval  # advance clock before each tick
+            await scheduler.acquire_next()
+            scheduler.release('A')
+
+        upper_bound = math.ceil(N * tick_interval / throttle_interval)
+        count = scheduler.write_state_snapshot.call_count
+        assert 1 <= count <= upper_bound, (
+            f'Expected 1 ≤ write_count ≤ {upper_bound}, got {count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_flush_state_snapshot_bypasses_throttle(self, tmp_path):
+        """flush_state_snapshot() forces a write even within the throttle window.
+
+        After throttled ticks, a flush must produce exactly one additional
+        write, proving the explicit final-flush capability persists the most
+        recent state regardless of the throttle interval.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = 1.0  # wide window
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+
+        task_a = _pending_task('A', files=['mod_a'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_a])
+        scheduler.write_state_snapshot = MagicMock()
+
+        # First tick writes (no prior timestamp).
+        await scheduler.acquire_next()
+        scheduler.release('A')
+        # Three more ticks — all throttled (clock not advanced).
+        for _ in range(3):
+            await scheduler.acquire_next()
+            scheduler.release('A')
+        # Exactly 1 write so far (throttle held the rest).
+        assert scheduler.write_state_snapshot.call_count == 1
+
+        # Record count before flush, then flush.  The clock is still at 0.0
+        # (well within the 1.0 s window) so only force=True can bypass it.
+        count_before = scheduler.write_state_snapshot.call_count
+        await scheduler.flush_state_snapshot()
+
+        assert scheduler.write_state_snapshot.call_count == count_before + 1, (
+            'flush_state_snapshot() must produce exactly 1 additional write '
+            'even when the throttle window has not elapsed'
+        )
