@@ -55,19 +55,13 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
 
 # ---------------------------------------------------------------------------
-# Helpers (mirror escalation/tests/test_server_dedupe.py:30-39)
+# Helper (mirror escalation/tests/test_server_dedupe.py:30-33)
 # ---------------------------------------------------------------------------
 
 
 async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_blocker')
     # escalate_blocker is a sync tool — tool.fn() returns dict directly
-    return tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    # escalate_info is a sync tool — tool.fn() returns dict directly
     return tool.fn(**kwargs)
 
 
