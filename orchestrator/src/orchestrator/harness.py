@@ -622,6 +622,12 @@ class Harness:
                     self._collect_done_reports(done, task_reports)
                     continue
 
+                # Check daily cost ceilings before dispatching the next task.
+                # On breach, pause_scheduler() is called and acquire_next()
+                # returns None (task-1322 machinery), draining in-flight work
+                # and exiting the run loop cleanly.  Task 1323.
+                await self._enforce_cost_ceilings()
+
                 assignment = await self.scheduler.acquire_next()
 
                 if assignment is None:
