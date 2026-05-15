@@ -464,15 +464,14 @@ class TestCostInWindow:
         assert stats.total_cost_24h == pytest.approx(4.5)
 
     @pytest.mark.asyncio
-    async def test_delegates_to_aggregate_window(self, tmp_path: Path) -> None:
-        """cost_in_window delegates to CostStore.aggregate_window (not direct SQL).
+    async def test_delegates_to_cost_totals_in_window(self, tmp_path: Path) -> None:
+        """cost_in_window delegates to CostStore.cost_totals_in_window (not direct SQL).
 
-        Monkeypatches aggregate_window to a recording stub that returns known
-        (total, watcher) tuples.  Asserts:
+        Monkeypatches cost_totals_in_window to a recording stub that returns
+        known (total, watcher) tuples.  Asserts:
         - exactly two calls were made
-        - first call uses (window_start_iso, window_end_iso)
-        - second call uses (cutoff_24h_iso, now_iso) where cutoff ≈ now-24h
-          and end ≈ now (within 10-second tolerance)
+        - first call passes window_start_iso and window_end_iso (positional or keyword)
+        - second call passes cutoff ≈ now-24h and end ≈ now (within 10-second tolerance)
         - returned CostStats carries stubbed values into the correct fields
         """
         store = CostStore(tmp_path / 'cost.db')
@@ -486,7 +485,7 @@ class TestCostInWindow:
                 (7.0, 5.0),   # first call: window → (total_win, watcher_win)
                 (9.0, 3.0),   # second call: 24h → (total_24h, watcher_24h)
             ])
-            store.aggregate_window = stub
+            store.cost_totals_in_window = stub
 
             before = _datetime.now(UTC)
             stats = await digest.cost_in_window(store, window_start, window_end)
@@ -495,16 +494,21 @@ class TestCostInWindow:
             # Two calls were made.
             assert stub.call_count == 2, f'Expected 2 calls, got {stub.call_count}'
 
-            # First call: window bounds passed through unchanged.
-            first_args = stub.call_args_list[0].args
-            assert first_args == (window_start, window_end), (
-                f'First call args wrong: {first_args!r}'
-            )
+            # First call passes the window bounds (positional or keyword).
+            first_call = stub.call_args_list[0]
+            first_start = (first_call.args[0] if first_call.args
+                           else first_call.kwargs.get('start_iso'))
+            first_end = (first_call.args[1] if len(first_call.args) > 1
+                         else first_call.kwargs.get('end_iso'))
+            assert first_start == window_start, f'First call start wrong: {first_start!r}'
+            assert first_end == window_end, f'First call end wrong: {first_end!r}'
 
-            # Second call: cutoff ≈ now-24h, end ≈ now (both ISO strings).
-            second_args = stub.call_args_list[1].args
-            assert len(second_args) == 2, f'Expected 2 positional args, got {second_args!r}'
-            cutoff_iso, now_iso = second_args
+            # Second call: cutoff ≈ now-24h, end ≈ now (positional or keyword).
+            second_call = stub.call_args_list[1]
+            cutoff_iso = (second_call.args[0] if second_call.args
+                          else second_call.kwargs.get('start_iso'))
+            now_iso = (second_call.args[1] if len(second_call.args) > 1
+                       else second_call.kwargs.get('end_iso'))
             cutoff_dt = _datetime.fromisoformat(cutoff_iso)
             now_dt = _datetime.fromisoformat(now_iso)
             expected_cutoff_lo = before - timedelta(hours=24) - timedelta(seconds=10)

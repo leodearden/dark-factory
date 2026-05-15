@@ -285,8 +285,12 @@ async def cost_in_window(
 ) -> CostStats:
     """Return cost aggregation for the digest window and trailing-24h.
 
-    Delegates to ``CostStore.aggregate_window`` — once for the explicit
+    Delegates to ``CostStore.cost_totals_in_window`` — once for the explicit
     window bounds and once for the trailing-24h window ending at now.
+
+    The trailing-24h upper bound is ``now_iso`` (a captured snapshot): any
+    invocations written after that snapshot are silently excluded, which is
+    acceptable for informational cost reporting.
 
     Fail-open: cost_store is None or any exception → CostStats with all zeros.
     """
@@ -297,10 +301,10 @@ async def cost_in_window(
         now_iso = now.isoformat()
         cutoff_24h_iso = (now - timedelta(hours=24)).isoformat()
 
-        total_win, watcher_win = await cost_store.aggregate_window(
+        total_win, watcher_win = await cost_store.cost_totals_in_window(
             window_start_iso, window_end_iso
         )
-        total_24h, watcher_24h = await cost_store.aggregate_window(
+        total_24h, watcher_24h = await cost_store.cost_totals_in_window(
             cutoff_24h_iso, now_iso
         )
 

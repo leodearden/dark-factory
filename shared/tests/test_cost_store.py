@@ -651,7 +651,7 @@ class TestCostStoreInheritsAsyncSqliteBase:
 
 
 # ---------------------------------------------------------------------------
-# TestAggregateWindow — CostStore.aggregate_window(start_iso, end_iso)
+# TestCostTotalsInWindow — CostStore.cost_totals_in_window(start_iso, end_iso)
 # ---------------------------------------------------------------------------
 
 
@@ -662,7 +662,7 @@ async def _seed_row(
     cost_usd: float,
     completed_at: str,
 ) -> None:
-    """Insert a minimal invocation row for aggregate_window testing."""
+    """Insert a minimal invocation row for cost_totals_in_window testing."""
     await store.save_invocation(
         run_id='r1',
         task_id=None,
@@ -683,13 +683,13 @@ async def _seed_row(
 
 
 @pytest.mark.asyncio
-class TestAggregateWindow:
-    """Tests for CostStore.aggregate_window(start_iso, end_iso) -> (total_usd, watcher_usd)."""
+class TestCostTotalsInWindow:
+    """Tests for CostStore.cost_totals_in_window(start_iso, end_iso) -> (total_usd, watcher_usd)."""
 
     async def test_empty_db_returns_zeros(self, tmp_path: Path) -> None:
         """Empty table → (0.0, 0.0)."""
         async with CostStore(tmp_path / 'costs.db') as store:
-            result = await store.aggregate_window(
+            result = await store.cost_totals_in_window(
                 '2026-01-01T00:00:00',
                 '2026-12-31T23:59:59',
             )
@@ -702,7 +702,7 @@ class TestAggregateWindow:
                 store, role='watcher', cost_usd=3.5,
                 completed_at='2026-06-01T12:00:00',
             )
-            result = await store.aggregate_window(
+            result = await store.cost_totals_in_window(
                 '2026-06-01T00:00:00',
                 '2026-06-01T23:59:59',
             )
@@ -717,7 +717,7 @@ class TestAggregateWindow:
                 store, role='orchestrator', cost_usd=2.0,
                 completed_at='2026-06-01T12:00:00',
             )
-            result = await store.aggregate_window(
+            result = await store.cost_totals_in_window(
                 '2026-06-01T00:00:00',
                 '2026-06-01T23:59:59',
             )
@@ -734,7 +734,7 @@ class TestAggregateWindow:
                 store, role='orchestrator', cost_usd=1.5,
                 completed_at='2026-06-01T11:00:00',
             )
-            result = await store.aggregate_window(
+            result = await store.cost_totals_in_window(
                 '2026-06-01T00:00:00',
                 '2026-06-01T23:59:59',
             )
@@ -760,7 +760,7 @@ class TestAggregateWindow:
                 store, role='watcher', cost_usd=1.0,
                 completed_at='2026-06-01T12:00:00',
             )
-            result = await store.aggregate_window(
+            result = await store.cost_totals_in_window(
                 '2026-06-01T00:00:00',
                 '2026-06-01T23:59:59',
             )
@@ -775,7 +775,7 @@ class TestAggregateWindow:
                     store, role=role, cost_usd=1.0,
                     completed_at='2026-06-01T12:00:00',
                 )
-            result = await store.aggregate_window(
+            result = await store.cost_totals_in_window(
                 '2026-06-01T00:00:00',
                 '2026-06-01T23:59:59',
             )
@@ -784,10 +784,10 @@ class TestAggregateWindow:
         assert watcher == pytest.approx(3.0)
 
     async def test_not_opened_raises_runtime_error(self, tmp_path: Path) -> None:
-        """Calling aggregate_window on a never-opened store raises RuntimeError."""
+        """Calling cost_totals_in_window on a never-opened store raises RuntimeError."""
         store = CostStore(tmp_path / 'costs.db')
         with pytest.raises(RuntimeError, match='CostStore not opened'):
-            await store.aggregate_window(
+            await store.cost_totals_in_window(
                 '2026-01-01T00:00:00',
                 '2026-12-31T23:59:59',
             )

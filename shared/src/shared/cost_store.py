@@ -146,7 +146,7 @@ class CostStore(AsyncSqliteBase):
 
     # -- public read API ------------------------------------------------------
 
-    async def aggregate_window(
+    async def cost_totals_in_window(
         self,
         start_iso: str,
         end_iso: str,
@@ -155,7 +155,13 @@ class CostStore(AsyncSqliteBase):
 
         Uses a single SELECT with conditional aggregation so the invocations
         table is scanned exactly once.  The ``%watcher%`` LIKE pattern is
-        hardcoded here so it lives in exactly one place.
+        hardcoded here — this method always returns the watcher split (total,
+        watcher) rather than a generic aggregation.
+
+        The window is **inclusive** at both ends (SQLite ``BETWEEN``).  For
+        trailing-24h callers, pass ``end_iso = datetime.now(UTC).isoformat()``
+        — any invocations whose ``completed_at`` is written after that snapshot
+        are silently excluded, which is acceptable for a fail-open cost guard.
 
         Returns:
             (total_usd, watcher_usd): total cost across all roles, and the

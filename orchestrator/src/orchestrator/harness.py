@@ -2070,10 +2070,14 @@ Output JSON matching the schema. Every task must appear in the output.
         paused (from any source), returns immediately to avoid redundant
         RunStore writes and duplicate log spam.
 
-        Delegates to ``CostStore.aggregate_window`` so the role-LIKE-watcher
-        aggregation pattern lives in exactly one place.  On any DB error the
-        method returns immediately without pausing (fail-open: a transient
-        query failure must never stop dispatch).  Task 1323.
+        Delegates to ``CostStore.cost_totals_in_window`` so the
+        role-LIKE-watcher aggregation pattern lives in exactly one place.
+        The trailing-24h window is ``[cutoff_24h_iso, now_iso]`` (inclusive
+        ``BETWEEN``); any invocations written after the ``now_iso`` snapshot
+        are silently excluded — acceptable for a fail-open dispatch guard.
+        On any DB error the method returns immediately without pausing
+        (fail-open: a transient query failure must never stop dispatch).
+        Task 1323.
         """
         if self.scheduler.is_paused:
             return
@@ -2083,7 +2087,7 @@ Output JSON matching the schema. Every task must appear in the output.
         now_iso = now.isoformat()
         cutoff_24h_iso = (now - timedelta(hours=24)).isoformat()
         try:
-            total, watcher = await self.cost_store.aggregate_window(cutoff_24h_iso, now_iso)
+            total, watcher = await self.cost_store.cost_totals_in_window(cutoff_24h_iso, now_iso)
         except Exception as exc:  # noqa: BLE001 — never block dispatch on this
             logger.warning(
                 '_enforce_cost_ceilings: trailing-24h cost query failed (%s) — fail-open',

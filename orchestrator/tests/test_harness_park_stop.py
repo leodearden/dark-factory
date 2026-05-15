@@ -978,16 +978,16 @@ class TestHarnessCostCeiling:
 
 
     @pytest.mark.asyncio
-    async def test_enforce_cost_ceilings_delegates_to_aggregate_window(
+    async def test_enforce_cost_ceilings_delegates_to_cost_totals_in_window(
         self, tmp_path: Path, _cost_store_factory
     ) -> None:
-        """_enforce_cost_ceilings delegates to cost_store.aggregate_window.
+        """_enforce_cost_ceilings delegates to cost_store.cost_totals_in_window.
 
-        Monkeypatches aggregate_window to a stub returning (total, watcher)
+        Monkeypatches cost_totals_in_window to a stub returning (total, watcher)
         values that trip the watcher ceiling.  Asserts:
         - stub called exactly once
-        - args were (cutoff_24h_iso, now_iso) where cutoff ≈ now-24h (within 10s)
-          and end ≈ now (within 10s)
+        - start ≈ now-24h (within 10s) and end ≈ now (within 10s),
+          regardless of whether passed positionally or as keyword args
         - scheduler was paused with cost_ceiling_watcher_exceeded
         """
         config = OrchestratorConfig(
@@ -1004,7 +1004,7 @@ class TestHarnessCostCeiling:
 
         # Stub returns (total, watcher) that trips the watcher ceiling.
         stub = AsyncMock(return_value=(20.0, 10.0))  # watcher=10.0 > ceiling=5.0
-        store.aggregate_window = stub
+        store.cost_totals_in_window = stub
 
         before = datetime.now(UTC)
         await harness._enforce_cost_ceilings()
@@ -1013,10 +1013,10 @@ class TestHarnessCostCeiling:
         # Exactly one call was made.
         assert stub.call_count == 1, f'Expected 1 call, got {stub.call_count}'
 
-        # Check the single call's args: (cutoff_24h_iso, now_iso).
-        args = stub.call_args_list[0].args
-        assert len(args) == 2, f'Expected 2 positional args, got {args!r}'
-        cutoff_iso, now_iso = args
+        # Extract start/end regardless of positional vs keyword calling convention.
+        call = stub.call_args_list[0]
+        cutoff_iso = call.args[0] if call.args else call.kwargs.get('start_iso')
+        now_iso = (call.args[1] if len(call.args) > 1 else call.kwargs.get('end_iso'))
 
         cutoff_dt = datetime.fromisoformat(cutoff_iso)
         now_dt = datetime.fromisoformat(now_iso)
