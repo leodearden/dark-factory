@@ -274,6 +274,21 @@ class TestModuleConfigDiscovery:
         assert mc.prefix == 'foo/bar'
         assert mc.test_command == 'pytest foo/bar/'
 
+    def test_discover_orders_results_by_depth_then_lex(self, tmp_path: Path):
+        """_discover_module_configs returns keys ordered by (depth, lex): depth-1 first, lex within depth."""
+        # Create four orchestrator.yaml files at varying depths
+        for parts in [
+            ('c',),
+            ('a',),
+            ('a', 'b'),
+            ('d', 'e', 'f'),
+        ]:
+            d = tmp_path.joinpath(*parts)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+        configs = _discover_module_configs(tmp_path)
+        assert list(configs.keys()) == ['a', 'c', 'a/b', 'd/e/f']
+
 
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
