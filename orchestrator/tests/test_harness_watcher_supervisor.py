@@ -884,6 +884,139 @@ class TestWatcherMisconfiguredGuard:
             f'got {len(h._watcher_degenerate_clean_exits)}'
         )
 
+    @pytest.mark.asyncio
+    async def test_misconfigured_trips_pause_scheduler(self, tmp_path: Path) -> None:
+        """After watcher_max_misconfigured_clean_exits fast-clean exits in the window,
+        pause_scheduler is called once with 'watcher_misconfigured' and the loop exits."""
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_misconfig = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': max_misconfig,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        # All rotations are fast-clean (duration 1s < 120s).
+        # Guard: cancel after max_misconfig * 2 rotations to prevent an infinite loop
+        # when the threshold trip is not yet implemented (makes RED state fail fast).
+        t0 = _time_mod.monotonic()
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > max_misconfig * 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
+        h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
+
+        # Each iteration: start=t0, end=t0+1.0 (duration 1s < 120s threshold)
+        call_count = 0
+
+        def fake_monotonic() -> float:
+            nonlocal call_count
+            call_count += 1
+            # start call (odd): t0; end call (even): t0 + 1.0
+            if call_count % 2 == 1:
+                return t0
+            return t0 + 1.0
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+        ):
+            # Loop should exit after max_misconfig fast-clean exits (no CancelledError)
+            await h._watcher_supervisor_loop()
+
+        assert pause_calls == ['watcher_misconfigured'], (
+            f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
+        )
+        assert rotation_calls == max_misconfig, (
+            f'Expected exactly {max_misconfig} rotations before trip; got {rotation_calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_old_degenerate_exits_outside_window_are_evicted(self, tmp_path: Path) -> None:
+        """Degenerate-clean exits older than watcher_crashloop_window_secs are evicted
+        so they do not contribute to the misconfigured count."""
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_misconfig = 3
+        window = 600
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': max_misconfig,
+            'watcher_crashloop_window_secs': window,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+        })
+
+        pause_calls: list[str] = []
+        rotation_calls = 0
+
+        # Drive 2 fast-clean exits at old_time, then jump past window,
+        # then drive 2 more fast-clean exits (< max_misconfig=3), then cancel.
+        old_time = _time_mod.monotonic()
+        new_time = old_time + window + 1  # beyond the window
+
+        # Each iteration: 2 monotonic calls (start, end)
+        # Old iterations: start=old_time, end=old_time+1 (duration 1s, fast)
+        # New iterations: start=new_time, end=new_time+1 (duration 1s, fast)
+        call_count = 0
+        iter_count = 0  # counts completed iterations (even end-call)
+
+        def fake_monotonic() -> float:
+            nonlocal call_count, iter_count
+            call_count += 1
+            is_end_call = (call_count % 2 == 0)
+            if is_end_call:
+                iter_count += 1
+            # First 2 iterations use old_time; rest use new_time
+            base = old_time if iter_count < 2 else new_time
+            return base + (1.0 if is_end_call else 0.0)
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > max_misconfig + 1:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
+        h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            # Loop should cancel (not trip) because old entries are evicted
+            await h._watcher_supervisor_loop()
+
+        assert pause_calls == [], (
+            'Old degenerate exits outside window should be evicted; '
+            'pause_scheduler must NOT trip'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-13: Wiring — __init__ attrs + run() source guard
