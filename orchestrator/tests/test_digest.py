@@ -12,6 +12,7 @@ import sqlite3
 from datetime import UTC, timedelta
 from datetime import datetime as _datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -280,10 +281,10 @@ class TestCountDoneInWindow:
         db_path = tmp_path / 'no-such.db'
         assert not db_path.exists(), "pre-condition: file must not exist"
 
-        def _raise_non_matching(*args: object, **kwargs: object) -> None:
-            raise sqlite3.OperationalError('could not open database')
-
-        monkeypatch.setattr(sqlite3, 'connect', _raise_non_matching)
+        # side_effect is a tripwire if the Path.exists() short-circuit regresses;
+        # assert_not_called() below is the primary contract.
+        mock_connect = MagicMock(side_effect=sqlite3.OperationalError('could not open database'))
+        monkeypatch.setattr(sqlite3, 'connect', mock_connect)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
             count = digest.count_done_in_window(
@@ -294,6 +295,7 @@ class TestCountDoneInWindow:
         assert count == 0, f"Expected 0 for missing DB; got {count}"
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
         assert not warnings, f"Missing-DB detection must not depend on SQLite error wording; got: {[r.message for r in warnings]}"
+        mock_connect.assert_not_called()  # verifies upfront Path.exists() short-circuit prevents connect from being reached
 
     def test_empty_window_returns_zero(self, tmp_path: Path) -> None:
         """Window with no matching rows returns 0."""
