@@ -2229,6 +2229,128 @@ class TestConfirmMarkerPersisted:
 
 
 # ---------------------------------------------------------------------------
+# task-1400 step-9 — dedup_flags HIT path: deletes priors only when confirmed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_path_no_delete_when_confirmation_misses(caplog):
+    """HIT path: when confirmation misses (marker not findable), priors are NOT deleted
+    and a WARNING is emitted.
+
+    Prior: [prior id='aaa']; add_memory returns memory_ids=['returned-id'];
+    confirmation: search side_effect = [[], []] (both miss — not findable).
+
+    Asserts:
+    (a) delete_memory NOT called (priors preserved — self-healing intact).
+    (b) WARNING mentioning task_id AND flag_type that the replacement could not be confirmed.
+    (c) Flag IS annotated with persisted_from_run (annotation extracted before write).
+
+    Fails until step-10 switches HIT gate from memory_ids to confirmed_id.
+    """
+    import logging
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'aaa'
+
+    memory_service = AsyncMock()
+    # suppression=[], pre-write HIT=[prior], confirmation miss=[], confirmation retry=[]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [], []])
+    memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['returned-id']))
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # (a) delete_memory NOT called — priors preserved when replacement unfindable
+    memory_service.delete_memory.assert_not_called()
+
+    # (b) WARNING that replacement could not be confirmed
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        ('42' in m or 'missing_deliverable' in m) and
+        ('could not confirm' in m or 'cannot confirm' in m or 'not confirmed' in m
+         or 'skipping' in m or 'skip' in m)
+        for m in warning_messages
+    ), (
+        f"Expected WARNING about unconfirmed replacement for task 42 but got: {warning_messages}"
+    )
+
+    # (c) Flag IS annotated (annotation extracted before write attempt)
+    assert len(result) == 1
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_hit_path_deletes_when_confirmed(caplog):
+    """HIT path: when confirmation succeeds (marker findable), all priors are deleted.
+
+    Converse of the above: add_memory returns memory_ids=['returned-id'] (different
+    from canonical); confirmation search returns [new_marker id='canon-new'].
+    Priors must be deleted exactly as before (existing atomic-replace contract).
+
+    Fails until step-10 switches HIT gate from memory_ids to confirmed_id.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'aaa'
+
+    new_confirmed_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '42',
+        'flag_type': 'missing_deliverable',
+        'run_id': 'r1',
+    })
+    new_confirmed_marker.id = 'canon-new'
+
+    memory_service = AsyncMock()
+    # suppression=[], pre-write HIT=[prior], confirmation hit=[new_marker]
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [new_confirmed_marker]])
+    memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['returned-DIFFERENT']))
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # Prior deleted (atomic-replace contract holds when confirmed)
+    memory_service.delete_memory.assert_called_once()
+    del_kwargs = memory_service.delete_memory.call_args.kwargs
+    assert del_kwargs.get('memory_id') == 'aaa'
+
+    # Flag annotated
+    assert result[0].get('persisted_from_run') == 'r0'
+    assert result[0].get('last_seen_run_id') == 'r1'
+
+
+# ---------------------------------------------------------------------------
 # task-1400 step-7 — dedup_flags MISS path: confirmation called after write
 # ---------------------------------------------------------------------------
 
