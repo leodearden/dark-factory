@@ -2842,6 +2842,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # --- Unclean exit path ---
+            # Symmetric with the clean path's ``consecutive_unclean = 0`` reset (which
+            # fires on both healthy and degenerate-clean exits): an unclean exit breaks
+            # any in-progress degenerate-clean burst, so reset the floor counter.
+            # Without this, interleaved degen/unclean workloads grow
+            # consecutive_degenerate_clean unboundedly across bursts (task 1443).
+            consecutive_degenerate_clean = 0
             consecutive_unclean += 1
             # _check_watcher_guard handles append+evict+trip defensively.  Called
             # outside any broad try/except so pause_scheduler failure cannot be
