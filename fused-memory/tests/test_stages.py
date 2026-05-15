@@ -2922,6 +2922,57 @@ class TestRunStageCapHandling:
 
 
 # ---------------------------------------------------------------------------
+# _STAGE_RUNNER_CAP_WAIT_SANITY_SECS: minutes-scale override forwarded to
+# invoke_with_cap_retry (task 1401)
+# ---------------------------------------------------------------------------
+
+
+class TestCliStageRunnerCapWaitSanityBound:
+    """_STAGE_RUNNER_CAP_WAIT_SANITY_SECS is minutes-scale and forwarded to
+    invoke_with_cap_retry; prevents stalling the reconciliation queue under cap."""
+
+    def test_constant_importable_and_minutes_scale(self):
+        """(a) _STAGE_RUNNER_CAP_WAIT_SANITY_SECS is importable, >0, <14d, <=3600s."""
+        from fused_memory.reconciliation.cli_stage_runner import (
+            _STAGE_RUNNER_CAP_WAIT_SANITY_SECS,
+        )
+
+        _FOURTEEN_DAYS_SECS = 14 * 86400
+        assert _STAGE_RUNNER_CAP_WAIT_SANITY_SECS > 0
+        assert _STAGE_RUNNER_CAP_WAIT_SANITY_SECS < _FOURTEEN_DAYS_SECS  # not the default 14d
+        assert _STAGE_RUNNER_CAP_WAIT_SANITY_SECS <= 3600.0  # hours-scale upper bound
+
+    @pytest.mark.asyncio
+    async def test_run_stage_via_cli_forwards_cap_wait_sanity_secs(self, tmp_path):
+        """(b) run_stage_via_cli forwards cap_wait_sanity_secs=_STAGE_RUNNER_CAP_WAIT_SANITY_SECS."""
+        from fused_memory.reconciliation.cli_stage_runner import (
+            _STAGE_RUNNER_CAP_WAIT_SANITY_SECS,
+        )
+
+        config = ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root=str(tmp_path),
+            agent_llm_model='sonnet',
+            agent_max_steps=5,
+            stage_timeout_seconds=600,
+        )
+        empty_result = AgentResult(success=True, output='')
+        mock = AsyncMock(return_value=empty_result)
+        with patch(
+            'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await run_stage_via_cli(
+                system_prompt='x',
+                payload='y',
+                disallowed_tools=[],
+                config=config,
+                mcp_config={'mcpServers': {}},
+            )
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _STAGE_RUNNER_CAP_WAIT_SANITY_SECS
+
+
+# ---------------------------------------------------------------------------
 # _format_flagged: no-silent-truncation tests (step-1)
 # ---------------------------------------------------------------------------
 
