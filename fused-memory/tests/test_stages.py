@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _fm_helpers import assert_id_title_pairing, make_8df8_scenario, parse_rendered_id_title_pairs
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
@@ -9298,13 +9299,8 @@ class TestStage2HintConversionDetection:
 # ── Regression: cycle 8df8bdcd — Stage 2 Recently-Completed/Done-Provenance
 #    title↔task_id contract (task 1379) ─────────────────────────────────────
 #
-# Cycle 8df8bdcd: tasks 1355/1361/1369 appeared in Stage 1 output each
-# carrying the NEXT task's title in the sorted completion sequence.
-# Investigation (task 1379, supersedes dc68f7b9, corroborates d3f56765):
-# _render_done_provenance_section and format_task_list read id+title from the
-# SAME task dict — no zip/index offset possible.  These tests lock the Stage 2
-# "Recently Completed Tasks" and "Done-task Provenance" formatters so any
-# future reintroduction of positional title resolution is caught.
+# Scenario data centralised in _fm_helpers.make_8df8_scenario(with_provenance=True).
+# See tests/_fm_helpers.py for the canonical fixture definition.
 
 
 class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
@@ -9319,36 +9315,9 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
     and verify no neighbor-title bleed in each branch's individual output.
     """
 
-    # Fixture: 8df8bdcd scenario (non-consecutive ids, distinct titles,
-    # completion order 1369→1355→1361 differs from id-sort order 1355<1361<1369).
-    # Provenance branches:
-    #   1369 — commit (rendered with project_root='/tmp' so branch fires)
-    #   1355 — note-only (renders '  note: ...' without a [id] header)
-    #   1361 — legacy/none (renders '- [id] title — provenance: unknown (legacy)')
-    _TASKS: list[dict] = [
-        {
-            'id': 1369,
-            'title': 'Refactor event dispatch to async',
-            'status': 'done',
-            'dependencies': [],
-            'metadata': {'done_provenance': {'commit': 'abc123deadbeef'}},
-        },
-        {
-            'id': 1355,
-            'title': 'Implement rate limiter middleware',
-            'status': 'done',
-            'dependencies': [],
-            'metadata': {'done_provenance': {'note': 'Covered by sibling task 1354'}},
-        },
-        {
-            'id': 1361,
-            'title': 'Add retry logic for database connections',
-            'status': 'done',
-            'dependencies': [],
-            # No metadata.done_provenance → legacy branch
-        },
-    ]
-    _TITLE_BY_ID: dict[int, str] = {t['id']: t['title'] for t in _TASKS}
+    # 8df8bdcd scenario with provenance metadata:
+    #   1369 — commit branch, 1355 — note-only branch, 1361 — legacy/none branch
+    _TASKS, _TITLE_BY_ID = make_8df8_scenario(id_type=int, status='done', with_provenance=True)
 
     @pytest.mark.asyncio
     async def test_render_done_provenance_section_commit_and_legacy_preserve_id_title(self):
@@ -9356,12 +9325,9 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
 
         Covers the commit branch (project_root set → fires [id] header) and the legacy
         branch.  The note-only branch (id=1355) does NOT render a [id] header by design.
-        Regex-extracts [id] → title from rendered lines and compares to the seeded map.
-        _git_show_name_only is patched to '' to avoid spawning a real git subprocess
-        (which is env-dependent if project_root happens to be inside a git worktree).
+        Uses parse_rendered_id_title_pairs(kind='provenance') via assert_id_title_pairing.
+        _git_show_name_only is patched to '' to avoid spawning a real git subprocess.
         """
-        import re
-
         # Patch _git_show_name_only so commit branch fires deterministically without a
         # real subprocess (git show result is irrelevant to the id↔title assertion).
         with patch(
@@ -9374,47 +9340,12 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
             f'Provenance section header missing:\n{rendered!r}'
         )
 
-        # Extract pairs from lines of the form: '- [<id>] <title>' (optionally followed by — or newline)
-        line_pattern = re.compile(r'^- \[(\d+)\] (.+?)(?:\s*—|\s*$)', re.MULTILINE)
-        found: dict[int, str] = {}
-        for m in line_pattern.finditer(rendered):
-            tid = int(m.group(1))
-            found_title = m.group(2).strip()
-            found[tid] = found_title
-
-        # Commit (1369) and legacy (1361) must appear; note-only (1355) has no [id] line
-        assert 1369 in found, (
-            f'Commit branch id=1369 missing from rendered:\n{rendered!r}'
+        # Commit (1369) and legacy (1361) render [id] lines; note-only (1355) has no [id] line
+        # assert_id_title_pairing checks own-title + expected_ids + anti-vacuity
+        assert_id_title_pairing(
+            rendered, self._TITLE_BY_ID, kind='provenance',
+            expected_ids={1369, 1361},
         )
-        assert 1361 in found, (
-            f'Legacy branch id=1361 missing from rendered:\n{rendered!r}'
-        )
-
-        # Each rendered [id] must carry its OWN title
-        for tid, rendered_title in found.items():
-            expected_title = self._TITLE_BY_ID[tid]
-            assert rendered_title == expected_title, (
-                f'[{tid}] rendered title={rendered_title!r}, '
-                f'expected own title={expected_title!r}\n'
-                f'rendered:\n{rendered}'
-            )
-
-        # No task's title should appear adjacent to another task's id
-        all_titles = list(self._TITLE_BY_ID.values())
-        for line in rendered.splitlines():
-            id_match = re.search(r'\[(\d+)\]', line)
-            if not id_match:
-                continue
-            tid = int(id_match.group(1))
-            if tid not in self._TITLE_BY_ID:
-                continue
-            own_title = self._TITLE_BY_ID[tid]
-            for title in all_titles:
-                if title == own_title:
-                    continue
-                assert title not in line, (
-                    f'Line for [{tid}] contains neighbor title {title!r}:\n  {line!r}'
-                )
 
     def test_format_task_list_recently_completed_preserves_id_title_pairing(self):
         """format_task_list for Recently Completed section: id↔title locked.
@@ -9423,27 +9354,12 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
         on done_tasks.  Verifies the 8df8bdcd scenario across completion-order
         ≠ id-sort-order, covering all provenance branch types.
         """
-        import re
-
         rendered = format_task_list(list(self._TASKS))
         assert rendered != 'No tasks.'
-
-        line_pattern = re.compile(r'^- \[(\d+)\] \([^)]+\) (.+?) deps=', re.MULTILINE)
-        found: dict[int, str] = {}
-        for m in line_pattern.finditer(rendered):
-            found[int(m.group(1))] = m.group(2)
-
-        assert set(found.keys()) == set(self._TITLE_BY_ID.keys()), (
-            f'Expected ids {set(self._TITLE_BY_ID.keys())}, got {set(found.keys())}\n'
-            f'rendered:\n{rendered}'
+        assert_id_title_pairing(
+            rendered, self._TITLE_BY_ID, kind='active',
+            expected_ids={1369, 1355, 1361},
         )
-
-        for tid, rendered_title in found.items():
-            expected_title = self._TITLE_BY_ID[tid]
-            assert rendered_title == expected_title, (
-                f'Recently Completed [id={tid}]: rendered={rendered_title!r}, '
-                f'expected own title={expected_title!r}'
-            )
 
     @pytest.mark.asyncio
     async def test_provenance_branch_commit_renders_own_id_and_title(self):
