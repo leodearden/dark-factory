@@ -38,6 +38,7 @@ from dashboard.data.orchestrator import (
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import safe_gather_result
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 # Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
 _LIST_TICKETS_LIMIT = 2000
+# Typed default for safe_gather_result in the fan_out_list_tickets per-root reducer.
+# Explicit annotation keeps pyright happy because the inferred type of (0, []) is
+# tuple[int, list[...]] which may not match the list[tuple[int, list[dict]]] annotation.
+_FAN_OUT_ROOT_DEFAULT: tuple[int, list[dict]] = (0, [])
 
 
 async def fan_out_list_tickets(
@@ -137,8 +142,14 @@ async def fan_out_list_tickets(
     raw_results = await asyncio.gather(
         *(_fan_out_one_root(r) for r in all_roots), return_exceptions=True
     )
+    # safe_gather_result re-raises non-Exception BaseException (CancelledError,
+    # KeyboardInterrupt, SystemExit) so shutdown cancellation propagates correctly.
+    # Exception subclasses (including per-root failures) are substituted with the
+    # (0, []) default and logged at WARNING — same convention as the sibling legs
+    # in api_curator (curator/sparks, curator/intervals, curator/fan_out).
     per_root_results: list[tuple[int, list[dict]]] = [
-        r if not isinstance(r, BaseException) else (0, []) for r in raw_results
+        safe_gather_result(r, _FAN_OUT_ROOT_DEFAULT, 'curator/fan_out_root')
+        for r in raw_results
     ]
     pending_total = sum(c for c, _ in per_root_results)
     tickets: list[dict] = [t for _, ts in per_root_results for t in ts]
