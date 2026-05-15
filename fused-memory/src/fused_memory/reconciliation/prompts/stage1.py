@@ -340,7 +340,7 @@ the LLM. Omitting `run_id` (or writing an empty `run_id`) causes the marker to b
 discarded rather than processed. The Mem0 marker channel is intentionally single-cycle; \
 the `flagged_items` field carries the durable delivery guarantee.
 
-Post-write confirmation (mirrors flag_dedup.confirm_marker_persisted — task-1400): \
+Post-write confirmation (LLM-side variant of the findability discipline enforced in code by flag_dedup.confirm_marker_persisted — task-1400, post-task-1413): \
 `add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
 canonical id. After every `flag_for_stage2=true` add_memory call you MUST immediately \
 re-search Mem0 by the flag content/task_id/flag_type to confirm the marker is findable: \
@@ -351,7 +351,11 @@ proceeding. \
 (c) Emit the CONFIRMED canonical memory_id (from the successful search result) in the \
 `flagged_items` entry rather than the unverified `memory_ids[0]`. If confirmation fails \
 after the retry, emit a sentinel such as `"unconfirmed"` and proceed — do not raise or abort. \
-`flag_dedup.confirm_marker_persisted` is the authoritative code-side enforcement of this \
-contract; this prompt directive mirrors it so LLM-written relay markers receive identical \
-post-write confirmation discipline.
+`flag_dedup.confirm_marker_persisted` performs the analogous code-side findability check for \
+Python-written markers, but returns a bool (post-task-1413) rather than a canonical id — it \
+gates prior-deletion on findability without surfacing the canonical id at all. This prompt \
+directive is intentionally STRICTER: the LLM is asked to additionally surface the canonical id \
+from its own re-search into the `flagged_items` entry, since the structured-output channel \
+carries the durable delivery guarantee. The asymmetry is deliberate; do not re-align by \
+reverting the Python helper to return `str | None`.
 """
