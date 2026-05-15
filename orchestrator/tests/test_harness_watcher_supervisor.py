@@ -3,12 +3,13 @@
 Task 1326 — AFK hardening: escalation-watcher-auto skill + orch subprocess supervisor.
 
 Steps covered by this file:
-  step-3: TestWatcherConfig — OrchestratorConfig field presence + defaults
-  step-5: TestWatcherSupervisorLifecycle — start/stop/idempotent lifecycle
-  step-7: TestRunWatcherRotation — _run_watcher_rotation invoke contract
-  step-9: TestWatcherSupervisorLoopClassification — clean/unclean backoff
+  step-3:  TestWatcherConfig — OrchestratorConfig field presence + defaults
+  step-5:  TestWatcherSupervisorLifecycle — start/stop/idempotent lifecycle
+  step-7:  TestRunWatcherRotation — _run_watcher_rotation invoke contract
+  step-9:  TestWatcherSupervisorLoopClassification — clean/unclean backoff
   step-11: TestWatcherCrashloopTrip — crashloop detection + pause_scheduler
-  step-13: TestWatcherSupervisorWiring — __init__ attrs + run() source guard
+  step-13: TestWatcherSupervisorWiring — __init__ attrs + bound-method checks
+  step-15: TestWatcherSupervisorRunWiring — behavioral run()-lifecycle ordering
 """
 
 from __future__ import annotations
@@ -712,7 +713,7 @@ class TestWatcherCrashloopTrip:
 # ---------------------------------------------------------------------------
 
 class TestWatcherSupervisorWiring:
-    """Verify __init__ sets the expected attributes and run() wires the lifecycle calls."""
+    """Verify __init__ sets the expected attributes and bound methods exist."""
 
     def test_init_sets_watcher_supervisor_task_none(self, tmp_path: Path) -> None:
         """Harness.__new__ + __init__ sets _watcher_supervisor_task=None."""
@@ -731,48 +732,167 @@ class TestWatcherSupervisorWiring:
         assert callable(h._start_watcher_supervisor)
         assert callable(h._stop_watcher_supervisor)
 
-    def test_run_calls_start_watcher_supervisor_after_dismiss_stale(self) -> None:
-        """Source guard: _start_watcher_supervisor() appears in run() after
-        the _dismiss_stale_escalations() call site and alongside the other
-        _start_* calls (mirrors terminal_status_watcher, orphan_l0_reaper)."""
-        harness_src = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
-        source = harness_src.read_text()
 
-        dismiss_pos = source.find('_dismiss_stale_escalations()')
-        assert dismiss_pos != -1, '_dismiss_stale_escalations() call not found in harness.py'
+# ---------------------------------------------------------------------------
+# step-15: Behavioral run()-lifecycle ordering test
+# ---------------------------------------------------------------------------
 
-        start_pos = source.find('_start_watcher_supervisor()')
-        assert start_pos != -1, (
-            '_start_watcher_supervisor() call not found in harness.py run() — '
-            'step-14 wiring not yet applied'
+
+def _make_run_wired_harness(tmp_path: Path) -> tuple:
+    """Real Harness with all run() side-effects stubbed + shared-parent call-order mock.
+
+    Uses a real OrchestratorConfig (like test_harness_park_stop._make_harness_with_mocks)
+    to avoid spec_set restrictions on properties not in model_fields.  Patches
+    McpLifecycle/Scheduler/BriefingAssembler during construction so no real servers start.
+
+    Returns ``(harness, parent_mock)`` where ``parent_mock.mock_calls`` records
+    every attached child-mock call in chronological order.
+    """
+    config = OrchestratorConfig(project_root=tmp_path)
+
+    with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(config)
+
+    mock_mcp = mock_mcp_cls.return_value
+    mock_mcp.start = AsyncMock()
+    mock_mcp.stop = AsyncMock()
+
+    h.git_ops = MagicMock()
+    h.git_ops.has_dirty_working_tree = AsyncMock(return_value=None)
+    h.git_ops.worktree_base = tmp_path / '.worktrees'
+
+    # Mock all startup side-effect methods not under call-order observation.
+    h._start_escalation_server = AsyncMock()
+    h._start_merge_worker = AsyncMock()
+    h._tag_task_modules = AsyncMock()
+    h._recover_crashed_tasks = AsyncMock()
+    h._reconcile_stranded_in_progress = AsyncMock()
+    h._tag_prd_metadata = AsyncMock()
+    h._start_orphan_l0_reaper = MagicMock()
+    h._start_stranded_reconcile = MagicMock()
+
+    # Scheduler: one pending task so run() proceeds to the acquire_next loop,
+    # which then raises RuntimeError('stop') to halt immediately after startup.
+    h.scheduler = MagicMock()
+    h.scheduler.get_tasks = AsyncMock(return_value=[{'id': '1', 'status': 'pending'}])
+    h.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.acquire_next = AsyncMock(side_effect=RuntimeError('stop'))
+
+    # Shared parent mock — all attached children's calls are recorded here in
+    # chronological order, enabling relative-ordering assertions without reading
+    # source text.
+    parent = MagicMock(name='lifecycle_order')
+
+    # Children: AsyncMock for async methods, MagicMock for sync.
+    dismiss_mock = AsyncMock()
+    start_terminal_mock = MagicMock()
+    start_watcher_mock = MagicMock()
+    stop_terminal_mock = AsyncMock()
+    stop_watcher_mock = AsyncMock()
+    mcp_stop_mock = AsyncMock()
+
+    parent.attach_mock(dismiss_mock, '_dismiss_stale_escalations')
+    parent.attach_mock(start_terminal_mock, '_start_terminal_status_watcher')
+    parent.attach_mock(start_watcher_mock, '_start_watcher_supervisor')
+    parent.attach_mock(stop_terminal_mock, '_stop_terminal_status_watcher')
+    parent.attach_mock(stop_watcher_mock, '_stop_watcher_supervisor')
+    parent.attach_mock(mcp_stop_mock, 'mcp_stop')
+
+    h._dismiss_stale_escalations = dismiss_mock
+    h._start_terminal_status_watcher = start_terminal_mock
+    h._start_watcher_supervisor = start_watcher_mock
+    h._stop_terminal_status_watcher = stop_terminal_mock
+    h._stop_watcher_supervisor = stop_watcher_mock
+    mock_mcp.stop = mcp_stop_mock
+
+    return h, parent
+
+
+class TestWatcherSupervisorRunWiring:
+    """Behavioral run()-lifecycle test replacing the brittle source-guard meta-tests.
+
+    Drives a real ``Harness.run()`` with all side-effects stubbed and verifies
+    that ``_start_watcher_supervisor`` / ``_stop_watcher_supervisor`` are
+    actually invoked — and in the correct startup/shutdown phase — via a shared
+    parent mock's ``mock_calls`` list (chronological call order).
+
+    Replaces the two source-introspection guards removed from
+    ``TestWatcherSupervisorWiring`` (step-13): those used ``source.find()`` on
+    harness.py text and matched the method name in docstrings/comments, making
+    them pass even when ``run()`` never called the methods, and breaking on
+    behaviour-preserving refactors. Step-16 proves these replacements detect
+    un-wiring.
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_watcher_supervisor_called_once(self, tmp_path: Path) -> None:
+        """_start_watcher_supervisor is called exactly once during run()."""
+        h, _parent = _make_run_wired_harness(tmp_path)
+        with pytest.raises(RuntimeError):
+            await h.run(prd_path=None)
+        h._start_watcher_supervisor.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_watcher_supervisor_after_dismiss_stale(self, tmp_path: Path) -> None:
+        """Startup block: _start_watcher_supervisor appears AFTER _dismiss_stale_escalations
+        in the shared parent's mock_calls (chronological call order)."""
+        h, parent = _make_run_wired_harness(tmp_path)
+        with pytest.raises(RuntimeError):
+            await h.run(prd_path=None)
+
+        call_strs = [str(c) for c in parent.mock_calls]
+
+        dismiss_idx = next(
+            (i for i, s in enumerate(call_strs) if '_dismiss_stale_escalations' in s), -1
+        )
+        start_idx = next(
+            (i for i, s in enumerate(call_strs) if '_start_watcher_supervisor' in s), -1
         )
 
-        # The start call must come AFTER the dismiss call in source order
-        assert start_pos > dismiss_pos, (
-            '_start_watcher_supervisor() must appear after _dismiss_stale_escalations() '
-            f'in run(); dismiss_pos={dismiss_pos} start_pos={start_pos}'
+        assert dismiss_idx >= 0, (
+            f'_dismiss_stale_escalations not found in mock_calls: {call_strs}'
+        )
+        assert start_idx >= 0, (
+            f'_start_watcher_supervisor not found in mock_calls: {call_strs}'
+        )
+        assert start_idx > dismiss_idx, (
+            f'_start_watcher_supervisor (idx={start_idx}) must appear AFTER '
+            f'_dismiss_stale_escalations (idx={dismiss_idx}); calls: {call_strs}'
         )
 
-    def test_run_calls_stop_watcher_supervisor_in_finally_block(self) -> None:
-        """Source guard: _stop_watcher_supervisor() appears in the finally shutdown
-        block alongside _stop_terminal_status_watcher()."""
-        harness_src = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
-        source = harness_src.read_text()
+    @pytest.mark.asyncio
+    async def test_stop_watcher_supervisor_awaited_after_stop_terminal(
+        self, tmp_path: Path
+    ) -> None:
+        """Shutdown finally block: _stop_watcher_supervisor is awaited and appears
+        AFTER _stop_terminal_status_watcher in the shared parent's mock_calls."""
+        h, parent = _make_run_wired_harness(tmp_path)
+        with pytest.raises(RuntimeError):
+            await h.run(prd_path=None)
 
-        stop_terminal_pos = source.find('_stop_terminal_status_watcher()')
-        assert stop_terminal_pos != -1, '_stop_terminal_status_watcher() not found'
+        # Must have been awaited (not just called)
+        h._stop_watcher_supervisor.assert_awaited()
 
-        stop_supervisor_pos = source.find('_stop_watcher_supervisor()')
-        assert stop_supervisor_pos != -1, (
-            '_stop_watcher_supervisor() call not found in harness.py run() finally block — '
-            'step-14 wiring not yet applied'
+        call_strs = [str(c) for c in parent.mock_calls]
+
+        stop_terminal_idx = next(
+            (i for i, s in enumerate(call_strs) if '_stop_terminal_status_watcher' in s), -1
+        )
+        stop_watcher_idx = next(
+            (i for i, s in enumerate(call_strs) if '_stop_watcher_supervisor' in s), -1
         )
 
-        # Both must be within ~100 lines of each other (same shutdown block)
-        line_stop_terminal = source[:stop_terminal_pos].count('\n')
-        line_stop_supervisor = source[:stop_supervisor_pos].count('\n')
-        assert abs(line_stop_terminal - line_stop_supervisor) < 15, (
-            f'_stop_watcher_supervisor() (line {line_stop_supervisor}) should be '
-            f'near _stop_terminal_status_watcher() (line {line_stop_terminal}) in the '
-            f'finally shutdown block'
+        assert stop_terminal_idx >= 0, (
+            f'_stop_terminal_status_watcher not found in mock_calls: {call_strs}'
+        )
+        assert stop_watcher_idx >= 0, (
+            f'_stop_watcher_supervisor not found in mock_calls: {call_strs}'
+        )
+        assert stop_watcher_idx > stop_terminal_idx, (
+            f'_stop_watcher_supervisor (idx={stop_watcher_idx}) must appear after '
+            f'_stop_terminal_status_watcher (idx={stop_terminal_idx}); '
+            f'calls: {call_strs}'
         )
