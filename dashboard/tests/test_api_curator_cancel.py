@@ -43,7 +43,7 @@ def _tool_name(c):
 # ---------------------------------------------------------------------------
 
 _INVALID_BODIES = [
-    pytest.param(None, id='non-dict-body'),        # send as raw bytes
+    pytest.param(None, id='non-dict-body'),  # send as raw bytes
     pytest.param({}, id='missing-key'),
     pytest.param({'ticket_id': 123}, id='non-string'),
     pytest.param({'ticket_id': ''}, id='empty-string'),
@@ -68,13 +68,14 @@ def test_invalid_ticket_id_returns_400(client, body):
     assert resp.status_code == 400
     data = resp.json()
     assert data.get('error') == 'invalid_ticket_id'
-    # Background tasks (metrics loop) may call mcp_tool_call for get_queue_stats
-    # or get_status probes; filter those out and assert the remainder is empty so
-    # no handler-level MCP call was made on the invalid-input fast-path.
-    _BACKGROUND_TOOLS = {'get_queue_stats', 'get_status'}
-    handler_calls = [c for c in mock_mcp.call_args_list if _tool_name(c) not in _BACKGROUND_TOOLS]
+    # Count only handler-level MCP calls; background probes (metrics loop etc.)
+    # are not counted so new background tools cannot cause spurious failures.
+    # Using a set rather than equality to one name preserves detection breadth
+    # if a second handler tool is added later.
+    _HANDLER_TOOLS = {'cancel_ticket'}
+    handler_calls = [c for c in mock_mcp.call_args_list if _tool_name(c) in _HANDLER_TOOLS]
     assert handler_calls == [], (
-        f'Expected no handler MCP calls for invalid input, got: {handler_calls}'
+        f'Expected no handler-level MCP calls for invalid input, got: {handler_calls}'
     )
 
 
@@ -121,6 +122,7 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     assert args_arg == {'ticket_id': 'tkt_abc'}
     # The URL must be exactly the first entry in the default config
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+
     assert url_arg == DEFAULT_FUSED_MEMORY_URLS[0]
 
 
@@ -240,10 +242,13 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
           message ('connection refused: port 8002'), not just the type name
     """
     exc_msg = 'connection refused: port 8002'
-    with patch(
-        _PATCH_TARGET,
-        new=AsyncMock(side_effect=httpx.ConnectError(exc_msg)),
-    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+    with (
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=httpx.ConnectError(exc_msg)),
+        ),
+        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+    ):
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -254,8 +259,7 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
 
     # (b) WARNING log
     warning_records = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'
     ]
     assert warning_records, 'Expected at least one WARNING from dashboard.app'
     combined_msg = ' '.join(r.getMessage() for r in warning_records)
@@ -267,104 +271,51 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
     assert exc_msg in detail, f'Expected "{exc_msg}" in detail, got: {detail!r}'
 
 
-def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
+@pytest.mark.parametrize(
+    'exc',
+    [
+        pytest.param(ValueError('X' * 300), id='ValueError'),
+        pytest.param(
+            httpx.HTTPStatusError(
+                'X' * 300,
+                request=httpx.Request('POST', 'http://x'),
+                response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
+            ),
+            id='HTTPStatusError',
+        ),
+    ],
+)
+def test_cancel_handler_502_detail_truncates_exception_text(client, caplog, exc):
     """502 detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars; WARNING keeps full text.
 
-    Guards against arbitrary-length response-body leakage via the 502 detail
-    field: the cancel handler interpolates str(exc) in the detail string, which
-    can be unbounded when the upstream MCP server returns a large error body.
-
-    Uses ValueError('X' * 300) as the exception fixture because:
-      - ValueError is already in the handler's caught-exception tuple
-        (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError)
-      - str(ValueError(s)) == s is part of the stdlib BaseException.__str__
-        contract (single-arg case returns self.args[0] as-is), so the assertion
-        directly pins the handler's truncation behaviour rather than depending on
-        httpx.HTTPStatusError.__str__ formatting, which is not contractual and
-        could change across httpx versions.
-
-    Assertions:
-      (a) response is 502
-      (b) detail contains the first _CANCEL_DETAIL_EXC_CHAR_LIMIT chars of the
-          exception message AND does NOT contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1
-          consecutive 'X' chars (i.e. is truncated)
-      (c) the WARNING log record still has the FULL 300-char message
-          (ops log must not lose information)
+    Parametrized over caught exception types so the cap is confirmed to apply
+    uniformly.  BaseException.__str__ returns args[0] verbatim (single-arg case),
+    so str(exc) == the message arg for both ValueError and httpx.HTTPStatusError.
     """
     long_msg = 'X' * 300
-    exc = ValueError(long_msg)
-    with patch(
-        _PATCH_TARGET,
-        new=AsyncMock(side_effect=exc),
-    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+    with (
+        patch(_PATCH_TARGET, new=AsyncMock(side_effect=exc)),
+        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+    ):
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
         )
 
-    # (a) 502
     assert resp.status_code == 502
-
-    # (b) detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars
     detail = resp.json().get('detail', '')
     assert 'X' * _CANCEL_DETAIL_EXC_CHAR_LIMIT in detail, (
         'Expected first _CANCEL_DETAIL_EXC_CHAR_LIMIT X chars in detail'
     )
     assert 'X' * (_CANCEL_DETAIL_EXC_CHAR_LIMIT + 1) not in detail, (
-        'Detail must not contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 X chars (leaked exc text)'
+        'Detail must not contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 X chars (exc text not truncated)'
     )
-
-    # (c) WARNING log retains full exception text
     warning_records = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'
     ]
     assert warning_records, 'Expected at least one WARNING from dashboard.app'
     combined_msg = ' '.join(r.getMessage() for r in warning_records)
     assert long_msg in combined_msg, 'WARNING log must contain full (untruncated) exception text'
-
-
-def test_cancel_handler_502_detail_bounded_for_httpstatuserror(client):
-    """HTTPStatusError with a large response body yields a bounded 502 detail.
-
-    httpx.HTTPStatusError.__str__ embeds the response body in its string
-    representation, so a large upstream error response could leak through the
-    502 detail field.  This test verifies that _CANCEL_DETAIL_EXC_CHAR_LIMIT
-    bounds the detail length without asserting on the exact HTTPStatusError
-    __str__ format (which is not part of the httpx public contract and could
-    change across httpx versions).
-
-    Complements test_cancel_handler_502_detail_truncates_exception_text (which
-    uses ValueError for a stable contract) by exercising the actual upstream
-    scenario the truncation cap was designed to defend against.
-    """
-    large_body = b'E' * 10000
-    exc = httpx.HTTPStatusError(
-        'Server Error',
-        request=httpx.Request('POST', 'http://x'),
-        response=httpx.Response(
-            500,
-            content=large_body,
-            request=httpx.Request('POST', 'http://x'),
-        ),
-    )
-    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=exc)):
-        resp = client.post(
-            '/api/v2/dashboard/curator/cancel',
-            json={'ticket_id': 'tkt_xyz'},
-        )
-
-    assert resp.status_code == 502
-    detail = resp.json().get('detail', '')
-    # Each per-URL error segment is '{url}: {typename}: {str(exc)[:LIMIT]}'.
-    # With the default single-URL config the total is bounded by the limit
-    # plus a small fixed overhead (URL + type name + separators).  Use 3×
-    # the limit as a generous ceiling so the assertion catches truncation
-    # failures without depending on URL/typename lengths.
-    max_detail = 3 * _CANCEL_DETAIL_EXC_CHAR_LIMIT
-    assert len(detail) <= max_detail, (
-        f'502 detail must be bounded (≤{max_detail} chars); got {len(detail)} chars'
-    )
 
 
 def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
