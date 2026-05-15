@@ -1972,7 +1972,24 @@ class TaskWorkflow:
             # the thrash signal does not apply; reset.
             counter = 0
 
-        new_metadata = dict(metadata)
+        # Read-modify-write: fetch the backend's current metadata so that keys
+        # added after self.task was loaded (e.g. memory_hints re-attached by
+        # Stage-2 reconciliation) survive the write.  Mirror the boundary-
+        # normalisation pattern used in _handle_bypass_done_on_terminal_exit.
+        try:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort, fall back to in-memory
+            logger.warning(
+                'Task %s: failed to refresh metadata before infra-resume thrash '
+                'counter write; falling back to in-memory metadata '
+                '(memory_hints may be clobbered): %s',
+                self.task_id, exc,
+            )
+            fresh_task = None
+        base_metadata: dict = (
+            (fresh_task.get('metadata') or {}) if isinstance(fresh_task, dict) else metadata
+        )
+        new_metadata = dict(base_metadata)
         new_metadata['consecutive_infra_resume_failures'] = counter
         new_metadata['last_infra_resume_iteration_count'] = current_iter_count
         self.task['metadata'] = new_metadata
