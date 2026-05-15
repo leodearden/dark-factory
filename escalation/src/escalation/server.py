@@ -318,7 +318,10 @@ def create_server(
 
         from orchestrator.merge_queue import MergeOutcome, MergeRequest, enqueue_merge_request
 
-        module_configs = list(orch_config._module_configs.values())
+        # Guard: direct-instantiation configs (e.g. build_eval_orch_config) leave
+        # _module_configs at the post-1405 None sentinel; treat None and {} alike.
+        # See config.py comment above _module_configs PrivateAttr for the contract.
+        module_configs = list((orch_config._module_configs or {}).values())
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         merge_req = MergeRequest(
             task_id=task_id,
