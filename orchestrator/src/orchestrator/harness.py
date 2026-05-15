@@ -316,12 +316,12 @@ class Harness:
         # Digest + EWA trip counters (task 1327 AFK hardening).
         # _escalation_event_count: incremented on every escalation submit/resolve callback.
         # _last_digest_event_count: snapshot of the count at the last digest write.
-        # _last_digest_done_count: snapshot of scheduler.done_transitions_total at last digest.
         # _ewa_value: current EWA state (process-local; resets on restart).
         # _last_digest_window_end_iso: ISO timestamp of the last digest window's end.
+        # Note: done_count comes from EventStore (count_done_in_window) as the
+        # single source of truth — no scheduler-delta counter needed (task 1421).
         self._escalation_event_count: int = 0
         self._last_digest_event_count: int = 0
-        self._last_digest_done_count: int = 0
         self._ewa_value: float = 0.0
         self._last_digest_window_end_iso: str = ''  # set to start time on first run
 
@@ -3208,13 +3208,17 @@ Output JSON matching the schema. Every task must appear in the output.
         Algorithm:
         1. Early-return when digest_enabled=False.
         2. Early-return when (escalation_event_count - last_count) < N.
-        3. Snapshot step deltas (escalations + done transitions).
+        3. Snapshot escalation delta.
         4. Compute window (last window_end → now).
         5. Aggregate escalation stats (fail-open).
         6. Count done tasks in EventStore (fail-open).
+           done_count from EventStore is the single source of truth for both
+           the rendered digest figure and the update_ewa input — ensuring the
+           operator sees exactly the number that drove the EWA decision.
+           (Task 1421: removed the scheduler.done_transitions_total delta path.)
         7. Query cost stats from CostStore (fail-open).
         8. Read parked-task counts from Scheduler state.
-        9. Update EWA.
+        9. Update EWA using EventStore done_count.
         10. Compute trip flag and anomaly flags.
         11. Write digest file (fail-open via write_digest_entry).
         12. Advance counters/state.
@@ -3232,11 +3236,8 @@ Output JSON matching the schema. Every task must appear in the output.
             if diff < self.config.digest_every_n_escalations:
                 return
 
-            # (3) Snapshot step deltas.
+            # (3) Snapshot escalation delta.
             escalations_in_step = diff
-            done_in_step = (
-                self.scheduler.done_transitions_total - self._last_digest_done_count
-            )
 
             # (4) Compute window timestamps.
             window_end = datetime.now(UTC).isoformat()
@@ -3272,11 +3273,12 @@ Output JSON matching the schema. Every task must appear in the output.
             parked_live = self.scheduler.parked_live_count
             parked_window_churn = self.scheduler.parked_window_churn_count
 
-            # (9) Update EWA.
+            # (9) Update EWA — done_count from EventStore (step 6) is the single
+            # source of truth so the EWA input matches the rendered digest figure.
             new_ewa = digest_mod.update_ewa(
                 prev_ewa=self._ewa_value,
                 escalations_in_step=escalations_in_step,
-                done_in_step=done_in_step,
+                done_in_step=done_count,
                 alpha=self.config.digest_ewa_alpha,
             )
 
@@ -3322,7 +3324,6 @@ Output JSON matching the schema. Every task must appear in the output.
             # (12) Advance EWA state and counters.
             self._ewa_value = new_ewa
             self._last_digest_event_count = self._escalation_event_count
-            self._last_digest_done_count = self.scheduler.done_transitions_total
             self._last_digest_window_end_iso = window_end
 
             # (13) EWA trip: pause scheduler AFTER the digest is written so the
