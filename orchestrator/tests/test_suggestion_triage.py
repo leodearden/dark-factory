@@ -11,6 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 import pytest
 from shared.cli_invoke import AllAccountsCappedException
 
+from _orch_helpers import pydantic_spec
+from orchestrator.config import OrchestratorConfig
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -23,7 +26,7 @@ def _make_workflow(*, escalation_queue=None, escalation_event=None):
     assignment.task_id = '42'
     assignment.task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
 
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.max_review_cycles = 2
@@ -629,7 +632,7 @@ def _make_steward(*, config_overrides=None, suggestion_count=15):
 
     from orchestrator.steward import TaskSteward
 
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = Path('/tmp/project')
     config.steward_lifetime_budget = 12.0
     config.steward_max_attempts = 3

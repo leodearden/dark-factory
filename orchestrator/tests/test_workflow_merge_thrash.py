@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from _orch_helpers import pydantic_spec
+from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     MergeOutcome,
@@ -54,7 +56,7 @@ def _make(
     }
     assignment.modules = ['mod_a']
 
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2

@@ -13,8 +13,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from _orch_helpers import pydantic_spec
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, ROLES
+from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow
 
 
@@ -29,7 +31,7 @@ def _make_workflow(*, escalation_queue=None) -> TaskWorkflow:
     assignment.task = {'id': '42', 'title': 'Test Task', 'description': 'd'}
     assignment.modules = ['some/module']
 
-    cfg = MagicMock()
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.fused_memory.project_id = 'dark_factory'
     cfg.fused_memory.url = 'http://localhost:8002'
     cfg.max_review_cycles = 2

@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock
 
+from _orch_helpers import pydantic_spec
+from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow
 
 
@@ -32,7 +34,7 @@ def _make_workflow(*, modules: list[str], lock_depth: int = 2) -> TaskWorkflow:
     assignment.task = {'id': '42', 'title': 'Test Task', 'description': 'd'}
     assignment.modules = modules
 
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.max_review_cycles = 2
