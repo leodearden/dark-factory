@@ -25,6 +25,53 @@ def _load_package_defaults() -> dict:
     return yaml.safe_load(defaults_file.read_text())
 
 
+# Shared diagnostic phrase used by both lock_depth boundary tests.
+# Hoisted to module scope so both the positive and negative tests reference one
+# source of truth, and any future sibling tests can reuse it without duplication.
+DISTINCTIVE_PHRASE = 'unreachable through the scheduler/workflow path'
+
+
+def _load_config_with_nested_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prefix: str,
+    lock_depth: int = 2,
+) -> OrchestratorConfig:
+    """Write a minimal global config + a nested module config and return load_config().
+
+    Single-sources the env-isolation contract (ORCH_LOCK_DEPTH / ORCH_CONFIG_PATH)
+    and the config-yaml + nested-orchestrator-yaml setup shared by the two
+    lock_depth boundary tests.
+
+    Args:
+        tmp_path: pytest tmp_path fixture — used as project_root.
+        monkeypatch: pytest monkeypatch fixture — owns env-var teardown.
+        prefix: Relative path of the nested module (e.g. 'foo/bar' or 'foo/bar/baz').
+        lock_depth: lock_depth value written to the global config.yaml (default 2).
+
+    Returns:
+        The OrchestratorConfig produced by load_config() after discovery.
+    """
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text(yaml.dump({
+        'project_root': str(tmp_path),
+        'lock_depth': lock_depth,
+    }))
+    # Isolate ORCH_LOCK_DEPTH so a stray env var cannot override lock_depth and
+    # silently invalidate the depth-comparison boundary being tested.  Route
+    # ORCH_CONFIG_PATH through monkeypatch so load_config's write is auto-restored.
+    monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+    # Create the nested module config; 'test_command' is an overridable field so
+    # _discover_module_configs registers the prefix (non-overridable fields are silently
+    # ignored and would leave the prefix unregistered — the step-1 helper test guards this).
+    nested = tmp_path / Path(prefix)
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+    return load_config(config_path)
+
+
 class TestDefaults:
     """Tests for OrchestratorConfig defaults — isolated from real config files."""
 
