@@ -75,3 +75,81 @@ class TestWatcherConfig:
     def test_watcher_backend_default(self, tmp_path: Path) -> None:
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.watcher_backend == 'claude'
+
+
+# ---------------------------------------------------------------------------
+# step-5: Supervisor lifecycle — start / stop / idempotent
+# ---------------------------------------------------------------------------
+
+async def _never_return() -> None:
+    """A coroutine that never completes (simulates a running supervisor loop)."""
+    await asyncio.sleep(9999)
+
+
+def _make_lifecycle_harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
+    """Build a minimal Harness via __new__ with lifecycle attributes injected."""
+    from collections import deque
+
+    h = Harness.__new__(Harness)
+    config = OrchestratorConfig(project_root=tmp_path)
+    config = config.model_copy(update={'watcher_supervisor_enabled': enabled})
+    h.config = config
+    h._watcher_supervisor_task = None
+    h._watcher_unclean_exits: deque = deque()
+    return h
+
+
+class TestWatcherSupervisorLifecycle:
+    """_start/_stop_watcher_supervisor lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_start_noop_when_disabled(self, tmp_path: Path) -> None:
+        """When disabled, _start_watcher_supervisor is a no-op."""
+        h = _make_lifecycle_harness(tmp_path, enabled=False)
+        with patch.object(h, '_watcher_supervisor_loop', side_effect=_never_return):
+            h._start_watcher_supervisor()
+        assert h._watcher_supervisor_task is None
+
+    @pytest.mark.asyncio
+    async def test_start_creates_named_task(self, tmp_path: Path) -> None:
+        """When enabled, creates an asyncio.Task named 'watcher-supervisor'."""
+        h = _make_lifecycle_harness(tmp_path, enabled=True)
+        with patch.object(Harness, '_watcher_supervisor_loop', return_value=_never_return()):
+            h._start_watcher_supervisor()
+            task = h._watcher_supervisor_task
+            assert task is not None
+            assert isinstance(task, asyncio.Task)
+            assert task.get_name() == 'watcher-supervisor'
+            task.cancel()
+            with pytest.raises((asyncio.CancelledError, Exception)):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_start_idempotent(self, tmp_path: Path) -> None:
+        """A second call while the task is still alive does not replace it."""
+        h = _make_lifecycle_harness(tmp_path, enabled=True)
+        with patch.object(Harness, '_watcher_supervisor_loop', return_value=_never_return()):
+            h._start_watcher_supervisor()
+            first_task = h._watcher_supervisor_task
+            h._start_watcher_supervisor()
+            assert h._watcher_supervisor_task is first_task
+            first_task.cancel()
+            with pytest.raises((asyncio.CancelledError, Exception)):
+                await first_task
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_and_resets(self, tmp_path: Path) -> None:
+        """_stop_watcher_supervisor cancels the task and resets to None."""
+        h = _make_lifecycle_harness(tmp_path, enabled=True)
+        with patch.object(Harness, '_watcher_supervisor_loop', return_value=_never_return()):
+            h._start_watcher_supervisor()
+            assert h._watcher_supervisor_task is not None
+        await h._stop_watcher_supervisor()
+        assert h._watcher_supervisor_task is None
+
+    @pytest.mark.asyncio
+    async def test_stop_noop_when_none(self, tmp_path: Path) -> None:
+        """_stop_watcher_supervisor with no task is a no-op."""
+        h = _make_lifecycle_harness(tmp_path)
+        # Should not raise
+        await h._stop_watcher_supervisor()
