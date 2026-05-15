@@ -1200,3 +1200,114 @@ class TestHarnessMaybeWriteDigest:
         assert harness.scheduler.is_paused is False, (
             'Scheduler must not be paused when write_digest_entry raises (fail-open)'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessEwaTrip (step-21)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessEwaTrip:
+    """Tests for the EWA trip logic in Harness._maybe_write_digest (step-22 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ewa_trip_pauses_scheduler(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """EWA >= threshold triggers pause_scheduler with reason starting 'ewa_trip_'.
+
+        alpha=1.0, threshold=0.01, done=0, esc=1 → EWA = 1.0*(1/1) = 1.0 >= 0.01 → trip.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=0.01,   # very low — any escalation trips
+            digest_ewa_alpha=1.0,        # alpha=1 → EWA = raw ratio
+        )
+        harness.cost_store = await _cost_store_factory()
+        # 1 new escalation, 0 done → EWA = 1.0*(1/1) = 1.0 >= 0.01
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        assert harness.scheduler.is_paused is True, (
+            'Scheduler must be paused after EWA trip'
+        )
+        reason = harness.scheduler.pause_reason
+        assert re.match(r'^ewa_trip_\d+\.\d+$', reason), (
+            f'pause_reason must match ewa_trip_<float>; got {reason!r}'
+        )
+        # RunStore.save_scheduler_pause must have been called with the ewa_trip_ reason.
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        call_kwargs = mock_run_store.save_scheduler_pause.call_args
+        recorded_reason = call_kwargs.kwargs.get('reason') or call_kwargs.args[1]
+        assert recorded_reason.startswith('ewa_trip_'), (
+            f'RunStore reason must start with ewa_trip_; got {recorded_reason!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ewa_trip_already_paused_no_second_pause(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When scheduler is already paused, EWA trip does not issue a second pause.
+
+        RunStore.save_scheduler_pause call count must be 0 after the pre-existing pause
+        is cleared from the mock, proving _maybe_write_digest skips the trip.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=0.01,
+            digest_ewa_alpha=1.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+
+        # Pre-pause the scheduler.
+        await harness.pause_scheduler('pre-existing-pause')
+        mock_run_store.reset_mock()  # clear the prior save_scheduler_pause call
+
+        await harness._maybe_write_digest()
+
+        # No additional save_scheduler_pause must be called.
+        mock_run_store.save_scheduler_pause.assert_not_called()
+        # Original reason is preserved.
+        assert harness.scheduler.pause_reason == 'pre-existing-pause', (
+            f'pause_reason must be unchanged; got {harness.scheduler.pause_reason!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_below_ewa_threshold_no_pause(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When EWA < threshold, digest file is written but scheduler is NOT paused."""
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=1_000_000_000.0,  # absurdly high — never trips
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        # File must exist.
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md'))
+        assert len(files) == 1, f'Expected 1 digest file; got {files}'
+
+        # Scheduler must NOT be paused.
+        assert harness.scheduler.is_paused is False, (
+            'Scheduler must not be paused when EWA is below threshold'
+        )
+        mock_run_store.save_scheduler_pause.assert_not_called()
