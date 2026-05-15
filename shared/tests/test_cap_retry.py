@@ -7,6 +7,7 @@ Covers every branch in shared.cli_invoke.invoke_with_cap_retry (lines 136-274).
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
