@@ -574,9 +574,20 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
     (which stamps ``created_at``).  Without it, a legitimate same-cycle marker
     written fractionally before the persisted start time would be swept.
 
-    Naive parsed datetimes are assumed UTC (``replace(tzinfo=UTC)``).  Any type
-    mismatch or parse failure returns ``False`` (fail-open: falls back to the
-    existing pure run_id partition behaviour).
+    Naive datetimes are assumed UTC on **both** sides of the comparison:
+
+    * A naive parsed *created_at* is normalized via ``replace(tzinfo=UTC)``
+      (existing behaviour, documented convention).
+    * A naive *run_window_start* is also normalized via ``replace(tzinfo=UTC)``
+      (task-1383 hardening).  Without this, the comparison
+      ``parsed(tz-aware) >= run_window_start(naive) - _CLOCK_SKEW_GRACE`` raises
+      ``TypeError``, which the ``except`` clause silently swallows, causing the
+      guard to return ``False`` for *every* marker and disabling the run-window
+      guard for the entire cycle (the task-1369 regression).  Assuming UTC is
+      safe: the journal persists ``started_at`` via ``datetime.now(UTC)``.
+
+    Any type mismatch or parse failure returns ``False`` (fail-open: falls back
+    to the existing pure run_id partition behaviour).
 
     .. note::
         Only a lower-bound check is applied.  The absence of an upper bound is
@@ -588,6 +599,8 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
     """
     if not isinstance(run_window_start, datetime):
         return False
+    if run_window_start.tzinfo is None:
+        run_window_start = run_window_start.replace(tzinfo=UTC)
     if not created_at or not isinstance(created_at, str):
         return False
     try:
@@ -685,7 +698,9 @@ async def _query_stage2_flags(
 
     The *run_window_start* parameter is optional and defaults to ``None``
     (backward-compatible: window guard dormant, pure run_id partition applies).
-    When supplied it must be a tz-aware :class:`~datetime.datetime`.
+    When supplied a tz-aware :class:`~datetime.datetime` is preferred; a naive
+    value is defensively normalized to UTC by :func:`_marker_is_within_run_window`
+    (task-1383 hardening) so the guard remains active regardless.
 
     .. note::
         The partition check requires ``metadata.run_id`` to be **truthy**
@@ -1665,6 +1680,15 @@ class TaskKnowledgeSync(BaseStage):
             _run = await self.journal.get_run(self._current_run_id)
             _sa = getattr(_run, 'started_at', None)
             if isinstance(_sa, datetime):
+                if _sa.tzinfo is None:
+                    logger.warning(
+                        'reconciliation.assemble_payload: journal.get_run().started_at is a '
+                        'naive datetime (tzinfo=None) — journal contract requires a tz-aware '
+                        'UTC datetime; normalizing to UTC here and in _marker_is_within_run_window '
+                        'as defence-in-depth so the run-window sweep guard remains active',
+                        extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+                    )
+                    _sa = _sa.replace(tzinfo=UTC)
                 run_window_start = _sa
         except Exception:
             logger.warning(
