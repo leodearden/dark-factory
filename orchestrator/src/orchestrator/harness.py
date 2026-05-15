@@ -2751,6 +2751,7 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         consecutive_unclean: int = 0
         while True:
+            start = time.monotonic()
             try:
                 result = await self._run_watcher_rotation()
             except asyncio.CancelledError:
@@ -2761,6 +2762,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
                 # Treat as unclean: backoff below
                 result = None  # sentinel for unclean path
+            end = time.monotonic()  # captured after rotation; reused as 'now' below
 
             clean = (
                 result is not None
@@ -2792,6 +2794,13 @@ Output JSON matching the schema. Every task must appear in the output.
                 # pattern.  watcher_subprocess_restart_backoff_secs (default 30s)
                 # doubles as the clean-restart floor.
                 consecutive_unclean = 0
+                # Cost-runaway guard: track degenerate-clean exits (task 1388).
+                # A healthy rotation takes at least watcher_misconfigured_min_rotation_secs
+                # seconds; one that exits faster is degenerate (empty queue, SKILL.md
+                # drift, misconfigured env).
+                duration = end - start
+                if duration < self.config.watcher_misconfigured_min_rotation_secs:
+                    self._watcher_degenerate_clean_exits.append(end)
                 logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
                 await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
@@ -2801,7 +2810,7 @@ Output JSON matching the schema. Every task must appear in the output.
             # transiently raising) is logged and the loop degrades gracefully
             # rather than dying unobserved with the scheduler still running.
             try:
-                now = time.monotonic()
+                now = end  # reuse end timestamp (captured above); avoids extra monotonic call
                 self._watcher_unclean_exits.append(now)
                 consecutive_unclean += 1
 

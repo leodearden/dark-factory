@@ -738,11 +738,13 @@ class TestWatcherCrashloopTrip:
         # Monotonic clock advances to put first exits outside the window.
         # Sequence: 2 old exits (at t=0), then clock jumps past window, then
         # (max_restarts - 1) exits (insufficient alone to trip), then cancel.
+        # Each loop iteration makes 2 monotonic calls (start + end); sequences
+        # are [start1, end1, start2, end2, ...] pairs.
         old_time = _time_mod.monotonic()
         new_time = old_time + window + 1  # beyond the window
         time_sequence = iter(
-            [old_time, old_time]            # first 2 unclean exits: old
-            + [new_time] * (max_restarts)   # subsequent exits: recent
+            [old_time] * 4              # 2 old iterations × (start, end) each
+            + [new_time] * (max_restarts * 2)   # subsequent iterations × 2 calls
         )
 
         async def fake_rotation() -> AgentResult:
