@@ -13,6 +13,8 @@ See also:
 
 import pathlib
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "dark-factory-orchestrator.service"
 REIFY_SERVICE = REPO_ROOT / "scripts" / "reify-orchestrator.service"
@@ -213,4 +215,71 @@ def test_watchdog_service_structure() -> None:
     assert exec_line is not None, "ExecStart= line not found"
     assert exec_line == "ExecStart=/home/leo/src/dark-factory/scripts/orchestrator-watchdog.py", (
         f"ExecStart must be the bare absolute path to orchestrator-watchdog.py, got: {exec_line!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# StartLimit directives must live in [Unit], not [Service]
+# ---------------------------------------------------------------------------
+
+
+def _parse_sections(content: str) -> dict[str, list[str]]:
+    """Split unit-file text into {section_name: [lines]} (header line excluded)."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in content.splitlines():
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return sections
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    [
+        pytest.param(
+            REPO_ROOT / "scripts" / "dark-factory-orchestrator.service",
+            id="dark-factory-orchestrator",
+        ),
+        pytest.param(
+            REPO_ROOT / "scripts" / "reify-orchestrator.service",
+            id="reify-orchestrator",
+        ),
+    ],
+)
+def test_start_limit_directives_under_unit_section(
+    service_path: pathlib.Path,
+) -> None:
+    """StartLimitIntervalSec and StartLimitBurst must be in [Unit], NOT [Service].
+
+    Since systemd v230 these directives are only honoured under [Unit].
+    Under [Service] systemd 255 (the target host) treats them as unknown keys
+    and silently ignores them, which would disable the restart-rate cap and
+    allow an unbounded 10s restart loop — especially dangerous when combined
+    with the watchdog.
+    """
+    content = service_path.read_text(encoding="utf-8")
+    sections = _parse_sections(content)
+
+    unit_text = "\n".join(sections.get("Unit", []))
+    service_text = "\n".join(sections.get("Service", []))
+
+    # Must be present in [Unit]
+    assert "StartLimitIntervalSec=600" in unit_text, (
+        f"StartLimitIntervalSec=600 must be under [Unit] in {service_path.name}"
+    )
+    assert "StartLimitBurst=10" in unit_text, (
+        f"StartLimitBurst=10 must be under [Unit] in {service_path.name}"
+    )
+
+    # Must NOT appear in [Service] (where systemd 255 ignores them)
+    assert "StartLimitIntervalSec" not in service_text, (
+        f"StartLimitIntervalSec must NOT be under [Service] in {service_path.name} "
+        "(systemd >=230 only honours it under [Unit])"
+    )
+    assert "StartLimitBurst" not in service_text, (
+        f"StartLimitBurst must NOT be under [Service] in {service_path.name} "
+        "(systemd >=230 only honours it under [Unit])"
     )
