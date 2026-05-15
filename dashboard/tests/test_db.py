@@ -394,6 +394,19 @@ class TestDbPool:
             f'expected worker-thread shutdown (_running is False), '
             f'got {opened[0]._running!r}'
         )
+        # Defense-in-depth: confirm the worker thread itself terminated, not just
+        # that the state flags were flipped.  The thread exits after the STOP
+        # sentinel is processed — which happens asynchronously after close()
+        # returns — so join(timeout=2.0) is required before asserting is_alive().
+        # Guarded by hasattr so a future aiosqlite that renames _thread skips
+        # this block instead of raising AttributeError.
+        if hasattr(opened[0], '_thread'):
+            opened[0]._thread.join(timeout=2.0)
+            assert not opened[0]._thread.is_alive(), (
+                f'aiosqlite worker thread did not exit after close '
+                f'(mid-open connection was not properly closed by the '
+                f'post-connect _closed re-check)'
+            )
 
 
 class TestWithDb:
