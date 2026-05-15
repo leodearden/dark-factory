@@ -332,6 +332,37 @@ class TestModuleConfigDiscovery:
         assert list(configs.keys()) == ['sub']
         assert configs['sub'].test_command == 'pytest sub/'
 
+    def test_for_module_longest_prefix_match(self):
+        """for_module resolves nested configs by longest-matching prefix (deepest wins).
+
+        This is the regression test the reviewer requires: it retrieves a nested config
+        through for_module() (the workflow/scheduler consumption boundary), not just
+        through _discover_module_configs directly.
+        """
+        config = OrchestratorConfig()
+        config._module_configs = {
+            'foo': ModuleConfig(prefix='foo', test_command='pytest foo/'),
+            'foo/bar': ModuleConfig(prefix='foo/bar', test_command='pytest foo/bar/'),
+        }
+        # (a) Deeper path resolves to the deeper registered prefix
+        mc_deep = config.for_module('foo/bar/baz/app.py')
+        assert mc_deep is not None
+        assert mc_deep.prefix == 'foo/bar'
+        # (b) Exact prefix match — shape scheduler passes after normalize_lock(..., depth=2)
+        mc_exact = config.for_module('foo/bar')
+        assert mc_exact is not None
+        assert mc_exact.prefix == 'foo/bar'
+        # (c) Sibling falls back to the shallower ancestor prefix
+        mc_fallback = config.for_module('foo/qux/app.py')
+        assert mc_fallback is not None
+        assert mc_fallback.prefix == 'foo'
+        # (d) Exact top-level prefix match
+        mc_top = config.for_module('foo')
+        assert mc_top is not None
+        assert mc_top.prefix == 'foo'
+        # (e) Completely unrelated path returns None
+        assert config.for_module('unrelated/x.py') is None
+
 
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
