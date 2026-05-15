@@ -451,27 +451,27 @@ class TestRouteReviewSuggestionsIntegration:
 # DONE-branch call-site via real workflow
 # ---------------------------------------------------------------------------
 
+_A_SUGGESTION = {
+    'reviewer': 'analyst',
+    'severity': 'suggestion',
+    'location': 'src/a.py:1',
+    'category': 'coverage',
+    'description': 'Missing edge case',
+    'suggested_fix': 'Add a test',
+}
+
 
 class TestDoneBranchCallSiteViaWorkflow:
     """Tests the call site at workflow.py:2437-2440 by driving the real workflow.
 
-    Both tests invoke ``_execute_verify_review_loop`` end-to-end: fully-done
-    plan (``_execute_iterations`` short-circuits), stubbed
+    The parametrized test invokes ``_execute_verify_review_loop`` end-to-end:
+    fully-done plan (``_execute_iterations`` short-circuits), stubbed
     ``_verify_debugfix_loop`` returning DONE, stubbed ``_review`` returning a
     real ``ReviewAggregation``, and stubbed ``_suggestions_in_scope`` returning
     ``[]`` so the amendment branch is skipped.  Only the two DONE-branch
     routing methods are patched, so the real call site at lines 2437-2440 of
     workflow.py is exercised.
     """
-
-    _A_SUGGESTION = {
-        'reviewer': 'analyst',
-        'severity': 'suggestion',
-        'location': 'src/a.py:1',
-        'category': 'coverage',
-        'description': 'Missing edge case',
-        'suggested_fix': 'Add a test',
-    }
 
     def _make_e2e_workflow(self, tmp_path: Path):
         """Build a workflow with a real worktree and a fully-done plan."""
@@ -505,34 +505,37 @@ class TestDoneBranchCallSiteViaWorkflow:
         wf.artifacts.write_plan(plan)
         wf.artifacts.stamp_plan_provenance(wf.session_id)
 
-        async def _verify_pass():
-            return WorkflowOutcome.DONE
-        wf._verify_debugfix_loop = _verify_pass  # type: ignore[method-assign]
-
+        wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
         wf._suggestions_in_scope = lambda s: []  # type: ignore[method-assign]
 
         return wf
 
     @pytest.mark.asyncio
-    async def test_done_branch_routes_to_curator_via_real_workflow(self, tmp_path):
-        """Non-empty suggestions → real call site routes to _route_review_suggestions_to_curator.
+    @pytest.mark.parametrize('suggestions, route_n, write_n', [
+        ([_A_SUGGESTION], 1, 0),
+        ([], 0, 1),
+    ])
+    async def test_done_branch_routing_via_real_workflow(
+        self, tmp_path, suggestions, route_n, write_n
+    ):
+        """DONE-branch call site at workflow.py:2437-2440: curator vs memory routing.
 
-        ``_execute_verify_review_loop`` is driven end-to-end.  A regression at
-        the call site (swapped branches, dropped ``await``, inverted condition)
-        causes this test to fail.
+        With non-empty suggestions the real call site routes to
+        ``_route_review_suggestions_to_curator``; with an empty list it routes
+        to ``_write_suggestions_to_memory``.  ``_execute_verify_review_loop``
+        is driven end-to-end, so a regression (swapped branches, dropped
+        ``await``, inverted condition) causes this test to fail.
         """
         wf = self._make_e2e_workflow(tmp_path)
 
         reviews = ReviewAggregation(
             has_blocking_issues=False,
             blocking_issues=[],
-            suggestions=[self._A_SUGGESTION],
+            suggestions=suggestions,
             reviews={'analyst': {}},
         )
 
-        async def _review_fn():
-            return reviews
-        wf._review = _review_fn  # type: ignore[method-assign]
+        wf._review = AsyncMock(return_value=reviews)  # type: ignore[method-assign]
 
         route_mock = AsyncMock()
         write_mock = AsyncMock()
@@ -542,42 +545,12 @@ class TestDoneBranchCallSiteViaWorkflow:
         outcome = await wf._execute_verify_review_loop()
 
         assert outcome == WorkflowOutcome.DONE
-        assert route_mock.await_count == 1
-        route_mock.assert_awaited_once_with(reviews)
-        assert write_mock.await_count == 0
-
-    @pytest.mark.asyncio
-    async def test_done_branch_falls_back_to_memory_via_real_workflow(self, tmp_path):
-        """Empty suggestions → real call site routes to _write_suggestions_to_memory.
-
-        ``_execute_verify_review_loop`` is driven end-to-end.  A regression at
-        the call site (swapped branches, dropped ``await``, inverted condition)
-        causes this test to fail.
-        """
-        wf = self._make_e2e_workflow(tmp_path)
-
-        reviews = ReviewAggregation(
-            has_blocking_issues=False,
-            blocking_issues=[],
-            suggestions=[],  # empty → falls back to memory
-            reviews={'analyst': {}},
-        )
-
-        async def _review_fn():
-            return reviews
-        wf._review = _review_fn  # type: ignore[method-assign]
-
-        route_mock = AsyncMock()
-        write_mock = AsyncMock()
-        wf._route_review_suggestions_to_curator = route_mock  # type: ignore[method-assign]
-        wf._write_suggestions_to_memory = write_mock  # type: ignore[method-assign]
-
-        outcome = await wf._execute_verify_review_loop()
-
-        assert outcome == WorkflowOutcome.DONE
-        assert write_mock.await_count == 1
-        write_mock.assert_awaited_once_with(reviews)
-        assert route_mock.await_count == 0
+        if route_n:
+            route_mock.assert_awaited_once_with(reviews)
+            assert write_mock.await_count == 0
+        else:
+            write_mock.assert_awaited_once_with(reviews)
+            assert route_mock.await_count == 0
 
 
 # ---------------------------------------------------------------------------
