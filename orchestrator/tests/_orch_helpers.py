@@ -16,6 +16,13 @@ from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountState, UsageGate
 
+# Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
+# to avoid re-computing BaseModel reflection on every call.
+_BASEMODEL_PROPS: frozenset[str] = frozenset(
+    name for name, v in inspect.getmembers(BaseModel) if isinstance(v, property)
+)
+_BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
+
 
 def pydantic_spec(model: type[BaseModel]) -> type:
     """Return a proxy class exposing ``model``'s fields for ``MagicMock(spec_set=...)``.
@@ -50,7 +57,8 @@ def pydantic_spec(model: type[BaseModel]) -> type:
 
     BaseModel API (``model_dump``, ``model_validate``, ``model_construct``,
     ``model_copy``, ``model_json_schema``, ``model_post_init``, …) remains
-    explicitly excluded via a ``set(dir(BaseModel))`` filter applied to the
+    explicitly excluded via the module-level ``_BASEMODEL_ATTRS`` frozenset
+    (``frozenset(dir(BaseModel))``, computed once at import) applied to the
     method walk.  This preserves the invariant established by task 1064: writing
     ``mock.model_dump = ...`` must still raise ``AttributeError``.
     """
@@ -59,13 +67,10 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     # OrchestratorConfig.overrides_db_path) — exclude properties inherited
     # from BaseModel (model_extra, model_fields_set, __fields_set__) so the
     # existing "BaseModel API is not exposed" invariant is preserved.
-    _basemodel_props = {
-        name
-        for name, value in inspect.getmembers(BaseModel)
-        if isinstance(value, property)
-    }
+    # _BASEMODEL_PROPS is computed once at module scope (constant for the process
+    # lifetime); see the module-level constant above.
     for name, _ in inspect.getmembers(model, lambda v: isinstance(v, property)):
-        if name in _basemodel_props:
+        if name in _BASEMODEL_PROPS:
             continue
         members[name] = None
     # User-defined regular methods — exclude dunders, BaseModel API surface, and
@@ -75,11 +80,12 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     # between BaseModel and the target model) are also included.  This is
     # intentional: spec_set should permit access to any non-BaseModel callable
     # the real object exposes, including helpers inherited from mixins.
-    _basemodel_attrs = set(dir(BaseModel))
+    # _BASEMODEL_ATTRS is computed once at module scope (constant for the process
+    # lifetime); see the module-level constant above.
     for name, _ in inspect.getmembers(model, callable):
         if name.startswith('_'):
             continue
-        if name in _basemodel_attrs:
+        if name in _BASEMODEL_ATTRS:
             continue
         if isinstance(getattr(model, name, None), property):
             # Belt-and-braces: plain properties fail callable() and are already
