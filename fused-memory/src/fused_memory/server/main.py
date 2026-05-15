@@ -613,16 +613,13 @@ async def run_server():
     mcp.settings.json_response = config.server.json_response
 
     # Thread monitor — log count every 60s, warn if growing unexpectedly
+    _warn_threshold = config.server.thread_warn_threshold
+
     async def _thread_monitor():
         prev = 0
         while True:
             await asyncio.sleep(60)
-            count = threading.active_count()
-            delta = count - prev
-            if delta != 0 or count > 30:
-                level = logging.WARNING if count > 30 else logging.INFO
-                logger.log(level, f'thread_monitor: threads={count} delta={delta:+d}')
-            prev = count
+            prev = _thread_monitor_iteration(prev, _warn_threshold)
 
     asyncio.create_task(_thread_monitor())
 
@@ -813,6 +810,79 @@ def _collect_checkpoint_targets(
     if pe is not None and hasattr(pe, 'checkpoint'):
         targets.append(('planned_episode_registry', pe.checkpoint))
     return targets
+
+
+def _snapshot_threads() -> dict[str, int]:
+    """Return a categorised count of live threads plus a ``_total`` key.
+
+    Buckets:
+      - ``main``        — the MainThread
+      - ``asyncio_pool`` — asyncio loop-internal workers (names start with
+                           ``asyncio_``; CPython names these ``asyncio_N``)
+      - ``executor``    — :class:`concurrent.futures.ThreadPoolExecutor` workers
+                           (names start with ``ThreadPoolExecutor``; includes
+                           asyncio's default executor on Python ≥ 3.9)
+      - ``aiosqlite``   — aiosqlite connection worker threads (name starts with
+                           ``aiosqlite``)
+      - ``timer``       — :class:`threading.Timer` instances (short-lived)
+      - ``other``       — everything else
+
+    ``_total`` equals ``len(threading.enumerate())`` at snapshot time.
+    """
+    threads = threading.enumerate()
+    buckets: dict[str, int] = {
+        'main': 0,
+        'asyncio_pool': 0,
+        'executor': 0,
+        'aiosqlite': 0,
+        'timer': 0,
+        'other': 0,
+    }
+    for t in threads:
+        name = t.name or ''
+        if name == 'MainThread':
+            buckets['main'] += 1
+        elif name.startswith('asyncio_'):
+            buckets['asyncio_pool'] += 1
+        elif name.startswith('ThreadPoolExecutor'):
+            buckets['executor'] += 1
+        elif name.startswith('aiosqlite'):
+            buckets['aiosqlite'] += 1
+        elif isinstance(t, threading.Timer):
+            buckets['timer'] += 1
+        else:
+            buckets['other'] += 1
+    buckets['_total'] = len(threads)
+    return buckets
+
+
+def _thread_monitor_iteration(prev: int, threshold: int) -> int:
+    """Single iteration of the thread-monitor loop.
+
+    Reads ``threading.active_count()``, decides log level, and emits log
+    records. Returns the new *prev* value for the next iteration.
+
+    When above *threshold*, :func:`_snapshot_threads` is called *before*
+    logging so the ``threads=N`` WARNING line and the ``breakdown=`` line
+    are guaranteed to derive from the same :func:`threading.enumerate` call.
+
+    Extracted from the inline ``_thread_monitor`` async closure so unit tests
+    can exercise the logging logic without mocking ``asyncio.sleep``.
+    """
+    count = threading.active_count()
+    snapshot: dict[str, int] | None = None
+    if count > threshold:
+        # Snapshot first so the WARNING and breakdown lines are consistent.
+        snapshot = _snapshot_threads()
+        count = snapshot['_total']
+    delta = count - prev
+    if delta != 0 or count > threshold:
+        level = logging.WARNING if count > threshold else logging.INFO
+        logger.log(level, 'thread_monitor: threads=%d delta=%+d', count, delta)
+        if count > threshold and snapshot is not None:
+            breakdown = ' '.join(f'{k}={v}' for k, v in sorted(snapshot.items()))
+            logger.log(level, 'thread_monitor: breakdown %s', breakdown)
+    return count
 
 
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:

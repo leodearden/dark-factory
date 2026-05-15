@@ -84,6 +84,13 @@ class ServerConfig(BaseModel):
     stateless_http: bool = Field(default=True, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
     keepalive_timeout: int = Field(default=30, description='HTTP keep-alive timeout in seconds')
+    thread_warn_threshold: int = Field(
+        default=60,
+        description=(
+            'Threshold above which thread_monitor emits a WARNING (with snapshot breakdown). '
+            'Above the observed ~40-thread normal but low enough to flag a real leak quickly.'
+        ),
+    )
 
 
 # --- LLM ---
