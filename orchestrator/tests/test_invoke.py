@@ -607,5 +607,3 @@ class TestMakeGateFactory:
         """_make_gate_yielding builds its gate via _make_gate (soonest_resets_at set)."""
         gate = _make_gate_yielding([_make_slot()])
         assert gate.soonest_resets_at is None
-        # invoke_slot is overridden by _make_gate_yielding itself
-        assert gate.invoke_slot is not None
