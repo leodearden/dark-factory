@@ -2070,27 +2070,26 @@ Output JSON matching the schema. Every task must appear in the output.
         paused (from any source), returns immediately to avoid redundant
         RunStore writes and duplicate log spam.
 
-        Both totals are fetched in a single query using conditional aggregation
-        (``SUM(CASE WHEN role LIKE '%watcher%' THEN cost_usd END)``) so the
-        invocations table is scanned at most once per tick.  On any DB error the
+        Delegates to ``CostStore.aggregate_window`` so the role-LIKE-watcher
+        aggregation pattern lives in exactly one place.  On any DB error the
         method returns immediately without pausing (fail-open: a transient
         query failure must never stop dispatch).  Task 1323.
         """
         if self.scheduler.is_paused:
             return
-        row = await self._trailing_24h_fetch_one(
-            'SELECT '
-            '  COALESCE(SUM(cost_usd), 0.0), '
-            '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
-            'FROM invocations '
-            'WHERE completed_at >= ?',
-            ('%watcher%',),
-            label='_enforce_cost_ceilings',
-        )
-        if row is None:
+        if self.cost_store is None:
             return
-        total = float(row[0]) if row[0] is not None else 0.0
-        watcher = float(row[1]) if row[1] is not None else 0.0
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        cutoff_24h_iso = (now - timedelta(hours=24)).isoformat()
+        try:
+            total, watcher = await self.cost_store.aggregate_window(cutoff_24h_iso, now_iso)
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '_enforce_cost_ceilings: trailing-24h cost query failed (%s) — fail-open',
+                exc,
+            )
+            return
 
         if watcher >= self.config.watcher_daily_cost_ceiling_usd:
             logger.warning(
