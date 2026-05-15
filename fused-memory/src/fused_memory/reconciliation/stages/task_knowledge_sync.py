@@ -1678,6 +1678,14 @@ class TaskKnowledgeSync(BaseStage):
             _run = await self.journal.get_run(self._current_run_id)
             _sa = getattr(_run, 'started_at', None)
             if isinstance(_sa, datetime):
+                if _sa.tzinfo is None:
+                    logger.warning(
+                        'reconciliation.assemble_payload: journal.get_run().started_at is a '
+                        'naive datetime (tzinfo=None) — journal contract requires a tz-aware '
+                        'UTC datetime; run-window sweep guard remains active via defensive '
+                        'UTC normalization in _marker_is_within_run_window',
+                        extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+                    )
                 run_window_start = _sa
         except Exception:
             logger.warning(
