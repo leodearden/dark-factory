@@ -153,6 +153,10 @@ async def test_submit_and_resolve_raises_when_no_result_json(row_value):
 # a future missing or renamed name surfaces as a localized test failure
 # rather than a collection error that breaks unrelated tests.
 
+# Invalid 'kind' values shared by the two ValueError parametrize tests below.
+# Keep in one place so the contract stays in sync if spelling/cases change.
+_INVALID_KINDS = ['actve', '', 'Active', 'provenence']
+
 
 class TestMake8df8Scenario:
     """Unit tests for the shared make_8df8_scenario() builder."""
@@ -355,7 +359,7 @@ class TestParseRenderedIdTitlePairs:
         found = parse_rendered_id_title_pairs('No tasks here.', kind='provenance')
         assert found == {}
 
-    @pytest.mark.parametrize('bad_kind', ['actve', '', 'Active', 'provenence'])
+    @pytest.mark.parametrize('bad_kind', _INVALID_KINDS)
     def test_parse_raises_value_error_for_invalid_kind(self, bad_kind):
         """parse_rendered_id_title_pairs raises ValueError for any kind that is not
         'active' or 'provenance', and the error message includes repr(bad_kind)."""
@@ -369,14 +373,14 @@ class TestParseRenderedIdTitlePairs:
         )
 
     def test_parse_valid_kinds_do_not_raise(self):
-        """parse_rendered_id_title_pairs does NOT raise for the two valid kinds."""
+        """parse_rendered_id_title_pairs does NOT raise for the two valid kinds,
+        and returns {} for input with no matching lines (empty-input contract)."""
         from _fm_helpers import parse_rendered_id_title_pairs
 
-        # Should complete without raising
-        parse_rendered_id_title_pairs('No tasks.', kind='active')
-        parse_rendered_id_title_pairs('No tasks.', kind='provenance')
+        assert parse_rendered_id_title_pairs('No tasks.', kind='active') == {}
+        assert parse_rendered_id_title_pairs('No tasks.', kind='provenance') == {}
 
-    @pytest.mark.parametrize('bad_kind', ['actve', '', 'Active', 'provenence'])
+    @pytest.mark.parametrize('bad_kind', _INVALID_KINDS)
     def test_assert_id_title_pairing_raises_value_error_transitively(self, bad_kind):
         """assert_id_title_pairing fires ValueError transitively for invalid kind
         (it delegates to parse_rendered_id_title_pairs, so the guard covers both)."""
