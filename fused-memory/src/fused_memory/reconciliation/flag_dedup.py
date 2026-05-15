@@ -535,8 +535,12 @@ async def dedup_flags(
             # marker is findable via a read-back search.  The WARNING is driven
             # off the confirmed canonical id (None = unfindable), not off the
             # unverified add_memory response.memory_ids.
+            #
+            # Circuit-breaker (task-1412): shares the same counter / disabled flag
+            # as the HIT branch.  When disabled, skip confirm_marker_persisted and
+            # drive the "will not be detected next cycle" WARNING off bool(response.memory_ids).
             try:
-                await memory_service.add_memory(
+                miss_response = await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -550,20 +554,43 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                confirmed_id = await confirm_marker_persisted(
-                    memory_service,
-                    project_id=project_id,
-                    task_id=tid,
-                    flag_type=ftype,
-                    run_id=run_id,
-                    log=logger,
-                )
-                if confirmed_id is None:
-                    logger.warning(
-                        'flag_dedup: MISS marker for task %s flag_type %s could not be'
-                        ' confirmed findable — recurring flag will not be detected next cycle',
-                        tid, ftype,
+                if not confirmation_disabled:
+                    confirmed_id = await confirm_marker_persisted(
+                        memory_service,
+                        project_id=project_id,
+                        task_id=tid,
+                        flag_type=ftype,
+                        run_id=run_id,
+                        log=logger,
                     )
+                    if confirmed_id is None:
+                        logger.warning(
+                            'flag_dedup: MISS marker for task %s flag_type %s could not be'
+                            ' confirmed findable — recurring flag will not be detected next cycle',
+                            tid, ftype,
+                        )
+                        consecutive_confirmation_misses += 1
+                        if (
+                            consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD
+                            and not confirmation_disabled
+                        ):
+                            logger.warning(
+                                'flag_dedup: confirmation circuit-breaker tripped after %d'
+                                ' consecutive misses; falling back to memory_ids gate for'
+                                ' remainder of batch',
+                                consecutive_confirmation_misses,
+                            )
+                            confirmation_disabled = True
+                    else:
+                        consecutive_confirmation_misses = 0
+                else:
+                    # Breaker tripped: drive WARNING off bool(response.memory_ids).
+                    if not bool(miss_response.memory_ids):
+                        logger.warning(
+                            'flag_dedup: MISS marker for task %s flag_type %s could not be'
+                            ' confirmed findable — recurring flag will not be detected next cycle',
+                            tid, ftype,
+                        )
             except Exception as e:
                 logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
         result.append(flag)
