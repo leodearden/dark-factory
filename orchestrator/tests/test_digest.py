@@ -365,3 +365,149 @@ class TestCostInWindow:
         # 24h figures are anchored to now, not the digest window
         assert stats.watcher_cost_24h == pytest.approx(3.0)
         assert stats.total_cost_24h == pytest.approx(4.5)
+
+
+# ---------------------------------------------------------------------------
+# TestRenderDigestMarkdown (step-11)
+# ---------------------------------------------------------------------------
+
+
+def _make_digest_inputs(*, tripped: bool = False) -> digest.DigestInputs:
+    """Build a concrete DigestInputs for render tests."""
+    esc_stats = digest.EscalationStats(
+        category_level_status_counts={
+            ('infra_issue', 0, 'resolved'): 3,
+            ('scope_violation', 1, 'pending'): 2,
+            ('risk_identified', 0, 'dismissed'): 1,
+        },
+        first_ts='2026-05-10T08:00:00+00:00',
+        last_ts='2026-05-10T20:00:00+00:00',
+        dedupe_children_total=4,
+        pending_total=2,
+    )
+    cost_stats = digest.CostStats(
+        watcher_cost_in_window=5.25,
+        total_cost_in_window=12.50,
+        watcher_cost_24h=8.00,
+        total_cost_24h=20.00,
+    )
+    return digest.DigestInputs(
+        window_start_iso='2026-05-10T00:00:00+00:00',
+        window_end_iso='2026-05-10T23:59:59+00:00',
+        escalation_stats=esc_stats,
+        done_count=5,
+        cost_stats=cost_stats,
+        parked_live=3,
+        parked_window_churn=7,
+        ewa_value=2.5,
+        ewa_threshold=3.0,
+        tripped=tripped,
+        anomaly_flags={
+            'cost_spike': True,
+            'park_spike': False,
+            'ewa_above_threshold': tripped,
+            'infra_dedupe_active': True,
+        },
+        watcher_clusters=['infra × scope cross-pattern (3 events)', 'repeated timeout cluster'],
+        dry_run_proposals=['unblock task-42: bump timeout', 'retry task-99 after requeue'],
+    )
+
+
+class TestRenderDigestMarkdown:
+    """Tests for digest.render_digest_markdown(inputs) -> str."""
+
+    def test_header_and_window_section(self) -> None:
+        """Rendered markdown contains # Digest header and ## Window section."""
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        assert '# Digest' in md
+        assert '## Window' in md
+        assert '2026-05-10T00:00:00+00:00' in md
+        assert '2026-05-10T23:59:59+00:00' in md
+
+    def test_escalation_outcomes_table(self) -> None:
+        """Escalation outcomes section with category × level rows."""
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        assert '## Escalation outcomes' in md
+        assert 'infra_issue' in md
+        assert 'scope_violation' in md
+        assert 'risk_identified' in md
+        # Status labels appear
+        assert 'resolved' in md
+        assert 'pending' in md
+        assert 'dismissed' in md
+
+    def test_tasks_done_section(self) -> None:
+        """Tasks done in window count is rendered."""
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        assert '## Tasks done in window' in md
+        assert '5' in md  # done_count
+
+    def test_cost_section(self) -> None:
+        """Cost section includes watcher and total figures for window and 24h."""
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        assert '## Cost' in md
+        assert '$5.25' in md   # watcher_cost_in_window
+        assert '$12.50' in md  # total_cost_in_window
+        assert '$8.00' in md   # watcher_cost_24h
+        assert '$20.00' in md  # total_cost_24h
+
+    def test_parked_tasks_section(self) -> None:
+        """Parked tasks section shows live count and window churn."""
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        assert '## Parked tasks' in md
+        assert '3' in md  # parked_live
+        assert '7' in md  # parked_window_churn
+
+    def test_ewa_section_not_tripped(self) -> None:
+        """EWA line shows value/threshold; no TRIPPED marker when not tripped."""
+        md = digest.render_digest_markdown(_make_digest_inputs(tripped=False))
+        assert '## EWA' in md
+        assert '2.5' in md   # ewa_value
+        assert '3.0' in md   # ewa_threshold
+        assert 'TRIPPED' not in md
+
+    def test_ewa_section_tripped(self) -> None:
+        """TRIPPED marker appears in EWA section when tripped=True."""
+        md = digest.render_digest_markdown(_make_digest_inputs(tripped=True))
+        assert '## EWA' in md
+        assert 'TRIPPED' in md
+
+    def test_anomalies_section_only_true_flags(self) -> None:
+        """Anomalies section lists only flags set to True; False flags omitted."""
+        md = digest.render_digest_markdown(_make_digest_inputs(tripped=True))
+        assert '## Anomalies' in md
+        assert 'cost_spike' in md
+        assert 'ewa_above_threshold' in md
+        assert 'infra_dedupe_active' in md
+        # park_spike is False — must NOT appear
+        assert 'park_spike' not in md
+
+    def test_watcher_clusters_section(self) -> None:
+        """Cross-escalation patterns section lists clusters."""
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        assert '## Cross-escalation patterns' in md
+        assert 'infra × scope cross-pattern' in md
+        assert 'repeated timeout cluster' in md
+
+    def test_watcher_clusters_empty(self) -> None:
+        """When no clusters, renders 'none detected'."""
+        inputs = _make_digest_inputs()
+        inputs.watcher_clusters = []
+        md = digest.render_digest_markdown(inputs)
+        assert '## Cross-escalation patterns' in md
+        assert 'none detected' in md
+
+    def test_dry_run_proposals_section(self) -> None:
+        """Dry-run proposals section shows count and first-line summaries."""
+        md = digest.render_digest_markdown(_make_digest_inputs())
+        assert '## Dry-run proposals' in md
+        assert 'unblock task-42' in md
+        assert 'retry task-99' in md
+
+    def test_dry_run_proposals_empty(self) -> None:
+        """When no dry-run proposals, renders 'none queued'."""
+        inputs = _make_digest_inputs()
+        inputs.dry_run_proposals = []
+        md = digest.render_digest_markdown(inputs)
+        assert '## Dry-run proposals' in md
+        assert 'none queued' in md
