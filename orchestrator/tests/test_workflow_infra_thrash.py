@@ -56,9 +56,11 @@ def _make(
     *,
     task_id: str = '99',
     metadata: dict | None = None,
+    backend_metadata: dict | None = None,
     iteration_log: list[dict] | None = None,
     resolved_l0s: list[Escalation] | None = None,
     update_task_raises: bool = False,
+    get_task_raises: bool = False,
     max_consecutive_infra_resumes: int = 3,
     no_queue: bool = False,
 ) -> _Fixture:
@@ -83,10 +85,17 @@ def _make(
     else:
         update_task = AsyncMock(return_value=True)
 
+    # backend_metadata: what get_task returns (defaults to metadata if not set).
+    _backend_md = backend_metadata if backend_metadata is not None else (metadata or {})
+
     scheduler = MagicMock()
     scheduler.update_task = update_task
     scheduler.set_task_status = AsyncMock()
     scheduler.get_status = AsyncMock(return_value='in-progress')
+    if get_task_raises:
+        scheduler.get_task = AsyncMock(side_effect=RuntimeError('mcp down'))
+    else:
+        scheduler.get_task = AsyncMock(return_value={'id': task_id, 'metadata': _backend_md})
 
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value='SHA-A')
@@ -342,3 +351,86 @@ async def test_metadata_round_trips_via_scheduler_update():
     assert isinstance(md['last_infra_resume_iteration_count'], int)
     assert md['consecutive_infra_resume_failures'] == 1
     assert md['last_infra_resume_iteration_count'] == 3
+
+
+@pytest.mark.asyncio
+async def test_persists_memory_hints_from_fresh_backend_metadata():
+    """memory_hints added by Stage-2 reconciliation after load survive the write.
+
+    The in-memory copy (self.task['metadata']) does NOT have memory_hints;
+    the backend's current metadata (scheduler.get_task) DOES.  After
+    _check_infra_resume_thrash the persisted dict must contain BOTH the
+    incremented counter AND memory_hints from the fresh backend read.
+    """
+    in_memory_md = {
+        'consecutive_infra_resume_failures': 1,
+        'last_infra_resume_iteration_count': 5,
+    }
+    backend_md = {
+        'consecutive_infra_resume_failures': 1,
+        'last_infra_resume_iteration_count': 5,
+        'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+    }
+    f = _make(
+        metadata=in_memory_md,
+        backend_metadata=backend_md,
+        iteration_log=[{'iteration': i} for i in range(5)],  # unchanged → infra_issue increments
+        resolved_l0s=[_esc(category='infra_issue')],
+    )
+
+    outcome = await f.wf._check_infra_resume_thrash()
+
+    # Below threshold (2 < 3) → fall through.
+    assert outcome is None
+    md = _persisted_metadata(f.update_task)
+    assert md['consecutive_infra_resume_failures'] == 2, (
+        f'Counter must have incremented to 2; got {md}'
+    )
+    assert md.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
+        f'memory_hints from backend read must survive the write; got {md}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_task_failure_falls_back_to_in_memory_metadata_and_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """If scheduler.get_task raises, fall back to in-memory metadata.
+
+    The counter must still advance (no exception escapes), and a WARNING must
+    be emitted mentioning the failure so operators can see the degraded path.
+    """
+    import logging
+
+    f = _make(
+        metadata={
+            'consecutive_infra_resume_failures': 0,
+            'last_infra_resume_iteration_count': 0,
+            'memory_hints': {'entities': ['E1']},
+        },
+        get_task_raises=True,
+        iteration_log=[{'iteration': 1}],
+        resolved_l0s=[_esc(category='infra_issue')],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = await f.wf._check_infra_resume_thrash()
+
+    # Must not raise; must fall through (1 < 3 threshold).
+    assert outcome is None
+    # update_task must still be called once — persistence happens on the fallback path.
+    f.update_task.assert_awaited_once()
+    md = _persisted_metadata(f.update_task)
+    assert md['consecutive_infra_resume_failures'] == 1, (
+        f'Counter must advance on fallback path; got {md}'
+    )
+    # In-memory memory_hints survive because we fell back to the in-memory copy.
+    assert md.get('memory_hints') == {'entities': ['E1']}, (
+        f'In-memory memory_hints must survive on fallback path; got {md}'
+    )
+    # A WARNING with the specific refresh-failure message must be logged.
+    warning_texts = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'failed to refresh metadata before infra-resume thrash' in t
+        for t in warning_texts
+    ), (
+        f'Expected warning about get_task refresh failure; got: {warning_texts}'
+    )
