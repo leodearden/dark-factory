@@ -483,8 +483,7 @@ class TestRenderDigestMarkdown:
         """EWA line shows value/threshold; no TRIPPED marker when not tripped."""
         md = digest.render_digest_markdown(_make_digest_inputs(tripped=False))
         assert '## EWA' in md
-        assert '2.5' in md   # ewa_value
-        assert '3.0' in md   # ewa_threshold
+        assert '- Value / threshold: 2.5000 / 3.0000\n' in md  # ewa_value / ewa_threshold rendered with :.4f, no TRIPPED on this path
         assert 'TRIPPED' not in md
 
     def test_ewa_section_tripped(self) -> None:
