@@ -623,11 +623,20 @@ class Stage2FlagPartition(NamedTuple):
             current ``run_id`` AND whose ``created_at`` is out of the run
             window.  These are normal prior-cycle residue.  Caller sweeps these
             via :func:`_sweep_stale_fixc_markers`.
+        rescued_ids: ``id`` strings for markers rescued by the run-window guard
+            (a subset of ``current``).  Non-empty indicates Stage 1 producer
+            drift within the CURRENT cycle — the LLM omitted or mis-stamped
+            ``metadata.run_id`` on a flag it wrote during this run, but the
+            marker was still surfaced to Stage 2 (not swept).  Populated
+            exclusively by the two rescue branches inside
+            :func:`_query_stage2_flags`; this is the single source of truth for
+            the rescued count (task-1381).
     """
 
     current: list[dict]
     stale_missing_run_id_ids: list[str]
     stale_mismatched_run_id_ids: list[str]
+    rescued_ids: list[str]
 
     @property
     def stale_all_ids(self) -> list[str]:
@@ -692,7 +701,7 @@ async def _query_stage2_flags(
         carries the top-N risk — see follow-up task for a proper
         ``scroll_by_metadata`` API on Mem0Backend.
 
-    Returns ``([], [], [])`` on search failure (best-effort; logs WARNING).
+    Returns ``([], [], [], [])`` on search failure (best-effort; logs WARNING).
     """
     try:
         results = await memory_service.search(
@@ -707,7 +716,7 @@ async def _query_stage2_flags(
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return Stage2FlagPartition([], [], [])
+        return Stage2FlagPartition([], [], [], [])
 
     if len(results) == 100:
         logger.warning(
@@ -721,6 +730,7 @@ async def _query_stage2_flags(
     current_flags: list[dict] = []
     stale_missing_run_id_ids: list[str] = []
     stale_mismatched_run_id_ids: list[str] = []
+    rescued_ids: list[str] = []
     run_id_str = str(current_run_id)
     for r in results:
         meta = dict(r.metadata or {})
@@ -752,6 +762,7 @@ async def _query_stage2_flags(
                     extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
                 )
                 current_flags.append(flag_dict)
+                rescued_ids.append(r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
@@ -789,6 +800,7 @@ async def _query_stage2_flags(
                     extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
                 )
                 current_flags.append(flag_dict)
+                rescued_ids.append(r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
@@ -813,7 +825,7 @@ async def _query_stage2_flags(
                 'current_run_id': run_id_str,
             },
         )
-    return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids)
+    return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids, rescued_ids)
 
 
 def _compute_stale_flags(
