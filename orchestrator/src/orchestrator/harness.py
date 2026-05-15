@@ -2027,44 +2027,6 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return 0.0
 
-    async def _trailing_24h_cost_usd(self, *, watcher_only: bool) -> float:
-        """Sum cost_usd from the invocations table for the trailing 24 hours.
-
-        When ``watcher_only=True``, restricts to rows whose role matches
-        ``LIKE '%watcher%'`` (e.g. 'escalation-watcher-auto').  When
-        ``watcher_only=False``, sums all roles.
-
-        Mirrors ``_auto_eval_budget_used_24h`` in structure: guards on
-        ``cost_store is None``, and swallows query exceptions so a transient
-        DB error never blocks dispatch.  Task 1323.
-        """
-        if self.cost_store is None:
-            return 0.0
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        try:
-            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
-            if watcher_only:
-                cur = await conn.execute(
-                    'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-                    'WHERE completed_at >= ? AND role LIKE ?',
-                    (cutoff, '%watcher%'),
-                )
-            else:
-                cur = await conn.execute(
-                    'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-                    'WHERE completed_at >= ?',
-                    (cutoff,),
-                )
-            row = await cur.fetchone()
-            await cur.close()
-            return float(row[0]) if row and row[0] is not None else 0.0
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
-            logger.warning(
-                '_trailing_24h_cost_usd(watcher_only=%s): query failed (%s) — assume zero',
-                watcher_only, exc,
-            )
-            return 0.0
-
     async def _enforce_cost_ceilings(self) -> None:
         """Check daily cost ceilings and pause the scheduler on breach.
 
