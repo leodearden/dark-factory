@@ -1786,6 +1786,7 @@ class TestPreTriageUsageGateCleanup:
             if cap_effects is not None
             else MagicMock(return_value=False)
         )
+        gate.soonest_resets_at = None
         return _attach_invoke_slot(gate)
 
     async def test_confirm_account_ok_called_on_success(self, steward: TaskSteward):
