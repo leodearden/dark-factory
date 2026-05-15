@@ -1424,3 +1424,80 @@ class TestSweepCancelledDescendants:
         assert esc.level == 1
         assert esc.severity == 'blocking'
         assert esc.category == 'scope_violation'
+
+
+# ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
+#
+# Cycle 8df8bdcd: tasks 1355/1361/1369 appeared in Stage 1 output each
+# carrying the NEXT task's title in the sorted completion sequence.
+# Investigation (task 1379, supersedes dc68f7b9) concluded every deterministic
+# data-layer path reads id+title from the SAME task dict — the symptom is an
+# LLM list-transcription error in Stage 1's free-form report, NOT a data bug.
+# These tests lock the data-layer write-content contract so any future
+# reintroduction of positional title resolution is caught immediately.
+
+
+# Fixture constants mirroring the 8df8bdcd scenario:
+#   - non-consecutive ids (1355, 1361, 1369)
+#   - distinct titles
+#   - completion order (1369, 1355, 1361) differs from id-sort order
+_8DF8_TASKS: list[dict] = [
+    {'id': '1369', 'title': 'Refactor event dispatch to async', 'status': 'in-progress'},
+    {'id': '1355', 'title': 'Implement rate limiter middleware', 'status': 'in-progress'},
+    {'id': '1361', 'title': 'Add retry logic for database connections', 'status': 'in-progress'},
+]
+_8DF8_TITLE_BY_ID: dict[str, str] = {t['id']: t['title'] for t in _8DF8_TASKS}
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_writes_own_title_in_multicompletion_window(
+    reconciler, mock_memory_service
+):
+    """Targeted-recon write path: each completion memory carries its OWN title.
+
+    Reproduces cycle 8df8bdcd at the write-path layer: three tasks complete in
+    completion order 1369→1355→1361 (non-consecutive ids, distinct titles).
+    Each resulting add_memory call must embed 'Task '<own title>' completed.'
+    and have metadata.task_id == that task's id — no neighbor-title bleed.
+
+    This pins the write-content contract.  Expected GREEN per the pipeline
+    audit: _on_task_done reads title from the passed task_before dict (same
+    dict as metadata.task_id), so no positional/commit-order aliasing exists.
+    """
+    for task in _8DF8_TASKS:
+        mock_memory_service.add_memory.reset_mock()
+        await reconciler.reconcile_task(
+            task_id=task['id'],
+            transition='done',
+            project_id='test-project',
+            project_root='/tmp/test',
+            task_before=task,
+        )
+        calls = mock_memory_service.add_memory.call_args_list
+        assert len(calls) >= 1, f'No add_memory calls for task {task["id"]}'
+
+        # The first (fast-path) call embeds "Task '<title>' completed."
+        first_call = calls[0]
+        content = first_call.kwargs.get('content', '') or (
+            first_call.args[0] if first_call.args else ''
+        )
+        own_title = _8DF8_TITLE_BY_ID[task['id']]
+        assert own_title in content, (
+            f"Task {task['id']}: fast-path write contains wrong title.\n"
+            f"  Expected own title: {own_title!r}\n"
+            f"  Actual content:     {content!r}"
+        )
+
+        # metadata.task_id must match
+        metadata = first_call.kwargs.get('metadata', {}) or {}
+        assert metadata.get('task_id') == task['id'], (
+            f"Task {task['id']}: metadata.task_id mismatch: {metadata}"
+        )
+
+        # No other task's title should appear in this memory's content
+        for other_id, other_title in _8DF8_TITLE_BY_ID.items():
+            if other_id != task['id']:
+                assert other_title not in content, (
+                    f"Task {task['id']}: content contains neighbor title {other_title!r}.\n"
+                    f"  content: {content!r}"
+                )
