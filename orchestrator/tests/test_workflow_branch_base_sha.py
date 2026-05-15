@@ -36,7 +36,9 @@ def _make_workflow(
     assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
     assignment.modules = ['mod_a']
 
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    _spec = pydantic_spec(OrchestratorConfig)
+    _spec.for_module = None  # custom method not in model_fields; expose to spec_set
+    config = MagicMock(spec_set=_spec)
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
