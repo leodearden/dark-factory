@@ -81,11 +81,6 @@ class TestWatcherConfig:
 # step-5: Supervisor lifecycle — start / stop / idempotent
 # ---------------------------------------------------------------------------
 
-async def _never_return() -> None:
-    """A coroutine that never completes (simulates a running supervisor loop)."""
-    await asyncio.sleep(9999)
-
-
 def _make_lifecycle_harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
     """Build a minimal Harness via __new__ with lifecycle attributes injected."""
     from collections import deque
@@ -100,51 +95,65 @@ def _make_lifecycle_harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
 
 
 class TestWatcherSupervisorLifecycle:
-    """_start/_stop_watcher_supervisor lifecycle."""
+    """_start/_stop_watcher_supervisor lifecycle.
 
-    @pytest.mark.asyncio
-    async def test_start_noop_when_disabled(self, tmp_path: Path) -> None:
+    Uses MagicMock tasks rather than real asyncio coroutines to avoid the
+    unawaited-coroutine warnings that pytest turns into errors
+    ('error:coroutine .* was never awaited:RuntimeWarning' filterwarning).
+    asyncio.create_task is patched at the module level so no real scheduler
+    overhead is incurred either.
+    """
+
+    def test_start_noop_when_disabled(self, tmp_path: Path) -> None:
         """When disabled, _start_watcher_supervisor is a no-op."""
         h = _make_lifecycle_harness(tmp_path, enabled=False)
-        with patch.object(h, '_watcher_supervisor_loop', side_effect=_never_return):
+        with patch('orchestrator.harness.asyncio.create_task') as mock_ct:
             h._start_watcher_supervisor()
+            mock_ct.assert_not_called()
         assert h._watcher_supervisor_task is None
 
-    @pytest.mark.asyncio
-    async def test_start_creates_named_task(self, tmp_path: Path) -> None:
+    def test_start_creates_named_task(self, tmp_path: Path) -> None:
         """When enabled, creates an asyncio.Task named 'watcher-supervisor'."""
         h = _make_lifecycle_harness(tmp_path, enabled=True)
-        with patch.object(Harness, '_watcher_supervisor_loop', return_value=_never_return()):
-            h._start_watcher_supervisor()
-            task = h._watcher_supervisor_task
-            assert task is not None
-            assert isinstance(task, asyncio.Task)
-            assert task.get_name() == 'watcher-supervisor'
-            task.cancel()
-            with pytest.raises((asyncio.CancelledError, Exception)):
-                await task
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+        mock_task.get_name.return_value = 'watcher-supervisor'
 
-    @pytest.mark.asyncio
-    async def test_start_idempotent(self, tmp_path: Path) -> None:
-        """A second call while the task is still alive does not replace it."""
+        with patch('orchestrator.harness.asyncio.create_task', return_value=mock_task) as mock_ct:
+            h._start_watcher_supervisor()
+
+        assert h._watcher_supervisor_task is mock_task
+        # Verify create_task was called with name='watcher-supervisor'
+        _, kwargs = mock_ct.call_args
+        assert kwargs.get('name') == 'watcher-supervisor'
+
+    def test_start_idempotent(self, tmp_path: Path) -> None:
+        """A second call while the task is still alive does not create a second task."""
         h = _make_lifecycle_harness(tmp_path, enabled=True)
-        with patch.object(Harness, '_watcher_supervisor_loop', return_value=_never_return()):
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False  # task is alive
+
+        with patch('orchestrator.harness.asyncio.create_task', return_value=mock_task) as mock_ct:
             h._start_watcher_supervisor()
-            first_task = h._watcher_supervisor_task
-            h._start_watcher_supervisor()
-            assert h._watcher_supervisor_task is first_task
-            first_task.cancel()
-            with pytest.raises((asyncio.CancelledError, Exception)):
-                await first_task
+            h._start_watcher_supervisor()  # second call: no-op
+
+        # create_task called exactly once (idempotent)
+        mock_ct.assert_called_once()
+        assert h._watcher_supervisor_task is mock_task
 
     @pytest.mark.asyncio
     async def test_stop_cancels_and_resets(self, tmp_path: Path) -> None:
         """_stop_watcher_supervisor cancels the task and resets to None."""
         h = _make_lifecycle_harness(tmp_path, enabled=True)
-        with patch.object(Harness, '_watcher_supervisor_loop', return_value=_never_return()):
-            h._start_watcher_supervisor()
-            assert h._watcher_supervisor_task is not None
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+        # Make await mock_task return immediately (no-op)
+        mock_task.__await__ = lambda self: iter([])
+
+        h._watcher_supervisor_task = mock_task
         await h._stop_watcher_supervisor()
+
+        mock_task.cancel.assert_called_once()
         assert h._watcher_supervisor_task is None
 
     @pytest.mark.asyncio

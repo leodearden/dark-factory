@@ -20,6 +20,7 @@ from shared.cost_store import CostStore
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
@@ -59,6 +60,14 @@ logger = logging.getLogger(__name__)
 # branch-on-main observation) is L1-worthy; transient PID-liveness or
 # branch-resolution races should clear well before this threshold fires.
 MAX_RECONCILE_FAILURES: int = 5
+
+# Grace period added to the watcher rotation timeout on top of
+# watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
+# exit cleanly before the supervisor kills it with a SIGTERM timeout.
+_WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
+
+# Maximum backoff between unclean watcher exits (seconds).
+_WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -2475,6 +2484,62 @@ Output JSON matching the schema. Every task must appear in the output.
                 await self._watcher_supervisor_task
             self._watcher_supervisor_task = None
             logger.info('Escalation-watcher-auto supervisor stopped')
+
+    async def _run_watcher_rotation(self):  # type: ignore[return]
+        """Run one escalation-watcher-auto rotation via invoke_with_cap_retry.
+
+        Extracted for deterministic unit testing (same rationale as
+        _scan_for_terminal_active_tasks).  Returns the AgentResult from
+        invoke_with_cap_retry.
+
+        The agent is instructed to exit cleanly after ROTATION_ESCALATIONS or
+        ROTATION_HOURS — whichever fires first — and to emit its digest as its
+        final message.  The supervisor-side timeout is rotation_hours*3600 +
+        _WATCHER_TIMEOUT_GRACE_SECS so that a wedged agent that ignores its
+        own rotation instructions is force-killed (classified as unclean, feeds
+        the crashloop guard).
+        """
+        from shared.cli_invoke import AgentResult  # local import to match test patching
+
+        cfg = self.config
+        user_prompt = (
+            f'You are running as an autonomous escalation watcher.\n'
+            f'Rotation limits (injected by supervisor):\n'
+            f'  ROTATION_ESCALATIONS={cfg.watcher_rotation_escalations}\n'
+            f'  ROTATION_HOURS={cfg.watcher_rotation_hours}\n'
+            f'\n'
+            f'When you have handled ROTATION_ESCALATIONS escalations '
+            f'or {cfg.watcher_rotation_hours} hours have elapsed since startup, '
+            f'emit your digest as the final message and exit cleanly.\n'
+            f'\n'
+            f'Project root: {cfg.project_root}\n'
+            f'Escalation queue: {cfg.project_root}/{cfg.escalation.queue_dir}\n'
+        )
+        system_prompt = load_skill_system_prompt('escalation-watcher-auto')
+        escalation_url = f'http://{cfg.escalation.host}:{cfg.escalation.port}/mcp'
+        mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
+        timeout_secs = cfg.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS
+
+        return await invoke_with_cap_retry(
+            self.usage_gate,
+            'Escalation watcher (auto)',
+            invoke_fn=invoke_agent,
+            cost_store=self.cost_store,
+            run_id=self._run_id or '',
+            project_id=cfg.fused_memory.project_id,
+            role='escalation-watcher-auto',
+            task_id='',
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            cwd=cfg.project_root,
+            model=cfg.watcher_model,
+            max_turns=cfg.watcher_max_turns,
+            max_budget_usd=cfg.watcher_rotation_budget_usd,
+            effort=cfg.watcher_effort,
+            backend=cfg.watcher_backend,
+            mcp_config=mcp_config,
+            timeout_seconds=timeout_secs,
+        )
 
     async def _watcher_supervisor_loop(self) -> None:
         """Supervisor loop — restart watcher rotations until shutdown.
