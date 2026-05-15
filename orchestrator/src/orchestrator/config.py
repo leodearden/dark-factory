@@ -592,6 +592,20 @@ class OrchestratorConfig(BaseSettings):
             'resolution starts from zero.'
         ),
     )
+    snapshot_min_write_interval_secs: float = Field(
+        default=0.25,
+        ge=0.0,
+        description=(
+            'Minimum wall/monotonic interval (seconds) between scheduler '
+            'state-snapshot disk writes.  Ticks within the window are '
+            'coalesced: the time-gate check is O(1) (a single monotonic '
+            'subtraction) so throttled ticks pay no serialisation or I/O '
+            'cost.  Default 250 ms coalesces the ~20 tick/s burst typical '
+            'during pin-queue drains (~1 500 tasks, < 1 MB snapshot).  '
+            'Set to 0.0 to disable throttling (all ticks write) — useful '
+            'for tests that need to isolate the content-dedup path.'
+        ),
+    )
 
     # Verification timeouts
     verify_command_timeout_secs: float = Field(default=1800.0)
