@@ -116,6 +116,58 @@ def test_probe_port_returns_true_on_ss_error(monkeypatch: pytest.MonkeyPatch) ->
     assert len(log_messages) >= 1, "probe_port must log a diagnostic when ss fails"
 
 
+def test_probe_port_returns_true_on_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_port must return True when ss binary is not found (FileNotFoundError).
+
+    If ss is absent (e.g. minimal container image), a FileNotFoundError must not
+    propagate — the safe default is True so the unit is not spuriously restarted.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[0] == "ss":
+            raise FileNotFoundError(2, "No such file or directory", "ss")
+        # systemd-cat call from log()
+        log_messages.append(str(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog.probe_port(8102)
+
+    assert result is True, (
+        "probe_port must return True when ss binary is missing "
+        "so a missing tool does not trigger a spurious restart"
+    )
+    assert len(log_messages) >= 1, "probe_port must log a diagnostic when ss is not found"
+
+
+def test_probe_port_returns_true_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_port must return True when the ss call exceeds its timeout.
+
+    A slow probe (subprocess.TimeoutExpired) must be treated as a tooling failure
+    and must not be misinterpreted as 'port down'.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[0] == "ss":
+            raise subprocess.TimeoutExpired(cmd, 5)
+        # systemd-cat call from log()
+        log_messages.append(str(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog.probe_port(8102)
+
+    assert result is True, (
+        "probe_port must return True when ss times out "
+        "so a slow probe does not trigger a spurious restart"
+    )
+    assert len(log_messages) >= 1, "probe_port must log a diagnostic when ss times out"
+
+
 # ---------------------------------------------------------------------------
 # restart_unit tests
 # ---------------------------------------------------------------------------
