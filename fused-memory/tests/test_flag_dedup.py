@@ -2100,7 +2100,10 @@ class TestConfirmMarkerPersisted:
         response (which is the root-cause vector for the ID-mismatch bug).
         """
         import logging
-        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted  # step-1: ImportError
+
+        from fused_memory.reconciliation.flag_dedup import (
+            confirm_marker_persisted,  # step-1: ImportError
+        )
 
         confirmed_marker = _make_memory_result({
             'source': 'stage1_flag_marker',
@@ -2142,6 +2145,7 @@ class TestConfirmMarkerPersisted:
         (c) Exactly one WARNING emitted BEFORE the retry containing task_id AND flag_type.
         """
         import logging
+
         from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
 
         retry_marker = _make_memory_result({
@@ -2206,6 +2210,7 @@ class TestConfirmMarkerPersisted:
             with phrasing like 'could not confirm' (ops-greppable).
         """
         import logging
+
         from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
 
         memory_service = AsyncMock()
@@ -2262,6 +2267,7 @@ async def test_dedup_flags_hit_path_no_delete_when_confirmation_misses(caplog):
     Fails until step-10 switches HIT gate from memory_ids to confirmed_id.
     """
     import logging
+
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     prior_marker = _make_memory_result({
@@ -2497,6 +2503,7 @@ async def test_dedup_flags_miss_path_confirmed_marker_no_noop_warning(caplog):
     Fails until step-8 wires confirmation into MISS branch.
     """
     import logging
+
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     confirmation_marker = _make_memory_result({
@@ -2562,6 +2569,7 @@ async def test_dedup_flags_miss_path_confirmation_miss_emits_noop_warning(caplog
     Fails until step-8 wires confirmation into MISS branch.
     """
     import logging
+
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
