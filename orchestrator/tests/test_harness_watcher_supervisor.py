@@ -344,3 +344,216 @@ class TestRunWatcherRotation:
         expected_url = f'http://{h.config.escalation.host}:{h.config.escalation.port}/mcp'
         h.mcp.mcp_config_json.assert_called_once_with(escalation_url=expected_url)
         assert captured.get('mcp_config') == {'mcp': 'config-sentinel'}
+
+
+# ---------------------------------------------------------------------------
+# step-9: Supervisor loop classification — clean/unclean backoff
+# ---------------------------------------------------------------------------
+
+def _make_loop_harness(tmp_path: Path) -> Harness:
+    """Minimal Harness for _watcher_supervisor_loop tests."""
+    from collections import deque
+
+    h = Harness.__new__(Harness)
+    config = OrchestratorConfig(project_root=tmp_path)
+    h.config = config
+    h._watcher_supervisor_task = None
+    h._watcher_unclean_exits: deque = deque()
+    h.usage_gate = None
+    h.cost_store = MagicMock()
+    h._run_id = 'run-loop-test-001'
+    h.mcp = MagicMock()
+    h.mcp.mcp_config_json.return_value = {'mcp': 'stub'}
+    return h
+
+
+class TestWatcherSupervisorLoopClassification:
+    """_watcher_supervisor_loop clean-vs-unclean classification and backoff.
+
+    Strategy: patch _run_watcher_rotation to return controlled results and
+    asyncio.sleep in the harness module to record calls + raise StopAsyncIteration
+    after a fixed number of iterations to break the loop under test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_clean_exit_no_backoff(self, tmp_path: Path) -> None:
+        """Clean exit (success=True, timed_out=False) → no backoff sleep, deque stays empty."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+
+        # rotation always succeeds cleanly; after 2 calls break the loop
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await h._watcher_supervisor_loop()
+
+        # At least one rotation ran
+        assert rotation_calls >= 1
+        # No backoff sleep should have been recorded (clean exits → immediate restart)
+        assert sleep_durations == [], (
+            f'Expected no backoff sleep after clean exit; got {sleep_durations}'
+        )
+        # Unclean-exit deque must stay empty
+        assert len(h._watcher_unclean_exits) == 0
+
+    @pytest.mark.asyncio
+    async def test_unclean_exit_triggers_backoff(self, tmp_path: Path) -> None:
+        """Unclean exit (success=False) → backoff sleep of base secs, deque grows."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=False, output='', timed_out=False)
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await h._watcher_supervisor_loop()
+
+        base = h.config.watcher_subprocess_restart_backoff_secs
+        assert len(sleep_durations) >= 1, 'Expected backoff sleep after unclean exit'
+        assert sleep_durations[0] == pytest.approx(base), (
+            f'First backoff should equal base {base}s; got {sleep_durations[0]}'
+        )
+        assert len(h._watcher_unclean_exits) >= 1
+
+    @pytest.mark.asyncio
+    async def test_timed_out_counts_as_unclean(self, tmp_path: Path) -> None:
+        """timed_out=True (even if success=True) counts as an unclean exit."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 2:
+                raise asyncio.CancelledError()
+            # timed_out=True → unclean regardless of success flag
+            return AgentResult(success=True, output='', timed_out=True)
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await h._watcher_supervisor_loop()
+
+        assert len(sleep_durations) >= 1, 'timed_out exit must trigger backoff'
+        assert len(h._watcher_unclean_exits) >= 1
+
+    @pytest.mark.asyncio
+    async def test_consecutive_unclean_doubles_backoff(self, tmp_path: Path) -> None:
+        """Second consecutive unclean exit doubles the backoff (exponential)."""
+        from shared.cli_invoke import AgentResult
+
+        # Use a short enough window to not evict entries
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+            'watcher_crashloop_window_secs': 9999,
+        })
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 3:
+                raise asyncio.CancelledError()
+            return AgentResult(success=False, output='')
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await h._watcher_supervisor_loop()
+
+        assert len(sleep_durations) >= 2, (
+            f'Expected 2 backoff sleeps for 2 unclean exits; got {sleep_durations}'
+        )
+        base = h.config.watcher_subprocess_restart_backoff_secs
+        assert sleep_durations[0] == pytest.approx(base)
+        # Second sleep should be larger (exponential — at least 1.5x base)
+        assert sleep_durations[1] >= base * 1.5, (
+            f'Second backoff {sleep_durations[1]} should be > 1.5*base {base*1.5}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_exit_resets_backoff(self, tmp_path: Path) -> None:
+        """A clean exit after unclean exits resets the backoff to base."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': 99,
+            'watcher_crashloop_window_secs': 9999,
+        })
+        # Sequence: unclean, clean, unclean, then cancel
+        results = [
+            AgentResult(success=False, output=''),   # unclean → backoff
+            AgentResult(success=True, output=''),    # clean   → reset, no backoff
+            AgentResult(success=False, output=''),   # unclean → base backoff again
+        ]
+        idx = 0
+        sleep_durations: list[float] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal idx
+            if idx >= len(results):
+                raise asyncio.CancelledError()
+            r = results[idx]
+            idx += 1
+            return r
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await h._watcher_supervisor_loop()
+
+        base = h.config.watcher_subprocess_restart_backoff_secs
+        # Should have 2 backoff sleeps (from rotation 1 and rotation 3)
+        # No sleep between rotations 2→3 (clean reset → immediate restart)
+        assert len(sleep_durations) == 2, (
+            f'Expected 2 backoff sleeps (unclean/clean/unclean); got {sleep_durations}'
+        )
+        # After the clean reset, next unclean should use base again (not doubled)
+        assert sleep_durations[1] == pytest.approx(base), (
+            f'Post-reset backoff should be base {base}s; got {sleep_durations[1]}'
+        )
