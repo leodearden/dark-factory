@@ -2520,6 +2520,98 @@ class TestConfirmMarkerPersisted:
             f"but got: {warning_messages}"
         )
 
+    @pytest.mark.asyncio
+    async def test_confirm_marker_retry_waits_for_configured_delay(self, monkeypatch):
+        """On first-search miss, _sleep(_CONFIRM_RETRY_DELAY_SECS) is called before the retry.
+
+        RED (step-1 task-1415): _sleep and _CONFIRM_RETRY_DELAY_SECS do not yet exist
+        in flag_dedup — the import will FAIL with AttributeError until step-2 adds them.
+
+        Test strategy:
+        - Monkeypatch _CONFIRM_RETRY_DELAY_SECS to a sentinel value 0.123.
+        - Install a recording coroutine as _sleep to capture calls and their order
+          relative to memory_service.search calls.
+        - search side_effect: [[] (miss), [retry_marker]] (miss then retry-hit).
+        - Call confirm_marker_persisted and assert:
+          (a) _sleep was called exactly once with 0.123 (the sentinel).
+          (b) _sleep was called AFTER the first search miss and BEFORE the retry search
+              (verify via ordered event log capturing both search and sleep events).
+          (c) Function returns True (retry found the marker).
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import (
+            _CONFIRM_RETRY_DELAY_SECS,  # noqa: F401 — AttributeError if absent (RED)
+            _sleep,  # noqa: F401 — AttributeError if absent (RED)
+            confirm_marker_persisted,
+        )
+
+        # Sentinel delay so the test pins the exact value forwarded to _sleep.
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRM_RETRY_DELAY_SECS', 0.123)
+
+        retry_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '77',
+            'flag_type': 'stale_metadata',
+            'run_id': 'rX',
+        })
+        retry_marker.id = 'retry-canonical'
+
+        # Shared ordered log: each event is ('search', call_count) or ('sleep', delay).
+        event_log: list[tuple[str, object]] = []
+
+        memory_service = AsyncMock()
+
+        # Wrap search to record events with a running counter.
+        _search_call_count = 0
+
+        async def recording_search(*args, **kwargs):
+            nonlocal _search_call_count
+            _search_call_count += 1
+            n = _search_call_count
+            event_log.append(('search', n))
+            if n == 1:
+                return []
+            return [retry_marker]
+
+        memory_service.search = recording_search
+
+        # Recording sleep coroutine.
+        async def recording_sleep(delay: float) -> None:
+            event_log.append(('sleep', delay))
+
+        monkeypatch.setattr(_flag_dedup_mod, '_sleep', recording_sleep)
+
+        result = await confirm_marker_persisted(
+            memory_service,
+            project_id='p',
+            task_id='77',
+            flag_type='stale_metadata',
+            run_id='rX',
+            log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+        )
+
+        # (a) Returns True — retry found the marker.
+        assert result is True, f"Expected True (retry found marker) but got {result!r}"
+        assert isinstance(result, bool), (
+            f"confirm_marker_persisted must return bool, not {type(result)!r}"
+        )
+
+        # (b) _sleep was called exactly once with the sentinel value 0.123.
+        sleep_events = [(name, val) for name, val in event_log if name == 'sleep']
+        assert len(sleep_events) == 1, (
+            f"Expected _sleep called exactly once; event_log: {event_log}"
+        )
+        assert sleep_events[0][1] == 0.123, (
+            f"_sleep must be called with sentinel 0.123; got: {sleep_events[0][1]}"
+        )
+
+        # (c) Order: search-1 (miss) → sleep → search-2 (retry hit).
+        assert event_log == [('search', 1), ('sleep', 0.123), ('search', 2)], (
+            f"Expected ordered events [search-1, sleep, search-2]; got: {event_log}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-1400 step-9 — dedup_flags HIT path: deletes priors only when confirmed
@@ -3835,16 +3927,22 @@ class TestConfirmationCircuitBreaker:
         for f in result:
             assert 'persisted_from_run' in f, f'Expected HIT-path annotation: {f}'
 
-    def test_confirmation_miss_threshold_constant_is_pinned_to_5(self):
-        """Regression-pin: _CONFIRMATION_MISS_THRESHOLD was chosen at task-1412 as 5.
+    def test_confirmation_miss_threshold_constant_is_pinned_to_3(self):
+        """Regression-pin: _CONFIRMATION_MISS_THRESHOLD was lowered to 3 at task-1415.
 
         A change to this constant affects how aggressively the circuit-breaker
         fires during a Mem0 brownout.  Changing it should be a deliberate
         decision with an accompanying test update, not a silent shift.
+
+        Trade-off: resilience to single-flag flakiness (higher threshold) vs
+        brownout load-shedding latency (lower threshold).  3 was chosen because
+        confirm_marker_persisted retries internally (each miss = 2 round-trips),
+        3 still tolerates a single spurious miss (a hit resets the counter), and
+        activating the breaker sooner is consistent with its load-shedding purpose.
         """
         from fused_memory.reconciliation.flag_dedup import _CONFIRMATION_MISS_THRESHOLD
-        assert _CONFIRMATION_MISS_THRESHOLD == 5, (
-            'Threshold was chosen at task-1412 default; a change should be a '
+        assert _CONFIRMATION_MISS_THRESHOLD == 3, (
+            'Threshold was lowered to 3 at task-1415; a change should be a '
             'deliberate decision with a test update, not a silent shift.'
         )
 
@@ -4012,6 +4110,111 @@ class TestConfirmationCircuitBreaker:
                 f'[branch={branch}] task {tid}: expected consequence '
                 f'{consequence!r} in WARNING; got: {bucket}'
             )
+
+    # -----------------------------------------------------------------------
+    # task-1415 step-3 — default threshold behavior pin
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_default_threshold_trips_at_three_consecutive_misses(self, caplog):
+        """Default _CONFIRMATION_MISS_THRESHOLD (no monkeypatch) trips at 3 consecutive misses.
+
+        RED (step-3 task-1415): the current default is 5.  At threshold=5 the
+        breaker does NOT trip after 3 misses, so flag-4 confirmation searches are
+        still reached → search.call_count would be 13 instead of 11, and no breaker
+        WARNING fires.  The test anchors the production default at 3.
+
+        Setup: 4 MISS-path flags.  Each flag's confirmation always misses (initial
+        miss + retry = 2 searches).  After flag-3's retry the counter reaches 3 →
+        TRIP.  Flag-4's confirmation is entirely skipped.
+
+        search side_effect (13 elements; [11] and [12] only reached without breaker):
+          [0]   suppression → []
+          [1]   flag-1 pre-write → []  (MISS)
+          [2]   flag-1 confirmation initial miss
+          [3]   flag-1 confirmation retry   → counter = 1
+          [4]   flag-2 pre-write → []  (MISS)
+          [5]   flag-2 confirmation initial miss
+          [6]   flag-2 confirmation retry   → counter = 2
+          [7]   flag-3 pre-write → []  (MISS)
+          [8]   flag-3 confirmation initial miss
+          [9]   flag-3 confirmation retry   → counter = 3 → TRIP
+          [10]  flag-4 pre-write → []  (MISS; no confirmation)
+          [11]  (flag-4 confirmation miss — only reached without breaker)
+          [12]  (flag-4 confirmation retry — only reached without breaker)
+
+        Asserts:
+          (a) Exactly ONE circuit-breaker WARNING whose text contains
+              'tripped after 3 consecutive' (anchoring both the event type
+              and the exact count; a bare '3' would also match 13 or 30).
+          (b) search.call_count == 11 (1 suppression + 4 pre-write +
+              3×2 confirmations for flags 1-3 + 0 confirmations for flag-4).
+          (c) All 4 flags returned (MISS-path, no 'persisted_from_run').
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            [],   # [0]  suppression
+            [],   # [1]  flag-1 pre-write MISS
+            [],   # [2]  flag-1 confirmation initial miss
+            [],   # [3]  flag-1 confirmation retry        → counter = 1
+            [],   # [4]  flag-2 pre-write MISS
+            [],   # [5]  flag-2 confirmation initial miss
+            [],   # [6]  flag-2 confirmation retry        → counter = 2
+            [],   # [7]  flag-3 pre-write MISS
+            [],   # [8]  flag-3 confirmation initial miss
+            [],   # [9]  flag-3 confirmation retry        → counter = 3 → TRIP
+            [],   # [10] flag-4 pre-write MISS (no confirmation — breaker tripped)
+            [],   # [11] flag-4 confirmation miss  (only reached without breaker)
+            [],   # [12] flag-4 confirmation retry (only reached without breaker)
+        ])
+        memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['x']))
+
+        flags = [
+            {'task_id': 601, 'flag_type': 'missing_deliverable', 'description': 'f1'},
+            {'task_id': 602, 'flag_type': 'missing_deliverable', 'description': 'f2'},
+            {'task_id': 603, 'flag_type': 'missing_deliverable', 'description': 'f3'},
+            {'task_id': 604, 'flag_type': 'missing_deliverable', 'description': 'f4'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (a) Exactly ONE breaker WARNING whose text contains 'tripped after 3 consecutive'
+        #     (anchoring both the event type and the exact count rendered into the message).
+        #     A bare '3' would match counts like 13 or 30; the longer substring is precise.
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
+        assert len(breaker_warnings) == 1, (
+            f"Expected exactly 1 circuit-breaker WARNING but got "
+            f"{len(breaker_warnings)}: {breaker_warnings}\nAll WARNINGs: {all_warnings}"
+        )
+        assert 'tripped after 3 consecutive' in breaker_warnings[0], (
+            f"Breaker WARNING must contain 'tripped after 3 consecutive' "
+            f"(the default threshold rendered into the message); "
+            f"got: {breaker_warnings[0]!r}"
+        )
+
+        # (b) Exactly 11 search calls — no confirmation for flag-4.
+        assert memory_service.search.call_count == 11, (
+            f"Expected 11 search calls (1 suppression + 4 pre-write + 3×2 confirmations "
+            f"for flags 1-3 + 0 for flag-4), got: {memory_service.search.call_count}; "
+            f"if count=13, the default threshold is still 5 (not yet lowered to 3)"
+        )
+
+        # (c) All 4 flags returned; MISS path — no 'persisted_from_run' annotation.
+        assert len(result) == 4, f"Expected 4 flags returned; got {len(result)}"
+        for f in result:
+            assert 'persisted_from_run' not in f, f"MISS path must not annotate: {f}"
 
 
 # ---------------------------------------------------------------------------

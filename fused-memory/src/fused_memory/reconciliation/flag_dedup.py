@@ -146,6 +146,7 @@ Public API
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Literal, TypedDict
 
@@ -153,6 +154,10 @@ from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
 
 logger = logging.getLogger(__name__)
+
+# Module-local sleep binding — allows tests to patch sleep without touching the
+# global asyncio namespace (same pattern as harness.py).
+_sleep = asyncio.sleep
 
 
 class _SuppressionMetadata(TypedDict):
@@ -190,16 +195,34 @@ class SuppressionPayload(TypedDict):
 # with _DELETE_DEAD_BATCH_SIZE).  See "Confirmation circuit-breaker (task-1412)"
 # section in the module docstring for the full design rationale.
 #
-# 5 was chosen as the default: during a sustained brownout confirm_marker_persisted
-# always misses (initial miss + one retry = 2 search calls per flag), so 5
-# consecutive misses manifest quickly and indicate a real backend failure.  Under
-# healthy-but-slow indexing, strictly-consecutive miss runs of 5 are rare because
-# any single successful confirmation resets the counter.  Note: write failures
-# (add_memory exceptions) do NOT count toward this threshold — the counter only
-# advances on confirmation misses from successful writes; see the module docstring
-# "Confirmation circuit-breaker" section for the "write failures do not count"
-# design rationale.
-_CONFIRMATION_MISS_THRESHOLD: int = 5
+# Trade-off: resilience to single-flag flakiness (higher threshold) vs
+# brownout load-shedding latency (lower threshold).
+#
+# 3 was chosen as the default (task-1415, lowered from 5):
+# - confirm_marker_persisted already retries internally so each "miss" costs 2
+#   search round-trips.  At threshold 5 the worst-case batch pays up to
+#   5 × (1 write + 2 confirmation searches) ≈ 15 round-trips before the breaker
+#   activates; at 3 that drops to ≈ 9.
+# - Threshold 3 still tolerates a single spurious miss without tripping: a
+#   sporadic miss followed by a hit resets the counter to 0, so strictly-
+#   consecutive miss runs of 3 are rare under healthy-but-slow indexing.
+# - The whole point of the breaker is to shed load during real brownouts, so
+#   activating it sooner (lower threshold) is consistent with its purpose.
+# - Write failures (add_memory exceptions) do NOT count — the counter only
+#   advances on confirmation misses from successful writes; see the module
+#   docstring "Confirmation circuit-breaker" section for the "write failures do
+#   not count" design rationale.
+_CONFIRMATION_MISS_THRESHOLD: int = 3
+
+# Bounded delay (seconds) awaited between the first-search miss and the retry in
+# confirm_marker_persisted.  Default 0.0 = pure event-loop yield (asyncio.sleep(0)
+# semantics): yields control to the loop, costs nothing on happy paths, and preserves
+# the module docstring's "Mem0 writes assumed to be immediately visible" invariant.
+# Bump via monkeypatch in tests or via future config if production shows a Mem0
+# write-flush boundary — this is the knob the docstring "Mem0 read-after-write
+# consistency" paragraph anticipates ("If production evidence shows otherwise, add a
+# small bounded delay before the retry").
+_CONFIRM_RETRY_DELAY_SECS: float = 0.0
 
 
 def _marker_query(tid: str, ftype: str) -> str:
@@ -247,7 +270,9 @@ async def confirm_marker_persisted(
     1. Run a confirmation search via ``find_prior_memories`` with
        ``kind={'source':'stage1_flag_marker','flag_type':flag_type,'run_id':run_id}``.
     2. If matches are found, return ``True``.
-    3. On a miss, log a WARNING (task_id + flag_type) and retry the search once.
+    3. On a miss, log a WARNING (task_id + flag_type), await
+       ``_sleep(_CONFIRM_RETRY_DELAY_SECS)`` (default 0.0 = pure event-loop yield),
+       then retry the search once.
     4. Return ``True`` if the retry finds matches; otherwise log a final WARNING
        and return ``False``.
     5. Never raises — the whole body is wrapped in a best-effort try/except so
@@ -258,9 +283,10 @@ async def confirm_marker_persisted(
         to Mem0 (not Graphiti).  The indexing-lag caveat in ``prompts/stage1.py``
         (lines 189-196) is specific to Graphiti's async embedding pipeline and
         does NOT apply here — Mem0 writes on this path are assumed to be
-        immediately visible to a subsequent ``search``.  If production evidence
-        shows otherwise, add a small bounded delay before the retry and increase
-        the retry count.
+        immediately visible to a subsequent ``search``.  The configurable
+        ``_CONFIRM_RETRY_DELAY_SECS`` constant (default 0.0) is awaited between
+        the first miss and the retry; bump it if production shows a write-flush
+        boundary that requires a bounded wait before the index catches up.
 
     Args:
         memory_service: Mem0 service with an async ``search`` method.
@@ -300,12 +326,13 @@ async def confirm_marker_persisted(
         if matches:
             return True
 
-        # Miss on first attempt — log WARNING and retry once.
+        # Miss on first attempt — log WARNING, wait the configured delay, then retry once.
         log.warning(
             'confirm_marker_persisted: marker not found after write for task %s'
             ' flag_type %s run_id %s — retrying search',
             task_id, flag_type, run_id,
         )
+        await _sleep(_CONFIRM_RETRY_DELAY_SECS)
         retry_matches = await find_prior_memories(
             memory_service,
             project_id=project_id,
