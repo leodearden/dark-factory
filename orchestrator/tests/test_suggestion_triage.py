@@ -719,8 +719,8 @@ class TestRouteReviewSuggestionsIntegration:
         # (e.g. an MCP probe) would still satisfy this check if the task is added and
         # not yet done — unlike the event check, which relies on no yield occurring.
         assert len(wf._background_tasks) == 1, (
-            '_route_review_suggestions_to_curator must schedule exactly one background '
-            'task via create_task — got %d' % len(wf._background_tasks)
+            f'_route_review_suggestions_to_curator must schedule exactly one background '
+            f'task via create_task — got {len(wf._background_tasks)}'
         )
         assert not next(iter(wf._background_tasks)).done(), (
             'background task must not be done yet — fire-and-forget means it runs '
