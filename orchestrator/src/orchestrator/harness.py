@@ -1995,6 +1995,41 @@ Output JSON matching the schema. Every task must appear in the output.
             original_id, new_task_id, renamed, used,
         )
 
+    async def _trailing_24h_fetch_one(
+        self,
+        sql: str,
+        leading_params: tuple = (),
+        *,
+        label: str,
+    ) -> tuple | None:
+        """Execute an arbitrary trailing-24h aggregate query and return the first row.
+
+        ``sql`` must be a full SELECT ending with ``... completed_at >= ?`` (the
+        cutoff is appended internally as the LAST parameter).  ``leading_params``
+        are passed in front of the cutoff in the same order.
+
+        Fail-open: returns None when ``cost_store is None`` or when any
+        exception is raised by ``_require_conn()`` / cursor execute / fetchone.
+        Callers MUST treat None as "skip / assume zero" — dispatch must
+        never be blocked by a transient cost-DB error.  The ``label`` is used
+        only in the warning log.
+        """
+        if self.cost_store is None:
+            return None
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        try:
+            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
+            cur = await conn.execute(sql, (*leading_params, cutoff))
+            row = await cur.fetchone()
+            await cur.close()
+            return row
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '%s: trailing-24h cost query failed (%s) — fail-open',
+                label, exc,
+            )
+            return None
+
     async def _auto_eval_budget_used_24h(self) -> float:
         """Sum cost_usd from invocations table for known auto-eval redo
         task_ids in the trailing 24h.
@@ -2005,27 +2040,14 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         if not self._auto_eval_redo_task_ids:
             return 0.0
-        if self.cost_store is None:
-            return 0.0
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        try:
-            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
-            placeholders = ','.join('?' for _ in self._auto_eval_redo_task_ids)
-            cur = await conn.execute(
-                f'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-                f'WHERE task_id IN ({placeholders}) '
-                f'AND completed_at >= ?',
-                (*self._auto_eval_redo_task_ids, cutoff),
-            )
-            row = await cur.fetchone()
-            await cur.close()
-            return float(row[0]) if row and row[0] is not None else 0.0
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
-            logger.warning(
-                'auto_eval_budget_used_24h: query failed (%s) — assume zero',
-                exc,
-            )
-            return 0.0
+        placeholders = ','.join('?' for _ in self._auto_eval_redo_task_ids)
+        row = await self._trailing_24h_fetch_one(
+            f'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+            f'WHERE task_id IN ({placeholders}) AND completed_at >= ?',
+            tuple(self._auto_eval_redo_task_ids),
+            label='auto_eval_budget_used_24h',
+        )
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     async def _enforce_cost_ceilings(self) -> None:
         """Check daily cost ceilings and pause the scheduler on breach.
@@ -2051,29 +2073,19 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         if self.scheduler.is_paused:
             return
-        if self.cost_store is None:
+        row = await self._trailing_24h_fetch_one(
+            'SELECT '
+            '  COALESCE(SUM(cost_usd), 0.0), '
+            '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
+            'FROM invocations '
+            'WHERE completed_at >= ?',
+            ('%watcher%',),
+            label='_enforce_cost_ceilings',
+        )
+        if row is None:
             return
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        try:
-            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
-            cur = await conn.execute(
-                'SELECT '
-                '  COALESCE(SUM(cost_usd), 0.0), '
-                '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
-                'FROM invocations '
-                'WHERE completed_at >= ?',
-                ('%watcher%', cutoff),
-            )
-            row = await cur.fetchone()
-            await cur.close()
-            total = float(row[0]) if row and row[0] is not None else 0.0
-            watcher = float(row[1]) if row and row[1] is not None else 0.0
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
-            logger.warning(
-                '_enforce_cost_ceilings: cost query failed (%s) — skip ceiling check',
-                exc,
-            )
-            return
+        total = float(row[0]) if row[0] is not None else 0.0
+        watcher = float(row[1]) if row[1] is not None else 0.0
 
         if watcher >= self.config.watcher_daily_cost_ceiling_usd:
             logger.warning(
