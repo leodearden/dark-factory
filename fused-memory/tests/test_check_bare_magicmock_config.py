@@ -5,6 +5,7 @@ config-named variables (config, cfg, *_config, *_cfg) in test files unless
 preceded by a structured exemption comment.
 See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -178,8 +179,7 @@ class TestFindViolationsExemption:
     def test_exemption_em_dash_suppresses_violation(self):
         """# noqa: bare-magicmock — reason directly above → no violation."""
         source = (
-            '# noqa: bare-magicmock — needed for legacy fixture migration\n'
-            'config = MagicMock()\n'
+            '# noqa: bare-magicmock — needed for legacy fixture migration\nconfig = MagicMock()\n'
         )
         violations = find_violations(source, 'test_exempt.py')
         assert violations == []
@@ -187,8 +187,7 @@ class TestFindViolationsExemption:
     def test_exemption_ascii_hyphen_suppresses_violation(self):
         """# noqa: bare-magicmock - reason with ASCII hyphen → no violation."""
         source = (
-            '# noqa: bare-magicmock - legacy interface, cannot add spec yet\n'
-            'config = MagicMock()\n'
+            '# noqa: bare-magicmock - legacy interface, cannot add spec yet\nconfig = MagicMock()\n'
         )
         violations = find_violations(source, 'test_exempt_hyphen.py')
         assert violations == []
@@ -196,48 +195,32 @@ class TestFindViolationsExemption:
     def test_exemption_with_blank_line_between_comment_and_assignment(self):
         """Blank lines between exemption comment and assignment are tolerated."""
         source = (
-            '# noqa: bare-magicmock — bridging task 1339 migration\n'
-            '\n'
-            '    \n'
-            'config = MagicMock()\n'
+            '# noqa: bare-magicmock — bridging task 1339 migration\n\n    \nconfig = MagicMock()\n'
         )
         violations = find_violations(source, 'test_exempt_blank.py')
         assert violations == []
 
     def test_no_exemption_for_bare_noqa_no_reason(self):
         """# noqa: bare-magicmock (no separator, no reason) → still a violation."""
-        source = (
-            '# noqa: bare-magicmock\n'
-            'config = MagicMock()\n'
-        )
+        source = '# noqa: bare-magicmock\nconfig = MagicMock()\n'
         violations = find_violations(source, 'test_no_reason.py')
         assert len(violations) == 1
 
     def test_no_exemption_for_separator_only_empty_reason(self):
         """# noqa: bare-magicmock — (em-dash but no reason text) → still a violation."""
-        source = (
-            '# noqa: bare-magicmock —\n'
-            'config = MagicMock()\n'
-        )
+        source = '# noqa: bare-magicmock —\nconfig = MagicMock()\n'
         violations = find_violations(source, 'test_empty_reason.py')
         assert len(violations) == 1
 
     def test_no_exemption_when_intervening_code_line_between_comment_and_assignment(self):
         """Intervening non-blank code line breaks the exemption."""
-        source = (
-            '# noqa: bare-magicmock — some reason\n'
-            'some_code = 42\n'
-            'config = MagicMock()\n'
-        )
+        source = '# noqa: bare-magicmock — some reason\nsome_code = 42\nconfig = MagicMock()\n'
         violations = find_violations(source, 'test_broken_exemption.py')
         assert len(violations) == 1
 
     def test_no_exemption_for_unrelated_comment_above(self):
         """An unrelated comment immediately above → still a violation."""
-        source = (
-            '# just a regular comment\n'
-            'config = MagicMock()\n'
-        )
+        source = '# just a regular comment\nconfig = MagicMock()\n'
         violations = find_violations(source, 'test_unrelated_comment.py')
         assert len(violations) == 1
 
@@ -284,8 +267,7 @@ class TestFindViolationsAnnAssign:
     def test_exemption_above_annotated_assignment_suppresses_violation(self):
         """# noqa: bare-magicmock — reason directly above config: Foo = MagicMock() → 0 violations."""
         source = (
-            '# noqa: bare-magicmock — exempted annotated assignment\n'
-            'config: Foo = MagicMock()\n'
+            '# noqa: bare-magicmock — exempted annotated assignment\nconfig: Foo = MagicMock()\n'
         )
         violations = find_violations(source, 'test_ann_exempt.py')
         assert violations == [], (
@@ -312,20 +294,17 @@ class TestFindViolationsOutputOrder:
         # BFS order:      module level (line 9) → outer_fn body (line 3) → inner_fn body (line 6)
         # Expected order: [3, 6, 9]  (ascending source order)
         source = (
-            'def outer():\n'                      # line 1
-            '    def inner():\n'                  # line 2
+            'def outer():\n'  # line 1
+            '    def inner():\n'  # line 2
             '        inner_config = MagicMock()\n'  # line 3
-            '    mid_config = MagicMock()\n'      # line 4
-            'top_config = MagicMock()\n'          # line 5
+            '    mid_config = MagicMock()\n'  # line 4
+            'top_config = MagicMock()\n'  # line 5
         )
         violations = find_violations(source, 'test_order.py')
-        assert len(violations) == 3, (
-            f'Expected 3 violations, got {len(violations)}: {violations}'
-        )
+        assert len(violations) == 3, f'Expected 3 violations, got {len(violations)}: {violations}'
         linenos = [v.lineno for v in violations]
         assert linenos == sorted(linenos), (
-            f'find_violations() must return violations sorted ascending by lineno; '
-            f'got {linenos}'
+            f'find_violations() must return violations sorted ascending by lineno; got {linenos}'
         )
 
     def test_violations_sorted_ascending_by_col_offset_within_same_line(self):
@@ -397,10 +376,7 @@ class TestFindViolationsMultiTarget:
 
 _VIOLATION_SOURCE = 'config = MagicMock()\n'
 
-_CLEAN_SOURCE = (
-    '# noqa: bare-magicmock — exempted for CLI clean test\n'
-    'config = MagicMock()\n'
-)
+_CLEAN_SOURCE = '# noqa: bare-magicmock — exempted for CLI clean test\nconfig = MagicMock()\n'
 
 
 def _assert_violation_output(stdout: str, bad_file: Path) -> None:
@@ -412,18 +388,14 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     Shared by TestCliExitCodes (sys.executable) and TestStdlibOnlyProof
     (python3 -I -S) so both tests track the same output contract.
     """
-    assert str(bad_file) in stdout, (
-        f'Expected bad_file path in violation output, got: {stdout!r}'
-    )
+    assert str(bad_file) in stdout, f'Expected bad_file path in violation output, got: {stdout!r}'
     assert 'mock_orch_config' in stdout, (
         f'Expected mock_orch_config in violation output, got: {stdout!r}'
     )
     assert 'MagicMock(spec_set=pydantic_spec(...))' in stdout, (
         f'Expected MagicMock(spec_set=pydantic_spec(...)) in violation output, got: {stdout!r}'
     )
-    assert '1339' in stdout, (
-        f'Expected task 1339 reference in violation output, got: {stdout!r}'
-    )
+    assert '1339' in stdout, f'Expected task 1339 reference in violation output, got: {stdout!r}'
 
 
 class TestCliExitCodes:
@@ -457,9 +429,7 @@ class TestCliExitCodes:
 class TestCliDirectoryScan:
     """Directory-mode scans test_*.py and conftest.py recursively, ignores other .py files."""
 
-    def test_cli_recursively_scans_directory_for_test_files_and_conftest(
-        self, tmp_path: Path
-    ):
+    def test_cli_recursively_scans_directory_for_test_files_and_conftest(self, tmp_path: Path):
         """Dir scan: test_example.py + conftest.py flagged; other_file.py ignored."""
         subdir = tmp_path / 'sub'
         subdir.mkdir()
@@ -597,9 +567,7 @@ class TestStdlibOnlyProof:
             f'  stdout: {result2.stdout!r}\n'
             f'  stderr: {result2.stderr!r}'
         )
-        assert result2.stdout == '', (
-            f'Expected empty stdout (clean file), got: {result2.stdout!r}'
-        )
+        assert result2.stdout == '', f'Expected empty stdout (clean file), got: {result2.stdout!r}'
 
         # --- Case 3: violation file (print-violations branch isolation) ---
         bad_file = tmp_path / 'test_bad.py'
@@ -639,7 +607,8 @@ class TestHooksIntegration:
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
         invocation_lines = [
-            line for line in content.splitlines()
+            line
+            for line in content.splitlines()
             if 'check_bare_magicmock_config.py' in line.split('#')[0]
         ]
         assert invocation_lines, (

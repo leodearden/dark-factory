@@ -52,6 +52,7 @@ This script is intentionally stdlib-only (ast, argparse, pathlib, re, sys, typin
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
 Adding a third-party dependency here would break that fast path.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -131,7 +132,7 @@ def _is_specced(call: ast.Call) -> bool:
 
 
 # Exemption comment regex.
-# Matches: # noqa: bare-magicmock — <non-empty-reason>
+# Matches: ``# noqa: bare-magicmock — <non-empty-reason>``
 # Accepts em-dash (—) or ASCII hyphen (-) as separator.
 # Requires at least one non-space character after the separator.
 _EXEMPT_RE = re.compile(r'#\s*noqa:\s*bare-magicmock\s*[—\-]+\s*\S.*')
@@ -279,9 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     for path_str in args.paths:
         p = Path(path_str)
         if p.is_dir():
-            files_to_scan.extend(
-                sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py')))
-            )
+            files_to_scan.extend(sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py'))))
         else:
             if not p.exists():
                 print(f'error: {p}: No such file or directory', file=sys.stderr)
