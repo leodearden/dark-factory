@@ -253,6 +253,8 @@ function SchedulerTab({ projectFilter = [] }) {
     snapshot_at = null,
     offline = false,
     offline_projects = [],
+    paused = false,
+    paused_projects = [],
   } = sched;
 
   // Sub-tab: 'tasks' or 'modules'
@@ -388,6 +390,14 @@ function SchedulerTab({ projectFilter = [] }) {
         <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
           ⚠ Scheduler offline
           {offline_projects.length > 0 && `: ${offline_projects.join(', ')}`}
+        </div>
+      )}
+
+      {/* Paused banner */}
+      {paused && (
+        <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
+          ⏸ Paused
+          {paused_projects.length > 0 && `: ${paused_projects.map(p => p.reason ? `${p.project} (${p.reason})` : p.project).join(', ')}`}
         </div>
       )}
 

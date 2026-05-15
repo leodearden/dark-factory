@@ -94,6 +94,8 @@ window.DF_DATA = {
     snapshot_at: null,
     offline: false,
     offline_projects: [],
+    paused: false,
+    paused_projects: [],
   },
 };
 

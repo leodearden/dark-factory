@@ -363,13 +363,14 @@ class TestEffectivePrioritiesCache:
 _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'snapshot_at',
+    'is_paused', 'pause_reason',
 })
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns the correct seven-key dict."""
+    """get_state_snapshot() returns the correct nine-key dict."""
 
-    def test_snapshot_returns_seven_top_level_keys(self):
+    def test_snapshot_returns_nine_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         snap = scheduler.get_state_snapshot()
         assert set(snap.keys()) == _SNAPSHOT_KEYS
@@ -385,6 +386,9 @@ class TestGetStateSnapshotShape:
         assert snap['current_holders'] == {}
         # snapshot_at must be an ISO8601 string.
         datetime.fromisoformat(snap['snapshot_at'])
+        # Pause state defaults — scheduler is not paused at construction.
+        assert snap['is_paused'] is False
+        assert snap['pause_reason'] is None
 
     def test_snapshot_is_deep_copy_of_internal_state(self):
         """Mutating the returned snapshot must not affect the scheduler's internal state."""

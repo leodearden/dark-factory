@@ -286,7 +286,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, modules, pin_queue, events_by_task, offline_projects = \
+        rows, modules, pin_queue, events_by_task, offline_projects, paused_projects = \
             await collect_scheduler_state(dummy_client, dummy_config)
 
     assert offline_projects == []
@@ -354,7 +354,7 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, modules, pin_queue, events_by_task, offline_projects = \
+        rows, modules, pin_queue, events_by_task, offline_projects, paused_projects = \
             await collect_scheduler_state(dummy_client, dummy_config)
 
     assert rows == []
@@ -365,12 +365,114 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
 
 
 # ---------------------------------------------------------------------------
+# step-1370-5: collect_scheduler_state surfaces paused_projects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_scheduler_state_surfaces_paused_projects(
+    dummy_client, dummy_config
+):
+    """collect_scheduler_state returns paused_projects in the 6th tuple element.
+
+    Mirrors test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable.
+    A snapshot with is_paused=True must yield paused_projects=[{project, reason}].
+    A snapshot with is_paused absent or False must yield paused_projects=[].
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+    pause_reason = 'park-stop: 5 tasks parked in 1h'
+
+    # --- Snapshot with is_paused=True ---
+    paused_snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'is_paused': True,
+        'pause_reason': pause_reason,
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+
+    mock_mcp_paused = AsyncMock(side_effect=[paused_snapshot, []])
+    mock_active = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_paused),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        _, _, _, _, _, paused_projects = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert paused_projects == [{'project': project, 'reason': pause_reason}], (
+        f'Expected paused_projects with one entry; got {paused_projects!r}'
+    )
+
+    # --- Snapshot with is_paused=False (or absent) must yield empty list ---
+    not_paused_snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'is_paused': False,
+        'pause_reason': None,
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+
+    mock_mcp_not_paused = AsyncMock(side_effect=[not_paused_snapshot, []])
+    mock_active2 = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_not_paused),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active2),
+    ):
+        _, _, _, _, _, paused_projects_empty = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert paused_projects_empty == [], (
+        f'Expected empty paused_projects when not paused; got {paused_projects_empty!r}'
+    )
+
+    # --- Snapshot with is_paused absent (pre-upgrade on-disk) must yield empty list ---
+    legacy_snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+
+    mock_mcp_legacy = AsyncMock(side_effect=[legacy_snapshot, []])
+    mock_active3 = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_legacy),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active3),
+    ):
+        _, _, _, _, _, paused_projects_legacy = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert paused_projects_legacy == [], (
+        f'Expected empty paused_projects for legacy snapshot; got {paused_projects_legacy!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-11: shape_scheduler envelope
 # ---------------------------------------------------------------------------
 
 
 def test_shape_scheduler_envelope():
-    """shape_scheduler wraps inputs in SCHEDULER key with offline flag."""
+    """shape_scheduler wraps inputs in SCHEDULER key with offline and paused flags."""
     from dashboard.data.redux_api import shape_scheduler
 
     rows = [{'task_id': '1', 'title': 'T1'}]
@@ -378,14 +480,16 @@ def test_shape_scheduler_envelope():
     pin_queue = [{'task_id': '1', 'order': 0}]
     events_by_task = {'1': {'labels': [], 'values': []}}
     snapshot_at = '2026-01-01T00:00:00+00:00'
+    paused_entry = {'project': 'proj-a', 'reason': 'park-stop: 3 tasks'}
 
-    # Non-empty offline_projects → offline=True
+    # Non-empty offline_projects + non-empty paused_projects
     result_offline = shape_scheduler(
         rows=rows,
         modules=modules,
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=['proj-a'],
+        paused_projects=[paused_entry],
         snapshot_at=snapshot_at,
     )
     assert 'SCHEDULER' in result_offline
@@ -393,25 +497,31 @@ def test_shape_scheduler_envelope():
     assert set(inner.keys()) == {
         'rows', 'modules', 'pin_queue', 'events_by_task',
         'snapshot_at', 'offline', 'offline_projects',
+        'paused', 'paused_projects',
     }
     assert inner['offline'] is True
     assert inner['offline_projects'] == ['proj-a']
+    assert inner['paused'] is True
+    assert inner['paused_projects'] == [paused_entry]
     assert inner['rows'] == rows
     assert inner['modules'] == modules
     assert inner['pin_queue'] == pin_queue
     assert inner['events_by_task'] == events_by_task
     assert inner['snapshot_at'] == snapshot_at
 
-    # Empty offline_projects → offline=False
+    # Empty offline_projects + empty paused_projects → both False/[]
     result_online = shape_scheduler(
         rows=rows,
         modules=modules,
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=[],
+        paused_projects=[],
         snapshot_at=snapshot_at,
     )
     assert result_online['SCHEDULER']['offline'] is False
+    assert result_online['SCHEDULER']['paused'] is False
+    assert result_online['SCHEDULER']['paused_projects'] == []
 
 
 def test_shape_scheduler_top_level_lists_are_shallow_copies():
@@ -429,12 +539,14 @@ def test_shape_scheduler_top_level_lists_are_shallow_copies():
     pin_queue = [{'task_id': '1', 'order': 0}]
     events_by_task = {'1': {'labels': [], 'values': []}}
 
+    paused_projects = [{'project': 'p1', 'reason': 'park-stop: x'}]
     result = shape_scheduler(
         rows=rows,
         modules=modules,
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=[],
+        paused_projects=paused_projects,
         snapshot_at=None,
     )
     inner = result['SCHEDULER']
@@ -446,11 +558,13 @@ def test_shape_scheduler_top_level_lists_are_shallow_copies():
     inner['pin_queue'].append({'task_id': 'sentinel'})
     inner['events_by_task']['sentinel'] = {'labels': [], 'values': []}
     inner['offline_projects'].append('sentinel')
+    inner['paused_projects'].append({'project': 'sentinel', 'reason': None})
 
     assert rows == [{'task_id': '1'}], 'rows must not be mutated by caller'
     assert modules == [{'path': 'src/a.py'}], 'modules must not be mutated'
     assert pin_queue == [{'task_id': '1', 'order': 0}], 'pin_queue must not be mutated'
     assert 'sentinel' not in events_by_task, 'events_by_task must be a copy'
+    assert len(paused_projects) == 1, 'paused_projects must not be mutated by caller'
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +580,8 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     """
     from unittest.mock import AsyncMock, patch
 
-    empty_5tuple = ([], [], [], {}, [])
-    with patch('dashboard.app.collect_scheduler_state', new=AsyncMock(return_value=empty_5tuple)):
+    empty_6tuple = ([], [], [], {}, [], [])
+    with patch('dashboard.app.collect_scheduler_state', new=AsyncMock(return_value=empty_6tuple)):
         resp = client.get('/api/v2/dashboard/scheduler')
 
     assert resp.status_code == 200
@@ -481,6 +595,8 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert 'snapshot_at' in inner
     assert 'offline' in inner
     assert 'offline_projects' in inner
+    assert 'paused' in inner
+    assert 'paused_projects' in inner
     # Pin empty-state values so a future shape change doesn't silently regress
     assert inner['offline'] is False
     assert inner['rows'] == []
@@ -489,6 +605,8 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert inner['events_by_task'] == {}
     assert inner['snapshot_at'] is None
     assert inner['offline_projects'] == []
+    assert inner['paused'] is False
+    assert inner['paused_projects'] == []
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +975,7 @@ async def test_collect_scheduler_state_enriches_active_tasks_with_project_root(
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, _, _, _, offline_projects = await collect_scheduler_state(dummy_client, config)
+        rows, _, _, _, offline_projects, _ = await collect_scheduler_state(dummy_client, config)
 
     assert offline_projects == []
     assert len(rows) == 2
@@ -1220,7 +1338,7 @@ async def test_collect_scheduler_state_tags_pins_with_project(dummy_client, tmp_
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        _rows, _modules, pin_queue, _events, _offline = \
+        _rows, _modules, pin_queue, _events, _offline, _paused = \
             await collect_scheduler_state(dummy_client, config)
 
     assert len(pin_queue) == 2
@@ -1305,7 +1423,7 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        _rows, modules, _pins, _events, _offline = \
+        _rows, modules, _pins, _events, _offline, _paused = \
             await collect_scheduler_state(dummy_client, config)
 
     # Two project-scoped entries, NOT one conflated row
@@ -1404,7 +1522,7 @@ async def test_collect_scheduler_state_normalises_non_dict_snapshot(
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, modules, pin_queue, events, offline = \
+        rows, modules, pin_queue, events, offline, _paused = \
             await collect_scheduler_state(dummy_client, dummy_config)
 
     # The project is treated as online-but-empty, NOT offline.
