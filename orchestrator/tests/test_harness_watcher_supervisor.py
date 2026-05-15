@@ -778,6 +778,112 @@ class TestWatcherCrashloopTrip:
 
 
 # ---------------------------------------------------------------------------
+# task-1388: Misconfigured-clean-exit cost-runaway guard
+# ---------------------------------------------------------------------------
+
+class TestWatcherMisconfiguredGuard:
+    """Fast degenerate-clean exit guard: trips watcher_misconfigured after N fast-clean exits.
+
+    A 'degenerate clean' exit is one where success=True but the rotation
+    completed in less than watcher_misconfigured_min_rotation_secs seconds
+    (indicating an empty queue, SKILL.md drift, or misconfigured env).
+    """
+
+    @pytest.mark.asyncio
+    async def test_fast_clean_exit_appends_degenerate_deque(self, tmp_path: Path) -> None:
+        """A fast clean exit (duration < min_rotation_secs) appends to _watcher_degenerate_clean_exits."""
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,  # disable trip during this test
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        # Rotation duration 1.0s — well under default 120s threshold
+        t0 = _time_mod.monotonic()
+        time_seq = iter([t0, t0 + 1.0])  # start, end for one rotation
+
+        def fake_monotonic() -> float:
+            try:
+                return next(time_seq)
+            except StopIteration:
+                return t0 + 1.0
+
+        rotation_calls = 0
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert len(h._watcher_degenerate_clean_exits) == 1, (
+            f'Expected 1 degenerate-clean entry after fast rotation; '
+            f'got {len(h._watcher_degenerate_clean_exits)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_slow_clean_exit_does_not_append(self, tmp_path: Path) -> None:
+        """A slow clean exit (duration >= min_rotation_secs) does NOT append to the degenerate deque."""
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_misconfigured_clean_exits': 99,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        # Rotation duration 200s — above the 120s threshold
+        t0 = _time_mod.monotonic()
+        time_seq = iter([t0, t0 + 200.0])  # start, end for one rotation
+
+        def fake_monotonic() -> float:
+            try:
+                return next(time_seq)
+            except StopIteration:
+                return t0 + 200.0
+
+        rotation_calls = 0
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert len(h._watcher_degenerate_clean_exits) == 0, (
+            f'Expected 0 degenerate-clean entries for slow rotation; '
+            f'got {len(h._watcher_degenerate_clean_exits)}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-13: Wiring — __init__ attrs + run() source guard
 # ---------------------------------------------------------------------------
 
