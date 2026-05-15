@@ -2763,6 +2763,21 @@ Output JSON matching the schema. Every task must appear in the output.
                 and not bool(getattr(result, 'timed_out', False))
             )
 
+            # Best-effort digest check after each rotation (task 1327).
+            # Single call site — applies to both clean and unclean paths.
+            # Never allowed to break the supervisor: CancelledError re-raised,
+            # every other exception logged and swallowed.
+            try:
+                await self._maybe_write_digest()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    '_maybe_write_digest raised unexpectedly in supervisor loop '
+                    '(best-effort swallowed)',
+                    exc_info=True,
+                )
+
             if clean:
                 # Healthy rotation completed — reset backoff.
                 # Enforce a minimum floor between rotations even on clean exit:
