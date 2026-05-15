@@ -78,10 +78,7 @@ def _is_specced(call: ast.Call) -> bool:
     if call.args:
         # First positional parameter of MagicMock IS spec.
         return True
-    for kw in call.keywords:
-        if kw.arg in ('spec', 'spec_set'):
-            return True
-    return False
+    return any(kw.arg in ('spec', 'spec_set') for kw in call.keywords)
 
 
 # Exemption comment regex.

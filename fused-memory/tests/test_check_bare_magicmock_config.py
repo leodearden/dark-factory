@@ -219,7 +219,7 @@ _CLEAN_SOURCE = (
 )
 
 
-def _assert_violation_output(stdout: str, bad_file: 'Path') -> None:
+def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     """Assert that checker stdout matches the violation-report contract.
 
     Checks: full bad_file path present, mock_orch_config present,
