@@ -89,7 +89,7 @@ class ModuleStats:
 
 
 def _first_component(module: str) -> str:
-    """Return the first path component (matching how for_module dispatches)."""
+    """Return the first path component (groups by top-level path component for analytics)."""
     return module.strip('/').split('/', 1)[0] if module else ''
 
 

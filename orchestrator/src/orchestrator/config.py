@@ -852,11 +852,31 @@ class OrchestratorConfig(BaseSettings):
         return self
 
     def for_module(self, module_path: str) -> ModuleConfig | None:
-        """Return ModuleConfig matching the first path component, or None."""
+        """Return the ModuleConfig whose registered prefix is the longest (deepest) match
+        for *module_path*, or None if no registered prefix matches at all.
+
+        Resolution walks candidate prefixes from the full normalised path inward
+        (``foo/bar/baz`` → ``foo/bar`` → ``foo``) and returns the first registered
+        match — i.e. the deepest/most-specific config wins.
+
+        This ensures coherence across all three consumers:
+        - ``verify.py`` (iterates ``module_configs.values()``)
+        - ``scheduler._limit_for`` (passes ``normalize_lock(module, lock_depth)`` —
+          exactly a depth-``lock_depth`` path like ``foo/bar``)
+        - ``workflow._resolve_module_configs`` (passes normalized module lock paths)
+
+        Backwards-compatible: single-segment prefixes resolve identically to before
+        because the deepest candidate that matches is still the first path component.
+        """
         if not self._module_configs:
             return None
-        first = module_path.strip('/').split('/')[0]
-        return self._module_configs.get(first)
+        parts = module_path.strip('/').split('/')
+        for i in range(len(parts), 0, -1):
+            candidate = '/'.join(parts[:i])
+            result = self._module_configs.get(candidate)
+            if result is not None:
+                return result
+        return None
 
     @property
     def overrides_db_path(self) -> Path:
