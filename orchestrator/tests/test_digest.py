@@ -6,6 +6,7 @@ Task 1327 — AFK hardening: Per-N-escalation digest + EWA escalation/done trip.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from datetime import UTC, timedelta
@@ -231,31 +232,68 @@ class TestCountDoneInWindow:
         )
         assert count == 2, f"Expected 2 done in window; got {count}"
 
-    def test_missing_db_returns_zero(self, tmp_path: Path) -> None:
+    def test_missing_db_returns_zero(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         """Non-existent DB returns 0 (fail-open) and does NOT create a stub file."""
         db_path = tmp_path / 'no-such.db'
-        count = digest.count_done_in_window(
-            db_path,
-            '2026-05-10T00:00:00+00:00',
-            '2026-05-10T23:59:59+00:00',
-        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
+            count = digest.count_done_in_window(
+                db_path,
+                '2026-05-10T00:00:00+00:00',
+                '2026-05-10T23:59:59+00:00',
+            )
         assert count == 0, f"Expected 0 for missing DB; got {count}"
         assert not db_path.exists(), "count_done_in_window must not create a stub DB file"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
+        assert not warnings, f"Missing DB must not WARNING; got: {[r.message for r in warnings]}"
 
-    def test_schema_missing_returns_zero(self, tmp_path: Path) -> None:
-        """DB file exists but has no 'events' table — returns 0 (fail-open)."""
+    def test_schema_missing_returns_zero(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """DB file exists but has no 'events' table — returns 0 (fail-open) with WARNING."""
         db_path = tmp_path / 'schema-less.db'
         # Create a real but schema-less SQLite file (no EventStore setup).
         conn = sqlite3.connect(str(db_path))
         conn.close()
         assert db_path.exists(), "pre-condition: file must exist"
 
-        count = digest.count_done_in_window(
-            db_path,
-            '2026-05-10T00:00:00+00:00',
-            '2026-05-10T23:59:59+00:00',
-        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
+            count = digest.count_done_in_window(
+                db_path,
+                '2026-05-10T00:00:00+00:00',
+                '2026-05-10T23:59:59+00:00',
+            )
         assert count == 0, f"Expected 0 for schema-less DB; got {count}"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
+        assert len(warnings) == 1, f"Schema-missing must WARNING exactly once; got {len(warnings)}: {[r.message for r in warnings]}"
+
+    def test_missing_db_independent_of_sqlite_message_wording(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Missing-DB detection must not rely on SQLite error wording.
+
+        Simulates a future SQLite version where the error message is different
+        (e.g. 'could not open database' instead of 'unable to open database file').
+        The structural Path.exists() check must short-circuit before connect is
+        ever called, so the non-matching wording never reaches the brittle match.
+        """
+        db_path = tmp_path / 'no-such.db'
+        assert not db_path.exists(), "pre-condition: file must not exist"
+
+        def _raise_non_matching(*args: object, **kwargs: object) -> None:
+            raise sqlite3.OperationalError('could not open database')
+
+        monkeypatch.setattr(sqlite3, 'connect', _raise_non_matching)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
+            count = digest.count_done_in_window(
+                db_path,
+                '2026-05-10T00:00:00+00:00',
+                '2026-05-10T23:59:59+00:00',
+            )
+        assert count == 0, f"Expected 0 for missing DB; got {count}"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
+        assert not warnings, f"Missing-DB detection must not depend on SQLite error wording; got: {[r.message for r in warnings]}"
 
     def test_empty_window_returns_zero(self, tmp_path: Path) -> None:
         """Window with no matching rows returns 0."""
@@ -268,6 +306,27 @@ class TestCountDoneInWindow:
             '2026-05-01T23:59:59+00:00',
         )
         assert count == 0, f"Expected 0 for empty window; got {count}"
+
+    def test_relative_path_resolves_to_absolute(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Relative path with existing DB resolves correctly — no WARNING, correct count."""
+        db_path = tmp_path / 'events.db'
+        _seed_events_db_direct(db_path)
+        monkeypatch.chdir(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
+            count = digest.count_done_in_window(
+                Path('events.db'),
+                '2026-05-10T00:00:00+00:00',
+                '2026-05-10T23:59:59+00:00',
+            )
+        assert count == 2, f"Expected 2 done in window via relative path; got {count}"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
+        assert not warnings, f"Relative path with existing DB must not WARNING; got: {[r.message for r in warnings]}"
 
 
 # ---------------------------------------------------------------------------
