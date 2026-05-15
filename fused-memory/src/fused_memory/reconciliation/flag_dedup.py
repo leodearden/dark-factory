@@ -55,8 +55,8 @@ the number of outage cycles (transient Mem0 failures) and is expected to
 remain far below 50; the self-healing property still holds over multiple
 cycles.
 
-Post-write confirmation (task-1400)
-------------------------------------
+Post-write confirmation (task-1400, corrected in task-1400 step-15)
+--------------------------------------------------------------------
 ``add_memory`` returns an id in ``memory_ids``, but Mem0 may store the content
 under a DIFFERENT canonical id.  ``confirm_marker_persisted`` performs a
 read-back search immediately after each write to verify the marker is
@@ -65,6 +65,16 @@ read-back search immediately after each write to verify the marker is
 miss it logs a WARNING and retries the search exactly once; returns ``None``
 after a failed retry, never raises.  The HIT-branch prior-deletion gate and
 the MISS-branch no-op WARNING are both driven off this confirmed id.
+
+Confirmation kind filter is intentionally ASYMMETRIC with the pre-write dedup
+search (design decision #6): it additionally includes ``run_id`` (the current
+run's id) so that surviving priors from earlier runs cannot masquerade as
+confirmation of the current write.  The two searches have different jobs:
+the pre-write dedup search asks "does ANY prior exist across all runs?"
+(must be run_id-agnostic); the confirmation search asks "did MY write for
+THIS run land?" (must be run_id-scoped).  Scoping confirmation by run_id is
+correct on both paths — HIT (new marker run_id=current matches; priors'
+older run_ids do not) and MISS (new marker still matches).
 
 Public API
 ----------
@@ -127,14 +137,21 @@ async def confirm_marker_persisted(
 
     Addresses the root-cause ID-mismatch bug: ``add_memory`` returns an id in
     ``memory_ids``, but Mem0 may store the content under a DIFFERENT canonical
-    id.  This helper performs a confirmation search using the same query and
-    kind-filter semantics as the next cycle's pre-write dedup search, so the
-    id it returns is the one the next cycle will actually find.
+    id.  This helper returns the CANONICAL id from ``MemoryResult.id`` — not
+    the unverified ``response.memory_ids[0]``.
+
+    The confirmation kind filter includes ``run_id`` (the current run) so that
+    surviving priors from earlier runs cannot masquerade as confirmation of this
+    write.  This is intentionally ASYMMETRIC with the pre-write dedup search
+    (which omits ``run_id`` so it can find priors from any earlier run).
+    The two searches have different jobs:
+
+    - Pre-write dedup: "does ANY prior exist across all runs?" → run_id-agnostic.
+    - Confirmation:    "did MY write for THIS run land?"       → run_id-scoped.
 
     Strategy:
-    1. Run a confirmation search via ``find_prior_memories`` with the same query
-       and ``kind={'source':'stage1_flag_marker','flag_type':flag_type}`` as
-       the pre-write dedup search (symmetry guarantee).
+    1. Run a confirmation search via ``find_prior_memories`` with
+       ``kind={'source':'stage1_flag_marker','flag_type':flag_type,'run_id':run_id}``.
     2. If a match is found, return ``match.id`` (the canonical id).
     3. On a miss, log a WARNING (task_id + flag_type) and retry the search once.
     4. Return the retry's first match id if found; otherwise log a final WARNING
@@ -147,7 +164,8 @@ async def confirm_marker_persisted(
         project_id: Project scope forwarded to ``find_prior_memories``.
         task_id: Task identifier (str-coerced by ``find_prior_memories``).
         flag_type: Flag type; used in both the ``kind`` filter and the WARNING.
-        run_id: Current run identifier; included in WARNING messages for tracing.
+        run_id: Current run identifier; scoped into the kind filter so only
+             the marker written by THIS run is returned (not stale priors).
         log: Logger to use (should be the ``flag_dedup`` module logger so
              caplog-based tests can capture WARNINGs under the right namespace).
 
@@ -157,7 +175,12 @@ async def confirm_marker_persisted(
     """
     try:
         query = f'stage1 flag marker task {task_id} type {flag_type}'
-        kind = {'source': 'stage1_flag_marker', 'flag_type': flag_type}
+        # run_id is included so that stale priors from earlier runs do NOT match.
+        # Intentionally asymmetric with the pre-write dedup search (which omits
+        # run_id to find priors from any earlier run).  The confirmation's job is
+        # 'did MY write for THIS run land?' — a prior from an older run must not
+        # masquerade as confirmation of the current write.
+        kind = {'source': 'stage1_flag_marker', 'flag_type': flag_type, 'run_id': run_id}
 
         matches = await find_prior_memories(
             memory_service,
