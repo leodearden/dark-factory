@@ -364,12 +364,15 @@ async def dedup_flags(
 
             # (2) Write replacement marker first.  If this fails, skip the
             #     delete so all priors remain intact for next cycle.
-            #     Also check that Mem0 actually persisted the write (non-empty
-            #     memory_ids); a silent no-op (empty memory_ids) skips deletion
-            #     so priors are preserved for the next cycle.
-            write_succeeded = False
+            #     After writing, confirm the marker is findable via a read-back
+            #     search (task-1400): add_memory may return a different id than
+            #     the one Mem0 actually stores.  Only a confirmed canonical id
+            #     proves the new marker is findable by the next cycle's search.
+            #     An unconfirmed write (write exception OR confirmation miss)
+            #     preserves priors for next cycle (best-effort at-least-one-marker).
+            confirmed_id: str | None = None
             try:
-                response = await memory_service.add_memory(
+                await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -383,12 +386,18 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                if getattr(response, 'memory_ids', None):
-                    write_succeeded = True
-                else:
+                confirmed_id = await confirm_marker_persisted(
+                    memory_service,
+                    project_id=project_id,
+                    task_id=tid,
+                    flag_type=ftype,
+                    run_id=run_id,
+                    log=logger,
+                )
+                if confirmed_id is None:
                     logger.warning(
-                        'flag_dedup: add_memory returned no memory_ids on HIT for task %s'
-                        ' flag_type %s — skipping prior deletion',
+                        'flag_dedup: replacement marker for task %s flag_type %s could not'
+                        ' be confirmed findable — skipping prior deletion',
                         tid, ftype,
                     )
             except Exception as e:
@@ -397,9 +406,13 @@ async def dedup_flags(
                     tid, ftype, e,
                 )
 
-            # (3) Delete ALL priors only if the new marker was successfully written.
+            # (3) Delete ALL priors only if the new marker was confirmed FINDABLE.
+            #     Gating on confirmed findability (not just memory_ids non-empty)
+            #     prevents a write whose returned id differs from the canonical id
+            #     from wiping priors with nothing recoverable next cycle.
             #     Each delete is wrapped individually so one bad delete does not
             #     abort the batch (self-healing: leftovers are retried next cycle).
+            write_succeeded = confirmed_id is not None
             if write_succeeded:
                 for prior in priors:
                     try:

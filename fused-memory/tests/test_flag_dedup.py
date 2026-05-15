@@ -159,7 +159,10 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     prior_marker.id = 'prior-42'
 
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    # task-1400: supply side_effect list for the post-write confirmation search.
+    # [suppression=[], pre-write HIT=[prior], confirmation=[prior]] — confirmation
+    # finds the prior (same metadata) → confirmed_id = prior_marker.id → delete proceeds.
+    memory_service.search = AsyncMock(side_effect=[[], [prior_marker], [prior_marker]])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -177,10 +180,10 @@ async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
     assert result[0]['persisted_from_run'] == 'r0'
     assert result[0]['last_seen_run_id'] == 'r1'
 
-    # (b) search was called twice: once for the suppression filter (filter_suppressed)
-    #     and once for the per-flag prior-marker lookup.  call_args refers to the last
-    #     call (per-flag), which must contain project_id='p' and mention task_id+flag_type.
-    assert memory_service.search.call_count == 2  # 1 suppression + 1 per-flag
+    # (b) search was called 3 times: suppression filter + per-flag prior-marker + confirmation.
+    #     call_args refers to the LAST call (confirmation search), which must mention
+    #     task_id+flag_type and use project_id='p'.
+    assert memory_service.search.call_count == 3  # 1 suppression + 1 per-flag + 1 confirmation
     # project_id must be passed as a kwarg (production code uses kwargs throughout)
     assert memory_service.search.call_args.kwargs['project_id'] == 'p'
     # query must strictly mention both the task_id and the flag_type (no permissive 'or')
@@ -1054,8 +1057,18 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
     else:
         response = AddMemoryResponse(memory_ids=['new-marker-id'])
 
+    # task-1400: switch to side_effect so confirmation search is explicit.
+    # 'empty': add_memory is a no-op → confirmation misses (no new findable marker)
+    #          → confirmed_id=None → write_succeeded=False → delete skipped.
+    # 'non_empty': add_memory wrote a marker → confirmation finds the prior marker
+    #              (same metadata still present) → confirmed_id set → delete proceeds.
+    if add_memory_response == 'empty':
+        search_side_effect = [[], [prior_marker], [], []]  # conf miss + retry miss
+    else:
+        search_side_effect = [[], [prior_marker], [prior_marker]]  # conf finds marker
+
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[prior_marker])
+    memory_service.search = AsyncMock(side_effect=search_side_effect)
     memory_service.add_memory = AsyncMock(return_value=response)
     memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1078,15 +1091,15 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
     memory_service.add_memory.assert_called_once()
 
     if expect_delete:
-        # Non-empty memory_ids: delete should proceed
+        # Confirmation succeeded: delete should proceed
         memory_service.delete_memory.assert_called_once()
         del_kwargs = memory_service.delete_memory.call_args.kwargs
         assert del_kwargs.get('memory_id') == 'prior-hit-resp-test'
     else:
-        # Empty memory_ids: delete must be skipped
+        # Confirmation missed (no findable marker): delete must be skipped
         memory_service.delete_memory.assert_not_called()
 
-    # Check WARNING for no-op case
+    # Check WARNING for no-op case (task-1400: WARNING now comes from confirmation failure)
     warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     if expect_noop_warning:
         assert any('42' in m for m in warning_messages), (
@@ -1096,10 +1109,10 @@ async def test_dedup_flags_hit_respects_add_memory_response_memory_ids(
             f'Expected WARNING mentioning flag_type but got: {warning_messages}'
         )
     else:
-        # No no-op warning expected when memory_ids is non-empty
+        # No no-op warning expected when confirmation succeeded
         noop_warnings = [m for m in warning_messages if 'no memory_ids' in m or 'returned no memory_ids' in m]
         assert not noop_warnings, (
-            f'Unexpected no-op WARNING on non-empty memory_ids path: {noop_warnings}'
+            f'Unexpected no-op WARNING on confirmed path: {noop_warnings}'
         )
 
 
