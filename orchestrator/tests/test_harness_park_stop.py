@@ -1311,3 +1311,119 @@ class TestHarnessEwaTrip:
             'Scheduler must not be paused when EWA is below threshold'
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestWatcherSupervisorCallsMaybeWriteDigest (step-23)
+# ---------------------------------------------------------------------------
+
+
+class TestWatcherSupervisorCallsMaybeWriteDigest:
+    """Tests that _watcher_supervisor_loop calls _maybe_write_digest after each rotation.
+
+    Task 1327 — AFK hardening (step-24 impl).
+    """
+
+    @pytest.mark.asyncio
+    async def test_clean_exit_triggers_maybe_write_digest(self, tmp_path: Path) -> None:
+        """A clean rotation exit causes _maybe_write_digest to be awaited."""
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness._maybe_write_digest = AsyncMock()
+
+        # First rotation: clean exit. Second rotation: CancelledError (stops loop).
+        rotation_count = 0
+
+        async def fake_rotation():
+            nonlocal rotation_count
+            rotation_count += 1
+            if rotation_count == 1:
+                return MagicMock(success=True, timed_out=False)
+            raise asyncio.CancelledError()
+
+        harness._run_watcher_rotation = fake_rotation
+
+        async def fast_sleep(_secs):
+            pass  # no-op — skip real delays
+
+        with patch('asyncio.sleep', side_effect=fast_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await harness._watcher_supervisor_loop()
+
+        harness._maybe_write_digest.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unclean_exit_also_triggers_maybe_write_digest(
+        self, tmp_path: Path
+    ) -> None:
+        """An unclean rotation exit (success=False) also causes _maybe_write_digest to run.
+
+        Quiet days where the watcher crashes must not silence the digest.
+        """
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness._maybe_write_digest = AsyncMock()
+
+        # First rotation: unclean. Second rotation: CancelledError (stops loop).
+        rotation_count = 0
+
+        async def fake_rotation():
+            nonlocal rotation_count
+            rotation_count += 1
+            if rotation_count == 1:
+                return MagicMock(success=False, timed_out=False)
+            raise asyncio.CancelledError()
+
+        harness._run_watcher_rotation = fake_rotation
+
+        async def fast_sleep(_secs):
+            pass  # no-op
+
+        with patch('asyncio.sleep', side_effect=fast_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await harness._watcher_supervisor_loop()
+
+        harness._maybe_write_digest.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_maybe_write_digest_raising_does_not_break_supervisor(
+        self, tmp_path: Path
+    ) -> None:
+        """_maybe_write_digest raising must not kill the watcher supervisor loop.
+
+        The supervisor must continue to the next rotation after a digest failure.
+        """
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        # Replace with a raising async mock to simulate digest failure.
+        harness._maybe_write_digest = AsyncMock(side_effect=RuntimeError('digest failure'))
+
+        # First rotation: success (digest raises but is swallowed). Second: CancelledError.
+        rotation_count = 0
+
+        async def fake_rotation():
+            nonlocal rotation_count
+            rotation_count += 1
+            if rotation_count == 1:
+                return MagicMock(success=True, timed_out=False)
+            raise asyncio.CancelledError()
+
+        harness._run_watcher_rotation = fake_rotation
+
+        async def fast_sleep(_secs):
+            pass  # no-op
+
+        with patch('asyncio.sleep', side_effect=fast_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await harness._watcher_supervisor_loop()
+
+        # Supervisor ran two rotations — proving it continued past the digest failure.
+        assert rotation_count == 2, (
+            f'Supervisor must loop to next rotation after digest failure; '
+            f'rotation_count={rotation_count}'
+        )
+        # _maybe_write_digest was called once (on the first rotation).
+        harness._maybe_write_digest.assert_awaited_once()
