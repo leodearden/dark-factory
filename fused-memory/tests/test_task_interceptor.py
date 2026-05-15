@@ -6040,6 +6040,12 @@ async def test_persist_worker_terminal_orphan_race_emits_warning(
             f'Expected WARNING to contain "orphan-race:" but got: {r.message!r}'
         )
 
+    # WARNING must include the caller label so per-caller grep patterns work
+    for r in warning_records:
+        assert 'caller=unit_test' in r.message, (
+            f'Expected WARNING to contain "caller=unit_test" but got: {r.message!r}'
+        )
+
 
 @pytest.mark.asyncio
 async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
