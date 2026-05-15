@@ -461,7 +461,7 @@ class TestRenderDigestMarkdown:
         """Tasks done in window count is rendered."""
         md = digest.render_digest_markdown(_make_digest_inputs())
         assert '## Tasks done in window' in md
-        assert '5' in md  # done_count
+        assert '## Tasks done in window\n5\n' in md  # done_count anchored to section header
 
     def test_cost_section(self) -> None:
         """Cost section includes watcher and total figures for window and 24h."""
