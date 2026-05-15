@@ -119,9 +119,12 @@ def restart_unit(unit: str) -> None:
 
     # Always run reset-failed regardless of stop outcome so a rate-limited unit
     # (StartLimitBurst exhausted) can be recovered even after the timeout path.
-    subprocess.run(
-        ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
-    )
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        log(f"systemctl reset-failed {unit} timed out after 10s")
 
     try:
         subprocess.run(
