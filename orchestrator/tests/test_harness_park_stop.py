@@ -734,3 +734,51 @@ class TestHarnessCostCeiling:
         )
         # Original pause reason must be preserved
         assert harness.scheduler.pause_reason == 'pre-existing-pause'
+
+    # ------------------------------------------------------------------
+    # Step 11 — integration contract: trip → pause → acquire_next returns None
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_cost_ceiling_trip_acquire_next_returns_none(
+        self, tmp_path: Path
+    ) -> None:
+        """After _enforce_cost_ceilings trips, acquire_next() returns None.
+
+        Proves the trip→pause→no-dispatch chain end-to-end via the task-1322
+        machinery (scheduler.is_paused short-circuits acquire_next()), without
+        needing the full MCP-dependent Harness.run().  Task 1323.
+        """
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=5.0,   # will be exceeded
+            orch_daily_cost_ceiling_usd=1000.0,
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-e2e-ceil-0001'
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        # Seed watcher row exceeding ceiling.
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='dark_factory',
+            account_name='acct', model='opus', role='escalation-watcher-auto',
+            cost_usd=10.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+
+        # Trip the ceiling.
+        await harness._enforce_cost_ceilings()
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_reason == 'cost_ceiling_watcher_exceeded'
+
+        # The task-1322 machinery: acquire_next() must return None when paused.
+        result = await harness.scheduler.acquire_next()
+        assert result is None, (
+            f'acquire_next() must return None after cost-ceiling trip; got {result!r}'
+        )
