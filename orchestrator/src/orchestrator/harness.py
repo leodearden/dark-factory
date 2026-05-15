@@ -622,6 +622,12 @@ class Harness:
                     self._collect_done_reports(done, task_reports)
                     continue
 
+                # Check daily cost ceilings before dispatching the next task.
+                # On breach, pause_scheduler() is called and acquire_next()
+                # returns None (task-1322 machinery), draining in-flight work
+                # and exiting the run loop cleanly.  Task 1323.
+                await self._enforce_cost_ceilings()
+
                 assignment = await self.scheduler.acquire_next()
 
                 if assignment is None:
@@ -2001,6 +2007,109 @@ Output JSON matching the schema. Every task must appear in the output.
                 exc,
             )
             return 0.0
+
+    async def _trailing_24h_cost_usd(self, *, watcher_only: bool) -> float:
+        """Sum cost_usd from the invocations table for the trailing 24 hours.
+
+        When ``watcher_only=True``, restricts to rows whose role matches
+        ``LIKE '%watcher%'`` (e.g. 'escalation-watcher-auto').  When
+        ``watcher_only=False``, sums all roles.
+
+        Mirrors ``_auto_eval_budget_used_24h`` in structure: guards on
+        ``cost_store is None``, and swallows query exceptions so a transient
+        DB error never blocks dispatch.  Task 1323.
+        """
+        if self.cost_store is None:
+            return 0.0
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        try:
+            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
+            if watcher_only:
+                cur = await conn.execute(
+                    'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+                    'WHERE completed_at >= ? AND role LIKE ?',
+                    (cutoff, '%watcher%'),
+                )
+            else:
+                cur = await conn.execute(
+                    'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+                    'WHERE completed_at >= ?',
+                    (cutoff,),
+                )
+            row = await cur.fetchone()
+            await cur.close()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '_trailing_24h_cost_usd(watcher_only=%s): query failed (%s) — assume zero',
+                watcher_only, exc,
+            )
+            return 0.0
+
+    async def _enforce_cost_ceilings(self) -> None:
+        """Check daily cost ceilings and pause the scheduler on breach.
+
+        Runs every dispatch-loop tick (Harness.run()) immediately before
+        ``scheduler.acquire_next()``.  Two checks, evaluated in order:
+
+        1. Watcher ceiling (early warning): trailing-24h cost for
+           invocations with ``role LIKE '%watcher%'`` vs
+           ``config.watcher_daily_cost_ceiling_usd``.
+        2. Orch-wide ceiling (safety net): trailing-24h cost for ALL
+           invocations vs ``config.orch_daily_cost_ceiling_usd``.
+
+        The first ceiling that trips wins.  When the scheduler is already
+        paused (from any source), returns immediately to avoid redundant
+        RunStore writes and duplicate log spam.
+
+        Both totals are fetched in a single query using conditional aggregation
+        (``SUM(CASE WHEN role LIKE '%watcher%' THEN cost_usd END)``) so the
+        invocations table is scanned at most once per tick.  On any DB error the
+        method returns immediately without pausing (fail-open: a transient
+        query failure must never stop dispatch).  Task 1323.
+        """
+        if self.scheduler.is_paused:
+            return
+        if self.cost_store is None:
+            return
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        try:
+            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
+            cur = await conn.execute(
+                'SELECT '
+                '  COALESCE(SUM(cost_usd), 0.0), '
+                '  COALESCE(SUM(CASE WHEN role LIKE ? THEN cost_usd END), 0.0) '
+                'FROM invocations '
+                'WHERE completed_at >= ?',
+                ('%watcher%', cutoff),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            total = float(row[0]) if row and row[0] is not None else 0.0
+            watcher = float(row[1]) if row and row[1] is not None else 0.0
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '_enforce_cost_ceilings: cost query failed (%s) — skip ceiling check',
+                exc,
+            )
+            return
+
+        if watcher >= self.config.watcher_daily_cost_ceiling_usd:
+            logger.warning(
+                '_enforce_cost_ceilings: watcher 24h cost $%.2f >= ceiling $%.2f '
+                '— pausing scheduler',
+                watcher, self.config.watcher_daily_cost_ceiling_usd,
+            )
+            await self.pause_scheduler('cost_ceiling_watcher_exceeded')
+            return
+
+        if total >= self.config.orch_daily_cost_ceiling_usd:
+            logger.warning(
+                '_enforce_cost_ceilings: orch-wide 24h cost $%.2f >= ceiling $%.2f '
+                '— pausing scheduler',
+                total, self.config.orch_daily_cost_ceiling_usd,
+            )
+            await self.pause_scheduler('cost_ceiling_orch_exceeded')
 
     @staticmethod
     def _extract_task_id(submit_result: Any) -> str | None:
