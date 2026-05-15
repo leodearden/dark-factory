@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1793,3 +1795,146 @@ class TestBuildFailureMessage:
             assert msg.startswith(f'{label} failed: '), (
                 f'Expected message to start with {label!r} + " failed: ", got {msg[:100]!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Periodic cap_wait log
+# ---------------------------------------------------------------------------
+
+_PERIODIC_SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
+_PERIODIC_INVOKE_PATCH = 'shared.cli_invoke.invoke_claude_agent'
+
+
+@pytest.mark.asyncio
+class TestCapWaitPeriodicLog:
+    """Periodic structured cap_wait JSON line emitted during exact-detect cap-hit waits.
+
+    Verifies: JSON structure and keys, task_id field, soonest_open_at (from
+    UsageGate.soonest_resets_at), and ~10-min throttling (600 s window).
+    RED until step-8 adds the logging logic.
+    """
+
+    def _exact_hit_gate(self, hits: int, *, soonest_resets_at=None) -> MagicMock:
+        """Gate mock: detect_cap_hit=True for *hits* calls, then False (success)."""
+        gate = make_gate_mock(
+            detect_cap_hit=MagicMock(side_effect=[True] * hits + [False]),
+        )
+        gate.soonest_resets_at = soonest_resets_at
+        return gate
+
+    async def test_cap_wait_json_line_emitted_on_first_hit(self, caplog):
+        """First exact-detect cap hit emits a cap_wait JSON line at WARNING level."""
+        gate = self._exact_hit_gate(hits=1)
+
+        with (
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, 'my-task', prompt='hi', cap_wait_sanity_secs=None)
+
+        cap_wait_lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        assert cap_wait_lines, f'Expected cap_wait log line; got messages: {caplog.messages}'
+        data = json.loads(cap_wait_lines[0])
+        assert data['event'] == 'cap_wait'
+        assert 'task_id' in data
+        assert 'elapsed_s' in data
+        assert 'soonest_open_at' in data
+        assert 'next_probe_in_s' in data
+
+    async def test_cap_wait_task_id_matches_label(self, caplog):
+        """task_id in the cap_wait line equals the label argument to invoke_with_cap_retry."""
+        gate = self._exact_hit_gate(hits=1)
+        label = 'task-99-architect'
+
+        with (
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, label, prompt='hi', cap_wait_sanity_secs=None)
+
+        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        assert lines
+        assert json.loads(lines[0])['task_id'] == label
+
+    async def test_cap_wait_soonest_open_at_is_iso_of_gate_resets_at(self, caplog):
+        """soonest_open_at is the ISO-8601 string of gate.soonest_resets_at when known."""
+        reset_dt = datetime(2025, 6, 1, 8, 0, 0, tzinfo=UTC)
+        gate = self._exact_hit_gate(hits=1, soonest_resets_at=reset_dt)
+
+        with (
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, 'task-x', prompt='hi', cap_wait_sanity_secs=None)
+
+        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        assert lines
+        assert json.loads(lines[0])['soonest_open_at'] == reset_dt.isoformat()
+
+    async def test_cap_wait_soonest_open_at_null_when_unknown(self, caplog):
+        """soonest_open_at is null in the JSON when gate.soonest_resets_at is None."""
+        gate = self._exact_hit_gate(hits=1, soonest_resets_at=None)
+
+        with (
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, 'task-x', prompt='hi', cap_wait_sanity_secs=None)
+
+        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        assert lines
+        assert json.loads(lines[0])['soonest_open_at'] is None
+
+    async def test_cap_wait_throttled_single_log_within_600s(self, caplog):
+        """Three consecutive cap hits within a <600 s window emit exactly ONE log line."""
+        gate = self._exact_hit_gate(hits=3)
+
+        with (
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
+            # All monotonic calls return 0.0 — time never advances, throttle stays active
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, 'task', prompt='hi', cap_wait_sanity_secs=None)
+
+        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        assert len(lines) == 1, (
+            f'Expected exactly 1 cap_wait log within 600 s window, got {len(lines)}: {lines}'
+        )
+
+    async def test_cap_wait_second_log_after_600s(self, caplog):
+        """A second cap_wait log is emitted after >=600 s have elapsed since the first."""
+        gate = self._exact_hit_gate(hits=3)
+
+        # Supply enough monotonic values for up to 2 time.monotonic() calls per cap hit:
+        #   initial  retry_start = 0.0
+        #   hit-1 (up to 2 calls): 0.0   → now=0.0, log emitted (last=0.0)
+        #   hit-2 (up to 2 calls): 300.0 → 300−0=300 < 600 → throttled
+        #   hit-3 (up to 2 calls): 700.0 → 700−0=700 ≥ 600 → log emitted
+        monotonic_vals = itertools.chain(
+            [0.0, 0.0, 0.0, 300.0, 300.0, 700.0, 700.0],
+            itertools.repeat(700.0),
+        )
+
+        with (
+            patch(_PERIODIC_INVOKE_PATCH, new_callable=AsyncMock, return_value=_make_result()),
+            patch(_PERIODIC_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_vals),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, 'task', prompt='hi', cap_wait_sanity_secs=None)
+
+        lines = [l for l in caplog.messages if '"event"' in l and 'cap_wait' in l]
+        assert len(lines) == 2, (
+            f'Expected 2 cap_wait logs (first at t=0, second after t=700), '
+            f'got {len(lines)}: {lines}'
+        )
