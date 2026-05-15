@@ -103,15 +103,7 @@ def _assume_utc(dt: datetime) -> datetime:
     """Return *dt* with UTC timezone attached if it is naive; return *dt* unchanged otherwise.
 
     Centralises the ``"naive datetimes from our journal/Mem0 are UTC"`` convention so
-    that the assumed-timezone behaviour has a single source of truth.  All three
-    call sites in this module — ``run_window_start`` and ``parsed`` inside
-    :func:`_marker_is_within_run_window`, and ``started_at`` inside
-    :meth:`~TaskKnowledgeSyncStage.assemble_payload` — delegate here.
-
-    The :func:`_marker_is_within_run_window` function calls this helper for
-    **both** arguments as defence-in-depth even though
-    :meth:`~TaskKnowledgeSyncStage.assemble_payload` already normalises
-    ``run_window_start`` before passing it in (task-1383 Amendment 2).
+    that the assumed-timezone behaviour has a single source of truth.
     """
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
