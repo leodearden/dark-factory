@@ -445,6 +445,18 @@ class TestModuleConfigDiscovery:
             f"got: {[r.getMessage() for r in pruned_warnings]}"
         )
 
+    def test_nested_module_helper_registers_prefix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Shared helper _load_config_with_nested_module must register the nested
+        prefix in config._module_configs so the depth-boundary tests are non-vacuous.
+        """
+        config = _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar')
+        assert 'foo/bar' in config._module_configs, (
+            "Helper must register 'foo/bar' via _discover_module_configs; "
+            "if this fails the boundary tests silently pass even when discovery is broken"
+        )
+
     def test_load_config_warns_when_module_prefix_deeper_than_lock_depth(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ):
