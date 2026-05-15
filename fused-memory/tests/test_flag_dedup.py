@@ -3636,3 +3636,158 @@ class TestMarkerQuery:
         assert m.groups() == (tid, ftype), (
             f'Regex groups {m.groups()!r} != ({tid!r}, {ftype!r})'
         )
+
+
+# ---------------------------------------------------------------------------
+# _write_and_confirm_marker helper (step-4 / step-5)
+# ---------------------------------------------------------------------------
+
+
+import logging as _logging_mod  # noqa: E402 — needed for caplog logger name
+
+
+@pytest.mark.asyncio
+class TestWriteAndConfirmMarker:
+    """Unit tests for the _write_and_confirm_marker module-level helper."""
+
+    async def test_writes_canonical_payload_and_delegates_to_confirm_and_track(self, caplog):
+        """Helper writes canonical payload and forwards result from confirm_and_track."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        memory_service = MagicMock()
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        confirm_calls = []
+
+        async def stub_confirm(response_memory_ids, miss_warning_template, *, tid, ftype):
+            confirm_calls.append((response_memory_ids, miss_warning_template, tid, ftype))
+            return ('canon-id', True)
+
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+        result = await _write_and_confirm_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            tid='42',
+            ftype='missing_deliverable',
+            log=log,
+            confirm_and_track=stub_confirm,
+            miss_warning_template='miss-template-%s-%s',
+        )
+
+        # Return value propagated verbatim from confirm_and_track
+        assert result == ('canon-id', True)
+
+        # add_memory called exactly once with canonical payload
+        memory_service.add_memory.assert_called_once()
+        kwargs = memory_service.add_memory.call_args.kwargs
+        _assert_valid_stage1_marker(kwargs, task_id='42', flag_type='missing_deliverable', run_id='r1')
+        assert kwargs['_source'] == 'stage1_flag_dedup'
+        assert kwargs['causation_id'] == 'r1'
+        assert kwargs['content'] == 'Stage 1 flag marker: task=42 type=missing_deliverable from run=r1'
+
+        # confirm_and_track called with correct args (delegation contract)
+        assert len(confirm_calls) == 1
+        ids, template, c_tid, c_ftype = confirm_calls[0]
+        assert ids == _STUB_ADD_MEMORY_RESPONSE.memory_ids
+        assert template == 'miss-template-%s-%s'
+        assert c_tid == '42'
+        assert c_ftype == 'missing_deliverable'
+
+    async def test_returns_none_false_and_logs_unified_warning_on_add_memory_exception(self, caplog):
+        """On add_memory exception: returns (None, False), logs WARNING, does NOT call confirm_and_track."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        memory_service = MagicMock()
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write blew up'))
+
+        confirm_and_track = AsyncMock()
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+
+        with caplog.at_level(_logging_mod.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await _write_and_confirm_marker(
+                memory_service,
+                project_id='p',
+                run_id='r2',
+                tid='42',
+                ftype='missing_deliverable',
+                log=log,
+                confirm_and_track=confirm_and_track,
+                miss_warning_template='irrelevant',
+            )
+
+        assert result == (None, False)
+        confirm_and_track.assert_not_called()
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= _logging_mod.WARNING]
+        assert len(warning_msgs) == 1
+        assert '42' in warning_msgs[0]
+        assert 'missing_deliverable' in warning_msgs[0]
+        assert 'failed to write marker' in warning_msgs[0]
+
+    async def test_propagates_confirm_and_track_breaker_tripped_return(self):
+        """Propagates (None, True) verbatim — helper does NOT derive write_succeeded from confirmed_id."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        memory_service = MagicMock()
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        async def breaker_tripped_confirm(response_memory_ids, miss_warning_template, *, tid, ftype):
+            # Simulates circuit-breaker tripped: confirmed_id=None, write_succeeded=True
+            return (None, True)
+
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+        result = await _write_and_confirm_marker(
+            memory_service,
+            project_id='p',
+            run_id='r3',
+            tid='77',
+            ftype='overdue_task',
+            log=log,
+            confirm_and_track=breaker_tripped_confirm,
+            miss_warning_template='some-template-%s-%s',
+        )
+
+        # Must propagate the tuple verbatim: (None, True) — not derive from confirmed_id
+        assert result == (None, True)
+
+    async def test_passes_through_breaker_disabled_state_via_closure_arg(self):
+        """Helper does not isolate confirm_and_track between calls — closure state persists."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        memory_service = MagicMock()
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        # Stateful stub: first call returns True, second returns False (state mutation observed)
+        call_counter = [0]
+
+        async def stateful_confirm(response_memory_ids, miss_warning_template, *, tid, ftype):
+            call_counter[0] += 1
+            return (None, call_counter[0] == 1)  # True on 1st call, False on 2nd
+
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+        first = await _write_and_confirm_marker(
+            memory_service,
+            project_id='p',
+            run_id='r4',
+            tid='1',
+            ftype='t',
+            log=log,
+            confirm_and_track=stateful_confirm,
+            miss_warning_template='t-%s-%s',
+        )
+        second = await _write_and_confirm_marker(
+            memory_service,
+            project_id='p',
+            run_id='r4',
+            tid='1',
+            ftype='t',
+            log=log,
+            confirm_and_track=stateful_confirm,
+            miss_warning_template='t-%s-%s',
+        )
+
+        # First call sees counter=1 → write_succeeded=True
+        assert first == (None, True)
+        # Second call sees counter=2 → write_succeeded=False (state mutation visible)
+        assert second == (None, False)
