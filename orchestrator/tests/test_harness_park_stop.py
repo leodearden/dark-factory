@@ -879,3 +879,63 @@ class TestHarnessCostCeiling:
             'Scheduler must NOT be paused when cost query fails (fail-open)'
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
+
+
+class TestDigestConfig:
+    """Tests for the five digest_* config fields on OrchestratorConfig.
+
+    Task 1327 — AFK hardening: Per-N-escalation digest + EWA escalation/done trip.
+    """
+
+    # ------------------------------------------------------------------
+    # Step 1 — config field defaults
+    # ------------------------------------------------------------------
+
+    def test_config_defaults(self, tmp_path: Path) -> None:
+        """OrchestratorConfig exposes the five digest fields with correct defaults."""
+        import math
+
+        config = OrchestratorConfig(project_root=tmp_path)
+
+        assert config.digest_enabled is True, (
+            f'Expected digest_enabled=True; got {config.digest_enabled!r}'
+        )
+        assert config.digest_every_n_escalations == 10, (
+            f'Expected digest_every_n_escalations=10; got {config.digest_every_n_escalations!r}'
+        )
+        assert config.digest_dir == '', (
+            f'Expected digest_dir=\'\' (empty, callers resolve to <project_root>/data/digests/); '
+            f'got {config.digest_dir!r}'
+        )
+        assert config.digest_ewa_alpha == pytest.approx(0.3), (
+            f'Expected digest_ewa_alpha≈0.3; got {config.digest_ewa_alpha!r}'
+        )
+        # Threshold is the reify 23-day baseline mean+2σ; just assert it's a finite
+        # positive float — the exact value can be tuned without breaking this test.
+        assert isinstance(config.digest_ewa_threshold, float), (
+            f'Expected digest_ewa_threshold to be a float; got {type(config.digest_ewa_threshold)}'
+        )
+        assert math.isfinite(config.digest_ewa_threshold), (
+            f'Expected digest_ewa_threshold to be finite; got {config.digest_ewa_threshold!r}'
+        )
+        assert 0.0 < config.digest_ewa_threshold < 1e6, (
+            f'Expected 0 < digest_ewa_threshold < 1e6; got {config.digest_ewa_threshold!r}'
+        )
+
+    def test_config_overridable(self, tmp_path: Path) -> None:
+        """All five digest fields are overridable via constructor kwargs."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_enabled=False,
+            digest_every_n_escalations=25,
+            digest_dir='/tmp/my-digests',
+            digest_ewa_alpha=0.5,
+            digest_ewa_threshold=99.9,
+        )
+        assert config.digest_enabled is False
+        assert config.digest_every_n_escalations == 25
+        assert config.digest_dir == '/tmp/my-digests'
+        assert isinstance(config.digest_ewa_alpha, float)
+        assert config.digest_ewa_alpha == pytest.approx(0.5)
+        assert isinstance(config.digest_ewa_threshold, float)
+        assert config.digest_ewa_threshold == pytest.approx(99.9)
