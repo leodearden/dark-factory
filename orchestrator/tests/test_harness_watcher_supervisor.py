@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness, _WATCHER_TIMEOUT_GRACE_SECS
+from orchestrator.harness import _WATCHER_TIMEOUT_GRACE_SECS, Harness
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
