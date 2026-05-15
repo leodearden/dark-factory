@@ -4,7 +4,6 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
-import re
 import uuid as _uuid_mod
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -13,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fused_memory.models.memory import AddMemoryResponse
-from fused_memory.reconciliation.flag_dedup import build_suppression_payload
+from fused_memory.reconciliation.flag_dedup import _marker_query, build_suppression_payload
 
 _STUB_ADD_MEMORY_RESPONSE = AddMemoryResponse(memory_ids=['stub-id'])
 
@@ -112,12 +111,6 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 # dedup_flags — prior marker found path (step-5)
 # ---------------------------------------------------------------------------
 
-# Compiled once at module load for _make_search_stub dispatch.
-# Mirrors the query templates in flag_dedup.py:191 and :376 — update both if the
-# production query format changes.
-_MARKER_QUERY_RE = re.compile(r'^stage1 flag marker task (\S+) type (\S+)$')
-
-
 def _make_search_stub(
     *,
     suppression: list | None = None,
@@ -132,10 +125,12 @@ def _make_search_stub(
       is the full list returned for that call (e.g. ``suppression=[[rec1], []]``
       means call 1 returns ``[rec1]``, call 2 returns ``[]``).
 
-    * ``query`` matches ``^stage1 flag marker task (\\S+) type (\\S+)$`` — the
-      ``find_prior_memories`` / ``confirm_marker_persisted`` call site.  A single
-      ordered queue per ``(task_id, flag_type)`` key (provided via ``marker``)
-      services ALL calls that share that query:
+    * ``query == _marker_query(tid, ftype)`` for any configured ``(tid, ftype)``
+      key — the ``find_prior_memories`` / ``confirm_marker_persisted`` call site.
+      Dispatch uses equality against ``_marker_query(*key)`` (single source of
+      truth; no regex parsing needed).  A single ordered queue per
+      ``(task_id, flag_type)`` key (provided via ``marker``) services ALL calls
+      that share that query:
 
         1. The pre-write ``find_prior_memories`` search (pop 1st entry)
         2. The post-write ``confirm_marker_persisted`` search (pop 2nd entry)
@@ -161,6 +156,12 @@ def _make_search_stub(
     marker_configured: dict[tuple[str, str], int] = {
         k: len(v) for k, v in marker_queues.items()
     }
+    # Build equality-dispatch map: canonical query string → (tid, ftype) key.
+    # Keyed by _marker_query(*k) so production-format changes propagate here
+    # automatically (no regex to keep in sync).
+    marker_query_to_key: dict[str, tuple[str, str]] = {
+        _marker_query(*k): k for k in marker_queues
+    }
 
     async def _stub(**kwargs: object) -> list:
         query: str = str(kwargs.get('query', ''))
@@ -175,9 +176,8 @@ def _make_search_stub(
                 )
             return suppression_queue.popleft()
 
-        m = _MARKER_QUERY_RE.match(query)
-        if m:
-            key = (m.group(1), m.group(2))
+        key = marker_query_to_key.get(query)
+        if key is not None:
             if key not in marker_queues:
                 raise AssertionError(
                     f'_make_search_stub: unconfigured marker query for '
@@ -197,8 +197,8 @@ def _make_search_stub(
 
         raise AssertionError(
             f"_make_search_stub: unrecognised query {query!r}; "
-            f"expected 'stage1_flag_suppression' or "
-            f"'stage1 flag marker task <tid> type <ftype>'"
+            f"expected 'stage1_flag_suppression' or the output of "
+            f"_marker_query(tid, ftype) (e.g. {_marker_query('42', 'missing_deliverable')!r})"
         )
 
     return _stub

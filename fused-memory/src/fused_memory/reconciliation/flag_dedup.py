@@ -193,6 +193,23 @@ class SuppressionPayload(TypedDict):
 _CONFIRMATION_MISS_THRESHOLD: int = 5
 
 
+def _marker_query(tid: str, ftype: str) -> str:
+    """Build the canonical Mem0 search query for a stage1_flag_marker.
+
+    Single source of truth used by BOTH:
+    - The pre-write dedup search in ``dedup_flags`` (asks "does any prior exist
+      across all runs?"; run_id-agnostic).
+    - The post-write confirmation search in ``confirm_marker_persisted``
+      (asks "did MY write for THIS run land?"; run_id-scoped via a separate
+      ``kind`` filter — see that helper for details).
+
+    The two callers differ in their ``kind`` filter but use the SAME query
+    string.  Tests rely on this equality to dispatch a single marker-search
+    stub from two call sites.
+    """
+    return f'stage1 flag marker task {tid} type {ftype}'
+
+
 async def confirm_marker_persisted(
     memory_service: Any,
     *,
@@ -257,7 +274,7 @@ async def confirm_marker_persisted(
         (deletion iterates the pre-write ``priors`` list directly).
     """
     try:
-        query = f'stage1 flag marker task {task_id} type {flag_type}'
+        query = _marker_query(task_id, flag_type)
         # run_id is included so that stale priors from earlier runs do NOT match.
         # Intentionally asymmetric with the pre-write dedup search (which omits
         # run_id to find priors from any earlier run).  The confirmation's job is
@@ -512,7 +529,7 @@ async def dedup_flags(
             project_id=project_id,
             task_id=tid,
             kind={'source': 'stage1_flag_marker', 'flag_type': ftype},
-            query=f'stage1 flag marker task {tid} type {ftype}',
+            query=_marker_query(tid, ftype),
             categories=['observations_and_summaries'],
             limit=50,
             log=logger,
