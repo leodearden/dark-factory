@@ -346,6 +346,45 @@ class TestRunWatcherRotation:
         h.mcp.mcp_config_json.assert_called_once_with(escalation_url=expected_url)  # type: ignore[union-attr]
         assert captured.get('mcp_config') == {'mcp': 'config-sentinel'}
 
+    @pytest.mark.asyncio
+    async def test_tool_restrictions_passed(self, tmp_path: Path) -> None:
+        """invoke_with_cap_retry receives non-empty allowed_tools and disallowed_tools.
+
+        Defence-in-depth: the autonomous agent runs unattended for up to 4h, so
+        its tool surface must be explicitly bounded (per UnblockAutoConfig precedent).
+        Edit and Write must appear in disallowed_tools; mcp__escalation__resolve_issue
+        must appear in allowed_tools (autonomous dispatch path).
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['allowed_tools'] = kwargs.get('allowed_tools')
+            captured['disallowed_tools'] = kwargs.get('disallowed_tools')
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        allowed = captured.get('allowed_tools')
+        disallowed = captured.get('disallowed_tools')
+
+        assert allowed is not None and len(allowed) > 0, (
+            'allowed_tools must be a non-empty list'
+        )
+        assert disallowed is not None and len(disallowed) > 0, (
+            'disallowed_tools must be a non-empty list'
+        )
+        # Autonomous dispatch requires escalation resolution
+        assert any('resolve_issue' in t for t in allowed), (
+            'mcp__escalation__resolve_issue must be in allowed_tools for autonomous dispatch'
+        )
+        # Code-edit tools must be blocked
+        assert 'Edit' in disallowed, 'Edit must be in disallowed_tools (no code edits)'
+        assert 'Write' in disallowed, 'Write must be in disallowed_tools (no code edits)'
+
 
 # ---------------------------------------------------------------------------
 # step-9: Supervisor loop classification — clean/unclean backoff
@@ -377,8 +416,13 @@ class TestWatcherSupervisorLoopClassification:
     """
 
     @pytest.mark.asyncio
-    async def test_clean_exit_no_backoff(self, tmp_path: Path) -> None:
-        """Clean exit (success=True, timed_out=False) → no backoff sleep, deque stays empty."""
+    async def test_clean_exit_floor_sleep_no_unclean(self, tmp_path: Path) -> None:
+        """Clean exit (success=True, timed_out=False) → floor sleep of restart_backoff_secs,
+        no exponential backoff, and the unclean-exit deque stays empty.
+
+        The floor sleep on the clean path prevents back-to-back opus invocations when
+        the agent self-exits near-instantly (misconfiguration guard).
+        """
         from shared.cli_invoke import AgentResult
 
         h = _make_loop_harness(tmp_path)
@@ -403,11 +447,17 @@ class TestWatcherSupervisorLoopClassification:
 
         # At least one rotation ran
         assert rotation_calls >= 1
-        # No backoff sleep should have been recorded (clean exits → immediate restart)
-        assert sleep_durations == [], (
-            f'Expected no backoff sleep after clean exit; got {sleep_durations}'
+        # A floor sleep should occur after the clean rotation (cost-runaway guard).
+        assert len(sleep_durations) == 1, (
+            f'Expected exactly 1 floor sleep after clean exit; got {sleep_durations}'
         )
-        # Unclean-exit deque must stay empty
+        assert sleep_durations[0] == pytest.approx(
+            h.config.watcher_subprocess_restart_backoff_secs
+        ), (
+            f'Floor sleep should equal restart_backoff_secs '
+            f'({h.config.watcher_subprocess_restart_backoff_secs}); got {sleep_durations[0]}'
+        )
+        # Unclean-exit deque must stay empty (clean path, not reclassified)
         assert len(h._watcher_unclean_exits) == 0
 
     @pytest.mark.asyncio
@@ -510,7 +560,14 @@ class TestWatcherSupervisorLoopClassification:
 
     @pytest.mark.asyncio
     async def test_clean_exit_resets_backoff(self, tmp_path: Path) -> None:
-        """A clean exit after unclean exits resets the backoff to base."""
+        """A clean exit after unclean exits resets the backoff to base.
+
+        Sequence unclean→clean→unclean produces 3 sleeps:
+          [unclean_backoff, clean_floor, unclean_base_again]
+        The clean-path floor sleep uses watcher_subprocess_restart_backoff_secs (same
+        value as base backoff), so all three sleeps are equal to base.  The key
+        assertion is that the unclean after the clean reset uses base (not doubled).
+        """
         from shared.cli_invoke import AgentResult
 
         h = _make_loop_harness(tmp_path)
@@ -520,8 +577,8 @@ class TestWatcherSupervisorLoopClassification:
         })
         # Sequence: unclean, clean, unclean, then cancel
         results = [
-            AgentResult(success=False, output=''),   # unclean → backoff
-            AgentResult(success=True, output=''),    # clean   → reset, no backoff
+            AgentResult(success=False, output=''),   # unclean → backoff(base)
+            AgentResult(success=True, output=''),    # clean   → reset + floor(base)
             AgentResult(success=False, output=''),   # unclean → base backoff again
         ]
         idx = 0
@@ -544,14 +601,14 @@ class TestWatcherSupervisorLoopClassification:
             await h._watcher_supervisor_loop()
 
         base = h.config.watcher_subprocess_restart_backoff_secs
-        # Should have 2 backoff sleeps (from rotation 1 and rotation 3)
-        # No sleep between rotations 2→3 (clean reset → immediate restart)
-        assert len(sleep_durations) == 2, (
-            f'Expected 2 backoff sleeps (unclean/clean/unclean); got {sleep_durations}'
+        # 3 sleeps: unclean backoff | clean floor | unclean base-reset
+        assert len(sleep_durations) == 3, (
+            f'Expected 3 sleeps (unclean/clean-floor/unclean); got {sleep_durations}'
         )
-        # After the clean reset, next unclean should use base again (not doubled)
-        assert sleep_durations[1] == pytest.approx(base), (
-            f'Post-reset backoff should be base {base}s; got {sleep_durations[1]}'
+        # The clean-path floor and the unclean base happen to be the same value.
+        # The critical assertion: post-reset unclean uses base (not doubled).
+        assert sleep_durations[2] == pytest.approx(base), (
+            f'Post-reset backoff should be base {base}s; got {sleep_durations[2]}'
         )
 
 
@@ -712,17 +769,37 @@ class TestWatcherCrashloopTrip:
 # step-13: Wiring — __init__ attrs + run() source guard
 # ---------------------------------------------------------------------------
 
+def _make_real_harness(tmp_path: Path) -> Harness:
+    """Construct a real Harness via __init__ with infrastructure classes mocked.
+
+    Patches McpLifecycle/Scheduler/BriefingAssembler so no real servers start,
+    but __init__ runs fully — including the attribute assignments under test.
+    """
+    config = OrchestratorConfig(project_root=tmp_path)
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        return Harness(config)
+
+
 class TestWatcherSupervisorWiring:
-    """Verify __init__ sets the expected attributes and bound methods exist."""
+    """Verify real Harness.__init__ sets the expected attributes and bound methods exist.
+
+    Uses _make_real_harness (real __init__ with infrastructure mocked) instead of
+    _make_lifecycle_harness (__new__ + manual injection) so the assertions actually
+    guard against __init__ failing to initialize these attributes.
+    """
 
     def test_init_sets_watcher_supervisor_task_none(self, tmp_path: Path) -> None:
-        """Harness.__new__ + __init__ sets _watcher_supervisor_task=None."""
-        h = _make_lifecycle_harness(tmp_path)
+        """Real Harness.__init__ sets _watcher_supervisor_task=None."""
+        h = _make_real_harness(tmp_path)
         assert h._watcher_supervisor_task is None
 
     def test_init_sets_watcher_unclean_exits_empty_deque(self, tmp_path: Path) -> None:
-        """Harness.__new__ + __init__ sets _watcher_unclean_exits to an empty deque."""
-        h = _make_lifecycle_harness(tmp_path)
+        """Real Harness.__init__ sets _watcher_unclean_exits to an empty deque."""
+        h = _make_real_harness(tmp_path)
         assert isinstance(h._watcher_unclean_exits, deque)
         assert len(h._watcher_unclean_exits) == 0
 

@@ -69,6 +69,49 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 
+# Allowed and disallowed tools for the escalation-watcher-auto rotation.
+# Scoped to what escalation triage actually needs: file reads, foreground
+# escalation.watcher subprocess, safe git reads, and the MCP tools for
+# autonomous dispatch (update_task, add_dependency, resolve_issue).
+# Defence-in-depth mirrors the unblock-auto precedent (dry_run_unblock.py).
+_WATCHER_ALLOWED_TOOLS: list[str] = [
+    'Read',
+    'Glob',
+    'Grep',
+    # Foreground-blocking watcher subprocess (see SKILL.md wait-for-next-L1 step)
+    'Bash(python -m escalation.watcher:*)',
+    # Git reads for context
+    'Bash(git log:*)',
+    'Bash(git diff:*)',
+    'Bash(git status:*)',
+    'Bash(git show:*)',
+    'Bash(git rev-parse:*)',
+    'Bash(git branch:*)',
+    'Bash(git ls-files:*)',
+    # Escalation MCP: read + autonomous resolve
+    'mcp__escalation__get_pending_escalations',
+    'mcp__escalation__resolve_issue',
+    # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup)
+    'mcp__fused-memory__get_task',
+    'mcp__fused-memory__get_tasks',
+    'mcp__fused-memory__search',
+    'mcp__fused-memory__update_task',
+    'mcp__fused-memory__add_dependency',
+]
+# Mutating tools blocked — no code edits, no destructive git, no infra commands.
+_WATCHER_DISALLOWED_TOOLS: list[str] = [
+    'Edit',
+    'Write',
+    'Bash(git commit:*)',
+    'Bash(git push:*)',
+    'Bash(git reset:*)',
+    'Bash(git checkout:*)',
+    'Bash(git restore:*)',
+    'Bash(git clean:*)',
+    'Bash(git merge:*)',
+    'Bash(git rebase:*)',
+]
+
 
 def _pid_alive(pid: int) -> bool:
     """Return True if the process identified by *pid* is alive.
@@ -2548,6 +2591,8 @@ Output JSON matching the schema. Every task must appear in the output.
             backend=cfg.watcher_backend,
             mcp_config=mcp_config,
             timeout_seconds=timeout_secs,
+            allowed_tools=_WATCHER_ALLOWED_TOOLS,
+            disallowed_tools=_WATCHER_DISALLOWED_TOOLS,
         )
 
     async def _watcher_supervisor_loop(self) -> None:
@@ -2583,46 +2628,73 @@ Output JSON matching the schema. Every task must appear in the output.
             )
 
             if clean:
-                # Healthy rotation completed — reset backoff, restart immediately.
+                # Healthy rotation completed — reset backoff.
+                # Enforce a minimum floor between rotations even on clean exit:
+                # prevents back-to-back opus invocations if the agent self-exits
+                # near-instantly due to misconfiguration (empty queue, SKILL.md
+                # drift, etc.).  Mirrors the terminal-status-watcher's always-sleep
+                # pattern.  watcher_subprocess_restart_backoff_secs (default 30s)
+                # doubles as the clean-restart floor.
                 consecutive_unclean = 0
                 logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
+                await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
 
             # --- Unclean exit path ---
-            now = time.monotonic()
-            self._watcher_unclean_exits.append(now)
-            consecutive_unclean += 1
+            # Wrapped in try/except so an unexpected error (e.g. pause_scheduler
+            # transiently raising) is logged and the loop degrades gracefully
+            # rather than dying unobserved with the scheduler still running.
+            try:
+                now = time.monotonic()
+                self._watcher_unclean_exits.append(now)
+                consecutive_unclean += 1
 
-            # Crashloop guard: evict entries older than the window, then check.
-            window = self.config.watcher_crashloop_window_secs
-            while (
-                self._watcher_unclean_exits
-                and self._watcher_unclean_exits[0] < now - window
-            ):
-                self._watcher_unclean_exits.popleft()
+                # Crashloop guard: evict entries older than the window, then check.
+                window = self.config.watcher_crashloop_window_secs
+                while (
+                    self._watcher_unclean_exits
+                    and self._watcher_unclean_exits[0] < now - window
+                ):
+                    self._watcher_unclean_exits.popleft()
 
-            if len(self._watcher_unclean_exits) >= self.config.watcher_max_crashloop_restarts:
-                logger.error(
-                    'Escalation-watcher-auto crashloop detected '
-                    '(%d unclean exits in %ds window) — pausing scheduler',
-                    len(self._watcher_unclean_exits),
-                    window,
+                if len(self._watcher_unclean_exits) >= self.config.watcher_max_crashloop_restarts:
+                    logger.error(
+                        'Escalation-watcher-auto crashloop detected '
+                        '(%d unclean exits in %ds window) — pausing scheduler',
+                        len(self._watcher_unclean_exits),
+                        window,
+                    )
+                    await self.pause_scheduler('watcher_crashloop')
+                    return  # stop supervising
+
+                backoff = min(
+                    self.config.watcher_subprocess_restart_backoff_secs
+                    * (2 ** (consecutive_unclean - 1)),
+                    _WATCHER_MAX_BACKOFF_SECS,
                 )
-                await self.pause_scheduler('watcher_crashloop')
-                return  # stop supervising
-
-            backoff = min(
-                self.config.watcher_subprocess_restart_backoff_secs
-                * (2 ** (consecutive_unclean - 1)),
-                _WATCHER_MAX_BACKOFF_SECS,
-            )
-            logger.warning(
-                'Escalation-watcher-auto rotation exited uncleanly '
-                '(consecutive=%d backoff=%.1fs)',
-                consecutive_unclean,
-                backoff,
-            )
-            await asyncio.sleep(backoff)
+                logger.warning(
+                    'Escalation-watcher-auto rotation exited uncleanly '
+                    '(consecutive=%d backoff=%.1fs)',
+                    consecutive_unclean,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise  # clean shutdown
+            except Exception:
+                logger.exception(
+                    'Escalation-watcher-auto supervisor: unexpected error in '
+                    'unclean-path bookkeeping — sleeping base backoff to avoid '
+                    'silent supervisor death'
+                )
+                # Degrade gracefully: sleep base backoff then continue the loop.
+                # Re-raise CancelledError from the fallback sleep if received.
+                try:
+                    await asyncio.sleep(
+                        self.config.watcher_subprocess_restart_backoff_secs
+                    )
+                except asyncio.CancelledError:
+                    raise
 
     async def _scan_for_terminal_active_tasks(self) -> int:
         """Single pass: cancel any active workflow whose task is terminal.
