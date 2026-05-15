@@ -466,6 +466,75 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
     )
 
 
+async def test_collect_scheduler_state_isolates_paused_across_projects(
+    dummy_client, tmp_path,
+):
+    """Mixed two-project fleet: only the paused project appears in paused_projects.
+
+    Project A (p1) is paused; project B (p2) is not.  A single
+    collect_scheduler_state call must include A in paused_projects and must NOT
+    include B — exercising the per-project conditional append at
+    scheduler.py:391-395 with a mixed fleet.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.config import DashboardConfig
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    p1 = tmp_path / 'p1'
+    p2 = tmp_path / 'p2'
+    p1.mkdir()
+    p2.mkdir()
+
+    config = DashboardConfig(project_root=p1, known_project_roots=[p2])
+
+    pause_reason = 'park-stop: 5 tasks parked in 1h'
+    snap_A = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'is_paused': True,
+        'pause_reason': pause_reason,
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+    snap_B = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'is_paused': False,
+        'pause_reason': None,
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+    snapshots = {str(p1): snap_A, str(p2): snap_B}
+
+    async def mock_mcp_call(client, url, tool, args):
+        if tool == 'get_scheduler_state':
+            return snapshots[args.get('project_root')]
+        return []
+
+    mock_active = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        _rows, _modules, _pins, _events, _offline, paused_projects = \
+            await collect_scheduler_state(dummy_client, config)
+
+    assert paused_projects == [{'project': p1.name, 'reason': pause_reason}], (
+        f'Expected paused_projects with only project A; got {paused_projects!r}'
+    )
+    assert p2.name not in [p['project'] for p in paused_projects], (
+        f'Project B must not appear in paused_projects; got {paused_projects!r}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-11: shape_scheduler envelope
 # ---------------------------------------------------------------------------
