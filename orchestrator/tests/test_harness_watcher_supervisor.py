@@ -1491,6 +1491,98 @@ class TestWatcherMisconfiguredGuard:
             f'then base*2^1 before trip arms on iter 3); got {sleep_durations}'
         )
 
+    @pytest.mark.asyncio
+    async def test_degenerate_clean_floor_does_not_overflow_at_high_consecutive(
+        self, tmp_path: Path
+    ) -> None:
+        """Degenerate-clean floor computation does not raise OverflowError at high consecutive.
+
+        With an unbounded exponent, ``2 ** (consecutive - 1)`` overflows to
+        OverflowError at consecutive > ~1024 (Python cannot represent 2^1024 as float).
+        The fix clamps the exponent to 60 before multiplying, so the outer
+        ``min(..., _WATCHER_MAX_BACKOFF_SECS)`` still applies and the sleep saturates
+        at the ceiling without ever raising.
+
+        RED: without the exponent clamp the loop crashes with OverflowError on the
+        ~1025th rotation, so the assert on len(sleep_durations) would never be
+        reached — the test fails with OverflowError propagating from
+        _watcher_supervisor_loop.
+        """
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99999,   # disable trip
+            'watcher_max_crashloop_restarts': 99999,           # disable crashloop trip
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+            'watcher_crashloop_window_secs': 999999,           # deque never evicts, trip never fires
+        })
+        # 1100 consecutive degenerate-clean rotations (1s each, well under 120s threshold).
+        # Beyond consecutive ~1024 the unguarded 2^(consecutive-1) overflows float range.
+        sleep_durations = await _run_supervisor_with_rotation_durations(h, [1.0] * 1100)
+        assert len(sleep_durations) == 1100, (
+            f'Expected 1100 sleep durations (one per rotation); got {len(sleep_durations)}'
+        )
+        assert all(s <= _WATCHER_MAX_BACKOFF_SECS for s in sleep_durations), (
+            f'One or more sleeps exceeded _WATCHER_MAX_BACKOFF_SECS={_WATCHER_MAX_BACKOFF_SECS}: '
+            f'{[s for s in sleep_durations if s > _WATCHER_MAX_BACKOFF_SECS]}'
+        )
+        # Tail values must saturate at the ceiling (not silently drop to 0 or raise)
+        assert sleep_durations[-1] == pytest.approx(_WATCHER_MAX_BACKOFF_SECS), (
+            f'Final sleep should saturate at {_WATCHER_MAX_BACKOFF_SECS}s; got {sleep_durations[-1]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unclean_backoff_does_not_overflow_at_high_consecutive(
+        self, tmp_path: Path
+    ) -> None:
+        """Unclean-exit backoff does not raise OverflowError at high consecutive.
+
+        Mirrors test_degenerate_clean_floor_does_not_overflow_at_high_consecutive
+        for the unclean-exit exponential backoff site (same overflow bug, different
+        code path — uses consecutive_unclean instead of consecutive_degenerate_clean).
+        No time.monotonic patch needed: the unclean path is duration-independent.
+
+        RED: without the exponent clamp the loop crashes with OverflowError on the
+        ~1025th unclean exit, so the assertions on sleep_durations are never reached.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': 99999,   # disable crashloop trip
+            'watcher_crashloop_window_secs': 999999,   # deque never evicts, trip never fires
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+        })
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > 1100:
+                raise asyncio.CancelledError()
+            return AgentResult(success=False, output='')
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
+
+        assert len(sleep_durations) >= 1100, (
+            f'Expected >= 1100 sleep durations; got {len(sleep_durations)}'
+        )
+        assert all(s <= _WATCHER_MAX_BACKOFF_SECS for s in sleep_durations), (
+            f'One or more sleeps exceeded _WATCHER_MAX_BACKOFF_SECS={_WATCHER_MAX_BACKOFF_SECS}: '
+            f'{[s for s in sleep_durations if s > _WATCHER_MAX_BACKOFF_SECS]}'
+        )
+        # Tail values must saturate at the ceiling (not silently drop to 0 or raise)
+        assert sleep_durations[-1] == pytest.approx(_WATCHER_MAX_BACKOFF_SECS), (
+            f'Final sleep should saturate at {_WATCHER_MAX_BACKOFF_SECS}s; got {sleep_durations[-1]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-13: Wiring — __init__ attrs + run() source guard
