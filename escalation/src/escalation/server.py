@@ -318,7 +318,10 @@ def create_server(
 
         from orchestrator.merge_queue import MergeOutcome, MergeRequest, enqueue_merge_request
 
-        module_configs = list(orch_config._module_configs.values())
+        # module_configs_or_empty normalises the post-1405 None sentinel (direct-
+        # instantiation configs never call load_config, so _module_configs stays None).
+        # See OrchestratorConfig.module_configs_or_empty (config.py) for details.
+        module_configs = list(orch_config.module_configs_or_empty.values())
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
         merge_req = MergeRequest(
             task_id=task_id,

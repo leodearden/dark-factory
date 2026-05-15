@@ -977,6 +977,13 @@ class OrchestratorConfig(BaseSettings):
     # None means "discovery never ran" (default); any dict (including {}) means
     # "discovery ran" — the empty-dict case is treated as a valid discovered-empty
     # result, not as uninitialized.  See run_full_verification for the reuse guard.
+    #
+    # Consumer normalization contract: any code outside load_config that reads
+    # _module_configs for iteration MUST normalize None → {} before calling
+    # .values() or iterating, because direct OrchestratorConfig(...) instantiation
+    # (e.g. build_eval_orch_config in evals/runner.py) leaves the sentinel at None.
+    # Prefer the `module_configs_or_empty` property below over inline `or {}`
+    # guards so new consumers cannot silently omit the normalization.
     _module_configs: dict[str, ModuleConfig] | None = PrivateAttr(default=None)
 
     @field_validator('project_root', mode='after')
@@ -996,6 +1003,19 @@ class OrchestratorConfig(BaseSettings):
                 'steward_completion_timeout in your orchestrator.yaml.'
             )
         return self
+
+    @property
+    def module_configs_or_empty(self) -> dict[str, ModuleConfig]:
+        """Return ``_module_configs``, falling back to ``{}`` when the post-1405
+        None sentinel is present.
+
+        Direct ``OrchestratorConfig(...)`` instantiation — e.g.
+        ``build_eval_orch_config`` in ``evals/runner.py`` — never calls
+        ``load_config``, so ``_module_configs`` stays at its ``None`` default.
+        This property encapsulates the normalization so callers cannot forget
+        the ``or {}`` guard.
+        """
+        return self._module_configs or {}
 
     def for_module(self, module_path: str) -> ModuleConfig | None:
         """Return the ModuleConfig whose registered prefix is the longest (deepest) match
