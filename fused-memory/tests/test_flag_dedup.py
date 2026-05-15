@@ -3391,3 +3391,115 @@ class TestConfirmationCircuitBreaker:
         assert len(result) == 3
         for f in result:
             assert 'persisted_from_run' not in f, f"MISS path must not annotate: {f}"
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_budget_is_fresh_per_dedup_flags_invocation(
+        self, monkeypatch, caplog,
+    ):
+        """Per-invocation freshness: each dedup_flags call starts with counter=0.
+
+        This is a regression pin.  The counter is function-local so it resets
+        automatically at each call.  A future refactor that lifts it to module
+        scope would break this test.
+
+        Monkeypatches threshold to 2.  Calls dedup_flags TWICE on the same
+        memory_service.  Each call has 3 MISS-path flags whose confirmations
+        all miss.  Each call's confirmation pattern:
+          flag-1: miss+retry → counter=1
+          flag-2: miss+retry → counter=2 → TRIP
+          flag-3: skipped (short-circuit)
+
+        search side_effect: 8 elements per call × 2 calls = 16 total.
+          Per-call pattern:
+            [n+0] suppression → []
+            [n+1] flag-1 pre-write → []
+            [n+2] flag-1 confirmation miss
+            [n+3] flag-1 confirmation retry    → counter=1
+            [n+4] flag-2 pre-write → []
+            [n+5] flag-2 confirmation miss
+            [n+6] flag-2 confirmation retry    → counter=2 → TRIP
+            [n+7] flag-3 pre-write → []
+
+        Asserts:
+          (a) Exactly TWO breaker WARNINGs across both calls (one per invocation).
+          (b) Total search.call_count == 16 (each call's flag-3 short-circuits).
+          (c) Second call's flag-1 confirmation IS reached (proves counter reset
+              between invocations).  Evidence: call-2's pattern matches call-1's
+              pattern (if counter carried over it would trip immediately on flag-1
+              and total search count would be less).
+          (d) Both calls return 3-element MISS-path flag lists (no annotation).
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 2)
+
+        # 16 search results: 8 per call, same pattern repeated.
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            # --- call 1 ---
+            [],   # [0]  suppression
+            [],   # [1]  flag-1 pre-write MISS
+            [],   # [2]  flag-1 confirmation miss
+            [],   # [3]  flag-1 confirmation retry   → counter=1
+            [],   # [4]  flag-2 pre-write MISS
+            [],   # [5]  flag-2 confirmation miss
+            [],   # [6]  flag-2 confirmation retry   → counter=2 → TRIP
+            [],   # [7]  flag-3 pre-write MISS (no confirmation)
+            # --- call 2 ---
+            [],   # [8]  suppression
+            [],   # [9]  flag-1 pre-write MISS  ← proves counter reset (fresh budget)
+            [],   # [10] flag-1 confirmation miss
+            [],   # [11] flag-1 confirmation retry  → counter=1
+            [],   # [12] flag-2 pre-write MISS
+            [],   # [13] flag-2 confirmation miss
+            [],   # [14] flag-2 confirmation retry  → counter=2 → TRIP
+            [],   # [15] flag-3 pre-write MISS (no confirmation)
+        ])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        flags = [
+            {'task_id': 401, 'flag_type': 'missing_deliverable', 'description': 'f1'},
+            {'task_id': 402, 'flag_type': 'missing_deliverable', 'description': 'f2'},
+            {'task_id': 403, 'flag_type': 'missing_deliverable', 'description': 'f3'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result1 = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=list(flags),  # copy so mutations don't bleed
+            )
+            result2 = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r2',
+                flags=list(flags),
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (a) Exactly TWO breaker WARNINGs (one per invocation)
+        breaker_warnings = [
+            m for m in all_warnings
+            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
+        ]
+        assert len(breaker_warnings) == 2, (
+            f"Expected exactly 2 breaker WARNINGs (one per invocation) but got "
+            f"{len(breaker_warnings)}: {breaker_warnings}"
+        )
+
+        # (b) Total 16 search calls (each invocation's flag-3 short-circuits)
+        assert memory_service.search.call_count == 16, (
+            f"Expected 16 total search calls (8 per invocation) but got: "
+            f"{memory_service.search.call_count}"
+        )
+
+        # (c) Both calls returned 3-element MISS-path lists
+        assert len(result1) == 3
+        assert len(result2) == 3
+        for f in result1 + result2:
+            assert 'persisted_from_run' not in f, f"MISS path must not annotate: {f}"
