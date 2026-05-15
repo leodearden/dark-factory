@@ -31,24 +31,27 @@ def _load_watchdog() -> types.ModuleType:
 # probe_port tests
 # ---------------------------------------------------------------------------
 
-
-_SS_HEADER = "Netid  State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port\n"
+# Verbatim `ss -ltn "sport = :<port>"` output from systemd 255 / iproute2-6.1.0.
+# Note: NO leading Netid column in this version — fields are:
+#   State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port
+# (5 fields per data row, index 0-4)
+_SS_HEADER = "State  Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
 
 _SS_LISTEN_8102 = (
     _SS_HEADER
-    + "tcp    LISTEN  0       4096    127.0.0.1:8102              0.0.0.0:*\n"
+    + "LISTEN 0      2048       127.0.0.1:8102      0.0.0.0:*\n"
 )
 
 _SS_LISTEN_8100 = (
     _SS_HEADER
-    + "tcp    LISTEN  0       4096    127.0.0.1:8100              0.0.0.0:*\n"
+    + "LISTEN 0      2048       127.0.0.1:8100      0.0.0.0:*\n"
 )
 
 # Decoy rows that must NOT trigger a false positive for port 8102
 _SS_DECOYS = (
     _SS_HEADER
-    + "tcp    LISTEN  0       4096    127.0.0.1:81020             0.0.0.0:*\n"
-    + "tcp    LISTEN  0       4096    127.0.0.1:48102             0.0.0.0:*\n"
+    + "LISTEN 0      2048       127.0.0.1:81020     0.0.0.0:*\n"
+    + "LISTEN 0      2048       127.0.0.1:48102     0.0.0.0:*\n"
 )
 
 
