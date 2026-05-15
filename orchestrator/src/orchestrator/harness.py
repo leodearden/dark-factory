@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2340,6 +2341,18 @@ Output JSON matching the schema. Every task must appear in the output.
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
 
+    def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
+        """Return an async callable (task_id) -> str|None backed by the scheduler.
+
+        The returned closure is injected into the escalation MCP server as
+        ``task_status_lookup`` so the chokepoint can query live task status
+        without holding a direct reference to the Harness.
+        """
+        async def _lookup(task_id: str) -> str | None:
+            return await self.scheduler.get_status(task_id)
+
+        return _lookup
+
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""
         if not HAS_ESCALATION:
@@ -2366,6 +2379,7 @@ Output JSON matching the schema. Every task must appear in the output.
             orch_config=self.config,
             event_store=self.event_store,
             harness=self,
+            task_status_lookup=self._build_task_status_lookup(),
         )
         host = self.config.escalation.host
         port = self.config.escalation.port

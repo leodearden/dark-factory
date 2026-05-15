@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.queue import EscalationQueue
@@ -68,8 +68,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
 async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('escalate_blocker')
-    # escalate_blocker is a sync tool — tool.fn() returns dict directly
-    return tool.fn(**kwargs)
+    return await tool.fn(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -267,3 +266,121 @@ class TestCrossTaskDedupeReengagement:
             'A must have no open L1 escalations after parent resolve.'
         )
 
+
+# ---------------------------------------------------------------------------
+# Step-7 RED tests: Harness._build_task_status_lookup + wiring into create_server
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessTaskStatusLookup:
+    """Harness._build_task_status_lookup() contract and create_server wiring.
+
+    Step 7 of task 1366 (AFK A4a): verify the lookup factory and how it is
+    injected into create_server via _start_escalation_server().
+    """
+
+    @pytest.mark.asyncio
+    async def test_build_lookup_returns_async_callable(self, harness: Harness):
+        """_build_task_status_lookup() returns a coroutine-function."""
+        import inspect
+
+        lookup = harness._build_task_status_lookup()
+        assert callable(lookup), '_build_task_status_lookup() must return a callable'
+        assert inspect.iscoroutinefunction(lookup), (
+            '_build_task_status_lookup() must return an async callable (coroutine function)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_build_lookup_delegates_to_scheduler(self, harness: Harness):
+        """Awaiting the lookup forwards to self.scheduler.get_status(task_id)."""
+        # Stub the scheduler's get_status so we can verify delegation.
+        harness.scheduler.get_status = AsyncMock(return_value='done')
+
+        lookup = harness._build_task_status_lookup()
+        result = await lookup('task-42')
+
+        harness.scheduler.get_status.assert_called_once_with('task-42')
+        assert result == 'done', f"Expected 'done', got: {result}"
+
+    @pytest.mark.asyncio
+    async def test_build_lookup_returns_none_when_scheduler_returns_none(
+        self, harness: Harness,
+    ):
+        """Awaiting the lookup returns None when scheduler.get_status returns None."""
+        harness.scheduler.get_status = AsyncMock(return_value=None)
+
+        lookup = harness._build_task_status_lookup()
+        result = await lookup('task-unknown')
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_start_escalation_server_passes_task_status_lookup(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """_start_escalation_server() calls create_server with non-None task_status_lookup."""
+        # Arrange: wire minimal escalation config on the harness's config mock.
+        harness.config.escalation.queue_dir = str(tmp_path / 'esc')
+        harness.config.escalation.host = '127.0.0.1'
+        harness.config.escalation.port = 18100
+        harness.config.project_root = tmp_path
+        harness.review_checkpoint = None  # skip review_checkpoint wiring
+
+        captured_kwargs: dict = {}
+
+        def _spy_create_server(queue, **kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()  # minimal stand-in for FastMCP server
+
+        # Mock task: done() returns False so the post-start health check passes.
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+
+        with (
+            patch('orchestrator.harness.create_server', side_effect=_spy_create_server),
+            patch('asyncio.create_task', return_value=mock_task),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await harness._start_escalation_server()
+
+        assert 'task_status_lookup' in captured_kwargs, (
+            'create_server must be called with task_status_lookup kwarg'
+        )
+        assert captured_kwargs['task_status_lookup'] is not None, (
+            'task_status_lookup passed to create_server must not be None'
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_escalation_server_lookup_callable_matches_build(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The task_status_lookup kwarg is the callable built by _build_task_status_lookup()."""
+        harness.config.escalation.queue_dir = str(tmp_path / 'esc')
+        harness.config.escalation.host = '127.0.0.1'
+        harness.config.escalation.port = 18100
+        harness.config.project_root = tmp_path
+        harness.review_checkpoint = None
+        harness.scheduler.get_status = AsyncMock(return_value='pending')
+
+        captured_lookup: Any = None
+
+        def _spy_create_server(queue, **kwargs):
+            nonlocal captured_lookup
+            captured_lookup = kwargs.get('task_status_lookup')
+            return MagicMock()
+
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+
+        with (
+            patch('orchestrator.harness.create_server', side_effect=_spy_create_server),
+            patch('asyncio.create_task', return_value=mock_task),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await harness._start_escalation_server()
+
+        assert captured_lookup is not None
+        # Verify the captured lookup actually delegates to the scheduler
+        result = await captured_lookup('task-99')
+        harness.scheduler.get_status.assert_called_once_with('task-99')
+        assert result == 'pending'

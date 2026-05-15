@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,8 @@ from fastmcp import FastMCP
 from escalation.dedupe import DedupeConfig, find_dedupe_parent
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+logger = logging.getLogger(__name__)
 
 CATEGORIES = [
     'scope_violation',
@@ -37,6 +41,7 @@ def create_server(
     event_store: Any = None,
     harness: Any = None,
     dedupe_config: DedupeConfig | None = None,
+    task_status_lookup: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -50,6 +55,13 @@ def create_server(
     *dedupe_config* controls infra_issue deduplication.  When omitted,
     ``DedupeConfig()`` is used (enabled, 600 s window, infra_issue category).
     Pass ``DedupeConfig(infra_dedupe_enabled=False)`` to disable.
+
+    *task_status_lookup* is an optional async callable ``(task_id) -> str|None``
+    that returns the current status of a task.  When provided, ``escalate_blocker``
+    and ``escalate_info`` will auto-resolve any escalation whose target task is
+    already in a terminal state (``'done'`` or ``'cancelled'``).  When omitted
+    (the default), the auto-resolve chokepoint is disabled and all escalations
+    are submitted normally.
     """
     mcp = FastMCP('escalation')
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
@@ -97,10 +109,75 @@ def create_server(
         esc_id = queue.submit(esc)
         return {'id': esc_id, 'status': 'queued'}
 
+    # --- Terminal-task chokepoint helper ---
+
+    async def _chokepoint_or_submit(
+        esc: Escalation,
+        terminal_state_is_the_bug: bool,
+    ) -> dict[str, Any]:
+        """Auto-resolve *esc* if the target task is already terminal, else submit normally.
+
+        Gate order (first match wins, all others fall through to _submit_or_dedupe):
+          1. terminal_state_is_the_bug=True  → bypass (submit normally)
+          2. category == 'review_suggestions' → bypass (A4b owns this category)
+          3. task_status_lookup is None       → bypass (chokepoint disabled)
+          4. await task_status_lookup(task_id):
+               done/cancelled → auto-resolve: submit + resolve, return resolved record
+               any other status or None → submit normally
+          On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
+        """
+        # Gate 1: semantic bypass — this escalation is expected even for terminal tasks
+        if terminal_state_is_the_bug:
+            return _submit_or_dedupe(esc)
+
+        # Gate 2: review_suggestions is owned by A4b
+        if esc.category == 'review_suggestions':
+            return _submit_or_dedupe(esc)
+
+        # Gate 3: chokepoint disabled (no lookup injected)
+        if task_status_lookup is None:
+            return _submit_or_dedupe(esc)
+
+        # Gate 4: query task status; fail-open on any error
+        try:
+            status = await task_status_lookup(esc.task_id)
+        except Exception as exc:
+            logger.warning(
+                'task_status_lookup raised for task %s, failing open: %s',
+                esc.task_id, exc,
+            )
+            return _submit_or_dedupe(esc)
+
+        if status in {'done', 'cancelled'}:
+            # Submit then immediately resolve — gives a precise audit record.
+            # Bypass _submit_or_dedupe to avoid folding into a dedupe parent
+            # and resolving the wrong record.
+            queue.submit(esc)
+            resolved = queue.resolve(
+                esc.id,
+                f'auto-resolved: task already terminal (status={status})',
+                resolved_by='escalation-mcp-pre-submit-check',
+            )
+            if resolved is None:
+                # resolve() could not re-read the record immediately after submit.
+                # Unlikely in practice, but the escalation may remain pending.
+                # Fail-safe: return esc.to_dict() (status='pending') rather than
+                # dropping the escalation.  The inconsistency is logged here.
+                logger.warning(
+                    'task %s: queue.resolve() returned None after terminal auto-resolve '
+                    'submit for escalation %s; escalation may remain pending. '
+                    'Returning pre-resolve record as fallback.',
+                    esc.task_id, esc.id,
+                )
+            return (resolved or esc).to_dict()
+
+        # Non-terminal or unknown status → submit normally
+        return _submit_or_dedupe(esc)
+
     # --- Agent-side tools ---
 
     @mcp.tool()
-    def escalate_info(
+    async def escalate_info(
         task_id: str,
         agent_role: str,
         category: str,
@@ -109,11 +186,15 @@ def create_server(
         suggested_action: str = '',
         worktree: str | None = None,
         workflow_state: str | None = None,
+        terminal_state_is_the_bug: bool = False,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
+
+        *terminal_state_is_the_bug* — set True when the escalation is expected even
+        if the target task is already terminal (bypasses the auto-resolve chokepoint).
         """
         esc = Escalation(
             id=queue.make_id(task_id),
@@ -127,12 +208,12 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
         )
-        # Returns {id, status} or {id, status, parent_id, child_id} on dedupe.
+        # Returns {id, status} or resolved record.
         # No 'action' key — that is only on the blocker path.
-        return _submit_or_dedupe(esc)
+        return await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
 
     @mcp.tool()
-    def escalate_blocker(
+    async def escalate_blocker(
         task_id: str,
         agent_role: str,
         category: str,
@@ -141,6 +222,7 @@ def create_server(
         suggested_action: str = '',
         worktree: str | None = None,
         workflow_state: str | None = None,
+        terminal_state_is_the_bug: bool = False,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, commit any in-progress work,
         log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
@@ -148,6 +230,10 @@ def create_server(
 
         Categories: scope_violation, design_concern, cleanup_needed,
         dependency_discovered, risk_identified, infra_issue.
+
+        *terminal_state_is_the_bug* — set True when the task being blocked is
+        expected to be terminal (bypasses the auto-resolve chokepoint and submits
+        normally).  action='terminate_cleanly' is still returned.
         """
         esc = Escalation(
             id=queue.make_id(task_id),
@@ -161,7 +247,7 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
         )
-        result = _submit_or_dedupe(esc)
+        result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
         return {**result, 'action': 'terminate_cleanly'}
 
     # --- Handler-side tools ---
