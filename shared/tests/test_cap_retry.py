@@ -7,6 +7,7 @@ Covers every branch in shared.cli_invoke.invoke_with_cap_retry (lines 136-274).
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
@@ -165,6 +166,7 @@ def test_mock_gate_defaults_include_release_probe_slot():
 # Shared patch targets
 _INVOKE_PATCH = 'shared.cli_invoke.invoke_claude_agent'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
+_LOGGER_WARN_PATCH = 'shared.cli_invoke.logger.warning'
 
 
 # ===================================================================
@@ -506,6 +508,14 @@ class TestCapRetryResume:
           TypeError: Object of type MagicMock is not JSON serializable
         and aborted invoke_with_cap_retry.  After the fix the log call
         must be a no-op for control flow.
+
+        Additionally asserts that the structured cap_wait JSON log is actually
+        emitted (verified via json.loads) so a future change that skips the
+        _check_cap_wait JSON branch fails loudly instead of silently dropping
+        coverage.  Note: logger.warning is called TWICE in this path — once at
+        the plain f-string cap-hit message and once at the JSON cap_wait emit —
+        so mock_warn.assert_called_once() is intentionally NOT used; instead we
+        filter by JSON-decodability and event=='cap_wait'.
         """
         gate = _mock_gate(
             account_count=2,
@@ -519,10 +529,54 @@ class TestCapRetryResume:
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch(_LOGGER_WARN_PATCH) as mock_warn,
         ):
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='x')
         assert mock_inv.await_count == 2
         assert got.success
+
+        # Collect all warning calls that decode to a JSON dict with event=='cap_wait'.
+        # The co-occurring plain-string cap-hit warning (non-JSON) is expected and
+        # will not decode as JSON, so it is filtered out naturally.
+        cap_wait_logs = []
+        for c in mock_warn.call_args_list:
+            arg = c.args[0] if c.args else None
+            if not isinstance(arg, str):
+                continue
+            try:
+                payload = json.loads(arg)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get('event') == 'cap_wait':
+                cap_wait_logs.append(payload)
+
+        assert len(cap_wait_logs) == 1, (
+            "Expected exactly ONE JSON cap_wait log from _check_cap_wait; "
+            f"got {len(cap_wait_logs)}.  A co-occurring plain-string warning is "
+            "expected and filtered out.  If count is 0, the _check_cap_wait JSON "
+            "branch was skipped."
+        )
+        payload = cap_wait_logs[0]
+        assert payload['event'] == 'cap_wait'
+        assert payload['label'] == 'lbl'
+        # soonest_open_at must be a non-None string: proves the
+        # usage_gate.soonest_resets_at.isoformat() conditional branch executed AND
+        # that json.dumps(..., default=str) stringified the non-serializable MagicMock.
+        assert isinstance(payload['soonest_open_at'], str), (
+            "soonest_open_at must be a non-None str (MagicMock stringified via "
+            "default=str); the .isoformat() branch was not taken or default=str missing"
+        )
+        assert payload['soonest_open_at'], (
+            "soonest_open_at must be non-empty; MagicMock stringified via default=str "
+            "cannot produce an empty string"
+        )
+        # Verify the remaining structured fields are present and numeric.
+        assert isinstance(payload.get('elapsed_s'), (int, float)), (
+            "elapsed_s must be a numeric value (round(elapsed, 1)) in the cap_wait payload"
+        )
+        assert isinstance(payload.get('next_probe_in_s'), (int, float)), (
+            "next_probe_in_s must be a numeric value (round(cooldown, 1)) in the cap_wait payload"
+        )
 
 
 # ===================================================================
