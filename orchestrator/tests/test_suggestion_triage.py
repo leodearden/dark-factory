@@ -597,10 +597,13 @@ class TestRouteReviewSuggestionsIntegration:
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
             elapsed = time.monotonic() - t0
 
-        # Method must return in ms — the POST is fire-and-forget
-        assert elapsed < 0.1, (
+        # Method must return well under the 2s slow stub — the POST is fire-and-forget.
+        # Threshold is 1.0s (not tighter) so the test passes under heavy parallel-test
+        # load without masking a real regression: if the function blocks synchronously
+        # on the 2s POST it will always take ≥2s, which exceeds 1.0s.
+        assert elapsed < 1.0, (
             f'_route_review_suggestions_to_curator took {elapsed:.3f}s '
-            f'(expected < 0.1s); may be awaiting curator synchronously'
+            f'(expected < 1.0s); may be awaiting curator synchronously'
         )
 
         # Cancel background tasks so they don't leak into the next test
