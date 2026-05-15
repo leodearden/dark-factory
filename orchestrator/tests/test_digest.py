@@ -476,8 +476,8 @@ class TestRenderDigestMarkdown:
         """Parked tasks section shows live count and window churn."""
         md = digest.render_digest_markdown(_make_digest_inputs())
         assert '## Parked tasks' in md
-        assert '3' in md  # parked_live
-        assert '7' in md  # parked_window_churn
+        assert '- Live parked:    3\n' in md  # parked_live (4 spaces of padding)
+        assert '- Window churn:   7\n' in md  # parked_window_churn (3 spaces of padding)
 
     def test_ewa_section_not_tripped(self) -> None:
         """EWA line shows value/threshold; no TRIPPED marker when not tripped."""
