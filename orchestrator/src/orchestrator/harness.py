@@ -2014,10 +2014,11 @@ Output JSON matching the schema. Every task must appear in the output.
         never be blocked by a transient cost-DB error.  The ``label`` is used
         only in the warning log.
         """
-        assert sql.rstrip().endswith('completed_at >= ?'), (
-            '_trailing_24h_fetch_one: sql must end with "completed_at >= ?" '
-            f'(got {sql[:80]!r})'
-        )
+        if not sql.rstrip().endswith('completed_at >= ?'):
+            raise ValueError(
+                '_trailing_24h_fetch_one: sql must end with "completed_at >= ?" '
+                f'(got {sql[:80]!r})'
+            )
         if self.cost_store is None:
             return None
         cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()

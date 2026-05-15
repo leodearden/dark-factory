@@ -839,6 +839,29 @@ class TestHarnessCostCeiling:
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
 
+    # ------------------------------------------------------------------
+    # SQL contract: _trailing_24h_fetch_one rejects bad sql suffix
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_fetch_one_raises_valueerror_on_bad_sql_suffix(
+        self, tmp_path: Path
+    ) -> None:
+        """_trailing_24h_fetch_one raises ValueError when sql does not end with 'completed_at >= ?'.
+
+        The guard must fire unconditionally — even under python -O — so it must
+        be a raise, not an assert.  cost_store=None is sufficient because the
+        ValueError is raised BEFORE the cost_store None-check.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.cost_store = None  # guard fires before None-check; defensive only
+
+        bad_sql = (
+            'SELECT cost_usd FROM invocations WHERE completed_at >= ? LIMIT 1'
+        )
+        with pytest.raises(ValueError, match=r'_trailing_24h_fetch_one: sql must end with'):
+            await harness._trailing_24h_fetch_one(bad_sql, (), label='bad-sql-test')
+
 
 class TestDigestConfig:
     """Tests for the five digest_* config fields on OrchestratorConfig.
