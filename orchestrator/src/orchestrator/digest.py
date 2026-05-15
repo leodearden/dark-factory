@@ -363,3 +363,49 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append('')
 
     return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# write_digest_entry — atomic file write, never raises
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DigestResult:
+    """Return value from write_digest_entry.
+
+    path is None when the write failed (fail-open — log warning, no raise).
+    """
+
+    path: Path | None
+    tripped: bool
+    ewa_value: float
+
+
+def write_digest_entry(digest_dir: Path, inputs: DigestInputs) -> DigestResult:
+    """Write a digest markdown file to digest_dir and return a DigestResult.
+
+    - mkdir(parents=True, exist_ok=True) so the dir is auto-created.
+    - File named digest-<YYYYMMDDTHHmmSS_ffffff>.md — microsecond suffix
+      prevents collisions on rapid back-to-back calls.
+    - Written atomically via a tmp file + rename so a partial write is never
+      left behind.
+    - NEVER raises: any exception logs a warning and returns
+      DigestResult(path=None, tripped=inputs.tripped, ewa_value=inputs.ewa_value).
+
+    Task 1327 AFK hardening.
+    """
+    try:
+        digest_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%S_%f')
+        filename = f'digest-{ts}.md'
+        target = digest_dir / filename
+        # Atomic write: tmp → rename
+        tmp = digest_dir / f'.tmp-{filename}'
+        markdown = render_digest_markdown(inputs)
+        tmp.write_text(markdown, encoding='utf-8')
+        tmp.rename(target)
+        return DigestResult(path=target, tripped=inputs.tripped, ewa_value=inputs.ewa_value)
+    except Exception:
+        logger.warning('write_digest_entry: failed to write digest (fail-open)', exc_info=True)
+        return DigestResult(path=None, tripped=inputs.tripped, ewa_value=inputs.ewa_value)
