@@ -136,6 +136,30 @@ class TestFindViolationsSpecHandling:
         violations = find_violations(source, 'test_autospec.py')
         assert violations == []
 
+    def test_starred_positional_arg_is_treated_as_unspecced(self):
+        """config = MagicMock(*args) → violation (Starred spread cannot be inspected at AST time)."""
+        source = 'config = MagicMock(*args)\n'
+        violations = find_violations(source, 'test_starred.py')
+        assert len(violations) == 1, (
+            'MagicMock(*args) cannot be statically verified as specced; should flag as violation'
+        )
+
+    def test_spec_equals_none_is_treated_as_unspecced(self):
+        """config = MagicMock(spec=None) → violation (None is not a real spec)."""
+        source = 'config = MagicMock(spec=None)\n'
+        violations = find_violations(source, 'test_spec_none.py')
+        assert len(violations) == 1, (
+            'MagicMock(spec=None) is equivalent to bare MagicMock(); should flag'
+        )
+
+    def test_spec_set_equals_none_is_treated_as_unspecced(self):
+        """config = MagicMock(spec_set=None) → violation (None is not a real spec)."""
+        source = 'config = MagicMock(spec_set=None)\n'
+        violations = find_violations(source, 'test_spec_set_none.py')
+        assert len(violations) == 1, (
+            'MagicMock(spec_set=None) is equivalent to bare MagicMock(); should flag'
+        )
+
 
 class TestFindViolationsExemption:
     """Exemption comment: # noqa: bare-magicmock — <reason> suppresses the violation."""
@@ -468,12 +492,20 @@ class TestHooksIntegration:
             assert 'uv run' not in line, (
                 f'Found uv run in bare-magicmock check invocation (should use plain python3): {line!r}'
             )
-        # Assert the scan targets appear in non-comment code somewhere in the file.
-        non_comment_lines = [line.split('#')[0] for line in content.splitlines()]
-        all_non_comment = '\n'.join(non_comment_lines)
-        assert 'fused-memory/tests' in all_non_comment, (
-            'Expected fused-memory/tests scan target in non-comment code in hooks/project-checks'
-        )
-        assert 'orchestrator/tests' in all_non_comment, (
-            'Expected orchestrator/tests scan target in non-comment code in hooks/project-checks'
-        )
+        # Assert ALL five configured scan directories appear in the invocation line(s).
+        # Asserting against invocation_lines (already filtered to lines that contain
+        # check_bare_magicmock_config.py in non-comment code) is more precise than
+        # scanning all_non_comment — a drop of any single directory is immediately caught.
+        _EXPECTED_SCAN_DIRS = [
+            'shared/tests',
+            'escalation/tests',
+            'fused-memory/tests',
+            'orchestrator/tests',
+            'dashboard/tests',
+        ]
+        invocation_code = '\n'.join(invocation_lines)
+        for expected_dir in _EXPECTED_SCAN_DIRS:
+            assert expected_dir in invocation_code, (
+                f'Expected scan target {expected_dir!r} in check_bare_magicmock_config.py '
+                f'invocation line(s) in hooks/project-checks, got: {invocation_code!r}'
+            )
