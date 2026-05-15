@@ -2285,27 +2285,25 @@ def test_write_suppression_record_importable_from_canonical_path():
 
 class TestConfirmMarkerPersisted:
     """Tests for confirm_marker_persisted(memory_service, *, project_id, task_id,
-    flag_type, run_id, log) — the canonical-id confirmation helper.
+    flag_type, run_id, log) — returns True if findable, False otherwise.
 
-    step-1: test_returns_canonical_id_from_search_not_response
+    step-1: test_returns_true_when_search_finds_marker
     step-3: test_miss_then_retry_finds_marker
-    step-5: test_miss_after_retry_returns_none_and_warns_never_raises
+    step-5: test_miss_after_retry_returns_false_and_warns_never_raises
     """
 
     @pytest.mark.asyncio
-    async def test_returns_canonical_id_from_search_not_response(self):
-        """Returns MemoryResult.id from the search (canonical id), NOT any add_memory response id.
+    async def test_returns_true_when_search_finds_marker(self):
+        """Returns True when the confirmation search finds at least one matching marker.
 
-        Step-1 RED: confirm_marker_persisted does not exist yet → ImportError.
-        When the confirmation search finds a matching marker, the returned id is
-        the MemoryResult.id ('canonical-XYZ'), not any id from an add_memory
-        response (which is the root-cause vector for the ID-mismatch bug).
+        The bool contract (task-1413): confirm_marker_persisted answers "is the
+        marker findable?" — True if at least one matching marker is returned by the
+        initial search, False after retry-miss or unexpected error.  The caller
+        only needs the presence sentinel; the id string is not used downstream.
         """
         import logging
 
-        from fused_memory.reconciliation.flag_dedup import (
-            confirm_marker_persisted,  # step-1: ImportError
-        )
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted
 
         confirmed_marker = _make_memory_result({
             'source': 'stage1_flag_marker',
@@ -2327,9 +2325,11 @@ class TestConfirmMarkerPersisted:
             log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
         )
 
-        assert result == 'canonical-XYZ', (
-            f"confirm_marker_persisted must return the canonical MemoryResult.id "
-            f"('canonical-XYZ'), not any add_memory response id; got {result!r}"
+        assert result is True, (
+            f"confirm_marker_persisted must return True when marker is findable; got {result!r}"
+        )
+        assert isinstance(result, bool), (
+            f"confirm_marker_persisted must return bool, not {type(result)!r}"
         )
 
     @pytest.mark.asyncio
@@ -2372,9 +2372,12 @@ class TestConfirmMarkerPersisted:
                 log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
             )
 
-        # (a) Returns canonical id from retry result
-        assert result == 'retry-canon', (
-            f"Expected 'retry-canon' from retry but got {result!r}"
+        # (a) Returns True when retry finds the marker
+        assert result is True, (
+            f"Expected True (marker found on retry) but got {result!r}"
+        )
+        assert isinstance(result, bool), (
+            f"confirm_marker_persisted must return bool, not {type(result)!r}"
         )
         # (b) Exactly 2 search calls (initial + 1 retry)
         assert memory_service.search.call_count == 2, (
@@ -2391,22 +2394,22 @@ class TestConfirmMarkerPersisted:
         pytest.param([[], []], 'both_miss', id='both_miss'),
         pytest.param(RuntimeError('search exploded'), 'exception', id='exception'),
     ])
-    async def test_miss_after_retry_returns_none_and_warns_never_raises(
+    async def test_miss_after_retry_returns_false_and_warns_never_raises(
         self, search_side_effect, label, caplog
     ):
-        """On double-miss (or search exception), returns None without raising; final WARNING emitted.
+        """On double-miss (or search exception), returns False without raising; final WARNING emitted.
 
-        Step-5 RED: current impl already handles both-miss → None path (should pass),
+        Step-5 RED: current impl already handles both-miss path (should pass),
         but the exception path (side_effect=RuntimeError) needs verification that
-        find_prior_memories degrades it to [] so helper still returns None not raises.
+        find_prior_memories degrades it to [] so helper still returns False not raises.
 
         Two parametrizations:
-        - both_miss:  search returns [] twice → final WARNING + None
+        - both_miss:  search returns [] twice → final WARNING + False
         - exception:  search raises RuntimeError → find_prior_memories catches it → []
-                      → first miss → WARNING + retry → [] → final WARNING + None
+                      → first miss → WARNING + retry → [] → final WARNING + False
 
         Asserts:
-        (a) Returns None.
+        (a) Returns False (bool).
         (b) Does NOT raise.
         (c) A final WARNING is emitted containing task_id AND flag_type
             with phrasing like 'could not confirm' (ops-greppable).
@@ -2432,8 +2435,11 @@ class TestConfirmMarkerPersisted:
                 log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
             )
 
-        # (a) Returns None
-        assert result is None, f"[{label}] Expected None but got {result!r}"
+        # (a) Returns False (bool)
+        assert result is False, f"[{label}] Expected False but got {result!r}"
+        assert isinstance(result, bool), (
+            f"[{label}] confirm_marker_persisted must return bool, not {type(result)!r}"
+        )
 
         # (b) Does NOT raise (no exception propagated — verified by reaching here)
 
@@ -2492,10 +2498,13 @@ class TestConfirmMarkerPersisted:
                 log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
             )
 
-        # (a) Returns None — stale prior must NOT be accepted as confirmation of 'r1' write
-        assert result is None, (
-            f"Expected None (stale prior run_id='r0' must not confirm run_id='r1') "
+        # (a) Returns False — stale prior must NOT be accepted as confirmation of 'r1' write
+        assert result is False, (
+            f"Expected False (stale prior run_id='r0' must not confirm run_id='r1') "
             f"but got {result!r}"
+        )
+        assert isinstance(result, bool), (
+            f"confirm_marker_persisted must return bool, not {type(result)!r}"
         )
         # (b) Both attempts made: miss → retry → miss
         assert memory_service.search.call_count == 2, (
@@ -3893,7 +3902,7 @@ class TestWriteAndConfirmMarker:
 
         async def stub_confirm(response_memory_ids, miss_warning_template, *, tid, ftype):
             confirm_calls.append((response_memory_ids, miss_warning_template, tid, ftype))
-            return ('canon-id', True)
+            return True
 
         log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
         result = await _write_and_confirm_marker(
@@ -3907,8 +3916,11 @@ class TestWriteAndConfirmMarker:
             miss_warning_template='miss-template-%s-%s',
         )
 
-        # Return value propagated verbatim from confirm_and_track
-        assert result == ('canon-id', True)
+        # Return value propagated verbatim from confirm_and_track (bool contract)
+        assert result is True
+        assert isinstance(result, bool), (
+            f"_write_and_confirm_marker must return bool, not {type(result)!r}"
+        )
 
         # add_memory called exactly once with canonical payload
         memory_service.add_memory.assert_called_once()
@@ -3926,8 +3938,8 @@ class TestWriteAndConfirmMarker:
         assert c_tid == '42'
         assert c_ftype == 'missing_deliverable'
 
-    async def test_returns_none_false_and_logs_unified_warning_on_add_memory_exception(self, caplog):
-        """On add_memory exception: returns (None, False), logs WARNING, does NOT call confirm_and_track."""
+    async def test_returns_false_and_logs_unified_warning_on_add_memory_exception(self, caplog):
+        """On add_memory exception: returns False, logs WARNING, does NOT call confirm_and_track."""
         from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
 
         memory_service = MagicMock()
@@ -3948,7 +3960,10 @@ class TestWriteAndConfirmMarker:
                 miss_warning_template='irrelevant',
             )
 
-        assert result == (None, False)
+        assert result is False
+        assert isinstance(result, bool), (
+            f"_write_and_confirm_marker must return bool on exception, not {type(result)!r}"
+        )
         confirm_and_track.assert_not_called()
 
         warning_msgs = [r.message for r in caplog.records if r.levelno >= _logging_mod.WARNING]
@@ -3957,29 +3972,4 @@ class TestWriteAndConfirmMarker:
         assert 'missing_deliverable' in warning_msgs[0]
         assert 'failed to write marker' in warning_msgs[0]
 
-    async def test_propagates_confirm_and_track_breaker_tripped_return(self):
-        """Propagates (None, True) verbatim — helper does NOT derive write_succeeded from confirmed_id."""
-        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
-
-        memory_service = MagicMock()
-        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-
-        async def breaker_tripped_confirm(response_memory_ids, miss_warning_template, *, tid, ftype):
-            # Simulates circuit-breaker tripped: confirmed_id=None, write_succeeded=True
-            return (None, True)
-
-        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
-        result = await _write_and_confirm_marker(
-            memory_service,
-            project_id='p',
-            run_id='r3',
-            tid='77',
-            ftype='overdue_task',
-            log=log,
-            confirm_and_track=breaker_tripped_confirm,
-            miss_warning_template='some-template-%s-%s',
-        )
-
-        # Must propagate the tuple verbatim: (None, True) — not derive from confirmed_id
-        assert result == (None, True)
 
