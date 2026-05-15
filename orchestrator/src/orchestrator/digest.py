@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +28,10 @@ from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
 logger = logging.getLogger(__name__)
+
+# The 'done' outcome value — must match WorkflowOutcome.DONE.value in workflow.py.
+# Kept as a local constant to avoid importing the full workflow module in a digest helper.
+_DONE_OUTCOME = 'done'
 
 # ---------------------------------------------------------------------------
 # EWA math
@@ -121,3 +126,36 @@ def aggregate_escalations(
             stats.pending_total += 1
 
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Done count from EventStore
+# ---------------------------------------------------------------------------
+
+
+def count_done_in_window(
+    events_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> int:
+    """Count task_completed events with outcome='done' inside the given window.
+
+    Uses sqlite3 directly (read-only).  Fail-open: any exception returns 0.
+    Missing DB returns 0.
+    """
+    try:
+        conn = sqlite3.connect(str(events_db))
+        try:
+            (count,) = conn.execute(
+                "SELECT COUNT(*) FROM events "
+                "WHERE event_type = 'task_completed' "
+                "  AND timestamp BETWEEN ? AND ? "
+                "  AND json_extract(data, '$.outcome') = ?",
+                (window_start_iso, window_end_iso, _DONE_OUTCOME),
+            ).fetchone()
+            return int(count)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug('count_done_in_window: failed (fail-open)', exc_info=True)
+        return 0
