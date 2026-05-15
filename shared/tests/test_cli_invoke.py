@@ -1915,13 +1915,13 @@ class TestCapWaitPeriodicLog:
         """A second cap_wait log is emitted after >=600 s have elapsed since the first."""
         gate = self._exact_hit_gate(hits=3)
 
-        # Supply enough monotonic values for up to 2 time.monotonic() calls per cap hit:
-        #   initial  retry_start = 0.0
-        #   hit-1 (up to 2 calls): 0.0   → now=0.0, log emitted (last=0.0)
-        #   hit-2 (up to 2 calls): 300.0 → 300−0=300 < 600 → throttled
-        #   hit-3 (up to 2 calls): 700.0 → 700−0=700 ≥ 600 → log emitted
+        # Monotonic sequence: one time.monotonic() call per cap-hit iteration
+        #   call 1: retry_start = 0.0
+        #   call 2: hit-1 now = 0.0   → log emitted (last=0.0)
+        #   call 3: hit-2 now = 300.0 → 300−0=300 < 600 → throttled
+        #   call 4: hit-3 now = 700.0 → 700−0=700 >= 600 → log emitted
         monotonic_vals = itertools.chain(
-            [0.0, 0.0, 0.0, 300.0, 300.0, 700.0, 700.0],
+            [0.0, 0.0, 300.0, 700.0],
             itertools.repeat(700.0),
         )
 

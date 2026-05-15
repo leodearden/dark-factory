@@ -44,6 +44,7 @@ _MAX_CAP_COOLDOWN_SECS = 300.0
 _DEFAULT_MAX_CAP_RETRIES = 20
 _DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0  # kept for back-compat; no branch checks it
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
+_CAP_WAIT_LOG_INTERVAL_SECS = 600.0        # emit at most one cap_wait log per ~10 min
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -379,6 +380,7 @@ async def invoke_with_cap_retry(
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
+    last_cap_wait_log_at: float | None = None
     account_name = ''
     unattributed_cap = False  # True when heuristic fires but token is unresolvable;
     # controls: (1) skip confirm, (2) mark capped=True in cost_store
@@ -484,7 +486,8 @@ async def invoke_with_cap_retry(
                     # Guard: raise before sleeping if the 14-day sanity bound is exceeded.
                     # max_cap_retries and cap_retry_deadline_secs are vestigial —
                     # kept in the signature for back-compat but no branch checks them.
-                    elapsed = time.monotonic() - retry_start
+                    now = time.monotonic()
+                    elapsed = now - retry_start
                     if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
                         logger.error(
                             f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
@@ -495,6 +498,19 @@ async def invoke_with_cap_retry(
                             elapsed_secs=elapsed,
                             label=label,
                         )
+
+                    if last_cap_wait_log_at is None or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS:
+                        logger.warning(json.dumps({
+                            'event': 'cap_wait',
+                            'task_id': label,
+                            'elapsed_s': round(elapsed, 1),
+                            'soonest_open_at': (
+                                usage_gate.soonest_resets_at.isoformat()
+                                if usage_gate and usage_gate.soonest_resets_at else None
+                            ),
+                            'next_probe_in_s': round(cooldown, 1),
+                        }))
+                        last_cap_wait_log_at = now
 
                     await asyncio.sleep(cooldown)
                     continue
@@ -544,7 +560,8 @@ async def invoke_with_cap_retry(
 
                         # Guard: raise before sleeping if the 14-day sanity bound is exceeded.
                         # max_cap_retries and cap_retry_deadline_secs are vestigial.
-                        elapsed = time.monotonic() - retry_start
+                        now = time.monotonic()
+                        elapsed = now - retry_start
                         if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
                             logger.error(
                                 f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
@@ -555,6 +572,19 @@ async def invoke_with_cap_retry(
                                 elapsed_secs=elapsed,
                                 label=label,
                             )
+
+                        if last_cap_wait_log_at is None or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS:
+                            logger.warning(json.dumps({
+                                'event': 'cap_wait',
+                                'task_id': label,
+                                'elapsed_s': round(elapsed, 1),
+                                'soonest_open_at': (
+                                    usage_gate.soonest_resets_at.isoformat()
+                                    if usage_gate and usage_gate.soonest_resets_at else None
+                                ),
+                                'next_probe_in_s': round(cooldown, 1),
+                            }))
+                            last_cap_wait_log_at = now
 
                         await asyncio.sleep(cooldown)
                         continue
