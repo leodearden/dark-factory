@@ -18,6 +18,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# _STAGE_RUNNER_CAP_WAIT_SANITY_SECS: minutes-scale cap-wait override for
+# cli_stage_runner.
+#
+# run_stage_via_cli is a reconciliation stage runner.  It is expected to
+# complete promptly within the reconciliation cycle.  Inheriting the shared
+# 14-day default from _DEFAULT_CAP_WAIT_SANITY_SECS would stall the
+# reconciliation queue indefinitely under sustained API capacity limits.
+#
+# 1800 s (30 min) mirrors _AGENT_LOOP_CAP_WAIT_SANITY_SECS and
+# _JUDGE_CAP_WAIT_SANITY_SECS, and is aligned with the stage_timeout_seconds
+# hierarchy (≤ 3600 s), giving a brief cap window time to resolve in-band
+# while keeping the queue moving.  Note: this runner already re-raises
+# AllAccountsCappedException to the harness for deferral; the override aligns
+# with the existing fast-defer contract.
+# See task 1401 / plans/afk-A1-cap-wait.md for the full per-caller policy.
+_STAGE_RUNNER_CAP_WAIT_SANITY_SECS: float = 1800.0
+
 # ── Disallowed tool lists ──────────────────────────────────────────────
 
 # Non-MCP built-in tools that stages should never use
@@ -191,6 +208,7 @@ async def run_stage_via_cli(
             output_schema=output_schema if output_schema is not None else STAGE_REPORT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
+            cap_wait_sanity_secs=_STAGE_RUNNER_CAP_WAIT_SANITY_SECS,
         )
     except AllAccountsCappedException:
         logger.warning(
