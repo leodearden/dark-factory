@@ -36,6 +36,25 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _patch_dry_run_unblock(monkeypatch):
+    """Prevent _spawn_dry_run_unblock from hanging all BLOCKED-outcome tests.
+
+    _mark_blocked fires asyncio.create_task(run_dry_run_unblock(...)) when
+    unblock_auto.enabled=True (the default).  In e2e tests the real
+    invoke_agent call inside run_dry_run_unblock has no Claude CLI available
+    and blocks indefinitely, causing every BLOCKED test to hit the 60 s
+    per-test timeout and the whole file to exceed 1200 s.  Patch to a no-op
+    so the background task completes instantly and the workflow state machine
+    is what gets tested here.  test_workflow_dry_run_hook.py pins the hook
+    behaviour with its own explicit patches.
+    """
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_dry_run_unblock',
+        AsyncMock(return_value=None),
+    )
+
+
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
