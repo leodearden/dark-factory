@@ -4105,6 +4105,107 @@ class TestConfirmationCircuitBreaker:
                 f'{consequence!r} in WARNING; got: {bucket}'
             )
 
+    # -----------------------------------------------------------------------
+    # task-1415 step-3 — default threshold behavior pin
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_default_threshold_trips_at_three_consecutive_misses(self, caplog):
+        """Default _CONFIRMATION_MISS_THRESHOLD (no monkeypatch) trips at 3 consecutive misses.
+
+        RED (step-3 task-1415): the current default is 5.  At threshold=5 the
+        breaker does NOT trip after 3 misses, so flag-4 confirmation searches are
+        still reached → search.call_count would be 13 instead of 11, and no breaker
+        WARNING fires.  The test anchors the production default at 3.
+
+        Setup: 4 MISS-path flags.  Each flag's confirmation always misses (initial
+        miss + retry = 2 searches).  After flag-3's retry the counter reaches 3 →
+        TRIP.  Flag-4's confirmation is entirely skipped.
+
+        search side_effect (13 elements; [11] and [12] only reached without breaker):
+          [0]   suppression → []
+          [1]   flag-1 pre-write → []  (MISS)
+          [2]   flag-1 confirmation initial miss
+          [3]   flag-1 confirmation retry   → counter = 1
+          [4]   flag-2 pre-write → []  (MISS)
+          [5]   flag-2 confirmation initial miss
+          [6]   flag-2 confirmation retry   → counter = 2
+          [7]   flag-3 pre-write → []  (MISS)
+          [8]   flag-3 confirmation initial miss
+          [9]   flag-3 confirmation retry   → counter = 3 → TRIP
+          [10]  flag-4 pre-write → []  (MISS; no confirmation)
+          [11]  (flag-4 confirmation miss — only reached without breaker)
+          [12]  (flag-4 confirmation retry — only reached without breaker)
+
+        Asserts:
+          (a) Exactly ONE circuit-breaker WARNING whose text contains '3'
+              (anchoring the new default value).
+          (b) search.call_count == 11 (1 suppression + 4 pre-write +
+              3×2 confirmations for flags 1-3 + 0 confirmations for flag-4).
+          (c) All 4 flags returned (MISS-path, no 'persisted_from_run').
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            [],   # [0]  suppression
+            [],   # [1]  flag-1 pre-write MISS
+            [],   # [2]  flag-1 confirmation initial miss
+            [],   # [3]  flag-1 confirmation retry        → counter = 1
+            [],   # [4]  flag-2 pre-write MISS
+            [],   # [5]  flag-2 confirmation initial miss
+            [],   # [6]  flag-2 confirmation retry        → counter = 2
+            [],   # [7]  flag-3 pre-write MISS
+            [],   # [8]  flag-3 confirmation initial miss
+            [],   # [9]  flag-3 confirmation retry        → counter = 3 → TRIP
+            [],   # [10] flag-4 pre-write MISS (no confirmation — breaker tripped)
+            [],   # [11] flag-4 confirmation miss  (only reached without breaker)
+            [],   # [12] flag-4 confirmation retry (only reached without breaker)
+        ])
+        memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['x']))
+
+        flags = [
+            {'task_id': 601, 'flag_type': 'missing_deliverable', 'description': 'f1'},
+            {'task_id': 602, 'flag_type': 'missing_deliverable', 'description': 'f2'},
+            {'task_id': 603, 'flag_type': 'missing_deliverable', 'description': 'f3'},
+            {'task_id': 604, 'flag_type': 'missing_deliverable', 'description': 'f4'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (a) Exactly ONE breaker WARNING whose text contains '3' (the new default).
+        breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
+        assert len(breaker_warnings) == 1, (
+            f"Expected exactly 1 circuit-breaker WARNING but got "
+            f"{len(breaker_warnings)}: {breaker_warnings}\nAll WARNINGs: {all_warnings}"
+        )
+        assert '3' in breaker_warnings[0], (
+            f"Breaker WARNING must mention count '3' (the default threshold); "
+            f"got: {breaker_warnings[0]!r}"
+        )
+
+        # (b) Exactly 11 search calls — no confirmation for flag-4.
+        assert memory_service.search.call_count == 11, (
+            f"Expected 11 search calls (1 suppression + 4 pre-write + 3×2 confirmations "
+            f"for flags 1-3 + 0 for flag-4), got: {memory_service.search.call_count}; "
+            f"if count=13, the default threshold is still 5 (not yet lowered to 3)"
+        )
+
+        # (c) All 4 flags returned; MISS path — no 'persisted_from_run' annotation.
+        assert len(result) == 4, f"Expected 4 flags returned; got {len(result)}"
+        for f in result:
+            assert 'persisted_from_run' not in f, f"MISS path must not annotate: {f}"
+
 
 # ---------------------------------------------------------------------------
 # _marker_query builder (step-1 / step-2)
