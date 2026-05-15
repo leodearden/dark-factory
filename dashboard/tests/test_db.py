@@ -153,6 +153,58 @@ class TestDbPool:
         finally:
             await pool.close_all()
 
+    async def test_disjoint_paths_do_not_serialize(self, tmp_path):
+        """Concurrent get() calls for *different* paths must not deadlock.
+
+        A pool-wide lock causes deadlock when path A's connect waits for path B
+        to connect (via an asyncio.Event) while B is blocked waiting for the
+        same pool-wide lock that A holds.
+
+        Pre-fix (step-2, pool-wide lock): asyncio.wait_for raises TimeoutError.
+        Post-fix (step-4, per-path locks): both connections open concurrently,
+        each using its own independent lock.
+        """
+        a_path = tmp_path / 'a.db'
+        b_path = tmp_path / 'b.db'
+        sqlite3.connect(str(a_path)).close()
+        sqlite3.connect(str(b_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        b_resolved = b_path.resolve()
+        event_b_done = asyncio.Event()
+        connect_calls = 0
+
+        async def wrapper(*args, **kwargs):
+            nonlocal connect_calls
+            connect_calls += 1
+            uri_str = args[0] if args else ''
+            if str(b_resolved) in uri_str:
+                # Path B: connect immediately, then signal path A to proceed.
+                conn = await real_connect(*args, **kwargs)
+                event_b_done.set()
+                return conn
+            else:
+                # Path A: wait for B to connect first, then connect.
+                # With a pool-wide lock A holds the lock here and B can never
+                # connect → deadlock → TimeoutError (RED).
+                await event_b_done.wait()
+                return await real_connect(*args, **kwargs)
+
+        try:
+            with patch('aiosqlite.connect', wrapper):
+                results = await asyncio.wait_for(
+                    asyncio.gather(pool.get(a_path), pool.get(b_path)),
+                    timeout=2.0,
+                )
+            assert results[0] is not None
+            assert results[1] is not None
+            assert results[0] is not results[1], 'disjoint paths must yield distinct connections'
+            assert pool.open_count == 2
+            assert connect_calls == 2
+        finally:
+            await pool.close_all()
+
 
 class TestWithDb:
     """Tests for the with_db helper."""
