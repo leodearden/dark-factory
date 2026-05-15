@@ -3877,3 +3877,56 @@ class TestRunFullVerificationReuse:
             f'Expected _discover_module_configs to be called when project_root differs '
             f'from config.project_root; called {call_count} time(s)'
         )
+
+    @pytest.mark.asyncio
+    async def test_discovered_empty_engages_reuse_path_no_walk(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Discovered-empty ({}) config._module_configs should engage the reuse path.
+
+        When load_config runs discovery and finds zero subproject orchestrator.yamls it
+        stores {} in config._module_configs.  That empty dict means "discovery ran and
+        found nothing" — NOT "discovery never ran".  run_full_verification must not
+        perform a redundant walk in this case; it should reuse the cached {} and fall
+        through to the global-fallback branch (run_verification with no ModuleConfig).
+
+        RED until the sentinel is implemented (step-2 changes the guard from
+        `if config._module_configs` to `if config._module_configs is not None`).
+        With the current falsy guard, {} triggers the else-branch and _discover_module_configs
+        IS called — so call_count will be >= 1 and this assertion fails.
+        """
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        # Simulate a load_config that ran discovery and found zero subprojects.
+        config._module_configs = {}  # discovered-empty; NOT the never-ran sentinel
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert call_count == 0, (
+            f'Expected _discover_module_configs NOT to be called when config._module_configs '
+            f'is {{}} (discovered-empty); called {call_count} time(s). '
+            f'The reuse guard must use `is not None` to distinguish '
+            f'"never discovered" (None) from "discovered, found nothing" ({{}}).'
+        )
+        # Global fallback: run_verification called once with only project_root + config
+        assert mock_run_verification.call_count == 1, (
+            f'Expected run_verification to be called exactly once (global fallback); '
+            f'called {mock_run_verification.call_count} time(s)'
+        )
+        assert len(mock_run_verification.call_args[0]) == 2, (
+            f'Expected global-fallback call to pass exactly 2 positional args '
+            f'(project_root, config); got {mock_run_verification.call_args[0]!r}'
+        )
