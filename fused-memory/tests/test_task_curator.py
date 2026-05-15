@@ -2329,3 +2329,106 @@ class TestNormalizeTitle:
     def test_empty_input_returns_empty_string(self):
         """(e) empty string → empty string."""
         assert normalize_title('') == ''
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _CURATOR_CAP_WAIT_SANITY_SECS: minutes-scale override forwarded to
+# invoke_with_cap_retry (task 1365, AFK A1 step-11/12)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCuratorCapWaitSanityBound:
+    """_CURATOR_CAP_WAIT_SANITY_SECS is minutes-scale and forwarded to both
+    invoke_with_cap_retry call sites; fast-fail/defer contract preserved."""
+
+    def test_constant_importable_and_minutes_scale(self):
+        """(a) _CURATOR_CAP_WAIT_SANITY_SECS is importable, >0, <14d, <=600s."""
+        from fused_memory.middleware.task_curator import _CURATOR_CAP_WAIT_SANITY_SECS
+
+        _FOURTEEN_DAYS_SECS = 14 * 86400  # shared._DEFAULT_CAP_WAIT_SANITY_SECS value
+        assert _CURATOR_CAP_WAIT_SANITY_SECS > 0
+        assert _CURATOR_CAP_WAIT_SANITY_SECS < _FOURTEEN_DAYS_SECS  # < 14 days
+        assert _CURATOR_CAP_WAIT_SANITY_SECS <= 600.0  # minutes, not days
+
+    @pytest.mark.asyncio
+    async def test_call_llm_forwards_cap_wait_sanity_secs(self):
+        """(b) _call_llm forwards cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS."""
+        from fused_memory.middleware.task_curator import _CURATOR_CAP_WAIT_SANITY_SECS
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        empty_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'action': 'create', 'justification': 'x'},
+        )
+        mock = AsyncMock(return_value=empty_result)
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['cap_wait_sanity_secs'] == _CURATOR_CAP_WAIT_SANITY_SECS
+
+    @pytest.mark.asyncio
+    async def test_call_llm_batch_forwards_cap_wait_sanity_secs(self):
+        """(c) _call_llm_batch forwards cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS."""
+        from fused_memory.middleware.task_curator import _CURATOR_CAP_WAIT_SANITY_SECS
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        batch_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': [
+                {'candidate_index': 0, 'action': 'create', 'justification': 'new0'},
+                {'candidate_index': 1, 'action': 'create', 'justification': 'new1'},
+            ]},
+        )
+        mock = AsyncMock(return_value=batch_result)
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title='T0'), CandidateTask(title='T1')],
+                pools=[[], []],
+                pool_sizes_list=[{}, {}],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['cap_wait_sanity_secs'] == _CURATOR_CAP_WAIT_SANITY_SECS
+
+    @pytest.mark.asyncio
+    async def test_regression_cap_handling_behavior_preserved(self):
+        """(d) AllAccountsCappedException from _call_llm still yields action='create'
+        from curate() — fast-fail/defer contract is preserved with the new explicit bound."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=90.0, label='task-curator[p]'
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(side_effect=cap_exc)):
+            result = await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
+
+        assert result.action == 'create'
+        assert result.justification == 'all-accounts-capped'

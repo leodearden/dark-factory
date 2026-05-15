@@ -42,7 +42,9 @@ logger = logging.getLogger(__name__)
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
 _DEFAULT_MAX_CAP_RETRIES = 20
-_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0
+_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0  # kept for back-compat; no branch checks it
+_DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
+_CAP_WAIT_LOG_INTERVAL_SECS = 600.0        # emit at most one cap_wait log per ~10 min
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -62,7 +64,10 @@ __all__ = [
 
 
 class AllAccountsCappedException(Exception):
-    """Raised when the cap-hit retry loop exceeds max retries or wall-clock deadline.
+    """Raised when the cap-hit retry loop exceeds the sanity-bound wall-clock deadline.
+
+    The count-based guard (``max_cap_retries``) no longer triggers this exception;
+    it is kept in the ``invoke_with_cap_retry`` signature for back-compat only.
 
     Attributes:
     - ``retries``: number of consecutive cap hits before giving up
@@ -336,8 +341,9 @@ async def invoke_with_cap_retry(
     task_id: str = '',
     project_id: str = '',
     role: str = '',
-    max_cap_retries: int | None = _DEFAULT_MAX_CAP_RETRIES,
-    cap_retry_deadline_secs: float | None = _DEFAULT_CAP_RETRY_DEADLINE_SECS,
+    max_cap_retries: int | None = None,
+    cap_retry_deadline_secs: float | None = None,
+    cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     **invoke_kwargs,
@@ -354,6 +360,13 @@ async def invoke_with_cap_retry(
     account switches.  If resume itself fails (non-cap-hit error), falls
     back to a fresh invocation with the original prompt.
 
+    *cap_wait_sanity_secs* is the outer wall-clock bound for cap-hit patience.
+    When total elapsed time since the first cap hit exceeds this value,
+    ``AllAccountsCappedException`` is raised so the caller can escalate.
+    Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).  Pass ``None``
+    to wait indefinitely.  ``cap_retry_deadline_secs`` is kept for
+    back-compat but is now vestigial — no branch checks it.
+
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
@@ -367,6 +380,40 @@ async def invoke_with_cap_retry(
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
+    last_cap_wait_log_at: float | None = None
+
+    def _check_cap_wait(now: float, elapsed: float, cooldown: float, hits: int) -> None:
+        """Guard and throttled log for cap-wait iterations.
+
+        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded.
+        Emits a structured 'cap_wait' JSON log at most once per _CAP_WAIT_LOG_INTERVAL_SECS.
+        Closes over: cap_wait_sanity_secs, label, num_accounts, usage_gate,
+        last_cap_wait_log_at (nonlocal write).
+        """
+        nonlocal last_cap_wait_log_at
+        if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
+            logger.error(
+                f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
+                f'({hits} retries, {num_accounts} account(s))',
+            )
+            raise AllAccountsCappedException(
+                retries=hits,
+                elapsed_secs=elapsed,
+                label=label,
+            )
+        if last_cap_wait_log_at is None or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS:
+            logger.warning(json.dumps({
+                'event': 'cap_wait',
+                'label': label,
+                'elapsed_s': round(elapsed, 1),
+                'soonest_open_at': (
+                    usage_gate.soonest_resets_at.isoformat()
+                    if usage_gate and usage_gate.soonest_resets_at else None
+                ),
+                'next_probe_in_s': round(cooldown, 1),
+            }))
+            last_cap_wait_log_at = now
+
     account_name = ''
     unattributed_cap = False  # True when heuristic fires but token is unresolvable;
     # controls: (1) skip confirm, (2) mark capped=True in cost_store
@@ -469,28 +516,10 @@ async def invoke_with_cap_retry(
                             f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
                         )
 
-                    # Guard: raise before sleeping if retry limit or deadline exceeded
-                    elapsed = time.monotonic() - retry_start
-                    if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
-                        logger.error(
-                            f'{label}: giving up after {consecutive_cap_hits} consecutive cap hits '
-                            f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
-                        )
-                        raise AllAccountsCappedException(
-                            retries=consecutive_cap_hits,
-                            elapsed_secs=elapsed,
-                            label=label,
-                        )
-                    if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
-                        logger.error(
-                            f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
-                            f'({consecutive_cap_hits} retries, {num_accounts} account(s))',
-                        )
-                        raise AllAccountsCappedException(
-                            retries=consecutive_cap_hits,
-                            elapsed_secs=elapsed,
-                            label=label,
-                        )
+                    # Guard + periodic log: raise on 14-day sanity bound, emit throttled JSON.
+                    now = time.monotonic()
+                    elapsed = now - retry_start
+                    _check_cap_wait(now, elapsed, cooldown, consecutive_cap_hits)
 
                     await asyncio.sleep(cooldown)
                     continue
@@ -538,28 +567,10 @@ async def invoke_with_cap_retry(
                             f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
                         )
 
-                        # Guard: raise before sleeping if retry limit or deadline exceeded
-                        elapsed = time.monotonic() - retry_start
-                        if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
-                            logger.error(
-                                f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
-                                f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
-                            )
-                            raise AllAccountsCappedException(
-                                retries=consecutive_cap_hits,
-                                elapsed_secs=elapsed,
-                                label=label,
-                            )
-                        if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
-                            logger.error(
-                                f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
-                                f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
-                            )
-                            raise AllAccountsCappedException(
-                                retries=consecutive_cap_hits,
-                                elapsed_secs=elapsed,
-                                label=label,
-                            )
+                        # Guard + periodic log: raise on 14-day sanity bound, emit throttled JSON.
+                        now = time.monotonic()
+                        elapsed = now - retry_start
+                        _check_cap_wait(now, elapsed, cooldown, consecutive_cap_hits)
 
                         await asyncio.sleep(cooldown)
                         continue

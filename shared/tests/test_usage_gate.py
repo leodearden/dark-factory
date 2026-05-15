@@ -742,3 +742,60 @@ class TestWaitForOpen:
         cannot be paused if it has no accounts."""
         gate = make_gate([])  # no accounts configured
         assert await gate.wait_for_open(timeout=0.05) is True
+
+
+# ---------------------------------------------------------------------------
+# soonest_resets_at property
+# ---------------------------------------------------------------------------
+
+
+class TestSoonestResetsAt:
+    """UsageGate.soonest_resets_at returns the earliest resets_at across capped
+    accounts, or None when that information is unavailable."""
+
+    def test_returns_none_when_no_account_is_capped(self):
+        """When no account is capped the property returns None."""
+        gate = make_gate(['A', 'B'])
+        # Default state: no account is capped.
+        assert gate.soonest_resets_at is None
+
+    def test_returns_earliest_resets_at_across_capped_accounts(self):
+        """With two capped accounts, returns the minimum resets_at."""
+        gate = make_gate(['A', 'B'])
+        earlier = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
+        later = datetime(2025, 1, 1, 14, 0, 0, tzinfo=UTC)
+
+        gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = later
+        gate._accounts[1].capped = True
+        gate._accounts[1].resets_at = earlier
+
+        assert gate.soonest_resets_at == earlier
+
+    def test_ignores_non_capped_accounts_and_capped_with_none_resets_at(self):
+        """Non-capped accounts and capped accounts with resets_at=None are ignored;
+        only capped accounts with a known resets_at contribute."""
+        gate = make_gate(['A', 'B', 'C'])
+        known = datetime(2025, 6, 15, 8, 0, 0, tzinfo=UTC)
+
+        # A: capped, resets_at known
+        gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = known
+        # B: capped, resets_at unknown (None)
+        gate._accounts[1].capped = True
+        gate._accounts[1].resets_at = None
+        # C: not capped, has a resets_at (should be ignored)
+        gate._accounts[2].capped = False
+        gate._accounts[2].resets_at = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+        assert gate.soonest_resets_at == known
+
+    def test_returns_none_when_all_capped_accounts_have_unknown_resets_at(self):
+        """If every capped account has resets_at=None the property returns None."""
+        gate = make_gate(['A', 'B'])
+        gate._accounts[0].capped = True
+        gate._accounts[0].resets_at = None
+        gate._accounts[1].capped = True
+        gate._accounts[1].resets_at = None
+
+        assert gate.soonest_resets_at is None
