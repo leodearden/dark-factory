@@ -4343,7 +4343,7 @@ class TestQueryStage2Flags:
             self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'}),
             self._make_result('id-2', 'no flag', {}),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         assert current_flags[0]['id'] == 'id-1'
         assert stale_missing_ids == []
@@ -4357,7 +4357,7 @@ class TestQueryStage2Flags:
             self._make_result('id-4', 'irrelevant', {'some_other_key': True}),
             self._make_result('id-5', 'also irrelevant', {}),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
         assert stale_missing_ids == []
         assert stale_mismatched_ids == []
@@ -4370,7 +4370,7 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('id-6', 'content here', meta),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         flag = current_flags[0]
         assert flag['id'] == 'id-6'
@@ -4386,7 +4386,7 @@ class TestQueryStage2Flags:
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
         with caplog.at_level(logging.WARNING):
-            current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+            current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
         assert stale_missing_ids == []
         assert stale_mismatched_ids == []
@@ -4428,7 +4428,7 @@ class TestQueryStage2Flags:
                 {'flag_for_stage2': True, 'task_id': '999'},
             ),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         stale_marker_ids = stale_missing_ids + stale_mismatched_ids
 
         # Only the current-cycle marker should be in current_flags
@@ -4463,7 +4463,7 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('test-id', 'content', meta),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids = await _query_stage2_flags(
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(
             memory_service, 'reify', filter_run_id
         )
         stale_marker_ids = stale_missing_ids + stale_mismatched_ids
@@ -4495,9 +4495,9 @@ class TestQueryStage2Flags:
         ]
         partition = await _query_stage2_flags(memory_service, 'reify', 'r-current')
 
-        # Partition must be the right type with 3 fields
+        # Partition must be the right type with 4 fields
         assert isinstance(partition, Stage2FlagPartition)
-        assert len(partition) == 3
+        assert len(partition) == 4
 
         # (a) only matching marker in current
         assert len(partition.current) == 1
@@ -4853,8 +4853,9 @@ class TestQueryStage2Flags:
         )
 
     @pytest.mark.asyncio
-    async def test_partition_return_is_3_field_stage2flagpartition(self):
-        """Return is still a 3-field Stage2FlagPartition with run_window_start active."""
+    async def test_partition_return_is_4_field_stage2flagpartition(self):
+        """Return is a 4-field Stage2FlagPartition (current, stale_missing_run_id_ids,
+        stale_mismatched_run_id_ids, rescued_ids) with run_window_start active."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             Stage2FlagPartition,
             _query_stage2_flags,
@@ -4867,7 +4868,91 @@ class TestQueryStage2Flags:
             memory_service, 'reify', 'r-current', run_window_start=run_window_start
         )
         assert isinstance(partition, Stage2FlagPartition)
-        assert len(partition) == 3
+        assert len(partition) == 4
+        assert partition.rescued_ids == []
+
+    @pytest.mark.asyncio
+    async def test_rescued_ids_field_collects_window_guard_rescued_marker_ids(self):
+        """Stage2FlagPartition exposes a rescued_ids field tracking markers rescued by the
+        run-window guard in BOTH branches (missing run_id + mismatched run_id), but NOT
+        clean markers or genuinely-stale out-of-window markers.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _query_stage2_flags,
+        )
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            # (a) clean matching run_id — in partition.current, NOT rescued
+            self._make_result(
+                'clean-current',
+                'clean current flag',
+                {'flag_for_stage2': True, 'task_id': '1', 'run_id': 'r-current'},
+                created_at=None,
+            ),
+            # (b) missing run_id, created_at in-window — rescued by window guard
+            self._make_result(
+                'rescued-missing',
+                'rescued missing run_id flag',
+                {'flag_for_stage2': True, 'task_id': '2'},
+                created_at='2026-05-15T10:00:05+00:00',
+            ),
+            # (c) mismatched run_id, created_at in-window — rescued by window guard
+            self._make_result(
+                'rescued-mismatch',
+                'rescued mismatched run_id flag',
+                {'flag_for_stage2': True, 'task_id': '3', 'run_id': 'r-other'},
+                created_at='2026-05-15T10:00:10+00:00',
+            ),
+            # (d) missing run_id, created_at out-of-window — genuinely stale, NOT rescued
+            self._make_result(
+                'stale-out-of-window',
+                'genuinely stale out-of-window flag',
+                {'flag_for_stage2': True, 'task_id': '4'},
+                created_at='2026-05-15T08:00:00+00:00',
+            ),
+        ]
+
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+
+        # The partition must expose the rescued_ids field (4th field of Stage2FlagPartition)
+        assert hasattr(partition, 'rescued_ids'), (
+            "Stage2FlagPartition must expose a 'rescued_ids' field populated by "
+            "the run-window guard branches"
+        )
+
+        # (b) and (c) must appear in rescued_ids (both rescue branches)
+        assert set(partition.rescued_ids) == {'rescued-missing', 'rescued-mismatch'}, (
+            f"rescued_ids should contain exactly the two window-guard-rescued markers; "
+            f"got: {partition.rescued_ids}"
+        )
+
+        # (a) clean marker is NOT in rescued_ids (it matched run_id cleanly)
+        assert 'clean-current' not in partition.rescued_ids, (
+            "Clean matching-run_id marker must NOT be in rescued_ids"
+        )
+
+        # (d) genuinely stale marker is NOT in rescued_ids
+        assert 'stale-out-of-window' not in partition.rescued_ids, (
+            "Out-of-window genuinely stale marker must NOT be in rescued_ids"
+        )
+
+        # (b) and (c) must still be in partition.current (rescue routes them to current)
+        current_ids = {f['id'] for f in partition.current}
+        assert 'rescued-missing' in current_ids, (
+            "Rescued missing-run_id marker must still appear in partition.current"
+        )
+        assert 'rescued-mismatch' in current_ids, (
+            "Rescued mismatched-run_id marker must still appear in partition.current"
+        )
+
+        # (d) stale out-of-window marker goes to stale_missing_run_id_ids
+        assert 'stale-out-of-window' in partition.stale_missing_run_id_ids, (
+            "Out-of-window missing-run_id marker must be in stale_missing_run_id_ids"
+        )
 
 
 class TestSweepStaleFixcMarkers:
@@ -6040,7 +6125,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [])
+            return Stage2FlagPartition([], [], [], [])
 
         with (
             patch(
@@ -6082,7 +6167,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [])
+            return Stage2FlagPartition([], [], [], [])
 
         with (
             patch(
@@ -6124,7 +6209,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [])
+            return Stage2FlagPartition([], [], [], [])
 
         with (
             patch(
@@ -6408,6 +6493,66 @@ class TestRescuedInWindowMarkersStat:
         assert 'rescued_in_window_markers' in report.stats
         assert report.stats['rescued_in_window_markers'] == 0, (
             'rescued_in_window_markers must be explicitly 0, not absent, when no rescue fires'
+        )
+
+    @pytest.mark.asyncio
+    async def test_rescued_in_window_count_reads_partition_rescued_ids_not_rederived(self, mock_deps):
+        """rescued_in_window_markers must equal len(partition.rescued_ids), not a re-derived
+        predicate over active_flags metadata.
+
+        Injects a hand-built partition where `current` contains TWO flags whose
+        metadata.run_id does NOT match the run_id ('mismatch' != 'test-run'), but
+        rescued_ids contains only ONE id ('rescued-1').  The old re-derivation
+        (sum over active_flags whose run_id != current) would yield 2; the single-source
+        contract (len(partition.rescued_ids)) must yield 1.
+
+        This test fails against the re-derivation at assemble_payload lines 1656-1660 and
+        passes only once the consumer reads partition.rescued_ids directly.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            TaskKnowledgeSync,
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal down'))
+
+        # Inject a partition where current has 2 non-matching-run_id flags but rescued_ids
+        # has only 1 entry — old re-derivation yields 2, single-source yields 1.
+        injected_partition = Stage2FlagPartition(
+            current=[
+                {'id': 'rescued-1', 'content': 'flag 1', 'metadata': {'run_id': 'mismatch'}, 'task_id': '1'},
+                {'id': 'not-rescued', 'content': 'flag 2', 'metadata': {'run_id': 'mismatch'}, 'task_id': '2'},
+            ],
+            stale_missing_run_id_ids=[],
+            stale_mismatched_run_id_ids=[],
+            rescued_ids=['rescued-1'],  # only 1, even though both flags have non-matching run_id
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+                new=AsyncMock(return_value=injected_partition),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='test-run',
+            )
+
+        assert report.stats['rescued_in_window_markers'] == 1, (
+            f"rescued_in_window_markers must equal len(partition.rescued_ids)==1, "
+            f"not a re-derived predicate over active_flags (which would yield 2); "
+            f"got: {report.stats.get('rescued_in_window_markers')}"
         )
 
 
