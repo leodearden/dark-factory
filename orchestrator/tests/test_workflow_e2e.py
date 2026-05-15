@@ -4680,6 +4680,71 @@ class TestAllAccountsCappedExceptionBoundary:
 
 
 @pytest.mark.asyncio
+class TestAllAccountsCappedEscalationLevel:
+    """Verify AllAccountsCappedException creates an L0 (not L1) with
+    suggested_action='cap_wait_exceeded_sanity_bound'.
+
+    Before step-10 impl, _mark_blocked hardcodes suggested_action='investigate_and_retry',
+    so the suggested_action assertion fails — proving the test is red before impl.
+    """
+
+    async def test_l0_escalation_with_cap_wait_suggested_action(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """AllAccountsCappedException creates a single L0 with cap_wait_exceeded_sanity_bound."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        async def raise_cap_exc(*args, **kwargs):
+            raise AllAccountsCappedException(
+                retries=2, elapsed_secs=1300000.0, label='Task 42 [architect]'
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        outcome = await workflow.run()
+
+        # Outcome and state
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert workflow.state == WorkflowState.BLOCKED
+
+        # Exactly one L0 escalation must exist
+        l0 = queue.get_by_task(task_assignment.task_id, level=0)
+        assert len(l0) == 1, f'Expected 1 L0 escalation, got {len(l0)}'
+        esc = l0[0]
+
+        # Summary must still start with 'All accounts capped'
+        assert esc.summary.lower().startswith('all accounts capped'), (
+            f'Expected summary starting with "All accounts capped", got: {esc.summary!r}'
+        )
+
+        # The suggested_action must be the cap-wait-specific value (red before step-10)
+        assert esc.suggested_action == 'cap_wait_exceeded_sanity_bound', (
+            f'Expected suggested_action="cap_wait_exceeded_sanity_bound", '
+            f'got: {esc.suggested_action!r}'
+        )
+
+        # An L1 is created via the no-steward fallthrough path (_ensure_l1_escalation_for_blocked),
+        # NOT via escalate_to_human=True — the cap-hit handler stays on the default L0/steward path.
+        # We verify the L1 has 'manual_intervention', not 'cap_wait_exceeded_sanity_bound'.
+        l1 = queue.get_by_task(task_assignment.task_id, level=1)
+        assert len(l1) == 1, f'Expected 1 L1 (fallthrough), got {len(l1)}'
+        assert l1[0].suggested_action == 'manual_intervention', (
+            f'L1 should be the generic fallthrough "manual_intervention", '
+            f'got: {l1[0].suggested_action!r}'
+        )
+
+
+@pytest.mark.asyncio
 class TestSessionBudgetExhaustionEscalation:
     """Verify _SessionBudgetExhausted creates an L1 escalation with actionable budget metrics.
 
