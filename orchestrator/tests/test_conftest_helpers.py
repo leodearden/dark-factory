@@ -1,6 +1,6 @@
 """Contract tests for ``conftest.py`` correctness.
 
-This module guards three invariants that would silently regress under refactoring
+This module guards five invariants that would silently regress under refactoring
 and are NOT already covered by other tests:
 
 1. **sys.path ordering / module resolution** — ``conftest.py`` must insert
@@ -19,12 +19,24 @@ and are NOT already covered by other tests:
    must be ``spec_set``'d so that typos raise ``AttributeError`` immediately
    rather than silently creating phantom attributes.
 
+4. **``@property`` descriptor exposure** — ``pydantic_spec`` must expose
+   user-defined ``@property`` descriptors (e.g. ``overrides_db_path``) in
+   the proxy class so ``spec_set`` accepts both read and write.
+   BaseModel-inherited properties (``model_extra``, ``model_fields_set``, …)
+   and BaseModel methods (``model_dump``, …) must remain excluded.
+
+5. **``mock_orch_config.overrides_db_path`` is a real ``Path``** — the
+   fixture must set a concrete ``Path`` under ``tmp_path`` for
+   ``overrides_db_path`` so ``OverrideStore.from_config(config)`` can call
+   ``.parent.mkdir()`` and ``sqlite3.connect(str(...))`` without crashing.
+
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
 ``conftest.py`` two lines away.
 """
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -96,3 +108,77 @@ def test_subsection_typo_rejected(mock_orch_config, attr_path):
         obj = getattr(obj, attr)
     with pytest.raises(AttributeError):
         setattr(obj, attr_path[-1], 'anything')
+
+
+def test_pydantic_spec_exposes_user_property_descriptors():
+    """pydantic_spec exposes @property descriptors declared on the user's pydantic model.
+
+    Regression pin for the bug introduced by task 1313: ``Harness.__init__:218``
+    calls ``OverrideStore.from_config(config)``, which dereferences
+    ``config.overrides_db_path`` — a ``@property`` on ``OrchestratorConfig``
+    (config.py:741).  Without this fix, ``MagicMock(spec_set=pydantic_spec(
+    OrchestratorConfig))`` rejects both read and write of ``overrides_db_path``
+    with ``AttributeError``.
+
+    This test FAILS on pre-fix pydantic_spec (model_fields only).
+    """
+    from _orch_helpers import pydantic_spec
+
+    from orchestrator.config import OrchestratorConfig
+
+    spec = pydantic_spec(OrchestratorConfig)
+    m = MagicMock(spec_set=spec)
+    # overrides_db_path is a @property on OrchestratorConfig — not in model_fields.
+    _ = m.overrides_db_path            # read must not raise AttributeError
+    m.overrides_db_path = Path('/x')   # write must not raise AttributeError
+
+
+def test_pydantic_spec_excludes_basemodel_inherited_members():
+    """pydantic_spec still rejects BaseModel methods and inherited properties.
+
+    Preserves the invariant established by task 1064: the proxy class created
+    by pydantic_spec must NOT expose BaseModel API surface (model_dump,
+    model_validate, model_extra, model_fields_set, …).  Exposing those would
+    let tests write ``mock.model_dump = ...`` without error, silently hiding
+    bugs in consumers that call real pydantic methods.
+
+    This test PASSES on current (pre-fix) pydantic_spec because the spec proxy
+    only contains model_fields names — none of which are BaseModel API.  After
+    step-2's fix (broader @property enumeration with BaseModel-inherited
+    filtering), it must continue to pass.
+    """
+    from _orch_helpers import pydantic_spec
+
+    from orchestrator.config import OrchestratorConfig
+
+    m = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    with pytest.raises(AttributeError):
+        _ = m.model_dump            # BaseModel method
+    with pytest.raises(AttributeError):
+        _ = m.model_extra           # BaseModel @property
+    with pytest.raises(AttributeError):
+        _ = m.model_fields_set      # BaseModel @property
+
+
+def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
+    """mock_orch_config seeds overrides_db_path with a real Path under tmp_path.
+
+    Guards the fixture-level cleanup (step-4): ``Harness.__init__`` calls
+    ``OverrideStore.from_config(config)`` unconditionally, which does
+    ``self.db_path.parent.mkdir(...)`` and ``sqlite3.connect(str(self.db_path))``.
+    A child ``MagicMock`` value for ``overrides_db_path`` would let ``.parent``
+    and ``.mkdir()`` silently no-op but then cause ``sqlite3.connect`` to open a
+    file named ``'<MagicMock …>'`` under cwd, leaking filesystem state in CI.
+
+    This test FAILS on pre-fix conftest.py (no default set for overrides_db_path).
+    """
+    db_path = mock_orch_config.overrides_db_path
+    assert isinstance(db_path, Path), (
+        f'expected overrides_db_path to be a Path, got {type(db_path).__name__!r}'
+    )
+    assert db_path.is_relative_to(tmp_path), (
+        f'expected overrides_db_path under tmp_path={tmp_path}, got {db_path}'
+    )
+    assert db_path.suffix == '.db', (
+        f'expected overrides_db_path to have .db suffix, got {db_path.name!r}'
+    )

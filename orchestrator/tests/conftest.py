@@ -99,6 +99,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``sandbox.backend`` = 'auto'
       - ``fused_memory`` = pre-created sub-section mock (no default value)
       - ``escalation`` = pre-created sub-section mock (no default value)
+      - ``overrides_db_path`` = ``tmp_path / 'overrides.db'``
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
     fused_memory, escalation) are spec_set'd against their pydantic model's
@@ -108,8 +109,9 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
 
     Gotcha — pydantic_spec hides BaseModel methods
     -----------------------------------------------
-    ``pydantic_spec`` (see ``_orch_helpers.py``) intentionally exposes *only*
-    ``model.model_fields`` names to ``MagicMock(spec_set=...)``.  BaseModel
+    ``pydantic_spec`` (see ``_orch_helpers.py``) intentionally exposes
+    ``model.model_fields`` names AND user-defined ``@property`` descriptors
+    (e.g. ``overrides_db_path``) to ``MagicMock(spec_set=...)``.  BaseModel
     methods — ``model_dump``, ``model_validate``, ``model_copy``, etc. — are
     NOT in the proxy class, so ``spec_set`` rejects them on both *read* and
     *write*::
@@ -150,4 +152,9 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # an additional asyncio.Task to manage.
     config.stranded_reconcile_enabled = False
     config.stranded_reconcile_interval_secs = 900.0
+    # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
+    # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
+    # is a @property on OrchestratorConfig (see config.py) and Harness wires
+    # OverrideStore.from_config(config) at construction (task 1313).
+    config.overrides_db_path = tmp_path / 'overrides.db'
     return config
