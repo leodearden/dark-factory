@@ -118,6 +118,20 @@ class EventType(StrEnum):
     # Reserve-now lifecycle — emitted when a reserve_now flag transitions
     # False→True (armed) or when parks are installed for a reserve_now task
     # and the flag is cleared (consumed).
+    #
+    # BREAKING RENAME (task 1230, commits 4d45eecd9b / deb8f426ab):
+    # reserve_now_consumed replaced the former reserve-now short-circuit form
+    # of reservation_installed (which used data.reason == 'reserve_now').
+    # The two reservation events are discriminated by EVENT NAME, not a
+    # 'reason' field:
+    #   threshold-based install  → reservation_installed
+    #                               data: {modules, skip_count, priority}
+    #                               no 'reason' key — UNCHANGED by task 1230
+    #   reserve-now short-circuit → reserve_now_consumed
+    #                               data: {modules, priority}
+    # Audit (task 1333): exhaustive repo search found ZERO in-repo consumers
+    # that ever filtered reservation_installed by data.reason == 'reserve_now'.
+    # Downstream consumers outside this repo must migrate; see CHANGELOG.md.
     reserve_now_armed = 'reserve_now_armed'
     reserve_now_consumed = 'reserve_now_consumed'
 
