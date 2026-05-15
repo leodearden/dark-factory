@@ -850,3 +850,78 @@ async def test_assemble_subtask_event_qualified_id_end_to_end(
     assert '[task:2]' not in item.formatted, (
         f"Must not contain bare '[task:2]', got: {item.formatted!r}"
     )
+
+
+# ── Task-1341: hint-query memory.search failure logs WARNING ─────────
+
+
+@pytest.mark.asyncio
+async def test_ctx_task_event_logs_warning_when_memory_search_fails_for_hint_query(
+    mock_memory, mock_taskmaster, caplog,
+):
+    """hint-query path: memory.search failure must be logged, loop continues.
+
+    context_assembler.py:312-313 is currently a bare ``except Exception: pass``
+    that swallows failures silently.  This test confirms a WARNING is emitted
+    with exc_info when search raises, that the assembler does not raise, and
+    that the task-context item is still present (non-hint context preserved).
+    """
+    import logging
+
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '99',
+            'title': 'Test task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'memory_hints': {
+                    'queries': ['some hint query'],
+                },
+            },
+        }
+    )
+    # Configure search to raise so the swallow site is exercised.
+    mock_memory.search = AsyncMock(side_effect=RuntimeError('mem0 down'))
+
+    assembler = _make_assembler(
+        memory_service=mock_memory,
+        taskmaster=mock_taskmaster,
+    )
+    events = [
+        _make_event(
+            event_type=EventType.task_status_changed,
+            payload={'task_id': '99', 'old_status': 'pending', 'new_status': 'in-progress'},
+        ),
+    ]
+    watermark = _make_watermark()
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger='fused_memory.reconciliation.context_assembler',
+    ):
+        result = await assembler.assemble(events, watermark, 'test-project')
+
+    # (a) Assembler does not raise; event is still included.
+    assert len(result.events) == 1, 'Expected the event to be included even when hint search fails'
+    # (b) Task context item is still present (non-hint enrichment not broken).
+    assert 'task:99' in result.context_items, (
+        f"Expected 'task:99' in context_items, got: {list(result.context_items.keys())}"
+    )
+    # (c) At least one WARNING from the assembler's logger mentioning memory.search or hint.
+    matching = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and r.name == 'fused_memory.reconciliation.context_assembler'
+        and ('memory.search' in r.getMessage() or 'hint' in r.getMessage())
+    ]
+    assert len(matching) >= 1, (
+        f'Expected at least 1 WARNING mentioning memory.search or hint, '
+        f'got {len(matching)}: {[r.getMessage() for r in caplog.records]}'
+    )
+    # (d) exc_info carries the RuntimeError (proves exc_info=True was used).
+    record = matching[0]
+    assert record.exc_info is not None, 'Expected exc_info to be set on the WARNING record'
+    assert record.exc_info[0] is RuntimeError, (
+        f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
+    )

@@ -762,6 +762,13 @@ class Scheduler:
         # Serialises concurrent _write_snapshot_best_effort invocations so that
         # tick writes and flush writes never race on the shared .json.tmp path.
         self._snapshot_write_lock: asyncio.Lock = asyncio.Lock()
+        # One-time dedup flag for the project_root guard warning so it logs at
+        # most once per scheduler instance, not every tick.
+        self._snapshot_guard_warned: bool = False
+        # One-time dedup flag for override-store read failures: a broken store
+        # is a static deployment condition, so one traceback per instance is
+        # enough — callers are time-throttled by _write_snapshot_best_effort.
+        self._override_store_warned: bool = False
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -2340,7 +2347,12 @@ class Scheduler:
                 for tid, row in self._override_store.get_pin_queue(self._project_root):
                     pin_queue.append({'task_id': tid, 'order': row.pin_order})
             except Exception:
-                pass
+                if not self._override_store_warned:
+                    self._override_store_warned = True
+                    logger.warning(
+                        'override_store.get_pin_queue failed; pin_queue degraded to empty list',
+                        exc_info=True,
+                    )
 
         # overrides — convert OverrideRow dataclasses to plain dicts.
         overrides: dict[str, dict] = {}
@@ -2356,7 +2368,12 @@ class Scheduler:
                         'ttl_until': row.ttl_until.isoformat() if row.ttl_until else None,
                     }
             except Exception:
-                pass
+                if not self._override_store_warned:
+                    self._override_store_warned = True
+                    logger.warning(
+                        'override_store.get_overrides failed; overrides degraded to empty dict',
+                        exc_info=True,
+                    )
 
         # current_holders — delegate to the public accessor.
         current_holders = self.lock_table.snapshot_holders()
@@ -2476,14 +2493,29 @@ class Scheduler:
         Swallows all exceptions so the scheduler never stops ticking due to
         disk or serialisation errors.
         """
-        # Guard: when config.project_root is None, scheduler.py:692 produces
-        # self._project_root = str(None) == 'None'.  Without this check,
-        # Path('None') / 'data' / 'orchestrator' / 'scheduler_state.json'
-        # would silently create a directory literally named ./None/ under the
-        # process CWD.  Refuse the write instead.  This guard MUST run before
-        # any timestamp bookkeeping so a no-project-root scheduler does not
-        # advance _last_snapshot_write_ts for a write that never happens.
+        # Guard: defensive belt-and-suspenders against a _project_root that
+        # bypassed pydantic validation.  Under normal operation this branch is
+        # unreachable: config.py:875 types project_root as
+        #   Path = Field(default=Path('.'))
+        # with an after-validator at config.py:880-883 that calls .resolve(),
+        # and validate_assignment=True at config.py:948 — so pydantic rejects
+        # None on both construction and assignment.  The only path that produces
+        # 'None'/empty in _project_root (set at scheduler.py:692 via
+        # str(config.project_root)) is a value that bypassed pydantic
+        # validation entirely, e.g. via object.__setattr__ as the task-1334
+        # guard tests do.  Without this check, Path('None') / 'data' /
+        # 'orchestrator' / 'scheduler_state.json' would create a directory
+        # literally named ./None/ under the process CWD.  Refuse the write
+        # instead.  This guard MUST run before any timestamp bookkeeping so a
+        # no-project-root scheduler does not advance _last_snapshot_write_ts
+        # for a write that never happens.
         if not self._project_root or self._project_root == 'None':
+            if not self._snapshot_guard_warned:
+                self._snapshot_guard_warned = True
+                logger.warning(
+                    'scheduler state snapshot skipped: project_root unset/invalid (%r)',
+                    self._project_root,
+                )
             return
         # Lock serialises the time-gate read → await → bookkeeping write section
         # so concurrent tick/flush callers never race on the stale timestamp or

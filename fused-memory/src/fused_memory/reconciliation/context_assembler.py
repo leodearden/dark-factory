@@ -296,6 +296,7 @@ class ContextAssembler:
         # If task has memory hints with queries, search for each
         hints = (task.get('metadata') or {}).get('memory_hints', {})
         queries = hints.get('queries', []) if isinstance(hints, dict) else []
+        _hint_exc_logged = False
         for query in queries[:3]:  # cap hint queries
             try:
                 results = await self.memory.search(
@@ -310,7 +311,11 @@ class ContextAssembler:
                         formatted=_format_memory_result(r),
                     ))
             except Exception:
-                pass
+                if not _hint_exc_logged:
+                    logger.warning('memory.search failed for hint query; skipping', exc_info=True)
+                    _hint_exc_logged = True
+                else:
+                    logger.warning('memory.search failed for hint query; skipping')
         return items
 
     async def _ctx_task_deleted(

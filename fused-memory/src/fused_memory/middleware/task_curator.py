@@ -2043,7 +2043,11 @@ def _parse_batch_decisions(
             if isinstance(parsed, dict) and isinstance(parsed.get('decisions'), list):
                 raw_decisions = parsed['decisions']
     except Exception:
-        pass
+        logger.warning(
+            'failed to extract decisions list from agent_result; '
+            'degrading entire batch to action=create',
+            exc_info=True,
+        )
 
     # Build a lookup from candidate_index → raw dict.
     index_to_raw: dict[int, dict] = {}

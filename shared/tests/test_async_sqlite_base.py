@@ -523,6 +523,7 @@ async def _swap_in_failing_close_mock(
       3. Install the AsyncMock — close() raises exc; tests then assert on _conn.
     """
     real_conn = store._conn
+    assert real_conn is not None
     store._conn = None
     await real_conn.close()
     mock_conn = AsyncMock()
@@ -705,6 +706,7 @@ class TestSwapLeakGuard:
         store = _SimpleStore(tmp_path / 'store.db')
         await store.open()
         real_conn = store._conn  # keep a reference for post-test cleanup
+        assert real_conn is not None
 
         with pytest.raises(AssertionError, match=r'Leaked aiosqlite connection'):  # noqa: SIM117
             with _ensure_real_conn_closed_at_exit(store):

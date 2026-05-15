@@ -675,6 +675,43 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         # prevent write_state_snapshot from being invoked for all bad root values.
         scheduler.write_state_snapshot.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_project_root_guard_logs_once_and_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Guard emits a WARNING exactly once across repeated calls (dedup).
+
+        The new instance flag ``_snapshot_guard_warned`` must suppress
+        duplicate log lines on subsequent guard trips — a misconfigured
+        project_root is a static deployment issue, not a per-tick event.
+        Best-effort no-raise contract must also hold: the guard returns
+        without raising, and write_state_snapshot is never called.
+        """
+        import logging
+        from unittest.mock import MagicMock
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler._project_root = 'None'
+        scheduler.write_state_snapshot = MagicMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler._write_snapshot_best_effort()
+            await scheduler._write_snapshot_best_effort()
+
+        # (a) Guard still short-circuits — write_state_snapshot never called.
+        scheduler.write_state_snapshot.assert_not_called()
+        # (b) Exactly ONE WARNING across BOTH calls (dedup via instance flag).
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.scheduler'
+            and ('project_root' in r.getMessage() or 'snapshot' in r.getMessage())
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 WARNING (dedup), got {len(matching)}: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
 
 # ===========================================================================
 # Task-1332: _write_snapshot_best_effort throttle / coalesce
@@ -924,4 +961,109 @@ class TestSnapshotWriteThrottle:
         assert in_flight['max'] == 1, (
             f'Expected max in-flight write_state_snapshot calls == 1 (serialised), '
             f'got {in_flight["max"]} — lock is missing or not covering the critical section'
+        )
+
+
+# ===========================================================================
+# Task-1341: override-store swallow sites log warnings on failure
+# ===========================================================================
+
+class TestStateSnapshotOverrideStoreLogging:
+    """get_state_snapshot() logs a WARNING when the override store call fails."""
+
+    def test_get_pin_queue_failure_logs_warning_and_returns_empty_pin_queue(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """pin_queue path: exception must be logged, fallback [] preserved.
+
+        scheduler.py:2342-2343 is currently a bare ``except Exception: pass``
+        that swallows failures silently.  This test confirms a WARNING is
+        emitted with exc_info and the empty-list fallback is returned.
+        """
+        import logging
+        from unittest.mock import MagicMock
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        mock_store = MagicMock()
+        mock_store.get_pin_queue.side_effect = RuntimeError('boom')
+        mock_store.get_overrides.return_value = {}
+        scheduler._override_store = mock_store
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            snap = scheduler.get_state_snapshot()
+
+        # (a) Fallback preserved: pin_queue is empty list.
+        assert snap['pin_queue'] == [], (
+            f"Expected pin_queue == [], got {snap['pin_queue']!r}"
+        )
+        # (b) Overrides fallback also preserved.
+        assert snap['overrides'] == {}, (
+            f"Expected overrides == {{}}, got {snap['overrides']!r}"
+        )
+        # (c) Exactly one WARNING record from orchestrator.scheduler mentioning
+        # get_pin_queue or pin_queue.
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.scheduler'
+            and ('get_pin_queue' in r.getMessage() or 'pin_queue' in r.getMessage())
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 WARNING mentioning pin_queue, '
+            f'got {len(matching)}: {[r.getMessage() for r in caplog.records]}'
+        )
+        # (d) exc_info must carry the RuntimeError (proves exc_info=True was used).
+        record = matching[0]
+        assert record.exc_info is not None, 'Expected exc_info to be set on the WARNING record'
+        assert record.exc_info[0] is RuntimeError, (
+            f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
+        )
+
+    def test_get_overrides_failure_logs_warning_and_returns_empty_overrides(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """overrides path: exception must be logged, fallback {} preserved.
+
+        scheduler.py:2358-2359 is currently a bare ``except Exception: pass``
+        that swallows failures silently.  This test confirms a WARNING is
+        emitted with exc_info and the empty-dict fallback is returned.
+        """
+        import logging
+        from unittest.mock import MagicMock
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        mock_store = MagicMock()
+        # pin_queue returns an empty iterator (the for-loop consumes it fine).
+        mock_store.get_pin_queue.return_value = iter([])
+        mock_store.get_overrides.side_effect = RuntimeError('boom')
+        scheduler._override_store = mock_store
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            snap = scheduler.get_state_snapshot()
+
+        # (a) Fallback preserved: overrides is empty dict.
+        assert snap['overrides'] == {}, (
+            f"Expected overrides == {{}}, got {snap['overrides']!r}"
+        )
+        # (b) pin_queue fallback also preserved.
+        assert snap['pin_queue'] == [], (
+            f"Expected pin_queue == [], got {snap['pin_queue']!r}"
+        )
+        # (c) Exactly one WARNING record from orchestrator.scheduler mentioning
+        # get_overrides or overrides.
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.scheduler'
+            and ('get_overrides' in r.getMessage() or 'overrides' in r.getMessage())
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 WARNING mentioning overrides, '
+            f'got {len(matching)}: {[r.getMessage() for r in caplog.records]}'
+        )
+        # (d) exc_info must carry the RuntimeError (proves exc_info=True was used).
+        record = matching[0]
+        assert record.exc_info is not None, 'Expected exc_info to be set on the WARNING record'
+        assert record.exc_info[0] is RuntimeError, (
+            f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
         )

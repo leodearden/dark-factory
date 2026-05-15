@@ -1243,6 +1243,73 @@ class TestParseBatchDecisions:
         assert result[2].action == 'create'
         assert result[2].justification == 'third'
 
+    def test_extraction_failure_logs_warning_and_degrades_entire_batch(
+        self, caplog,
+    ):
+        """Whole-batch structural failure: WARNING logged, all items degraded.
+
+        task_curator.py:2037-2038 is currently a bare ``except Exception: pass``
+        that swallows the json.JSONDecodeError silently.  This test confirms
+        a WARNING is emitted with exc_info and the existing whole-batch degrade
+        (every item → action='create', justification='batch-item-missing') is
+        preserved.
+        """
+        import json
+        import logging
+
+        # Build an AgentResult with structured_output=None and a non-JSON output
+        # so json.loads(output) raises json.JSONDecodeError.
+        bad_output = 'not valid json {'
+        agent_result = AgentResult(
+            success=True,
+            output=bad_output,
+            structured_output=None,
+            cost_usd=0.03,
+        )
+        # Verify our precondition: the output really does raise JSONDecodeError.
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(bad_output)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.middleware.task_curator',
+        ):
+            result = _parse_batch_decisions(
+                agent_result,
+                pools=[[], [], []],
+                pool_sizes_list=[{}, {}, {}],
+                latency_ms=50,
+            )
+
+        # (a) Whole-batch degrade preserved: all 3 items → action='create'.
+        assert len(result) == 3, f'Expected 3 decisions, got {len(result)}'
+        for decision in result:
+            assert decision.action == 'create', (
+                f"Expected action == 'create', got {decision.action!r}"
+            )
+            assert decision.justification == 'batch-item-missing', (
+                f"Expected justification == 'batch-item-missing', "
+                f"got {decision.justification!r}"
+            )
+        # (b) At least one WARNING from the task_curator logger.
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.middleware.task_curator'
+            and ('decisions' in r.getMessage() or 'extract' in r.getMessage())
+        ]
+        assert len(matching) >= 1, (
+            f'Expected at least 1 WARNING mentioning decisions or extract, '
+            f'got {len(matching)}: {[r.getMessage() for r in caplog.records]}'
+        )
+        # (c) exc_info carries a ValueError subclass (json.JSONDecodeError).
+        record = matching[0]
+        assert record.exc_info is not None, 'Expected exc_info on the WARNING record'
+        assert issubclass(record.exc_info[0], ValueError), (
+            f'Expected exc_info[0] to be a subclass of ValueError, '
+            f'got {record.exc_info[0]!r}'
+        )
+
 
 # ----------------------------------------------------------------------
 # TaskCurator._build_batch_user_prompt
