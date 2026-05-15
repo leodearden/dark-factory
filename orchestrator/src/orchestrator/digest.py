@@ -16,6 +16,7 @@ Design decisions (see plan.json):
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -29,11 +30,13 @@ if TYPE_CHECKING:
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
+from orchestrator.workflow import WorkflowOutcome
+
 logger = logging.getLogger(__name__)
 
-# The 'done' outcome value — must match WorkflowOutcome.DONE.value in workflow.py.
-# Kept as a local constant to avoid importing the full workflow module in a digest helper.
-_DONE_OUTCOME = 'done'
+# Canonical 'done' outcome value sourced directly from WorkflowOutcome so that
+# any future rename is caught at import time rather than silently zeroing done counts.
+_DONE_OUTCOME: str = WorkflowOutcome.DONE.value
 
 # ---------------------------------------------------------------------------
 # EWA math
@@ -91,22 +94,91 @@ def aggregate_escalations(
     which handles root-precedence deduplication. Filters by
     window_start_iso <= esc.timestamp <= window_end_iso.
 
+    Performance: applies two layers of prefiltering before full JSON parse:
+      1. Directory-level: archive/YYYY-MM-DD/ dirs strictly before window_start
+         date are skipped entirely (archive layout is date-partitioned).
+      2. File-level: reads only the 'timestamp' field from raw JSON and skips
+         the file if it is outside the window before constructing a full
+         Escalation object.
+
+    Timezone robustness: timestamp comparison uses datetime.fromisoformat()
+    rather than lexicographic string comparison, so 'Z' and '+00:00' suffixes
+    are handled correctly.  Falls back to lexicographic comparison when
+    fromisoformat() cannot parse.
+
     Fail-open: on any per-file error, logs a warning and continues.
     """
     stats = EscalationStats()
 
+    # Parse window bounds as aware datetimes once for the whole loop.
+    try:
+        window_start_dt = datetime.fromisoformat(window_start_iso)
+        window_end_dt = datetime.fromisoformat(window_end_iso)
+    except ValueError:
+        logger.warning(
+            'aggregate_escalations: cannot parse window bounds %r / %r — returning empty stats',
+            window_start_iso, window_end_iso,
+        )
+        return stats
+
+    # window_start date prefix for directory-level prefilter (YYYY-MM-DD).
+    window_start_date = window_start_iso[:10]
+
     for path in iter_all_escalation_paths(escalations_dir):
+        # (1) Directory-level prefilter: skip archive/YYYY-MM-DD/ dirs entirely
+        # when the date partition is strictly before the window start date.
+        # archive layout: <escalations_dir>/archive/YYYY-MM-DD/esc-*.json
         try:
-            esc = Escalation.from_json(path.read_text())
+            rel = path.relative_to(escalations_dir)
+            rel_parts = rel.parts
+            if (
+                len(rel_parts) >= 3
+                and rel_parts[0] == 'archive'
+                and len(rel_parts[1]) == 10
+                and rel_parts[1][4] == '-'
+                and rel_parts[1][7] == '-'
+                and rel_parts[1] < window_start_date
+            ):
+                continue
+        except ValueError:
+            pass  # path not relative to escalations_dir — skip dir check
+
+        # (2) File-level prefilter: read raw JSON and parse only 'timestamp'
+        # before constructing the full Escalation object.
+        try:
+            text = path.read_text()
+        except Exception:
+            logger.warning('aggregate_escalations: failed to read %s', path, exc_info=True)
+            continue
+
+        ts: str = ''
+        ts_dt: datetime | None = None
+        try:
+            raw = json.loads(text)
+            ts = raw.get('timestamp') or ''
+        except Exception:
+            pass  # malformed JSON — attempt full parse below, let from_json report it
+
+        if ts:
+            try:
+                ts_dt = datetime.fromisoformat(ts)
+                if ts_dt < window_start_dt or ts_dt > window_end_dt:
+                    continue
+            except ValueError:
+                # fromisoformat failed (e.g. unusual suffix) — fall back to lexicographic
+                if ts < window_start_iso or ts > window_end_iso:
+                    continue
+        else:
+            continue  # no timestamp → skip
+
+        # Full parse only for in-window files.
+        try:
+            esc = Escalation.from_json(text)
         except Exception:
             logger.warning('aggregate_escalations: failed to parse %s', path, exc_info=True)
             continue
 
-        ts = esc.timestamp or ''
-        if not ts:
-            continue
-        if ts < window_start_iso or ts > window_end_iso:
-            continue
+        esc_ts = esc.timestamp or ts  # prefer parsed timestamp for stats
 
         # Update counts
         key = (esc.category, esc.level, esc.status)
@@ -114,11 +186,11 @@ def aggregate_escalations(
             stats.category_level_status_counts.get(key, 0) + 1
         )
 
-        # Track first / last timestamps in window
-        if stats.first_ts is None or ts < stats.first_ts:
-            stats.first_ts = ts
-        if stats.last_ts is None or ts > stats.last_ts:
-            stats.last_ts = ts
+        # Track first / last timestamps in window (use raw ts for consistency)
+        if stats.first_ts is None or esc_ts < stats.first_ts:
+            stats.first_ts = esc_ts
+        if stats.last_ts is None or esc_ts > stats.last_ts:
+            stats.last_ts = esc_ts
 
         # Dedupe children
         stats.dedupe_children_total += len(esc.dedupe_children or [])
@@ -159,7 +231,7 @@ def count_done_in_window(
         finally:
             conn.close()
     except Exception:
-        logger.debug('count_done_in_window: failed (fail-open)', exc_info=True)
+        logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
         return 0
 
 
@@ -176,9 +248,6 @@ class CostStats:
     total_cost_in_window: float = 0.0
     watcher_cost_24h: float = 0.0
     total_cost_24h: float = 0.0
-
-
-_ZERO_COST = CostStats()
 
 
 async def cost_in_window(

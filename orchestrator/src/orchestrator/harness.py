@@ -3048,9 +3048,22 @@ Output JSON matching the schema. Every task must appear in the output.
         1. Delegates to ``scheduler.resume()`` (idempotent).
         2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
         3. Emits ``EventType.scheduler_resumed`` (best-effort).
-        4. Logs INFO.
+        4. If the pause was caused by an EWA trip (reason starts with 'ewa_trip_'),
+           resets ``_ewa_value`` to 0.0 so the next digest step does not immediately
+           re-trigger a pause.  EWA decays naturally with alpha=0.3 (~N digests of
+           low ratio to fall back below threshold), but an operator-driven resume
+           signals that the situation is under control — a clean reset is less
+           surprising than watching the EWA trip instantly again.
+        5. Logs INFO.
         """
+        # Snapshot pause reason BEFORE resume() clears it.
+        prior_reason = self.scheduler.pause_reason or ''
         self.scheduler.resume()
+        if prior_reason.startswith('ewa_trip_'):
+            self._ewa_value = 0.0
+            logger.info(
+                'resume_scheduler: EWA value reset to 0.0 (prior pause was ewa_trip).'
+            )
         logger.info('Scheduler resumed.')
 
         if self._run_store:
@@ -3189,9 +3202,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 self.cost_store, window_start, window_end
             )
 
-            # (8) Parked-task counts from Scheduler state (no MCP round-trip).
-            parked_live = len(self.scheduler._blocked_task_ids_in_window)
-            parked_window_churn = len(self.scheduler._blocked_transitions)
+            # (8) Parked-task counts via public Scheduler properties (task 1327).
+            parked_live = self.scheduler.parked_live_count
+            parked_window_churn = self.scheduler.parked_window_churn_count
 
             # (9) Update EWA.
             new_ewa = digest_mod.update_ewa(

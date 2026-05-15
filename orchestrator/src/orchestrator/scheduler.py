@@ -796,6 +796,26 @@ class Scheduler:
         """
         return self._done_transitions_total
 
+    @property
+    def parked_live_count(self) -> int:
+        """Count of task_ids currently in the park-stop sliding window (de-duped).
+
+        Equal to len(_blocked_task_ids_in_window).  Exposed as a public property
+        so the digest subsystem (and any other observer) does not need to access
+        the private set directly.  Task 1327 encapsulation.
+        """
+        return len(self._blocked_task_ids_in_window)
+
+    @property
+    def parked_window_churn_count(self) -> int:
+        """Count of (task_id, timestamp) entries in the park-stop rolling deque.
+
+        Equal to len(_blocked_transitions).  Counts raw transitions in the window
+        (may exceed parked_live_count if the deque has not been evicted yet).
+        Exposed as a public property for the digest subsystem.  Task 1327.
+        """
+        return len(self._blocked_transitions)
+
     def pause(self, reason: str) -> None:
         """Pause the scheduler.  acquire_next() will return None until resume().
 

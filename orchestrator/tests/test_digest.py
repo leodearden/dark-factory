@@ -42,7 +42,14 @@ class TestUpdateEwa:
         assert result == pytest.approx(0.7), f"Expected 0.7; got {result}"
 
     def test_alpha_zero_returns_prev_unchanged(self) -> None:
-        """alpha=0.0: EWA is never updated — returns prev unchanged."""
+        """alpha=0.0: EWA is never updated — returns prev unchanged.
+
+        NOTE: alpha=0.0 is rejected by OrchestratorConfig (Field constraint gt=0.0),
+        so this case cannot be reached through normal config paths.  It is kept as a
+        mathematical edge-case test to verify the formula itself, not a production
+        regression guard.  For reachable near-zero alpha, see test_standard_case
+        (alpha=0.3) which exercises the same code path with a valid config value.
+        """
         result = digest.update_ewa(prev_ewa=3.5, escalations_in_step=100, done_in_step=1, alpha=0.0)
         assert result == pytest.approx(3.5), f"Expected 3.5 (prev unchanged); got {result}"
 

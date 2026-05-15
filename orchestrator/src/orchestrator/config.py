@@ -835,15 +835,16 @@ class OrchestratorConfig(BaseSettings):
     )
 
     # Digest + EWA trip (AFK hardening, task 1327).
-    # Every digest_every_n_escalations escalation events (counted in both
-    # _on_escalation and _on_escalation_resolved callbacks), _maybe_write_digest()
-    # writes an append-only markdown file to digest_dir summarising recent activity.
+    # Every digest_every_n_escalations escalation-lifecycle events (both submit
+    # AND resolve callbacks each count), _maybe_write_digest() writes an append-only
+    # markdown file to digest_dir summarising recent activity.
     # The EWA of escalations/done is updated each digest step; when it exceeds
     # digest_ewa_threshold, Harness.pause_scheduler('ewa_trip_<value>') is called.
     # digest_ewa_alpha: smoothing factor for EWA(t+1) = alpha*(esc/max(done,1)) + (1-alpha)*EWA(t).
-    # digest_ewa_threshold default: reify 23-day baseline mean+2σ; see task 1327 completion notes.
+    # digest_ewa_threshold default: reify 23-day baseline mean+2σ ≈ 24.6; see task 1327 notes.
     # EWA state is process-local (reset on orchestrator restart — consistent with
     # park-stop and watcher-supervisor counters, documented in design decisions).
+    # EWA is also reset to 0.0 on resume_scheduler() when pause was caused by ewa_trip.
     digest_enabled: bool = Field(
         default=True,
         description=(
@@ -855,8 +856,11 @@ class OrchestratorConfig(BaseSettings):
         default=10,
         ge=1,
         description=(
-            'Number of escalation events (submit + resolve) between digest writes. '
-            'Task 1327.'
+            'Number of escalation-lifecycle events (BOTH submit AND resolve callbacks '
+            'each increment this counter — a single escalation that is later resolved '
+            'contributes 2 events) that must accumulate since the last digest before '
+            'the next digest is written. A value of 10 therefore means ~5 distinct '
+            'escalations resolved, or ~10 unresolved escalations submitted. Task 1327.'
         ),
     )
     digest_dir: str = Field(
@@ -876,12 +880,20 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     digest_ewa_threshold: float = Field(
-        default=24.555779,  # reify 23-day baseline mean+2σ; see task 1327 completion notes
+        # Rounded from reify 23-day baseline: EWA-smoothed(alpha=0.3) daily
+        # escalation/done ratio, mean=21.05 + 2*stddev=3.51 ≈ 24.56.
+        # Full derivation in task 1327 completion notes (fused-memory).
+        # Re-derive with: walk reify/data/escalations/ (23 days), get daily
+        # done counts, compute ratio/day, EWA-smooth with alpha=0.3, mean+2σ.
+        default=24.6,
         gt=0.0,
         description=(
             'EWA threshold above which the scheduler is paused via '
             'pause_scheduler(\'ewa_trip_<value>\'). Default derived from '
-            'reify 23-day escalation/done ratio history (mean+2σ=24.56). Task 1327.'
+            'reify 23-day escalation/done ratio history (mean+2σ≈24.6). '
+            'EWA starts at 0.0 on process start; reaching 24.6 from a cold '
+            'start requires sustained high ratios across multiple digest steps. '
+            'Task 1327.'
         ),
     )
 
