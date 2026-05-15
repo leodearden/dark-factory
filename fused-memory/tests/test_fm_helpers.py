@@ -274,14 +274,6 @@ class TestMake8df8Scenario:
 class TestLineRegexConstants:
     """ID_TITLE_LINE_RE and PROVENANCE_LINE_RE constants exist and parse correctly."""
 
-    def test_id_title_line_re_exists(self):
-        """ID_TITLE_LINE_RE is importable from _fm_helpers."""
-        from _fm_helpers import ID_TITLE_LINE_RE  # noqa: F401
-
-    def test_provenance_line_re_exists(self):
-        """PROVENANCE_LINE_RE is importable from _fm_helpers."""
-        from _fm_helpers import PROVENANCE_LINE_RE  # noqa: F401
-
     def test_id_title_line_re_matches_active_line(self):
         """ID_TITLE_LINE_RE matches a typical active-task rendered line."""
         from _fm_helpers import ID_TITLE_LINE_RE
