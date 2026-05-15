@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
-from shared.async_sqlite_base import AsyncSqliteBase
+from shared.async_sqlite_base import (
+    AsyncSqliteBase,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+)
 
 # ---------------------------------------------------------------------------
 # Step-1: apply_wal_pragmas
@@ -105,6 +109,44 @@ class TestApplyWalPragmas:
 
         with pytest.raises(RuntimeError, match='WAL'):
             await apply_wal_pragmas(mock_conn, busy_timeout_ms=5000)
+
+
+# ---------------------------------------------------------------------------
+# Step-2: apply_full_durability_pragmas
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestApplyFullDurabilityPragmas:
+    """apply_full_durability_pragmas delegates to apply_wal_pragmas and adds the
+    synchronous/wal_autocheckpoint/journal_size_limit triad."""
+
+    async def test_applies_full_pragma_triad(self, tmp_path: Path):
+        """A single call sets journal_mode, busy_timeout, synchronous, wal_autocheckpoint,
+        and journal_size_limit — all five PRAGMAs in one connection open.
+
+        Uses busy_timeout_ms=12345 so we can distinguish the configured value
+        from any SQLite default (5000 is a plausible default; 12345 is not).
+        """
+        db_path = tmp_path / 'test.db'
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=12345)
+            async with conn.execute('PRAGMA journal_mode') as cur:
+                journal_row = await cur.fetchone()
+            async with conn.execute('PRAGMA busy_timeout') as cur:
+                timeout_row = await cur.fetchone()
+            async with conn.execute('PRAGMA synchronous') as cur:
+                sync_row = await cur.fetchone()
+            async with conn.execute('PRAGMA wal_autocheckpoint') as cur:
+                checkpoint_row = await cur.fetchone()
+            async with conn.execute('PRAGMA journal_size_limit') as cur:
+                size_row = await cur.fetchone()
+
+        assert journal_row is not None and journal_row[0] == 'wal'
+        assert timeout_row is not None and timeout_row[0] == 12345
+        assert sync_row is not None and sync_row[0] == 2  # 2 == FULL
+        assert checkpoint_row is not None and checkpoint_row[0] == 100
+        assert size_row is not None and size_row[0] == 67108864
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +274,7 @@ class TestAsyncSqliteBaseOpen:
         mock_conn.executescript = AsyncMock(side_effect=RuntimeError('schema failure'))
         mock_conn.close = AsyncMock()
 
-        with patch('shared.async_sqlite_base.apply_wal_pragmas', new=AsyncMock()), \
+        with patch('shared.async_sqlite_base.apply_full_durability_pragmas', new=AsyncMock()), \
              patch('aiosqlite.connect', new=AsyncMock(return_value=mock_conn)), \
              pytest.raises(RuntimeError, match='schema failure'):
             await store.open()
@@ -689,3 +731,90 @@ class TestSwapLeakGuard:
             await _swap_in_failing_close_mock(store, OSError('boom'))
             with pytest.raises(OSError):
                 await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Step-13: AsyncSqliteBase.checkpoint()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAsyncSqliteBaseCheckpoint:
+    """Tests for AsyncSqliteBase.checkpoint()."""
+
+    async def test_checkpoint_raises_when_not_opened(self, tmp_path: Path) -> None:
+        """checkpoint() raises RuntimeError('{ClassName} not opened') before open()."""
+        store = _SimpleStore(tmp_path / 'store.db')
+        with pytest.raises(RuntimeError, match='_SimpleStore not opened'):
+            await store.checkpoint()
+
+    async def test_checkpoint_returns_checkpoint_result_on_fresh_store(self, tmp_path: Path) -> None:
+        """checkpoint() returns a CheckpointResult with busy==0 on a fresh store."""
+        async with _SimpleStore(tmp_path / 'store.db') as store:
+            result = await store.checkpoint()
+        assert isinstance(result, CheckpointResult)
+        assert isinstance(result, tuple)  # NamedTuple is a tuple subclass
+        assert len(result) == 3
+        assert result.busy == 0
+        # TRUNCATE moves all WAL frames into the main db; log == checkpointed
+        assert result.log == result.checkpointed
+
+    async def test_checkpoint_raises_if_pragma_returns_no_rows(self, tmp_path: Path) -> None:
+        """checkpoint() raises RuntimeError when PRAGMA wal_checkpoint returns no rows.
+
+        Defensive guard: SQLite always returns a row for this PRAGMA in practice,
+        but the explicit check ensures callers get a loud failure rather than a
+        silent sentinel if the behaviour ever changes.
+        """
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=None)
+        mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_cursor.__aexit__ = AsyncMock(return_value=False)
+
+        mock_conn = AsyncMock()
+        # execute() must return a sync value (the cursor) so `async with conn.execute(...)`
+        # can call __aenter__ on it directly.
+        mock_conn.execute = MagicMock(return_value=mock_cursor)
+
+        store = _SimpleStore(tmp_path / 'store.db')
+        store._conn = mock_conn  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError, match='PRAGMA wal_checkpoint returned no rows'):
+            await store.checkpoint()
+
+    async def test_checkpoint_truncates_wal_after_writes(self, tmp_path: Path) -> None:
+        """After inserting rows, checkpoint() flushes the WAL with busy==0.
+
+        We assert only what SQLite's documented contract guarantees:
+        - ``busy == 0`` when no readers are blocking the checkpoint.
+        - The WAL file shrinks to near-zero (≤ 32 bytes, the WAL header size).
+
+        log and checkpointed counters are only sanity-bounded (>= 0) because
+        their post-TRUNCATE values differ across SQLite builds and are not
+        part of the contractually stable API.
+        """
+        db_path = tmp_path / 'store.db'
+        wal_path = tmp_path / 'store.db-wal'
+        async with _SimpleStore(db_path) as store:
+            # Insert enough rows to populate WAL frames
+            for i in range(10):
+                await store._conn.execute(  # type: ignore[union-attr]
+                    "INSERT INTO items (name) VALUES (?)", (f'item-{i}',)
+                )
+            await store._conn.commit()  # type: ignore[union-attr]
+
+            # WAL file should have frames from the inserts
+            before_size = wal_path.stat().st_size if wal_path.exists() else 0
+            assert before_size > 0, 'Expected WAL frames to exist after commits'
+
+            result = await store.checkpoint()
+
+        assert isinstance(result, CheckpointResult)
+        # Contractually guaranteed: no readers blocked the checkpoint
+        assert result.busy == 0
+        # Non-negative sanity bounds only; exact values are build-specific
+        assert result.log >= 0
+        assert result.checkpointed >= 0
+        # WAL file must be truncated to near-zero (SQLite WAL header = 32 bytes)
+        after_size = wal_path.stat().st_size if wal_path.exists() else 0
+        assert after_size <= 32, f'WAL should be truncated; got {after_size} bytes'

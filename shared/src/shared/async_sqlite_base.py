@@ -2,6 +2,7 @@
 
 Provides:
 - apply_wal_pragmas(conn, busy_timeout_ms): standalone utility to configure WAL + busy_timeout
+- apply_full_durability_pragmas(conn, busy_timeout_ms): WAL + busy_timeout + Phase 3 triad
 - AsyncSqliteBase: ABC with lifecycle management (open/close/context-manager/guard)
 """
 
@@ -11,11 +12,26 @@ import abc
 import asyncio
 import contextlib
 from pathlib import Path
-from typing import Self
+from typing import NamedTuple, Self
 
 import aiosqlite
 
-__all__ = ['apply_wal_pragmas', 'AsyncSqliteBase']
+__all__ = ['apply_wal_pragmas', 'apply_full_durability_pragmas', 'CheckpointResult', 'AsyncSqliteBase']
+
+
+class CheckpointResult(NamedTuple):
+    """Result of a ``PRAGMA wal_checkpoint(TRUNCATE)`` call.
+
+    Attributes:
+        busy: 1 if one or more WAL frames could not be checkpointed because they
+            are in use by a reader, 0 otherwise.
+        log: Total number of frames in the WAL file.
+        checkpointed: Total number of frames that were successfully checkpointed.
+    """
+
+    busy: int
+    log: int
+    checkpointed: int
 
 
 async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int) -> None:
@@ -35,6 +51,38 @@ async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int)
         )
     if busy_timeout_ms != 0:
         await conn.execute(f'PRAGMA busy_timeout={busy_timeout_ms}')
+
+
+async def apply_full_durability_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int) -> None:
+    """Configure WAL mode, busy_timeout, and the Phase 3 durability triad.
+
+    Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then sets the
+    three additional PRAGMAs that harden crash durability across all
+    fused-memory SQLite stores:
+
+    - ``synchronous=FULL`` (2): fsync per-commit; eliminates corruption on
+      unexpected shutdown without relying on WAL-checkpoint timing.
+    - ``wal_autocheckpoint=100``: auto-checkpoint after every 100 WAL pages to
+      bound WAL growth under normal load.
+    - ``journal_size_limit=67108864`` (64 MiB): caps the WAL file size to
+      prevent unbounded disk use during high-write bursts.
+
+    See ``docs/task-recovery-2026-05-13/`` for the production incident that
+    drove this convention across all fused-memory SQLite stores.
+
+    Args:
+        conn: An open aiosqlite connection.
+        busy_timeout_ms: Milliseconds to wait for a locked database.
+            Pass 0 to skip setting the busy_timeout pragma entirely.
+    """
+    await apply_wal_pragmas(conn, busy_timeout_ms=busy_timeout_ms)
+    # synchronous=FULL: per-commit fsync. Cost is ~1-5ms/commit; the
+    # win is crash durability without relying on WAL checkpoints. See
+    # docs/task-recovery-2026-05-13/ for the prod incident that drove
+    # this change across all fused-memory SQLite stores.
+    await conn.execute('PRAGMA synchronous=FULL')
+    await conn.execute('PRAGMA wal_autocheckpoint=100')
+    await conn.execute('PRAGMA journal_size_limit=67108864')
 
 
 class AsyncSqliteBase(abc.ABC):
@@ -71,7 +119,7 @@ class AsyncSqliteBase(abc.ABC):
         """DDL string passed to executescript() when the store is opened."""
 
     async def open(self) -> None:
-        """Open persistent connection, set WAL + busy_timeout, ensure schema."""
+        """Open persistent connection, set WAL + Phase 3 durability triad, ensure schema."""
         async with self._lifecycle_lock:
             if self._conn is not None:
                 raise RuntimeError(f'{type(self).__name__} already opened')
@@ -87,7 +135,7 @@ class AsyncSqliteBase(abc.ABC):
                 conn_awaitable._thread.daemon = True
             conn = await conn_awaitable
             try:
-                await apply_wal_pragmas(conn, busy_timeout_ms=self.busy_timeout_ms)
+                await apply_full_durability_pragmas(conn, busy_timeout_ms=self.busy_timeout_ms)
                 await conn.executescript(self._schema)
             except BaseException:
                 await conn.close()
@@ -120,3 +168,26 @@ class AsyncSqliteBase(abc.ABC):
         if self._conn is None:
             raise RuntimeError(f'{type(self).__name__} not opened')
         return self._conn
+
+    async def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return the result.
+
+        Returns:
+            A :class:`CheckpointResult` named-tuple ``(busy, log, checkpointed)`` where:
+
+            - ``busy``: 1 if one or more frames could not be checkpointed because
+              they are in use by a reader, 0 otherwise.
+            - ``log``: total number of frames in the WAL file.
+            - ``checkpointed``: total number of checkpointed frames.
+
+        Raises:
+            RuntimeError: If the store has not been opened.
+            RuntimeError: If ``PRAGMA wal_checkpoint(TRUNCATE)`` returns no rows
+                (unexpected; SQLite always returns a row for this pragma).
+        """
+        conn = self._require_conn()
+        async with conn.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
