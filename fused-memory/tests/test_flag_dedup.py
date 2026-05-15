@@ -3257,3 +3257,137 @@ class TestConfirmationCircuitBreaker:
         assert len(result) == 5
         for f in result:
             assert 'persisted_from_run' in f, f"Expected HIT annotation: {f}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('flag_3_response,expect_noop_warning', [
+        pytest.param(
+            AddMemoryResponse(memory_ids=['x']), False,
+            id='non_empty_fallback_no_warning',
+        ),
+        pytest.param(
+            AddMemoryResponse(memory_ids=[]), True,
+            id='empty_fallback_emits_warning',
+        ),
+    ])
+    async def test_miss_path_shares_counter_and_falls_back_to_memory_ids(
+        self, flag_3_response, expect_noop_warning, monkeypatch, caplog,
+    ):
+        """MISS path shares the same circuit-breaker counter as HIT path.
+
+        Monkeypatches threshold to 2.  Three MISS-path flags (no priors found).
+        Flags 1 and 2 each miss confirmation (2 searches each).  After flag-2's
+        miss the counter reaches 2 → breaker trips.  Flag-3's confirmation call
+        is entirely skipped; the "will not be detected next cycle" WARNING is
+        driven off bool(response.memory_ids) rather than off confirmed_id.
+
+        search side_effect (8 total; elements [8]/[9] only reached without breaker):
+          [0]  suppression → []
+          [1]  flag-1 pre-write → []  (MISS)
+          [2]  flag-1 confirmation miss
+          [3]  flag-1 confirmation retry     → counter=1
+          [4]  flag-2 pre-write → []  (MISS)
+          [5]  flag-2 confirmation miss
+          [6]  flag-2 confirmation retry     → counter=2 → TRIP
+          [7]  flag-3 pre-write → []  (MISS)
+          [8]  (flag-3 confirmation miss — only without breaker)
+          [9]  (flag-3 confirmation retry   — only without breaker)
+
+        Parametrized on flag-3's add_memory response:
+          non_empty_fallback_no_warning:  memory_ids=['x'] → no "will not be detected" WARNING.
+          empty_fallback_emits_warning:   memory_ids=[]    → "will not be detected" WARNING fires.
+
+        Asserts (both parametrizations):
+          (i)  Exactly ONE circuit-breaker WARNING.
+          (ii) flag-3's add_memory called once.
+          (iii) search.call_count == 8 (no confirmation searches for flag-3).
+          (iv) "will not be detected next cycle" WARNING presence matches memory_ids gate.
+
+        Will FAIL until step-6 wires MISS branch through circuit-breaker.
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 2)
+
+        memory_service = AsyncMock()
+        # 10 elements: elements [8] and [9] only consumed without the circuit-breaker.
+        memory_service.search = AsyncMock(side_effect=[
+            [],   # [0]  suppression
+            [],   # [1]  flag-1 pre-write MISS
+            [],   # [2]  flag-1 confirmation miss
+            [],   # [3]  flag-1 confirmation retry    → counter=1
+            [],   # [4]  flag-2 pre-write MISS
+            [],   # [5]  flag-2 confirmation miss
+            [],   # [6]  flag-2 confirmation retry    → counter=2 → TRIP
+            [],   # [7]  flag-3 pre-write MISS
+            [],   # [8]  flag-3 confirmation miss  (without breaker only)
+            [],   # [9]  flag-3 confirmation retry (without breaker only)
+        ])
+        memory_service.add_memory = AsyncMock(side_effect=[
+            _STUB_ADD_MEMORY_RESPONSE,  # flag-1
+            _STUB_ADD_MEMORY_RESPONSE,  # flag-2
+            flag_3_response,            # flag-3 (parametrized)
+        ])
+
+        flags = [
+            {'task_id': 301, 'flag_type': 'missing_deliverable', 'description': 'miss-1'},
+            {'task_id': 302, 'flag_type': 'missing_deliverable', 'description': 'miss-2'},
+            {'task_id': 303, 'flag_type': 'missing_deliverable', 'description': 'miss-3'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (i) Exactly ONE circuit-breaker WARNING
+        breaker_warnings = [
+            m for m in all_warnings
+            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
+        ]
+        assert len(breaker_warnings) == 1, (
+            f"Expected 1 breaker WARNING but got {len(breaker_warnings)}: "
+            f"{breaker_warnings}\nAll WARNINGs: {all_warnings}"
+        )
+        assert '2' in breaker_warnings[0], (
+            f"Breaker WARNING must mention count '2': {breaker_warnings[0]}"
+        )
+
+        # (ii) flag-3's add_memory called once (write still happens even after trip)
+        assert memory_service.add_memory.call_count == 3
+
+        # (iii) Exactly 8 search calls — flag-3 confirmation short-circuited
+        assert memory_service.search.call_count == 8, (
+            f"Expected 8 search calls (1 suppression + 3 pre-write + 2+2 confirmations "
+            f"for flags 1+2, none for flag-3), got: {memory_service.search.call_count}"
+        )
+
+        # (iv) "will not be detected next cycle" WARNING driven by memory_ids gate
+        noop_warnings = [
+            m for m in all_warnings
+            if 'will not be detected' in m and '303' in m
+        ]
+        if expect_noop_warning:
+            # empty memory_ids → bool([]) = False → WARNING fires for flag-3
+            assert len(noop_warnings) >= 1, (
+                f"Expected 'will not be detected' WARNING for task 303 "
+                f"(empty memory_ids) but got none.\nAll WARNINGs: {all_warnings}"
+            )
+        else:
+            # non-empty memory_ids → bool(['x']) = True → no WARNING for flag-3
+            assert len(noop_warnings) == 0, (
+                f"Expected NO 'will not be detected' WARNING for task 303 "
+                f"(non-empty memory_ids) but got: {noop_warnings}"
+            )
+
+        # All 3 flags returned; MISS path so no persisted_from_run
+        assert len(result) == 3
+        for f in result:
+            assert 'persisted_from_run' not in f, f"MISS path must not annotate: {f}"
