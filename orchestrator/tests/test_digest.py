@@ -12,7 +12,7 @@ import sqlite3
 from datetime import UTC, timedelta
 from datetime import datetime as _datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -462,6 +462,67 @@ class TestCostInWindow:
         # 24h figures are anchored to now, not the digest window
         assert stats.watcher_cost_24h == pytest.approx(3.0)
         assert stats.total_cost_24h == pytest.approx(4.5)
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_aggregate_window(self, tmp_path: Path) -> None:
+        """cost_in_window delegates to CostStore.aggregate_window (not direct SQL).
+
+        Monkeypatches aggregate_window to a recording stub that returns known
+        (total, watcher) tuples.  Asserts:
+        - exactly two calls were made
+        - first call uses (window_start_iso, window_end_iso)
+        - second call uses (cutoff_24h_iso, now_iso) where cutoff ≈ now-24h
+          and end ≈ now (within 10-second tolerance)
+        - returned CostStats carries stubbed values into the correct fields
+        """
+        store = CostStore(tmp_path / 'cost.db')
+        await store.open()
+        try:
+            window_start = '2026-05-10T00:00:00+00:00'
+            window_end = '2026-05-10T23:59:59+00:00'
+
+            # Stub returns different values per call so we can distinguish them.
+            stub = AsyncMock(side_effect=[
+                (7.0, 5.0),   # first call: window → (total_win, watcher_win)
+                (9.0, 3.0),   # second call: 24h → (total_24h, watcher_24h)
+            ])
+            store.aggregate_window = stub
+
+            before = _datetime.now(UTC)
+            stats = await digest.cost_in_window(store, window_start, window_end)
+            after = _datetime.now(UTC)
+
+            # Two calls were made.
+            assert stub.call_count == 2, f'Expected 2 calls, got {stub.call_count}'
+
+            # First call: window bounds passed through unchanged.
+            first_args = stub.call_args_list[0].args
+            assert first_args == (window_start, window_end), (
+                f'First call args wrong: {first_args!r}'
+            )
+
+            # Second call: cutoff ≈ now-24h, end ≈ now (both ISO strings).
+            second_args = stub.call_args_list[1].args
+            assert len(second_args) == 2, f'Expected 2 positional args, got {second_args!r}'
+            cutoff_iso, now_iso = second_args
+            cutoff_dt = _datetime.fromisoformat(cutoff_iso)
+            now_dt = _datetime.fromisoformat(now_iso)
+            expected_cutoff_lo = before - timedelta(hours=24) - timedelta(seconds=10)
+            expected_cutoff_hi = after - timedelta(hours=24) + timedelta(seconds=10)
+            assert expected_cutoff_lo <= cutoff_dt <= expected_cutoff_hi, (
+                f'cutoff_dt {cutoff_dt} not within 10s of (now-24h)'
+            )
+            assert before - timedelta(seconds=10) <= now_dt <= after + timedelta(seconds=10), (
+                f'now_dt {now_dt} not within 10s of now'
+            )
+
+            # Returned CostStats uses the stubbed values.
+            assert stats.total_cost_in_window == pytest.approx(7.0)
+            assert stats.watcher_cost_in_window == pytest.approx(5.0)
+            assert stats.total_cost_24h == pytest.approx(9.0)
+            assert stats.watcher_cost_24h == pytest.approx(3.0)
+        finally:
+            await store.close()
 
 
 # ---------------------------------------------------------------------------
