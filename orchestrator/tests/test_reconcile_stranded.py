@@ -1794,6 +1794,10 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.max_concurrent_tasks = 2
     config.fused_memory.project_id = 'test'
     config.sandbox.backend = 'auto'
+    # Real Path so OverrideStore.from_config(config) can call .parent.mkdir()
+    # and sqlite3.connect(str(...)) without leaking MagicMock-named files —
+    # Harness.__init__ wires OverrideStore unconditionally (task 1313).
+    config.overrides_db_path = tmp_path / 'overrides.db'
 
     with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
          patch('orchestrator.harness.Scheduler'), \
