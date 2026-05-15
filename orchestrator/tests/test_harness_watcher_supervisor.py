@@ -578,11 +578,15 @@ class TestWatcherSupervisorLoopClassification:
     async def test_clean_exit_resets_backoff(self, tmp_path: Path) -> None:
         """A clean exit after unclean exits resets the backoff to base.
 
-        Sequence unclean→clean→unclean produces 3 sleeps:
-          [unclean_backoff, clean_floor, unclean_base_again]
-        The clean-path floor sleep uses watcher_subprocess_restart_backoff_secs (same
-        value as base backoff), so all three sleeps are equal to base.  The key
-        assertion is that the unclean after the clean reset uses base (not doubled).
+        Sequence [unclean, unclean, clean, unclean] produces 4 sleeps:
+          sleep[0] = base          (consecutive=1)
+          sleep[1] = 2*base        (consecutive=2, escalated)
+          sleep[2] = base          (clean floor)
+          sleep[3] = base          (consecutive reset → 1 again)
+
+        The reset is OBSERVABLE because sleep[1] is escalated (2*base) and
+        sleep[3] drops back to base.  Asserting sleep[3] < sleep[1] proves the
+        consecutive counter was zeroed — a broken reset would yield sleep[3]=4*base.
         """
         from shared.cli_invoke import AgentResult
 
@@ -590,12 +594,14 @@ class TestWatcherSupervisorLoopClassification:
         h.config = h.config.model_copy(update={
             'watcher_max_crashloop_restarts': 99,
             'watcher_crashloop_window_secs': 9999,
+            'watcher_max_misconfigured_clean_exits': 99,  # disable misconfig trip
         })
-        # Sequence: unclean, clean, unclean, then cancel
+        # Sequence: unclean, unclean, clean, unclean, then cancel
         results = [
-            AgentResult(success=False, output=''),   # unclean → backoff(base)
-            AgentResult(success=True, output=''),    # clean   → reset + floor(base)
-            AgentResult(success=False, output=''),   # unclean → base backoff again
+            AgentResult(success=False, output=''),   # unclean → backoff(base, consecutive=1)
+            AgentResult(success=False, output=''),   # unclean → backoff(2*base, consecutive=2)
+            AgentResult(success=True, output=''),    # clean   → reset consecutive + floor(base)
+            AgentResult(success=False, output=''),   # unclean → base backoff (consecutive reset to 1)
         ]
         idx = 0
         sleep_durations: list[float] = []
@@ -617,14 +623,20 @@ class TestWatcherSupervisorLoopClassification:
             await h._watcher_supervisor_loop()
 
         base = h.config.watcher_subprocess_restart_backoff_secs
-        # 3 sleeps: unclean backoff | clean floor | unclean base-reset
-        assert len(sleep_durations) == 3, (
-            f'Expected 3 sleeps (unclean/clean-floor/unclean); got {sleep_durations}'
+        # 4 sleeps: unclean | escalated-unclean | clean-floor | reset-unclean
+        assert len(sleep_durations) == 4, (
+            f'Expected 4 sleeps (u/u/clean-floor/u); got {sleep_durations}'
         )
-        # The clean-path floor and the unclean base happen to be the same value.
-        # The critical assertion: post-reset unclean uses base (not doubled).
-        assert sleep_durations[2] == pytest.approx(base), (
-            f'Post-reset backoff should be base {base}s; got {sleep_durations[2]}'
+        assert sleep_durations[1] == pytest.approx(2 * base), (
+            f'Pre-clean backoff should be 2*base ({2*base}s); got {sleep_durations[1]}'
+        )
+        assert sleep_durations[3] == pytest.approx(base), (
+            f'Post-reset backoff should be base ({base}s); got {sleep_durations[3]}'
+        )
+        # This is the key observable assertion: reset worked iff post-clean < pre-clean.
+        assert sleep_durations[3] < sleep_durations[1], (
+            f'Post-reset backoff {sleep_durations[3]} must be < pre-clean escalated '
+            f'backoff {sleep_durations[1]} (proves consecutive counter was zeroed)'
         )
 
     @pytest.mark.asyncio
