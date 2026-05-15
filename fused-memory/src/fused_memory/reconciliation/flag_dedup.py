@@ -76,6 +76,45 @@ THIS run land?" (must be run_id-scoped).  Scoping confirmation by run_id is
 correct on both paths — HIT (new marker run_id=current matches; priors'
 older run_ids do not) and MISS (new marker still matches).
 
+Confirmation circuit-breaker (task-1412)
+-----------------------------------------
+During a sustained Mem0 brownout every flag in the batch incurs the worst-case
+confirmation cost (initial search miss + retry = 2 search calls per flag),
+compounding pressure on the already-failing backend.  To limit this, ``dedup_flags``
+maintains a **per-invocation** circuit-breaker:
+
+- ``consecutive_confirmation_misses`` counts strictly-consecutive ``confirm_marker_persisted``
+  misses (``None`` return).  The counter resets to 0 on any successful confirmation
+  (non-``None`` id) so sporadic misses during otherwise-healthy operation do **not**
+  accumulate toward the threshold.
+- ``confirmation_disabled`` starts ``False`` and is set ``True`` the first time
+  ``consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD``.
+- At the moment of trip, exactly **one** breaker WARNING is logged (format:
+  ``"flag_dedup: confirmation circuit-breaker tripped after N consecutive misses;
+  falling back to memory_ids gate for remainder of batch"``).  Subsequent flags
+  do **not** re-emit the WARNING even if they also miss.
+- Once tripped, both HIT and MISS branches skip ``confirm_marker_persisted``
+  entirely and fall back to the cheaper pre-task-1400 gate:
+
+  * **HIT branch**: ``write_succeeded = bool(response.memory_ids)``.  Deletion
+    of prior markers proceeds if ``True``; is skipped (with a per-flag
+    "skipping prior deletion" WARNING) if ``False``.
+  * **MISS branch**: the "will not be detected next cycle" WARNING fires only
+    if ``bool(miss_response.memory_ids) is False``; silent if ``True``.
+
+- Both branches share **one counter** (same local variable), so a HIT-branch
+  trip persists into MISS-branch flags later in the same batch and vice versa.
+- The counter and disabled flag are **function-local**, so a subsequent
+  ``dedup_flags`` invocation (next reconciliation cycle) gets a fresh budget.
+  This is intentional — a transient brownout should not permanently disable
+  confirmation for future healthy cycles.
+
+The breaker is an **internal load-shedding mechanism** operating entirely within
+``dedup_flags``.  It does not change the contract documented in the LLM-side
+``stage1.py`` prompt (which mirrors the confirmation contract under normal
+conditions).  No change to ``confirm_marker_persisted`` itself is required —
+only the call-site within ``dedup_flags`` is gated.
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
@@ -376,6 +415,7 @@ async def dedup_flags(
     # confirmation_disabled = True so the remainder of the batch skips
     # confirm_marker_persisted entirely and gates on bool(response.memory_ids).
     # Being function-local, these reset automatically at each dedup_flags call.
+    # See: "Confirmation circuit-breaker (task-1412)" section in module docstring.
     consecutive_confirmation_misses: int = 0
     confirmation_disabled: bool = False
 
