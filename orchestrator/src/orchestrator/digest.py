@@ -239,3 +239,127 @@ async def cost_in_window(
     except Exception:
         logger.warning('cost_in_window: query failed (fail-open)', exc_info=True)
         return CostStats()
+
+
+# ---------------------------------------------------------------------------
+# Digest inputs and markdown rendering
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DigestInputs:
+    """All data needed to render one digest entry."""
+
+    window_start_iso: str
+    window_end_iso: str
+    escalation_stats: EscalationStats
+    done_count: int
+    cost_stats: CostStats
+    parked_live: int
+    parked_window_churn: int
+    ewa_value: float
+    ewa_threshold: float
+    tripped: bool
+    # Dict of flag_name → bool; only True flags are rendered in Anomalies
+    anomaly_flags: dict[str, bool]
+    # Free-text cluster descriptions (or empty list for "none detected")
+    watcher_clusters: list[str]
+    # Free-text proposal summaries (or empty list for "none queued")
+    dry_run_proposals: list[str]
+
+
+def render_digest_markdown(inputs: DigestInputs) -> str:
+    """Render a DigestInputs as a markdown string.
+
+    All sections are always present; empty lists render as 'none detected' /
+    'none queued'.  Costs are formatted as $X.XX.  No I/O — pure string
+    computation.
+    """
+    lines: list[str] = []
+
+    # Header
+    lines.append('# Digest')
+    lines.append('')
+
+    # Window
+    lines.append('## Window')
+    lines.append(f'- Start: {inputs.window_start_iso}')
+    lines.append(f'- End:   {inputs.window_end_iso}')
+    lines.append('')
+
+    # Escalation outcomes
+    lines.append('## Escalation outcomes')
+    counts = inputs.escalation_stats.category_level_status_counts
+    if counts:
+        lines.append('| category | level | status | count |')
+        lines.append('|----------|-------|--------|-------|')
+        for (category, level, status), count in sorted(counts.items()):
+            lines.append(f'| {category} | {level} | {status} | {count} |')
+    else:
+        lines.append('_none_')
+    esc = inputs.escalation_stats
+    lines.append(f'- Pending: {esc.pending_total}')
+    lines.append(f'- Dedupe children: {esc.dedupe_children_total}')
+    if esc.first_ts:
+        lines.append(f'- First: {esc.first_ts}')
+        lines.append(f'- Last:  {esc.last_ts}')
+    lines.append('')
+
+    # Tasks done
+    lines.append('## Tasks done in window')
+    lines.append(f'{inputs.done_count}')
+    lines.append('')
+
+    # Cost
+    cs = inputs.cost_stats
+    lines.append('## Cost')
+    lines.append(f'- Watcher (window):  ${cs.watcher_cost_in_window:.2f}')
+    lines.append(f'- Total   (window):  ${cs.total_cost_in_window:.2f}')
+    lines.append(f'- Watcher (24h):     ${cs.watcher_cost_24h:.2f}')
+    lines.append(f'- Total   (24h):     ${cs.total_cost_24h:.2f}')
+    lines.append('')
+
+    # Parked tasks
+    lines.append('## Parked tasks')
+    lines.append(f'- Live parked:    {inputs.parked_live}')
+    lines.append(f'- Window churn:   {inputs.parked_window_churn}')
+    lines.append('')
+
+    # EWA
+    tripped_marker = ' — **TRIPPED**' if inputs.tripped else ''
+    lines.append('## EWA')
+    lines.append(
+        f'- Value / threshold: {inputs.ewa_value:.4f} / {inputs.ewa_threshold:.4f}'
+        f'{tripped_marker}'
+    )
+    lines.append('')
+
+    # Anomalies
+    lines.append('## Anomalies')
+    active = [name for name, val in sorted(inputs.anomaly_flags.items()) if val]
+    if active:
+        for name in active:
+            lines.append(f'- {name}')
+    else:
+        lines.append('_none_')
+    lines.append('')
+
+    # Cross-escalation patterns
+    lines.append('## Cross-escalation patterns')
+    if inputs.watcher_clusters:
+        for cluster in inputs.watcher_clusters:
+            lines.append(f'- {cluster}')
+    else:
+        lines.append('none detected')
+    lines.append('')
+
+    # Dry-run proposals
+    lines.append('## Dry-run proposals')
+    if inputs.dry_run_proposals:
+        for proposal in inputs.dry_run_proposals:
+            lines.append(f'- {proposal}')
+    else:
+        lines.append('none queued')
+    lines.append('')
+
+    return '\n'.join(lines)
