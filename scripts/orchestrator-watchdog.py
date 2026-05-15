@@ -25,8 +25,16 @@ def probe_port(port: int) -> bool:
     """Return True iff a process is listening on *port* (TCP, local).
 
     Runs ``ss -ltn "sport = :<port>"`` and checks whether any output line
-    contains a local-address field whose port component is exactly *port*
-    (robust against substring matches such as :81020 or :48102).
+    contains a field whose port component is exactly *port* (robust against
+    substring matches such as :81020 or :48102).
+
+    Column-independent scan: for each LISTEN line every whitespace-delimited
+    field is checked.  Any field containing ':' is split on the LAST ':' and
+    the trailing component is compared as an int to *port*.  This handles both
+    the legacy Netid-prefixed layout (local addr at index 4) and the no-Netid
+    layout from iproute2-6.1.0 / systemd 255 (local addr at index 3); the
+    peer ``0.0.0.0:*`` field is harmlessly skipped (``int('*')`` raises
+    ValueError).
     """
     result = subprocess.run(
         ["ss", "-ltn", f"sport = :{port}"],
@@ -35,22 +43,17 @@ def probe_port(port: int) -> bool:
         timeout=5,
     )
     for line in result.stdout.splitlines():
-        # ss -ltn columns: Netid State Recv-Q Send-Q Local-Address:Port Peer-Address:Port
-        # The local address is the 5th whitespace-delimited field (index 4).
-        parts = line.split()
-        if len(parts) < 5:
+        if "LISTEN" not in line:
             continue
-        local = parts[4]  # e.g. "127.0.0.1:8102" or "*:8102"
-        # Split on the LAST ':' so IPv6 addresses like "[::1]:8102" work too.
-        colon_idx = local.rfind(":")
-        if colon_idx == -1:
-            continue
-        try:
-            local_port = int(local[colon_idx + 1:])
-        except ValueError:
-            continue
-        if local_port == port:
-            return True
+        for field in line.split():
+            colon_idx = field.rfind(":")
+            if colon_idx == -1:
+                continue
+            try:
+                if int(field[colon_idx + 1:]) == port:
+                    return True
+            except ValueError:
+                continue
     return False
 
 
