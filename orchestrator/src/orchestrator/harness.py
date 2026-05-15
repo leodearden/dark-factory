@@ -2040,6 +2040,44 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return 0.0
 
+    async def _enforce_cost_ceilings(self) -> None:
+        """Check daily cost ceilings and pause the scheduler on breach.
+
+        Runs every dispatch-loop tick (Harness.run()) immediately before
+        ``scheduler.acquire_next()``.  Two checks, evaluated in order:
+
+        1. Watcher ceiling (early warning): trailing-24h cost for
+           invocations with ``role LIKE '%watcher%'`` vs
+           ``config.watcher_daily_cost_ceiling_usd``.
+        2. Orch-wide ceiling (safety net): trailing-24h cost for ALL
+           invocations vs ``config.orch_daily_cost_ceiling_usd``.
+
+        The first ceiling that trips wins.  When the scheduler is already
+        paused (from any source), returns immediately to avoid redundant
+        RunStore writes and duplicate log spam.  Task 1323.
+        """
+        if self.scheduler.is_paused:
+            return
+
+        watcher = await self._trailing_24h_cost_usd(watcher_only=True)
+        if watcher >= self.config.watcher_daily_cost_ceiling_usd:
+            logger.warning(
+                '_enforce_cost_ceilings: watcher 24h cost $%.2f >= ceiling $%.2f '
+                '— pausing scheduler',
+                watcher, self.config.watcher_daily_cost_ceiling_usd,
+            )
+            await self.pause_scheduler('cost_ceiling_watcher_exceeded')
+            return
+
+        total = await self._trailing_24h_cost_usd(watcher_only=False)
+        if total >= self.config.orch_daily_cost_ceiling_usd:
+            logger.warning(
+                '_enforce_cost_ceilings: orch-wide 24h cost $%.2f >= ceiling $%.2f '
+                '— pausing scheduler',
+                total, self.config.orch_daily_cost_ceiling_usd,
+            )
+            await self.pause_scheduler('cost_ceiling_orch_exceeded')
+
     @staticmethod
     def _extract_task_id(submit_result: Any) -> str | None:
         """Pull the task_id out of an MCP tools/call response wrapper.
