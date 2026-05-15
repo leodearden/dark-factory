@@ -3503,3 +3503,88 @@ class TestConfirmationCircuitBreaker:
         assert len(result2) == 3
         for f in result1 + result2:
             assert 'persisted_from_run' not in f, f"MISS path must not annotate: {f}"
+
+    @pytest.mark.asyncio
+    async def test_add_memory_exceptions_do_not_count_toward_threshold(
+        self, monkeypatch, caplog,
+    ):
+        """Write failures (add_memory exceptions) do NOT advance the miss counter.
+
+        The circuit-breaker targets the *confirmation* overhead: the extra search
+        round-trip after a successful write.  When add_memory itself raises, the
+        confirmation call is never reached so neither counter nor disabled flag is
+        touched.  A batch where every add_memory raises therefore never trips the
+        breaker — this pins that contract against an incorrect future change that
+        would increment the counter on write failure.
+
+        Setup: 3 MISS-path flags, all with add_memory raising RuntimeError.
+        search side_effect: 1 suppression + 3 pre-write (no confirmation searches
+        because add_memory always fails before _confirm_and_track is called).
+
+        Asserts:
+          (a) No breaker WARNING emitted (counter never advanced).
+          (b) search.call_count == 4 (1 suppression + 3 pre-write; zero confirmations).
+          (c) All 3 flags returned (exceptions logged, not raised).
+          (d) A per-flag WARNING is emitted for each failed write.
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 2)
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            [],   # [0] suppression
+            [],   # [1] flag-1 pre-write MISS
+            [],   # [2] flag-2 pre-write MISS
+            [],   # [3] flag-3 pre-write MISS
+            # No confirmation searches — add_memory always raises before them
+        ])
+        memory_service.add_memory = AsyncMock(
+            side_effect=RuntimeError('Mem0 write failure'),
+        )
+
+        flags = [
+            {'task_id': 501, 'flag_type': 'stale'},
+            {'task_id': 502, 'flag_type': 'stale'},
+            {'task_id': 503, 'flag_type': 'stale'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (a) No breaker WARNING — counter never advanced via write failures
+        breaker_warnings = [
+            m for m in all_warnings
+            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
+        ]
+        assert len(breaker_warnings) == 0, (
+            f'Breaker must not trip on write-only failures; got: {breaker_warnings}'
+        )
+
+        # (b) Exactly 4 searches: 1 suppression + 3 pre-write; no confirmation searches
+        assert memory_service.search.call_count == 4, (
+            f'Expected 4 searches (1 suppression + 3 pre-write) but got: '
+            f'{memory_service.search.call_count}'
+        )
+
+        # (c) All 3 flags returned (exceptions are logged, not raised)
+        assert len(result) == 3
+
+        # (d) Per-flag write-failure WARNINGs emitted (one per flag)
+        write_fail_warnings = [
+            m for m in all_warnings
+            if 'failed to write replacement marker' in m or 'flag_dedup failed' in m
+        ]
+        assert len(write_fail_warnings) == 3, (
+            f'Expected 3 per-flag write-failure WARNINGs but got: {write_fail_warnings}'
+        )
