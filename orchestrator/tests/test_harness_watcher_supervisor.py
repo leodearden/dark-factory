@@ -691,11 +691,11 @@ class TestWatcherSupervisorLoopClassification:
         )
         # logger.exception must have fired — a silent swallow would not emit this record
         assert any(
-            'rotation raised unexpected exception' in r.message
+            'rotation raised unexpected exception' in r.getMessage()
             for r in caplog.records
         ), (
             'Expected logger.exception with "rotation raised unexpected exception" '
-            f'in orchestrator.harness; records: {[r.message for r in caplog.records]}'
+            f'in orchestrator.harness; records: {[r.getMessage() for r in caplog.records]}'
         )
 
 
