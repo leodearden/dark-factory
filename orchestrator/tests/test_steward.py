@@ -2497,3 +2497,55 @@ class TestStewardEmptyOutputRecovery:
         assert steward.metrics.empty_outputs_recovered == 0
         # Retry budget not consumed by either carve-out
         assert steward._retry_counts.get('esc-42-1', 0) == 0
+
+
+# ── _make_gate factory contract ───────────────────────────────────────────────
+
+
+class TestMakeGateFactory:
+    """Regression: _make_gate must set every UsageGate attribute in one place.
+
+    Prior bare-MagicMock() drift caused a 122-error cascade (tasks 1313/1339)
+    when a new attribute (soonest_resets_at) was added to UsageGate but not
+    propagated to every construction site.  This test pins the factory contract
+    so a new attribute addition only requires one edit here.
+    """
+
+    def test_make_gate_defaults(self):
+        """_make_gate() returns a MagicMock with all required attribute defaults."""
+        gate = _make_gate()
+        assert isinstance(gate, MagicMock)
+        assert gate.account_count == 1
+        assert gate.active_account_name == 'acct-a'
+        assert gate.soonest_resets_at is None
+        assert gate.on_agent_complete is not None
+        assert gate.confirm_account_ok is not None
+        assert gate.release_probe_slot is not None
+        assert gate.before_invoke is not None
+
+    def test_make_gate_override_and_passthrough(self):
+        """Named overrides are applied; arbitrary kwargs are set via setattr."""
+        gate = _make_gate(soonest_resets_at=123, account_count=3, custom_attr='x')
+        assert gate.soonest_resets_at == 123
+        assert gate.account_count == 3
+        assert gate.custom_attr == 'x'
+        assert gate.active_account_name == 'acct-a'
+
+    def test_make_gate_yielding_routes_through_factory(self):
+        """_make_gate_yielding builds its gate via _make_gate (soonest_resets_at set)."""
+        gate = _make_gate_yielding([_make_slot()])
+        assert gate.soonest_resets_at is None
+        assert gate.invoke_slot is not None
+
+    def test_pre_triage_gate_default_detect_cap_hit(self):
+        """TestPreTriageUsageGateCleanup._gate() routes through _make_gate."""
+        gate = TestPreTriageUsageGateCleanup._gate()
+        assert gate.soonest_resets_at is None
+        # default detect_cap_hit returns False
+        assert gate.detect_cap_hit() is False
+
+    def test_pre_triage_gate_cap_effects_side_effect(self):
+        """cap_effects sequence is wired as side_effect on detect_cap_hit."""
+        gate = TestPreTriageUsageGateCleanup._gate(cap_effects=[True, False])
+        assert gate.detect_cap_hit() is True
+        assert gate.detect_cap_hit() is False
