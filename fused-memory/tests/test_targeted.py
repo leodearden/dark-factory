@@ -3,6 +3,8 @@
 import re
 from unittest.mock import AsyncMock
 
+from _fm_helpers import make_8df8_scenario
+
 import pytest
 import pytest_asyncio
 
@@ -1427,26 +1429,10 @@ class TestSweepCancelledDescendants:
 
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
-#
-# Cycle 8df8bdcd: tasks 1355/1361/1369 appeared in Stage 1 output each
-# carrying the NEXT task's title in the sorted completion sequence.
-# Investigation (task 1379, supersedes dc68f7b9) concluded every deterministic
-# data-layer path reads id+title from the SAME task dict — the symptom is an
-# LLM list-transcription error in Stage 1's free-form report, NOT a data bug.
-# These tests lock the data-layer write-content contract so any future
-# reintroduction of positional title resolution is caught immediately.
+# Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='in-progress').
 
-
-# Fixture constants mirroring the 8df8bdcd scenario:
-#   - non-consecutive ids (1355, 1361, 1369)
-#   - distinct titles
-#   - completion order (1369, 1355, 1361) differs from id-sort order
-_8DF8_TASKS: list[dict] = [
-    {'id': '1369', 'title': 'Refactor event dispatch to async', 'status': 'in-progress'},
-    {'id': '1355', 'title': 'Implement rate limiter middleware', 'status': 'in-progress'},
-    {'id': '1361', 'title': 'Add retry logic for database connections', 'status': 'in-progress'},
-]
-_8DF8_TITLE_BY_ID: dict[str, str] = {t['id']: t['title'] for t in _8DF8_TASKS}
+# Fixture: 8df8bdcd scenario (str ids, in-progress) — canonical definition in _fm_helpers.py
+_8DF8_TASKS, _8DF8_TITLE_BY_ID = make_8df8_scenario(id_type=str, status='in-progress')
 
 
 @pytest.mark.asyncio
