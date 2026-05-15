@@ -448,7 +448,9 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
       reserved name — however deeply nested — is silently skipped.  If a legitimate module
       directory shares a name with a reserved dir (e.g. a module literally called ``build``),
       its ``orchestrator.yaml`` will not be discovered; rename the directory or place the
-      config at a depth that avoids the collision.
+      config at a depth that avoids the collision.  When a pruned directory directly contains
+      an ``orchestrator.yaml`` (a "shadow" config), a runtime warning is emitted so operators
+      can detect and resolve the collision rather than having the config silently disappear.
     - Uses ``followlinks=False`` (passed explicitly) for symlink-cycle safety — a symlink that
       points back into an ancestor directory cannot drive infinite recursion because the walk
       will not follow it.
@@ -479,6 +481,20 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
     # followlinks=False (the default, stated explicitly so a future refactor cannot flip it
     # silently): prevents infinite recursion from self-referencing symlink cycles.
     for dirpath, dirnames, filenames in os.walk(project_root, followlinks=False):
+        # Warn about pruned directories that directly contain an orchestrator.yaml
+        # (one cheap stat per about-to-be-excluded sibling; no descent into the tree).
+        for d in dirnames:
+            if d in _DISCOVERY_EXCLUDED_DIRS:
+                shadow = Path(dirpath) / d / 'orchestrator.yaml'
+                if shadow.is_file():
+                    rel = shadow.parent.relative_to(project_root)
+                    logger.warning(
+                        'Skipping orchestrator.yaml under pruned directory %s '
+                        '(reserved name %r); rename the directory or remove the '
+                        'file to suppress this warning.',
+                        rel,
+                        d,
+                    )
         dirnames[:] = [d for d in dirnames if d not in _DISCOVERY_EXCLUDED_DIRS]
         if 'orchestrator.yaml' not in filenames:
             continue
