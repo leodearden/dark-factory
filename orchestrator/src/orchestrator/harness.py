@@ -216,6 +216,11 @@ class Harness:
         self.mcp = McpLifecycle(config)
         self.git_ops = GitOps(config.git, config.project_root)
         self.scheduler = Scheduler(config, override_store=OverrideStore.from_config(config))
+        # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
+        # This connects in-memory trip detection to the full pause bundle
+        # (persistence + event + log) defined on the Harness.  Sibling tasks
+        # (cost-ceiling 1323, EWA digest 1327) call pause_scheduler() directly.
+        self.scheduler._on_park_stop_trip = self.pause_scheduler
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
@@ -365,6 +370,9 @@ class Harness:
             )
         except Exception:
             logger.warning('Failed to create run store', exc_info=True)
+
+        # 0a-post. Restore scheduler pause state from prior run (if any).
+        await self._load_persisted_scheduler_pause()
 
         # 0b. Create cost store (shares runs.db with EventStore/RunStore)
         try:
@@ -2562,3 +2570,123 @@ Output JSON matching the schema. Every task must appear in the output.
             owner, reason,
         )
         return {'unhalted': True, 'prior_owner': owner, 'reason': reason}
+
+    # ------------------------------------------------------------------ #
+    # Scheduler park-and-stop pause (task 1322)                           #
+    # ------------------------------------------------------------------ #
+
+    async def pause_scheduler(self, reason: str) -> None:
+        """Pause the scheduler so acquire_next() returns None until resumed.
+
+        1. Delegates to ``scheduler.pause(reason)`` (idempotent in-memory state).
+        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort).
+        3. Emits ``EventType.scheduler_paused`` (best-effort).
+        4. Logs a WARNING so the operator sees it.
+
+        Called directly by sibling tasks (cost-ceiling 1323, EWA digest 1327)
+        and also wired as the callback for Scheduler's park-stop trip detector.
+
+        Race note: when this is invoked as the park-stop trip callback, the
+        scheduler's synchronous latch has already set ``is_paused=True`` with
+        the trip reason, so a different external caller racing in between the
+        latch and this callback executing would briefly see is_paused=True
+        with the trip reason but no disk row yet.  After this callback runs,
+        disk and memory both reflect the trip reason — first-wins on memory,
+        last-write-wins on disk for the same reason value.  Sequential
+        external callers after a trip see no-op idempotent in-memory plus a
+        disk overwrite with the new reason; this divergence between memory
+        and disk for the in-flight pause is accepted as the cost of keeping
+        the trip's status write off the synchronous critical path.
+        """
+        self.scheduler.pause(reason)
+        logger.warning('Scheduler paused: %s', reason)
+
+        if self._run_store and self._run_id:
+            try:
+                self._run_store.save_scheduler_pause(
+                    project_id=self.config.fused_memory.project_id,
+                    reason=reason,
+                    pause_at_iso=datetime.now(UTC).isoformat(),
+                    set_by_run_id=self._run_id,
+                )
+            except Exception:
+                logger.warning('pause_scheduler: failed to persist pause state', exc_info=True)
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.scheduler_paused,
+                data={'reason': reason},
+            )
+
+    async def resume_scheduler(self) -> None:
+        """Clear the scheduler pause so acquire_next() resumes dispatching.
+
+        1. Delegates to ``scheduler.resume()`` (idempotent).
+        2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
+        3. Emits ``EventType.scheduler_resumed`` (best-effort).
+        4. Logs INFO.
+        """
+        self.scheduler.resume()
+        logger.info('Scheduler resumed.')
+
+        if self._run_store:
+            try:
+                self._run_store.clear_scheduler_pause(
+                    self.config.fused_memory.project_id,
+                )
+            except Exception:
+                logger.warning('resume_scheduler: failed to clear persisted pause', exc_info=True)
+
+        if self.event_store:
+            self.event_store.emit(EventType.scheduler_resumed)
+
+    async def _load_persisted_scheduler_pause(self) -> None:
+        """Restore scheduler pause state from runs.db on restart.
+
+        Called once from ``Harness.run()`` after the RunStore is initialised.
+        If a pause record exists, the scheduler is paused in-memory using
+        ``scheduler.pause()`` directly — NOT ``pause_scheduler()`` — so that
+        no duplicate persistence write or event emission occurs (the row is
+        already on disk from the prior run that set it).
+
+        Logs a WARNING with the persisted reason and pause_at so the operator
+        is alerted on startup.  Any failure is caught and logged but never
+        blocks startup.
+        """
+        if not self._run_store:
+            return
+        try:
+            record = self._run_store.load_scheduler_pause(
+                self.config.fused_memory.project_id,
+            )
+            if record:
+                reason = record.get('reason', '<unknown reason>')
+                pause_at = record.get('pause_at', '<unknown time>')
+                restored_from_run_id = record.get('set_by_run_id', '<unknown>')
+                logger.warning(
+                    'Scheduler pause persisted from prior run — restoring. '
+                    'reason=%r  pause_at=%r  set_by_run_id=%r  '
+                    '(call Harness.resume_scheduler() to clear)',
+                    reason,
+                    pause_at,
+                    restored_from_run_id,
+                )
+                self.scheduler.pause(reason)
+                # Emit a distinct event so the timeline self-documents
+                # cross-run continuity.  Operators querying the event log
+                # for a run that starts with dispatch halted can see WHY
+                # without having to cross-reference the previous run_id.
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.scheduler_pause_restored,
+                        data={
+                            'reason': reason,
+                            'pause_at': pause_at,
+                            'restored_from_run_id': restored_from_run_id,
+                        },
+                    )
+        except Exception:
+            logger.warning(
+                '_load_persisted_scheduler_pause: failed to read pause state',
+                exc_info=True,
+            )

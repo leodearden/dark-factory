@@ -314,3 +314,68 @@ class TestIncrementalPersistence:
         ).fetchone()
         assert run_row['completed_at'] is None  # never finalized
         conn.close()
+
+
+class TestSchedulerStatePersistence:
+    """Tests for save/load/clear_scheduler_pause on RunStore."""
+
+    def test_load_returns_none_when_unset(self, tmp_path):
+        """Fresh RunStore has no scheduler pause record."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        result = store.load_scheduler_pause('proj-a')
+        assert result is None, f'Expected None for unset pause, got {result!r}'
+
+    def test_save_then_load_round_trip(self, tmp_path):
+        """save_scheduler_pause → load_scheduler_pause returns matching dict."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-x', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='park-stop: 5 blocked',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-x',
+        )
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None, 'Expected a dict after save'
+        assert result['reason'] == 'park-stop: 5 blocked'
+        assert result['pause_at'] == '2026-05-14T10:05:00+00:00'
+        assert result['set_by_run_id'] == 'run-x'
+
+    def test_save_is_idempotent_upsert(self, tmp_path):
+        """Second save with a different reason replaces the first (UPSERT semantics)."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='first reason',
+            pause_at_iso='2026-05-14T10:01:00+00:00',
+            set_by_run_id='run-1',
+        )
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='second reason',
+            pause_at_iso='2026-05-14T10:02:00+00:00',
+            set_by_run_id='run-1',
+        )
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['reason'] == 'second reason', (
+            f'Expected most-recent reason; got {result["reason"]!r}'
+        )
+
+    def test_clear_removes_row(self, tmp_path):
+        """clear_scheduler_pause causes subsequent load to return None."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='will be cleared',
+            pause_at_iso='2026-05-14T10:01:00+00:00',
+            set_by_run_id='run-1',
+        )
+        store.clear_scheduler_pause('proj-a')
+        result = store.load_scheduler_pause('proj-a')
+        assert result is None, (
+            f'Expected None after clear, got {result!r}'
+        )

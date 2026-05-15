@@ -1,6 +1,7 @@
 """Tests for scheduler module lock logic."""
 
 
+import asyncio
 import time
 from datetime import UTC
 from unittest.mock import AsyncMock, patch
@@ -4737,4 +4738,462 @@ class TestRequeueCooldownGc:
         assert scheduler._requeue_until == {}, (
             f'Expected _requeue_until to be empty after acquire_next GC sweep; '
             f'got: {scheduler._requeue_until}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Park-and-stop pause mechanism (task 1322)
+# ---------------------------------------------------------------------------
+
+class TestSchedulerPause:
+    """Unit tests for Scheduler.pause() / resume() / is_paused / pause_reason."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_pause_sets_is_paused_and_reason(self, scheduler: Scheduler):
+        scheduler.pause('parked-threshold')
+        assert scheduler.is_paused is True
+        assert scheduler.pause_reason == 'parked-threshold'
+
+    def test_resume_clears_pause(self, scheduler: Scheduler):
+        scheduler.pause('parked-threshold')
+        scheduler.resume()
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_returns_none_when_paused(self, scheduler: Scheduler):
+        """acquire_next() must short-circuit to None when the scheduler is paused."""
+        task = {
+            'id': '1',
+            'title': 'Task one',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend']},
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        # Sanity: without pause the task is dispatched normally.
+        result_before = await scheduler.acquire_next()
+        assert result_before is not None, (
+            'Expected TaskAssignment before pause; got None'
+        )
+        scheduler.release('1')
+
+        # Now pause and confirm acquire_next returns None.
+        scheduler.pause('test')
+        result_paused = await scheduler.acquire_next()
+        assert result_paused is None, (
+            f'Expected None while paused; got {result_paused}'
+        )
+
+        # Resume and confirm the task is dispatchable again.
+        scheduler.resume()
+        result_resumed = await scheduler.acquire_next()
+        assert result_resumed is not None, (
+            'Expected TaskAssignment after resume; got None'
+        )
+
+
+class TestSchedulerBlockedTransitionTracking:
+    """Unit tests for the blocked-transition deque used by park-stop trip detection."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        now = 1_000_000.0
+        return Scheduler(config, monotonic_clock_source=lambda: now)
+
+    def test_record_blocked_transition_appends_timestamp(self):
+        """_record_blocked_transition() adds entries matching the clock source."""
+        timestamps = [1_000_000.0, 1_000_001.0, 1_000_002.0]
+        idx = [0]
+
+        def time_source() -> float:
+            val = timestamps[idx[0]]
+            idx[0] += 1
+            return val
+
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        scheduler = Scheduler(config, monotonic_clock_source=time_source)
+
+        # Three distinct task IDs → three entries in the deque.
+        scheduler._record_blocked_transition('t1')
+        scheduler._record_blocked_transition('t2')
+        scheduler._record_blocked_transition('t3')
+
+        assert len(scheduler._blocked_transitions) == 3
+        # Each entry is a (task_id, timestamp) tuple.
+        assert [ts for _, ts in scheduler._blocked_transitions] == timestamps
+
+    def test_record_evicts_entries_older_than_window(self):
+        """Entries older than the rolling window are evicted on each record call."""
+        now = 1_000_000.0
+        call_times = [now]  # subsequent records return `now`
+
+        def time_source() -> float:
+            return call_times[-1]
+
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        scheduler = Scheduler(config, monotonic_clock_source=time_source)
+
+        # Seed three (task_id, timestamp) entries: two outside the 3600s window, one inside.
+        from collections import deque
+        scheduler._blocked_transitions = deque([
+            ('task-a', now - 7200),   # 2h ago — expired
+            ('task-b', now - 3600),   # exactly at cutoff boundary — expired (strictly older)
+            ('task-c', now - 100),    # 100s ago — within window
+        ])
+        scheduler._blocked_task_ids_in_window = {'task-a', 'task-b', 'task-c'}
+
+        # Record a new transition at `now`.
+        scheduler._record_blocked_transition('task-d')
+
+        timestamps_in_deque = [ts for _, ts in scheduler._blocked_transitions]
+        task_ids_in_deque = [tid for tid, _ in scheduler._blocked_transitions]
+        assert (now - 7200) not in timestamps_in_deque, 'Entry 2h old must be evicted'
+        assert (now - 3600) not in timestamps_in_deque, 'Entry at boundary must be evicted'
+        assert (now - 100) in timestamps_in_deque, 'Entry 100s old must survive'
+        assert now in timestamps_in_deque, 'New entry must be present'
+        assert len(scheduler._blocked_transitions) == 2, (
+            f'Expected 2 entries; got {len(scheduler._blocked_transitions)}: '
+            f'{list(scheduler._blocked_transitions)}'
+        )
+        # task-a and task-b must also be removed from the companion set.
+        assert 'task-a' not in scheduler._blocked_task_ids_in_window
+        assert 'task-b' not in scheduler._blocked_task_ids_in_window
+        assert 'task-c' in scheduler._blocked_task_ids_in_window
+        assert 'task-d' in scheduler._blocked_task_ids_in_window
+        assert 'task-d' in task_ids_in_deque
+
+    def test_same_task_id_not_double_counted(self):
+        """Idempotent re-sets of the same task must count as one transition.
+
+        This guards against recovery loops, post-restart replays, or retry
+        code paths re-marking the same already-blocked task and artificially
+        inflating the trip counter beyond threshold.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
+        scheduler = Scheduler(config, monotonic_clock_source=lambda: now)
+
+        # Block the same task three times.
+        scheduler._record_blocked_transition('task-1')
+        scheduler._record_blocked_transition('task-1')
+        scheduler._record_blocked_transition('task-1')
+
+        # Only the first one should be counted.
+        assert len(scheduler._blocked_transitions) == 1, (
+            f'Same task blocked 3× must count as 1; got {len(scheduler._blocked_transitions)}'
+        )
+        assert scheduler._blocked_task_ids_in_window == {'task-1'}
+
+        # A different task must still be counted separately.
+        scheduler._record_blocked_transition('task-2')
+        assert len(scheduler._blocked_transitions) == 2
+        assert scheduler._blocked_task_ids_in_window == {'task-1', 'task-2'}
+
+
+class TestSetTaskStatusBlockedRecording:
+    """set_task_status('blocked') must record in the deque; other statuses must not."""
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_blocked_records_transition(self, monkeypatch):
+        """A successful blocked transition adds one entry to _blocked_transitions."""
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, monotonic_clock_source=lambda: now)
+
+        # Return a clean success response (no rejection structure).
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('42', 'blocked')
+
+        assert len(scheduler._blocked_transitions) == 1
+        # Each entry is a (task_id, timestamp) tuple.
+        assert list(scheduler._blocked_transitions) == [('42', now)]
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_non_blocked_does_not_record(self, monkeypatch):
+        """A successful non-blocked status transition must not touch _blocked_transitions."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('42', 'pending')
+
+        assert len(scheduler._blocked_transitions) == 0
+
+    @pytest.mark.asyncio
+    async def test_blocked_transition_not_recorded_on_rejection(self, monkeypatch):
+        """A rejected transition must NOT record in _blocked_transitions.
+
+        Uses the terminal_exit_rejected warn-and-return carve-out: when the
+        target status is terminal (done/cancelled), fused-memory returns a
+        terminal_exit_rejected and the scheduler logs + returns without raising.
+        The 'done' target is not 'blocked', so no recording should happen either way.
+        Verifies that only confirmed successful writes advance the deque.
+        """
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+
+        # Return a terminal_exit_rejected response — 'done' is in _TERMINAL_STATUSES
+        # so the warn-and-return carve-out fires (logs warning, returns cleanly).
+        rejection_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': '{"error": "terminal_exit_rejected", "from_status": "done", "to_status": "done"}',
+                    }
+                ]
+            }
+        }
+        mock = AsyncMock(return_value=rejection_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('42', 'done')
+
+        assert len(scheduler._blocked_transitions) == 0, (
+            'Rejected (non-successful) transition must not be recorded in _blocked_transitions'
+        )
+
+
+class TestParkStopTrip:
+    """Tests for the park-stop trip detection and callback invocation."""
+
+    @pytest.mark.asyncio
+    async def test_trip_fires_callback_at_threshold(self, monkeypatch):
+        """Callback is invoked exactly once when threshold is reached."""
+        import re
+
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
+        )
+        scheduler = Scheduler(config)
+
+        callback_args: list[str] = []
+
+        async def recording_callback(reason: str) -> None:
+            callback_args.append(reason)
+
+        scheduler._on_park_stop_trip = recording_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('1', 'blocked')
+        await scheduler.set_task_status('2', 'blocked')
+        await scheduler.set_task_status('3', 'blocked')
+        # Yield to the event loop so the ensure_future'd callback can execute.
+        await asyncio.sleep(0)
+
+        assert len(callback_args) == 1, (
+            f'Expected callback called once; got {len(callback_args)}'
+        )
+        # Reason must reference the trip parameters.
+        reason = callback_args[0]
+        assert re.search(r'3', reason), f'Reason must mention threshold count: {reason!r}'
+        assert re.search(r'1\.0', reason), f'Reason must mention window hours: {reason!r}'
+
+    @pytest.mark.asyncio
+    async def test_trip_does_not_re_fire_when_paused(self, monkeypatch):
+        """Once paused, additional blocked transitions must not fire the callback again."""
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+        )
+        scheduler = Scheduler(config)
+
+        callback_count = [0]
+
+        async def counting_callback(reason: str) -> None:
+            callback_count[0] += 1
+
+        scheduler._on_park_stop_trip = counting_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Pause manually before the third transition reaches the threshold.
+        await scheduler.set_task_status('1', 'blocked')
+        await scheduler.set_task_status('2', 'blocked')
+        scheduler.pause('manual')  # already paused; trip check should be suppressed
+        await scheduler.set_task_status('3', 'blocked')
+
+        assert callback_count[0] == 0, (
+            f'Callback must not fire while already paused; fired {callback_count[0]} time(s)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_trip_below_threshold_does_not_fire(self, monkeypatch):
+        """Below-threshold transitions must never invoke the callback."""
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=5,
+        )
+        scheduler = Scheduler(config)
+
+        callback_count = [0]
+
+        async def counting_callback(reason: str) -> None:
+            callback_count[0] += 1
+
+        scheduler._on_park_stop_trip = counting_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        for i in range(4):
+            await scheduler.set_task_status(str(i), 'blocked')
+
+        assert callback_count[0] == 0, (
+            f'Expected 0 callback invocations (only 4 of 5 threshold); got {callback_count[0]}'
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_trip_does_not_re_fire_under_concurrent_transitions(self, monkeypatch):
+        """Regression test: concurrent blocked transitions must not cause duplicate callbacks.
+
+        Without the synchronous latch fix in _maybe_fire_park_stop_trip, coroutines
+        3..N all observe self._paused=False (the async callback hasn't set it yet) and
+        each schedule a duplicate ensure_future — so callback_args ends up with length 4+.
+        After the fix, the synchronous pause() call inside _maybe_fire_park_stop_trip
+        immediately sets _paused=True, so any concurrent coroutine that has already
+        reached the guard returns early.
+        """
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
+        )
+        scheduler = Scheduler(config)
+
+        callback_args: list[str] = []
+
+        async def recording_callback(reason: str) -> None:
+            # Mirror harness.pause_scheduler shape: call scheduler.pause()
+            # so any concurrent guard check sees _paused=True immediately.
+            scheduler.pause(reason)
+            callback_args.append(reason)
+
+        scheduler._on_park_stop_trip = recording_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Fire 6 concurrent blocked transitions (threshold=3, so calls 3-6 all
+        # observe n >= threshold if _paused is not set synchronously first).
+        await asyncio.gather(
+            *[scheduler.set_task_status(str(i), 'blocked') for i in range(6)]
+        )
+        # Yield so any ensure_future'd callbacks have a chance to run.
+        await asyncio.sleep(0)
+
+        assert len(callback_args) == 1, (
+            f'Callback must fire exactly once (synchronous latch prevents duplicates); '
+            f'got {len(callback_args)}: {callback_args!r}'
+        )
+        assert scheduler.is_paused, 'Scheduler must be paused after trip'
+        assert scheduler.pause_reason == callback_args[0], (
+            'pause_reason must equal the reason passed to the callback'
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_resume_clears_blocked_transitions_deque(self, monkeypatch):
+        """Regression: resume() must clear the rolling _blocked_transitions deque.
+
+        Without this, the wall-clock 1h window can still hold ≥ threshold stale
+        timestamps after a human resume, so the very next blocked transition
+        (e.g. an in-flight workflow finishing shortly after resume) would
+        immediately re-trip the park-stop pause and silently undo the operator
+        action.  The flow: trip → resume → record one new blocked transition →
+        is_paused must still be False.
+        """
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
+        )
+        scheduler = Scheduler(config)
+
+        callback_count = [0]
+
+        async def trip_callback(reason: str) -> None:
+            callback_count[0] += 1
+            # Mirror harness.pause_scheduler — scheduler.pause is idempotent
+            # because the synchronous latch already set _paused=True.
+            scheduler.pause(reason)
+
+        scheduler._on_park_stop_trip = trip_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        # Trip the park-stop by marking threshold tasks blocked.
+        for i in range(3):
+            await scheduler.set_task_status(str(i), 'blocked')
+        await asyncio.sleep(0)  # let ensure_future callbacks settle
+        assert scheduler.is_paused, 'Trip must have fired and paused scheduler'
+        assert callback_count[0] == 1
+
+        # Operator resumes.
+        scheduler.resume()
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
+
+        # One new blocked transition arrives (e.g. an in-flight workflow
+        # finishing shortly after resume).  With the deque cleared on resume,
+        # the new count (=1) is far below threshold and must NOT re-trip.
+        await scheduler.set_task_status('post-resume', 'blocked')
+        await asyncio.sleep(0)
+        assert scheduler.is_paused is False, (
+            'Park-stop must not re-trip on a single post-resume transition '
+            '(deque should have been cleared on resume)'
+        )
+        assert callback_count[0] == 1, (
+            f'Callback must not fire a second time; fired {callback_count[0]}'
+        )
+
+
+class TestParkStopDisabled:
+    """park_stop_enabled=False suppresses the trip but still records transitions."""
+
+    @pytest.mark.asyncio
+    async def test_park_stop_disabled_suppresses_trip(self, monkeypatch):
+        """When park_stop_enabled=False the callback must NOT be invoked, but
+        _blocked_transitions must still accumulate entries (so a live-enable
+        picks up accurate state immediately)."""
+        config = OrchestratorConfig(
+            max_per_module=1,
+            park_stop_enabled=False,
+            park_stop_parked_threshold=3,
+        )
+        scheduler = Scheduler(config)
+
+        callback_count = [0]
+
+        async def recording_callback(reason: str) -> None:
+            callback_count[0] += 1
+
+        scheduler._on_park_stop_trip = recording_callback
+        mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        await scheduler.set_task_status('1', 'blocked')
+        await scheduler.set_task_status('2', 'blocked')
+        await scheduler.set_task_status('3', 'blocked')
+
+        # Transitions are recorded even when disabled.
+        assert len(scheduler._blocked_transitions) == 3, (
+            'Blocked transitions must be recorded even when park_stop_enabled=False'
+        )
+        # Trip must be suppressed.
+        assert callback_count[0] == 0, (
+            f'Callback must not fire when park_stop_enabled=False; fired {callback_count[0]} time(s)'
         )

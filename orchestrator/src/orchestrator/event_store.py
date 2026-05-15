@@ -85,6 +85,19 @@ class EventType(StrEnum):
     task_unpinned = 'task_unpinned'
     pin_queue_reordered = 'pin_queue_reordered'
 
+    # Scheduler park-and-stop pause (AFK hardening, task 1322).
+    # scheduler_paused: emitted when Harness.pause_scheduler() is called
+    #   (whether by the park-stop trip, a sibling cost-ceiling watcher, or a
+    #   human operator).  Data payload: {reason, threshold, window_hours}.
+    # scheduler_resumed: emitted when Harness.resume_scheduler() clears the pause.
+    # scheduler_pause_restored: emitted on orchestrator restart when a persisted
+    #   pause is loaded from runs.db.  Distinct from scheduler_paused so the
+    #   event timeline self-documents cross-run continuity.  Data payload:
+    #   {reason, pause_at, restored_from_run_id}.
+    scheduler_paused = 'scheduler_paused'
+    scheduler_resumed = 'scheduler_resumed'
+    scheduler_pause_restored = 'scheduler_pause_restored'
+
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
 

@@ -663,9 +663,21 @@ class Scheduler:
         mcp_session: McpSessionLike | None = None,
         time_source: Callable[[], float] | None = None,
         override_store: OverrideStore | None = None,
+        monotonic_clock_source: Callable[[], float] | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
+        # Monotonic clock source for the park-stop rolling-window transition
+        # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
+        # from non-monotonic wall-clock skew (NTP steps, VM clock drift).
+        # Injectable via the ``monotonic_clock_source`` kwarg so deterministic
+        # tests can inject a fixed lambda without touching production semantics.
+        # NOTE: callers MUST inject a monotonic-style source (no epoch relation,
+        # immune to NTP/clock skew).  Injecting ``time.time`` will break trip
+        # semantics under clock adjustments.
+        self._park_stop_clock: Callable[[], float] = (
+            monotonic_clock_source if monotonic_clock_source is not None else time.monotonic
+        )
         self.lock_table = ModuleLockTable(config, time_source=self._time_source)
         self.event_store = event_store
         self._mcp_session = mcp_session
@@ -714,6 +726,194 @@ class Scheduler:
         # was already known, not fresh user actions.  The first tick seeds the
         # snapshot without emitting events; subsequent ticks diff-emit normally.
         self._overrides_initialized: bool = False
+        # --- Park-and-stop pause state (task 1322) ---
+        self._paused: bool = False
+        self._pause_reason: str | None = None
+        # Rolling deque of (task_id, monotonic_timestamp) pairs for each
+        # successful blocked transition.  Entries older than
+        # park_stop_parked_window_hours * 3600s are lazily evicted on each
+        # _record_blocked_transition() call.  Storing task_id alongside the
+        # timestamp enables per-task de-duplication: idempotent re-sets
+        # (blocked→blocked, e.g. from a recovery loop or post-restart replay)
+        # count as ONE transition per task within the window rather than N.
+        self._blocked_transitions: deque[tuple[str, float]] = deque()
+        # Companion set for O(1) de-dup lookup: contains the task_ids of all
+        # entries currently in _blocked_transitions.  Kept in sync with the
+        # deque — entries are added/removed together.
+        self._blocked_task_ids_in_window: set[str] = set()
+        # Callback installed by the Harness so trip → persistence + event.
+        self._on_park_stop_trip: Callable[[str], Any] | None = None
+
+    # --- Park-and-stop pause API (task 1322) ---
+
+    @property
+    def is_paused(self) -> bool:
+        """True when the scheduler is paused and acquire_next() returns None."""
+        return self._paused
+
+    @property
+    def pause_reason(self) -> str | None:
+        """Human-readable reason for the current pause, or None if not paused."""
+        return self._pause_reason
+
+    def pause(self, reason: str) -> None:
+        """Pause the scheduler.  acquire_next() will return None until resume().
+
+        Idempotent: if already paused, the original reason is kept and a DEBUG
+        log is emitted.  The pause state is in-memory only; callers that need
+        persistence (e.g. Harness.pause_scheduler) must persist separately.
+        """
+        if self._paused:
+            logger.debug(
+                'Scheduler.pause() called while already paused '
+                '(existing reason=%r, new reason=%r) — keeping original',
+                self._pause_reason, reason,
+            )
+            return
+        self._paused = True
+        self._pause_reason = reason
+        logger.info('Scheduler paused: %s', reason)
+
+    def resume(self) -> None:
+        """Resume the scheduler.  Next acquire_next() tick will dispatch normally.
+
+        Idempotent: if not paused, this is a no-op.
+
+        Clears the rolling ``_blocked_transitions`` deque so the operator's
+        resume establishes a clean baseline.  Without this, a still-full deque
+        (the window is a monotonic-clock 1h by default) would cause the next
+        blocked transition — e.g. an in-flight workflow finishing shortly after
+        resume — to immediately re-trip the park-stop pause, silently undoing
+        the operator's action.  Requiring fresh transitions post-resume keeps the
+        circuit breaker observable: trips correspond to bursts after resume,
+        not stale history from before it.
+        """
+        if not self._paused:
+            logger.debug('Scheduler.resume() called while not paused — no-op')
+            return
+        self._paused = False
+        self._pause_reason = None
+        self._blocked_transitions.clear()
+        self._blocked_task_ids_in_window.clear()
+        logger.info('Scheduler resumed')
+
+    def _maybe_fire_park_stop_trip(self) -> None:
+        """Check if the park-stop trip threshold is met and fire the callback.
+
+        Guards (checked in order, earliest exit first):
+          1. Already paused — no re-trip.
+          2. park_stop_enabled=False — trip suppressed (but deque still records).
+          3. Callback not wired — no-op.
+          4. Count < threshold — not yet.
+
+        When all guards pass, this method:
+          a. SYNCHRONOUSLY calls self.pause(reason) — the latch step.  This
+             immediately sets _paused=True so any concurrent coroutine that has
+             already appended its timestamp but hasn't yet called
+             _maybe_fire_park_stop_trip will see _paused=True and return at
+             guard 1 without scheduling a duplicate callback.  This prevents the
+             race where N concurrent set_task_status('blocked') calls each
+             observe _paused=False (the async callback hasn't run yet) and each
+             schedule their own ensure_future — resulting in N-threshold+1
+             duplicate callbacks and an equal number of duplicate
+             run_store.save_scheduler_pause / scheduler_paused event writes.
+          b. Formats a human-readable reason string and logs a WARNING.
+          c. Schedules the full callback (harness.pause_scheduler) via
+             asyncio.ensure_future() — fire-and-forget so the status write is
+             never delayed.  The callback's own scheduler.pause(reason) call
+             becomes a no-op because _paused is already True (idempotent).
+             Persistence (run_store) and event emission still fire exactly once.
+
+        The synchronous latch is the key invariant: pause() BEFORE ensure_future.
+
+        Crash semantics — at-most-once on disk: the in-memory ``_paused`` latch
+        is set synchronously, but the ``run_store.save_scheduler_pause`` write
+        and ``scheduler_paused`` event emission both live inside the scheduled
+        ``harness.pause_scheduler`` coroutine.  If the orchestrator crashes
+        (or the loop is shut down) AFTER the latch is set but BEFORE that
+        coroutine executes, the pause is observable in-memory and in the WARN
+        log but never reaches disk.  The next restart will therefore NOT
+        restore the pause — operators investigating a near-trip crash should
+        verify ``run_store.load_scheduler_pause`` reflects the expected state
+        before resuming dispatch.  This trade-off is intentional: keeping the
+        status write off the synchronous path avoids blocking the caller
+        (set_task_status) on a SQLite write.
+        """
+        if self._paused:
+            return
+        if not self.config.park_stop_enabled:
+            return
+        if self._on_park_stop_trip is None:
+            return
+        n = len(self._blocked_transitions)
+        threshold = self.config.park_stop_parked_threshold
+        if n < threshold:
+            return
+        window_hours = self.config.park_stop_parked_window_hours
+        reason = (
+            f'park-stop: {n} tasks transitioned to blocked within '
+            f'{window_hours}h (threshold={threshold})'
+        )
+        # SYNCHRONOUS LATCH: set _paused=True immediately so concurrent
+        # coroutines see the paused state before the async callback runs.
+        # This must happen before asyncio.ensure_future to close the race
+        # window between "trip detected" and "callback sets _paused".
+        self.pause(reason)
+        logger.warning('Park-stop trip: %s — pausing scheduler', reason)
+        try:
+            t = asyncio.ensure_future(self._on_park_stop_trip(reason))
+            # Attach a done-callback so exceptions inside harness.pause_scheduler
+            # (e.g. RunStore write failure, EventStore emit failure) are logged
+            # immediately rather than surfacing as GC-collected Task warnings
+            # with no context.  Without this the operator sees the scheduler is
+            # paused but has no diagnostic for why persistence failed.
+            t.add_done_callback(
+                lambda f: logger.error(
+                    'park-stop trip callback raised an exception',
+                    exc_info=f.exception(),
+                )
+                if not f.cancelled() and f.exception() is not None
+                else None
+            )
+        except RuntimeError:
+            # No running event loop — should not happen in production since
+            # set_task_status is always called from an async context.  Log and
+            # skip rather than crashing the caller.
+            logger.warning(
+                'park-stop trip: no running event loop; callback not scheduled'
+            )
+
+    def _record_blocked_transition(self, task_id: str) -> None:
+        """Record a successful blocked transition in the rolling deque.
+
+        De-duplicates by *task_id*: if the same task is already counted within
+        the rolling window (e.g. from an idempotent re-set or post-restart
+        replay), this call is a no-op.  This prevents a single task being
+        marked blocked multiple times from artificially inflating the trip
+        counter — the design intent is "N *distinct* tasks transition to
+        blocked", not "N writes that resolve to blocked".
+
+        Evicts (task_id, timestamp) pairs older than
+        ``park_stop_parked_window_hours * 3600`` seconds from the left of
+        the deque.  O(k) where k is the number of expired entries (typically
+        tiny).  The companion ``_blocked_task_ids_in_window`` set is kept in
+        sync so de-dup checks remain O(1).
+        """
+        now = self._park_stop_clock()
+        cutoff = now - self.config.park_stop_parked_window_hours * 3600
+
+        # Evict expired (task_id, ts) pairs from the front of the deque,
+        # keeping _blocked_task_ids_in_window consistent.
+        while self._blocked_transitions and self._blocked_transitions[0][1] <= cutoff:
+            evicted_id, _ = self._blocked_transitions.popleft()
+            self._blocked_task_ids_in_window.discard(evicted_id)
+
+        # De-dup: if this task is already counted in the window, skip.
+        if task_id in self._blocked_task_ids_in_window:
+            return
+
+        self._blocked_transitions.append((task_id, now))
+        self._blocked_task_ids_in_window.add(task_id)
 
     async def dispatch_tool(
         self,
@@ -880,6 +1080,12 @@ class Scheduler:
 
             rejection = extract_rejection(response)
             if rejection is None:
+                # Success — record the blocked transition if applicable and
+                # fire the park-stop trip check.  These must run before return
+                # so that every confirmed write is counted exactly once.
+                if status == 'blocked':
+                    self._record_blocked_transition(task_id)
+                    self._maybe_fire_park_stop_trip()
                 return  # success
             last_rejection = rejection
             if not is_transient_rejection(rejection):
@@ -1685,7 +1891,18 @@ class Scheduler:
         Dispatch order is determined by ``_compute_score()``: tier base is
         dominant, age + CPM bonuses order tasks within a tier, and
         per-tier slot caps reserve headroom for higher-value work.
+
+        Returns ``None`` immediately when the scheduler is paused (park-stop).
+        No MCP round-trips, no GC, no override snapshots are performed while
+        paused — all resume cleanly on the first unpaused tick.
         """
+        if self._paused:
+            logger.debug(
+                'acquire_next() short-circuit: scheduler is paused (reason=%r)',
+                self._pause_reason,
+            )
+            return None
+
         tasks = await self.get_tasks()
         if not tasks:
             return None
