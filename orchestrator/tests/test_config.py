@@ -305,6 +305,7 @@ class TestModuleConfigDiscovery:
             'max_per_module': 2,
         }))
         config = load_config(config_path)
+        assert config._module_configs is not None
         assert 'backend' in config._module_configs
         assert config._module_configs['backend'].test_command == 'cargo test'
         assert config._module_configs['backend'].max_per_module == 2
@@ -499,6 +500,7 @@ class TestModuleConfigDiscovery:
         prefix in config._module_configs so the depth-boundary tests are non-vacuous.
         """
         config = _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar')
+        assert config._module_configs is not None
         assert 'foo/bar' in config._module_configs, (
             "Helper must register 'foo/bar' via _discover_module_configs; "
             "if this fails the boundary tests silently pass even when discovery is broken"
@@ -562,6 +564,7 @@ class TestModuleConfigDiscovery:
         # config.py:1042 is actually evaluated at the == boundary.  If discovery is
         # broken, the loop has zero iterations, no warning is emitted, and this test
         # would silently pass without exercising the boundary it claims to guard.
+        assert config._module_configs is not None
         assert 'foo/bar' in config._module_configs, (
             "'foo/bar' must appear in config._module_configs; "
             "if missing, the depth-comparison loop never runs and the warning-absence "
