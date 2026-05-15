@@ -307,9 +307,8 @@ class TestParkInstallAtTracking:
         lt.install_parks('T1', ['mod/a'], 'medium')
         assert 'T1' in lt._park_install_at, 'T1 must have a new entry after re-install'
         new_ts = lt._park_install_at['T1']
-        datetime.fromisoformat(new_ts)  # must be valid ISO8601
-        assert new_ts >= old_ts, (
-            'Re-installed timestamp must be >= original (ISO8601 strings sort chronologically)'
+        assert datetime.fromisoformat(new_ts) >= datetime.fromisoformat(old_ts), (
+            'Re-installed timestamp must be >= original'
         )
 
 
