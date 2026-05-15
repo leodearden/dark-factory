@@ -223,7 +223,15 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
     })
 
     memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[wrong_source, wrong_flag_type, both_wrong])
+    # task-1400: supply side_effect list to satisfy the post-write confirmation search.
+    # The wrong-metadata rows are not stage1_flag_markers, so confirmation also misses.
+    # suppression filter, per-flag pre-write, confirmation first, confirmation retry:
+    memory_service.search = AsyncMock(side_effect=[
+        [wrong_source, wrong_flag_type, both_wrong],  # suppression filter (kind mismatch → no suppression)
+        [wrong_source, wrong_flag_type, both_wrong],  # per-flag search (all filtered → MISS)
+        [],  # confirmation search (miss — no stage1_flag_marker match)
+        [],  # confirmation retry (miss)
+    ])
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
@@ -248,8 +256,8 @@ async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
         task_id='42', flag_type='missing_deliverable', run_id='r1',
     )
 
-    # Two search calls: 1 for the suppression filter (filter_suppressed) + 1 per-flag.
-    assert memory_service.search.call_count == 2
+    # Four search calls: 1 suppression + 1 per-flag + 2 confirmation (miss+retry).
+    assert memory_service.search.call_count == 4
 
 
 # ---------------------------------------------------------------------------
@@ -1434,7 +1442,9 @@ async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
     (a) Result has exactly one item — the task_id=99 flag.
     (b) task_id=42 flag was dropped.
     (c) add_memory called exactly once (MISS path for task_id=99 only).
-    (d) search called exactly twice (1 suppression + 1 per-flag-marker for task_id=99).
+    (d) search called exactly 4 times: 1 suppression + 1 per-flag-marker for task_id=99
+        + 2 confirmation searches (first + retry, both miss — no stage1_flag_marker written
+        yet from the perspective of the confirmation search).
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
@@ -1450,7 +1460,7 @@ async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
         if call_count[0] == 1:
             # First call is the filter_suppressed project-scoped query
             return [suppression_record]
-        # Subsequent calls are per-flag prior-marker queries (MISS path)
+        # Subsequent calls: per-flag prior-marker (MISS) and confirmation searches
         return []
 
     memory_service = AsyncMock()
@@ -1480,9 +1490,9 @@ async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
         f'Expected exactly 1 add_memory call (task_id=99 MISS) but got '
         f'{memory_service.add_memory.call_count}'
     )
-    # (d) search called exactly twice: 1 suppression + 1 per-flag-marker
-    assert memory_service.search.call_count == 2, (
-        f'Expected 2 search calls (1 suppression + 1 per-flag-marker) but got '
+    # (d) search called exactly 4 times: 1 suppression + 1 per-flag-marker + 2 confirmation
+    assert memory_service.search.call_count == 4, (
+        f'Expected 4 search calls (1 suppression + 1 per-flag + 2 confirmation) but got '
         f'{memory_service.search.call_count}'
     )
 

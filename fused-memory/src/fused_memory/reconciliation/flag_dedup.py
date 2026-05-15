@@ -428,8 +428,13 @@ async def dedup_flags(
             # per-(task_id, flag_type) bound.  The best-effort replacement
             # pattern on the HIT path ensures that once search recovers, the
             # next cycle collapses any accumulated duplicates back to a single row.
+            #
+            # Post-write confirmation (task-1400): after writing, confirm the
+            # marker is findable via a read-back search.  The WARNING is driven
+            # off the confirmed canonical id (None = unfindable), not off the
+            # unverified add_memory response.memory_ids.
             try:
-                miss_response = await memory_service.add_memory(
+                await memory_service.add_memory(
                     content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
                     category='observations_and_summaries',
                     project_id=project_id,
@@ -443,10 +448,18 @@ async def dedup_flags(
                     causation_id=run_id,
                     _source='stage1_flag_dedup',
                 )
-                if not getattr(miss_response, 'memory_ids', None):
+                confirmed_id = await confirm_marker_persisted(
+                    memory_service,
+                    project_id=project_id,
+                    task_id=tid,
+                    flag_type=ftype,
+                    run_id=run_id,
+                    log=logger,
+                )
+                if confirmed_id is None:
                     logger.warning(
-                        'flag_dedup: add_memory returned no memory_ids on MISS for task %s'
-                        ' flag_type %s — recurring flag will not be detected next cycle',
+                        'flag_dedup: MISS marker for task %s flag_type %s could not be'
+                        ' confirmed findable — recurring flag will not be detected next cycle',
                         tid, ftype,
                     )
             except Exception as e:
