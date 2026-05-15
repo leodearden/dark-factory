@@ -401,6 +401,45 @@ class TestRouteReviewSuggestionsToCurator:
         mock_post.assert_not_called()
         write_mock.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_mcp_none_no_queue_logs_audit_warning_on_dropped_suggestions(
+        self, caplog
+    ):
+        """(mcp=None, queue=None) must emit a WARNING so the drop is auditable.
+
+        Before step-2 impl: the fallback silently drops suggestions after the
+        no-op _write_suggestions_to_memory call — no log record is produced.
+        After step-2 impl: a WARNING is emitted containing 'suggestion' and
+        one of {'drop', 'no-op', 'no sink'} plus the count (2).
+        """
+        suggestions = self._suggestions()
+        wf = _make_workflow(escalation_queue=None)
+        wf.mcp = None  # simulate CLI/dry-run/test context
+
+        # Do NOT patch _write_suggestions_to_memory — exercise the real (no-op)
+        # path so we confirm the warning fires after the real fallback.
+        with (
+            patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post,
+            caplog.at_level(logging.WARNING, logger='orchestrator.workflow'),
+        ):
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        # Regression guard: must not attempt any HTTP against missing MCP
+        mock_post.assert_not_called()
+
+        # The audit warning must be present
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        drop_keywords = {'drop', 'no-op', 'no sink'}
+        assert any(
+            'suggestion' in t.lower() and any(kw in t.lower() for kw in drop_keywords)
+            for t in warning_texts
+        ), f'Expected WARNING with "suggestion" + drop keyword, got: {warning_texts}'
+
+        # Must also mention the count of dropped suggestions (2)
+        assert any(
+            str(len(suggestions)) in t for t in warning_texts
+        ), f'Expected WARNING mentioning count {len(suggestions)}, got: {warning_texts}'
+
 
 # ---------------------------------------------------------------------------
 # Integration: stall guard + call-site routing
