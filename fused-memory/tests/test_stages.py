@@ -6037,6 +6037,158 @@ class TestAssemblePayloadRunWindowStart:
         assert captured_kwargs.get('run_window_start') is None
 
 
+class TestSameCycleSweepFix:
+    """step-7 (task-1369): end-to-end reproduction of cycle-00d1e252 defect.
+
+    Proves that the run-window guard (steps 4+6) prevents same-cycle Stage-1
+    markers (missing run_id) from being swept before Stage 2 can process them,
+    while genuine prior-cycle residue is still swept correctly.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fake_cli_result(self):
+        return MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model', error=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_window_missing_run_id_not_swept_prior_cycle_is_swept(self, mock_deps):
+        """Same-cycle marker (missing run_id, created_at in window) is NOT swept;
+        prior-cycle residue (mismatched run_id, created_at out of window) IS swept."""
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        T0 = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        mock_run = MagicMock()
+        mock_run.started_at = T0
+        mock_deps['journal'].get_run = AsyncMock(return_value=mock_run)
+
+        mock_deps['memory_service'].search.return_value = [
+            # (iii) clean current marker — matching run_id
+            SimpleNamespace(
+                id='current', content='current flag',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+                created_at=None,
+            ),
+            # (i) same-cycle marker — MISSING run_id, created_at within window
+            SimpleNamespace(
+                id='in-window-missing', content='same-cycle flag',
+                metadata={'flag_for_stage2': True, 'task_id': '2'},
+                created_at='2026-05-15T10:00:01+00:00',  # T0 + 1s
+            ),
+            # (ii) genuine prior-cycle marker — mismatched run_id, created_at before window
+            SimpleNamespace(
+                id='out-of-window-stale', content='prior-cycle flag',
+                metadata={'flag_for_stage2': True, 'task_id': '3', 'run_id': 'old-run'},
+                created_at='2026-05-15T09:00:00+00:00',  # T0 - 1h
+            ),
+        ]
+
+        watermark = Watermark(project_id='reify')
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=self._fake_cli_result())):
+            report = await stage.run(events=[], watermark=watermark, prior_reports=[],
+                                     run_id='test-run')
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in mock_deps['memory_service'].delete_memory.call_args_list
+        }
+        # (i) same-cycle marker must NOT be swept
+        assert 'in-window-missing' not in deleted_ids, (
+            'Same-cycle in-window marker must NOT be swept (run-window guard fix)'
+        )
+        # (ii) prior-cycle residue MUST be swept
+        assert 'out-of-window-stale' in deleted_ids, (
+            'Prior-cycle out-of-window marker must still be swept'
+        )
+        # Verify the expected _source kwarg on the stale-sweep delete call
+        stale_call_kwargs = {
+            c.kwargs['memory_id']: c.kwargs
+            for c in mock_deps['memory_service'].delete_memory.call_args_list
+            if c.kwargs.get('_source') == 'stage2_stale_fixc_sweep'
+        }
+        assert 'out-of-window-stale' in stale_call_kwargs
+        # Only 1 marker swept
+        assert report.stats.get('stale_fixc_markers_swept') == 1
+
+    @pytest.mark.asyncio
+    async def test_control_journal_raises_reverts_to_sweeping_in_window_marker(self, mock_deps):
+        """Control: when journal.get_run raises, window guard is dormant and the
+        same-cycle marker (missing run_id) IS swept — proves guard is doing the rescue."""
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        # Journal raises → run_window_start=None → window guard dormant
+        mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal unavailable'))
+
+        mock_deps['memory_service'].search.return_value = [
+            # Matching run_id marker — always current
+            SimpleNamespace(
+                id='current', content='current flag',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+                created_at=None,
+            ),
+            # Same-cycle marker with missing run_id — WITHOUT guard, this gets swept
+            SimpleNamespace(
+                id='in-window-missing', content='same-cycle flag',
+                metadata={'flag_for_stage2': True, 'task_id': '2'},
+                created_at='2026-05-15T10:00:01+00:00',
+            ),
+            # Prior-cycle residue — always swept
+            SimpleNamespace(
+                id='out-of-window-stale', content='prior-cycle flag',
+                metadata={'flag_for_stage2': True, 'task_id': '3', 'run_id': 'old-run'},
+                created_at='2026-05-15T09:00:00+00:00',
+            ),
+        ]
+
+        watermark = Watermark(project_id='reify')
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=self._fake_cli_result())):
+            report = await stage.run(events=[], watermark=watermark, prior_reports=[],
+                                     run_id='test-run')
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in mock_deps['memory_service'].delete_memory.call_args_list
+        }
+        # Without the guard (journal failed), the same-cycle marker reverts to being swept
+        assert 'in-window-missing' in deleted_ids, (
+            'Control: without run-window guard, same-cycle missing-run_id marker IS swept'
+        )
+        assert report.stats.get('stale_fixc_markers_swept') == 2
+
+
 class TestStage3PayloadIncludesProjectRoot:
     """IntegrityCheck.assemble_payload() must emit a Use project_root="..." directive.
 
