@@ -2932,15 +2932,12 @@ class TestCliStageRunnerCapWaitSanityBound:
     invoke_with_cap_retry; prevents stalling the reconciliation queue under cap."""
 
     def test_constant_importable_and_minutes_scale(self):
-        """(a) _STAGE_RUNNER_CAP_WAIT_SANITY_SECS is importable, >0, <14d, <=3600s."""
+        """(a) _STAGE_RUNNER_CAP_WAIT_SANITY_SECS is importable and pinned to the documented 30-min policy."""
         from fused_memory.reconciliation.cli_stage_runner import (
             _STAGE_RUNNER_CAP_WAIT_SANITY_SECS,
         )
 
-        _FOURTEEN_DAYS_SECS = 14 * 86400
-        assert _STAGE_RUNNER_CAP_WAIT_SANITY_SECS > 0
-        assert _STAGE_RUNNER_CAP_WAIT_SANITY_SECS < _FOURTEEN_DAYS_SECS  # not the default 14d
-        assert _STAGE_RUNNER_CAP_WAIT_SANITY_SECS <= 3600.0  # hours-scale upper bound
+        assert _STAGE_RUNNER_CAP_WAIT_SANITY_SECS == 1800.0
 
     @pytest.mark.asyncio
     async def test_run_stage_via_cli_forwards_cap_wait_sanity_secs(self, tmp_path):

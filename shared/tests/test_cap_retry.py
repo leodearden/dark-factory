@@ -6,6 +6,7 @@ Covers every branch in shared.cli_invoke.invoke_with_cap_retry (lines 136-274).
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import json
 import logging
@@ -2029,9 +2030,6 @@ class TestInvokeFnParameter:
 # ===================================================================
 # TestVestigialParamsRemoved  (step-1 regression guard)
 # ===================================================================
-
-
-import inspect  # noqa: E402 — kept here so it's co-located with the test class
 
 
 class TestVestigialParamsRemoved:

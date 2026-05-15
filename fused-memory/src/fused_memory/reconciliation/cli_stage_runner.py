@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 
+from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SECS
+
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
 
@@ -18,22 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# _STAGE_RUNNER_CAP_WAIT_SANITY_SECS: minutes-scale cap-wait override for
-# cli_stage_runner.
-#
-# run_stage_via_cli is a reconciliation stage runner.  It is expected to
-# complete promptly within the reconciliation cycle.  Inheriting the shared
-# 14-day default from _DEFAULT_CAP_WAIT_SANITY_SECS would stall the
-# reconciliation queue indefinitely under sustained API capacity limits.
-#
-# 1800 s (30 min) mirrors _AGENT_LOOP_CAP_WAIT_SANITY_SECS and
-# _JUDGE_CAP_WAIT_SANITY_SECS, and is aligned with the stage_timeout_seconds
-# hierarchy (≤ 3600 s), giving a brief cap window time to resolve in-band
-# while keeping the queue moving.  Note: this runner already re-raises
-# AllAccountsCappedException to the harness for deferral; the override aligns
-# with the existing fast-defer contract.
-# See task 1401 / plans/afk-A1-cap-wait.md for the full per-caller policy.
-_STAGE_RUNNER_CAP_WAIT_SANITY_SECS: float = 1800.0
+# Per-caller cap-wait policy: see shared/src/shared/cli_invoke.py and plans/afk-A1-cap-wait.md.
+_STAGE_RUNNER_CAP_WAIT_SANITY_SECS = _RECONCILIATION_STAGE_CAP_WAIT_SECS
 
 # ── Disallowed tool lists ──────────────────────────────────────────────
 

@@ -15,23 +15,14 @@ from fused_memory.models.reconciliation import (
     VerdictAction,
     VerdictSeverity,
 )
+from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SECS
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# _JUDGE_CAP_WAIT_SANITY_SECS: minutes-scale cap-wait override for the judge.
-#
-# The judge is a single-shot reconciliation stage runner.  It is expected to
-# complete promptly within the reconciliation cycle.  Inheriting the shared
-# 14-day default from _DEFAULT_CAP_WAIT_SANITY_SECS would stall the
-# reconciliation queue indefinitely under sustained API capacity limits.
-#
-# 1800 s (30 min) mirrors _AGENT_LOOP_CAP_WAIT_SANITY_SECS in agent_loop.py
-# and is aligned with the stage_timeout_seconds hierarchy (≤ 3600 s), giving
-# a brief cap window time to resolve in-band while keeping the queue moving.
-# See task 1401 / plans/afk-A1-cap-wait.md for the full per-caller policy.
-_JUDGE_CAP_WAIT_SANITY_SECS: float = 1800.0
+# Per-caller cap-wait policy: see shared/src/shared/cli_invoke.py and plans/afk-A1-cap-wait.md.
+_JUDGE_CAP_WAIT_SANITY_SECS = _RECONCILIATION_STAGE_CAP_WAIT_SECS
 
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]

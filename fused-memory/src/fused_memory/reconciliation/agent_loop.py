@@ -20,16 +20,12 @@ from shared.cli_invoke import AgentResult, build_failure_message, invoke_with_ca
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
+from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SECS
 
 logger = logging.getLogger(__name__)
 
-# Cap-wait policy override for the reconciliation agent loop.
-# This runner participates in a bounded reconciliation cycle (stage_timeout_seconds
-# defaults to 3600s; cycle_timeout_seconds to 21600s).  A 14-day wait (the shared
-# default) would stall the reconciliation queue under sustained cap, so we cap at
-# 30 minutes — long enough for a brief cap window to resolve in-band, short enough
-# to defer cleanly.  Mirrors the _CURATOR_CAP_WAIT_SANITY_SECS pattern.
-_AGENT_LOOP_CAP_WAIT_SANITY_SECS = 1800.0
+# Per-caller cap-wait policy: see shared/src/shared/cli_invoke.py and plans/afk-A1-cap-wait.md.
+_AGENT_LOOP_CAP_WAIT_SANITY_SECS = _RECONCILIATION_STAGE_CAP_WAIT_SECS
 
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
