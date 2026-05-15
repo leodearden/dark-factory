@@ -82,6 +82,29 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
     return slot
 
 
+def _make_gate(**overrides) -> MagicMock:
+    """Build a MagicMock UsageGate with all required attribute defaults initialised.
+
+    Ensures every gate attribute that UsageGate exposes is set to a sensible
+    default so that a new attribute added to UsageGate only needs to be updated
+    here rather than at every construction site.  Accepts ``**overrides`` so
+    callers can pin specific values without re-specifying the rest.
+
+    Mirrors the ``_mock_gate`` helper in ``shared/tests/test_cap_retry.py``.
+    """
+    gate = MagicMock()
+    gate.account_count = overrides.pop('account_count', 1)
+    gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok-a'))
+    gate.active_account_name = overrides.pop('active_account_name', 'acct-a')
+    gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
+    gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
+    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
+    gate.soonest_resets_at = overrides.pop('soonest_resets_at', None)
+    for k, v in overrides.items():
+        setattr(gate, k, v)
+    return gate
+
+
 def _make_gate_yielding(slots, *, active_account_name=None):
     """UsageGate mock whose successive invoke_slot() calls yield the given slots.
 
@@ -98,18 +121,15 @@ def _make_gate_yielding(slots, *, active_account_name=None):
         cm.__aexit__ = AsyncMock(return_value=False)
         return cm
 
-    gate = MagicMock()
-    gate.invoke_slot = MagicMock(side_effect=_new_cm)
-    gate.account_count = len(slots)
-    gate.active_account_name = (
-        active_account_name if active_account_name is not None
-        else slots[0].account_name
+    gate = _make_gate(
+        account_count=len(slots),
+        active_account_name=(
+            active_account_name if active_account_name is not None
+            else slots[0].account_name
+        ),
+        before_invoke=AsyncMock(return_value=slots[0].token),
     )
-    gate.before_invoke = AsyncMock(return_value=slots[0].token)
-    gate.on_agent_complete = MagicMock()
-    gate.confirm_account_ok = MagicMock()
-    gate.release_probe_slot = MagicMock()
-    gate.soonest_resets_at = None
+    gate.invoke_slot = MagicMock(side_effect=_new_cm)
     return gate
 
 
@@ -466,15 +486,7 @@ class TestReleaseProbeSlotOnException:
 
     async def test_release_probe_slot_called_on_runtime_error(self):
         """release_probe_slot is called with oauth_token when invoke raises."""
-        gate = MagicMock()
-        gate.account_count = 1
-        gate.before_invoke = AsyncMock(return_value='tok-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
-        gate.confirm_account_ok = MagicMock()
-        gate.release_probe_slot = MagicMock()
-        gate.soonest_resets_at = None
+        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=RuntimeError('subprocess failed'))
@@ -489,12 +501,7 @@ class TestReleaseProbeSlotOnException:
 
     async def test_runtime_error_propagates(self):
         """RuntimeError raised by invoke propagates with its message intact."""
-        gate = MagicMock()
-        gate.account_count = 1
-        gate.before_invoke = AsyncMock(return_value='tok-a')
-        gate.active_account_name = 'acct-a'
-        gate.release_probe_slot = MagicMock()
-        gate.soonest_resets_at = None
+        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
@@ -508,13 +515,7 @@ class TestReleaseProbeSlotOnException:
 
     async def test_confirm_account_ok_not_called_when_invoke_raises(self):
         """confirm_account_ok is NOT called when invoke raises."""
-        gate = MagicMock()
-        gate.account_count = 1
-        gate.before_invoke = AsyncMock(return_value='tok-a')
-        gate.active_account_name = 'acct-a'
-        gate.confirm_account_ok = MagicMock()
-        gate.release_probe_slot = MagicMock()
-        gate.soonest_resets_at = None
+        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
@@ -528,12 +529,7 @@ class TestReleaseProbeSlotOnException:
 
     async def test_cancelled_error_release_probe_slot(self):
         """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
-        gate = MagicMock()
-        gate.account_count = 1
-        gate.before_invoke = AsyncMock(return_value='tok-a')
-        gate.active_account_name = 'acct-a'
-        gate.release_probe_slot = MagicMock()
-        gate.soonest_resets_at = None
+        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
         _attach_invoke_slot(gate)
 
         fake_invoke = AsyncMock(side_effect=asyncio.CancelledError())
