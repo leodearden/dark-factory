@@ -62,7 +62,10 @@ __all__ = [
 
 
 class AllAccountsCappedException(Exception):
-    """Raised when the cap-hit retry loop exceeds max retries or wall-clock deadline.
+    """Raised when the cap-hit retry loop exceeds the sanity-bound wall-clock deadline.
+
+    The count-based guard (``max_cap_retries``) no longer triggers this exception;
+    it is kept in the ``invoke_with_cap_retry`` signature for back-compat only.
 
     Attributes:
     - ``retries``: number of consecutive cap hits before giving up
@@ -469,18 +472,11 @@ async def invoke_with_cap_retry(
                             f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
                         )
 
-                    # Guard: raise before sleeping if retry limit or deadline exceeded
+                    # Guard: raise before sleeping if wall-clock deadline exceeded.
+                    # max_cap_retries is vestigial — kept in the signature for
+                    # back-compat (task_curator.py passes max_cap_retries=3) but
+                    # no branch checks it any more.
                     elapsed = time.monotonic() - retry_start
-                    if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
-                        logger.error(
-                            f'{label}: giving up after {consecutive_cap_hits} consecutive cap hits '
-                            f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
-                        )
-                        raise AllAccountsCappedException(
-                            retries=consecutive_cap_hits,
-                            elapsed_secs=elapsed,
-                            label=label,
-                        )
                     if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
                         logger.error(
                             f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
@@ -538,18 +534,9 @@ async def invoke_with_cap_retry(
                             f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
                         )
 
-                        # Guard: raise before sleeping if retry limit or deadline exceeded
+                        # Guard: raise before sleeping if wall-clock deadline exceeded.
+                        # max_cap_retries is vestigial — no branch checks it any more.
                         elapsed = time.monotonic() - retry_start
-                        if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
-                            logger.error(
-                                f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
-                                f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
-                            )
-                            raise AllAccountsCappedException(
-                                retries=consecutive_cap_hits,
-                                elapsed_secs=elapsed,
-                                label=label,
-                            )
                         if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
                             logger.error(
                                 f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
