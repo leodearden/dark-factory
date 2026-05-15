@@ -31,6 +31,8 @@ def _empty_skeleton() -> dict:
         'pin_queue': [],
         'overrides': {},
         'current_holders': {},
+        'is_paused': False,
+        'pause_reason': None,
         'snapshot_at': None,
     }
 
