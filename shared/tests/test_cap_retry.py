@@ -2289,3 +2289,43 @@ class TestInvokeFnParameter:
         with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv:
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
         mock_inv.assert_awaited_once()
+
+
+# ===================================================================
+# TestVestigialParamsRemoved  (step-1 regression guard)
+# ===================================================================
+
+
+import inspect  # noqa: E402 — kept here so it's co-located with the test class
+
+
+class TestVestigialParamsRemoved:
+    """Regression guard: vestigial params and constants must not exist after task-1401/step-2.
+
+    RED until step-2 removes max_cap_retries / cap_retry_deadline_secs from the
+    invoke_with_cap_retry signature and deletes the corresponding module constants.
+    """
+
+    def test_signature_has_no_max_cap_retries(self):
+        """invoke_with_cap_retry must NOT have a max_cap_retries parameter."""
+        params = inspect.signature(invoke_with_cap_retry).parameters
+        assert 'max_cap_retries' not in params, (
+            'max_cap_retries is vestigial (task-1401): remove it from the signature'
+        )
+
+    def test_signature_has_no_cap_retry_deadline_secs(self):
+        """invoke_with_cap_retry must NOT have a cap_retry_deadline_secs parameter."""
+        params = inspect.signature(invoke_with_cap_retry).parameters
+        assert 'cap_retry_deadline_secs' not in params, (
+            'cap_retry_deadline_secs is vestigial (task-1401): remove it from the signature'
+        )
+
+    def test_default_max_cap_retries_not_importable(self):
+        """_DEFAULT_MAX_CAP_RETRIES must NOT be importable from shared.cli_invoke."""
+        with pytest.raises(ImportError):
+            from shared.cli_invoke import _DEFAULT_MAX_CAP_RETRIES  # noqa: PLC0415, F401
+
+    def test_default_cap_retry_deadline_secs_not_importable(self):
+        """_DEFAULT_CAP_RETRY_DEADLINE_SECS must NOT be importable from shared.cli_invoke."""
+        with pytest.raises(ImportError):
+            from shared.cli_invoke import _DEFAULT_CAP_RETRY_DEADLINE_SECS  # noqa: PLC0415, F401
