@@ -670,9 +670,24 @@ class TestRouteReviewSuggestionsIntegration:
     """Integration test: stall guard for `_route_review_suggestions_to_curator` fire-and-forget POST."""
 
     @pytest.mark.asyncio
-    async def test_stall_guard_returns_in_ms_despite_slow_stub(self):
-        """STALL GUARD: method returns within 100ms even with a 2s slow HTTP stub."""
-        import time
+    async def test_stall_guard_post_not_completed_when_route_returns(self):
+        """STALL GUARD: the curator POST must not complete before the route call returns.
+
+        Contract: `_route_review_suggestions_to_curator` schedules the curator POST
+        as a fire-and-forget background task via `asyncio.create_task`.  It must
+        NOT synchronously await the POST.
+
+        Mechanism: `post_completed` is an `asyncio.Event` that the slow_post stub
+        sets AFTER its 2s sleep finishes.  Because `_route_review_suggestions_to_curator`
+        has no `await` points on its hot path, the event loop never yields between the
+        route call and the synchronous assertion below — so slow_post never runs and
+        `post_completed` stays unset.
+
+        Regression path: if the impl were changed to `await self._post_submit_tasks(…)`
+        instead of `asyncio.create_task(…)`, the route call would block for 2s while
+        slow_post's sleep completes, setting `post_completed`, and the assertion would
+        fail with a clear message — independent of system load.
+        """
 
         suggestions = [
             {
@@ -686,22 +701,24 @@ class TestRouteReviewSuggestionsIntegration:
         ]
         wf = _make_workflow()
 
+        post_completed = asyncio.Event()
+
         async def slow_post(url, *, json=None, **kwargs):
             await asyncio.sleep(2)
+            post_completed.set()
             return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-slow'}})
 
         with patch('httpx.AsyncClient.post', side_effect=slow_post):
-            t0 = time.monotonic()
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            elapsed = time.monotonic() - t0
 
-        # Method must return well under the 2s slow stub — the POST is fire-and-forget.
-        # Threshold is 1.0s (not tighter) so the test passes under heavy parallel-test
-        # load without masking a real regression: if the function blocks synchronously
-        # on the 2s POST it will always take ≥2s, which exceeds 1.0s.
-        assert elapsed < 1.0, (
-            f'_route_review_suggestions_to_curator took {elapsed:.3f}s '
-            f'(expected < 1.0s); may be awaiting curator synchronously'
+        # The POST must not have completed — it should still be running (or not yet
+        # started) as a background task.  If post_completed is set it means the route
+        # call synchronously awaited slow_post's 2s sleep before returning, which
+        # violates the fire-and-forget contract.
+        assert not post_completed.is_set(), (
+            '_route_review_suggestions_to_curator must not synchronously await the '
+            'curator POST — post_completed was set, indicating the slow_post sleep '
+            'completed before the route call returned'
         )
 
         # Cancel background tasks so they don't leak into the next test
