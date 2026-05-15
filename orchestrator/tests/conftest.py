@@ -73,6 +73,25 @@ def _clear_orch_config_path(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_dry_run_unblock(monkeypatch, request):
+    """Replace ``orchestrator.workflow.run_dry_run_unblock`` with an async no-op.
+
+    The real hook fires the Claude CLI fire-and-forget; in the test suite that
+    causes pytest-timeout hangs (~60 s × ~8 tests) whenever ``_mark_blocked``
+    runs.  Tests that genuinely need the real binding (e.g.
+    ``test_workflow_dry_run_hook.py`` stacks its own ``patch(...)`` on top)
+    can opt out with the ``exercise_dry_run_unblock`` marker.
+    """
+    if request.node.get_closest_marker('exercise_dry_run_unblock'):
+        return
+
+    async def _noop(**_):
+        return None
+
+    monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', _noop)
+
+
+@pytest.fixture(autouse=True)
 def _restore_sandbox_backend():
     """Snapshot and restore sandbox_dispatch._preferred around every test.
 

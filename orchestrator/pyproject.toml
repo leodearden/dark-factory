@@ -82,6 +82,9 @@ filterwarnings = [
 # switch to thread — see fused-memory/pyproject.toml for that divergence.
 timeout = 60
 timeout_method = "signal"
+markers = [
+    "exercise_dry_run_unblock: allow workflow._mark_blocked to spawn the real run_dry_run_unblock hook (fire-and-forget Claude CLI). Default: autouse no-op installed in conftest.py.",
+]
 
 [dependency-groups]
 dev = [
