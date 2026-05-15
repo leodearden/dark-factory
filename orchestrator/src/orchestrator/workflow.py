@@ -392,6 +392,7 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 'Internal: SUCCESS without merge_sha — provenance unconstructable',
                 escalate_to_human=True,
+                terminal_state_is_the_bug=True,
             )
         try:
             await self.scheduler.mark_done(
@@ -408,6 +409,7 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                terminal_state_is_the_bug=True,
             )
         logger.info(
             f'Task {self.task_id} DONE — '
@@ -1052,6 +1054,7 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 f'Unhandled set_task_status rejection: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                terminal_state_is_the_bug=True,
             )
 
         except Exception as e:
@@ -4132,6 +4135,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return await self._mark_blocked(
                 f'Pre-PLAN recovery rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
+                terminal_state_is_the_bug=True,
             )
         return WorkflowOutcome.DONE
 
@@ -4380,6 +4384,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         merge_phase: bool = False,
         escalate_to_human: bool = False,
         suggested_action: str = 'investigate_and_retry',
+        terminal_state_is_the_bug: bool = False,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -4396,7 +4401,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         a confirmed loop / unresolvable failure that the steward cannot
         meaningfully un-stick (e.g. ≥2 consecutive no-plan failures on
         the same main SHA).
+        *terminal_state_is_the_bug* is a **semantic marker only** with no
+        runtime effect on this direct-submit path.  It signals that the
+        failure is expected even when the target task is already terminal
+        (e.g. the persistence layer rejected a done write because the task
+        was already done/cancelled by another actor — the escalation is still
+        warranted for audit).  Honored by the MCP chokepoint in the escalation
+        server if these submissions are ever routed through it; the
+        orchestrator's own queue.submit() calls are unaffected.
         """
+        _ = terminal_state_is_the_bug  # semantic marker — consumed by callers
         if self.state == WorkflowState.DONE:
             logger.warning(
                 'Task %s: already DONE, ignoring late blocked transition: %s',
