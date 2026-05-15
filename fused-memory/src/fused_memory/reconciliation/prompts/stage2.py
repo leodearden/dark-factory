@@ -249,28 +249,10 @@ UUID field). These flags are live Mem0 memories written by Stage 1 with \
 needed), you MUST immediately delete that flag from Mem0 to prevent it from being \
 re-surfaced in future reconciliation cycles:
 
-  Before calling `delete_memory`, search Mem0 to resolve the canonical live id \
-for this flag:
+  `mcp__fused-memory__delete_memory(memory_id=<flag_id>, store='mem0')`
 
-  `mcp__fused-memory__search(query='stage 1 flag for stage 2', \
-project_id=<current_project_id>, categories=['observations_and_summaries'], limit=10)`
-
-  Filter the returned results to find the entry whose metadata fields match: \
-source='stage1_flag_marker', task_id == this flag's `task_id`, and \
-last_seen_run_id == the current `run_id` (available in the \
-`## Reconciliation Context` section). Delete using the search-result `id` \
-field of that matched entry:
-
-  `mcp__fused-memory__delete_memory(memory_id=<search_result_id>, store='mem0')`
-
-  If the metadata-filtered search returns no matching result, fall back to the \
-payload `flag_id`:
-
-  `mcp__fused-memory__delete_memory(memory_id=<payload_flag_id>, store='mem0')`
-
-Within the same iteration, emit an action record in your structured report (use \
-the search-result id on the happy path, or the payload id on the fallback path):
-  `{{"action": "flag_deleted", "flag_id": "<id_actually_deleted>", "reason": "processed"}}`
+Within the same iteration, emit an action record in your structured report:
+  `{{"action": "flag_deleted", "flag_id": "<mem0_uuid>", "reason": "processed"}}`
 
 Do NOT delete the flag before acting — deletion is the acknowledgement that the \
 flag has been processed.
