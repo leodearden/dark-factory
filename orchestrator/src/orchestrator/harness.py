@@ -312,6 +312,18 @@ class Harness:
         self._escalation_task: asyncio.Task | None = None
         self._orphan_reaper_task: asyncio.Task | None = None
 
+        # Digest + EWA trip counters (task 1327 AFK hardening).
+        # _escalation_event_count: incremented on every escalation submit/resolve callback.
+        # _last_digest_event_count: snapshot of the count at the last digest write.
+        # _last_digest_done_count: snapshot of scheduler.done_transitions_total at last digest.
+        # _ewa_value: current EWA state (process-local; resets on restart).
+        # _last_digest_window_end_iso: ISO timestamp of the last digest window's end.
+        self._escalation_event_count: int = 0
+        self._last_digest_event_count: int = 0
+        self._last_digest_done_count: int = 0
+        self._ewa_value: float = 0.0
+        self._last_digest_window_end_iso: str = ''  # set to start time on first run
+
         # Soft-cancel registry — keyed by task_id, set externally to abort
         # long workflow waits (merge queue future, steward grace period).
         # Mirrors ``_escalation_events``: created in ``_run_slot`` for each
@@ -2895,12 +2907,17 @@ Output JSON matching the schema. Every task must appear in the output.
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
+        # Increment before the event-set logic so the counter reflects every submission.
+        self._escalation_event_count += 1  # task 1327 AFK hardening
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
 
     def _on_escalation_resolved(self, escalation) -> None:
         """Callback when an escalation is resolved — wake the waiting workflow."""
+        # Increment for any status transition (resolved or dismissed) — both are
+        # escalation events that the EWA digest needs to count.
+        self._escalation_event_count += 1  # task 1327 AFK hardening
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
