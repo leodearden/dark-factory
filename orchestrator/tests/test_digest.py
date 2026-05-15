@@ -231,13 +231,30 @@ class TestCountDoneInWindow:
         assert count == 2, f"Expected 2 done in window; got {count}"
 
     def test_missing_db_returns_zero(self, tmp_path: Path) -> None:
-        """Non-existent DB returns 0 (fail-open)."""
+        """Non-existent DB returns 0 (fail-open) and does NOT create a stub file."""
+        db_path = tmp_path / 'no-such.db'
         count = digest.count_done_in_window(
-            tmp_path / 'no-such.db',
+            db_path,
             '2026-05-10T00:00:00+00:00',
             '2026-05-10T23:59:59+00:00',
         )
         assert count == 0, f"Expected 0 for missing DB; got {count}"
+        assert not db_path.exists(), "count_done_in_window must not create a stub DB file"
+
+    def test_schema_missing_returns_zero(self, tmp_path: Path) -> None:
+        """DB file exists but has no 'events' table — returns 0 (fail-open)."""
+        db_path = tmp_path / 'schema-less.db'
+        # Create a real but schema-less SQLite file (no EventStore setup).
+        conn = sqlite3.connect(str(db_path))
+        conn.close()
+        assert db_path.exists(), "pre-condition: file must exist"
+
+        count = digest.count_done_in_window(
+            db_path,
+            '2026-05-10T00:00:00+00:00',
+            '2026-05-10T23:59:59+00:00',
+        )
+        assert count == 0, f"Expected 0 for schema-less DB; got {count}"
 
     def test_empty_window_returns_zero(self, tmp_path: Path) -> None:
         """Window with no matching rows returns 0."""

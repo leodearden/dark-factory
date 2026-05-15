@@ -218,7 +218,11 @@ def count_done_in_window(
     Missing DB returns 0.
     """
     try:
-        conn = sqlite3.connect(str(events_db))
+        # Use Path.as_uri() so special characters in the path are percent-encoded
+        # before appending the ?mode=ro query string.  Raw f-string interpolation
+        # would misinterpret '?', '#', or '%' as URI syntax.
+        db_uri = Path(events_db).as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
         try:
             (count,) = conn.execute(
                 "SELECT COUNT(*) FROM events "
@@ -230,6 +234,18 @@ def count_done_in_window(
             return int(count)
         finally:
             conn.close()
+    except sqlite3.OperationalError as exc:
+        # "unable to open database file" is the expected condition before the
+        # EventStore is created (missing DB).  Log at DEBUG to avoid noisy
+        # stack traces during normal startup.  All other OperationalErrors
+        # (e.g. "no such table: events") are unexpected and deserve a WARNING.
+        if "unable to open database file" in str(exc):
+            logger.debug(
+                'count_done_in_window: DB not found (fail-open): %s', events_db
+            )
+        else:
+            logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
+        return 0
     except Exception:
         logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
         return 0
