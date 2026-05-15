@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
+from orchestrator.agents.skill_prompt import load_skill_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -117,37 +118,11 @@ _DISALLOWED_TOOLS: list[str] = [
 def _load_skill_system_prompt() -> str:
     """Load skills/unblock-auto/SKILL.md from repo root, strip frontmatter.
 
-    Walks up from __file__ until it finds a directory containing
-    ``skills/unblock-auto/SKILL.md`` or reaches the repo root (.git marker).
-    Raises FileNotFoundError with a clear message if the file cannot be found
-    (so the outer exception handler in run_dry_run_unblock writes a fallback
-    entry rather than running the agent with an empty/missing system prompt).
+    Delegates to the shared ``load_skill_system_prompt`` helper so the
+    parent-walk and frontmatter-strip logic is not duplicated here.
+    Raises FileNotFoundError with a clear message if the file cannot be found.
     """
-    here = Path(__file__).resolve()
-    skill_path: Path | None = None
-
-    for parent in here.parents:
-        candidate = parent / 'skills' / 'unblock-auto' / 'SKILL.md'
-        if candidate.exists():
-            skill_path = candidate
-            break
-        # Stop searching once we reach the repo root to avoid wandering above it
-        if (parent / '.git').exists():
-            break
-
-    if skill_path is None:
-        msg = f'skills/unblock-auto/SKILL.md not found: searched upward from {here}'
-        logger.error(
-            'dry_run_unblock: %s — is the orchestrator installed outside the monorepo?',
-            msg,
-        )
-        raise FileNotFoundError(msg)
-
-    raw = skill_path.read_text()
-    if not raw.startswith('---'):
-        return raw
-    parts = raw.split('---', maxsplit=2)
-    return parts[2].strip() if len(parts) >= 3 else raw
+    return load_skill_system_prompt('unblock-auto')
 
 
 # ---------------------------------------------------------------------------
