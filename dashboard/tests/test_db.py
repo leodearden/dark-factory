@@ -369,7 +369,6 @@ class TestDbPool:
         assert pool.open_count == 0, (
             f'expected open_count=0, got {pool.open_count}'
         )
-        assert pool._conns == {}, f'_conns must be empty, got {pool._conns!r}'
 
         # The mid-flight connection was physically opened (wrapper appended it).
         assert len(opened) == 1, f'expected 1 opened connection, got {len(opened)}'

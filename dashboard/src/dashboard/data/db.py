@@ -35,7 +35,11 @@ class DbPool:
     ``DASHBOARD_KNOWN_PROJECT_ROOTS``; ``__post_init__`` resolves them; they
     are never mutated at runtime).  The ``rel-path`` values are fixed literals
     (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``) plus the
-    six fixed ``@property`` paths on ``DashboardConfig``.  Therefore::
+    six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
+    paths (``reconciliation_db``, ``tickets_db``, ``metrics_db``,
+    ``write_journal_db``, etc.) are called only with ``config.project_root``,
+    never with each root in ``known_project_roots``, so they contribute a
+    flat ``+6`` rather than a per-root multiplier.  Therefore::
 
         |_open_locks| ≤ (1 + len(known_project_roots)) × 2 + 6
 
