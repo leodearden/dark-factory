@@ -405,9 +405,9 @@ class TestDbPool:
         if hasattr(opened[0], '_thread'):
             opened[0]._thread.join(timeout=2.0)
             assert not opened[0]._thread.is_alive(), (
-                f'aiosqlite worker thread did not exit after close '
-                f'(mid-open connection was not properly closed by the '
-                f'post-connect _closed re-check)'
+                'aiosqlite worker thread did not exit after close '
+                '(mid-open connection was not properly closed by the '
+                'post-connect _closed re-check)'
             )
 
 
