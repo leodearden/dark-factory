@@ -4329,9 +4329,9 @@ class TestShouldSkipKnownBug1139Flag:
 class TestQueryStage2Flags:
     """_query_stage2_flags retrieves and filters Mem0 active-query flags."""
 
-    def _make_result(self, id, content, metadata):
+    def _make_result(self, id, content, metadata, created_at=None):
         from types import SimpleNamespace
-        return SimpleNamespace(id=id, content=content, metadata=metadata)
+        return SimpleNamespace(id=id, content=content, metadata=metadata, created_at=created_at)
 
     @pytest.mark.asyncio
     async def test_returns_flags_with_flag_for_stage2(self):
@@ -4572,6 +4572,200 @@ class TestQueryStage2Flags:
         assert missing_warnings == [], (
             f'Expected no missing-run_id WARNING, but got: {[r.getMessage() for r in missing_warnings]}'
         )
+
+    # ------------------------------------------------------------------ #
+    # step-3 (task-1369): window-aware partition tests                     #
+    # These FAIL until step-4 adds run_window_start param + window logic.  #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_missing_run_id_in_window_routes_to_current(self):
+        """(a) Marker with MISSING run_id but created_at >= run_window_start goes to current."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'in-window-no-rid',
+                'same-cycle flag',
+                {'flag_for_stage2': True, 'task_id': '77'},
+                created_at='2026-05-15T10:00:01+00:00',  # 1s after window start
+            ),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        # In-window marker must go to current, NOT to stale buckets
+        assert any(f['id'] == 'in-window-no-rid' for f in partition.current), (
+            'Same-cycle marker (missing run_id but in window) must appear in current'
+        )
+        assert 'in-window-no-rid' not in partition.stale_missing_run_id_ids
+        assert 'in-window-no-rid' not in partition.stale_mismatched_run_id_ids
+
+    @pytest.mark.asyncio
+    async def test_mismatched_run_id_in_window_routes_to_current(self):
+        """(b) Marker with MISMATCHED run_id but created_at >= run_window_start goes to current."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'in-window-mismatch',
+                'mis-stamped run_id flag',
+                {'flag_for_stage2': True, 'task_id': '88', 'run_id': 'wrong-run-id'},
+                created_at='2026-05-15T10:00:02+00:00',
+            ),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert any(f['id'] == 'in-window-mismatch' for f in partition.current), (
+            'Same-cycle marker (mismatched run_id but in window) must appear in current'
+        )
+        assert 'in-window-mismatch' not in partition.stale_mismatched_run_id_ids
+        assert 'in-window-mismatch' not in partition.stale_missing_run_id_ids
+
+    @pytest.mark.asyncio
+    async def test_out_of_window_stale_marker_stays_stale(self):
+        """(c) Marker with stale run_id and created_at BEFORE run_window_start stays in stale bucket."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'out-of-window',
+                'prior cycle flag',
+                {'flag_for_stage2': True, 'task_id': '99', 'run_id': 'old-run'},
+                created_at='2026-05-15T09:00:00+00:00',  # 1h BEFORE window start
+            ),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert 'out-of-window' in partition.stale_mismatched_run_id_ids, (
+            'Prior-cycle marker (out of window) must remain in stale bucket'
+        )
+        assert not any(f['id'] == 'out-of-window' for f in partition.current)
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_none_preserves_original_behavior(self):
+        """(d) run_window_start=None -> same partition as today (stale stays stale)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'no-run-id',
+                'legacy flag',
+                {'flag_for_stage2': True, 'task_id': '5'},
+                created_at='2026-05-15T10:00:00+00:00',
+            ),
+            self._make_result(
+                'mismatch',
+                'old run flag',
+                {'flag_for_stage2': True, 'task_id': '6', 'run_id': 'r-old'},
+                created_at='2026-05-15T10:00:00+00:00',
+            ),
+        ]
+        # No run_window_start — original behavior: stale stays stale
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=None
+        )
+        assert 'no-run-id' in partition.stale_missing_run_id_ids
+        assert 'mismatch' in partition.stale_mismatched_run_id_ids
+        assert partition.current == []
+
+    @pytest.mark.asyncio
+    async def test_none_created_at_with_valid_window_stays_stale(self):
+        """(e) created_at=None with stale run_id and a valid window -> stale, no exception."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'no-ts',
+                'no timestamp',
+                {'flag_for_stage2': True, 'task_id': '7'},  # missing run_id
+                created_at=None,
+            ),
+        ]
+        # Must not raise; created_at=None -> window guard dormant -> stale bucket
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert 'no-ts' in partition.stale_missing_run_id_ids, (
+            'Marker with created_at=None must fall through to stale bucket (window guard dormant)'
+        )
+        assert not any(f['id'] == 'no-ts' for f in partition.current)
+
+    @pytest.mark.asyncio
+    async def test_unparseable_created_at_with_valid_window_stays_stale(self):
+        """(e-b) Unparseable created_at with stale run_id and a valid window -> stale, no exception."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'bad-ts',
+                'bad timestamp',
+                {'flag_for_stage2': True, 'task_id': '8', 'run_id': 'old-run'},
+                created_at='not-a-date',
+            ),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert 'bad-ts' in partition.stale_mismatched_run_id_ids, (
+            'Marker with unparseable created_at must fall through to stale bucket'
+        )
+        assert not any(f['id'] == 'bad-ts' for f in partition.current)
+
+    @pytest.mark.asyncio
+    async def test_matching_run_id_always_current_regardless_of_window(self):
+        """(f) Matching run_id always goes to current even when created_at precedes window."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'match-old-ts',
+                'correct run_id, old timestamp',
+                {'flag_for_stage2': True, 'task_id': '9', 'run_id': 'r-current'},
+                created_at='2026-05-14T10:00:00+00:00',  # 1 day before window
+            ),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert len(partition.current) == 1
+        assert partition.current[0]['id'] == 'match-old-ts', (
+            'Matching run_id must always go to current regardless of created_at/window'
+        )
+        assert partition.stale_missing_run_id_ids == []
+        assert partition.stale_mismatched_run_id_ids == []
+
+    @pytest.mark.asyncio
+    async def test_partition_return_is_3_field_stage2flagpartition(self):
+        """Return is still a 3-field Stage2FlagPartition with run_window_start active."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            _query_stage2_flags,
+        )
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = []
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert isinstance(partition, Stage2FlagPartition)
+        assert len(partition) == 3
 
 
 class TestSweepStaleFixcMarkers:
