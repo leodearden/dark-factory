@@ -431,3 +431,49 @@ class TestStdlibOnlyProof:
             f'  stderr: {result3.stderr!r}'
         )
         _assert_violation_output(result3.stdout, bad_file)
+
+
+class TestHooksIntegration:
+    """hooks/project-checks must invoke the bare-magicmock-config checker."""
+
+    def test_hook_invokes_check_with_python3_not_uv_run(self):
+        """The bare-magicmock check invocation must use a python3 token, not uv run,
+        and target the five test directories.
+
+        Word-boundary regex r'\\bpython3(?:\\.\\d+)?\\b' accepts plain `python3`,
+        versioned `python3.11`, and absolute paths, while rejecting `mypython3`.
+
+        The filter checks `'check_bare_magicmock_config.py' in line.split('#')[0]`
+        so that the script name must appear in the non-comment portion of the line.
+        This excludes both full-line bash comments and inline comments.
+
+        The scan-target assertions check each line's non-comment portion
+        (`line.split('#')[0]`) so that comment-only occurrences don't satisfy them.
+        """
+        import re as _re  # noqa: PLC0415 — avoid polluting module namespace
+
+        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
+        content = hooks_path.read_text(encoding='utf-8')
+        invocation_lines = [
+            line for line in content.splitlines()
+            if 'check_bare_magicmock_config.py' in line.split('#')[0]
+        ]
+        assert invocation_lines, (
+            'No invocation of check_bare_magicmock_config.py found in hooks/project-checks'
+        )
+        for line in invocation_lines:
+            assert _re.search(r'\bpython3(?:\.\d+)?\b', line), (
+                f'Expected a python3 token in invocation, got: {line!r}'
+            )
+            assert 'uv run' not in line, (
+                f'Found uv run in bare-magicmock check invocation (should use plain python3): {line!r}'
+            )
+        # Assert the scan targets appear in non-comment code somewhere in the file.
+        non_comment_lines = [line.split('#')[0] for line in content.splitlines()]
+        all_non_comment = '\n'.join(non_comment_lines)
+        assert 'fused-memory/tests' in all_non_comment, (
+            'Expected fused-memory/tests scan target in non-comment code in hooks/project-checks'
+        )
+        assert 'orchestrator/tests' in all_non_comment, (
+            'Expected orchestrator/tests scan target in non-comment code in hooks/project-checks'
+        )
