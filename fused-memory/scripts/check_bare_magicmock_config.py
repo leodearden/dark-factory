@@ -8,6 +8,13 @@ source line is a structured exemption comment:
 
     # noqa: bare-magicmock — <reason>   (em-dash or ASCII hyphen; reason must be non-empty)
 
+Inline trailing exemption NOT honored: a ``# noqa: bare-magicmock`` comment placed on
+the *same* line as the assignment (e.g. ``config = MagicMock()  # noqa: bare-magicmock — x``)
+is intentionally ignored.  Only the nearest preceding non-blank source line is consulted.
+Placing the exemption on the same line as the violating code is a common footgun with
+ruff-style suppressions; keeping the contract to a dedicated preceding line makes
+exemptions both auditable and deliberate.
+
 Config-name set: exact ``config`` and ``cfg``, plus any name ending with ``_config`` or
 ``_cfg`` (e.g. ``orch_config``, ``mock_cfg``).  Generic names like ``mcp``, ``mock``, ``m``
 are intentionally excluded — this rule targets config objects only (non-goal: no scope creep).
@@ -18,6 +25,21 @@ module-level and local ``config = MagicMock()``).  Attribute assignments such as
 resolving attribute targets requires class/instance context that is not available during
 AST inspection.  This exclusion is an intentional non-goal; it is documented here so the
 scope limit is discoverable.
+
+Tuple/list-unpacking non-goal: ``a, b = MagicMock()`` uses an ``ast.Tuple`` target, not
+an ``ast.Name``, so it is excluded by the same ast.Name-only rule.  Inspecting unpacked
+targets would require data-flow analysis to identify which element ends up in a
+config-named binding; this is intentionally out of scope.
+
+Chained/multi-target assignment: ``mock = config = MagicMock()`` is an ``ast.Assign``
+with ``len(node.targets) == 2``.  Each ``ast.Name`` target is evaluated independently
+against the shared RHS value (a single MagicMock call).  One Violation is emitted per
+config-named ``ast.Name`` target:
+  • ``mock = config = MagicMock()``  → 1 violation  (``config`` only)
+  • ``config = cfg = MagicMock()``   → 2 violations (both config-named)
+  • ``mock = other = MagicMock()``   → 0 violations (no config-named targets)
+Spec and exemption checks apply once per target (shared value/lineno; per-target
+``col_offset``).
 
 Preferred alternatives named in the rejection message:
   • ``mock_orch_config`` fixture (orchestrator/tests/conftest.py:91)
@@ -30,6 +52,7 @@ This script is intentionally stdlib-only (ast, argparse, pathlib, re, sys, typin
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
 Adding a third-party dependency here would break that fast path.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -87,6 +110,9 @@ def _is_specced(call: ast.Call) -> bool:
     - ``MagicMock(*args)`` (ast.Starred positional): treated as NOT specced.
       The spread is opaque at AST-inspection time, so we cannot guarantee a spec
       is present; flagging is safer than a false negative.
+    - ``MagicMock(**kwargs)`` (double-starred keyword spread): treated as NOT specced.
+      Like ``*args``, the spread is opaque — even if the dict contains a ``spec`` key
+      we cannot verify it statically; conservative flagging mirrors the *args stance.
     - ``MagicMock(spec=None)`` / ``MagicMock(spec_set=None)``: treated as NOT specced.
       Passing None is semantically equivalent to omitting spec altogether and defeats
       the rule's intent.
@@ -106,7 +132,7 @@ def _is_specced(call: ast.Call) -> bool:
 
 
 # Exemption comment regex.
-# Matches: # noqa: bare-magicmock — <non-empty-reason>
+# Matches: ``# noqa: bare-magicmock — <non-empty-reason>``
 # Accepts em-dash (—) or ASCII hyphen (-) as separator.
 # Requires at least one non-space character after the separator.
 _EXEMPT_RE = re.compile(r'#\s*noqa:\s*bare-magicmock\s*[—\-]+\s*\S.*')
@@ -125,6 +151,11 @@ def _is_exempted(lines: list[str], lineno: int) -> bool:
     Walks upward from ``lineno - 1`` over blank lines to the nearest non-blank line.
     If that line matches _EXEMPT_RE the assignment is exempt.
     Any intervening non-blank, non-matching line breaks the exemption.
+
+    Inline trailing exemption NOT honored: only the nearest *preceding* non-blank line
+    is inspected.  A ``# noqa: bare-magicmock`` comment on the same line as the
+    assignment (inline trailing) is intentionally ignored.  This is by design — see
+    module-level docstring for rationale.
     """
     # lineno is 1-based; convert to 0-based index of the line ABOVE the assignment.
     idx = lineno - 2  # the line immediately above
@@ -143,9 +174,12 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     """Parse *source* and return violations for bare MagicMock() config assignments.
 
     A violation is emitted for each ``<config_name> = MagicMock()`` call that:
-      - targets a single ast.Name whose id matches the config-name set,
+      - has at least one ast.Name target whose id matches the config-name set,
       - calls MagicMock (by name or attribute) with no spec/spec_set,
       - is NOT preceded (on the nearest non-blank source line) by a valid exemption comment.
+
+    For chained assignments (``mock = config = MagicMock()``), each ast.Name target
+    is evaluated independently and may produce a separate Violation.
 
     SyntaxError in *source* → returns an empty list.
     """
@@ -158,50 +192,59 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     violations: list[Violation] = []
 
     for node in ast.walk(tree):
-        # Determine the assignment target name and value.
+        # Normalise both ast.Assign (possibly multi-target) and ast.AnnAssign
+        # (single annotated target) into a uniform (targets, value, lineno) triple
+        # so the evaluation pipeline below can be written once.
         if isinstance(node, ast.Assign):
-            # Only single-name targets: skip tuple/list unpacking.
-            if len(node.targets) != 1:
-                continue
-            target = node.targets[0]
-            if not isinstance(target, ast.Name):
-                continue
-            name = target.id
+            # All ast.Name targets share the RHS value and the assignment lineno.
+            # Non-Name targets (ast.Tuple for unpacking, ast.Attribute for
+            # self.config, etc.) are intentional non-goals skipped by the
+            # isinstance guard in the loop below.
+            targets: list[ast.expr] = node.targets
             value = node.value
             assignment_lineno = node.lineno
-            col_offset = target.col_offset
         elif isinstance(node, ast.AnnAssign):
-            target = node.target
-            if not isinstance(target, ast.Name):
-                continue
             if node.value is None:
                 continue
-            name = target.id
+            targets = [node.target]
             value = node.value
             assignment_lineno = node.lineno
-            col_offset = target.col_offset
         else:
             continue
 
-        if not _is_config_name(name):
-            continue
+        # Shared upfront checks: both branches reject non-MagicMock or specced calls
+        # before iterating targets, so the (typically cheap) per-target name check
+        # does not run for irrelevant RHS expressions.
         if not _is_magicmock_call(value):
             continue
         if _is_specced(value):  # type: ignore[arg-type]
             continue
-        if _is_exempted(lines, assignment_lineno):
-            continue
 
-        violations.append(
-            Violation(
-                filename=filename,
-                lineno=assignment_lineno,
-                col_offset=col_offset,
-                message=_VIOLATION_MSG,
+        # _is_exempted is computed lazily — only on finding the first config-named
+        # ast.Name target — because the exemption check (an upward line walk + regex)
+        # is not free, and most assignments have no config-named targets.
+        exempted: bool | None = None
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if not _is_config_name(target.id):
+                continue
+            if exempted is None:
+                exempted = _is_exempted(lines, assignment_lineno)
+            if exempted:
+                # All targets of this node share the same lineno and therefore
+                # the same exemption status — no need to check further targets.
+                break
+            violations.append(
+                Violation(
+                    filename=filename,
+                    lineno=assignment_lineno,
+                    col_offset=target.col_offset,
+                    message=_VIOLATION_MSG,
+                )
             )
-        )
 
-    return violations
+    return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -231,9 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     for path_str in args.paths:
         p = Path(path_str)
         if p.is_dir():
-            files_to_scan.extend(
-                sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py')))
-            )
+            files_to_scan.extend(sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py'))))
         else:
             if not p.exists():
                 print(f'error: {p}: No such file or directory', file=sys.stderr)
@@ -259,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
         all_violations.extend(violations)
 
     # Phase 3: reporting.
+    # Sort across files for deterministic ruff-style (filename, lineno, col_offset) output.
+    all_violations.sort(key=lambda v: (v.filename, v.lineno, v.col_offset))
     for v in all_violations:
         print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
     for file_path, exc in read_errors:
