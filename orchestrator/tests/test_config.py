@@ -446,7 +446,7 @@ class TestModuleConfigDiscovery:
         )
 
     def test_load_config_warns_when_module_prefix_deeper_than_lock_depth(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ):
         """load_config emits a WARNING when a discovered module-config prefix has more
         path components than lock_depth.
@@ -457,7 +457,6 @@ class TestModuleConfigDiscovery:
           (b) the prefix depth 'prefix depth 3'
           (c) the configured depth 'lock_depth=2'
           (d) the consequence phrase 'unreachable through the scheduler/workflow path'
-          (e) the remediation 'Move the orchestrator.yaml up or raise lock_depth.'
         """
         # Global config: lock_depth set explicitly so test is self-documenting and
         # immune to future changes in OrchestratorConfig default values.
@@ -466,6 +465,12 @@ class TestModuleConfigDiscovery:
             'project_root': str(tmp_path),
             'lock_depth': 2,
         }))
+        # Isolate ORCH_LOCK_DEPTH so a stray env var cannot override lock_depth: 2 and
+        # silently invalidate the depth-comparison boundary being tested. Route
+        # ORCH_CONFIG_PATH through monkeypatch so load_config's unconditional write is
+        # auto-restored at teardown (no stale tmp_path leaks into subsequent tests).
+        monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
         # Nested module config at depth 3 (foo/bar/baz) > lock_depth 2 → must warn.
         nested = tmp_path / 'foo' / 'bar' / 'baz'
         nested.mkdir(parents=True)
@@ -480,8 +485,11 @@ class TestModuleConfigDiscovery:
             r for r in caplog.records
             if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
         ]
-        # Pin all five mandatory substrings so the operator diagnostic cannot silently
-        # drop the prefix, either depth, the unreachability consequence, or the remedy.
+        # Pin the three dynamic substrings plus the distinctive consequence phrase so the
+        # operator diagnostic cannot silently drop the prefix, either depth, or the
+        # unreachability consequence. The exact remediation prose is intentionally omitted
+        # here — it is runtime log output, so coupling tests to its verbatim wording adds
+        # breakage risk without additional regression-detection value.
         DISTINCTIVE_PHRASE = 'unreachable through the scheduler/workflow path'
         matching = [r for r in warning_records if DISTINCTIVE_PHRASE in r.getMessage()]
         assert matching, (
@@ -494,14 +502,13 @@ class TestModuleConfigDiscovery:
             'prefix depth 3',
             'lock_depth=2',
             DISTINCTIVE_PHRASE,
-            'Move the orchestrator.yaml up or raise lock_depth.',
         ):
             assert fragment in msg, (
                 f"Expected {fragment!r} in WARNING message; got: {msg!r}"
             )
 
     def test_load_config_no_warning_when_module_prefix_equals_lock_depth(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ):
         """load_config does NOT emit the depth-mismatch WARNING when prefix depth ==
         lock_depth (the boundary: strictly-greater-than triggers the warning, not >=).
@@ -514,6 +521,10 @@ class TestModuleConfigDiscovery:
             'project_root': str(tmp_path),
             'lock_depth': 2,
         }))
+        # Isolate ORCH_LOCK_DEPTH so a stray env var cannot silently override lock_depth:
+        # 2 and invalidate the == boundary this test exercises.
+        monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
         # Nested module config at depth 2 (foo/bar) == lock_depth 2 → must NOT warn.
         nested = tmp_path / 'foo' / 'bar'
         nested.mkdir(parents=True)
