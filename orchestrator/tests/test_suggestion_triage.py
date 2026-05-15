@@ -217,6 +217,161 @@ class TestEscalateSuggestionsCharacterization:
 
 
 # ---------------------------------------------------------------------------
+# _route_review_suggestions_to_curator
+# ---------------------------------------------------------------------------
+
+
+class TestRouteReviewSuggestionsToCurator:
+    """Tests for the new fire-and-forget direct-to-curator routing method."""
+
+    def _suggestions(self):
+        return [
+            {
+                'reviewer': 'analyst',
+                'severity': 'suggestion',
+                'location': 'src/foo.py:10',
+                'category': 'coverage',
+                'description': 'Missing edge case for branch X',
+                'suggested_fix': 'Add a test covering branch X',
+            },
+            {
+                'reviewer': 'analyst',
+                'severity': 'suggestion',
+                'location': 'src/bar.py:20',
+                'category': 'naming',
+                'description': 'Variable name could be clearer',
+                'suggested_fix': 'Rename to something more descriptive',
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_calls_for_empty_suggestions(self):
+        """Empty suggestions list → no HTTP calls, no background tasks."""
+        queue = MagicMock()
+        wf = _make_workflow(escalation_queue=queue)
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post:
+            await wf._route_review_suggestions_to_curator(_fake_reviews([]))
+            mock_post.assert_not_called()
+
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_schedules_one_post_per_suggestion(self):
+        """N suggestions → exactly N submit_task MCP POSTs are eventually made."""
+        suggestions = self._suggestions()
+        wf = _make_workflow()
+
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            # Drain background tasks
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert len(posted_bodies) == len(suggestions)
+
+    @pytest.mark.asyncio
+    async def test_payload_fields(self):
+        """Each POST payload has the required fields per the spec."""
+        from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
+
+        suggestions = self._suggestions()
+        wf = _make_workflow()
+
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert len(posted_bodies) == len(suggestions)
+        content_hash = review_suggestion_payload_hash(suggestions)
+        task_id = wf.task_id
+
+        for i, (body, suggestion) in enumerate(zip(posted_bodies, suggestions)):
+            assert body['method'] == 'tools/call'
+            params = body['params']
+            assert params['name'] == 'submit_task'
+            args = params['arguments']
+
+            # priority
+            assert args['priority'] == 'low'
+
+            # metadata
+            meta = args['metadata']
+            assert meta['spawned_from'] == task_id
+            assert meta['spawn_context'] == 'review_suggestions'
+            assert meta['escalation_id'] == f'review-suggestions-{task_id}'
+            assert meta['suggestion_hash'] == content_hash
+
+            # title: [<cat>] <loc>: <desc[:60]>
+            cat = suggestion.get('category', '')
+            loc = suggestion.get('location', '')
+            desc = suggestion.get('description', '')
+            expected_title = f'[{cat}] {loc}: {desc[:60]}'
+            assert args['title'] == expected_title
+
+            # details: json.dumps(suggestion)
+            assert args['details'] == json.dumps(suggestion)
+
+            # project_root is passed
+            assert 'project_root' in args
+
+    @pytest.mark.asyncio
+    async def test_escalation_queue_never_touched(self):
+        """escalation_queue.submit must never be called by the curator path."""
+        suggestions = self._suggestions()
+        queue = MagicMock()
+        wf = _make_workflow(escalation_queue=queue)
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=lambda: {'result': {'ticket': 'tkt-1'}},
+            )
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_curate_batch_call(self):
+        """curate_batch must never be called (stall risk)."""
+        suggestions = self._suggestions()
+        wf = _make_workflow()
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=lambda: {'result': {'ticket': 'tkt-1'}},
+            )
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        for call in mock_post.call_args_list:
+            body = call.kwargs.get('json') or (call.args[1] if len(call.args) > 1 else {})
+            tool_name = (body.get('params') or {}).get('name', '')
+            assert tool_name != 'curate_batch', 'curate_batch must never be called'
+
+
+# ---------------------------------------------------------------------------
 # _escalate_review_issues
 # ---------------------------------------------------------------------------
 
