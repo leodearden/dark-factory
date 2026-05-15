@@ -4,7 +4,10 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
+import re
 import uuid as _uuid_mod
+from collections import deque
+from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -108,6 +111,95 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 # ---------------------------------------------------------------------------
 # dedup_flags — prior marker found path (step-5)
 # ---------------------------------------------------------------------------
+
+# Compiled once at module load for _make_search_stub dispatch.
+_MARKER_QUERY_RE = re.compile(r'^stage1 flag marker task (\S+) type (\S+)$')
+
+
+def _make_search_stub(
+    *,
+    suppression: list | None = None,
+    marker: dict[tuple[str, str], list] | None = None,
+) -> Callable[..., Awaitable[list]]:
+    """Return an async callable suitable for ``AsyncMock(side_effect=...)``.
+
+    Dispatches on ``kwargs.get('query', '')``:
+
+    * ``query == 'stage1_flag_suppression'`` — the ``filter_suppressed`` sweep.
+      Pop the front of the *suppression* queue.  Each entry in ``suppression``
+      is the full list returned for that call (e.g. ``suppression=[[rec1], []]``
+      means call 1 returns ``[rec1]``, call 2 returns ``[]``).
+
+    * ``query`` matches ``^stage1 flag marker task (\\S+) type (\\S+)$`` — the
+      ``find_prior_memories`` / ``confirm_marker_persisted`` call site.  A single
+      ordered queue per ``(task_id, flag_type)`` key (provided via ``marker``)
+      services ALL calls that share that query:
+
+        1. The pre-write ``find_prior_memories`` search (pop 1st entry)
+        2. The post-write ``confirm_marker_persisted`` search (pop 2nd entry)
+        3. Any confirmation retry (pop 3rd entry), etc.
+
+      Populate the queue in call order: ``marker={('42', 'md'): [[prior], [new]]}``
+      means the pre-write search returns ``[prior]`` and the confirmation returns
+      ``[new]``.
+
+    * Any other query — raises ``AssertionError`` with a clear diagnostic.
+
+    On queue exhaustion, raises ``AssertionError`` naming the kind and how many
+    entries were configured, rather than the cryptic ``StopAsyncIteration`` that
+    an exhausted ``AsyncMock(side_effect=[...])`` would raise.
+    """
+    # Build mutable queues from the caller-supplied specs.
+    suppression_queue: deque[list] = deque(suppression or [])
+    suppression_configured: int = len(suppression_queue)
+
+    marker_queues: dict[tuple[str, str], deque[list]] = {
+        k: deque(v) for k, v in (marker or {}).items()
+    }
+    marker_configured: dict[tuple[str, str], int] = {
+        k: len(v) for k, v in marker_queues.items()
+    }
+
+    async def _stub(**kwargs: object) -> list:
+        query: str = str(kwargs.get('query', ''))
+
+        if query == 'stage1_flag_suppression':
+            if not suppression_queue:
+                raise AssertionError(
+                    f'_make_search_stub: suppression queue exhausted '
+                    f'(configured {suppression_configured} entr'
+                    f'{"y" if suppression_configured == 1 else "ies"} via '
+                    f'suppression=[...]; add more entries to cover this call)'
+                )
+            return suppression_queue.popleft()
+
+        m = _MARKER_QUERY_RE.match(query)
+        if m:
+            key = (m.group(1), m.group(2))
+            if key not in marker_queues:
+                raise AssertionError(
+                    f'_make_search_stub: unconfigured marker query for '
+                    f'task_id={key[0]!r}, flag_type={key[1]!r}; '
+                    f'configured keys: {list(marker_queues.keys())}'
+                )
+            q = marker_queues[key]
+            if not q:
+                n = marker_configured[key]
+                raise AssertionError(
+                    f'_make_search_stub: marker queue exhausted for '
+                    f'task_id={key[0]!r}, flag_type={key[1]!r}; '
+                    f'queue had {n} entr{"y" if n == 1 else "ies"} — '
+                    f'add more via marker[{key!r}]=[...]'
+                )
+            return q.popleft()
+
+        raise AssertionError(
+            f"_make_search_stub: unrecognised query {query!r}; "
+            f"expected 'stage1_flag_suppression' or "
+            f"'stage1 flag marker task <tid> type <ftype>'"
+        )
+
+    return _stub
 
 
 def _make_memory_result(metadata: dict | None) -> MagicMock:
