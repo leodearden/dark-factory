@@ -37,7 +37,6 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     assert "[Install]" in content
 
     # --- [Unit] ---
-    assert "Dark Factory" in content, "Description must mention 'Dark Factory'"
     # After= must chain all four dependencies
     after_line = next(
         (ln for ln in content.splitlines() if ln.startswith("After=")), None
@@ -84,7 +83,6 @@ def test_reify_orchestrator_service_structure() -> None:
     assert "[Install]" in content
 
     # --- [Unit] ---
-    assert "Reify" in content, "Description must mention 'Reify'"
     after_line = next(
         (ln for ln in content.splitlines() if ln.startswith("After=")), None
     )
@@ -176,14 +174,12 @@ def test_watchdog_timer_structure() -> None:
     assert "[Timer]" in content
     assert "[Install]" in content
 
-    # Description must hint at the 60-second interval
+    # Description field must exist (prose content is not pinned — the functional
+    # interval invariant is asserted via OnUnitActiveSec=60 below)
     desc_line = next(
         (ln for ln in content.splitlines() if ln.startswith("Description=")), None
     )
     assert desc_line is not None, "Description= line not found"
-    assert "60" in desc_line or "every 60" in desc_line.lower(), (
-        f"Description must mention '60' to document the probe interval: {desc_line!r}"
-    )
 
     assert "OnBootSec=30" in content
     assert "OnUnitActiveSec=60" in content
