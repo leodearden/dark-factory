@@ -301,6 +301,86 @@ class TestDbPool:
         # open_count stays at 0 — no connection was installed post-close.
         assert pool.open_count == 0
 
+    async def test_get_suspended_in_connect_during_close_all_does_not_leak(
+        self, tmp_path
+    ):
+        """get() suspended inside aiosqlite.connect() when close_all() runs must
+        close the freshly-opened connection and return None — not install a stranded
+        connection into the drained pool.
+
+        Race window: get() acquires the per-path lock, passes the pre-connect
+        `if self._closed` check (False at that point), then suspends inside
+        `await aiosqlite.connect()`.  close_all() runs to completion — sets
+        _closed=True, drains _conns, clears _open_locks — WITHOUT holding the
+        per-path lock.  get() then resumes.
+
+        Pre-fix: get() has no post-connect re-check → installs the connection,
+        returns it (not None), open_count==1, and leaves the aiosqlite worker
+        thread stranded (result is not None, open_count != 0 → RED).
+
+        Post-fix: `if self._closed: await conn.close(); return None` after
+        aiosqlite.connect() → result is None, open_count==0, and the
+        mid-flight connection is closed (use-after-close raises) → GREEN.
+        """
+        db_path = tmp_path / 'test.db'
+        sqlite3.connect(str(db_path)).close()
+
+        pool = DbPool()
+        real_connect = aiosqlite.connect
+        # Track every aiosqlite.Connection object opened inside the wrapper so
+        # we can verify the mid-flight connection was actually closed.
+        opened: list[aiosqlite.Connection] = []
+
+        # Two events for deterministic synchronisation:
+        #   inside_connect  — get() has entered aiosqlite.connect() (suspended)
+        #   close_done      — close_all() has completed
+        inside_connect = asyncio.Event()
+        close_done = asyncio.Event()
+
+        async def wrapper(*args, **kwargs):
+            inside_connect.set()          # signal: get() is now suspended mid-open
+            await close_done.wait()       # wait until close_all() has finished
+            conn = await real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        with patch('aiosqlite.connect', wrapper):
+            # Launch get() as a background task; it will suspend inside wrapper.
+            getter = asyncio.create_task(pool.get(db_path))
+
+            # Wait until get() is suspended inside aiosqlite.connect().
+            await asyncio.wait_for(inside_connect.wait(), timeout=2.0)
+
+            # close_all() runs now: sets _closed, drains _conns, clears
+            # _open_locks — it does NOT hold the per-path lock, so getter is
+            # still suspended in wrapper above.
+            await pool.close_all()
+
+            # Unblock get() so it can resume after aiosqlite.connect() returns.
+            close_done.set()
+
+            result = await asyncio.wait_for(getter, timeout=2.0)
+
+        # get() must return None — connection must NOT be installed post-close.
+        assert result is None, (
+            f'expected None (post-connect _closed re-check), got {result!r}'
+        )
+        # The pool must remain empty — no stranded connection.
+        assert pool.open_count == 0, (
+            f'expected open_count=0, got {pool.open_count}'
+        )
+        assert pool._conns == {}, f'_conns must be empty, got {pool._conns!r}'
+
+        # The mid-flight connection was physically opened (wrapper appended it).
+        assert len(opened) == 1, f'expected 1 opened connection, got {len(opened)}'
+
+        # The post-connect re-check must have CLOSED the mid-flight connection so
+        # its aiosqlite worker thread is not stranded.  Attempting to use the
+        # connection after close() raises (proving the leak is fixed).
+        with pytest.raises((ValueError, sqlite3.ProgrammingError, RuntimeError)):
+            async with opened[0].execute('SELECT 1'):
+                pass
+
 
 class TestWithDb:
     """Tests for the with_db helper."""
