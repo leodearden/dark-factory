@@ -82,7 +82,11 @@ async def read_cap_intervals(
         now: Reference instant for the look-back cutoff; defaults to
             ``datetime.now(UTC)``.  Pass an explicit timestamp to anchor the
             query to the same clock as the caller's other time computations
-            (e.g. ticket bounds in ``_sample_curator``).
+            (e.g. ticket bounds in ``_sample_curator``).  A naive datetime
+            (no ``tzinfo``) is normalized to UTC, matching the prevailing
+            convention in this codebase — the cutoff string will then carry
+            a ``+00:00`` suffix and compare correctly against the tz-aware
+            ISO strings stored in ``account_events.created_at``.
 
     Returns:
         Flat list of :class:`CapInterval` objects across all DBs, unordered.
@@ -90,6 +94,8 @@ async def read_cap_intervals(
     if days <= 0:
         raise ValueError("days must be positive")
     effective_now = now if now is not None else datetime.now(UTC)
+    if effective_now.tzinfo is None:
+        effective_now = effective_now.replace(tzinfo=UTC)
     cutoff = (effective_now - timedelta(days=days)).isoformat()
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
