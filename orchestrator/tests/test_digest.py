@@ -307,6 +307,27 @@ class TestCountDoneInWindow:
         )
         assert count == 0, f"Expected 0 for empty window; got {count}"
 
+    def test_relative_path_resolves_to_absolute(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Relative path with existing DB resolves correctly — no WARNING, correct count."""
+        db_path = tmp_path / 'events.db'
+        _seed_events_db_direct(db_path)
+        monkeypatch.chdir(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
+            count = digest.count_done_in_window(
+                Path('events.db'),
+                '2026-05-10T00:00:00+00:00',
+                '2026-05-10T23:59:59+00:00',
+            )
+        assert count == 2, f"Expected 2 done in window via relative path; got {count}"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
+        assert not warnings, f"Relative path with existing DB must not WARNING; got: {[r.message for r in warnings]}"
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for async CostStore tests
