@@ -324,6 +324,7 @@ def test_elapsed_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
         return _make_systemctl_show_result("5000000", rc=0)
 
     def fake_clock_gettime(clk_id):  # noqa: ANN001
+        assert clk_id == wdog.time.CLOCK_MONOTONIC
         return 305.0
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -407,6 +408,37 @@ def test_elapsed_empty_stdout_returns_none(monkeypatch: pytest.MonkeyPatch) -> N
 
     def fake_run(cmd, **kwargs):  # noqa: ANN001
         return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_systemctl_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when the systemctl call times out.
+
+    subprocess.TimeoutExpired from the timeout=5 call is the most likely real-world
+    failure mode (systemctl hung).  The outer except Exception guard must convert it
+    to None so callers treat the grace window as not applicable and proceed to probe.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_systemctl_not_found_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when systemctl binary is not found.
+
+    FileNotFoundError (systemctl absent) must be absorbed by the outer except
+    Exception guard and converted to None so callers proceed to probe normally.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert wdog._unit_start_elapsed_secs("some.service") is None
