@@ -2538,6 +2538,59 @@ class TestSearchMem0Filtering:
         assert len(results) == 1, 'Non-planned result must NOT be excluded'
 
 
+class TestSearchMem0CreatedAt:
+    """step-1 (task-1369): _search_mem0 propagates Mem0 server-stamped created_at to MemoryResult."""
+
+    @pytest.mark.asyncio
+    async def test_created_at_populated_from_top_level_field(self, service):
+        """When mem0.search returns a result with top-level created_at, MemoryResult.created_at is set."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm1',
+                    'memory': 'x',
+                    'score': 0.9,
+                    'created_at': '2026-05-15T10:00:00+00:00',
+                    'metadata': {'category': 'observations_and_summaries'},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('x', scope, 10)
+
+        assert len(results) == 1
+        assert results[0].created_at == '2026-05-15T10:00:00+00:00', (
+            'MemoryResult.created_at must be populated from the Mem0 top-level created_at field'
+        )
+
+    @pytest.mark.asyncio
+    async def test_created_at_is_none_when_key_absent(self, service):
+        """When mem0.search returns a result without created_at, MemoryResult.created_at is None."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm2',
+                    'memory': 'y',
+                    'score': 0.8,
+                    'metadata': {'category': 'observations_and_summaries'},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('y', scope, 10)
+
+        assert len(results) == 1
+        assert results[0].created_at is None, (
+            'MemoryResult.created_at must be None when created_at is absent in the Mem0 result'
+        )
+
+
 class TestSearchIncludePlannedPassthrough:
     """step-17: MemoryService.search passes include_planned to _search_graphiti and _search_mem0."""
 
