@@ -12,6 +12,7 @@ import subprocess
 import types
 
 import pytest
+import yaml
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
@@ -116,6 +117,58 @@ def test_probe_port_returns_true_on_ss_error(monkeypatch: pytest.MonkeyPatch) ->
     assert len(log_messages) >= 1, "probe_port must log a diagnostic when ss fails"
 
 
+def test_probe_port_returns_true_on_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_port must return True when ss binary is not found (FileNotFoundError).
+
+    If ss is absent (e.g. minimal container image), a FileNotFoundError must not
+    propagate — the safe default is True so the unit is not spuriously restarted.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[0] == "ss":
+            raise FileNotFoundError(2, "No such file or directory", "ss")
+        # systemd-cat call from log()
+        log_messages.append(str(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog.probe_port(8102)
+
+    assert result is True, (
+        "probe_port must return True when ss binary is missing "
+        "so a missing tool does not trigger a spurious restart"
+    )
+    assert len(log_messages) >= 1, "probe_port must log a diagnostic when ss is not found"
+
+
+def test_probe_port_returns_true_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_port must return True when the ss call exceeds its timeout.
+
+    A slow probe (subprocess.TimeoutExpired) must be treated as a tooling failure
+    and must not be misinterpreted as 'port down'.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[0] == "ss":
+            raise subprocess.TimeoutExpired(cmd, 5)
+        # systemd-cat call from log()
+        log_messages.append(str(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog.probe_port(8102)
+
+    assert result is True, (
+        "probe_port must return True when ss times out "
+        "so a slow probe does not trigger a spurious restart"
+    )
+    assert len(log_messages) >= 1, "probe_port must log a diagnostic when ss times out"
+
+
 # ---------------------------------------------------------------------------
 # restart_unit tests
 # ---------------------------------------------------------------------------
@@ -216,6 +269,219 @@ def test_restart_unit_handles_start_timeout(monkeypatch: pytest.MonkeyPatch) -> 
     wdog.restart_unit("dark-factory-orchestrator.service")
 
     assert len(log_messages) >= 1, "start timeout must be logged via log()"
+
+
+def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """restart_unit must not raise if systemctl reset-failed times out.
+
+    After a reset-failed timeout the start call must still execute so the
+    unit is not left in a permanently-down state (docstring: "remaining
+    phases still execute").
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "reset-failed"]:
+            raise subprocess.TimeoutExpired(cmd, 10)
+        if cmd[0] == "systemd-cat":
+            log_messages.append(" ".join(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Must not raise
+    wdog.restart_unit("dark-factory-orchestrator.service")
+
+    systemctl_cmds = [c for c in calls if c[0] == "systemctl"]
+    verbs = [c[2] for c in systemctl_cmds]
+    assert "start" in verbs, "start must be called even after reset-failed timeout"
+    assert len(log_messages) >= 1, "reset-failed timeout must be logged via log()"
+
+
+# ---------------------------------------------------------------------------
+# _unit_start_elapsed_secs direct tests
+# ---------------------------------------------------------------------------
+
+
+def _make_systemctl_show_result(value: str, rc: int = 0) -> subprocess.CompletedProcess:
+    """Build a fake systemctl show CompletedProcess with the given property value."""
+    stdout = f"ExecMainStartTimestampMonotonic={value}\n"
+    return subprocess.CompletedProcess(["systemctl"], rc, stdout=stdout, stderr="")
+
+
+def test_elapsed_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns correct elapsed seconds on the happy path.
+
+    start=5_000_000 us (= 5.0 s), clock_gettime→305.0 s → elapsed = 300.0 s.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("5000000", rc=0)
+
+    def fake_clock_gettime(clk_id):  # noqa: ANN001
+        assert clk_id == wdog.time.CLOCK_MONOTONIC
+        return 305.0
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "clock_gettime", fake_clock_gettime)
+
+    result = wdog._unit_start_elapsed_secs("some.service")
+    assert result == pytest.approx(300.0)
+
+
+def test_elapsed_nonzero_rc_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when systemctl exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("5000000", rc=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_unparseable_value_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when the property value is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("notanint", rc=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_zero_sentinel_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None for the zero sentinel (unit never started)."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("0", rc=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_clock_failure_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when clock_gettime raises OSError."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("5000000", rc=0)
+
+    def fake_clock_gettime(clk_id):  # noqa: ANN001
+        raise OSError("clock unavailable")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "clock_gettime", fake_clock_gettime)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_clamp_future_start_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs clamps to 0.0 when start_us/1e6 > now (max(0,…))."""
+    wdog = _load_watchdog()
+
+    # start is in the future relative to now (clock drift or negative elapsed)
+    start_us = int(310.0 * 1_000_000)  # 310 s
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result(str(start_us), rc=0)
+
+    def fake_clock_gettime(clk_id):  # noqa: ANN001
+        return 305.0  # now is BEFORE start → elapsed would be negative
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "clock_gettime", fake_clock_gettime)
+
+    result = wdog._unit_start_elapsed_secs("some.service")
+    assert result == pytest.approx(0.0)
+
+
+def test_elapsed_empty_stdout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when stdout has no '=' line."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_systemctl_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when the systemctl call times out.
+
+    subprocess.TimeoutExpired from the timeout=5 call is the most likely real-world
+    failure mode (systemctl hung).  The outer except Exception guard must convert it
+    to None so callers treat the grace window as not applicable and proceed to probe.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_systemctl_not_found_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when systemctl binary is not found.
+
+    FileNotFoundError (systemctl absent) must be absorbed by the outer except
+    Exception guard and converted to None so callers proceed to probe normally.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+# ---------------------------------------------------------------------------
+# Config-drift guard test
+# ---------------------------------------------------------------------------
+
+
+def test_watched_ports_match_configured_escalation_ports() -> None:
+    """WATCHED ports must equal the escalation.port values in each orchestrator's config.
+
+    This is a behavioral drift guard: it passes when the ports are aligned and
+    fails if WATCHED or either config file drifts to a different port number.
+    The reify config is skipped gracefully if it is not reachable (e.g. CI).
+    """
+    wdog = _load_watchdog()
+
+    # Build a unit→port map from WATCHED for convenient lookup
+    unit_to_port = {unit: port for port, unit in wdog.WATCHED}
+
+    # --- dark-factory orchestrator ---
+    df_config_path = REPO_ROOT / "orchestrator" / "config.yaml"
+    df_cfg = yaml.safe_load(df_config_path.read_text())
+    df_port = df_cfg["escalation"]["port"]
+    assert unit_to_port["dark-factory-orchestrator.service"] == df_port, (
+        f"WATCHED port for dark-factory-orchestrator.service "
+        f"({unit_to_port['dark-factory-orchestrator.service']}) != "
+        f"orchestrator/config.yaml escalation.port ({df_port})"
+    )
+
+    # --- reify orchestrator (skip if absent in this environment) ---
+    reify_config_path = pathlib.Path("/home/leo/src/reify/orchestrator.yaml")
+    if not reify_config_path.exists():
+        pytest.skip("reify orchestrator.yaml not reachable in this environment")
+    reify_cfg = yaml.safe_load(reify_config_path.read_text())
+    reify_port = reify_cfg["escalation"]["port"]
+    assert unit_to_port["reify-orchestrator.service"] == reify_port, (
+        f"WATCHED port for reify-orchestrator.service "
+        f"({unit_to_port['reify-orchestrator.service']}) != "
+        f"reify/orchestrator.yaml escalation.port ({reify_port})"
+    )
 
 
 # ---------------------------------------------------------------------------

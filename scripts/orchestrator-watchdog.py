@@ -12,10 +12,11 @@ scripts/orchestrator-watchdog.timer).
 """
 
 import subprocess
+import time
 
-# (port, systemd unit name) pairs to watch.  Port order matches the
-# config files: dark-factory=8102 (orchestrator/config.yaml:38),
-# reify=8100 (/home/leo/src/reify/orchestrator.yaml:87).
+# (port, systemd unit name) pairs to watch.  Port values match each
+# orchestrator's configured escalation.port (guarded by the drift test in
+# tests/scripts/test_orchestrator_watchdog.py).
 WATCHED = [
     (8102, "dark-factory-orchestrator.service"),
     (8100, "reify-orchestrator.service"),
@@ -54,17 +55,27 @@ def probe_port(port: int) -> bool:
     peer ``0.0.0.0:*`` field is harmlessly skipped (``int('*')`` raises
     ValueError).
 
-    If ``ss`` exits non-zero (binary missing, permission issue, or
-    filter-syntax difference across iproute2 versions), a diagnostic is logged
-    and True is returned so a tooling failure is not misinterpreted as the
-    port being down, which would trigger a spurious restart on a healthy unit.
+    If ``ss`` exits non-zero (permission issue or filter-syntax difference
+    across iproute2 versions), a diagnostic is logged and True is returned.
+    If ``ss`` is not installed (FileNotFoundError) or the probe exceeds its
+    5-second timeout (subprocess.TimeoutExpired), the exception is caught,
+    a diagnostic is logged, and True is returned.  In all error cases the
+    safe default is True — a tooling failure must not trigger a spurious
+    restart on a healthy unit.
     """
-    result = subprocess.run(
-        ["ss", "-ltn", f"sport = :{port}"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    try:
+        result = subprocess.run(
+            ["ss", "-ltn", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log(
+            f"ss probe for port {port} could not complete ({type(exc).__name__}); "
+            "assuming port is up to avoid a false restart"
+        )
+        return True
     if result.returncode != 0:
         log(
             f"ss probe for port {port} exited with code {result.returncode}; "
@@ -109,9 +120,12 @@ def restart_unit(unit: str) -> None:
 
     # Always run reset-failed regardless of stop outcome so a rate-limited unit
     # (StartLimitBurst exhausted) can be recovered even after the timeout path.
-    subprocess.run(
-        ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
-    )
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        log(f"systemctl reset-failed {unit} timed out after 10s")
 
     try:
         subprocess.run(
@@ -121,20 +135,14 @@ def restart_unit(unit: str) -> None:
         log(f"systemctl start {unit} timed out after 45s")
 
 
-def _read_uptime_secs() -> float | None:
-    """Return current system uptime in seconds from /proc/uptime, or None."""
-    try:
-        with open("/proc/uptime") as f:
-            return float(f.read().split()[0])
-    except OSError:
-        return None
-
-
 def _unit_start_elapsed_secs(unit: str) -> float | None:
     """Seconds since *unit*'s main process started (monotonic clock), or None.
 
     Queries ``ExecMainStartTimestampMonotonic`` (microseconds since boot) via
-    ``systemctl --user show`` and compares it against ``/proc/uptime``.
+    ``systemctl --user show`` and compares it against
+    ``time.clock_gettime(time.CLOCK_MONOTONIC)`` — the same CLOCK_MONOTONIC
+    source systemd uses — so a host suspend no longer skews the elapsed
+    estimate (unlike /proc/uptime which advances during suspend).
 
     Returns None if the unit has no recorded start time, the value cannot be
     parsed, or any subprocess/OS error occurs — callers must treat None as
@@ -165,8 +173,9 @@ def _unit_start_elapsed_secs(unit: str) -> float | None:
                 return None
             if start_mono_us == 0:
                 return None  # unit has never started (or no PID recorded)
-            now_secs = _read_uptime_secs()
-            if now_secs is None:
+            try:
+                now_secs = time.clock_gettime(time.CLOCK_MONOTONIC)
+            except OSError:
                 return None
             return max(0.0, now_secs - start_mono_us / 1_000_000)
         return None
