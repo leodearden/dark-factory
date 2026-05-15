@@ -469,3 +469,51 @@ class TestHarnessCostCeiling:
 
         result = await harness._trailing_24h_cost_usd(watcher_only=False)
         assert result == 0.0, f'Expected 0.0 for empty table; got {result!r}'
+
+    # ------------------------------------------------------------------
+    # Step 5 — _trailing_24h_cost_usd(watcher_only=True) role filter
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_trailing_24h_cost_usd_watcher_only_filters_role(
+        self, tmp_path: Path
+    ) -> None:
+        """watcher_only=True sums only rows with role matching '%watcher%'.
+
+        Seeds:
+          - role='escalation-watcher-auto'  cost=7.0  (within window) — INCLUDED
+          - role='terminal-status-watcher'  cost=3.0  (within window) — INCLUDED
+          - role='orchestrator'             cost=20.0 (within window) — EXCLUDED
+          - role='steward'                  cost=15.0 (within window) — EXCLUDED
+        Expects watcher_only=True → 10.0; watcher_only=False → 45.0.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        rows = [
+            ('escalation-watcher-auto', 7.0),
+            ('terminal-status-watcher', 3.0),
+            ('orchestrator', 20.0),
+            ('steward', 15.0),
+        ]
+        for i, (role, cost) in enumerate(rows):
+            await store.save_invocation(
+                run_id=f'r{i}', task_id=f't{i}', project_id='dark_factory',
+                account_name='acct', model='sonnet', role=role,
+                cost_usd=cost, input_tokens=None, output_tokens=None,
+                cache_read_tokens=None, cache_create_tokens=None,
+                duration_ms=100, capped=False,
+                started_at=_iso(timedelta(hours=-(i + 1))),
+                completed_at=_iso(timedelta(hours=-(i + 1))),
+            )
+
+        watcher_sum = await harness._trailing_24h_cost_usd(watcher_only=True)
+        assert watcher_sum == pytest.approx(10.0), (
+            f'Expected 7.0+3.0=10.0 for watcher_only=True; got {watcher_sum!r}'
+        )
+
+        total_sum = await harness._trailing_24h_cost_usd(watcher_only=False)
+        assert total_sum == pytest.approx(45.0), (
+            f'Expected 45.0 for watcher_only=False; got {total_sum!r}'
+        )
