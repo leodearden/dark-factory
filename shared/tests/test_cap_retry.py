@@ -1652,10 +1652,13 @@ class TestCapRetrySanityGuardLogging:
         assert len(error_msgs) >= 1
 
     async def test_error_log_includes_label_on_sanity_raise(self, caplog):
-        """logger.error includes label and elapsed time on sanity-bound raise.
+        """logger.error includes elapsed-time diagnostic info on sanity-bound raise.
 
-        Distinct from test_error_logged_before_sanity_raise: verifies the label
-        is present in the error message. Both tests exercise the sanity-bound raise.
+        Distinct from test_error_logged_before_sanity_raise (which checks label +
+        level): this test verifies that the error message body contains the
+        elapsed-time diagnostic (e.g. '4000.0s') produced by
+        ``_check_cap_wait``'s format string
+        ``'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s ...'``.
         """
         gate = _mock_gate(
             account_count=1,
@@ -1664,7 +1667,7 @@ class TestCapRetrySanityGuardLogging:
             active_account_name='acct',
         )
         result = make_result()
-        # First call → 0.0, all subsequent → 4000.0
+        # First call → 0.0, all subsequent → 4000.0 → elapsed = 4000.0s
         monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
@@ -1682,8 +1685,9 @@ class TestCapRetrySanityGuardLogging:
             )
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
-        assert any('deadline-label' in m for m in error_msgs), (
-            f'Error log should include label. Got: {error_msgs}'
+        # Verify the diagnostic elapsed-time content (not just the label):
+        assert any('4000.0s' in m for m in error_msgs), (
+            f'Error log should include elapsed time (4000.0s). Got: {error_msgs}'
         )
 
 
