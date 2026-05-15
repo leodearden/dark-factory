@@ -13,7 +13,8 @@ the shared-helper requirement.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Iterable
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 from orchestrator.agents.triage import sha256_16
 

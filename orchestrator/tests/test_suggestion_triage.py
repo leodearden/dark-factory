@@ -206,8 +206,9 @@ class TestEscalateSuggestionsCharacterization:
 
     def test_workflow_module_imports_shared_helper(self):
         """workflow.py must import review_suggestion_payload_hash from the shared module."""
-        import orchestrator.workflow as wf_module
         import inspect
+
+        import orchestrator.workflow as wf_module
 
         src = inspect.getsource(wf_module)
         assert 'from orchestrator.review_suggestions.dedup import' in src, (
@@ -301,7 +302,7 @@ class TestRouteReviewSuggestionsToCurator:
         content_hash = review_suggestion_payload_hash(suggestions)
         task_id = wf.task_id
 
-        for i, (body, suggestion) in enumerate(zip(posted_bodies, suggestions)):
+        for _i, (body, suggestion) in enumerate(zip(posted_bodies, suggestions, strict=True)):
             assert body['method'] == 'tools/call'
             params = body['params']
             assert params['name'] == 'submit_task'
