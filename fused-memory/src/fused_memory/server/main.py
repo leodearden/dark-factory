@@ -818,10 +818,13 @@ def _snapshot_threads() -> dict[str, int]:
     Buckets:
       - ``main``        — the MainThread
       - ``asyncio_pool`` — asyncio loop-internal workers (names start with
-                           ``asyncio_``; CPython names these ``asyncio_N``)
-      - ``executor``    — :class:`concurrent.futures.ThreadPoolExecutor` workers
-                           (names start with ``ThreadPoolExecutor``; includes
-                           asyncio's default executor on Python ≥ 3.9)
+                           ``asyncio_``; since CPython 3.9 asyncio's default
+                           :class:`~concurrent.futures.ThreadPoolExecutor` uses
+                           ``thread_name_prefix='asyncio'``, so its workers are
+                           counted here, not in ``executor``)
+      - ``executor``    — user-created :class:`concurrent.futures.ThreadPoolExecutor`
+                           workers that retain the default ``'ThreadPoolExecutor'``
+                           thread name prefix (names start with ``ThreadPoolExecutor``)
       - ``aiosqlite``   — aiosqlite connection worker threads (name starts with
                            ``aiosqlite``)
       - ``timer``       — :class:`threading.Timer` instances (short-lived)
