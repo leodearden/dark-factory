@@ -580,8 +580,8 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     """
     from unittest.mock import AsyncMock, patch
 
-    empty_5tuple = ([], [], [], {}, [])
-    with patch('dashboard.app.collect_scheduler_state', new=AsyncMock(return_value=empty_5tuple)):
+    empty_6tuple = ([], [], [], {}, [], [])
+    with patch('dashboard.app.collect_scheduler_state', new=AsyncMock(return_value=empty_6tuple)):
         resp = client.get('/api/v2/dashboard/scheduler')
 
     assert resp.status_code == 200
@@ -595,6 +595,8 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert 'snapshot_at' in inner
     assert 'offline' in inner
     assert 'offline_projects' in inner
+    assert 'paused' in inner
+    assert 'paused_projects' in inner
     # Pin empty-state values so a future shape change doesn't silently regress
     assert inner['offline'] is False
     assert inner['rows'] == []
@@ -603,6 +605,8 @@ def test_scheduler_endpoint_returns_envelope_shape(client):
     assert inner['events_by_task'] == {}
     assert inner['snapshot_at'] is None
     assert inner['offline_projects'] == []
+    assert inner['paused'] is False
+    assert inner['paused_projects'] == []
 
 
 # ---------------------------------------------------------------------------
