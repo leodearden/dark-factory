@@ -258,9 +258,10 @@ Do NOT delete the flag before acting — deletion is the acknowledgement that th
 flag has been processed.
 
 **Important — the flag list is already run-scoped.** The Python layer partitions \
-`flag_for_stage2` markers by `metadata.run_id` before assembling this payload: only \
-markers whose `run_id` matches the current reconciliation run appear in the \
-"Stage 1 Flagged Items" section above. Any markers left over from prior cycles that \
+`flag_for_stage2` markers before assembling this payload: markers whose `run_id` \
+matches the current reconciliation run, AND markers written during the current run \
+window (even if `run_id` was omitted by the Stage 1 producer), appear in the \
+"Stage 1 Flagged Items" section above. Any markers from prior cycles that \
 failed FIX C deletion are swept automatically by Python (their count is recorded in \
 `stats.stale_fixc_markers_swept`). You do NOT need to search for, re-process, or \
 count prior-cycle markers — every flag in this section is current-cycle and is your \

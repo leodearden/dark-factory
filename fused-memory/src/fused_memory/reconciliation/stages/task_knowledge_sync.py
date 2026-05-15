@@ -1053,12 +1053,20 @@ class TaskKnowledgeSync(BaseStage):
     # current assemble_payload() call (task 1224).  Reset to 0 at the top of
     # run() so cross-invocation contamination is impossible.  Written to
     # report.stats['stale_fixc_markers_swept'] after super().run() returns.
+    # Note (task-1369): same-run in-window markers with absent/mismatched run_id
+    # are rescued to partition.current by the run-window guard in
+    # _query_stage2_flags and therefore NEVER enter the stale buckets — this
+    # counter reflects only genuine prior-cycle residue.
     _stale_fixc_markers_swept: int = 0
 
-    # Count of Stage 2 markers with absent/empty metadata.run_id observed during
-    # the current assemble_payload() call (task 1257).  Non-zero indicates Stage 1
-    # producer drift — the LLM omitted the required run_id field.  Reset and
-    # injected via the same four-touchpoint pattern as _stale_fixc_markers_swept.
+    # Count of Stage 2 markers with absent/empty metadata.run_id that were routed
+    # to the stale_missing_run_id bucket in the current assemble_payload() call
+    # (task 1257).  Non-zero indicates Stage 1 producer drift from a PRIOR cycle —
+    # the LLM omitted the required run_id field.  Reset and injected via the same
+    # four-touchpoint pattern as _stale_fixc_markers_swept.
+    # Note (task-1369): same-cycle markers with absent run_id whose Mem0 created_at
+    # is within the current run window are rescued to partition.current by
+    # _query_stage2_flags and are NOT counted here.
     _stale_missing_run_id_markers: int = 0
 
     # Set to True by assemble_payload() when the autopilot_video contamination
@@ -1534,10 +1542,13 @@ class TaskKnowledgeSync(BaseStage):
         # FIX A — merge Mem0 active-query flags into the flagged section.
         # _query_stage2_flags is best-effort: search failures yield ([], [], []) internally.
         # Returns a Stage2FlagPartition with three fields:
-        #   .current          — markers matching the current run_id (rendered to LLM)
-        #   .stale_missing_run_id_ids  — markers with absent/empty run_id (producer drift)
-        #   .stale_mismatched_run_id_ids — markers with wrong run_id (prior-cycle residue)
-        # Both stale buckets are swept below so they are never rendered to the LLM.
+        #   .current          — markers whose run_id matches the current run, OR whose
+        #                       Mem0 created_at is within the run window (task-1369 guard)
+        #   .stale_missing_run_id_ids  — prior-cycle markers with absent/empty run_id
+        #   .stale_mismatched_run_id_ids — prior-cycle markers with wrong run_id
+        # Both stale buckets contain only genuine prior-cycle residue (in-window same-
+        # cycle markers are rescued to .current by the run-window guard) and are swept
+        # below so they are never rendered to the LLM.
         #
         # Run-window guard (task-1369): fetch the run's started_at from the journal so
         # same-cycle Stage-1 markers whose run_id was omitted/mis-stamped by the LLM
