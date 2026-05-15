@@ -674,6 +674,35 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
+    # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
+    # windows with rotation, exponential backoff, and a crashloop→pause_scheduler
+    # guard.  The supervisor restarts the agent after each clean rotation exit
+    # (agent self-exits after ROTATION_ESCALATIONS or ROTATION_HOURS) with no
+    # backoff.  Unclean exits (crash, timeout-kill) incur exponential backoff.
+    # When ≥watcher_max_crashloop_restarts unclean exits occur within
+    # watcher_crashloop_window_secs, pause_scheduler('watcher_crashloop') is
+    # called and the supervisor stops.
+    #
+    # Sibling tasks: 1321 (L1 persistence), 1322 (park-and-stop),
+    # 1323 (cost-ceiling), 1325 (unblock-auto), 1327 (EWA digest).
+    watcher_supervisor_enabled: bool = Field(default=True)
+    watcher_subprocess_restart_backoff_secs: float = Field(default=30.0)
+    watcher_rotation_escalations: int = Field(default=50)
+    watcher_rotation_hours: float = Field(default=4.0)
+    watcher_max_crashloop_restarts: int = Field(default=5)
+    watcher_crashloop_window_secs: int = Field(default=600)
+
+    # Invocation knobs for each watcher rotation (per UnblockAutoConfig precedent).
+    # watcher_rotation_budget_usd is sized for a full 4h rotation at opus rates;
+    # using invoke_agent's default $5 would exhaust within minutes and falsely
+    # trip the crashloop guard.
+    watcher_model: str = Field(default='opus')
+    watcher_rotation_budget_usd: float = Field(default=40.0)
+    watcher_max_turns: int = Field(default=400)
+    watcher_effort: str = Field(default='high')
+    watcher_backend: str = Field(default='claude')
+
     # Legacy scalar — ignored if `timeouts` section is present in config.
     # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)

@@ -256,3 +256,44 @@ usage_cap:
 park_stop_enabled: true
 park_stop_parked_threshold: 5
 park_stop_parked_window_hours: 1.0
+
+# Escalation-watcher subprocess supervisor (AFK hardening, task 1326)
+#
+# An orchestrator-managed asyncio supervisor that keeps a fresh
+# escalation-watcher-auto agent alive across multi-day AFK windows.
+# The agent self-exits cleanly after ROTATION_ESCALATIONS or ROTATION_HOURS,
+# then the supervisor restarts it immediately (clean → no backoff).
+# Unclean exits (crash or timeout-kill) use exponential backoff.
+# When ≥watcher_max_crashloop_restarts unclean exits occur within
+# watcher_crashloop_window_secs the supervisor calls pause_scheduler
+# with reason='watcher_crashloop' and stops.
+#
+# watcher_supervisor_enabled: set false to disable entirely (default true).
+# watcher_subprocess_restart_backoff_secs: base backoff (s) on first unclean
+#   exit; doubles on each consecutive unclean exit (default 30).
+# watcher_rotation_escalations: agent self-exits after N escalations (default 50).
+# watcher_rotation_hours: agent self-exits after M hours (default 4.0).
+# watcher_max_crashloop_restarts: unclean exits within the window to trip
+#   the crashloop guard (default 5).
+# watcher_crashloop_window_secs: rolling window (s) for the crashloop counter
+#   (default 600 = 10 min).
+#
+# Invocation knobs (per rotation):
+# watcher_model: LLM backend model (default 'opus').
+# watcher_rotation_budget_usd: per-rotation budget ($); must be sized for a
+#   full rotation — invoke_agent default $5 would exhaust within minutes of a
+#   4h rotation and falsely trip the crashloop guard (default 40.0).
+# watcher_max_turns: max agent turns per rotation (default 400).
+# watcher_effort: effort level for the agent (default 'high').
+# watcher_backend: backend provider (default 'claude').
+watcher_supervisor_enabled: true
+watcher_subprocess_restart_backoff_secs: 30
+watcher_rotation_escalations: 50
+watcher_rotation_hours: 4.0
+watcher_max_crashloop_restarts: 5
+watcher_crashloop_window_secs: 600
+watcher_model: opus
+watcher_rotation_budget_usd: 40.0
+watcher_max_turns: 400
+watcher_effort: high
+watcher_backend: claude
