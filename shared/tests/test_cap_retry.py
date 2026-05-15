@@ -498,10 +498,11 @@ class TestCapRetryResume:
     async def test_cap_wait_log_survives_non_serializable_soonest_resets_at(self):
         """invoke_with_cap_retry completes when soonest_resets_at is non-JSON-serializable.
 
-        Regression guard for the json.dumps call in _check_cap_wait
-        (cli_invoke.py:405).  With soonest_resets_at=MagicMock() the
-        conditional ``usage_gate.soonest_resets_at.isoformat()`` branch is
-        taken; before the default=str hardening this raised:
+        Regression guard for the json.dumps call inside _check_cap_wait
+        (called from invoke_with_cap_retry on the cap-hit retry path).
+        With soonest_resets_at=MagicMock() the conditional
+        ``usage_gate.soonest_resets_at.isoformat()`` branch is taken;
+        before the default=str hardening this raised:
           TypeError: Object of type MagicMock is not JSON serializable
         and aborted invoke_with_cap_retry.  After the fix the log call
         must be a no-op for control flow.
