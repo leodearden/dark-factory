@@ -57,10 +57,17 @@ class DbPool:
             # Re-check after acquiring: a racing coroutine may have opened it.
             if resolved in self._conns:
                 return self._conns[resolved]
-            # Refuse to open new connections once close_all() has been called.
-            # Fully aligns with SqliteTaskBackend._get_connection _closed convention:
-            # a concurrent get() that is mid-open when close_all() runs will see
-            # this flag after acquiring the per-path lock and abort cleanly.
+            # Two _closed guards are needed:
+            # (a) Pre-connect fast-abort — if close_all() already finished before
+            #     we acquired this lock, exit immediately without touching aiosqlite.
+            # (b) Post-connect re-check — close_all() does NOT hold the per-path
+            #     lock, so it can run to completion while this coroutine is
+            #     suspended inside `await aiosqlite.connect()`.  Without (b), the
+            #     resumed get() would install a fresh connection into an already-
+            #     drained pool, leaking the aiosqlite worker thread indefinitely.
+            #     DbPool closes that window here; note the mirrored
+            #     SqliteTaskBackend._get_connection convention has the same window
+            #     (not closed there — callers must not race close and get).
             if self._closed:
                 return None
             try:
@@ -71,6 +78,14 @@ class DbPool:
                     f'{resolved.as_uri()}?mode=ro',
                     uri=True,
                 )
+                # (b) Post-connect re-check: close_all() may have completed while
+                # we were suspended inside aiosqlite.connect() above.
+                if self._closed:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        logger.debug('DbPool: error closing mid-open conn after pool closed', exc_info=True)
+                    return None
                 conn.row_factory = aiosqlite.Row
                 self._conns[resolved] = conn
                 return conn
