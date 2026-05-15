@@ -417,3 +417,26 @@ async def test_get_task_failure_falls_back_to_in_memory_metadata_and_warns(
     ), (
         f'Expected warning about get_task refresh failure; got: {warning_texts}'
     )
+
+
+@pytest.mark.asyncio
+async def test_backend_wins_on_collision(tmp_path: Path):
+    """When the same key exists in both in-memory and backend metadata,
+    the backend value wins.
+
+    This pins the merge direction: {**in_memory, **backend}.  A one-character
+    inversion to {**backend, **in_memory} would silently flip this contract.
+    """
+    f = _make(
+        project_root=tmp_path,
+        main_sha='SHA-A',
+        metadata={'memory_hints': {'entities': ['OLD']}},
+        backend_metadata={'memory_hints': {'entities': ['NEW']}},
+    )
+
+    await f.wf._handle_no_plan_failure('no plan', detail='')
+
+    persisted = _persisted_metadata(f.update_task)
+    assert persisted.get('memory_hints') == {'entities': ['NEW']}, (
+        f'Backend value must win on collision; got {persisted.get("memory_hints")!r}'
+    )
