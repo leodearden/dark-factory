@@ -217,6 +217,7 @@ def _make_gate_yielding(slots):
     gate.before_invoke = AsyncMock(return_value=slots[0].token)
     gate.on_agent_complete = MagicMock()
     gate.confirm_account_ok = MagicMock()
+    gate.soonest_resets_at = None
     return gate
 
 
@@ -1648,6 +1649,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
@@ -1671,6 +1673,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
@@ -1694,6 +1697,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
@@ -1718,6 +1722,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        gate.soonest_resets_at = None
         _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
@@ -1786,6 +1791,7 @@ class TestPreTriageUsageGateCleanup:
             if cap_effects is not None
             else MagicMock(return_value=False)
         )
+        gate.soonest_resets_at = None
         return _attach_invoke_slot(gate)
 
     async def test_confirm_account_ok_called_on_success(self, steward: TaskSteward):

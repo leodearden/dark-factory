@@ -495,6 +495,35 @@ class TestCapRetryResume:
         # Call 4: fresh again (no session_id on capped2) -> original
         assert mock_inv.call_args_list[3].kwargs.get('prompt') == 'my original prompt'
 
+    async def test_cap_wait_log_survives_non_serializable_soonest_resets_at(self):
+        """invoke_with_cap_retry completes when soonest_resets_at is non-JSON-serializable.
+
+        Regression guard for the json.dumps call inside _check_cap_wait
+        (called from invoke_with_cap_retry on the cap-hit retry path).
+        With soonest_resets_at=MagicMock() the conditional
+        ``usage_gate.soonest_resets_at.isoformat()`` branch is taken;
+        before the default=str hardening this raised:
+          TypeError: Object of type MagicMock is not JSON serializable
+        and aborted invoke_with_cap_retry.  After the fix the log call
+        must be a no-op for control flow.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+            soonest_resets_at=MagicMock(),  # truthy + non-serializable
+        )
+        capped = make_result(session_id='')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='x')
+        assert mock_inv.await_count == 2
+        assert got.success
+
 
 # ===================================================================
 # TestCapRetryCooldown
