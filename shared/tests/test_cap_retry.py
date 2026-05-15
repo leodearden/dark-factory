@@ -166,6 +166,7 @@ def test_mock_gate_defaults_include_release_probe_slot():
 # Shared patch targets
 _INVOKE_PATCH = 'shared.cli_invoke.invoke_claude_agent'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
+_LOGGER_WARN_PATCH = 'shared.cli_invoke.logger.warning'
 
 
 # ===================================================================
@@ -528,14 +529,14 @@ class TestCapRetryResume:
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
-            patch('shared.cli_invoke.logger.warning') as mock_warn,
+            patch(_LOGGER_WARN_PATCH) as mock_warn,
         ):
             got = await invoke_with_cap_retry(gate, 'lbl', prompt='x')
         assert mock_inv.await_count == 2
         assert got.success
 
         # Collect all warning calls that decode to a JSON dict with event=='cap_wait'.
-        # The co-occurring plain-string warning at cli_invoke @509 is expected and
+        # The co-occurring plain-string cap-hit warning (non-JSON) is expected and
         # will not decode as JSON, so it is filtered out naturally.
         cap_wait_logs = []
         for c in mock_warn.call_args_list:
@@ -564,6 +565,17 @@ class TestCapRetryResume:
         assert isinstance(payload['soonest_open_at'], str), (
             "soonest_open_at must be a non-None str (MagicMock stringified via "
             "default=str); the .isoformat() branch was not taken or default=str missing"
+        )
+        assert payload['soonest_open_at'], (
+            "soonest_open_at must be non-empty; MagicMock stringified via default=str "
+            "cannot produce an empty string"
+        )
+        # Verify the remaining structured fields are present and numeric.
+        assert isinstance(payload.get('elapsed_s'), (int, float)), (
+            "elapsed_s must be a numeric value (round(elapsed, 1)) in the cap_wait payload"
+        )
+        assert isinstance(payload.get('next_probe_in_s'), (int, float)), (
+            "next_probe_in_s must be a numeric value (round(cooldown, 1)) in the cap_wait payload"
         )
 
 
