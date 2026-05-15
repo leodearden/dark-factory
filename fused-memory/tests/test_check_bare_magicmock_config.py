@@ -323,8 +323,8 @@ class TestFindViolationsOutputOrder:
         violations = find_violations(source, 'test_col_order.py')
         assert len(violations) == 2
         col_offsets = [v.col_offset for v in violations]
-        assert col_offsets == sorted(col_offsets), (
-            f'find_violations() must sort by col_offset within same line; got {col_offsets}'
+        assert col_offsets == [0, 9], (
+            f'find_violations() must sort by col_offset within same line; expected [0, 9], got {col_offsets}'
         )
 
 
