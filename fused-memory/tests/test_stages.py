@@ -3,7 +3,7 @@
 import json
 import logging
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -4751,6 +4751,106 @@ class TestQueryStage2Flags:
         assert partition.stale_mismatched_run_id_ids == []
 
     @pytest.mark.asyncio
+    async def test_clock_skew_grace_rescues_marker_just_before_window_start(self):
+        """Clock-skew grace: marker timestamped a few seconds before run_window_start is rescued.
+
+        The run_window_start is sourced from the orchestrator clock while created_at is
+        stamped by the Mem0 server.  A small negative inter-host skew can legitimately
+        produce created_at < run_window_start even for a same-cycle write.
+        _CLOCK_SKEW_GRACE (30 s) absorbs this: any marker within 30 s before the window
+        start is treated as in-window and routed to current rather than swept.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _CLOCK_SKEW_GRACE,
+            _query_stage2_flags,
+        )
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        # Marker written 10 s before run_window_start — within the 30 s grace window
+        skewed_created_at = (run_window_start - timedelta(seconds=10)).isoformat()
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'skewed-ts',
+                'same-cycle flag with clock skew',
+                {'flag_for_stage2': True, 'task_id': '5'},  # missing run_id
+                created_at=skewed_created_at,
+            ),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert any(f['id'] == 'skewed-ts' for f in partition.current), (
+            f'Marker written {int(_CLOCK_SKEW_GRACE.total_seconds())}s-grace before '
+            f'run_window_start must be rescued to current, but got: '
+            f'current={[f["id"] for f in partition.current]}, '
+            f'stale_missing={partition.stale_missing_run_id_ids}'
+        )
+        assert 'skewed-ts' not in partition.stale_missing_run_id_ids
+        assert 'skewed-ts' not in partition.stale_mismatched_run_id_ids
+
+    @pytest.mark.asyncio
+    async def test_marker_outside_grace_window_stays_stale(self):
+        """Marker written more than _CLOCK_SKEW_GRACE before run_window_start stays stale."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _CLOCK_SKEW_GRACE,
+            _query_stage2_flags,
+        )
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        # Marker written 60 s before run_window_start — outside the 30 s grace window
+        outside_created_at = (run_window_start - timedelta(seconds=60)).isoformat()
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'outside-grace',
+                'pre-window flag outside grace',
+                {'flag_for_stage2': True, 'task_id': '6'},  # missing run_id
+                created_at=outside_created_at,
+            ),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        assert 'outside-grace' in partition.stale_missing_run_id_ids, (
+            f'Marker {int(_CLOCK_SKEW_GRACE.total_seconds())+30}s before run_window_start '
+            f'must NOT be rescued (outside {int(_CLOCK_SKEW_GRACE.total_seconds())}s grace)'
+        )
+        assert not any(f['id'] == 'outside-grace' for f in partition.current)
+
+    @pytest.mark.asyncio
+    async def test_info_log_emitted_when_missing_run_id_marker_rescued(self, caplog):
+        """An INFO log is emitted when a missing-run_id marker is rescued by the run-window guard."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(
+                'rescued-missing',
+                'rescued same-cycle flag',
+                {'flag_for_stage2': True, 'task_id': '7'},  # no run_id
+                created_at='2026-05-15T10:00:05+00:00',  # in-window
+            ),
+        ]
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.reconciliation.stages.task_knowledge_sync'):
+            await _query_stage2_flags(
+                memory_service, 'reify', 'r-current', run_window_start=run_window_start
+            )
+
+        info_records = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'rescued' in r.getMessage().lower()
+        ]
+        assert info_records, (
+            'Expected an INFO log mentioning "rescued" when run-window guard rescues '
+            'a same-cycle missing-run_id marker'
+        )
+
+    @pytest.mark.asyncio
     async def test_partition_return_is_3_field_stage2flagpartition(self):
         """Return is still a 3-field Stage2FlagPartition with run_window_start active."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
@@ -6191,6 +6291,122 @@ class TestSameCycleSweepFix:
             'Control: without run-window guard, same-cycle missing-run_id marker IS swept'
         )
         assert report.stats.get('stale_fixc_markers_swept') == 2
+
+
+class TestRescuedInWindowMarkersStat:
+    """TaskKnowledgeSync.run() sets report.stats['rescued_in_window_markers'] (task-1369 amendment).
+
+    Non-zero when the run-window guard rescues same-cycle Stage-1 markers whose
+    run_id was omitted or mis-stamped.  Surfaced alongside stale_missing_run_id_markers
+    so operators can distinguish rescued (benign, processed) from genuinely stale
+    (swept, never reached Stage 2).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fake_cli_result(self):
+        return MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model', error=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_rescued_in_window_markers_count_nonzero_when_guard_fires(self, mock_deps):
+        """rescued_in_window_markers equals the number of same-cycle markers the guard rescued."""
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        T0 = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        mock_run = MagicMock()
+        mock_run.started_at = T0
+        mock_deps['journal'].get_run = AsyncMock(return_value=mock_run)
+
+        mock_deps['memory_service'].search.return_value = [
+            # Clean current marker (matching run_id) — should NOT be counted as rescued
+            SimpleNamespace(
+                id='current', content='current flag',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+                created_at=None,
+            ),
+            # Same-cycle marker — MISSING run_id, rescued by window guard
+            SimpleNamespace(
+                id='rescued-missing', content='rescued same-cycle flag missing run_id',
+                metadata={'flag_for_stage2': True, 'task_id': '2'},
+                created_at='2026-05-15T10:00:01+00:00',  # T0 + 1s, in-window
+            ),
+            # Prior-cycle residue — swept, NOT rescued
+            SimpleNamespace(
+                id='stale', content='prior-cycle flag',
+                metadata={'flag_for_stage2': True, 'task_id': '3', 'run_id': 'old-run'},
+                created_at='2026-05-15T09:00:00+00:00',  # T0 - 1h, out-of-window
+            ),
+        ]
+
+        watermark = Watermark(project_id='reify')
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=self._fake_cli_result())):
+            report = await stage.run(events=[], watermark=watermark, prior_reports=[],
+                                     run_id='test-run')
+
+        assert 'rescued_in_window_markers' in report.stats, (
+            "report.stats must contain 'rescued_in_window_markers' key (explicit zero required)"
+        )
+        assert report.stats['rescued_in_window_markers'] == 1, (
+            f"Expected 1 rescued marker, got {report.stats.get('rescued_in_window_markers')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rescued_in_window_markers_zero_when_no_rescue_fires(self, mock_deps):
+        """rescued_in_window_markers is 0 (explicit) when all active markers have matching run_id."""
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal down'))
+
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='clean', content='clean current',
+                metadata={'flag_for_stage2': True, 'task_id': '1', 'run_id': 'test-run'},
+                created_at=None,
+            ),
+        ]
+
+        watermark = Watermark(project_id='reify')
+        with patch('fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                   new=AsyncMock(return_value=self._fake_cli_result())):
+            report = await stage.run(events=[], watermark=watermark, prior_reports=[],
+                                     run_id='test-run')
+
+        assert 'rescued_in_window_markers' in report.stats
+        assert report.stats['rescued_in_window_markers'] == 0, (
+            'rescued_in_window_markers must be explicitly 0, not absent, when no rescue fires'
+        )
 
 
 class TestStage3PayloadIncludesProjectRoot:

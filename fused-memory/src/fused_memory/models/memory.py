@@ -36,7 +36,10 @@ class MemoryResult(BaseModel):
     temporal: dict | None = None  # {valid_at, invalid_at}
     entities: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
-    # Mem0 server-stamped write time (tz-aware UTC ISO string); None for Graphiti results.
+    # Mem0 server-stamped write time, passed through verbatim from the Mem0 search result.
+    # Typically an offset-aware ISO-8601 string (e.g. "2026-05-15T10:00:00+00:00"), but the
+    # UTC offset is not guaranteed — Mem0 may stamp in any offset or return a non-UTC value.
+    # None when the key is absent in the Mem0 response or for Graphiti-sourced results.
     created_at: str | None = None
 
 

@@ -10,7 +10,7 @@ import json
 import logging
 import sys
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -87,6 +87,16 @@ _KNOWN_BUG_1139_CONTENT_MARKERS: tuple[str, ...] = (
 # A flag that has survived this many Stage 2 cycles without being deleted is
 # considered stale and is surfaced in the payload for operator escalation.
 STAGE2_FLAG_PERSISTENCE_THRESHOLD: int = 3
+
+# Clock-skew grace period for the run-window guard in _marker_is_within_run_window.
+# run_window_start is sourced from the orchestrator clock (journal-persisted), while
+# created_at is stamped by the Mem0 server clock.  A small negative inter-host skew
+# would cause a legitimate same-cycle marker (created_at slightly before
+# run_window_start) to be misclassified as stale.  We absorb that risk by lowering
+# the effective threshold by this amount.  30 seconds covers typical NTP drift
+# between containers; the worst-case outcome of over-rescuing is one extra LLM render
+# of a marker that should wait — strictly safer than the underlying bug (deletion).
+_CLOCK_SKEW_GRACE: timedelta = timedelta(seconds=30)
 
 
 def _should_skip_known_bug_1139_flag(flag: dict) -> bool:
@@ -556,11 +566,25 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
 
     A marker is considered within the run window when *run_window_start* is a
     :class:`~datetime.datetime` instance AND *created_at* is a non-empty string
-    that parses as an ISO-8601 datetime that is >= *run_window_start*.
+    that parses as an ISO-8601 datetime that is >= *run_window_start* minus
+    :data:`_CLOCK_SKEW_GRACE` (30 s by default).
+
+    The grace period absorbs inter-host clock skew between the orchestrator
+    (which persists ``run_window_start`` via the journal) and the Mem0 server
+    (which stamps ``created_at``).  Without it, a legitimate same-cycle marker
+    written fractionally before the persisted start time would be swept.
 
     Naive parsed datetimes are assumed UTC (``replace(tzinfo=UTC)``).  Any type
     mismatch or parse failure returns ``False`` (fail-open: falls back to the
     existing pure run_id partition behaviour).
+
+    .. note::
+        Only a lower-bound check is applied.  The absence of an upper bound is
+        intentional: per-project run serialization (harness run lock) guarantees
+        that at most one reconciliation run for a given project is active at any
+        time, so a marker written by a *later* run cannot exist yet.  If that
+        serialization assumption is ever relaxed, an upper bound of
+        ``datetime.now(UTC)`` should be added here as defence-in-depth.
     """
     if not isinstance(run_window_start, datetime):
         return False
@@ -570,7 +594,7 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
         parsed = datetime.fromisoformat(created_at)
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
-        return parsed >= run_window_start
+        return parsed >= run_window_start - _CLOCK_SKEW_GRACE
     except (ValueError, TypeError):
         return False
 
@@ -718,9 +742,27 @@ async def _query_stage2_flags(
             # Producer drift = missing-bucket warning; protocol violation = mismatched-bucket type warning.
             # Run-window guard: if the marker was written during this run's window, rescue it to
             # current so Stage 2 can process it this cycle (task-1369 same-cycle Stage-1 write fix).
-            if _marker_is_within_run_window(getattr(r, 'created_at', None), run_window_start):
+            _created_at_val = getattr(r, 'created_at', None)
+            if _marker_is_within_run_window(_created_at_val, run_window_start):
+                logger.info(
+                    'reconciliation._query_stage2_flags: same-cycle Stage-1 marker rescued '
+                    'by run-window guard (missing run_id, created_at=%s); routing to current '
+                    'for Stage 2 — indicates Stage 1 producer drift within the current cycle',
+                    _created_at_val,
+                    extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
+                )
                 current_flags.append(flag_dict)
             else:
+                if run_window_start is not None and (
+                    not _created_at_val or not isinstance(_created_at_val, str)
+                ):
+                    logger.debug(
+                        'reconciliation._query_stage2_flags: run_window_start set but '
+                        'created_at is missing/non-string for marker %s; window guard '
+                        'dormant for this marker, routing to stale bucket',
+                        r.id,
+                        extra={'project_id': project_id, 'current_run_id': run_id_str},
+                    )
                 stale_missing_run_id_ids.append(r.id)
         else:
             # Present but does not match current run_id — prior-cycle residue (or unexpected type).
@@ -736,9 +778,28 @@ async def _query_stage2_flags(
                     extra={'project_id': project_id, 'current_run_id': run_id_str},
                 )
             # Run-window guard: same-cycle marker with a mis-stamped run_id — rescue to current.
-            if _marker_is_within_run_window(getattr(r, 'created_at', None), run_window_start):
+            _created_at_val = getattr(r, 'created_at', None)
+            if _marker_is_within_run_window(_created_at_val, run_window_start):
+                logger.info(
+                    'reconciliation._query_stage2_flags: same-cycle Stage-1 marker rescued '
+                    'by run-window guard (mismatched run_id=%r, created_at=%s); routing to '
+                    'current for Stage 2 — indicates Stage 1 run_id mis-stamp this cycle',
+                    _rid_val,
+                    _created_at_val,
+                    extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
+                )
                 current_flags.append(flag_dict)
             else:
+                if run_window_start is not None and (
+                    not _created_at_val or not isinstance(_created_at_val, str)
+                ):
+                    logger.debug(
+                        'reconciliation._query_stage2_flags: run_window_start set but '
+                        'created_at is missing/non-string for marker %s; window guard '
+                        'dormant for this marker, routing to stale bucket',
+                        r.id,
+                        extra={'project_id': project_id, 'current_run_id': run_id_str},
+                    )
                 stale_mismatched_run_id_ids.append(r.id)
     if stale_missing_run_id_ids:
         logger.warning(
@@ -1069,6 +1130,14 @@ class TaskKnowledgeSync(BaseStage):
     # _query_stage2_flags and are NOT counted here.
     _stale_missing_run_id_markers: int = 0
 
+    # Count of Stage 2 markers rescued to partition.current by the run-window guard
+    # in _query_stage2_flags (task 1369).  Non-zero indicates Stage 1 producer drift
+    # within the CURRENT cycle — the LLM omitted or mis-stamped metadata.run_id on a
+    # flag it wrote during this run.  The marker was still surfaced to the Stage 2 LLM
+    # (not swept), but the drift is recorded here for operator observability.  Reset
+    # and injected via the same four-touchpoint pattern as _stale_fixc_markers_swept.
+    _rescued_in_window_markers: int = 0
+
     # Set to True by assemble_payload() when the autopilot_video contamination
     # guardrail fires (task IDs above AUTOPILOT_VIDEO_TASK_CEILING detected).
     # get_disallowed_tools() then adds DISALLOW_TASK_WRITES to the disallowed list
@@ -1113,6 +1182,7 @@ class TaskKnowledgeSync(BaseStage):
         # (mirrors _current_run_id overwrite pattern).
         self._stale_fixc_markers_swept = 0
         self._stale_missing_run_id_markers = 0
+        self._rescued_in_window_markers = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
 
@@ -1126,6 +1196,12 @@ class TaskKnowledgeSync(BaseStage):
         # Mirrors _stale_fixc_markers_swept; explicit zero is required so
         # downstream consumers never need .get(..., 0) fallbacks.
         report.stats['stale_missing_run_id_markers'] = self._stale_missing_run_id_markers
+        # --- rescued-in-window marker stat (task-1369 amendment) ---
+        # Non-zero when the run-window guard rescued same-cycle Stage-1 markers
+        # whose run_id was omitted/mis-stamped.  They reached Stage 2 fine (not
+        # swept), but the count is observable here for operator diagnostics.
+        # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
+        report.stats['rescued_in_window_markers'] = self._rescued_in_window_markers
 
         # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
         # Guard on stage identity so a future reorder of prior_reports doesn't
@@ -1574,6 +1650,14 @@ class TaskKnowledgeSync(BaseStage):
         active_flags = partition.current
         stale_marker_ids = partition.stale_all_ids
         self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
+        # Count markers rescued by the run-window guard: active flags whose run_id
+        # does NOT match the current run (they were missing or mis-stamped but were
+        # written during this run's window and thus routed to current rather than swept).
+        _run_id_str = str(run_id_for_markers)
+        self._rescued_in_window_markers = sum(
+            1 for f in active_flags
+            if not (f['metadata'].get('run_id') and str(f['metadata']['run_id']) == _run_id_str)
+        )
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
         # the active-query path ONLY.  Stage 1's structured-output flags are
