@@ -153,3 +153,171 @@ class TestWatcherSupervisorLifecycle:
         h = _make_lifecycle_harness(tmp_path)
         # Should not raise
         await h._stop_watcher_supervisor()
+
+
+# ---------------------------------------------------------------------------
+# step-7: _run_watcher_rotation invoke contract
+# ---------------------------------------------------------------------------
+
+def _make_rotation_harness(tmp_path: Path) -> Harness:
+    """Minimal Harness for _run_watcher_rotation tests."""
+    from collections import deque
+
+    h = Harness.__new__(Harness)
+    config = OrchestratorConfig(project_root=tmp_path)
+    h.config = config
+    h._watcher_supervisor_task = None
+    h._watcher_unclean_exits: deque = deque()
+    h.usage_gate = None
+    h.cost_store = MagicMock()
+    h._run_id = 'run-test-rotation-001'
+    # Stub mcp: mcp_config_json returns a sentinel dict
+    h.mcp = MagicMock()
+    h.mcp.mcp_config_json.return_value = {'mcp': 'config-sentinel'}
+    return h
+
+
+class TestRunWatcherRotation:
+    """_run_watcher_rotation invoke contract tests."""
+
+    @pytest.mark.asyncio
+    async def test_calls_load_skill_system_prompt(self, tmp_path: Path) -> None:
+        """system_prompt comes from load_skill_system_prompt('escalation-watcher-auto')."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke_with_cap_retry(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['system_prompt'] = kwargs.get('system_prompt', '')
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke_with_cap_retry):
+            from orchestrator.agents.skill_prompt import load_skill_system_prompt
+            expected = load_skill_system_prompt('escalation-watcher-auto')
+            await h._run_watcher_rotation()
+
+        assert captured['system_prompt'] == expected
+
+    @pytest.mark.asyncio
+    async def test_role_and_cost_store(self, tmp_path: Path) -> None:
+        """Invoked with role='escalation-watcher-auto' and the harness's cost_store."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, cost_store, role, run_id, project_id, **kwargs):
+            captured['role'] = role
+            captured['cost_store'] = cost_store
+            captured['run_id'] = run_id
+            captured['project_id'] = project_id
+            captured['invoke_fn'] = invoke_fn
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        assert captured['role'] == 'escalation-watcher-auto'
+        assert captured['cost_store'] is h.cost_store
+        assert captured['run_id'] == 'run-test-rotation-001'
+        assert captured['project_id'] == h.config.fused_memory.project_id
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_is_invoke_agent(self, tmp_path: Path) -> None:
+        """invoke_fn must be the orchestrator's invoke_agent."""
+        from orchestrator.agents.invoke import invoke_agent
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['invoke_fn'] = invoke_fn
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        assert captured['invoke_fn'] is invoke_agent
+
+    @pytest.mark.asyncio
+    async def test_timeout_seconds_includes_grace(self, tmp_path: Path) -> None:
+        """timeout_seconds = rotation_hours * 3600 + grace (> 0)."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['timeout_seconds'] = kwargs.get('timeout_seconds')
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        expected_min = h.config.watcher_rotation_hours * 3600
+        assert captured['timeout_seconds'] is not None
+        assert captured['timeout_seconds'] > expected_min, (
+            'timeout_seconds must be > rotation_hours*3600 (grace not added)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_budget_and_model(self, tmp_path: Path) -> None:
+        """max_budget_usd and model come from config knobs."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured.update(kwargs)
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        assert captured['max_budget_usd'] == h.config.watcher_rotation_budget_usd
+        assert captured['model'] == h.config.watcher_model
+
+    @pytest.mark.asyncio
+    async def test_user_prompt_contains_rotation_limits(self, tmp_path: Path) -> None:
+        """User prompt embeds ROTATION_ESCALATIONS and ROTATION_HOURS values."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert str(h.config.watcher_rotation_escalations) in prompt, (
+            'ROTATION_ESCALATIONS value not found in user prompt'
+        )
+        assert str(h.config.watcher_rotation_hours) in prompt, (
+            'ROTATION_HOURS value not found in user prompt'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mcp_config_from_escalation_url(self, tmp_path: Path) -> None:
+        """mcp_config comes from self.mcp.mcp_config_json with escalation_url."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured.update(kwargs)
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        expected_url = f'http://{h.config.escalation.host}:{h.config.escalation.port}/mcp'
+        h.mcp.mcp_config_json.assert_called_once_with(escalation_url=expected_url)
+        assert captured.get('mcp_config') == {'mcp': 'config-sentinel'}
