@@ -574,27 +574,19 @@ class TestModuleConfigDiscovery:
 
         False-positive guard for task 1328 operator diagnostic (config.py:1036).
         """
-        # Global config: lock_depth 2 explicitly set — same reasoning as positive test.
-        config_path = tmp_path / 'config.yaml'
-        config_path.write_text(yaml.dump({
-            'project_root': str(tmp_path),
-            'lock_depth': 2,
-        }))
-        # Isolate ORCH_LOCK_DEPTH so a stray env var cannot silently override lock_depth:
-        # 2 and invalidate the == boundary this test exercises.
-        monkeypatch.delenv('ORCH_LOCK_DEPTH', raising=False)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
         # Nested module config at depth 2 (foo/bar) == lock_depth 2 → must NOT warn.
-        nested = tmp_path / 'foo' / 'bar'
-        nested.mkdir(parents=True)
-        (nested / 'orchestrator.yaml').write_text(yaml.dump({
-            'test_command': 'pytest',  # overridable field required so prefix registers
-        }))
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
-            load_config(config_path)
+            config = _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar')
 
-        DISTINCTIVE_PHRASE = 'unreachable through the scheduler/workflow path'
+        # Non-vacuity guard: 'foo/bar' must be registered so the depth comparison at
+        # config.py:1042 is actually evaluated at the == boundary.  If discovery is
+        # broken, the loop has zero iterations, no warning is emitted, and this test
+        # would silently pass without exercising the boundary it claims to guard.
+        assert 'foo/bar' in config._module_configs, (
+            "'foo/bar' must appear in config._module_configs; "
+            "if missing, the depth-comparison loop never runs and the warning-absence "
+            "check is vacuously true (the boundary is not actually exercised)"
+        )
         depth_mismatch_warnings = [
             r for r in caplog.records
             if r.levelno >= logging.WARNING and DISTINCTIVE_PHRASE in r.getMessage()
