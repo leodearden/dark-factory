@@ -345,6 +345,20 @@ class TaskWorkflow:
         # from destroying long-running investigations before they complete.
         self._background_tasks: set = set()
 
+        # In-task dedup cache for _route_review_suggestions_to_curator.
+        # Stores the content_hash of the *most recently* routed suggestion
+        # batch (scalar, not a set).  The escalation→resume cycle can re-enter
+        # REVIEW→DONE with identical suggestions; this sentinel short-circuits
+        # consecutive identical re-entries so the curator R4 gate never has to
+        # absorb redundant N-HTTP batches.
+        #
+        # Boundary: sequence A→B→A will re-submit A on the third call because
+        # B overwrites the cache entry.  This is intentional — the scalar
+        # fast-path only eliminates *consecutive* duplicates.  The server-side
+        # curator R4 idempotency gate (task_interceptor._check_escalation_idempotency)
+        # is the durable source-of-truth dedup for non-consecutive repeats.
+        self._last_routed_suggestion_hash: str | None = None
+
         # One-shot guard for the architect plan-tightening retry.  Set
         # True on first _try_narrow_plan call regardless of outcome so
         # the workflow never loops the narrowing pass on the same task.
@@ -4939,21 +4953,42 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not suggestions:
             return
 
+        # In-task dedup: compute the hash first so the cache check sits above
+        # ALL routing branches (curator submit, escalation-queue fallback, no-op).
+        # The escalation→resume cycle can re-enter REVIEW→DONE with an identical
+        # suggestion set; short-circuiting here avoids N HTTP round-trips that
+        # the curator R4 gate (_check_escalation_idempotency) would otherwise
+        # have to absorb on the server side.
+        content_hash = review_suggestion_payload_hash(suggestions)
+        if self._last_routed_suggestion_hash == content_hash:
+            logger.info(
+                'Task %s: skipping duplicate curator route (hash=%s already sent)',
+                self.task_id, content_hash,
+            )
+            return
+
         # Guard: fall back if MCP transport is unavailable so suggestions are
         # never silently dropped.  _escalate_suggestions is the real caller of
         # the steward-escalation fallback path.
         if self.mcp is None:
             if self.escalation_queue:
                 self._escalate_suggestions(reviews)
+                # Record the hash after a successful fallback so identical
+                # re-entries skip the escalation queue entirely.  The queue's
+                # own dedup would also catch it, but the in-task fast-path
+                # avoids touching the queue at all.
+                self._last_routed_suggestion_hash = content_hash
             else:
                 logger.warning(
                     'Task %s: dropping %d review suggestion(s) — no MCP transport and no '
                     'escalation queue configured (CLI/dry-run/test no-op)',
                     self.task_id, len(suggestions),
                 )
+                # NOTE: do NOT set _last_routed_suggestion_hash here.
+                # Suggestions were dropped, not routed.  The WARNING must fire
+                # on every drop call to preserve audit visibility of this
+                # pathological branch.
             return
-
-        content_hash = review_suggestion_payload_hash(suggestions)
         task_id = self.task_id
         project_root = str(self.config.project_root)
 
@@ -4987,6 +5022,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             self._background_tasks.add(_task)
             _task.add_done_callback(self._background_tasks.discard)
+            # Record the hash only on successful scheduling so that a
+            # create_task failure does not prevent a retry with the same
+            # suggestion set.  The curator R4 gate is the durable backstop
+            # for duplicates that slip through on a successful retry.
+            self._last_routed_suggestion_hash = content_hash
         except Exception as exc:
             logger.warning(
                 'Task %s: failed to schedule curator submits: %s',

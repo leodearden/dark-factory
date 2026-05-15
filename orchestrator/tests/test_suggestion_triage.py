@@ -366,6 +366,83 @@ class TestRouteReviewSuggestionsToCurator:
             assert tool_name != 'curate_batch', 'curate_batch must never be called'
 
     @pytest.mark.asyncio
+    async def test_distinct_second_call_still_submits(self):
+        """Distinct suggestion sets → both batches are submitted (no over-eager dedup).
+
+        The cache keys on content_hash: two different suggestion lists produce
+        different hashes so NEITHER call must be short-circuited.
+        Total POSTs == len(A) + len(B).
+        """
+        suggestions_a = self._suggestions()  # 2 suggestions
+        suggestions_b = [
+            {
+                'reviewer': 'security',
+                'severity': 'suggestion',
+                'location': 'src/auth.py:5',
+                'category': 'security',
+                'description': 'Validate input before use',
+                'suggested_fix': 'Add input validation',
+            },
+        ]
+
+        wf = _make_workflow()
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            # First call with suggestions A
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Second call with DIFFERENT suggestions B
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Both batches must go through
+        expected = len(suggestions_a) + len(suggestions_b)
+        assert len(posted_bodies) == expected, (
+            f'Expected {expected} POSTs (A + B), got {len(posted_bodies)}: '
+            'distinct suggestion sets must not be collapsed by the dedup cache'
+        )
+
+    @pytest.mark.asyncio
+    async def test_identical_second_call_short_circuits_fallback(self):
+        """Cache check sits above mcp=None guard: identical re-entry skips queue.submit entirely.
+
+        When mcp is None and escalation_queue is set, the in-task cache must
+        short-circuit the second call BEFORE touching the fallback queue so
+        queue.submit.call_count == 1, not 2.
+        """
+        suggestions = self._suggestions()
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-0'
+        queue.get_by_task.return_value = []
+        wf = _make_workflow(escalation_queue=queue)
+        wf.mcp = None  # simulate missing MCP transport
+        wf.state = MagicMock(value='review')
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post:
+            # First call — falls back to queue.submit
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            # Second call — identical, must be short-circuited before queue
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        # HTTP must never be attempted (mcp is None)
+        mock_post.assert_not_called()
+        # Queue submit must be called exactly once (cache blocks second call)
+        assert queue.submit.call_count == 1, (
+            f'Expected queue.submit called once, got {queue.submit.call_count}: '
+            'the in-task cache must short-circuit before reaching the fallback'
+        )
+
+    @pytest.mark.asyncio
     async def test_mcp_none_falls_back_to_escalation_queue(self):
         """When self.mcp is None and escalation_queue is set, _escalate_suggestions is called."""
         suggestions = self._suggestions()
@@ -405,6 +482,41 @@ class TestRouteReviewSuggestionsToCurator:
 
         mock_post.assert_not_called()
         write_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_identical_second_call_short_circuits_curator_submit(self):
+        """Identical re-entry → exactly N POSTs across both calls, not 2*N.
+
+        The in-task dedup cache (self._last_routed_suggestion_hash) should
+        short-circuit the second call so the curator only receives one batch.
+        """
+        suggestions = self._suggestions()
+        wf = _make_workflow()
+
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            # First call — should submit
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Second call with identical suggestions — should be short-circuited
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Exactly N posts (one batch), not 2*N
+        assert len(posted_bodies) == len(suggestions), (
+            f'Expected {len(suggestions)} POSTs (one batch), got {len(posted_bodies)}: '
+            'second identical call should have been short-circuited by the dedup cache'
+        )
 
     @pytest.mark.asyncio
     async def test_mcp_none_no_queue_logs_audit_warning_on_dropped_suggestions(
@@ -450,6 +562,104 @@ class TestRouteReviewSuggestionsToCurator:
             f'Expected suggestion count {len(suggestions)} in record.args, got: {rec.args}'
         )
 
+    @pytest.mark.asyncio
+    async def test_A_B_A_sequence_resubmits_A(self):
+        """A→B→A: the third call re-submits A because B overwrote the scalar cache.
+
+        The in-task cache stores only the *most recently* routed hash (a scalar,
+        not a set).  This means it only eliminates *consecutive* duplicates:
+
+            call 1 (A) → submitted,  cache = hash(A)
+            call 2 (B) → submitted,  cache = hash(B)   [hash(A) evicted]
+            call 3 (A) → submitted,  cache = hash(A)   [NOT a duplicate vs B]
+
+        Total POSTs == len(A) + len(B) + len(A) = 2*len(A) + len(B).
+
+        This boundary is intentional — the server-side curator R4 idempotency
+        gate (task_interceptor._check_escalation_idempotency) is the durable
+        source-of-truth dedup for non-consecutive repeats.
+        """
+        suggestions_a = self._suggestions()  # 2 items
+        suggestions_b = [
+            {
+                'reviewer': 'security',
+                'severity': 'suggestion',
+                'location': 'src/auth.py:5',
+                'category': 'security',
+                'description': 'Validate input before use',
+                'suggested_fix': 'Add input validation',
+            },
+        ]  # 1 item, different hash
+
+        wf = _make_workflow()
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            # Call 1: A — submitted, cache = hash(A)
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Call 2: B — submitted (different hash), cache = hash(B)
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Call 3: A again — hash(A) != hash(B) so NOT short-circuited;
+            # re-submitted, cache = hash(A) again.
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        expected = len(suggestions_a) + len(suggestions_b) + len(suggestions_a)
+        assert len(posted_bodies) == expected, (
+            f'A→B→A: expected {expected} POSTs (A={len(suggestions_a)}, '
+            f'B={len(suggestions_b)}, A again={len(suggestions_a)}), '
+            f'got {len(posted_bodies)}.  The scalar cache must not suppress '
+            'non-consecutive repeats — that is the server-side R4 gate\'s job.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_no_queue_drop_warning_fires_on_every_call(
+        self, caplog
+    ):
+        """(mcp=None, queue=None) drop branch: WARNING fires on every call, not just the first.
+
+        Unlike the curator and escalation-queue paths, the drop branch does NOT
+        record the dedup hash.  Suggestions were never routed; suppressing the
+        WARNING on subsequent identical calls would hide repeated data loss from
+        audit logs.
+        """
+        suggestions = self._suggestions()
+        wf = _make_workflow(escalation_queue=None)
+        wf.mcp = None  # simulate CLI/dry-run/test context
+
+        with (
+            patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post,
+            caplog.at_level(logging.WARNING, logger='orchestrator.workflow'),
+        ):
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        mock_post.assert_not_called()
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'orchestrator.workflow'
+        ]
+        assert len(warning_records) == 2, (
+            f'Expected two WARNINGs (one per drop call), got {len(warning_records)}: '
+            'the drop branch must not cache the hash — repeated drops must remain '
+            'auditable.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Integration: stall guard + call-site routing
@@ -485,10 +695,13 @@ class TestRouteReviewSuggestionsIntegration:
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
             elapsed = time.monotonic() - t0
 
-        # Method must return in ms — the POST is fire-and-forget
-        assert elapsed < 0.1, (
+        # Method must return well under the 2s slow stub — the POST is fire-and-forget.
+        # Threshold is 1.0s (not tighter) so the test passes under heavy parallel-test
+        # load without masking a real regression: if the function blocks synchronously
+        # on the 2s POST it will always take ≥2s, which exceeds 1.0s.
+        assert elapsed < 1.0, (
             f'_route_review_suggestions_to_curator took {elapsed:.3f}s '
-            f'(expected < 0.1s); may be awaiting curator synchronously'
+            f'(expected < 1.0s); may be awaiting curator synchronously'
         )
 
         # Cancel background tasks so they don't leak into the next test
