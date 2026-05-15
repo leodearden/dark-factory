@@ -1076,7 +1076,17 @@ class TestWatcherMisconfiguredGuard:
     @pytest.mark.asyncio
     async def test_old_degenerate_exits_outside_window_are_evicted(self, tmp_path: Path) -> None:
         """Degenerate-clean exits older than watcher_crashloop_window_secs are evicted
-        so they do not contribute to the misconfigured count."""
+        so they do not contribute to the misconfigured count.
+
+        Sequence: 2 old fast-clean exits, time-jump past window, 2 more new fast-clean
+        exits (total in-window = 2 < max_misconfig=3) → no trip, loop cancels normally.
+
+        Uses a paired-values iterator (start, end per iteration) so BOTH monotonic
+        calls within a single rotation use matched timestamps — ensures iteration 2
+        also has a short duration and is classified as degenerate (the previous
+        impl used iter_count tracking which made iteration 2's duration ≈ window+2s,
+        so only 1 old entry was actually added instead of the intended 2).
+        """
         import time as _time_mod
 
         from shared.cli_invoke import AgentResult
@@ -1100,25 +1110,34 @@ class TestWatcherMisconfiguredGuard:
         old_time = _time_mod.monotonic()
         new_time = old_time + window + 1  # beyond the window
 
-        # Each iteration: 2 monotonic calls (start, end)
-        # Old iterations: start=old_time, end=old_time+1 (duration 1s, fast)
-        # New iterations: start=new_time, end=new_time+1 (duration 1s, fast)
-        call_count = 0
-        iter_count = 0  # counts completed iterations (even end-call)
+        # Paired iterator: (start, end) per iteration — both calls within one
+        # rotation use matched timestamps so duration is always 1s (< 120s threshold).
+        # iter 1: old start, old end
+        # iter 2: old start, old end
+        # iter 3: new start, new end  (old entries evicted here)
+        # iter 4: new start, new end
+        # iter 5: new start only (CancelledError raised before end)
+        monotonic_sequence = iter(
+            [old_time, old_time + 1.0,   # iter 1 — old fast-clean
+             old_time, old_time + 1.0,   # iter 2 — old fast-clean
+             new_time, new_time + 1.0,   # iter 3 — new fast-clean (old entries evicted)
+             new_time, new_time + 1.0,   # iter 4 — new fast-clean
+             new_time]                   # iter 5 start (before CancelledError)
+        )
 
         def fake_monotonic() -> float:
-            nonlocal call_count, iter_count
-            call_count += 1
-            is_end_call = (call_count % 2 == 0)
-            if is_end_call:
-                iter_count += 1
-            # First 2 iterations use old_time; rest use new_time
-            base = old_time if iter_count < 2 else new_time
-            return base + (1.0 if is_end_call else 0.0)
+            return next(monotonic_sequence)
+
+        # Track deque size at the start of each rotation to verify that 2 old
+        # entries were actually in the deque before the time jump.
+        deque_snapshots: dict[int, int] = {}
 
         async def fake_rotation() -> AgentResult:
             nonlocal rotation_calls
             rotation_calls += 1
+            # Snapshot is taken BEFORE this iteration's deque update, so
+            # snapshot[3] == 2 proves two old entries existed before eviction.
+            deque_snapshots[rotation_calls] = len(h._watcher_degenerate_clean_exits)
             if rotation_calls > max_misconfig + 1:
                 raise asyncio.CancelledError()
             return AgentResult(success=True, output='', timed_out=False)
@@ -1140,6 +1159,21 @@ class TestWatcherMisconfiguredGuard:
         assert pause_calls == [], (
             'Old degenerate exits outside window should be evicted; '
             'pause_scheduler must NOT trip'
+        )
+        # Verify that 2 old entries were genuinely added before the time jump
+        # (snapshot taken at start of iter 3, before iter 3's deque update).
+        assert deque_snapshots.get(3) == 2, (
+            f'Expected 2 old entries in deque at start of iteration 3 '
+            f'(before time-jump eviction); got {deque_snapshots.get(3)}'
+        )
+        # After eviction at iter 3 and iter 4: only 2 new entries remain.
+        assert len(h._watcher_degenerate_clean_exits) == 2, (
+            f'Expected 2 in-window entries after old entries evicted; '
+            f'got {len(h._watcher_degenerate_clean_exits)}'
+        )
+        # All remaining entries must be from new_time (old_time entries evicted).
+        assert all(t >= new_time for t in h._watcher_degenerate_clean_exits), (
+            'All remaining deque entries must use new_time (old entries evicted)'
         )
 
     @pytest.mark.asyncio
