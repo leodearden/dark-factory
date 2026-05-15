@@ -825,6 +825,68 @@ class TestWatcherCrashloopTrip:
             'Old exits outside window should be evicted; pause_scheduler must NOT trip'
         )
 
+    @pytest.mark.asyncio
+    async def test_pause_scheduler_failure_still_stops_supervisor(
+        self, tmp_path: Path
+    ) -> None:
+        """When pause_scheduler raises on a crashloop trip, the supervisor must
+        still stop (not silently continue).
+
+        Regression test (S2/S4b): the broad try/except around the unclean path
+        previously swallowed pause_scheduler failures, causing the loop to restart
+        the agent indefinitely instead of stopping.
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_restarts = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': max_restarts,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            # Guard: cancel after max_restarts * 2 iterations to prevent an infinite
+            # loop when the S2 defect is present (makes RED state fail fast).
+            if rotation_calls > max_restarts * 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=False, output='')
+
+        async def raising_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+            raise RuntimeError('pause failed')
+
+        h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
+        h.pause_scheduler = raising_pause_scheduler          # type: ignore[method-assign]
+
+        stable_time = _time_mod.monotonic()
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', return_value=stable_time),
+        ):
+            # Supervisor must return even though pause_scheduler raises.
+            # In RED state: CancelledError fires at max_restarts*2+1 rotations, and
+            # rotation_calls != max_restarts assertion reveals the defect.
+            await h._watcher_supervisor_loop()
+
+        # pause_scheduler was called exactly once with the crashloop reason
+        assert pause_calls == ['watcher_crashloop'], (
+            f'Expected pause_scheduler("watcher_crashloop") once; got {pause_calls}'
+        )
+        # No 4th rotation after the failing trip (supervisor stopped)
+        assert rotation_calls == max_restarts, (
+            f'Expected exactly {max_restarts} rotations; got {rotation_calls} '
+            f'(supervisor did not stop after failing pause)'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-1388: Misconfigured-clean-exit cost-runaway guard
