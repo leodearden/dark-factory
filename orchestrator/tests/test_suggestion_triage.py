@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
@@ -440,10 +441,12 @@ class TestRouteReviewSuggestionsToCurator:
             for t in warning_texts
         ), f'Expected WARNING with "suggestion" + drop keyword, got: {warning_texts}'
 
-        # Must also mention the count of dropped suggestions (2)
+        # Must also mention the count of dropped suggestions as a standalone number.
+        # Use word-boundary regex so '2' in task_id '42' does not satisfy the check.
+        n = len(suggestions)
         assert any(
-            str(len(suggestions)) in t for t in warning_texts
-        ), f'Expected WARNING mentioning count {len(suggestions)}, got: {warning_texts}'
+            re.search(rf'\b{n}\b', t) is not None for t in warning_texts
+        ), f'Expected WARNING mentioning standalone count {n}, got: {warning_texts}'
 
 
 # ---------------------------------------------------------------------------
