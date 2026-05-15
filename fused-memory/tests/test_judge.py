@@ -954,9 +954,9 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
 
 
 class TestJudgeCapWaitSanityBound:
-    """The canonical _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS constant is
-    forwarded to invoke_with_cap_retry by judge; prevents stalling the
-    reconciliation queue under cap.  Value pin lives in TestCliStageRunnerCapWaitSanityBound."""
+    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
+    invoke_with_cap_retry by judge; prevents stalling the reconciliation
+    queue under cap."""
 
     @pytest.mark.asyncio
     async def test_call_judge_cli_forwards_cap_wait_sanity_secs(self):

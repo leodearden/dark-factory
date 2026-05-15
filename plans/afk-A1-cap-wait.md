@@ -55,4 +55,4 @@ Cap-park / wake-hook / worker-release machinery — explicitly rejected.
 > no-op'd after 1365).  The cap-wait mechanism today is controlled solely by
 > `cap_wait_sanity_secs=` on each `invoke_with_cap_retry` call site.
 
-The authoritative per-caller policy table lives as a comment block adjacent to `_DEFAULT_CAP_WAIT_SANITY_SECS` in [`shared/src/shared/cli_invoke.py:44-83`](../shared/src/shared/cli_invoke.py).
+The authoritative per-caller policy table lives as a comment block adjacent to `_DEFAULT_CAP_WAIT_SANITY_SECS` in [`shared/src/shared/cli_invoke.py`](../shared/src/shared/cli_invoke.py).

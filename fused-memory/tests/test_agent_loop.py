@@ -1528,9 +1528,9 @@ async def test_call_claude_cli_failure_surfaces_stderr_and_summary_in_runtime_er
 
 
 class TestAgentLoopCapWaitSanityBound:
-    """The canonical _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS constant is
-    forwarded to invoke_with_cap_retry by agent_loop; prevents stalling the
-    reconciliation queue under cap.  Value pin lives in TestCliStageRunnerCapWaitSanityBound."""
+    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
+    invoke_with_cap_retry by agent_loop; prevents stalling the reconciliation
+    queue under cap."""
 
     @pytest.mark.asyncio
     async def test_call_claude_cli_forwards_cap_wait_sanity_secs(self):
