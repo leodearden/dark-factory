@@ -362,7 +362,7 @@ class TestHarnessTaskStatusLookup:
         harness.review_checkpoint = None
         harness.scheduler.get_status = AsyncMock(return_value='pending')
 
-        captured_lookup = None
+        captured_lookup: Any = None
 
         def _spy_create_server(queue, **kwargs):
             nonlocal captured_lookup

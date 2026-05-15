@@ -10,11 +10,11 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-logger = logging.getLogger(__name__)
-
 from escalation.dedupe import DedupeConfig, find_dedupe_parent
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+logger = logging.getLogger(__name__)
 
 CATEGORIES = [
     'scope_violation',
