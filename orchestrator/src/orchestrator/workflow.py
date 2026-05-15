@@ -254,7 +254,7 @@ class TaskWorkflow:
         git_ops: GitOps,
         scheduler: _SchedulerLike,
         briefing: _BriefingLike,
-        mcp: _McpLike,
+        mcp: _McpLike | None,
         escalation_queue=None,
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,
