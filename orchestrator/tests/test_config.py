@@ -512,7 +512,7 @@ class TestModuleConfigDiscovery:
         """load_config emits a WARNING when a discovered module-config prefix has more
         path components than lock_depth.
 
-        Regression guard for task 1328 operator diagnostic (config.py:1034-1042).
+        Regression guard for task 1328 operator diagnostic (the depth-mismatch warning loop in load_config).
         Acceptance criteria — the WARNING record from orchestrator.config must pin:
           (a) the prefix 'foo/bar/baz'
           (b) the prefix depth 'prefix depth 3'
@@ -554,16 +554,18 @@ class TestModuleConfigDiscovery:
         """load_config does NOT emit the depth-mismatch WARNING when prefix depth ==
         lock_depth (the boundary: strictly-greater-than triggers the warning, not >=).
 
-        False-positive guard for task 1328 operator diagnostic (config.py:1036).
+        False-positive guard for task 1328 operator diagnostic (the depth-mismatch warning loop in load_config).
         """
         # Nested module config at depth 2 (foo/bar) == lock_depth 2 → must NOT warn.
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
             config = _load_config_with_nested_module(tmp_path, monkeypatch, prefix='foo/bar')
 
-        # Non-vacuity guard: 'foo/bar' must be registered so the depth comparison at
-        # config.py:1042 is actually evaluated at the == boundary.  If discovery is
-        # broken, the loop has zero iterations, no warning is emitted, and this test
-        # would silently pass without exercising the boundary it claims to guard.
+        # Non-vacuity guard: 'foo/bar' must be registered so the depth comparison in
+        # the depth-mismatch warning loop is actually evaluated at the == boundary.  If
+        # discovery is broken, the loop has zero iterations, no warning is emitted, and
+        # this test would silently pass without exercising the boundary it claims to guard.
+        # (test_nested_module_helper_registers_prefix isolates the failure cause if this
+        # assertion fires, so the duplication is intentional rather than accidental.)
         assert config._module_configs is not None
         assert 'foo/bar' in config._module_configs, (
             "'foo/bar' must appear in config._module_configs; "
