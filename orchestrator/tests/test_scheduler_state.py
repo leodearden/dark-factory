@@ -249,6 +249,68 @@ class TestParkInstallAtTracking:
             '_park_install_at must not be set when install_parks installs nothing'
         )
 
+    def test_partial_eviction_preserves_install_at(self):
+        """Partial eviction (owner retains another park) must keep its _park_install_at entry."""
+        lt = self._make_lock_table()
+        # (1) T1 parks two independent modules at medium priority.
+        installed, _ = lt.install_parks('T1', ['mod/a', 'mod/b'], 'medium')
+        assert len(installed) == 2, f'Expected 2 installs, got {installed}'
+        ts = lt._park_install_at['T1']
+
+        # (2) T2 at critical priority evicts ONLY mod/a; T1 retains mod/b.
+        _, evicted = lt.install_parks('T2', ['mod/a'], 'critical')
+        assert evicted == [('T1', ['mod/a'])], f'Expected T1 evicted from mod/a only, got: {evicted}'
+        assert lt.has_parks('T1'), 'T1 still owns mod/b — has_parks must return True'
+
+        # (3) Core assertion: original timestamp must survive the partial eviction.
+        assert 'T1' in lt._park_install_at, (
+            'T1 still has parks (mod/b) — its _park_install_at entry must not be dropped'
+        )
+        assert lt._park_install_at['T1'] == ts, (
+            'Partial eviction must preserve the original installed_at timestamp'
+        )
+
+    def test_park_install_at_bounded_under_preemption_churn(self):
+        """_park_install_at must not accumulate stale entries under repeated evictions."""
+        lt = self._make_lock_table()
+        for i in range(50):
+            lt.install_parks(f'low{i}', ['mod/a'], 'medium')
+            lt.install_parks('high', ['mod/a'], 'critical')
+            lt.clear_parks_for('high')  # free mod/a for next iteration
+        # Every low{i} was fully evicted; 'high' was cleared each round.
+        assert len(lt._park_install_at) == 0, (
+            f'Expected empty _park_install_at after all evictions+clears, '
+            f'got {len(lt._park_install_at)} entries — without the fix this would be ~50'
+        )
+
+    def test_install_parks_drops_install_at_for_fully_evicted_owner(self):
+        """Full eviction must remove the owner from _park_install_at."""
+        lt = self._make_lock_table()
+        # (1) T1 parks mod/a at medium priority.
+        installed, _ = lt.install_parks('T1', ['mod/a'], 'medium')
+        assert installed, 'T1 should have installed mod/a'
+        old_ts = lt._park_install_at['T1']
+        assert 'T1' in lt._park_install_at
+
+        # (2) T2 at critical priority evicts T1 fully.
+        _, evicted = lt.install_parks('T2', ['mod/a'], 'critical')
+        assert evicted == [('T1', ['mod/a'])], f'Expected T1 evicted, got: {evicted}'
+        assert not lt.has_parks('T1'), 'T1 should have no parks after full eviction'
+
+        # (3) Core regression: stale entry must be gone.
+        assert 'T1' not in lt._park_install_at, (
+            '_park_install_at must drop fully-evicted owner T1'
+        )
+
+        # (4) Re-install: fresh timestamp must be recorded.
+        lt.clear_parks_for('T2')  # free mod/a
+        lt.install_parks('T1', ['mod/a'], 'medium')
+        assert 'T1' in lt._park_install_at, 'T1 must have a new entry after re-install'
+        new_ts = lt._park_install_at['T1']
+        assert datetime.fromisoformat(new_ts) >= datetime.fromisoformat(old_ts), (
+            'Re-installed timestamp must be >= original'
+        )
+
 
 # ===========================================================================
 # Step-9: _last_effective_priorities cache

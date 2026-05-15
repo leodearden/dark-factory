@@ -477,6 +477,12 @@ class ModuleLockTable:
                 eviction_acc[owner].append(parked_m)
             self._parked[normalized] = (task_id, rank)
             installed.append(normalized)
+        # Drop fully-evicted owners from _park_install_at so the dict stays
+        # bounded under preemption churn and a later re-install records a
+        # fresh installed_at instead of the stale setdefault-preserved value.
+        for owner in eviction_acc:
+            if not self.has_parks(owner):
+                self._park_install_at.pop(owner, None)
         # Build evicted list in first-seen owner order, modules sorted.
         evicted = [
             (owner, sorted(eviction_acc[owner]))
