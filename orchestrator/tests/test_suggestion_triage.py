@@ -677,16 +677,20 @@ class TestRouteReviewSuggestionsIntegration:
         as a fire-and-forget background task via `asyncio.create_task`.  It must
         NOT synchronously await the POST.
 
-        Mechanism: `post_completed` is an `asyncio.Event` that the slow_post stub
-        sets AFTER its 2s sleep finishes.  Because `_route_review_suggestions_to_curator`
-        has no `await` points on its hot path, the event loop never yields between the
-        route call and the synchronous assertion below — so slow_post never runs and
-        `post_completed` stays unset.
+        PRIMARY assertion: verifies that exactly one background task was scheduled and
+        is still unfinished when the route call returns.  This check tolerates
+        intermediate `await` points on the hot path (e.g. an MCP probe before
+        `create_task`) — what matters is that the task was scheduled *and* has not
+        finished by the time the call returns.
 
-        Regression path: if the impl were changed to `await self._post_submit_tasks(…)`
-        instead of `asyncio.create_task(…)`, the route call would block for 2s while
-        slow_post's sleep completes, setting `post_completed`, and the assertion would
-        fail with a clear message — independent of system load.
+        SECONDARY (strict no-sync-await sentinel): `post_completed` is an
+        `asyncio.Event` that the slow_post stub sets AFTER its 2s sleep finishes.
+        This secondary check only holds when no `await` occurs between the route
+        entry and the return — if the impl were changed to
+        `await self._post_submit_tasks(…)`, the route call would block for 2s while
+        slow_post's sleep completes, setting `post_completed`, and the assertion
+        would fail with a clear message — independent of system load.  Kept as
+        defense-in-depth alongside the PRIMARY check.
         """
 
         suggestions = [
@@ -722,7 +726,8 @@ class TestRouteReviewSuggestionsIntegration:
             f'_route_review_suggestions_to_curator must schedule exactly one background '
             f'task via create_task — got {len(wf._background_tasks)}'
         )
-        assert not next(iter(wf._background_tasks)).done(), (
+        bg_task = next(iter(wf._background_tasks))
+        assert not bg_task.done(), (
             'background task must not be done yet — fire-and-forget means it runs '
             'after the route call returns, not before'
         )
@@ -739,13 +744,12 @@ class TestRouteReviewSuggestionsIntegration:
             'completed before the route call returned'
         )
 
-        # Cancel background tasks and await their completion to drain them
+        # Cancel the background task and await its completion to drain it
         # deterministically, preventing 'Task was destroyed but it is pending'
-        # warnings at pytest-asyncio fixture teardown.
-        tasks = list(wf._background_tasks)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # warnings at pytest-asyncio fixture teardown.  Reuse the same handle
+        # captured above to avoid re-iterating the set.
+        bg_task.cancel()
+        await asyncio.gather(bg_task, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
