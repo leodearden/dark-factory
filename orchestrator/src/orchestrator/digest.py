@@ -54,11 +54,23 @@ def update_ewa(
     EWA(t+1) = alpha * (escalations_in_step / max(done_in_step, 1))
                + (1 - alpha) * prev_ewa
 
-    done_in_step == 0 uses denominator 1 so a step with escalations and zero
-    completions (the worst-case signal) pushes EWA up rather than crashing.
+    Caller contract: escalations_in_step must be > 0.  In normal flow
+    _maybe_write_digest only calls this when escalations_in_step >= N (the
+    digest gate guarantees this invariant).  A ValueError is raised so that
+    any caller that violates the contract is loud rather than silently
+    returning a stale value — keeping the unreachable path unreachable.
 
-    No exception handling — pure arithmetic.
+    done_in_step == 0 (with esc > 0) uses denominator 1 so a step with
+    escalations and zero completions (the worst-case signal) pushes EWA up
+    rather than crashing.
+
+    No other exception handling — pure arithmetic.
     """
+    if escalations_in_step == 0:
+        raise ValueError(
+            'update_ewa: escalations_in_step must be > 0; '
+            'the digest gate guarantees this — passing 0 is a caller error'
+        )
     ratio = escalations_in_step / max(done_in_step, 1)
     return alpha * ratio + (1 - alpha) * prev_ewa
 

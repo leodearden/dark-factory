@@ -39,10 +39,24 @@ class TestUpdateEwa:
         result = digest.update_ewa(prev_ewa=0.0, escalations_in_step=4, done_in_step=0, alpha=0.3)
         assert result == pytest.approx(1.2), f"Expected 1.2; got {result}"
 
-    def test_esc_zero_pulls_toward_zero(self) -> None:
-        """esc==0 with done>0 pulls EWA toward zero: esc=0, done=5, prev=1.0, alpha=0.3 → 0.7."""
-        result = digest.update_ewa(prev_ewa=1.0, escalations_in_step=0, done_in_step=5, alpha=0.3)
-        assert result == pytest.approx(0.7), f"Expected 0.7; got {result}"
+    def test_esc_zero_raises_value_error(self) -> None:
+        """esc==0 raises ValueError — caller contract violation.
+
+        The digest gate guarantees escalations_in_step >= N >= 1 before
+        calling update_ewa, so esc=0 is always a caller error.  Raising keeps
+        the unreachable path loud rather than silently returning a stale EWA.
+        """
+        with pytest.raises(ValueError, match='escalations_in_step must be > 0'):
+            digest.update_ewa(prev_ewa=1.0, escalations_in_step=0, done_in_step=5, alpha=0.3)
+
+    def test_esc_zero_done_zero_raises_value_error(self) -> None:
+        """(esc=0, done=0) edge case raises ValueError — not a divide-by-zero path.
+
+        max(done, 1) would handle (esc=0, done=0) mathematically but the
+        ValueError guard fires first, keeping the caller contract explicit.
+        """
+        with pytest.raises(ValueError, match='escalations_in_step must be > 0'):
+            digest.update_ewa(prev_ewa=0.42, escalations_in_step=0, done_in_step=0, alpha=0.3)
 
     def test_alpha_zero_returns_prev_unchanged(self) -> None:
         """alpha=0.0: EWA is never updated — returns prev unchanged.

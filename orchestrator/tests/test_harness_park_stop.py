@@ -1425,3 +1425,138 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         )
         # _maybe_write_digest was called once (on the first rotation).
         harness._maybe_write_digest.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessDigestDoneCountSource (task 1421, step-3 test / step-4 impl)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessDigestDoneCountSource:
+    """Fix 1: EventStore done_count is the single source of truth for update_ewa.
+
+    Task 1421 cleanup — reconcile done_count sources.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ewa_uses_eventstore_done_count_not_scheduler_counter(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """EWA input done_in_step comes from EventStore, not scheduler.done_transitions_total.
+
+        Setup: alpha=1.0 so EWA == raw ratio; EventStore seeded with 4 done
+        rows in the last hour (inside the default 24h window); scheduler counter
+        set to 100 — a deliberately different value to prove the source.
+
+        If EWA uses EventStore count (4): EWA = 1/4 = 0.25  ← expected
+        If EWA uses scheduler delta (100): EWA = 1/100 = 0.01 ← current impl
+        """
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_alpha=1.0,        # EWA = raw ratio so result is unambiguous
+            digest_ewa_threshold=999.0,  # high — no trip in this test
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+        # Set scheduler counter to a value that would give a different EWA.
+        # After Fix 1 this value must NOT influence _ewa_value.
+        harness.scheduler._done_transitions_total = 100
+
+        # Seed EventStore with 4 task_completed rows with outcome='done' inside
+        # the 24h default window (timestamps 10–13 minutes in the past).
+        conn = sqlite3.connect(str(event_store.db_path))
+        try:
+            for i in range(4):
+                ts = (datetime.now(UTC) - timedelta(minutes=10 + i)).isoformat()
+                conn.execute(
+                    'INSERT INTO events (timestamp, run_id, task_id, event_type, data) '
+                    'VALUES (?, ?, ?, ?, ?)',
+                    (ts, 'run-test-0001', f't{i}', 'task_completed',
+                     json.dumps({'outcome': 'done'})),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        await harness._maybe_write_digest()
+
+        # alpha=1.0, escalations_in_step=1, done_from_eventstore=4 → EWA = 1/4 = 0.25
+        # (scheduler delta of 100 would give EWA = 1/100 = 0.01)
+        assert harness._ewa_value == pytest.approx(1 / 4), (
+            f'Expected _ewa_value=0.25 (EventStore done_count=4); '
+            f'got {harness._ewa_value!r} '
+            f'(scheduler counter=100 would give 0.01)'
+        )
+
+        # The rendered digest's "Tasks done in window" figure must also equal 4,
+        # proving both the EWA input AND the displayed count come from EventStore
+        # (single source of truth — task 1421 Fix 1).
+        digest_dir = tmp_path / 'data' / 'digests'
+        digest_files = sorted(digest_dir.glob('digest-*.md'))
+        assert digest_files, 'Expected at least one digest file written by _maybe_write_digest'
+        content = digest_files[-1].read_text()
+        assert '## Tasks done in window\n4\n' in content, (
+            f'Expected rendered digest to show "Tasks done in window\\n4\\n"; '
+            f'digest content:\n{content}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessDigestEscalationCounterSnapshot (task 1421, step-5 test / step-6 impl)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessDigestEscalationCounterSnapshot:
+    """Fix 2: _escalation_event_count is snapshotted once at the top of _maybe_write_digest.
+
+    Task 1421 cleanup — guard against concurrent callback mid-function drift.
+    """
+
+    @pytest.mark.asyncio
+    async def test_escalation_event_count_snapshotted_at_start(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """_last_digest_event_count advances to the snapshot taken at entry, not the live value.
+
+        Setup: _escalation_event_count=5 at entry; a patch on aggregate_escalations
+        fires a side-effect that increments _escalation_event_count by 100 mid-function
+        (simulating a concurrent callback).  After _maybe_write_digest returns:
+          - _last_digest_event_count must be 5  (the snapshot at entry)
+          - NOT 105 (the live value after the concurrent +100)
+
+        Today the function reads self._escalation_event_count directly at the
+        advance line, so it picks up 105.  After Fix 2 it uses a snapshot taken
+        before aggregate_escalations is called.
+        """
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,   # diff=5 >= 3 → triggers
+            digest_ewa_threshold=999.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+
+        # Side-effect: simulate a concurrent escalation callback firing inside
+        # aggregate_escalations — bumps _escalation_event_count by 100.
+        from orchestrator.digest import EscalationStats
+
+        def _concurrent_bump(*_args, **_kwargs):
+            harness._escalation_event_count += 100
+            return EscalationStats()
+
+        with patch('orchestrator.digest.aggregate_escalations', side_effect=_concurrent_bump):
+            await harness._maybe_write_digest()
+
+        # Must use the snapshot (5), not the post-mutation value (105).
+        assert harness._last_digest_event_count == 5, (
+            f'Expected _last_digest_event_count=5 (entry snapshot); '
+            f'got {harness._last_digest_event_count} '
+            f'(live value after concurrent +100 would be 105)'
+        )
