@@ -2784,6 +2784,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 # reuses watcher_crashloop_window_secs as the burst-detection
                 # window — semantically identical for both failure modes.
                 if duration < self.config.watcher_misconfigured_min_rotation_secs:
+                    # Increment before the guard call — mirrors the unclean path
+                    # convention (consecutive_unclean += 1 before _check_watcher_guard).
+                    consecutive_degenerate_clean += 1
                     if await self._check_watcher_guard(
                         self._watcher_degenerate_clean_exits,
                         'watcher_misconfigured',
@@ -2795,8 +2798,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     # Degenerate-clean, no trip — apply exponential floor (task 1430).
                     # Fast rotation signals potential cost-runaway; grow the sleep
                     # exponentially to slow the burn rate before the trip arms.
-                    # Mirrors the unclean-exit backoff shape at line ~2820.
-                    consecutive_degenerate_clean += 1
+                    # Mirrors the unclean-exit exponential backoff in the section below.
                     floor = min(
                         self.config.watcher_subprocess_restart_backoff_secs
                         * (2 ** (consecutive_degenerate_clean - 1)),
@@ -2808,7 +2810,22 @@ Output JSON matching the schema. Every task must appear in the output.
                         consecutive_degenerate_clean,
                         floor,
                     )
-                    await asyncio.sleep(floor)
+                    try:
+                        await asyncio.sleep(floor)
+                    except asyncio.CancelledError:
+                        raise  # clean shutdown
+                    except Exception:
+                        logger.exception(
+                            'Escalation-watcher-auto supervisor: unexpected error in '
+                            'degenerate-clean-path floor sleep — sleeping base backoff '
+                            'to avoid silent supervisor death'
+                        )
+                        try:
+                            await asyncio.sleep(
+                                self.config.watcher_subprocess_restart_backoff_secs
+                            )
+                        except asyncio.CancelledError:
+                            raise
                 else:
                     # Healthy clean (duration >= watcher_misconfigured_min_rotation_secs):
                     # positive evidence the queue had real work — reset the cost-runaway

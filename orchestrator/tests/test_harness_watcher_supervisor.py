@@ -424,6 +424,64 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     return h
 
 
+async def _run_supervisor_with_rotation_durations(
+    h: Harness,
+    rotation_durations_secs: list[float],
+) -> list[float]:
+    """Drive _watcher_supervisor_loop with controlled per-rotation durations.
+
+    Each entry in *rotation_durations_secs* becomes one paired (start, end)
+    timestamp consumed by the patched ``time.monotonic``.  After all rotations
+    a final start is issued and ``fake_rotation`` raises ``CancelledError`` so
+    the loop terminates cleanly.
+
+    Returns the list of floor/backoff sleep durations recorded via the patched
+    ``asyncio.sleep``.  The caller is responsible for configuring *h* (config
+    overrides, etc.) before calling this helper.
+    """
+    import time as _time_mod
+
+    from shared.cli_invoke import AgentResult
+
+    sleep_durations: list[float] = []
+    rotation_calls = 0
+    n = len(rotation_durations_secs)
+
+    t0 = _time_mod.monotonic()
+    # Build paired (start, end) sequence plus one trailing start for the
+    # cancelling (n+1)th rotation call.
+    timestamps: list[float] = []
+    for dur in rotation_durations_secs:
+        timestamps.extend([t0, t0 + dur])
+    timestamps.append(t0)  # start of the rotation that will raise CancelledError
+
+    monotonic_sequence = iter(timestamps)
+
+    def fake_monotonic() -> float:
+        return next(monotonic_sequence)
+
+    async def fake_rotation() -> AgentResult:
+        nonlocal rotation_calls
+        rotation_calls += 1
+        if rotation_calls > n:
+            raise asyncio.CancelledError()
+        return AgentResult(success=True, output='', timed_out=False)
+
+    async def recording_sleep(duration: float) -> None:
+        sleep_durations.append(duration)
+
+    h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+    with (
+        patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+        patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await h._watcher_supervisor_loop()
+
+    return sleep_durations
+
+
 class TestWatcherSupervisorLoopClassification:
     """_watcher_supervisor_loop clean-vs-unclean classification and backoff.
 
@@ -1268,10 +1326,6 @@ class TestWatcherMisconfiguredGuard:
         RED: currently the production code sleeps a flat watcher_subprocess_restart_backoff_secs
         on every clean rotation, so all 4 sleeps would be 1.0 instead of growing.
         """
-        import time as _time_mod
-
-        from shared.cli_invoke import AgentResult
-
         h = _make_loop_harness(tmp_path)
         h.config = h.config.model_copy(update={
             'watcher_max_misconfigured_clean_exits': 99,   # disable trip
@@ -1280,43 +1334,8 @@ class TestWatcherMisconfiguredGuard:
             'watcher_crashloop_window_secs': 600,
             'watcher_max_crashloop_restarts': 99,          # disable crashloop trip
         })
-
-        sleep_durations: list[float] = []
-        rotation_calls = 0
-
-        t0 = _time_mod.monotonic()
-        # Paired (start, end) per rotation so duration == 1.0s < 120s threshold.
-        # 4 full rotations + 1 start-only value for the cancelling 5th call.
-        monotonic_sequence = iter([
-            t0, t0 + 1.0,  # iter 1 — degenerate clean
-            t0, t0 + 1.0,  # iter 2 — degenerate clean
-            t0, t0 + 1.0,  # iter 3 — degenerate clean
-            t0, t0 + 1.0,  # iter 4 — degenerate clean
-            t0,             # iter 5 start (CancelledError before end)
-        ])
-
-        def fake_monotonic() -> float:
-            return next(monotonic_sequence)
-
-        async def fake_rotation() -> AgentResult:
-            nonlocal rotation_calls
-            rotation_calls += 1
-            if rotation_calls > 4:
-                raise asyncio.CancelledError()
-            return AgentResult(success=True, output='', timed_out=False)
-
-        async def recording_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-
-        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
-
+        # 4 consecutive degenerate-clean rotations (1s each, well under 120s threshold)
+        sleep_durations = await _run_supervisor_with_rotation_durations(h, [1.0, 1.0, 1.0, 1.0])
         assert sleep_durations == pytest.approx([1.0, 2.0, 4.0, 8.0]), (
             f'Expected exponential floor [1.0, 2.0, 4.0, 8.0] for 4 consecutive '
             f'degenerate-clean exits; got {sleep_durations}'
@@ -1338,10 +1357,6 @@ class TestWatcherMisconfiguredGuard:
         RED: after step-2 the counter is never zeroed on a healthy rotation, so
         sleep[3] == 4.0 instead of 1.0.
         """
-        import time as _time_mod
-
-        from shared.cli_invoke import AgentResult
-
         h = _make_loop_harness(tmp_path)
         h.config = h.config.model_copy(update={
             'watcher_max_misconfigured_clean_exits': 99,   # disable trip
@@ -1350,46 +1365,11 @@ class TestWatcherMisconfiguredGuard:
             'watcher_crashloop_window_secs': 600,
             'watcher_max_crashloop_restarts': 99,          # disable crashloop trip
         })
-
-        sleep_durations: list[float] = []
-        rotation_calls = 0
-
-        t0 = _time_mod.monotonic()
-        # Paired (start, end) per rotation:
-        #   iters 1, 2: degenerate (1s < 120s threshold)
-        #   iter  3:    healthy    (200s > 120s threshold)
-        #   iter  4:    degenerate (1s < 120s threshold)
-        #   iter  5:    start only (CancelledError before end)
-        monotonic_sequence = iter([
-            t0, t0 + 1.0,    # iter 1 — degenerate clean
-            t0, t0 + 1.0,    # iter 2 — degenerate clean
-            t0, t0 + 200.0,  # iter 3 — healthy clean
-            t0, t0 + 1.0,    # iter 4 — degenerate clean (key: counter must be reset)
-            t0,               # iter 5 start (CancelledError before end)
-        ])
-
-        def fake_monotonic() -> float:
-            return next(monotonic_sequence)
-
-        async def fake_rotation() -> AgentResult:
-            nonlocal rotation_calls
-            rotation_calls += 1
-            if rotation_calls > 4:
-                raise asyncio.CancelledError()
-            return AgentResult(success=True, output='', timed_out=False)
-
-        async def recording_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-
-        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
-
+        # degen (1s), degen (1s), HEALTHY (200s), degen (1s)
+        # key: the post-healthy degenerate must sleep 1.0 (counter reset), not 4.0
+        sleep_durations = await _run_supervisor_with_rotation_durations(
+            h, [1.0, 1.0, 200.0, 1.0]
+        )
         assert sleep_durations == pytest.approx([1.0, 2.0, 1.0, 1.0]), (
             f'Expected [1.0, 2.0, 1.0, 1.0] — healthy rotation at index 2 must reset '
             f'the degenerate counter so index 3 is base (not 4.0); got {sleep_durations}'
