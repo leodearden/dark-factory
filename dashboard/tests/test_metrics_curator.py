@@ -1365,3 +1365,51 @@ async def test_fan_out_list_tickets_first_url_succeeds_skips_second(tmp_path: Pa
         'should count URL1 only, not double-count both URLs'
     )
     assert tickets == []
+
+
+# ---------------------------------------------------------------------------
+# task-1329 step-3: CancelledError from a CHILD coroutine propagates out of
+# fan_out_list_tickets (buggy reducer swallows it silently)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_propagates_child_cancelled_error(tmp_path: Path):
+    """fan_out_list_tickets must propagate CancelledError raised in a child coroutine.
+
+    RED baseline: the current reducer
+        per_root_results = [r if not isinstance(r, BaseException) else (0, []) ...]
+    coerces a child-level CancelledError captured in raw_results into (0, []).
+    fan_out_list_tickets then returns ([], 0) silently, pytest.raises sees no
+    exception → the test FAILS (no raise observed).
+
+    The fix is to replace the reducer with
+        safe_gather_result(r, default, 'curator/fan_out_root')
+    which re-raises non-Exception BaseException (CancelledError/KeyboardInterrupt/
+    SystemExit) and substitutes the default only for Exception.
+
+    IMPORTANT — why child-level CancelledError and not outer-task cancel:
+    This test deliberately raises CancelledError from INSIDE a child coroutine
+    (mcp_tool_call side_effect) rather than cancelling the outer task that runs
+    fan_out_list_tickets.  Under asyncio.gather(return_exceptions=True), a
+    child-level CancelledError is captured INTO raw_results as a BaseException
+    instance — the gather itself is NOT cancelled.  Cancelling the outer task
+    instead makes `await asyncio.gather(...)` raise CancelledError directly
+    (bypassing the reducer), which would pass even with the buggy code and yield
+    no RED.  The reducer bug only manifests when CancelledError is aggregated
+    into raw_results via a child-level raise.
+    """
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[],
+    )
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call',
+               new=AsyncMock(side_effect=asyncio.CancelledError())):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            with pytest.raises(asyncio.CancelledError):
+                await fan_out_list_tickets(http_client, cfg, limit=2000, timeout=5.0)
