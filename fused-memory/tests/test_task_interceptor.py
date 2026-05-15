@@ -6162,3 +6162,142 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
         )
 
 
+# ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
+#
+# Cycle 8df8bdcd: tasks 1355/1361/1369 appeared in Stage 1 output each
+# carrying the NEXT task's title in the sorted completion sequence.
+# The ONLY locus where a data-layer off-by-one could live is the
+# `before = await tm.get_task(task_id)` capture + `asyncio.create_task(
+# reconcile_task(..., task_before=before))` eager-arg binding in
+# `_apply_status_transition` (aliasing/late-binding class of bug).
+# Investigation (task 1379, supersedes dc68f7b9, corroborates d3f56765):
+# `before` is a fresh local per invocation; CSV loops sequentially; create_task
+# args bind eagerly at coroutine creation — no aliasing across the window.
+# This test locks the before-capture/spawn contract.
+
+# Fixture constants (same scenario as test_targeted.py _8DF8_* constants):
+_8DF8_TASKS_INTERCEPTOR = [
+    {'id': '1369', 'title': 'Refactor event dispatch to async', 'status': 'pending'},
+    {'id': '1355', 'title': 'Implement rate limiter middleware', 'status': 'pending'},
+    {'id': '1361', 'title': 'Add retry logic for database connections', 'status': 'pending'},
+]
+_8DF8_TITLE_BY_ID_INTERCEPTOR = {t['id']: t['title'] for t in _8DF8_TASKS_INTERCEPTOR}
+
+
+@pytest.mark.asyncio
+async def test_multicompletion_window_each_reconcile_gets_own_task_before(
+    event_buffer, tmp_path,
+):
+    """CSV path: each spawned reconcile_task call receives its OWN task_before.
+
+    Reproduces cycle 8df8bdcd at the task_interceptor spawn path: drive
+    set_task_status("1355,1361,1369", "done") and verify that each spawned
+    reconciler.reconcile_task call received a task_before dict whose 'title'
+    matches that call's own task_id — no aliasing/late-binding title swap.
+
+    Expected GREEN: `before` is a fresh local per _apply_status_transition
+    invocation; CSV loops sequentially (sequential awaits); asyncio.create_task
+    args bind eagerly at coroutine creation time — no closure/shared-mutable
+    aliasing possible across the multi-completion window.
+    """
+    # Build a taskmaster that returns the right task dict for each id
+    task_map = {t['id']: dict(t) for t in _8DF8_TASKS_INTERCEPTOR}
+
+    async def mock_get_task(task_id, *args, **kwargs):
+        # Return the per-id dict (or a generic fallback)
+        return task_map.get(str(task_id), {'id': str(task_id), 'status': 'pending', 'title': f'Task {task_id}'})
+
+    tm = AsyncMock()
+    tm.get_task = mock_get_task
+    tm.set_task_status = AsyncMock(return_value={'success': True})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.update_task = AsyncMock(return_value={'success': True})
+
+    # Record reconcile_task calls by task_id → task_before
+    captured: dict[str, dict] = {}
+
+    async def mock_reconcile(*, task_id, transition, project_id, project_root, task_before, **kwargs):
+        captured[task_id] = task_before
+        return {'actions': [{'type': 'knowledge_captured'}]}
+
+    reconciler = AsyncMock()
+    reconciler.reconcile_task = mock_reconcile
+
+    interceptor = TaskInterceptor(tm, reconciler, event_buffer)
+
+    # Drive CSV completion (completion order: 1355,1361,1369 comma-joined)
+    csv_ids = '1355,1361,1369'
+    result = await interceptor.set_task_status(csv_ids, 'done', '/project')
+    assert result.get('success') is True, f'Unexpected result: {result}'
+
+    # Drain background tasks so reconcile calls run
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # All 3 tasks should have been reconciled
+    assert set(captured.keys()) == {'1355', '1361', '1369'}, (
+        f'Expected reconcile calls for all 3 tasks; got: {set(captured.keys())}'
+    )
+
+    # Each task_before must carry ITS OWN title — no neighbor bleed
+    for task_id, task_before in captured.items():
+        expected_title = _8DF8_TITLE_BY_ID_INTERCEPTOR[task_id]
+        actual_title = task_before.get('title')
+        assert actual_title == expected_title, (
+            f'task_id={task_id}: task_before.title={actual_title!r} '
+            f'but expected own title={expected_title!r}.\n'
+            f'  task_before={task_before}'
+        )
+        # task_before.id must also match
+        assert str(task_before.get('id')) == task_id, (
+            f'task_id={task_id}: task_before["id"]={task_before.get("id")!r} mismatch'
+        )
+
+
+@pytest.mark.asyncio
+async def test_single_completion_reconcile_gets_correct_task_before(
+    event_buffer, tmp_path,
+):
+    """Single-id path: reconcile_task receives the correct task_before.
+
+    Interleaved variant of the 8df8bdcd scenario: drive each task id
+    individually (single set_task_status calls) and verify title↔id binding.
+    """
+    task_map = {t['id']: dict(t) for t in _8DF8_TASKS_INTERCEPTOR}
+
+    async def mock_get_task(task_id, *args, **kwargs):
+        return task_map.get(str(task_id), {'id': str(task_id), 'status': 'pending', 'title': f'Task {task_id}'})
+
+    tm = AsyncMock()
+    tm.get_task = mock_get_task
+    tm.set_task_status = AsyncMock(return_value={'success': True})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.update_task = AsyncMock(return_value={'success': True})
+
+    captured: dict[str, dict] = {}
+
+    async def mock_reconcile(*, task_id, transition, project_id, project_root, task_before, **kwargs):
+        captured[task_id] = task_before
+        return {'actions': [{'type': 'knowledge_captured'}]}
+
+    reconciler = AsyncMock()
+    reconciler.reconcile_task = mock_reconcile
+
+    interceptor = TaskInterceptor(tm, reconciler, event_buffer)
+
+    # Drive individually in non-id order (1369 → 1355 → 1361)
+    for task in _8DF8_TASKS_INTERCEPTOR:
+        await interceptor.set_task_status(task['id'], 'done', '/project')
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert set(captured.keys()) == {'1355', '1361', '1369'}
+    for task_id, task_before in captured.items():
+        expected_title = _8DF8_TITLE_BY_ID_INTERCEPTOR[task_id]
+        actual_title = task_before.get('title')
+        assert actual_title == expected_title, (
+            f'Single-id path task_id={task_id}: got title={actual_title!r}, '
+            f'expected={expected_title!r}'
+        )
+
+
