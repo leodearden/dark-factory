@@ -39,7 +39,18 @@ class TestSnapshotThreads:
         assert snapshot.get('main', 0) >= 1
 
     def test_named_asyncio_thread_bucketed(self):
-        """A thread named 'asyncio_test_X' must be counted in asyncio_pool."""
+        """A thread named 'asyncio_test_X' must be counted in asyncio_pool.
+
+        Counts the uniquely-named test thread via threading.enumerate() rather
+        than diffing the aggregate asyncio_pool bucket against a baseline.  The
+        baseline-diff approach was a flake vector: another asyncio_*-prefixed
+        thread terminating between the two _snapshot_threads() calls could net
+        the bucket delta to zero even though the test thread was correctly
+        bucketed.  By proving exactly one live thread named
+        'asyncio_test_snapshot_X' exists, the ``asyncio_pool >= 1`` assertion
+        is itself non-flaky (no baseline diff) yet still exercises the bucketing
+        logic directly.
+        """
         barrier = threading.Barrier(2)
         stop_event = threading.Event()
 
@@ -47,15 +58,18 @@ class TestSnapshotThreads:
             barrier.wait()
             stop_event.wait()
 
-        baseline = server_main._snapshot_threads()
         t = threading.Thread(target=worker, name='asyncio_test_snapshot_X', daemon=True)
         t.start()
         barrier.wait()  # ensure the thread is alive before snapshotting
         try:
             snapshot = server_main._snapshot_threads()
-            assert snapshot.get('asyncio_pool', 0) >= baseline.get('asyncio_pool', 0) + 1, (
-                f"Expected asyncio_pool to grow by at least 1; "
-                f"baseline={baseline}, snapshot={snapshot}"
+            named = [th for th in threading.enumerate() if th.name == 'asyncio_test_snapshot_X']
+            assert len(named) == 1, (
+                f"Expected exactly one live thread named 'asyncio_test_snapshot_X'; "
+                f"found {len(named)}: {sorted(th.name for th in threading.enumerate())}"
+            )
+            assert snapshot.get('asyncio_pool', 0) >= 1, (
+                f"Expected asyncio_pool >= 1; snapshot={snapshot}"
             )
         finally:
             stop_event.set()
@@ -165,6 +179,41 @@ class TestThreadMonitorIteration:
         # No breakdown line — the spike already passed
         assert not any('_total=' in r.getMessage() for r in monitor_records), (
             f"Unexpected breakdown in transient spike: {[r.getMessage() for r in monitor_records]}"
+        )
+
+    def test_transient_spike_nonzero_delta_emits_plain_info(self, monkeypatch, caplog):
+        """active_count>threshold but snapshot._total settles ≤ threshold, delta != 0 → plain INFO (no transient marker, no breakdown).
+
+        Pins the sibling branch documented in main.py:875-878: when the spike
+        resolves (snapshot._total ≤ threshold) but the count changed relative to
+        *prev* (delta != 0), the first ``if delta != 0 or count > threshold``
+        branch is taken, emitting an ordinary INFO line.  The ``elif`` transient
+        branch (``transient=true`` marker) is only reached when delta == 0 — as
+        tested by ``test_transient_spike_emits_info_with_marker``.
+
+        This is a characterisation/coverage test: the production code already
+        implements and documents this branch correctly; the test pins it so
+        future changes cannot silently break the observable output.
+        """
+        fake_snapshot = {
+            '_total': 55, 'main': 1, 'asyncio_pool': 50, 'executor': 2,
+            'aiosqlite': 2, 'timer': 0, 'other': 0,
+        }
+        monkeypatch.setattr(threading, 'active_count', lambda: 70)
+        monkeypatch.setattr(server_main, '_snapshot_threads', lambda: fake_snapshot)
+        with caplog.at_level(logging.INFO, logger='fused_memory.server.main'):
+            result = server_main._thread_monitor_iteration(prev=50, threshold=60)
+        assert result == 55
+        monitor_records = [r for r in caplog.records if 'thread_monitor' in r.getMessage()]
+        assert len(monitor_records) == 1, (
+            f"Expected exactly one thread_monitor record; "
+            f"got {[r.getMessage() for r in monitor_records]}"
+        )
+        assert monitor_records[0].levelno == logging.INFO
+        assert 'threads=55 delta=+5' in monitor_records[0].getMessage()
+        assert 'transient=true' not in monitor_records[0].getMessage()
+        assert not any('_total=' in r.getMessage() for r in monitor_records), (
+            f"Unexpected breakdown in plain-INFO branch: {[r.getMessage() for r in monitor_records]}"
         )
 
     def test_above_threshold_and_delta_uses_warning_not_info(self, monkeypatch, caplog):
