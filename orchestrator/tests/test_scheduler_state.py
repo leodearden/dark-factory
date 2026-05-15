@@ -598,3 +598,66 @@ class TestAcquireNextWritesSnapshot:
             'acquire_next must return a TaskAssignment even if snapshot write fails'
         )
         assert result.task_id == 'A'
+
+
+# ===========================================================================
+# Step-1334: _write_snapshot_best_effort short-circuits when project_root unset
+# ===========================================================================
+
+class TestWriteSnapshotBestEffortProjectRootGuard:
+    """_write_snapshot_best_effort skips the write when _project_root is unset."""
+
+    @pytest.mark.asyncio
+    async def test_write_snapshot_best_effort_skips_when_config_project_root_none(
+        self, tmp_path, monkeypatch
+    ):
+        """Construction-path repro: str(None) produces '_project_root == "None"';
+        the snapshot write must be refused rather than creating ./None/ on disk."""
+        from unittest.mock import MagicMock
+
+        config = OrchestratorConfig(max_per_module=1)
+        # Bypass pydantic validate_assignment=True: field_validator raises for
+        # config.project_root = None, so use object.__setattr__ to inject None
+        # directly, faithfully reproducing the str(None) path in scheduler.py:692.
+        object.__setattr__(config, 'project_root', None)
+
+        scheduler = Scheduler(config)
+        # Sanity: document the exact literal that str(None) produces.
+        assert scheduler._project_root == 'None', (
+            f"Expected '_project_root' to be the literal string 'None', "
+            f"got {scheduler._project_root!r}"
+        )
+
+        scheduler.write_state_snapshot = MagicMock()
+        monkeypatch.chdir(tmp_path)
+
+        await scheduler._write_snapshot_best_effort()
+
+        scheduler.write_state_snapshot.assert_not_called()
+        assert not (tmp_path / 'None').exists(), (
+            "A directory named 'None' must not be created under the CWD "
+            "when project_root is unset"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad_root', ['None', '', None])
+    async def test_write_snapshot_best_effort_skips_for_falsy_project_root(
+        self, bad_root, tmp_path, monkeypatch
+    ):
+        """Guard covers the literal 'None', empty string, and None itself."""
+        from unittest.mock import MagicMock
+
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        # Directly override _project_root, matching the test_scheduler_state.py
+        # direct-set pattern used at lines 565 and 586.
+        scheduler._project_root = bad_root
+
+        scheduler.write_state_snapshot = MagicMock()
+        monkeypatch.chdir(tmp_path)
+
+        await scheduler._write_snapshot_best_effort()
+
+        scheduler.write_state_snapshot.assert_not_called()
+        assert not (tmp_path / 'None').exists(), (
+            f"No 'None/' dir should be created for _project_root={bad_root!r}"
+        )
