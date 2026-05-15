@@ -48,6 +48,13 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     ):
         h = Harness(mock_orch_config)
 
+    # Deliberate bypass: Harness.start() / _start_escalation_server (harness.py:2162-2188)
+    # is NOT invoked — this fixture exercises only the escalation/harness boundary.
+    # We hand-wire only the notify/resolve callbacks here, mirroring the callback
+    # registrations in _start_escalation_server but omitting review_checkpoint.escalation_queue
+    # wiring and MCP-server bring-up.
+    # If _start_escalation_server grows new registrations (e.g. cleanup_supervisor or
+    # review_checkpoint hooks), this fixture will silently drift — revisit if that method grows.
     h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
     h._escalation_queue.set_notify_callback(h._on_escalation)
     h._escalation_queue.set_resolve_callback(h._on_escalation_resolved)
