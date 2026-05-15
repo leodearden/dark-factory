@@ -2366,6 +2366,26 @@ class Scheduler:
             'snapshot_at': datetime.now(UTC).isoformat(),
         }
 
+    def _build_snapshot_payload(self) -> str:
+        """Serialise the current scheduler business state to a stable JSON string.
+
+        Excludes ``snapshot_at`` from the output because that field is derived
+        from ``datetime.now()`` and changes on every call — including it would
+        make two consecutive calls with identical business state byte-different,
+        defeating the content-dedup check in ``_write_snapshot_best_effort``.
+
+        The ``snapshot_at`` field is added by ``write_state_snapshot`` when
+        building the final disk payload so the on-disk file always carries it
+        (preserving the contract checked by existing snapshot-path tests).
+
+        Returns a sorted-keys JSON string of ``get_state_snapshot()`` minus
+        ``snapshot_at``.  Sorted keys ensure deterministic output regardless
+        of insertion order.
+        """
+        state = self.get_state_snapshot()
+        state.pop('snapshot_at', None)
+        return json.dumps(state, default=str, sort_keys=True)
+
     def write_state_snapshot(self, path: Path) -> None:
         """Atomically write the current state snapshot to *path* as JSON.
 
@@ -2379,6 +2399,8 @@ class Scheduler:
             path = Path(path)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = path.with_suffix('.json.tmp')
+            # Full payload: build the stable business-state payload and enrich
+            # it with a fresh snapshot_at timestamp for the on-disk record.
             payload = json.dumps(self.get_state_snapshot(), default=str)
             tmp_path.write_text(payload, encoding='utf-8')
             os.replace(tmp_path, path)
@@ -2399,12 +2421,20 @@ class Scheduler:
         1 500 tasks), each write costs a few ms of disk I/O that is now
         transparent to the event loop.
 
-        **Throttle**: to avoid disk-write amplification, writes are
-        coalesced to at most one per ``config.snapshot_min_write_interval_secs``
-        (default 250 ms).  The first-ever write always proceeds.  Pass
-        ``force=True`` to bypass the throttle and guarantee an immediate write
-        (used by ``flush_state_snapshot``).  Throttled ticks are O(1) — a
-        single monotonic subtraction, no JSON serialisation.
+        **Throttle (time gate)**: writes are coalesced to at most one per
+        ``config.snapshot_min_write_interval_secs`` (default 250 ms).  The
+        first-ever write always proceeds.  Throttled ticks are O(1) — a
+        single monotonic subtraction, no JSON serialisation.  Pass
+        ``force=True`` to bypass the throttle and guarantee an immediate
+        write (used by ``flush_state_snapshot``).
+
+        **Content dedup**: after the time gate passes, the payload is built
+        once via ``_build_snapshot_payload()`` and compared against the last
+        written payload (``_last_snapshot_payload``).  If byte-identical,
+        the disk write is skipped but ``_last_snapshot_write_ts`` is still
+        updated to prevent re-serialisation on every subsequent tick of an
+        unchanged steady state.  ``force=True`` always writes regardless of
+        content equality.
 
         Swallows all exceptions so the scheduler never stops ticking due to
         disk or serialisation errors.
@@ -2422,21 +2452,32 @@ class Scheduler:
         # minimum interval at O(1) cost (monotonic subtraction only).
         # force=True bypasses the gate to guarantee a fresh write (e.g. flush
         # on quiescence/shutdown).
+        now = self._time_source()
         if not force:
-            now = self._time_source()
             interval = self.config.snapshot_min_write_interval_secs
             if (
                 self._last_snapshot_write_ts is not None
                 and (now - self._last_snapshot_write_ts) < interval
             ):
                 return  # throttled: within the coalesce window, no I/O
-        else:
-            now = self._time_source()
+        # Time gate passed (or force=True): build the payload once.
+        # Note: payload is built ONLY after the gate passes so throttled ticks
+        # remain O(1) — they never reach this serialisation point.
         try:
+            payload = self._build_snapshot_payload()
+            # Content dedup: skip the disk write if the business state has not
+            # changed since the last write.  Still advance the timestamp so the
+            # next throttle window starts from now (prevents re-serialisation
+            # every tick during an unchanged steady state).
+            # force=True always writes, regardless of content equality.
+            if not force and payload == self._last_snapshot_payload:
+                self._last_snapshot_write_ts = now
+                return
             path = (
                 Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
             )
             await asyncio.to_thread(self.write_state_snapshot, path)
+            self._last_snapshot_payload = payload
             self._last_snapshot_write_ts = now
         except Exception:
             logger.warning('_write_snapshot_best_effort failed', exc_info=True)
