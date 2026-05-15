@@ -3627,6 +3627,7 @@ class TestMarkerQuery:
     def test_round_trips_through_regex_used_by_legacy_test_stub(self):
         """Output is parseable by the legacy regex format (protects out-of-tree callers)."""
         import re
+
         from fused_memory.reconciliation.flag_dedup import _marker_query
 
         legacy_re = re.compile(r'^stage1 flag marker task (\S+) type (\S+)$')
