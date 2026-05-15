@@ -6,6 +6,7 @@ Task 1327 — AFK hardening: Per-N-escalation digest + EWA escalation/done trip.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import UTC, timedelta
 from datetime import datetime as _datetime
@@ -461,7 +462,7 @@ class TestRenderDigestMarkdown:
         """Tasks done in window count is rendered."""
         md = digest.render_digest_markdown(_make_digest_inputs())
         assert '## Tasks done in window' in md
-        assert '5' in md  # done_count
+        assert '## Tasks done in window\n5\n' in md  # done_count anchored to section header
 
     def test_cost_section(self) -> None:
         """Cost section includes watcher and total figures for window and 24h."""
@@ -476,15 +477,14 @@ class TestRenderDigestMarkdown:
         """Parked tasks section shows live count and window churn."""
         md = digest.render_digest_markdown(_make_digest_inputs())
         assert '## Parked tasks' in md
-        assert '3' in md  # parked_live
-        assert '7' in md  # parked_window_churn
+        assert re.search(r'- Live parked:\s+3\b', md)    # parked_live anchored to label (whitespace-flexible)
+        assert re.search(r'- Window churn:\s+7\b', md)  # parked_window_churn anchored to label (whitespace-flexible)
 
     def test_ewa_section_not_tripped(self) -> None:
         """EWA line shows value/threshold; no TRIPPED marker when not tripped."""
         md = digest.render_digest_markdown(_make_digest_inputs(tripped=False))
         assert '## EWA' in md
-        assert '2.5' in md   # ewa_value
-        assert '3.0' in md   # ewa_threshold
+        assert '- Value / threshold: 2.5000 / 3.0000\n' in md  # ewa_value / ewa_threshold rendered with :.4f, no TRIPPED on this path
         assert 'TRIPPED' not in md
 
     def test_ewa_section_tripped(self) -> None:
