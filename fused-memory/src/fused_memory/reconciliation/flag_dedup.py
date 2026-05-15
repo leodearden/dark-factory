@@ -467,6 +467,10 @@ async def _write_and_confirm_marker(
             tid, ftype, e,
         )
         return None, False
+    # ``confirm_and_track`` is required to never raise (``confirm_marker_persisted``
+    # has its own internal try/except; the breaker counter mutations are non-raising).
+    # If that invariant is broken by a future refactor, the exception will propagate
+    # out of this helper and abort the ``dedup_flags`` for-loop iteration.
     return await confirm_and_track(
         response.memory_ids, miss_warning_template, tid=tid, ftype=ftype,
     )
@@ -561,6 +565,8 @@ async def dedup_flags(
                 log=logger,
             )
             if c_id is None:
+                # ``miss_warning_msg`` MUST be a printf-style string with exactly
+                # two %s placeholders in order: (task_id, flag_type).
                 logger.warning(miss_warning_msg, tid, ftype)
                 consecutive_confirmation_misses += 1
                 if consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD:
