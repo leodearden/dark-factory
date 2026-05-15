@@ -1880,8 +1880,31 @@ class TaskWorkflow:
         # bug behind 16 successive Opus calls on task 917).
         total += 1
 
+        # Read-modify-write: fetch the backend's current metadata so that keys
+        # added after self.task was loaded (e.g. memory_hints re-attached by
+        # Stage-2 reconciliation) survive the write.  Mirror the boundary-
+        # normalisation pattern used in _handle_terminal_exit_on_block (line ~4187).
+        try:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort, fall back to in-memory
+            logger.warning(
+                'Task %s: failed to refresh metadata before no-plan counter '
+                'write; falling back to in-memory metadata '
+                '(memory_hints may be clobbered): %s',
+                self.task_id, exc,
+            )
+            fresh_task = None
+        # Merge: start from in-memory metadata so that locally-set keys not yet
+        # persisted are preserved, then overlay fresh backend keys so that
+        # backend-side additions (e.g. memory_hints from Stage-2 reconciliation)
+        # win on collision.  When get_task failed (fresh_task is None) the
+        # backend overlay is empty and we fall back to the in-memory copy only.
+        base_metadata: dict = {
+            **metadata,
+            **((fresh_task.get('metadata') or {}) if isinstance(fresh_task, dict) else {}),
+        }
         # Persist the new counters (best-effort — never block on this).
-        new_metadata = dict(metadata)
+        new_metadata = dict(base_metadata)
         new_metadata['last_no_plan_main_sha'] = current_main_sha
         new_metadata['consecutive_no_plan_failures'] = counter
         new_metadata['total_no_plan_failures'] = total
