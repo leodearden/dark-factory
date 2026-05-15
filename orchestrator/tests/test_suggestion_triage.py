@@ -407,6 +407,41 @@ class TestRouteReviewSuggestionsToCurator:
         write_mock.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_identical_second_call_short_circuits_curator_submit(self):
+        """Identical re-entry → exactly N POSTs across both calls, not 2*N.
+
+        The in-task dedup cache (self._last_routed_suggestion_hash) should
+        short-circuit the second call so the curator only receives one batch.
+        """
+        suggestions = self._suggestions()
+        wf = _make_workflow()
+
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            # First call — should submit
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Second call with identical suggestions — should be short-circuited
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Exactly N posts (one batch), not 2*N
+        assert len(posted_bodies) == len(suggestions), (
+            f'Expected {len(suggestions)} POSTs (one batch), got {len(posted_bodies)}: '
+            'second identical call should have been short-circuited by the dedup cache'
+        )
+
+    @pytest.mark.asyncio
     async def test_mcp_none_no_queue_logs_audit_warning_on_dropped_suggestions(
         self, caplog
     ):
