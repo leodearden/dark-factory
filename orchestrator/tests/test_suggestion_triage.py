@@ -386,7 +386,12 @@ class TestRouteReviewSuggestionsToCurator:
 
     @pytest.mark.asyncio
     async def test_mcp_none_falls_back_to_memory_when_no_queue(self):
-        """When both self.mcp and escalation_queue are None, _write_suggestions_to_memory is used."""
+        """When both self.mcp and escalation_queue are None, only the audit WARNING is emitted.
+
+        _write_suggestions_to_memory is NOT called — the previous dead call (which
+        immediately returned when mcp is None) was removed so the branch is now
+        unambiguous: log-only, no sink.
+        """
         suggestions = self._suggestions()
         wf = _make_workflow(escalation_queue=None)
         wf.mcp = None  # simulate missing MCP transport
@@ -399,7 +404,7 @@ class TestRouteReviewSuggestionsToCurator:
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
 
         mock_post.assert_not_called()
-        write_mock.assert_called_once()
+        write_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mcp_none_no_queue_logs_audit_warning_on_dropped_suggestions(
@@ -416,8 +421,8 @@ class TestRouteReviewSuggestionsToCurator:
         wf = _make_workflow(escalation_queue=None)
         wf.mcp = None  # simulate CLI/dry-run/test context
 
-        # Do NOT patch _write_suggestions_to_memory — exercise the real (no-op)
-        # path so we confirm the warning fires after the real fallback.
+        # _write_suggestions_to_memory is no longer called in this branch (dead call
+        # removed), so no patch is needed — the WARNING fires unconditionally.
         with (
             patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post,
             caplog.at_level(logging.WARNING, logger='orchestrator.workflow'),
