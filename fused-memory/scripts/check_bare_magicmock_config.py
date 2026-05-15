@@ -182,6 +182,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     is evaluated independently and may produce a separate Violation.
 
     SyntaxError in *source* → returns an empty list.
+
+    Returned violations are sorted ascending by (lineno, col_offset) for
+    deterministic source-order output (ast.walk yields BFS order, not source order).
     """
     try:
         tree = ast.parse(source, filename=filename)

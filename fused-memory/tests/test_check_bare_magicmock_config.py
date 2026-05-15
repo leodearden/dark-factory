@@ -309,18 +309,22 @@ class TestFindViolationsOutputOrder:
 
     def test_violations_sorted_ascending_by_col_offset_within_same_line(self):
         """Within the same line, violations are ordered by col_offset ascending."""
-        # Two chained assignments on different lines — col_offset for each is 0.
-        # Main test: same-line, different col_offsets via two separate stmts
-        # sharing a line is not possible, so we test via a chained assign
-        # where two targets have different col_offsets on the same line.
+        # NOTE: This is a guard, not a true adversarial regression test.
+        # Chained-assign targets (config = cfg = MagicMock()) are appended to
+        # ast.Assign.targets left-to-right, so col_offsets are inherently
+        # col_offset-ascending; col_offsets == sorted(col_offsets) would hold
+        # even without the sorted() call in find_violations().  No Python
+        # construct yields same-line violations in descending col_offset order,
+        # so the col_offset sort path cannot be adversarially isolated.
+        # The test documents and guards the ordering contract.
         # Python AST: 'config = cfg = MagicMock()' — both on line 1.
         # config is at col_offset 0; cfg is at col_offset 9.
         source = 'config = cfg = MagicMock()\n'
         violations = find_violations(source, 'test_col_order.py')
         assert len(violations) == 2
         col_offsets = [v.col_offset for v in violations]
-        assert col_offsets == sorted(col_offsets), (
-            f'find_violations() must sort by col_offset within same line; got {col_offsets}'
+        assert col_offsets == [0, 9], (
+            f'find_violations() must sort by col_offset within same line; expected [0, 9], got {col_offsets}'
         )
 
 
