@@ -8,6 +8,7 @@ colliding with sibling subprojects' helpers.
 """
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock
@@ -130,6 +131,168 @@ def extract_params(call_args: Any) -> dict:
     if len(call_args.args) > 1:
         return call_args.args[1]
     return call_args.kwargs.get('params', {})
+
+
+# ---------------------------------------------------------------------------
+# 8df8bdcd regression scenario builder + shared parse helpers
+# ---------------------------------------------------------------------------
+#
+# Cycle 8df8bdcd: tasks 1355/1361/1369 appeared in Stage 1 output each
+# carrying the NEXT task's title in the sorted completion sequence.
+# The canonical scenario (task 1379) uses non-consecutive ids in completion
+# order 1369→1355→1361 (differs from id-sort order 1355<1361<1369).
+#
+# Centralised here so the four test suites that cover this contract import
+# from a single source of truth instead of each keeping a private copy.
+# ---------------------------------------------------------------------------
+
+# Active-task rendered line format: "- [<id>] (<status>) <title> deps=[...]"
+ID_TITLE_LINE_RE: re.Pattern[str] = re.compile(
+    r'^- \[(\d+)\] \([^)]+\) (.+?) deps=',
+    re.MULTILINE,
+)
+
+# Provenance-section rendered line format:
+#   commit branch:  "- [<id>] <title>" (no trailing token, just EOL or continuation)
+#   legacy branch:  "- [<id>] <title> — provenance: ..."
+# Capture everything up to the first "—" (em-dash) or end-of-line.
+PROVENANCE_LINE_RE: re.Pattern[str] = re.compile(
+    r'^- \[(\d+)\] (.+?)(?:\s*—|\s*$)',
+    re.MULTILINE,
+)
+
+# Canonical titles for the three 8df8bdcd scenario tasks (completion-order list).
+_8DF8_IDS_IN_COMPLETION_ORDER = [1369, 1355, 1361]
+_8DF8_TITLES = {
+    1369: 'Refactor event dispatch to async',
+    1355: 'Implement rate limiter middleware',
+    1361: 'Add retry logic for database connections',
+}
+# Per-task provenance metadata mirroring test_stages.py _TASKS fixture:
+#   1369 — commit branch
+#   1355 — note-only branch
+#   1361 — legacy/none (no metadata.done_provenance key)
+_8DF8_PROVENANCE: dict[int, dict | None] = {
+    1369: {'commit': 'abc123deadbeef'},
+    1355: {'note': 'Covered by sibling task 1354'},
+    1361: None,  # legacy: no done_provenance
+}
+
+
+def make_8df8_scenario(
+    *,
+    id_type: type = int,
+    status: str = 'done',
+    with_provenance: bool = False,
+) -> tuple[list[dict], dict]:
+    """Return the canonical 8df8bdcd scenario as (tasks, title_by_id).
+
+    Args:
+        id_type: ``int`` or ``str`` — coerces task ids and title_by_id keys.
+        status: Task status string applied to all three tasks.
+        with_provenance: When True, attaches metadata.done_provenance to tasks
+            that have a provenance fixture (matching test_stages.py's _TASKS).
+            Task 1361 (legacy branch) gets no metadata.done_provenance key.
+
+    Returns:
+        A 2-tuple ``(tasks, title_by_id)`` where:
+        - ``tasks`` is a list of 3 task dicts in completion order (1369→1355→1361).
+        - ``title_by_id`` maps id (coerced to id_type) → title string.
+    """
+    tasks: list[dict] = []
+    for raw_id in _8DF8_IDS_IN_COMPLETION_ORDER:
+        task: dict = {
+            'id': id_type(raw_id),
+            'title': _8DF8_TITLES[raw_id],
+            'status': status,
+            'dependencies': [],
+        }
+        if with_provenance:
+            prov = _8DF8_PROVENANCE[raw_id]
+            if prov is not None:
+                task['metadata'] = {'done_provenance': prov}
+        tasks.append(task)
+
+    title_by_id: dict = {id_type(raw_id): _8DF8_TITLES[raw_id] for raw_id in _8DF8_IDS_IN_COMPLETION_ORDER}
+    return tasks, title_by_id
+
+
+def parse_rendered_id_title_pairs(rendered: str, kind: str) -> dict[int, str]:
+    """Extract {id: title} pairs from a rendered task output string.
+
+    Args:
+        rendered: The string output of a formatter (format_task_list,
+            format_filtered_task_tree, _render_done_provenance_section, …).
+        kind: ``'active'`` to parse active-task lines via ID_TITLE_LINE_RE,
+              ``'provenance'`` to parse provenance-section lines via
+              PROVENANCE_LINE_RE.
+
+    Returns:
+        A dict mapping integer task id → stripped title string.
+        Returns an empty dict when no lines match (callers must guard
+        against vacuity themselves or use assert_id_title_pairing).
+    """
+    pattern = ID_TITLE_LINE_RE if kind == 'active' else PROVENANCE_LINE_RE
+    found: dict[int, str] = {}
+    for m in pattern.finditer(rendered):
+        found[int(m.group(1))] = m.group(2).strip()
+    return found
+
+
+def assert_id_title_pairing(
+    rendered: str,
+    title_by_id: dict,
+    kind: str,
+    *,
+    expected_ids: set | None = None,
+) -> None:
+    """Assert that every rendered id pairs with its OWN title from title_by_id.
+
+    Bundles three checks:
+    1. Anti-vacuity: the regex found at least one match (zero matches → fail loudly).
+    2. Own-title check: for each found id, rendered title == title_by_id[id].
+    3. No-neighbor-bleed check: if expected_ids is given, asserts found.keys() ==
+       expected_ids (all expected ids present, no extra ids).
+
+    Args:
+        rendered: The formatter output string.
+        title_by_id: Map of id → expected title.  Keys may be int or str;
+            they are compared after normalising both sides to int.
+        kind: ``'active'`` or ``'provenance'`` (forwarded to parse helper).
+        expected_ids: Optional set of int ids expected to appear.  When None,
+            only asserts that at least one match was found.
+
+    Raises:
+        AssertionError: On zero matches, wrong title, or unexpected ids.
+    """
+    found = parse_rendered_id_title_pairs(rendered, kind=kind)
+
+    # 1. Anti-vacuity
+    assert found, (
+        f'assert_id_title_pairing: regex matched nothing in rendered output '
+        f'(kind={kind!r}) — test would be vacuous.\n'
+        f'Rendered:\n{rendered}'
+    )
+
+    # Normalise title_by_id keys to int for comparison
+    norm_title_by_id: dict[int, str] = {int(k): v for k, v in title_by_id.items()}
+
+    # 2. Own-title check
+    for tid, rendered_title in found.items():
+        if tid in norm_title_by_id:
+            expected_title = norm_title_by_id[tid]
+            assert rendered_title == expected_title, (
+                f'id={tid}: rendered title={rendered_title!r}, '
+                f'expected own title={expected_title!r}\n'
+                f'Rendered:\n{rendered}'
+            )
+
+    # 3. Expected-ids check (no-neighbor-bleed and completeness)
+    if expected_ids is not None:
+        assert set(found.keys()) == expected_ids, (
+            f'Expected ids {expected_ids}, got {set(found.keys())}.\n'
+            f'Rendered:\n{rendered}'
+        )
 
 
 async def submit_and_resolve(
