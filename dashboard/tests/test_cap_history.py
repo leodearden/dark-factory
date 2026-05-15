@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import aiosqlite
 import pytest
@@ -365,6 +365,56 @@ class TestReadCapIntervals:
             f"Expected 0 intervals with tz-aware now (boundary row at exact cutoff "
             f"is excluded under half-open semantics), got {result_aware}"
         )
+
+    @pytest.mark.asyncio
+    async def test_non_utc_now_normalized_to_utc(self, tmp_path):
+        """A tz-aware but non-UTC `now` must yield identical results to the UTC equivalent.
+
+        A non-UTC offset (e.g. ``-08:00``) produces a cutoff isoformat with a
+        non-UTC suffix (e.g. ``"2026-05-08T04:00:00-08:00"``).  That string
+        compares *incorrectly* against the ``+00:00``-suffixed ISO strings stored
+        in ``account_events.created_at`` via SQLite's lexicographic TEXT ordering:
+        the ``-`` in ``-08:00`` sorts *before* ``+``, so the offset-negative cutoff
+        string sorts before any ``+00:00`` string of the same UTC instant, causing
+        the window to appear larger than it is.
+
+        After the fix, ``astimezone(UTC)`` converts any tz-aware ``now`` to UTC
+        before computing the cutoff, so the suffix is always ``+00:00``.
+        """
+        # A UTC reference instant
+        real_now_utc = datetime.now(UTC)
+        cutoff_instant_utc = real_now_utc - timedelta(days=7)
+
+        # Equivalent now in a fixed -08:00 offset timezone
+        tz_minus8 = timezone(timedelta(hours=-8))
+        real_now_minus8 = real_now_utc.astimezone(tz_minus8)
+
+        # Insert one tz-aware boundary row (production format: +00:00 suffix).
+        # Using a tz-aware row here is intentional: we want to verify the
+        # *cutoff* normalisation is correct, not the row normalisation path.
+        db_path = _make_db_with_events(tmp_path, 'non_utc_now.db', [
+            ('acc-x', 'cap_hit', cutoff_instant_utc),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            result_utc = await read_cap_intervals(
+                [conn], days=7, now=real_now_utc
+            )
+            result_minus8 = await read_cap_intervals(
+                [conn], days=7, now=real_now_minus8
+            )
+
+        # Both should return the same set: the boundary row is at the exact
+        # cutoff edge, excluded by >=, so both calls should return 0 intervals.
+        assert len(result_utc) == len(result_minus8), (
+            f"UTC now → {len(result_utc)} interval(s), "
+            f"-08:00 now → {len(result_minus8)} interval(s); expected equal counts. "
+            f"Bug: non-UTC cutoff has a non-+00:00 suffix that compares incorrectly "
+            f"against tz-aware DB rows via lexicographic string ordering."
+        )
+        assert {iv.account_name for iv in result_utc} == {iv.account_name for iv in result_minus8}
 
 
 # ---------------------------------------------------------------------------
