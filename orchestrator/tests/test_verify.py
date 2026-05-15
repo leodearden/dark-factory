@@ -20,6 +20,7 @@ from orchestrator.verify import (
     _maybe_prune_archive,
     _run_cmd,
     _scope_cargo_workspace,
+    run_full_verification,
     run_scoped_verification,
     run_verification,
     scope_module_config,
@@ -3744,3 +3745,135 @@ class TestRunCmdStreaming:
         assert 'hello' in stdout
         # No log file should appear in tmp_path.
         assert list(tmp_path.iterdir()) == []
+
+
+class TestRunFullVerificationReuse:
+    """Tests for run_full_verification reusing config._module_configs.
+
+    Guards the optimization that skips _discover_module_configs when
+    config._module_configs is already populated and project_root matches
+    config.project_root.
+    """
+
+    def _make_passing_result(self) -> VerifyResult:
+        return VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='ok',
+        )
+
+    @pytest.mark.asyncio
+    async def test_reuses_populated_config_module_configs_when_root_matches(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """run_full_verification skips _discover_module_configs when config._module_configs
+        is already populated and the resolved project_root arg matches config.project_root."""
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+        }
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert call_count == 0, (
+            f'Expected _discover_module_configs not to be called when reusing '
+            f'config._module_configs; called {call_count} time(s)'
+        )
+        # Confirm semantic equivalence: the reused dict was actually consumed —
+        # run_verification should have been called exactly once, with the 'dashboard'
+        # ModuleConfig passed as the third positional arg.
+        assert mock_run_verification.call_count == 1, (
+            f'Expected run_verification to be called exactly once (one module config); '
+            f'called {mock_run_verification.call_count} time(s)'
+        )
+        called_mc = mock_run_verification.call_args[0][2]  # positional arg index 2
+        assert called_mc.prefix == 'dashboard', (
+            f"Expected run_verification to be called with the 'dashboard' ModuleConfig; "
+            f"got prefix={called_mc.prefix!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_discovery_when_module_configs_empty(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """run_full_verification calls _discover_module_configs when config._module_configs is empty.
+
+        With no orchestrator.yaml files under tmp_path, discovery returns {} and
+        the global-fallback branch fires (run_verification once with no module_config).
+        """
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        # config._module_configs left as default empty dict
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        # No orchestrator.yaml in tmp_path → discovery returns {} → global fallback fires
+        passing = self._make_passing_result()
+        with patch('orchestrator.verify.run_verification', new=AsyncMock(return_value=passing)):
+            await run_full_verification(tmp_path, config)
+
+        assert call_count >= 1, (
+            f'Expected _discover_module_configs to be called when config._module_configs is empty; '
+            f'called {call_count} time(s)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_discovery_when_root_arg_differs(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """run_full_verification falls back to _discover_module_configs when the project_root
+        arg resolves to a different path than config.project_root."""
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        # Config is rooted at one directory
+        config_root = tmp_path / 'config_root'
+        config_root.mkdir()
+        config = OrchestratorConfig(project_root=config_root)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+        }
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        # Pass a different root → resolved paths differ → must re-discover
+        other_root = tmp_path / 'other_root'
+        other_root.mkdir()
+        passing = self._make_passing_result()
+        with patch('orchestrator.verify.run_verification', new=AsyncMock(return_value=passing)):
+            await run_full_verification(other_root, config)
+
+        assert call_count >= 1, (
+            f'Expected _discover_module_configs to be called when project_root differs '
+            f'from config.project_root; called {call_count} time(s)'
+        )

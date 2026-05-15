@@ -1635,10 +1635,34 @@ async def run_full_verification(
     Unlike run_scoped_verification, this runs full (unscoped) test suites
     for every subproject that has an orchestrator.yaml. Used by review
     checkpoints to check integration health across the whole codebase.
+
+    Discovery reuse: when ``config._module_configs`` is already populated (as it
+    always is after ``load_config``) and *project_root* resolves to the same
+    absolute path as ``config.project_root``, the pre-discovered dict is reused
+    directly and no additional filesystem walk is performed.  A fresh walk via
+    ``_discover_module_configs`` is retained as a fallback for the cases where
+    *project_root* differs from ``config.project_root`` or where the config was
+    constructed without going through ``load_config`` (e.g. direct instantiation
+    in tests that leave ``_module_configs`` empty).
+
+    **Staleness note**: because the reuse path reads a snapshot captured at
+    process startup (by ``load_config``), a new subproject whose
+    ``orchestrator.yaml`` is added or merged *after* startup will not appear in
+    the module set until the process restarts.  In the primary production call
+    site (``review_checkpoint.py``) this means a freshly-created subproject
+    module is absent from full verification for the remainder of the current
+    orchestrator run.  If dynamic re-discovery is needed (e.g. after a merge
+    that introduces a new module), pass a fresh ``OrchestratorConfig`` instance
+    (with ``_module_configs`` empty or with a root that differs from
+    ``config.project_root``) to force the fallback walk.
     """
     from orchestrator.config import _discover_module_configs
 
-    module_configs = _discover_module_configs(project_root)
+    resolved = project_root.resolve()
+    if config._module_configs and resolved == config.project_root:
+        module_configs = config._module_configs
+    else:
+        module_configs = _discover_module_configs(project_root)
     if not module_configs:
         logger.info('Full verification: no subproject configs — using global')
         return await run_verification(project_root, config)

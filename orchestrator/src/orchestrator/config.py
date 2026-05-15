@@ -448,7 +448,14 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
       reserved name — however deeply nested — is silently skipped.  If a legitimate module
       directory shares a name with a reserved dir (e.g. a module literally called ``build``),
       its ``orchestrator.yaml`` will not be discovered; rename the directory or place the
-      config at a depth that avoids the collision.
+      config at a depth that avoids the collision.  When a pruned directory **directly**
+      contains an ``orchestrator.yaml`` (a "shadow" config, i.e. ``<reserved>/orchestrator.yaml``
+      with no intervening subdirectory), a runtime warning is emitted so operators can detect
+      and resolve the collision rather than having the config silently disappear.
+      **Limitation**: an ``orchestrator.yaml`` nested *deeper* inside a pruned directory
+      (e.g. ``build/some_sub/orchestrator.yaml``) is **still silently dropped** — the walk
+      never descends into the pruned tree, so no stat is performed for deeper levels.  Only
+      the immediate child case is diagnosed.
     - Uses ``followlinks=False`` (passed explicitly) for symlink-cycle safety — a symlink that
       points back into an ancestor directory cannot drive infinite recursion because the walk
       will not follow it.
@@ -456,11 +463,14 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
       deterministic regardless of filesystem order.
 
     Performance note:
-    This performs a full recursive walk of *project_root* on every call (once at startup via
-    ``load_config``, and again inside ``run_full_verification``).  On large repositories with
-    many non-excluded subdirectories this can be noticeable.  If discovery latency is a
-    concern, consider adding project-specific directories to ``_DISCOVERY_EXCLUDED_DIRS`` or
-    reducing the nesting depth of your module layout.
+    This performs a full recursive walk of *project_root* on every call.  In the normal flow
+    it is called once at startup via ``load_config``, which stores the result in
+    ``OrchestratorConfig._module_configs``.  ``run_full_verification`` reuses that cached dict
+    when its *project_root* arg resolves to the same absolute path as ``config.project_root``,
+    so no redundant walk occurs in the typical case.  On large repositories with many
+    non-excluded subdirectories the walk can be noticeable; adding project-specific directories
+    to ``_DISCOVERY_EXCLUDED_DIRS`` or reducing the nesting depth of your module layout will
+    help when the fallback walk path is exercised.
 
     Depth and scheduler coherence:
     ``OrchestratorConfig.for_module`` resolves configs via longest-matching prefix walk, but
@@ -476,6 +486,20 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
     # followlinks=False (the default, stated explicitly so a future refactor cannot flip it
     # silently): prevents infinite recursion from self-referencing symlink cycles.
     for dirpath, dirnames, filenames in os.walk(project_root, followlinks=False):
+        # Warn about pruned directories that directly contain an orchestrator.yaml
+        # (one cheap stat per about-to-be-excluded sibling; no descent into the tree).
+        for d in dirnames:
+            if d in _DISCOVERY_EXCLUDED_DIRS:
+                shadow = Path(dirpath) / d / 'orchestrator.yaml'
+                if shadow.is_file():
+                    rel = shadow.parent.relative_to(project_root)
+                    logger.warning(
+                        'Skipping orchestrator.yaml under pruned directory %s '
+                        '(reserved name %r); rename the directory or remove the '
+                        'file to suppress this warning.',
+                        rel,
+                        d,
+                    )
         dirnames[:] = [d for d in dirnames if d not in _DISCOVERY_EXCLUDED_DIRS]
         if 'orchestrator.yaml' not in filenames:
             continue
