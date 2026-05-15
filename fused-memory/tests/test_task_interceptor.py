@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from _fm_helpers import make_8df8_scenario, submit_and_resolve as _submit_and_resolve
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
@@ -6163,25 +6163,11 @@ async def test_process_add_ticket_cancelled_after_dispatch_emits_orphan_warning(
 
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
-#
-# Cycle 8df8bdcd: tasks 1355/1361/1369 appeared in Stage 1 output each
-# carrying the NEXT task's title in the sorted completion sequence.
-# The ONLY locus where a data-layer off-by-one could live is the
-# `before = await tm.get_task(task_id)` capture + `asyncio.create_task(
-# reconcile_task(..., task_before=before))` eager-arg binding in
-# `_apply_status_transition` (aliasing/late-binding class of bug).
-# Investigation (task 1379, supersedes dc68f7b9, corroborates d3f56765):
-# `before` is a fresh local per invocation; CSV loops sequentially; create_task
-# args bind eagerly at coroutine creation — no aliasing across the window.
-# This test locks the before-capture/spawn contract.
+# Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='pending').
+# Tests lock the before-capture/spawn contract in _apply_status_transition.
 
-# Fixture constants (same scenario as test_targeted.py _8DF8_* constants):
-_8DF8_TASKS_INTERCEPTOR = [
-    {'id': '1369', 'title': 'Refactor event dispatch to async', 'status': 'pending'},
-    {'id': '1355', 'title': 'Implement rate limiter middleware', 'status': 'pending'},
-    {'id': '1361', 'title': 'Add retry logic for database connections', 'status': 'pending'},
-]
-_8DF8_TITLE_BY_ID_INTERCEPTOR = {t['id']: t['title'] for t in _8DF8_TASKS_INTERCEPTOR}
+# Fixture: 8df8bdcd scenario (str ids, pending) — canonical definition in _fm_helpers.py
+_8DF8_TASKS_INTERCEPTOR, _8DF8_TITLE_BY_ID_INTERCEPTOR = make_8df8_scenario(id_type=str, status='pending')
 
 
 @pytest.mark.asyncio
