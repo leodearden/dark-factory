@@ -574,3 +574,163 @@ class TestHarnessCostCeiling:
         assert all_args.get('reason') == 'cost_ceiling_watcher_exceeded', (
             f'Expected reason=cost_ceiling_watcher_exceeded in RunStore call; got {all_args!r}'
         )
+
+    # ------------------------------------------------------------------
+    # Step 9 — _enforce_cost_ceilings: orch-wide, ordering, idempotency
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_orch_wide_trip(self, tmp_path: Path) -> None:
+        """Orch-wide cost exceeding orch ceiling pauses with 'cost_ceiling_orch_exceeded'.
+
+        Watcher cost is under its ceiling; total cost exceeds orch ceiling.
+        """
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=1000.0,  # NOT exceeded
+            orch_daily_cost_ceiling_usd=20.0,       # WILL be exceeded
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-orch-0001'
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        # Seed a non-watcher row summing to 25.0 > orch ceiling 20.0
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=25.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+
+        await harness._enforce_cost_ceilings()
+
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_reason == 'cost_ceiling_orch_exceeded', (
+            f'Expected cost_ceiling_orch_exceeded; got {harness.scheduler.pause_reason!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_both_under_no_pause(self, tmp_path: Path) -> None:
+        """When both ceilings are NOT exceeded, scheduler is not paused."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=1000.0,
+            orch_daily_cost_ceiling_usd=1000.0,
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-under-0001'
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=1.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+
+        await harness._enforce_cost_ceilings()
+
+        assert harness.scheduler.is_paused is False, (
+            'Scheduler must NOT be paused when both costs are under ceilings'
+        )
+        mock_run_store.save_scheduler_pause.assert_not_called()
+
+        # acquire_next should return None only if paused; here it should proceed
+        # (returns None because no tasks, but NOT because paused).
+        assert not harness.scheduler.is_paused
+
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_both_exceed_watcher_reason_wins(
+        self, tmp_path: Path
+    ) -> None:
+        """When BOTH ceilings would be exceeded, watcher reason wins (checked first)."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=5.0,   # WILL be exceeded
+            orch_daily_cost_ceiling_usd=10.0,     # also exceeded by total
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-both-0001'
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        # Watcher row: 8.0 > watcher ceiling 5.0 AND > orch ceiling 10? No — need
+        # total to also exceed orch ceiling. Seed both.
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='dark_factory',
+            account_name='acct', model='opus', role='escalation-watcher-auto',
+            cost_usd=8.0, input_tokens=None, output_tokens=None,  # > watcher ceil 5.0
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+        await store.save_invocation(
+            run_id='r2', task_id='t2', project_id='dark_factory',
+            account_name='acct', model='sonnet', role='orchestrator',
+            cost_usd=5.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-2)),
+            completed_at=_iso(timedelta(hours=-2)),
+        )
+        # Total = 13.0 > orch ceiling 10.0; watcher = 8.0 > watcher ceiling 5.0
+
+        await harness._enforce_cost_ceilings()
+
+        assert harness.scheduler.pause_reason == 'cost_ceiling_watcher_exceeded', (
+            f'Watcher reason must win when both ceilings trip; '
+            f'got {harness.scheduler.pause_reason!r}'
+        )
+        # save_scheduler_pause called exactly once (watcher branch returns early)
+        mock_run_store.save_scheduler_pause.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_already_paused_no_extra_call(
+        self, tmp_path: Path
+    ) -> None:
+        """When scheduler is already paused, _enforce_cost_ceilings() returns immediately.
+
+        No additional RunStore.save_scheduler_pause call is made.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        # Pre-pause the scheduler.
+        await harness.pause_scheduler('pre-existing-pause')
+        mock_run_store.reset_mock()  # clear prior call count
+
+        # Even with watcher rows above threshold, no new pause call should be made.
+        await store.save_invocation(
+            run_id='r1', task_id='t1', project_id='dark_factory',
+            account_name='acct', model='opus', role='escalation-watcher-auto',
+            cost_usd=999.0, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None,
+            duration_ms=100, capped=False,
+            started_at=_iso(timedelta(hours=-1)),
+            completed_at=_iso(timedelta(hours=-1)),
+        )
+
+        await harness._enforce_cost_ceilings()
+
+        mock_run_store.save_scheduler_pause.assert_not_called(), (
+            'Already-paused scheduler: _enforce_cost_ceilings must NOT call '
+            'save_scheduler_pause again'
+        )
+        # Original pause reason must be preserved
+        assert harness.scheduler.pause_reason == 'pre-existing-pause'
