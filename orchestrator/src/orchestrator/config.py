@@ -977,6 +977,14 @@ class OrchestratorConfig(BaseSettings):
     # None means "discovery never ran" (default); any dict (including {}) means
     # "discovery ran" — the empty-dict case is treated as a valid discovered-empty
     # result, not as uninitialized.  See run_full_verification for the reuse guard.
+    #
+    # Consumer normalization contract: any code outside load_config that reads
+    # _module_configs for iteration MUST normalize None → {} before calling
+    # .values() or iterating, because direct OrchestratorConfig(...) instantiation
+    # (e.g. build_eval_orch_config in evals/runner.py) leaves the sentinel at None.
+    # Two canonical examples that honour this contract:
+    #   • OrchestratorConfig.for_module (this file): `if not self._module_configs:`
+    #   • escalation/server.py merge_request tool: `(orch_config._module_configs or {}).values()`
     _module_configs: dict[str, ModuleConfig] | None = PrivateAttr(default=None)
 
     @field_validator('project_root', mode='after')
