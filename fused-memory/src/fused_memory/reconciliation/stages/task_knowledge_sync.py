@@ -1628,12 +1628,15 @@ class TaskKnowledgeSync(BaseStage):
                 )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
-        # _query_stage2_flags is best-effort: search failures yield ([], [], []) internally.
-        # Returns a Stage2FlagPartition with three fields:
+        # _query_stage2_flags is best-effort: search failures yield ([], [], [], []) internally.
+        # Returns a Stage2FlagPartition with four fields:
         #   .current          — markers whose run_id matches the current run, OR whose
         #                       Mem0 created_at is within the run window (task-1369 guard)
         #   .stale_missing_run_id_ids  — prior-cycle markers with absent/empty run_id
         #   .stale_mismatched_run_id_ids — prior-cycle markers with wrong run_id
+        #   .rescued_ids      — ids of markers rescued by the run-window guard (subset of
+        #                       .current); single source of truth for the rescued count
+        #                       (task-1381, replaces the re-derivation over active_flags)
         # Both stale buckets contain only genuine prior-cycle residue (in-window same-
         # cycle markers are rescued to .current by the run-window guard) and are swept
         # below so they are never rendered to the LLM.
@@ -1662,14 +1665,12 @@ class TaskKnowledgeSync(BaseStage):
         active_flags = partition.current
         stale_marker_ids = partition.stale_all_ids
         self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
-        # Count markers rescued by the run-window guard: active flags whose run_id
-        # does NOT match the current run (they were missing or mis-stamped but were
-        # written during this run's window and thus routed to current rather than swept).
-        _run_id_str = str(run_id_for_markers)
-        self._rescued_in_window_markers = sum(
-            1 for f in active_flags
-            if not (f['metadata'].get('run_id') and str(f['metadata']['run_id']) == _run_id_str)
-        )
+        # Single source of truth for the rescued count: read directly from
+        # partition.rescued_ids, which is populated exclusively by the run-window
+        # guard branches inside _query_stage2_flags (task-1381).  Avoids re-deriving
+        # the partition predicate here, so any future change to the guard logic
+        # automatically flows through to this counter without drift.
+        self._rescued_in_window_markers = len(partition.rescued_ids)
 
         # SCOPE ADDITION (task 1139): apply the known-bug-1139 scope filter to
         # the active-query path ONLY.  Stage 1's structured-output flags are
