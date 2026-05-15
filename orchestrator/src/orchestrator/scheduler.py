@@ -749,6 +749,16 @@ class Scheduler:
         self._blocked_task_ids_in_window: set[str] = set()
         # Callback installed by the Harness so trip → persistence + event.
         self._on_park_stop_trip: Callable[[str], Any] | None = None
+        # --- Snapshot write throttle (task 1332) ---
+        # Monotonic timestamp of the last successful _write_snapshot_best_effort
+        # disk write.  None before the first write; the first write always
+        # proceeds regardless of the throttle interval.
+        self._last_snapshot_write_ts: float | None = None
+        # Serialised payload from the last disk write.  Used for content-diff:
+        # if the new payload is byte-identical, the disk write is skipped even
+        # after the time gate passes (populated in step-6; kept here for
+        # structural completeness and future use).
+        self._last_snapshot_payload: str | None = None
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -2377,7 +2387,7 @@ class Scheduler:
                 'write_state_snapshot failed for path %s', path, exc_info=True
             )
 
-    async def _write_snapshot_best_effort(self) -> None:
+    async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.
 
         Derives the path from ``_project_root`` and offloads the JSON
@@ -2389,6 +2399,13 @@ class Scheduler:
         1 500 tasks), each write costs a few ms of disk I/O that is now
         transparent to the event loop.
 
+        **Throttle**: to avoid disk-write amplification, writes are
+        coalesced to at most one per ``config.snapshot_min_write_interval_secs``
+        (default 250 ms).  The first-ever write always proceeds.  Pass
+        ``force=True`` to bypass the throttle and guarantee an immediate write
+        (used by ``flush_state_snapshot``).  Throttled ticks are O(1) — a
+        single monotonic subtraction, no JSON serialisation.
+
         Swallows all exceptions so the scheduler never stops ticking due to
         disk or serialisation errors.
         """
@@ -2396,16 +2413,46 @@ class Scheduler:
         # self._project_root = str(None) == 'None'.  Without this check,
         # Path('None') / 'data' / 'orchestrator' / 'scheduler_state.json'
         # would silently create a directory literally named ./None/ under the
-        # process CWD.  Refuse the write instead.
+        # process CWD.  Refuse the write instead.  This guard MUST run before
+        # any timestamp bookkeeping so a no-project-root scheduler does not
+        # advance _last_snapshot_write_ts for a write that never happens.
         if not self._project_root or self._project_root == 'None':
             return
+        # Leading-edge time throttle.  Coalesces ticks within the configured
+        # minimum interval at O(1) cost (monotonic subtraction only).
+        # force=True bypasses the gate to guarantee a fresh write (e.g. flush
+        # on quiescence/shutdown).
+        if not force:
+            now = self._time_source()
+            interval = self.config.snapshot_min_write_interval_secs
+            if (
+                self._last_snapshot_write_ts is not None
+                and (now - self._last_snapshot_write_ts) < interval
+            ):
+                return  # throttled: within the coalesce window, no I/O
+        else:
+            now = self._time_source()
         try:
             path = (
                 Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
             )
             await asyncio.to_thread(self.write_state_snapshot, path)
+            self._last_snapshot_write_ts = now
         except Exception:
             logger.warning('_write_snapshot_best_effort failed', exc_info=True)
+
+    async def flush_state_snapshot(self) -> None:
+        """Force an immediate state snapshot write, bypassing the throttle.
+
+        Guarantees that the on-disk snapshot reflects the most recent in-memory
+        state regardless of how recently the last throttled write occurred.
+        Intended for shutdown or quiescence paths where a stale-on-disk read
+        would be incorrect.
+
+        The project_root guard still applies: if ``_project_root`` is unset,
+        this is a no-op (there is nowhere to write, even under force).
+        """
+        await self._write_snapshot_best_effort(force=True)
 
     async def handle_blast_radius_expansion(
         self,
