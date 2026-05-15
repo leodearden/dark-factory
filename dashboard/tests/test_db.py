@@ -383,6 +383,8 @@ class TestDbPool:
         # Both flags are set synchronously inside `await conn.close()`, which runs
         # in the resumed getter task — they are therefore settled by the time
         # `await getter` returns above.
+        # Verified against aiosqlite >=0.22.x — bump and re-verify the
+        # private-attribute lifecycle if this pin moves.
         assert hasattr(opened[0], '_connection') and hasattr(opened[0], '_running'), (
             'aiosqlite internal attribute names changed — update test'
         )
