@@ -229,13 +229,15 @@ def parse_rendered_id_title_pairs(rendered: str, kind: str) -> dict[int, str]:
             format_filtered_task_tree, _render_done_provenance_section, …).
         kind: ``'active'`` to parse active-task lines via ID_TITLE_LINE_RE,
               ``'provenance'`` to parse provenance-section lines via
-              PROVENANCE_LINE_RE.
+              PROVENANCE_LINE_RE.  Any other value raises ``ValueError``.
 
     Returns:
         A dict mapping integer task id → stripped title string.
         Returns an empty dict when no lines match (callers must guard
         against vacuity themselves or use assert_id_title_pairing).
     """
+    if kind not in ('active', 'provenance'):
+        raise ValueError(f'kind must be active or provenance, got {kind!r}')
     pattern = ID_TITLE_LINE_RE if kind == 'active' else PROVENANCE_LINE_RE
     found: dict[int, str] = {}
     for m in pattern.finditer(rendered):
