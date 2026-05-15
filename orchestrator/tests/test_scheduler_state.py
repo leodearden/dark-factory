@@ -612,9 +612,14 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         self, tmp_path, monkeypatch
     ):
         """Construction-path repro: str(None) produces '_project_root == "None"';
-        the snapshot write must be refused rather than creating ./None/ on disk."""
-        from unittest.mock import MagicMock
+        the snapshot write must be refused rather than creating ./None/ on disk.
 
+        write_state_snapshot is intentionally NOT mocked here so that the
+        directory-existence assertion is a genuine end-to-end regression check:
+        if the guard were removed, write_state_snapshot would call
+        path.parent.mkdir(parents=True, exist_ok=True) and create
+        tmp_path/None/data/orchestrator/, making the assertion fail.
+        """
         config = OrchestratorConfig(max_per_module=1)
         # Bypass pydantic validate_assignment=True: field_validator raises for
         # config.project_root = None, so use object.__setattr__ to inject None
@@ -628,12 +633,12 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
             f"got {scheduler._project_root!r}"
         )
 
-        scheduler.write_state_snapshot = MagicMock()
         monkeypatch.chdir(tmp_path)
 
         await scheduler._write_snapshot_best_effort()
 
-        scheduler.write_state_snapshot.assert_not_called()
+        # Real write_state_snapshot would create tmp_path/None/data/orchestrator/
+        # if the guard were absent; its non-existence proves the guard fired.
         assert not (tmp_path / 'None').exists(), (
             "A directory named 'None' must not be created under the CWD "
             "when project_root is unset"
@@ -644,7 +649,12 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
     async def test_write_snapshot_best_effort_skips_for_falsy_project_root(
         self, bad_root, tmp_path, monkeypatch
     ):
-        """Guard covers the literal 'None', empty string, and None itself."""
+        """Guard covers the literal 'None', empty string, and None itself.
+
+        write_state_snapshot is mocked so assert_not_called() is the sole
+        genuine assertion: it verifies the guard fires before the write is
+        attempted for each invalid _project_root value.
+        """
         from unittest.mock import MagicMock
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
@@ -657,7 +667,6 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
 
         await scheduler._write_snapshot_best_effort()
 
+        # assert_not_called() is the genuine regression check: the guard must
+        # prevent write_state_snapshot from being invoked for all bad root values.
         scheduler.write_state_snapshot.assert_not_called()
-        assert not (tmp_path / 'None').exists(), (
-            f"No 'None/' dir should be created for _project_root={bad_root!r}"
-        )
