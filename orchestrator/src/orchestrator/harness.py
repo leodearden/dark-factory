@@ -460,6 +460,12 @@ class Harness:
             # for tens of minutes after the human has finished the task.
             self._start_terminal_status_watcher()
 
+            # 1c1c1. Start escalation-watcher-auto supervisor (task 1326,
+            # AFK hardening) — keeps a fresh autonomous L1-watcher subprocess
+            # alive across multi-day AFK windows.  Depends on L1 persistence
+            # (task 1321: _dismiss_stale_escalations above preserves L1 queue).
+            self._start_watcher_supervisor()
+
             # 1c1c. Start periodic stranded-in-progress reconcile (Fix 4).
             # Catches tasks stranded by transient backend failures during a
             # long run so they don't accumulate until the next restart.
@@ -712,6 +718,10 @@ class Harness:
                 await self._stop_terminal_status_watcher()
             except Exception as e:
                 logger.warning(f'_stop_terminal_status_watcher() failed: {e}')
+            try:
+                await self._stop_watcher_supervisor()
+            except Exception as e:
+                logger.warning(f'_stop_watcher_supervisor() failed: {e}')
             try:
                 await self._stop_stranded_reconcile()
             except Exception as e:
