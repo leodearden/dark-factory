@@ -509,6 +509,8 @@ class TestCostInWindow:
                           else second_call.kwargs.get('start_iso'))
             now_iso = (second_call.args[1] if len(second_call.args) > 1
                        else second_call.kwargs.get('end_iso'))
+            assert cutoff_iso is not None, 'start_iso arg missing from aggregate_window call'
+            assert now_iso is not None, 'end_iso arg missing from aggregate_window call'
             cutoff_dt = _datetime.fromisoformat(cutoff_iso)
             now_dt = _datetime.fromisoformat(now_iso)
             expected_cutoff_lo = before - timedelta(hours=24) - timedelta(seconds=10)
