@@ -567,6 +567,39 @@ class TestDoneBranchCallSiteViaWorkflow:
         route_mock.assert_awaited_once_with(reviews)
         assert write_mock.await_count == 0
 
+    @pytest.mark.asyncio
+    async def test_done_branch_falls_back_to_memory_via_real_workflow(self, tmp_path):
+        """Empty suggestions → real call site routes to _write_suggestions_to_memory.
+
+        ``_execute_verify_review_loop`` is driven end-to-end.  A regression at
+        the call site (swapped branches, dropped ``await``, inverted condition)
+        causes this test to fail.
+        """
+        wf = self._make_e2e_workflow(tmp_path)
+
+        reviews = ReviewAggregation(
+            has_blocking_issues=False,
+            blocking_issues=[],
+            suggestions=[],  # empty → falls back to memory
+            reviews={'analyst': {}},
+        )
+
+        async def _review_fn():
+            return reviews
+        wf._review = _review_fn  # type: ignore[method-assign]
+
+        route_mock = AsyncMock()
+        write_mock = AsyncMock()
+        wf._route_review_suggestions_to_curator = route_mock  # type: ignore[method-assign]
+        wf._write_suggestions_to_memory = write_mock  # type: ignore[method-assign]
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert write_mock.await_count == 1
+        write_mock.assert_awaited_once_with(reviews)
+        assert route_mock.await_count == 0
+
 
 # ---------------------------------------------------------------------------
 # _escalate_review_issues
