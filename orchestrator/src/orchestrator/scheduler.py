@@ -759,6 +759,9 @@ class Scheduler:
         # after the time gate passes (populated in step-6; kept here for
         # structural completeness and future use).
         self._last_snapshot_payload: str | None = None
+        # Serialises concurrent _write_snapshot_best_effort invocations so that
+        # tick writes and flush writes never race on the shared .json.tmp path.
+        self._snapshot_write_lock: asyncio.Lock = asyncio.Lock()
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -2482,52 +2485,61 @@ class Scheduler:
         # advance _last_snapshot_write_ts for a write that never happens.
         if not self._project_root or self._project_root == 'None':
             return
-        # Leading-edge time throttle.  Coalesces ticks within the configured
-        # minimum interval at O(1) cost (monotonic subtraction only).
-        # force=True bypasses the gate to guarantee a fresh write (e.g. flush
-        # on quiescence/shutdown).
-        now = self._time_source()
-        if not force:
-            interval = self.config.snapshot_min_write_interval_secs
-            if (
-                self._last_snapshot_write_ts is not None
-                and (now - self._last_snapshot_write_ts) < interval
-            ):
-                return  # throttled: within the coalesce window, no I/O
-        # Time gate passed (or force=True): build the payload once.
-        # Note: payload is built ONLY after the gate passes so throttled ticks
-        # remain O(1) — they never reach this serialisation point.
-        try:
-            # Compute the state dict once; _build_snapshot_payload uses it for
-            # the dedup comparison and disk_payload carries it to disk — no
-            # second get_state_snapshot() call on the write path.
-            state = self.get_state_snapshot()
-            payload = self._build_snapshot_payload(state)
-            # Content dedup: skip the disk write if the business state has not
-            # changed since the last write.  Still advance the timestamp so the
-            # next throttle window starts from now (prevents re-serialisation
-            # every tick during an unchanged steady state).
-            # force=True always writes, regardless of content equality.
-            if not force and payload == self._last_snapshot_payload:
+        # Lock serialises the time-gate read → await → bookkeeping write section
+        # so concurrent tick/flush callers never race on the stale timestamp or
+        # on the shared .json.tmp path.  The project-root guard above stays
+        # outside: it is O(1), touches no shared state, and acquiring the lock
+        # for a guaranteed no-op would needlessly block no-project-root callers.
+        # Latency tradeoff: a tick's snapshot attempt may briefly wait here
+        # behind an in-flight flush's disk write; that serialisation is the
+        # deliberate cost of preventing concurrent .json.tmp corruption.
+        async with self._snapshot_write_lock:
+            # Leading-edge time throttle.  Coalesces ticks within the configured
+            # minimum interval at O(1) cost (monotonic subtraction only).
+            # force=True bypasses the gate to guarantee a fresh write (e.g. flush
+            # on quiescence/shutdown).
+            now = self._time_source()
+            if not force:
+                interval = self.config.snapshot_min_write_interval_secs
+                if (
+                    self._last_snapshot_write_ts is not None
+                    and (now - self._last_snapshot_write_ts) < interval
+                ):
+                    return  # throttled: within the coalesce window, no I/O
+            # Time gate passed (or force=True): build the payload once.
+            # Note: payload is built ONLY after the gate passes so throttled ticks
+            # remain O(1) — they never reach this serialisation point.
+            try:
+                # Compute the state dict once; _build_snapshot_payload uses it for
+                # the dedup comparison and disk_payload carries it to disk — no
+                # second get_state_snapshot() call on the write path.
+                state = self.get_state_snapshot()
+                payload = self._build_snapshot_payload(state)
+                # Content dedup: skip the disk write if the business state has not
+                # changed since the last write.  Still advance the timestamp so the
+                # next throttle window starts from now (prevents re-serialisation
+                # every tick during an unchanged steady state).
+                # force=True always writes, regardless of content equality.
+                if not force and payload == self._last_snapshot_payload:
+                    self._last_snapshot_write_ts = now
+                    return
+                # Build the disk payload (full state including snapshot_at) only
+                # after the dedup check — avoids serialising when a dedup skip
+                # applies.  Passed directly to write_state_snapshot to avoid a
+                # second get_state_snapshot() call on the actual write path.
+                disk_payload = json.dumps(state, default=str)
+                path = (
+                    Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+                )
+                await asyncio.to_thread(self.write_state_snapshot, path, disk_payload)
+                # Bookkeeping advanced only after a confirmed successful write.
+                # write_state_snapshot propagates exceptions so these lines are
+                # unreachable when the disk write fails — preventing a stale
+                # snapshot from being recorded as last-written.
+                self._last_snapshot_payload = payload
                 self._last_snapshot_write_ts = now
-                return
-            # Build the disk payload (full state including snapshot_at) only
-            # after the dedup check — avoids serialising when a dedup skip
-            # applies.  Passed directly to write_state_snapshot to avoid a
-            # second get_state_snapshot() call on the actual write path.
-            disk_payload = json.dumps(state, default=str)
-            path = (
-                Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
-            )
-            await asyncio.to_thread(self.write_state_snapshot, path, disk_payload)
-            # Bookkeeping advanced only after a confirmed successful write.
-            # write_state_snapshot propagates exceptions so these lines are
-            # unreachable when the disk write fails — preventing a stale
-            # snapshot from being recorded as last-written.
-            self._last_snapshot_payload = payload
-            self._last_snapshot_write_ts = now
-        except Exception:
-            logger.warning('_write_snapshot_best_effort failed', exc_info=True)
+            except Exception:
+                logger.warning('_write_snapshot_best_effort failed', exc_info=True)
 
     async def flush_state_snapshot(self) -> None:
         """Force an immediate state snapshot write, bypassing the throttle.

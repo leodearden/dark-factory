@@ -732,11 +732,25 @@ class TestSnapshotWriteThrottle:
 
     @pytest.mark.asyncio
     async def test_acceptance_bound_writes_bounded_under_burst(self, tmp_path):
-        """Over N ticks, disk writes ≤ ceil(N * tick_interval / throttle_interval).
+        """Over N ticks, disk writes == ceil(N * tick_interval / throttle_interval).
 
         Simulates N=20 ticks at tick_interval=0.05 s with a
         throttle_interval=0.25 s.  The acceptance bound is
         ceil(20 * 0.05 / 0.25) = ceil(4.0) = 4.
+
+        Content-dedup is defeated by mutating a unique _skip_count key per
+        tick so every payload differs — making the time-throttle gate the
+        SOLE mechanism bounding writes.  The exact-equality assertion guards
+        against future time-gate off-by-one regressions that the former
+        1 ≤ count ≤ upper_bound assertion would have missed.
+
+        The clock is computed as ``(i+1) * tick_interval`` (not accumulated
+        via ``+=``) to eliminate IEEE-754 accumulation drift: repeated
+        addition shifts the 3rd/4th boundary write one tick later
+        (ticks 12/17 instead of 11/16), causing a mismatch between the
+        ``ceil()`` formula and the simulated write positions.  With the
+        multiplicative form the drift is removed and the trace is exact:
+        writes occur on ticks 1, 6, 11, 16 → exactly 4.
         """
         import math
         from unittest.mock import AsyncMock, MagicMock
@@ -756,15 +770,18 @@ class TestSnapshotWriteThrottle:
         scheduler.get_tasks = AsyncMock(return_value=[task_a])
         scheduler.write_state_snapshot = MagicMock()
 
-        for _ in range(N):
-            clock['t'] += tick_interval  # advance clock before each tick
+        for i in range(N):
+            scheduler._skip_count[f'X{i}'] = i  # unique per tick → defeats content-dedup
+            clock['t'] = (i + 1) * tick_interval  # multiplicative: no accumulation drift
             await scheduler.acquire_next()
             scheduler.release('A')
 
         upper_bound = math.ceil(N * tick_interval / throttle_interval)
         count = scheduler.write_state_snapshot.call_count
-        assert 1 <= count <= upper_bound, (
-            f'Expected 1 ≤ write_count ≤ {upper_bound}, got {count}'
+        assert count == upper_bound, (
+            f'Expected exactly {upper_bound} disk writes (time-throttle gate is '
+            f'the sole bound; content-dedup defeated by per-tick unique state), '
+            f'got {count}'
         )
 
     @pytest.mark.asyncio
@@ -852,4 +869,59 @@ class TestSnapshotWriteThrottle:
         assert scheduler.write_state_snapshot.call_count == 2, (
             'Expected disk write after state mutation (changed payload), '
             f'got call_count={scheduler.write_state_snapshot.call_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_flush_and_tick_do_not_overlap_on_disk(self, tmp_path):
+        """Concurrent tick and flush invocations must never write to disk in parallel.
+
+        Without a lock, both coroutines can pass the time-gate simultaneously
+        (the gate reads _last_snapshot_write_ts before the await, so both see
+        the stale value), reach asyncio.to_thread(write_state_snapshot, …)
+        concurrently, and write to the same .json.tmp path from two threads.
+
+        With the lock, only one coroutine holds the gate at a time, so
+        write_state_snapshot is always called serially and max in-flight == 1.
+        """
+        import threading
+        import time as _time
+        from unittest.mock import MagicMock
+
+        clock = {'t': 0.0}
+        config = OrchestratorConfig(max_per_module=1)
+        config.snapshot_min_write_interval_secs = 0.0  # throttle disabled so gate never short-circuits
+
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler._project_root = str(tmp_path)
+
+        # Spy on write_state_snapshot: tracks how many calls are in-flight simultaneously.
+        spy_lock = threading.Lock()
+        in_flight = {'current': 0, 'max': 0}
+
+        def spy_write(path, payload):
+            with spy_lock:
+                in_flight['current'] += 1
+                if in_flight['current'] > in_flight['max']:
+                    in_flight['max'] = in_flight['current']
+            _time.sleep(0.02)  # widen the window so concurrent calls overlap
+            with spy_lock:
+                in_flight['current'] -= 1
+
+        scheduler.write_state_snapshot = MagicMock(side_effect=spy_write)
+
+        # Launch several concurrent invocations: mix of tick (force=False) and
+        # flush (force=True).  Each mutates a unique _skip_count key so payloads
+        # differ and content-dedup never coalesces them.
+        N = 6
+        async def invoke(idx: int):
+            scheduler._skip_count[f'X{idx}'] = idx
+            force = idx % 2 == 1  # alternate tick / flush
+            await scheduler._write_snapshot_best_effort(force=force)
+
+        import asyncio as _asyncio
+        await _asyncio.gather(*[invoke(i) for i in range(N)])
+
+        assert in_flight['max'] == 1, (
+            f'Expected max in-flight write_state_snapshot calls == 1 (serialised), '
+            f'got {in_flight["max"]} — lock is missing or not covering the critical section'
         )
