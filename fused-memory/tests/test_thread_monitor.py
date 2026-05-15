@@ -47,13 +47,15 @@ class TestSnapshotThreads:
             barrier.wait()
             stop_event.wait()
 
+        baseline = server_main._snapshot_threads()
         t = threading.Thread(target=worker, name='asyncio_test_snapshot_X', daemon=True)
         t.start()
         barrier.wait()  # ensure the thread is alive before snapshotting
         try:
             snapshot = server_main._snapshot_threads()
-            assert snapshot.get('asyncio_pool', 0) >= 1, (
-                f"Expected asyncio_pool >= 1, got snapshot={snapshot}"
+            assert snapshot.get('asyncio_pool', 0) >= baseline.get('asyncio_pool', 0) + 1, (
+                f"Expected asyncio_pool to grow by at least 1; "
+                f"baseline={baseline}, snapshot={snapshot}"
             )
         finally:
             stop_event.set()
