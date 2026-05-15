@@ -310,6 +310,62 @@ class TestReadCapIntervals:
             assert result_shifted[0].account_name == 'acc-x'
             assert result_shifted[0].end is None  # open-ended (no resumed)
 
+    @pytest.mark.asyncio
+    async def test_naive_now_normalized_to_utc(self, tmp_path):
+        """A naive `now` must yield identical results to the equivalent tz-aware `now`.
+
+        WHY a naive DB row is inserted:
+        With tz-aware DB rows (production format), the lexicographic naive-vs-aware
+        cutoff mismatch coincidentally yields identical inclusion for all realistic
+        instants — so an aware-only test *cannot* go red.  The divergence is only
+        observable at a naive boundary row:
+
+        - naive `now` → cutoff is offset-less, e.g. ``"2026-05-08T12:00:00"``
+          The row's created_at is the *same* naive string → ``created_at >= cutoff``
+          is True (equal) → row is INCLUDED → 1 interval returned.
+        - tz-aware `now` → cutoff is ``"2026-05-08T12:00:00+00:00"``
+          That string sorts *after* the naive row string lexicographically → ``>=``
+          is False → row is EXCLUDED → 0 intervals returned.
+
+        Before the fix the two calls diverge (naive→1, aware→0) so the equivalence
+        assertion fails red.  After the fix both normalize to tz-aware before
+        computing cutoff → both yield 0 → assertion passes green.
+        """
+        real_now = datetime.now(UTC)
+        cutoff_instant = real_now - timedelta(days=7)
+
+        # Insert the boundary event as a NAIVE datetime so _make_db_with_events
+        # stores its isoformat without a +00:00 suffix — the only configuration
+        # where the lexicographic mismatch is detectable.
+        db_path = _make_db_with_events(tmp_path, 'naive_now.db', [
+            ('acc-n', 'cap_hit', cutoff_instant.replace(tzinfo=None)),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            result_naive = await read_cap_intervals(
+                [conn], days=7, now=real_now.replace(tzinfo=None)
+            )
+            result_aware = await read_cap_intervals(
+                [conn], days=7, now=real_now
+            )
+
+        # Both should be empty: the boundary-naive row is AT the cutoff, but
+        # with a consistent tz-aware cutoff ``created_at >= cutoff`` is False
+        # (the row string sorts before the +00:00 cutoff string).
+        assert len(result_naive) == len(result_aware), (
+            f"naive now → {len(result_naive)} interval(s), "
+            f"aware now → {len(result_aware)} interval(s); expected equal counts. "
+            f"Bug: naive cutoff has no +00:00 so it equals the naive boundary row "
+            f"(>= true), whereas aware cutoff sorts after it (>= false)."
+        )
+        assert {iv.account_name for iv in result_naive} == {iv.account_name for iv in result_aware}
+        assert result_aware == [], (
+            f"Expected 0 intervals with tz-aware now (boundary row at exact cutoff "
+            f"is excluded under half-open semantics), got {result_aware}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-3 tests: merge_all_accounts_capped
