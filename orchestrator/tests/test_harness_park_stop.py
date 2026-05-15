@@ -1038,91 +1038,6 @@ class TestDigestConfig:
 
 
 # ---------------------------------------------------------------------------
-# TestSchedulerDoneCounter (step-15)
-# ---------------------------------------------------------------------------
-
-# A minimal success response — extract_rejection({}) returns None (success).
-_MCP_SUCCESS = {}
-
-# A non-transient, non-terminal-exit rejection that causes SetTaskStatusRejected.
-_MCP_REJECTION = {
-    'result': {
-        'structuredContent': {
-            'error': 'some_rejection',
-            'success': False,
-        }
-    }
-}
-
-
-class TestSchedulerDoneCounter:
-    """Tests for Scheduler.done_transitions_total monotonic counter (step-16 impl).
-
-    Task 1327 — AFK hardening.
-    """
-
-    @pytest.mark.asyncio
-    async def test_done_transitions_increments_on_done(self, tmp_path: Path) -> None:
-        """set_task_status('tX', 'done') increments done_transitions_total."""
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        scheduler = harness.scheduler
-        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
-
-        assert scheduler.done_transitions_total == 0
-
-        await scheduler.set_task_status('t1', 'done')
-        await scheduler.set_task_status('t2', 'done')
-        await scheduler.set_task_status('t3', 'done')
-
-        assert scheduler.done_transitions_total == 3, (
-            f'Expected 3 after three done transitions; got {scheduler.done_transitions_total}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_non_done_status_does_not_increment(self, tmp_path: Path) -> None:
-        """Non-done status (e.g. 'in-progress') does NOT increment the counter."""
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        scheduler = harness.scheduler
-        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
-
-        await scheduler.set_task_status('t1', 'in-progress')
-        await scheduler.set_task_status('t2', 'blocked')
-
-        assert scheduler.done_transitions_total == 0, (
-            f'Expected 0 for non-done statuses; got {scheduler.done_transitions_total}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_rejected_done_does_not_increment(self, tmp_path: Path) -> None:
-        """A rejected set_task_status('t1', 'done') does NOT increment the counter."""
-        from orchestrator.scheduler import SetTaskStatusRejected
-
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        scheduler = harness.scheduler
-        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_REJECTION)
-
-        with pytest.raises(SetTaskStatusRejected):
-            await scheduler.set_task_status('t1', 'done')
-
-        assert scheduler.done_transitions_total == 0, (
-            f'Expected 0 after a rejected done; got {scheduler.done_transitions_total}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_mark_done_increments_counter(self, tmp_path: Path) -> None:
-        """mark_done routes through set_task_status and increments done_transitions_total."""
-        harness, _, _ = _make_harness_with_mocks(tmp_path)
-        scheduler = harness.scheduler
-        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
-
-        await scheduler.mark_done('t42', kind='merged', sha='abc123')
-
-        assert scheduler.done_transitions_total == 1, (
-            f'Expected 1 after mark_done; got {scheduler.done_transitions_total}'
-        )
-
-
-# ---------------------------------------------------------------------------
 # TestSchedulerDoneCounterRemoved (step-1, task 1434)
 # ---------------------------------------------------------------------------
 
@@ -1576,11 +1491,9 @@ class TestHarnessDigestDoneCountSource:
         """EWA input done_in_step comes from EventStore, not scheduler.done_transitions_total.
 
         Setup: alpha=1.0 so EWA == raw ratio; EventStore seeded with 4 done
-        rows in the last hour (inside the default 24h window); scheduler counter
-        set to 100 — a deliberately different value to prove the source.
+        rows in the last hour (inside the default 24h window).
 
         If EWA uses EventStore count (4): EWA = 1/4 = 0.25  ← expected
-        If EWA uses scheduler delta (100): EWA = 1/100 = 0.01 ← current impl
         """
         harness, _, event_store = _make_harness_with_mocks(tmp_path)
         harness.config = OrchestratorConfig(
@@ -1592,9 +1505,6 @@ class TestHarnessDigestDoneCountSource:
         harness.cost_store = await _cost_store_factory()
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
-        # Set scheduler counter to a value that would give a different EWA.
-        # After Fix 1 this value must NOT influence _ewa_value.
-        harness.scheduler._done_transitions_total = 100
 
         # Seed EventStore with 4 task_completed rows with outcome='done' inside
         # the 24h default window (timestamps 10–13 minutes in the past).
@@ -1615,11 +1525,9 @@ class TestHarnessDigestDoneCountSource:
         await harness._maybe_write_digest()
 
         # alpha=1.0, escalations_in_step=1, done_from_eventstore=4 → EWA = 1/4 = 0.25
-        # (scheduler delta of 100 would give EWA = 1/100 = 0.01)
         assert harness._ewa_value == pytest.approx(1 / 4), (
             f'Expected _ewa_value=0.25 (EventStore done_count=4); '
-            f'got {harness._ewa_value!r} '
-            f'(scheduler counter=100 would give 0.01)'
+            f'got {harness._ewa_value!r}'
         )
 
         # The rendered digest's "Tasks done in window" figure must also equal 4,
