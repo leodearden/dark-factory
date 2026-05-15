@@ -2802,9 +2802,12 @@ Output JSON matching the schema. Every task must appear in the output.
                     # Fast rotation signals potential cost-runaway; grow the sleep
                     # exponentially to slow the burn rate before the trip arms.
                     # Mirrors the unclean-exit exponential backoff in the section below.
+                    # Clamp exp to 60 (2**60 ≈ 1.15e18) to prevent OverflowError at very
+                    # high consecutive counts; the outer min still bounds to _WATCHER_MAX_BACKOFF_SECS
+                    # so observable behaviour is unchanged for any realistic consecutive value.
+                    exp = min(consecutive_degenerate_clean - 1, 60)
                     floor = min(
-                        self.config.watcher_subprocess_restart_backoff_secs
-                        * (2 ** (consecutive_degenerate_clean - 1)),
+                        self.config.watcher_subprocess_restart_backoff_secs * (2 ** exp),
                         _WATCHER_MAX_BACKOFF_SECS,
                     )
                     logger.warning(
@@ -2839,6 +2842,12 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # --- Unclean exit path ---
+            # Symmetric with the clean path's ``consecutive_unclean = 0`` reset (which
+            # fires on both healthy and degenerate-clean exits): an unclean exit breaks
+            # any in-progress degenerate-clean burst, so reset the floor counter.
+            # Without this, interleaved degen/unclean workloads grow
+            # consecutive_degenerate_clean unboundedly across bursts (task 1443).
+            consecutive_degenerate_clean = 0
             consecutive_unclean += 1
             # _check_watcher_guard handles append+evict+trip defensively.  Called
             # outside any broad try/except so pause_scheduler failure cannot be
@@ -2854,9 +2863,10 @@ Output JSON matching the schema. Every task must appear in the output.
 
             # No trip — apply exponential backoff.
             try:
+                # Clamp exp to 60; see degenerate-clean path comment above re: overflow.
+                exp = min(consecutive_unclean - 1, 60)
                 backoff = min(
-                    self.config.watcher_subprocess_restart_backoff_secs
-                    * (2 ** (consecutive_unclean - 1)),
+                    self.config.watcher_subprocess_restart_backoff_secs * (2 ** exp),
                     _WATCHER_MAX_BACKOFF_SECS,
                 )
                 logger.warning(
