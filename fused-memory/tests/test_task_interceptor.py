@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2923,20 +2924,29 @@ async def test_set_task_status_holds_lock_across_read_and_write(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    bool(os.environ.get('PYTEST_XDIST_WORKER')),
+    reason='latency threshold unreliable under xdist I/O contention; run without -n to exercise this guard',
+)
 async def test_single_call_latency_smoke(
     overlap_tm,
     reconciler,
     event_buffer,
 ):
     """WP-E: smoke check — a sequence of sequential mutating calls under
-    no contention finishes within an order-of-magnitude budget, confirming
-    the lock itself adds no catastrophic per-call overhead.
+    no contention finishes within a 5 s budget, confirming the lock itself
+    adds no significant per-call overhead.
 
-    The 20 s ceiling is intentionally loose: under full 32-worker xdist
-    load with SQLite disk I/O contention the observed worst-case was 11.3 s,
-    so a tighter bound would be flaky without a more deterministic harness
-    (single worker, no xdist).  This test catches orders-of-magnitude
-    regressions only — not gradual 2-3x slowdowns.
+    Observed single-worker runtime is ~0.6 s (pure in-process AsyncMock
+    I/O), so the 5 s ceiling gives roughly 8x headroom — wide enough to
+    absorb CI noise while still catching 2-3x regressions.
+
+    Skipped automatically when PYTEST_XDIST_WORKER is set: SQLite disk I/O
+    contention from 32 concurrent workers inflated the worst-case to 11.3 s,
+    making a meaningful threshold flaky.  Running in single-worker mode keeps
+    the bound deterministic.  To exercise this guard in CI, invoke pytest
+    without the -n flag in a dedicated single-worker step, e.g.:
+    ``pytest fused-memory/tests/test_task_interceptor.py::test_single_call_latency_smoke``
     """
     import time
 
@@ -2952,7 +2962,7 @@ async def test_single_call_latency_smoke(
         status = 'in-progress' if i % 2 == 0 else 'pending'
         await interceptor.set_task_status('1', status, '/project')
     elapsed = time.perf_counter() - start
-    assert elapsed < 20.0, f'{N} sequential calls took {elapsed:.3f}s (orders-of-magnitude regression guard)'
+    assert elapsed < 5.0, f'{N} sequential calls took {elapsed:.3f}s (latency regression guard)'
 
 
 @pytest.mark.asyncio
