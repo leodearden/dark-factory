@@ -1256,6 +1256,72 @@ class TestWatcherMisconfiguredGuard:
             f'(supervisor did not stop after failing pause)'
         )
 
+    @pytest.mark.asyncio
+    async def test_degenerate_clean_floor_grows_exponentially(self, tmp_path: Path) -> None:
+        """Consecutive degenerate-clean exits grow the restart floor exponentially.
+
+        Each fast-clean rotation (duration < watcher_misconfigured_min_rotation_secs)
+        that does NOT trip the guard should sleep base * 2^(consecutive-1) — mirroring
+        the unclean-exit exponential pattern.  With watcher_subprocess_restart_backoff_secs=1.0
+        and 4 consecutive degenerate exits, expected floor durations are [1.0, 2.0, 4.0, 8.0].
+
+        RED: currently the production code sleeps a flat watcher_subprocess_restart_backoff_secs
+        on every clean rotation, so all 4 sleeps would be 1.0 instead of growing.
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,   # disable trip
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_max_crashloop_restarts': 99,          # disable crashloop trip
+        })
+
+        sleep_durations: list[float] = []
+        rotation_calls = 0
+
+        t0 = _time_mod.monotonic()
+        # Paired (start, end) per rotation so duration == 1.0s < 120s threshold.
+        # 4 full rotations + 1 start-only value for the cancelling 5th call.
+        monotonic_sequence = iter([
+            t0, t0 + 1.0,  # iter 1 — degenerate clean
+            t0, t0 + 1.0,  # iter 2 — degenerate clean
+            t0, t0 + 1.0,  # iter 3 — degenerate clean
+            t0, t0 + 1.0,  # iter 4 — degenerate clean
+            t0,             # iter 5 start (CancelledError before end)
+        ])
+
+        def fake_monotonic() -> float:
+            return next(monotonic_sequence)
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > 4:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def recording_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert sleep_durations == pytest.approx([1.0, 2.0, 4.0, 8.0]), (
+            f'Expected exponential floor [1.0, 2.0, 4.0, 8.0] for 4 consecutive '
+            f'degenerate-clean exits; got {sleep_durations}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-13: Wiring — __init__ attrs + run() source guard
