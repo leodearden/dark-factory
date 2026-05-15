@@ -2340,7 +2340,10 @@ class Scheduler:
                 for tid, row in self._override_store.get_pin_queue(self._project_root):
                     pin_queue.append({'task_id': tid, 'order': row.pin_order})
             except Exception:
-                pass
+                logger.warning(
+                    'override_store.get_pin_queue failed; pin_queue degraded to empty list',
+                    exc_info=True,
+                )
 
         # overrides — convert OverrideRow dataclasses to plain dicts.
         overrides: dict[str, dict] = {}
