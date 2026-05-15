@@ -234,7 +234,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
             )
         )
 
-    return violations
+    return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -292,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
         all_violations.extend(violations)
 
     # Phase 3: reporting.
+    # Sort across files for deterministic ruff-style (filename, lineno, col_offset) output.
+    all_violations.sort(key=lambda v: (v.filename, v.lineno, v.col_offset))
     for v in all_violations:
         print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
     for file_path, exc in read_errors:
