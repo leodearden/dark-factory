@@ -4050,8 +4050,21 @@ class TestWriteAndConfirmMarker:
 
         confirm_calls = []
 
-        async def stub_confirm(response_memory_ids, miss_warning_template, *, tid, ftype):
-            confirm_calls.append((response_memory_ids, miss_warning_template, tid, ftype))
+        async def stub_confirm(
+            response_memory_ids,
+            active_miss_warning_template,
+            tripped_skip_warning_template,
+            *,
+            tid,
+            ftype,
+        ):
+            confirm_calls.append((
+                response_memory_ids,
+                active_miss_warning_template,
+                tripped_skip_warning_template,
+                tid,
+                ftype,
+            ))
             return True
 
         log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
@@ -4063,7 +4076,8 @@ class TestWriteAndConfirmMarker:
             ftype='missing_deliverable',
             log=log,
             confirm_and_track=stub_confirm,
-            miss_warning_template='miss-template-%s-%s',
+            active_miss_warning_template='active-miss-template-%s-%s',
+            tripped_skip_warning_template='tripped-skip-template-%s-%s',
         )
 
         # Return value propagated verbatim from confirm_and_track (bool contract)
@@ -4082,9 +4096,10 @@ class TestWriteAndConfirmMarker:
 
         # confirm_and_track called with correct args (delegation contract)
         assert len(confirm_calls) == 1
-        ids, template, c_tid, c_ftype = confirm_calls[0]
+        ids, active_tmpl, tripped_tmpl, c_tid, c_ftype = confirm_calls[0]
         assert ids == _STUB_ADD_MEMORY_RESPONSE.memory_ids
-        assert template == 'miss-template-%s-%s'
+        assert active_tmpl == 'active-miss-template-%s-%s'
+        assert tripped_tmpl == 'tripped-skip-template-%s-%s'
         assert c_tid == '42'
         assert c_ftype == 'missing_deliverable'
 
@@ -4107,7 +4122,8 @@ class TestWriteAndConfirmMarker:
                 ftype='missing_deliverable',
                 log=log,
                 confirm_and_track=confirm_and_track,
-                miss_warning_template='irrelevant',
+                active_miss_warning_template='irrelevant-active',
+                tripped_skip_warning_template='irrelevant-tripped',
             )
 
         assert result is False

@@ -124,6 +124,15 @@ The breaker is an **internal load-shedding mechanism** operating entirely within
 conditions).  No change to ``confirm_marker_persisted`` itself is required —
 only the call-site within ``dedup_flags`` is gated.
 
+WARNING wording disambiguation (task-1413): the per-flag WARNINGs use distinct
+templates for the ACTIVE-breaker miss path (a confirmation search was attempted
+and returned no result) versus the TRIPPED-breaker skip path (no search
+attempted because the breaker is open).  The ACTIVE wording is
+``'could not be confirmed findable'``; the TRIPPED wording is
+``'confirmation skipped (circuit-breaker open); relying on memory_ids gate only'``.
+During a brownout this lets operators distinguish genuine confirmation misses
+from gate-only flags raised purely from the memory_ids check.
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
@@ -412,8 +421,9 @@ async def _write_and_confirm_marker(
     tid: str,
     ftype: str,
     log: logging.Logger,
-    confirm_and_track,  # async callable: (response_memory_ids, miss_warning_msg, *, tid, ftype) -> bool
-    miss_warning_template: str,
+    confirm_and_track,  # async callable: (response_memory_ids, active_miss_warning_msg, tripped_skip_warning_msg, *, tid, ftype) -> bool
+    active_miss_warning_template: str,
+    tripped_skip_warning_template: str,
 ) -> bool:
     """Write a stage1_flag_marker memory and confirm it is findable.
 
@@ -429,11 +439,12 @@ async def _write_and_confirm_marker(
     On success: delegates to ``confirm_and_track`` (the circuit-breaker-aware
     inner closure from ``dedup_flags``) and propagates its bool verbatim.
 
-    Propagates the bool returned by ``confirm_and_track`` verbatim — does NOT
-    derive locally.  The ``miss_warning_template`` parameter is the
-    branch-specific consequence WARNING string (e.g. "skipping prior deletion"
-    for HIT, "will not be detected next cycle" for MISS).  It is forwarded to
-    ``confirm_and_track``, which logs it on confirmation miss.
+    The ``active_miss_warning_template`` is emitted by ``confirm_and_track``
+    when a confirmation search was attempted but returned no result (ACTIVE
+    breaker).  The ``tripped_skip_warning_template`` is emitted when
+    confirmation was skipped because the breaker was already tripped and
+    ``bool(response.memory_ids)`` was False (TRIPPED breaker).  Both templates
+    are forwarded verbatim to ``confirm_and_track``.
     """
     try:
         response = await memory_service.add_memory(
@@ -461,7 +472,10 @@ async def _write_and_confirm_marker(
     # If that invariant is broken by a future refactor, the exception will propagate
     # out of this helper and abort the ``dedup_flags`` for-loop iteration.
     return await confirm_and_track(
-        response.memory_ids, miss_warning_template, tid=tid, ftype=ftype,
+        response.memory_ids,
+        active_miss_warning_template,
+        tripped_skip_warning_template,
+        tid=tid, ftype=ftype,
     )
 
 
@@ -514,7 +528,8 @@ async def dedup_flags(
 
     async def _confirm_and_track(
         response_memory_ids: list[str],
-        miss_warning_msg: str,
+        active_miss_warning_msg: str,
+        tripped_skip_warning_msg: str,
         *,
         tid: str,
         ftype: str,
@@ -523,8 +538,8 @@ async def dedup_flags(
 
         When the breaker is ACTIVE (``confirmation_disabled`` is False):
         - Calls ``confirm_marker_persisted``; on miss (``False`` return) emits
-          ``miss_warning_msg``, increments the consecutive miss counter, and
-          trips the breaker when the threshold is reached (one breaker WARNING
+          ``active_miss_warning_msg``, increments the consecutive miss counter,
+          and trips the breaker when the threshold is reached (one breaker WARNING
           logged at trip-time only).
         - On hit (``True`` return): resets the counter so sporadic misses don't
           accumulate.
@@ -532,8 +547,13 @@ async def dedup_flags(
 
         When the breaker is TRIPPED (``confirmation_disabled`` is True):
         - Skips ``confirm_marker_persisted``; gates on ``bool(response_memory_ids)``.
-        - Emits ``miss_warning_msg`` iff ``bool(response_memory_ids)`` is False.
+        - Emits ``tripped_skip_warning_msg`` iff ``bool(response_memory_ids)`` is False.
         - Returns ``bool(response_memory_ids)``.
+
+        The two templates MUST be distinct so brownout logs cleanly separate genuine
+        confirmation-miss flags (search attempted, returned no result) from gate-only
+        flags (search skipped because breaker open).  This is the disambiguation
+        contract operators rely on during a Mem0 brownout.
 
         ``tid`` and ``ftype`` are explicit keyword-only parameters so this helper
         is safe to schedule out-of-order (e.g. ``asyncio.gather``); the enclosing-
@@ -555,9 +575,10 @@ async def dedup_flags(
                 log=logger,
             )
             if not is_found:
-                # ``miss_warning_msg`` MUST be a printf-style string with exactly
-                # two %s placeholders in order: (task_id, flag_type).
-                logger.warning(miss_warning_msg, tid, ftype)
+                # Both ``active_miss_warning_msg`` and ``tripped_skip_warning_msg``
+                # MUST be printf-style strings with exactly two %s placeholders in
+                # order: (task_id, flag_type).
+                logger.warning(active_miss_warning_msg, tid, ftype)
                 consecutive_confirmation_misses += 1
                 if consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD:
                     logger.warning(
@@ -577,7 +598,7 @@ async def dedup_flags(
         else:
             write_succeeded = bool(response_memory_ids)
             if not write_succeeded:
-                logger.warning(miss_warning_msg, tid, ftype)
+                logger.warning(tripped_skip_warning_msg, tid, ftype)
             return write_succeeded
 
     result: list[dict[str, Any]] = []
@@ -639,9 +660,15 @@ async def dedup_flags(
                 memory_service,
                 project_id=project_id, run_id=run_id, tid=tid, ftype=ftype, log=logger,
                 confirm_and_track=_confirm_and_track,
-                miss_warning_template=(
+                active_miss_warning_template=(
                     'flag_dedup: replacement marker for task %s flag_type %s could not'
                     ' be confirmed findable — skipping prior deletion'
+                ),
+                tripped_skip_warning_template=(
+                    'flag_dedup: replacement marker for task %s flag_type %s —'
+                    ' confirmation skipped (circuit-breaker open); relying on'
+                    ' memory_ids gate only; memory_ids empty —'
+                    ' skipping prior deletion'
                 ),
             )
 
@@ -692,9 +719,15 @@ async def dedup_flags(
                 memory_service,
                 project_id=project_id, run_id=run_id, tid=tid, ftype=ftype, log=logger,
                 confirm_and_track=_confirm_and_track,
-                miss_warning_template=(
+                active_miss_warning_template=(
                     'flag_dedup: MISS marker for task %s flag_type %s could not be'
                     ' confirmed findable — recurring flag will not be detected next cycle'
+                ),
+                tripped_skip_warning_template=(
+                    'flag_dedup: MISS marker for task %s flag_type %s —'
+                    ' confirmation skipped (circuit-breaker open); relying on'
+                    ' memory_ids gate only; memory_ids empty —'
+                    ' recurring flag will not be detected next cycle'
                 ),
             )
         result.append(flag)
