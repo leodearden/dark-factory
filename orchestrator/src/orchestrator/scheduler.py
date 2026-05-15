@@ -765,6 +765,10 @@ class Scheduler:
         # One-time dedup flag for the project_root guard warning so it logs at
         # most once per scheduler instance, not every tick.
         self._snapshot_guard_warned: bool = False
+        # One-time dedup flag for override-store read failures: a broken store
+        # is a static deployment condition, so one traceback per instance is
+        # enough — callers are time-throttled by _write_snapshot_best_effort.
+        self._override_store_warned: bool = False
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -2343,10 +2347,12 @@ class Scheduler:
                 for tid, row in self._override_store.get_pin_queue(self._project_root):
                     pin_queue.append({'task_id': tid, 'order': row.pin_order})
             except Exception:
-                logger.warning(
-                    'override_store.get_pin_queue failed; pin_queue degraded to empty list',
-                    exc_info=True,
-                )
+                if not self._override_store_warned:
+                    self._override_store_warned = True
+                    logger.warning(
+                        'override_store.get_pin_queue failed; pin_queue degraded to empty list',
+                        exc_info=True,
+                    )
 
         # overrides — convert OverrideRow dataclasses to plain dicts.
         overrides: dict[str, dict] = {}
@@ -2362,10 +2368,12 @@ class Scheduler:
                         'ttl_until': row.ttl_until.isoformat() if row.ttl_until else None,
                     }
             except Exception:
-                logger.warning(
-                    'override_store.get_overrides failed; overrides degraded to empty dict',
-                    exc_info=True,
-                )
+                if not self._override_store_warned:
+                    self._override_store_warned = True
+                    logger.warning(
+                        'override_store.get_overrides failed; overrides degraded to empty dict',
+                        exc_info=True,
+                    )
 
         # current_holders — delegate to the public accessor.
         current_holders = self.lock_table.snapshot_holders()
