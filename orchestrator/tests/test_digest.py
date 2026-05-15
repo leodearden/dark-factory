@@ -12,10 +12,10 @@ import sqlite3
 from datetime import UTC, timedelta
 from datetime import datetime as _datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
-from unittest.mock import MagicMock
 from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
