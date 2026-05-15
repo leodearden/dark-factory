@@ -20,6 +20,19 @@ from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
+# _JUDGE_CAP_WAIT_SANITY_SECS: minutes-scale cap-wait override for the judge.
+#
+# The judge is a single-shot reconciliation stage runner.  It is expected to
+# complete promptly within the reconciliation cycle.  Inheriting the shared
+# 14-day default from _DEFAULT_CAP_WAIT_SANITY_SECS would stall the
+# reconciliation queue indefinitely under sustained API capacity limits.
+#
+# 1800 s (30 min) mirrors _AGENT_LOOP_CAP_WAIT_SANITY_SECS in agent_loop.py
+# and is aligned with the stage_timeout_seconds hierarchy (≤ 3600 s), giving
+# a brief cap window time to resolve in-band while keeping the queue moving.
+# See task 1401 / plans/afk-A1-cap-wait.md for the full per-caller policy.
+_JUDGE_CAP_WAIT_SANITY_SECS: float = 1800.0
+
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
 
@@ -254,6 +267,7 @@ Review this run and provide your verdict as JSON.
             permission_mode='bypassPermissions',
             timeout_seconds=float(self.config.judge_cli_timeout_seconds),
             cwd=Path(self.config.explore_codebase_root),
+            cap_wait_sanity_secs=_JUDGE_CAP_WAIT_SANITY_SECS,
         )
 
         # Preserve legacy "empty stdout = valid empty verdict" semantics.
