@@ -48,7 +48,18 @@ def _patch_dry_run_unblock(monkeypatch):
     so the background task completes instantly and the workflow state machine
     is what gets tested here.  test_workflow_dry_run_hook.py pins the hook
     behaviour with its own explicit patches.
+
+    NOTE: This fixture is autouse for the entire module.  If you need to test
+    dry-run-unblock behaviour from an e2e perspective, add that test to
+    test_workflow_dry_run_hook.py instead of this file, or the hook will be
+    silently suppressed here.
     """
+    import orchestrator.workflow as _wf  # local import to avoid circular at module level
+
+    assert hasattr(_wf, 'run_dry_run_unblock'), (
+        "run_dry_run_unblock not found in orchestrator.workflow — "
+        "update this fixture's patch target if the symbol was renamed."
+    )
     monkeypatch.setattr(
         'orchestrator.workflow.run_dry_run_unblock',
         AsyncMock(return_value=None),

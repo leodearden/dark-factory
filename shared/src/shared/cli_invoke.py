@@ -341,8 +341,8 @@ async def invoke_with_cap_retry(
     task_id: str = '',
     project_id: str = '',
     role: str = '',
-    max_cap_retries: int | None = _DEFAULT_MAX_CAP_RETRIES,
-    cap_retry_deadline_secs: float | None = _DEFAULT_CAP_RETRY_DEADLINE_SECS,
+    max_cap_retries: int | None = None,
+    cap_retry_deadline_secs: float | None = None,
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
@@ -381,6 +381,39 @@ async def invoke_with_cap_retry(
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
     last_cap_wait_log_at: float | None = None
+
+    def _check_cap_wait(now: float, elapsed: float, cooldown: float, hits: int) -> None:
+        """Guard and throttled log for cap-wait iterations.
+
+        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded.
+        Emits a structured 'cap_wait' JSON log at most once per _CAP_WAIT_LOG_INTERVAL_SECS.
+        Closes over: cap_wait_sanity_secs, label, num_accounts, usage_gate,
+        last_cap_wait_log_at (nonlocal write).
+        """
+        nonlocal last_cap_wait_log_at
+        if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
+            logger.error(
+                f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
+                f'({hits} retries, {num_accounts} account(s))',
+            )
+            raise AllAccountsCappedException(
+                retries=hits,
+                elapsed_secs=elapsed,
+                label=label,
+            )
+        if last_cap_wait_log_at is None or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS:
+            logger.warning(json.dumps({
+                'event': 'cap_wait',
+                'label': label,
+                'elapsed_s': round(elapsed, 1),
+                'soonest_open_at': (
+                    usage_gate.soonest_resets_at.isoformat()
+                    if usage_gate and usage_gate.soonest_resets_at else None
+                ),
+                'next_probe_in_s': round(cooldown, 1),
+            }))
+            last_cap_wait_log_at = now
+
     account_name = ''
     unattributed_cap = False  # True when heuristic fires but token is unresolvable;
     # controls: (1) skip confirm, (2) mark capped=True in cost_store
@@ -483,34 +516,10 @@ async def invoke_with_cap_retry(
                             f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
                         )
 
-                    # Guard: raise before sleeping if the 14-day sanity bound is exceeded.
-                    # max_cap_retries and cap_retry_deadline_secs are vestigial —
-                    # kept in the signature for back-compat but no branch checks them.
+                    # Guard + periodic log: raise on 14-day sanity bound, emit throttled JSON.
                     now = time.monotonic()
                     elapsed = now - retry_start
-                    if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
-                        logger.error(
-                            f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
-                            f'({consecutive_cap_hits} retries, {num_accounts} account(s))',
-                        )
-                        raise AllAccountsCappedException(
-                            retries=consecutive_cap_hits,
-                            elapsed_secs=elapsed,
-                            label=label,
-                        )
-
-                    if last_cap_wait_log_at is None or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS:
-                        logger.warning(json.dumps({
-                            'event': 'cap_wait',
-                            'task_id': label,
-                            'elapsed_s': round(elapsed, 1),
-                            'soonest_open_at': (
-                                usage_gate.soonest_resets_at.isoformat()
-                                if usage_gate and usage_gate.soonest_resets_at else None
-                            ),
-                            'next_probe_in_s': round(cooldown, 1),
-                        }))
-                        last_cap_wait_log_at = now
+                    _check_cap_wait(now, elapsed, cooldown, consecutive_cap_hits)
 
                     await asyncio.sleep(cooldown)
                     continue
@@ -558,33 +567,10 @@ async def invoke_with_cap_retry(
                             f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
                         )
 
-                        # Guard: raise before sleeping if the 14-day sanity bound is exceeded.
-                        # max_cap_retries and cap_retry_deadline_secs are vestigial.
+                        # Guard + periodic log: raise on 14-day sanity bound, emit throttled JSON.
                         now = time.monotonic()
                         elapsed = now - retry_start
-                        if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
-                            logger.error(
-                                f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
-                                f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
-                            )
-                            raise AllAccountsCappedException(
-                                retries=consecutive_cap_hits,
-                                elapsed_secs=elapsed,
-                                label=label,
-                            )
-
-                        if last_cap_wait_log_at is None or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS:
-                            logger.warning(json.dumps({
-                                'event': 'cap_wait',
-                                'task_id': label,
-                                'elapsed_s': round(elapsed, 1),
-                                'soonest_open_at': (
-                                    usage_gate.soonest_resets_at.isoformat()
-                                    if usage_gate and usage_gate.soonest_resets_at else None
-                                ),
-                                'next_probe_in_s': round(cooldown, 1),
-                            }))
-                            last_cap_wait_log_at = now
+                        _check_cap_wait(now, elapsed, cooldown, consecutive_cap_hits)
 
                         await asyncio.sleep(cooldown)
                         continue

@@ -1838,13 +1838,13 @@ class TestCapWaitPeriodicLog:
         assert cap_wait_lines, f'Expected cap_wait log line; got messages: {caplog.messages}'
         data = json.loads(cap_wait_lines[0])
         assert data['event'] == 'cap_wait'
-        assert 'task_id' in data
+        assert 'label' in data
         assert 'elapsed_s' in data
         assert 'soonest_open_at' in data
         assert 'next_probe_in_s' in data
 
-    async def test_cap_wait_task_id_matches_label(self, caplog):
-        """task_id in the cap_wait line equals the label argument to invoke_with_cap_retry."""
+    async def test_cap_wait_label_matches_label_arg(self, caplog):
+        """'label' in the cap_wait line equals the label argument to invoke_with_cap_retry."""
         gate = self._exact_hit_gate(hits=1)
         label = 'task-99-architect'
 
@@ -1858,7 +1858,7 @@ class TestCapWaitPeriodicLog:
 
         lines = [msg for msg in caplog.messages if '"event"' in msg and 'cap_wait' in msg]
         assert lines
-        assert json.loads(lines[0])['task_id'] == label
+        assert json.loads(lines[0])['label'] == label
 
     async def test_cap_wait_soonest_open_at_is_iso_of_gate_resets_at(self, caplog):
         """soonest_open_at is the ISO-8601 string of gate.soonest_resets_at when known."""
