@@ -2309,13 +2309,15 @@ class Scheduler:
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains seven top-level keys:
+        Contains nine top-level keys:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}}
         - effective_priorities: {task_id: str}
         - pin_queue: [{task_id: str, order: int}, ...]
         - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
         - current_holders: {module: task_id}
+        - is_paused: bool — True when the scheduler is park-stop paused
+        - pause_reason: str | None — human-readable reason, or None when not paused
         - snapshot_at: ISO8601 timestamp
         """
         # skip_counts — plain int values, safe to copy.
@@ -2363,6 +2365,8 @@ class Scheduler:
             'pin_queue': pin_queue,
             'overrides': overrides,
             'current_holders': current_holders,
+            'is_paused': self.is_paused,
+            'pause_reason': self.pause_reason,
             'snapshot_at': datetime.now(UTC).isoformat(),
         }
 
