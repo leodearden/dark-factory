@@ -366,6 +366,53 @@ class TestRouteReviewSuggestionsToCurator:
             assert tool_name != 'curate_batch', 'curate_batch must never be called'
 
     @pytest.mark.asyncio
+    async def test_distinct_second_call_still_submits(self):
+        """Distinct suggestion sets → both batches are submitted (no over-eager dedup).
+
+        The cache keys on content_hash: two different suggestion lists produce
+        different hashes so NEITHER call must be short-circuited.
+        Total POSTs == len(A) + len(B).
+        """
+        suggestions_a = self._suggestions()  # 2 suggestions
+        suggestions_b = [
+            {
+                'reviewer': 'security',
+                'severity': 'suggestion',
+                'location': 'src/auth.py:5',
+                'category': 'security',
+                'description': 'Validate input before use',
+                'suggested_fix': 'Add input validation',
+            },
+        ]
+
+        wf = _make_workflow()
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            # First call with suggestions A
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Second call with DIFFERENT suggestions B
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
+            tasks = list(wf._background_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Both batches must go through
+        expected = len(suggestions_a) + len(suggestions_b)
+        assert len(posted_bodies) == expected, (
+            f'Expected {expected} POSTs (A + B), got {len(posted_bodies)}: '
+            'distinct suggestion sets must not be collapsed by the dedup cache'
+        )
+
+    @pytest.mark.asyncio
     async def test_mcp_none_falls_back_to_escalation_queue(self):
         """When self.mcp is None and escalation_queue is set, _escalate_suggestions is called."""
         suggestions = self._suggestions()
