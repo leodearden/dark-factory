@@ -79,6 +79,27 @@ class EventType(StrEnum):
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
 
     # Scheduler priority overrides
+    #
+    # Pin-order observation contract (decided in task 1290):
+    #
+    # These events are observability-only and may lag OverrideStore / MCP
+    # writes by one scheduler tick.  ``pin_queue_reordered`` fires ONLY on a
+    # pure reorder (tasks already pinned shifting position via
+    # reorder_pin_queue) and carries the complete new ordering in
+    # ``data['new_order']``.  It is intentionally NOT emitted on pin add
+    # (task_pinned) or remove (task_unpinned), since those events already
+    # fully describe the change.
+    #
+    # Consumer strategies for current pin order:
+    #   (i)  Event recomposition — task_pinned → append task_id;
+    #        task_unpinned → remove task_id;
+    #        pin_queue_reordered → replace list with new_order.
+    #   (ii) Authoritative snapshot (preferred) — call
+    #        OverrideStore.get_pin_queue(project_root) or read
+    #        snapshot.pin_queue from the scheduler's public API directly.
+    #
+    # See also: _emit_override_diff_events docstring in scheduler.py
+    # (producer side) for full rationale and example consumer code.
     priority_override_set = 'priority_override_set'
     priority_override_cleared = 'priority_override_cleared'
     task_pinned = 'task_pinned'
