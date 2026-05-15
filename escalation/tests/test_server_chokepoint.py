@@ -310,3 +310,130 @@ class TestKeptOpenPaths:
         result = await _blocker(server, **_COMMON_KWARGS)
 
         assert result['status'] == 'queued', f"Expected fail-open 'queued', got: {result['status']}"
+
+
+# ---------------------------------------------------------------------------
+# Step-5 RED tests: bypass gates (terminal_state_is_the_bug + review_suggestions)
+# ---------------------------------------------------------------------------
+
+
+class TestBypassGates:
+    """Two bypass gates skip the auto-resolve chokepoint entirely."""
+
+    @pytest.mark.asyncio
+    async def test_terminal_state_is_the_bug_skips_auto_resolve(self, tmp_path: Path):
+        """escalate_blocker with terminal_state_is_the_bug=True → NOT auto-resolved (queued)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        spy_calls: list[str] = []
+
+        async def _spy_lookup(task_id: str) -> str:
+            spy_calls.append(task_id)
+            return 'done'
+
+        server = create_server(queue, task_status_lookup=_spy_lookup)
+
+        result = await _blocker(
+            server,
+            terminal_state_is_the_bug=True,
+            **_COMMON_KWARGS,
+        )
+
+        assert result['status'] == 'queued', (
+            f"Expected 'queued' (bypass), got: {result['status']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_state_is_the_bug_lookup_not_called(self, tmp_path: Path):
+        """With terminal_state_is_the_bug=True, the lookup spy is NOT consulted."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        spy_calls: list[str] = []
+
+        async def _spy_lookup(task_id: str) -> str:
+            spy_calls.append(task_id)
+            return 'done'
+
+        server = create_server(queue, task_status_lookup=_spy_lookup)
+
+        await _blocker(server, terminal_state_is_the_bug=True, **_COMMON_KWARGS)
+
+        assert spy_calls == [], f"Lookup was unexpectedly called: {spy_calls}"
+
+    @pytest.mark.asyncio
+    async def test_terminal_state_is_the_bug_open_on_disk(self, tmp_path: Path):
+        """With terminal_state_is_the_bug=True, escalation file on disk is 'pending'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, terminal_state_is_the_bug=True, **_COMMON_KWARGS)
+
+        esc_id = result['id']
+        esc = queue.get(esc_id)
+        assert esc is not None
+        assert esc.status == 'pending', f"Expected 'pending', got: {esc.status}"
+
+    @pytest.mark.asyncio
+    async def test_review_suggestions_category_skips_auto_resolve(self, tmp_path: Path):
+        """escalate_info with category='review_suggestions' → NOT auto-resolved (queued)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        spy_calls: list[str] = []
+
+        async def _spy_lookup(task_id: str) -> str:
+            spy_calls.append(task_id)
+            return 'done'
+
+        server = create_server(queue, task_status_lookup=_spy_lookup)
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='review_suggestions',
+            summary='review suggestions bypass test',
+        )
+
+        assert result['status'] == 'queued', (
+            f"Expected 'queued' (bypass), got: {result['status']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_suggestions_lookup_not_called(self, tmp_path: Path):
+        """With category='review_suggestions', the lookup spy is NOT consulted."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        spy_calls: list[str] = []
+
+        async def _spy_lookup(task_id: str) -> str:
+            spy_calls.append(task_id)
+            return 'done'
+
+        server = create_server(queue, task_status_lookup=_spy_lookup)
+
+        await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='review_suggestions',
+            summary='review suggestions bypass test',
+        )
+
+        assert spy_calls == [], f"Lookup was unexpectedly called: {spy_calls}"
+
+    @pytest.mark.asyncio
+    async def test_review_suggestions_open_on_disk(self, tmp_path: Path):
+        """With category='review_suggestions', escalation file on disk is 'pending'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _info(
+            server,
+            task_id='task-999',
+            agent_role='implementer',
+            category='review_suggestions',
+            summary='review suggestions bypass test',
+        )
+
+        esc_id = result['id']
+        esc = queue.get(esc_id)
+        assert esc is not None
+        assert esc.status == 'pending', f"Expected 'pending', got: {esc.status}"
