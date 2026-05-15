@@ -231,6 +231,41 @@ class TestFindViolationsExemption:
         assert len(violations) == 1
 
 
+class TestFindViolationsAnnAssign:
+    """AnnAssign branch: config: Foo = MagicMock() is detected; annotation-only and exempted forms are not."""
+
+    def test_annotated_assignment_with_magicmock_is_a_violation(self):
+        """config: Foo = MagicMock() → exactly 1 violation with correct lineno/col/message."""
+        source = 'config: Foo = MagicMock()\n'
+        violations = find_violations(source, 'test_annassign.py')
+        assert len(violations) == 1, (
+            f'config: Foo = MagicMock() should produce 1 violation; got {len(violations)}'
+        )
+        v = violations[0]
+        assert v.lineno == 1
+        assert v.col_offset == 0
+        assert 'mock_orch_config' in v.message
+
+    def test_annotation_only_no_value_is_not_a_violation(self):
+        """config: Foo (no value, node.value is None) → 0 violations."""
+        source = 'config: Foo\n'
+        violations = find_violations(source, 'test_ann_only.py')
+        assert violations == [], (
+            f'Annotation-only assignment (no value) should produce no violation; got {violations}'
+        )
+
+    def test_exemption_above_annotated_assignment_suppresses_violation(self):
+        """# noqa: bare-magicmock — reason directly above config: Foo = MagicMock() → 0 violations."""
+        source = (
+            '# noqa: bare-magicmock — exempted annotated assignment\n'
+            'config: Foo = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_ann_exempt.py')
+        assert violations == [], (
+            f'Exemption comment above annotated assignment should suppress violation; got {violations}'
+        )
+
+
 class TestFindViolationsOutputOrder:
     """find_violations() returns violations sorted ascending by (lineno, col_offset)."""
 
