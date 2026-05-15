@@ -2359,7 +2359,10 @@ class Scheduler:
                         'ttl_until': row.ttl_until.isoformat() if row.ttl_until else None,
                     }
             except Exception:
-                pass
+                logger.warning(
+                    'override_store.get_overrides failed; overrides degraded to empty dict',
+                    exc_info=True,
+                )
 
         # current_holders — delegate to the public accessor.
         current_holders = self.lock_table.snapshot_holders()
