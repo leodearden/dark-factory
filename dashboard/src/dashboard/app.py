@@ -174,6 +174,7 @@ async def _metrics_loop(
     collect_metrics_snapshot has its own try/except, so one failed source
     does not poison the others.
     """
+
     async def _run_once() -> None:
         config: DashboardConfig = app.state.config
         pool: DbPool = app.state.db
@@ -181,7 +182,9 @@ async def _metrics_loop(
         recon_db = await pool.get(config.reconciliation_db)
         tickets_db = await pool.get(config.tickets_db)
         merge_dbs = await _project_scoped_dbs_labeled(
-            config, pool, Path('data/orchestrator/runs.db'),
+            config,
+            pool,
+            Path('data/orchestrator/runs.db'),
         )
         await collect_metrics_snapshot(
             conn=conn,
@@ -224,9 +227,13 @@ async def lifespan(app: FastAPI):
     await burndown_conn.execute('PRAGMA journal_mode=WAL')
     await burndown_conn.executescript(BURNDOWN_SCHEMA)
     await burndown_conn.commit()
-    collector_task = asyncio.create_task(_burndown_loop(
-        burndown_conn, app.state.config, app.state.http_client,
-    ))
+    collector_task = asyncio.create_task(
+        _burndown_loop(
+            burndown_conn,
+            app.state.config,
+            app.state.http_client,
+        )
+    )
 
     # Metrics snapshot collector (separate WAL writer for sparse-history signals).
     metrics_path = app.state.config.metrics_db
@@ -403,11 +410,13 @@ async def api_orchestrators(request: Request) -> JSONResponse:
         get_orchestrators_running_series(metrics_db, days=1),
     )
     known_roots = [config.project_root, *config.known_project_roots]
-    return JSONResponse(redux_api.shape_orchestrators(
-        orchestrators,
-        known_project_roots=known_roots,
-        running_spark=running_spark,
-    ))
+    return JSONResponse(
+        redux_api.shape_orchestrators(
+            orchestrators,
+            known_project_roots=known_roots,
+            running_spark=running_spark,
+        )
+    )
 
 
 @app.get('/api/v2/dashboard/tasks')
@@ -416,12 +425,14 @@ async def api_tasks(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
     active, locks, offline_projects = await collect_active_tasks(http_client, config)
-    return JSONResponse({
-        'ACTIVE_TASKS': active,
-        'FILE_LOCKS': locks,
-        'TASKS_OFFLINE': bool(offline_projects),
-        'TASKS_OFFLINE_PROJECTS': offline_projects,
-    })
+    return JSONResponse(
+        {
+            'ACTIVE_TASKS': active,
+            'FILE_LOCKS': locks,
+            'TASKS_OFFLINE': bool(offline_projects),
+            'TASKS_OFFLINE_PROJECTS': offline_projects,
+        }
+    )
 
 
 @app.get('/api/v2/dashboard/memory')
@@ -439,11 +450,16 @@ async def api_memory(request: Request) -> JSONResponse:
         get_memory_24h_ago(metrics_db),
         memory_data.get_wal_status(http_client, config),
     )
-    return JSONResponse(redux_api.shape_memory(
-        status, queue,
-        sparks=sparks, queue_spark=queue_spark, delta_24h=delta_24h,
-        wal=wal,
-    ))
+    return JSONResponse(
+        redux_api.shape_memory(
+            status,
+            queue,
+            sparks=sparks,
+            queue_spark=queue_spark,
+            delta_24h=delta_24h,
+            wal=wal,
+        )
+    )
 
 
 @app.get('/api/v2/dashboard/memory-graphs')
@@ -457,8 +473,12 @@ async def api_memory_graphs(request: Request) -> JSONResponse:
         get_operations_breakdown(db),
         return_exceptions=True,
     )
-    timeseries = safe_gather_result(ts_r, {'labels': [], 'reads': [], 'writes': []}, 'memory-graphs/ts')
-    ops = cast(ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'memory-graphs/ops'))
+    timeseries = safe_gather_result(
+        ts_r, {'labels': [], 'reads': [], 'writes': []}, 'memory-graphs/ts'
+    )
+    ops = cast(
+        ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'memory-graphs/ops')
+    )
     return JSONResponse(redux_api.shape_memory_graphs(timeseries, ops))
 
 
@@ -480,7 +500,9 @@ async def api_recon(request: Request) -> JSONResponse:
         return_exceptions=True,
     )
     buffer_stats = safe_gather_result(
-        bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'recon/buffer',
+        bs_r,
+        {'buffered_count': 0, 'oldest_event_age_seconds': None},
+        'recon/buffer',
     )
     burst_state_raw = safe_gather_result(burst_r, [], 'recon/burst')
     active_burst, _ = partition_burst_state(burst_state_raw)
@@ -489,14 +511,22 @@ async def api_recon(request: Request) -> JSONResponse:
     runs = safe_gather_result(runs_r, [], 'recon/runs')
     sparks = safe_gather_result(
         sparks_r,
-        {'buffered_count': {'labels': [], 'values': []},
-         'active_agents': {'labels': [], 'values': []}},
+        {
+            'buffered_count': {'labels': [], 'values': []},
+            'active_agents': {'labels': [], 'values': []},
+        },
         'recon/sparks',
     )
-    return JSONResponse(redux_api.shape_recon(
-        buffer_stats=buffer_stats, burst_state=active_burst,
-        watermarks=watermarks, verdict=verdict, runs=runs, sparks=sparks,
-    ))
+    return JSONResponse(
+        redux_api.shape_recon(
+            buffer_stats=buffer_stats,
+            burst_state=active_burst,
+            watermarks=watermarks,
+            verdict=verdict,
+            runs=runs,
+            sparks=sparks,
+        )
+    )
 
 
 @app.get('/api/v2/dashboard/merge-queue')
@@ -509,20 +539,22 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     effective_now = datetime.now(UTC)
 
     project_dbs = await _project_scoped_dbs_labeled(
-        config, pool, Path('data/orchestrator/runs.db'),
+        config,
+        pool,
+        Path('data/orchestrator/runs.db'),
     )
     http_client: httpx.AsyncClient = request.app.state.http_client
     projects_raw, halt_status = await asyncio.gather(
         build_per_project_merge_queue(
-            project_dbs, hours=hours, now=effective_now, recent_window_minutes=15,
+            project_dbs,
+            hours=hours,
+            now=effective_now,
+            recent_window_minutes=15,
         ),
         get_merge_halt_status(http_client, config.escalation_urls),
     )
     pids = list(projects_raw.keys())
-    title_maps = await asyncio.gather(*(
-        load_task_titles(http_client, config, pid)
-        for pid in pids
-    ))
+    title_maps = await asyncio.gather(*(load_task_titles(http_client, config, pid) for pid in pids))
     enriched: dict[str, dict] = {}
     for pid, data, titles in zip(pids, projects_raw.values(), title_maps, strict=True):
         enriched[pid] = {
@@ -537,9 +569,13 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     active_sparks: dict[str, dict] = {}
     for pid in pids:
         active_sparks[pid] = await get_merge_active_series(metrics_db, project_id=pid, days=1)
-    return JSONResponse(redux_api.shape_merge_queue(
-        enriched, active_sparks=active_sparks, halt_status=halt_status,
-    ))
+    return JSONResponse(
+        redux_api.shape_merge_queue(
+            enriched,
+            active_sparks=active_sparks,
+            halt_status=halt_status,
+        )
+    )
 
 
 @app.get('/api/v2/dashboard/costs')
@@ -558,14 +594,16 @@ async def api_costs(request: Request) -> JSONResponse:
         aggregate_account_events(dbs, days=days),
         return_exceptions=True,
     )
-    return JSONResponse(redux_api.shape_costs(
-        summary=safe_gather_result(summary, {}, 'costs/summary'),
-        by_project=safe_gather_result(by_project, {}, 'costs/by_project'),
-        by_account=safe_gather_result(by_account, {}, 'costs/by_account'),
-        by_role=safe_gather_result(by_role, {}, 'costs/by_role'),
-        trend=safe_gather_result(trend, {}, 'costs/trend'),
-        events=safe_gather_result(events, [], 'costs/events'),
-    ))
+    return JSONResponse(
+        redux_api.shape_costs(
+            summary=safe_gather_result(summary, {}, 'costs/summary'),
+            by_project=safe_gather_result(by_project, {}, 'costs/by_project'),
+            by_account=safe_gather_result(by_account, {}, 'costs/by_account'),
+            by_role=safe_gather_result(by_role, {}, 'costs/by_role'),
+            trend=safe_gather_result(trend, {}, 'costs/trend'),
+            events=safe_gather_result(events, [], 'costs/events'),
+        )
+    )
 
 
 @app.get('/api/v2/dashboard/performance')
@@ -583,13 +621,15 @@ async def api_performance(request: Request) -> JSONResponse:
         aggregate_performance_history(dbs, days=days),
         return_exceptions=True,
     )
-    return JSONResponse(redux_api.shape_performance(
-        paths=safe_gather_result(paths_r, {}, 'perf/paths'),
-        escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
-        histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
-        ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
-        history=safe_gather_result(history_r, {}, 'perf/history'),
-    ))
+    return JSONResponse(
+        redux_api.shape_performance(
+            paths=safe_gather_result(paths_r, {}, 'perf/paths'),
+            escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
+            histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
+            ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
+            history=safe_gather_result(history_r, {}, 'perf/history'),
+        )
+    )
 
 
 # Cap str(exc) inside the 502 `detail` field to bound arbitrary-length
@@ -622,8 +662,10 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     ticket_id = body.get('ticket_id') if isinstance(body, dict) else None
     if not isinstance(ticket_id, str) or not ticket_id.startswith('tkt_'):
         return JSONResponse(
-            {'error': 'invalid_ticket_id',
-             'detail': "ticket_id must be a string starting with 'tkt_'"},
+            {
+                'error': 'invalid_ticket_id',
+                'detail': "ticket_id must be a string starting with 'tkt_'",
+            },
             status_code=400,
         )
 
@@ -653,14 +695,20 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     for url in config.fused_memory_urls:
         try:
             result = await memory_data.mcp_tool_call(
-                http_client, url, 'cancel_ticket', {'ticket_id': ticket_id},
+                http_client,
+                url,
+                'cancel_ticket',
+                {'ticket_id': ticket_id},
             )
-        except (httpx.ConnectError, httpx.TimeoutException,
-                httpx.HTTPStatusError, ValueError) as exc:
+        except (
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.HTTPStatusError,
+            ValueError,
+        ) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
             errors.append(
-                f'{url}: {type(exc).__name__}: '
-                f'{str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
+                f'{url}: {type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
             )
             # Invalidate the cached MCP session so the next caller retries
             # session initialisation — mirrors get_memory_status/get_queue_stats.
@@ -703,7 +751,8 @@ async def api_curator(request: Request) -> JSONResponse:
 
     fanout_r, sparks_r, intervals_r = await asyncio.gather(
         fan_out_list_tickets(
-            http_client, config,
+            http_client,
+            config,
             timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
         ),
         get_curator_sparks(metrics_db, days=1),
@@ -731,14 +780,16 @@ async def api_curator(request: Request) -> JSONResponse:
                 age_seconds = int((now - created_dt).total_seconds())
             except (ValueError, TypeError):
                 age_seconds = None
-        pending.append({
-            'ticket_id': r.get('ticket_id', ''),
-            'project_id': r.get('project_id', ''),
-            'title': r.get('candidate_title') or '',
-            'files': r.get('files', []),
-            'created_at': created_at_str,
-            'age_seconds': age_seconds,
-        })
+        pending.append(
+            {
+                'ticket_id': r.get('ticket_id', ''),
+                'project_id': r.get('project_id', ''),
+                'title': r.get('candidate_title') or '',
+                'files': r.get('files', []),
+                'created_at': created_at_str,
+                'age_seconds': age_seconds,
+            }
+        )
 
     # capped_now (any-account semantics) + capped_windows (all-accounts merge)
     # come from one helper — single source of truth shared with _sample_curator.
@@ -755,17 +806,19 @@ async def api_curator(request: Request) -> JSONResponse:
         capped_now = 1 if any(iv.end is None for iv in intervals) else 0
         capped_spark = _empty_capped
 
-    return JSONResponse(redux_api.shape_curator(
-        pending=pending,
-        curator_sparks=curator_sparks,
-        capped_spark=cast(dict, capped_spark),
-        capped_now=capped_now,
-        # paused_reason: the usage_gate's pause reason lives only in-memory and
-        # is not exposed by any current MCP tool.  Returns None until a follow-up
-        # task adds a snapshot column or a new get_curator_state MCP tool.
-        paused_reason=None,
-        pending_total=pending_total,
-    ))
+    return JSONResponse(
+        redux_api.shape_curator(
+            pending=pending,
+            curator_sparks=curator_sparks,
+            capped_spark=cast(dict, capped_spark),
+            capped_now=capped_now,
+            # paused_reason: the usage_gate's pause reason lives only in-memory and
+            # is not exposed by any current MCP tool.  Returns None until a follow-up
+            # task adds a snapshot column or a new get_curator_state MCP tool.
+            paused_reason=None,
+            pending_total=pending_total,
+        )
+    )
 
 
 @app.get('/api/v2/dashboard/scheduler')
@@ -773,16 +826,19 @@ async def api_scheduler(request: Request) -> JSONResponse:
     """SCHEDULER — task contention, parks, overrides, and event sparklines."""
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    rows, modules, pin_queue, events_by_task, offline_projects = \
-        await collect_scheduler_state(http_client, config)
-    return JSONResponse(redux_api.shape_scheduler(
-        rows=rows,
-        modules=modules,
-        pin_queue=pin_queue,
-        events_by_task=events_by_task,
-        offline_projects=offline_projects,
-        snapshot_at=None,
-    ))
+    rows, modules, pin_queue, events_by_task, offline_projects = await collect_scheduler_state(
+        http_client, config
+    )
+    return JSONResponse(
+        redux_api.shape_scheduler(
+            rows=rows,
+            modules=modules,
+            pin_queue=pin_queue,
+            events_by_task=events_by_task,
+            offline_projects=offline_projects,
+            snapshot_at=None,
+        )
+    )
 
 
 _VALID_BOOST_TIERS = frozenset({'critical', 'high', 'medium', 'low', 'polish'})
@@ -816,8 +872,12 @@ async def _scheduler_proxy(
     for url in config.fused_memory_urls:
         try:
             result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
-        except (httpx.ConnectError, httpx.TimeoutException,
-                httpx.HTTPStatusError, ValueError) as exc:
+        except (
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.HTTPStatusError,
+            ValueError,
+        ) as exc:
             logger.warning('%s failed for %s: %s', tool_name, url, exc)
             errors.append(f'{url}: {str(exc)[:200]}')
             memory_data.invalidate_session(url)
@@ -858,7 +918,10 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
     boost_tier = body.get('boost_tier')
     if boost_tier is not None and boost_tier not in _VALID_BOOST_TIERS:
         return JSONResponse(
-            {'error': 'invalid_boost_tier', 'detail': f'must be one of {sorted(_VALID_BOOST_TIERS)}'},
+            {
+                'error': 'invalid_boost_tier',
+                'detail': f'must be one of {sorted(_VALID_BOOST_TIERS)}',
+            },
             status_code=400,
         )
 
@@ -875,7 +938,9 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
 
     pin_order = body.get('pin_order')
     # Reject non-integer pin_order (bool subclasses int in Python, so exclude it)
-    if pin_order is not None and not (isinstance(pin_order, int) and not isinstance(pin_order, bool)):
+    if pin_order is not None and not (
+        isinstance(pin_order, int) and not isinstance(pin_order, bool)
+    ):
         return JSONResponse(
             {'error': 'invalid_pin_order', 'detail': 'pin_order must be an integer'},
             status_code=400,
@@ -897,12 +962,18 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
             ttl_val = float(ttl_raw)  # raises TypeError for None
         except (TypeError, ValueError):
             return JSONResponse(
-                {'error': 'invalid_ttl_minutes', 'detail': 'ttl_minutes must be a positive number ≤ 1440'},
+                {
+                    'error': 'invalid_ttl_minutes',
+                    'detail': 'ttl_minutes must be a positive number ≤ 1440',
+                },
                 status_code=400,
             )
         if ttl_val <= 0 or ttl_val > 1440:
             return JSONResponse(
-                {'error': 'invalid_ttl_minutes', 'detail': 'ttl_minutes must be a positive number ≤ 1440'},
+                {
+                    'error': 'invalid_ttl_minutes',
+                    'detail': 'ttl_minutes must be a positive number ≤ 1440',
+                },
                 status_code=400,
             )
         ttl_secs = int(round(ttl_val * 60))
@@ -943,7 +1014,9 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
     fields = body.get('fields')
     if fields is not None:
         if not isinstance(fields, list):
-            return JSONResponse({'error': 'invalid_fields', 'detail': 'fields must be a list'}, status_code=400)
+            return JSONResponse(
+                {'error': 'invalid_fields', 'detail': 'fields must be a list'}, status_code=400
+            )
         invalid = [f for f in fields if f not in _VALID_CLEAR_FIELDS]
         if invalid:
             return JSONResponse(
@@ -975,7 +1048,9 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
 
     task_ids = body.get('task_ids')
     if not isinstance(task_ids, list):
-        return JSONResponse({'error': 'invalid_task_ids', 'detail': 'task_ids must be a list'}, status_code=400)
+        return JSONResponse(
+            {'error': 'invalid_task_ids', 'detail': 'task_ids must be a list'}, status_code=400
+        )
 
     # Validate each element at the boundary — the override endpoint enforces
     # str/non-empty for task_id, and reorder should match.  Without this a
@@ -1000,7 +1075,9 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
     # reorder_pin_queue forwards MCP results verbatim (no not_found→404 mapping),
     # so the React layer can toast on 'mismatch' without an extra round-trip.
     return await _scheduler_proxy(
-        http_client, config, 'reorder_pin_queue',
+        http_client,
+        config,
+        'reorder_pin_queue',
         {'task_ids': task_ids, 'project_root': project_root},
         treat_not_found_as_404=False,
     )

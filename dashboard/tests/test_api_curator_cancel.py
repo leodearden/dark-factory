@@ -43,7 +43,7 @@ def _tool_name(c):
 # ---------------------------------------------------------------------------
 
 _INVALID_BODIES = [
-    pytest.param(None, id='non-dict-body'),        # send as raw bytes
+    pytest.param(None, id='non-dict-body'),  # send as raw bytes
     pytest.param({}, id='missing-key'),
     pytest.param({'ticket_id': 123}, id='non-string'),
     pytest.param({'ticket_id': ''}, id='empty-string'),
@@ -120,6 +120,7 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     assert args_arg == {'ticket_id': 'tkt_abc'}
     # The URL must be exactly the first entry in the default config
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+
     assert url_arg == DEFAULT_FUSED_MEMORY_URLS[0]
 
 
@@ -239,10 +240,13 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
           message ('connection refused: port 8002'), not just the type name
     """
     exc_msg = 'connection refused: port 8002'
-    with patch(
-        _PATCH_TARGET,
-        new=AsyncMock(side_effect=httpx.ConnectError(exc_msg)),
-    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+    with (
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=httpx.ConnectError(exc_msg)),
+        ),
+        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+    ):
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -253,8 +257,7 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
 
     # (b) WARNING log
     warning_records = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'
     ]
     assert warning_records, 'Expected at least one WARNING from dashboard.app'
     combined_msg = ' '.join(r.getMessage() for r in warning_records)
@@ -292,10 +295,13 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
     """
     long_msg = 'X' * 300
     exc = ValueError(long_msg)
-    with patch(
-        _PATCH_TARGET,
-        new=AsyncMock(side_effect=exc),
-    ), caplog.at_level(logging.WARNING, logger='dashboard.app'):
+    with (
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=exc),
+        ),
+        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+    ):
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -315,8 +321,7 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog):
 
     # (c) WARNING log retains full exception text
     warning_records = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'
     ]
     assert warning_records, 'Expected at least one WARNING from dashboard.app'
     combined_msg = ' '.join(r.getMessage() for r in warning_records)
