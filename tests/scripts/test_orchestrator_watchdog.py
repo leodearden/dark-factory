@@ -302,6 +302,116 @@ def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPat
 
 
 # ---------------------------------------------------------------------------
+# _unit_start_elapsed_secs direct tests
+# ---------------------------------------------------------------------------
+
+
+def _make_systemctl_show_result(value: str, rc: int = 0) -> subprocess.CompletedProcess:
+    """Build a fake systemctl show CompletedProcess with the given property value."""
+    stdout = f"ExecMainStartTimestampMonotonic={value}\n"
+    return subprocess.CompletedProcess(["systemctl"], rc, stdout=stdout, stderr="")
+
+
+def test_elapsed_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns correct elapsed seconds on the happy path.
+
+    start=5_000_000 us (= 5.0 s), clock_gettime→305.0 s → elapsed = 300.0 s.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("5000000", rc=0)
+
+    def fake_clock_gettime(clk_id):  # noqa: ANN001
+        return 305.0
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "clock_gettime", fake_clock_gettime)
+
+    result = wdog._unit_start_elapsed_secs("some.service")
+    assert result == pytest.approx(300.0)
+
+
+def test_elapsed_nonzero_rc_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when systemctl exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("5000000", rc=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_unparseable_value_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when the property value is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("notanint", rc=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_zero_sentinel_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None for the zero sentinel (unit never started)."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("0", rc=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_clock_failure_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when clock_gettime raises OSError."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result("5000000", rc=0)
+
+    def fake_clock_gettime(clk_id):  # noqa: ANN001
+        raise OSError("clock unavailable")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "clock_gettime", fake_clock_gettime)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+def test_elapsed_clamp_future_start_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs clamps to 0.0 when start_us/1e6 > now (max(0,…))."""
+    wdog = _load_watchdog()
+
+    # start is in the future relative to now (clock drift or negative elapsed)
+    start_us = int(310.0 * 1_000_000)  # 310 s
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_systemctl_show_result(str(start_us), rc=0)
+
+    def fake_clock_gettime(clk_id):  # noqa: ANN001
+        return 305.0  # now is BEFORE start → elapsed would be negative
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "clock_gettime", fake_clock_gettime)
+
+    result = wdog._unit_start_elapsed_secs("some.service")
+    assert result == pytest.approx(0.0)
+
+
+def test_elapsed_empty_stdout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_elapsed_secs returns None when stdout has no '=' line."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+# ---------------------------------------------------------------------------
 # main() tests
 # ---------------------------------------------------------------------------
 
