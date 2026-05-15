@@ -436,8 +436,23 @@ class ModuleConfig:
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
-    """Scan project_root recursively for orchestrator.yaml files and load overridable fields."""
+    """Walk *project_root* recursively for ``orchestrator.yaml`` files and load overridable fields.
+
+    Contract:
+    - Prefix is the POSIX-style relative path from *project_root* (e.g. ``dashboard`` or
+      ``foo/bar``).  A root-level ``orchestrator.yaml`` (prefix ``"."``) is skipped because
+      it is the top-level orchestrator config, not a module config.
+    - Excludes standard build/VCS dirs (``_DISCOVERY_EXCLUDED_DIRS``) by pruning ``dirnames``
+      in place during the walk so their subtrees are never visited.
+    - Uses ``followlinks=False`` (passed explicitly) for symlink-cycle safety — a symlink that
+      points back into an ancestor directory cannot drive infinite recursion because the walk
+      will not follow it.
+    - Results are inserted into the returned dict in ``(depth, lex)`` order so iteration is
+      deterministic regardless of filesystem order.
+    """
     found: list[tuple[str, Path]] = []
+    # followlinks=False (the default, stated explicitly so a future refactor cannot flip it
+    # silently): prevents infinite recursion from self-referencing symlink cycles.
     for dirpath, dirnames, filenames in os.walk(project_root, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in _DISCOVERY_EXCLUDED_DIRS]
         if 'orchestrator.yaml' not in filenames:
