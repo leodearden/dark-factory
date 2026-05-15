@@ -2729,6 +2729,7 @@ Output JSON matching the schema. Every task must appear in the output.
         Crashloop detection is added in step-12.
         """
         consecutive_unclean: int = 0
+        consecutive_degenerate_clean: int = 0  # task 1430: exponential floor on fast-clean exits
         while True:
             start = time.monotonic()
             try:
@@ -2782,19 +2783,37 @@ Output JSON matching the schema. Every task must appear in the output.
                 # Only called when duration is below the healthy-rotation floor;
                 # reuses watcher_crashloop_window_secs as the burst-detection
                 # window — semantically identical for both failure modes.
-                if (
-                    duration < self.config.watcher_misconfigured_min_rotation_secs
-                    and await self._check_watcher_guard(
+                if duration < self.config.watcher_misconfigured_min_rotation_secs:
+                    if await self._check_watcher_guard(
                         self._watcher_degenerate_clean_exits,
                         'watcher_misconfigured',
                         self.config.watcher_max_misconfigured_clean_exits,
                         self.config.watcher_crashloop_window_secs,
                         end,
+                    ):
+                        return
+                    # Degenerate-clean, no trip — apply exponential floor (task 1430).
+                    # Fast rotation signals potential cost-runaway; grow the sleep
+                    # exponentially to slow the burn rate before the trip arms.
+                    # Mirrors the unclean-exit backoff shape at line ~2820.
+                    consecutive_degenerate_clean += 1
+                    floor = min(
+                        self.config.watcher_subprocess_restart_backoff_secs
+                        * (2 ** (consecutive_degenerate_clean - 1)),
+                        _WATCHER_MAX_BACKOFF_SECS,
                     )
-                ):
-                    return
-                logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
-                await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
+                    logger.warning(
+                        'Escalation-watcher-auto rotation completed cleanly but fast '
+                        '(consecutive_degenerate=%d floor=%.1fs)',
+                        consecutive_degenerate_clean,
+                        floor,
+                    )
+                    await asyncio.sleep(floor)
+                else:
+                    # Healthy clean (duration >= watcher_misconfigured_min_rotation_secs):
+                    # flat floor — queue had real work, no cost-runaway concern.
+                    logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
+                    await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
 
             # --- Unclean exit path ---
