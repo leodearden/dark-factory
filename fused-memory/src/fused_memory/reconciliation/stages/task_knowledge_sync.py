@@ -1538,9 +1538,27 @@ class TaskKnowledgeSync(BaseStage):
         #   .stale_missing_run_id_ids  — markers with absent/empty run_id (producer drift)
         #   .stale_mismatched_run_id_ids — markers with wrong run_id (prior-cycle residue)
         # Both stale buckets are swept below so they are never rendered to the LLM.
+        #
+        # Run-window guard (task-1369): fetch the run's started_at from the journal so
+        # same-cycle Stage-1 markers whose run_id was omitted/mis-stamped by the LLM
+        # producer are rescued (routed to current) rather than swept.  Best-effort:
+        # any failure leaves run_window_start=None (window guard dormant this cycle).
         run_id_for_markers = self._current_run_id
+        run_window_start: datetime | None = None
+        try:
+            _run = await self.journal.get_run(self._current_run_id)
+            _sa = getattr(_run, 'started_at', None)
+            if isinstance(_sa, datetime):
+                run_window_start = _sa
+        except Exception:
+            logger.warning(
+                'reconciliation.assemble_payload: journal.get_run failed; '
+                'run-window sweep guard disabled this cycle',
+                extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+            )
         partition = await _query_stage2_flags(
-            self.memory, self.project_id, run_id_for_markers
+            self.memory, self.project_id, run_id_for_markers,
+            run_window_start=run_window_start,
         )
         active_flags = partition.current
         stale_marker_ids = partition.stale_all_ids
