@@ -4823,6 +4823,101 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         except Exception as e:
             logger.warning(f'Failed to write suggestions to memory: {e}')
 
+    async def _post_submit_task(self, arguments: dict) -> None:
+        """Fire-and-forget helper: POST a submit_task call to the fused-memory MCP.
+
+        Runs inside an asyncio.create_task so the caller returns immediately.
+        Exceptions are caught and logged as warnings (fire-and-forget tolerance).
+        """
+        try:
+            import httpx as httpx_mod
+            async with httpx_mod.AsyncClient() as client:
+                await client.post(
+                    f'{self.mcp.url}/mcp/',
+                    json={
+                        'jsonrpc': '2.0',
+                        'id': 1,
+                        'method': 'tools/call',
+                        'params': {
+                            'name': 'submit_task',
+                            'arguments': arguments,
+                        },
+                    },
+                    timeout=10,
+                )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to submit curator task (fire-and-forget): %s',
+                self.task_id, exc,
+            )
+
+    async def _route_review_suggestions_to_curator(self, reviews) -> None:
+        """Route review suggestions directly to the curator intake (fire-and-forget).
+
+        Replaces the steward-escalation call site so suggestions are inserted
+        directly as CandidateTask tickets via ``submit_task`` MCP calls.  The
+        curator's ``_curator_worker`` drains the tickets asynchronously; this
+        method returns immediately after scheduling, regardless of curator speed.
+
+        Cross-submission dedup is handled by the curator R4 gate
+        ``_check_escalation_idempotency`` which matches
+        ``(escalation_id, suggestion_hash)`` metadata against existing
+        non-cancelled tasks.  Re-submitting identical suggestions produces the
+        same content_hash → same metadata → ticket marked 'combined' → 0 new rows.
+
+        Must NOT call curate_batch — that dispatches invoke_with_cap_retry and
+        can stall up to 31 minutes.  Uses asyncio.create_task +
+        ``self._background_tasks`` (mirrors ``_spawn_dry_run_unblock``).
+        """
+        from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
+
+        suggestions = reviews.suggestions
+        if not suggestions:
+            return
+
+        content_hash = review_suggestion_payload_hash(suggestions)
+        task_id = self.task_id
+        project_root = str(self.config.project_root)
+
+        for i, suggestion in enumerate(suggestions):
+            cat = suggestion.get('category', '')
+            loc = suggestion.get('location', '')
+            desc = suggestion.get('description', '')
+            title = f'[{cat}] {loc}: {desc[:60]}'
+
+            arguments = {
+                'title': title,
+                'description': desc,
+                'details': json.dumps(suggestion),
+                'priority': 'low',
+                'project_root': project_root,
+                'metadata': {
+                    'spawned_from': task_id,
+                    'spawn_context': 'review_suggestions',
+                    'escalation_id': f'review-suggestions-{task_id}',
+                    'suggestion_hash': content_hash,
+                },
+            }
+
+            try:
+                _task = asyncio.create_task(
+                    self._post_submit_task(arguments),
+                    name=f'route-suggestion-{task_id}-{i}',
+                )
+                self._background_tasks.add(_task)
+                _task.add_done_callback(self._background_tasks.discard)
+            except Exception as exc:
+                logger.warning(
+                    'Task %s: failed to schedule curator submit for suggestion %d: %s',
+                    task_id, i, exc,
+                )
+
+        logger.info(
+            'Task %s: scheduled %d suggestion(s) for direct curator intake '
+            '(hash=%s)',
+            task_id, len(suggestions), content_hash,
+        )
+
     def _escalate_suggestions(self, reviews) -> None:
         """Submit review suggestions as an info escalation for steward triage.
 
