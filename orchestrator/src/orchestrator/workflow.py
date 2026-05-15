@@ -254,7 +254,7 @@ class TaskWorkflow:
         git_ops: GitOps,
         scheduler: _SchedulerLike,
         briefing: _BriefingLike,
-        mcp: _McpLike,
+        mcp: _McpLike | None,
         escalation_queue=None,
         escalation_event: asyncio.Event | None = None,
         usage_gate: UsageGate | None = None,
@@ -2396,9 +2396,13 @@ class TaskWorkflow:
                     self.metrics.amendment_rounds += 1
                     continue  # re-loop: EXECUTE → VERIFY → REVIEW
 
-                # Cap exhausted or nothing in-scope — existing DONE path
-                if self.escalation_queue and reviews.suggestions:
-                    self._escalate_suggestions(reviews)
+                # Cap exhausted or nothing in-scope — existing DONE path.
+                # Route suggestions directly to the curator intake (fire-and-
+                # forget); fall back to memory write when there are none.
+                # _escalate_suggestions is retained as the steward fallback
+                # but is no longer called from this path.
+                if reviews.suggestions:
+                    await self._route_review_suggestions_to_curator(reviews)
                 else:
                     await self._write_suggestions_to_memory(reviews)
                 return WorkflowOutcome.DONE
@@ -3680,7 +3684,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if self.escalation_queue:
                 esc = self.config.escalation
                 escalation_url = f'http://{esc.host}:{esc.port}/mcp'
-            mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
+            if self.mcp is not None:
+                mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
         # Plan-tools stdio MCP server — architect builds plans, implementer/
         # debugger marks steps done.  Per-invocation isolation: each agent
@@ -4740,6 +4745,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         content = '\n'.join(parts)
 
+        if self.mcp is None:
+            return
         try:
             import httpx as httpx_mod
             async with httpx_mod.AsyncClient() as client:
@@ -4768,6 +4775,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Write plan design decisions to fused-memory."""
         decisions = self.plan.get('design_decisions', [])
         if not decisions:
+            return
+        if self.mcp is None:
             return
         try:
             async with __import__('httpx').AsyncClient() as client:
@@ -4798,6 +4807,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         suggestions = reviews.suggestions
         if not suggestions:
             return
+        if self.mcp is None:
+            return
         try:
             import httpx as httpx_mod
             async with httpx_mod.AsyncClient() as client:
@@ -4823,34 +4834,166 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         except Exception as e:
             logger.warning(f'Failed to write suggestions to memory: {e}')
 
+    async def _post_submit_tasks(self, arguments_list: list[dict]) -> None:
+        """Fire-and-forget: POST all submit_task calls to the fused-memory MCP.
+
+        Uses a single shared ``httpx.AsyncClient`` for the entire batch so only
+        one TCP connection pool is opened per routing call regardless of how many
+        suggestions are being submitted.  Runs inside ``asyncio.create_task`` so
+        the caller returns immediately.
+
+        Per-POST exceptions are caught and logged as warnings; a failure on one
+        suggestion does not abort the remaining submissions.
+        """
+        if self.mcp is None:
+            return
+        try:
+            import httpx as httpx_mod
+            async with httpx_mod.AsyncClient() as client:
+                for arguments in arguments_list:
+                    try:
+                        await client.post(
+                            f'{self.mcp.url}/mcp/',
+                            json={
+                                'jsonrpc': '2.0',
+                                'id': 1,
+                                'method': 'tools/call',
+                                'params': {
+                                    'name': 'submit_task',
+                                    'arguments': arguments,
+                                },
+                            },
+                            timeout=10,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            'Task %s: failed to submit curator task (fire-and-forget): %s',
+                            self.task_id, exc,
+                        )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to open HTTP client for curator submits: %s',
+                self.task_id, exc,
+            )
+
+    async def _route_review_suggestions_to_curator(self, reviews) -> None:
+        """Route review suggestions directly to the curator intake (fire-and-forget).
+
+        Inserts suggestions as CandidateTask tickets via ``submit_task`` MCP calls.
+        The curator's ``_curator_worker`` drains tickets asynchronously; this method
+        returns immediately after scheduling regardless of curator speed.
+
+        Cross-submission dedup is handled by the curator R4 gate
+        ``_check_escalation_idempotency`` which matches
+        ``(escalation_id, suggestion_hash)`` metadata against existing
+        non-cancelled tasks.  Re-submitting identical suggestions produces the
+        same content_hash → same metadata → ticket marked 'combined' → 0 new rows.
+
+        Must NOT call curate_batch — that dispatches invoke_with_cap_retry and
+        can stall up to 31 minutes.  Uses asyncio.create_task +
+        ``self._background_tasks`` (mirrors ``_spawn_dry_run_unblock``).
+
+        When ``self.mcp`` is not configured (e.g. CLI / dry-run / test contexts),
+        falls back to ``_escalate_suggestions`` if an escalation queue is available,
+        or to ``_write_suggestions_to_memory`` otherwise — preserving suggestions in
+        all cases rather than silently dropping them.
+        """
+        from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
+
+        suggestions = reviews.suggestions
+        if not suggestions:
+            return
+
+        # Guard: fall back if MCP transport is unavailable so suggestions are
+        # never silently dropped.  _escalate_suggestions is the real caller of
+        # the steward-escalation fallback path.
+        if self.mcp is None:
+            if self.escalation_queue:
+                self._escalate_suggestions(reviews)
+            else:
+                await self._write_suggestions_to_memory(reviews)
+            return
+
+        content_hash = review_suggestion_payload_hash(suggestions)
+        task_id = self.task_id
+        project_root = str(self.config.project_root)
+
+        all_arguments = []
+        for suggestion in suggestions:
+            cat = suggestion.get('category', '')
+            loc = suggestion.get('location', '')
+            desc = suggestion.get('description', '')
+            title = f'[{cat}] {loc}: {desc[:60]}'
+
+            all_arguments.append({
+                'title': title,
+                'description': desc,
+                'details': json.dumps(suggestion),
+                'priority': 'low',
+                'project_root': project_root,
+                'metadata': {
+                    'spawned_from': task_id,
+                    'spawn_context': 'review_suggestions',
+                    'escalation_id': f'review-suggestions-{task_id}',
+                    'suggestion_hash': content_hash,
+                },
+            })
+
+        # Schedule the entire batch as one background task with a shared HTTP
+        # client — avoids opening N separate connection pools for N suggestions.
+        try:
+            _task = asyncio.create_task(
+                self._post_submit_tasks(all_arguments),
+                name=f'route-suggestions-{task_id}',
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+        except Exception as exc:
+            logger.warning(
+                'Task %s: failed to schedule curator submits: %s',
+                task_id, exc,
+            )
+
+        logger.info(
+            'Task %s: scheduled %d suggestion(s) for direct curator intake '
+            '(hash=%s)',
+            task_id, len(suggestions), content_hash,
+        )
+
     def _escalate_suggestions(self, reviews) -> None:
-        """Submit review suggestions as an info escalation for steward triage."""
+        """Submit review suggestions as an info escalation for steward triage.
+
+        Retained as the steward-escalation fallback even though the primary
+        call site now routes via ``_route_review_suggestions_to_curator``.
+        The dedup helpers are shared with the curator path — both sites import
+        from ``orchestrator.review_suggestions.dedup``.
+        """
         from escalation.models import Escalation
+
+        from orchestrator.review_suggestions.dedup import (
+            find_prior_review_suggestion,
+            hash_marker,
+            review_suggestion_payload_hash,
+        )
 
         suggestions = reviews.suggestions
         if not suggestions or not self.escalation_queue:
             return
 
-        # Content fingerprint: skip if identical suggestions already escalated
-        content_hash = hashlib.sha256(
-            json.dumps(suggestions, sort_keys=True).encode(),
-        ).hexdigest()[:16]
+        # Content fingerprint: skip if identical suggestions already escalated.
+        content_hash = review_suggestion_payload_hash(suggestions)
 
         existing = self.escalation_queue.get_by_task(self.task_id)
-        for prev in existing:
-            if (
-                prev.category == 'review_suggestions'
-                and prev.detail
-                and prev.detail.startswith(f'#hash:{content_hash}#')
-            ):
-                logger.info(
-                    'Task %s: skipping duplicate review_suggestions escalation '
-                    '(content hash %s matches %s)',
-                    self.task_id, content_hash, prev.id,
-                )
-                return
+        prior = find_prior_review_suggestion(existing, content_hash)
+        if prior is not None:
+            logger.info(
+                'Task %s: skipping duplicate review_suggestions escalation '
+                '(content hash %s matches %s)',
+                self.task_id, content_hash, prior.id,
+            )
+            return
 
-        detail = f'#hash:{content_hash}#' + json.dumps(suggestions)
+        detail = hash_marker(content_hash) + json.dumps(suggestions)
 
         esc = Escalation(
             id=self.escalation_queue.make_id(self.task_id),
