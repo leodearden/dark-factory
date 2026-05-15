@@ -431,10 +431,17 @@ class ModuleConfig:
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
-    """Scan project_root/*/orchestrator.yaml and load overridable fields."""
+    """Scan project_root recursively for orchestrator.yaml files and load overridable fields."""
     configs: dict[str, ModuleConfig] = {}
-    for yaml_path in sorted(project_root.glob('*/orchestrator.yaml')):
-        prefix = yaml_path.parent.name
+    for dirpath, dirnames, filenames in os.walk(project_root, followlinks=False):
+        if 'orchestrator.yaml' not in filenames:
+            continue
+        yaml_path = Path(dirpath) / 'orchestrator.yaml'
+        rel = yaml_path.parent.relative_to(project_root)
+        prefix = rel.as_posix()
+        if prefix == '.':
+            # Root-level orchestrator.yaml is the top-level config, not a module config
+            continue
         try:
             with open(yaml_path) as f:
                 raw = yaml.safe_load(f) or {}
