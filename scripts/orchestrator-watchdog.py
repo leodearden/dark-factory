@@ -54,17 +54,27 @@ def probe_port(port: int) -> bool:
     peer ``0.0.0.0:*`` field is harmlessly skipped (``int('*')`` raises
     ValueError).
 
-    If ``ss`` exits non-zero (binary missing, permission issue, or
-    filter-syntax difference across iproute2 versions), a diagnostic is logged
-    and True is returned so a tooling failure is not misinterpreted as the
-    port being down, which would trigger a spurious restart on a healthy unit.
+    If ``ss`` exits non-zero (permission issue or filter-syntax difference
+    across iproute2 versions), a diagnostic is logged and True is returned.
+    If ``ss`` is not installed (FileNotFoundError) or the probe exceeds its
+    5-second timeout (subprocess.TimeoutExpired), the exception is caught,
+    a diagnostic is logged, and True is returned.  In all error cases the
+    safe default is True — a tooling failure must not trigger a spurious
+    restart on a healthy unit.
     """
-    result = subprocess.run(
-        ["ss", "-ltn", f"sport = :{port}"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    try:
+        result = subprocess.run(
+            ["ss", "-ltn", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log(
+            f"ss probe for port {port} could not complete ({type(exc).__name__}); "
+            "assuming port is up to avoid a false restart"
+        )
+        return True
     if result.returncode != 0:
         log(
             f"ss probe for port {port} exited with code {result.returncode}; "
