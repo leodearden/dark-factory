@@ -732,11 +732,19 @@ class TestSnapshotWriteThrottle:
 
     @pytest.mark.asyncio
     async def test_acceptance_bound_writes_bounded_under_burst(self, tmp_path):
-        """Over N ticks, disk writes ≤ ceil(N * tick_interval / throttle_interval).
+        """Over N ticks, disk writes == ceil(N * tick_interval / throttle_interval).
 
         Simulates N=20 ticks at tick_interval=0.05 s with a
         throttle_interval=0.25 s.  The acceptance bound is
         ceil(20 * 0.05 / 0.25) = ceil(4.0) = 4.
+
+        Content-dedup is defeated by mutating a unique _skip_count key per
+        tick so every payload differs — making the time-throttle gate the
+        SOLE mechanism bounding writes.  The exact-equality assertion guards
+        against future time-gate off-by-one regressions that the former
+        1 ≤ count ≤ upper_bound assertion would have missed.
+
+        Manual trace: writes occur on ticks 1, 6, 11, 16 → exactly 4.
         """
         import math
         from unittest.mock import AsyncMock, MagicMock
@@ -756,15 +764,18 @@ class TestSnapshotWriteThrottle:
         scheduler.get_tasks = AsyncMock(return_value=[task_a])
         scheduler.write_state_snapshot = MagicMock()
 
-        for _ in range(N):
+        for i in range(N):
+            scheduler._skip_count[f'X{i}'] = i  # unique per tick → defeats content-dedup
             clock['t'] += tick_interval  # advance clock before each tick
             await scheduler.acquire_next()
             scheduler.release('A')
 
         upper_bound = math.ceil(N * tick_interval / throttle_interval)
         count = scheduler.write_state_snapshot.call_count
-        assert 1 <= count <= upper_bound, (
-            f'Expected 1 ≤ write_count ≤ {upper_bound}, got {count}'
+        assert count == upper_bound, (
+            f'Expected exactly {upper_bound} disk writes (time-throttle gate is '
+            f'the sole bound; content-dedup defeated by per-tick unique state), '
+            f'got {count}'
         )
 
     @pytest.mark.asyncio
