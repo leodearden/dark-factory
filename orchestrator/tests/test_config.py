@@ -289,6 +289,29 @@ class TestModuleConfigDiscovery:
         configs = _discover_module_configs(tmp_path)
         assert list(configs.keys()) == ['a', 'c', 'a/b', 'd/e/f']
 
+    def test_discover_excludes_standard_dirs(self, tmp_path: Path):
+        """_discover_module_configs does not descend into standard build/VCS directories."""
+        excluded_dirs = [
+            '.git', '.venv', 'venv', '.worktrees', 'node_modules',
+            '__pycache__', 'build', 'target', '.gradle',
+        ]
+        # Create an orchestrator.yaml nested inside each excluded dir
+        for excluded in excluded_dirs:
+            nested = tmp_path / excluded / 'sub'
+            nested.mkdir(parents=True, exist_ok=True)
+            (nested / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+        # Also create a legitimate module that should be found
+        legit = tmp_path / 'legit'
+        legit.mkdir()
+        (legit / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest legit/'}))
+        configs = _discover_module_configs(tmp_path)
+        assert 'legit' in configs
+        for excluded in excluded_dirs:
+            for key in configs:
+                assert not key.startswith(excluded + '/') and key != excluded, (
+                    f"Excluded dir {excluded!r} leaked into results as key {key!r}"
+                )
+
 
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
