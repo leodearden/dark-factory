@@ -215,13 +215,16 @@ def count_done_in_window(
     """Count task_completed events with outcome='done' inside the given window.
 
     Uses sqlite3 directly (read-only).  Fail-open: any exception returns 0.
-    Missing DB returns 0.
+    Missing DB returns 0 (DEBUG); other failures return 0 (WARNING).
     """
     try:
-        # Use Path.as_uri() so special characters in the path are percent-encoded
-        # before appending the ?mode=ro query string.  Raw f-string interpolation
-        # would misinterpret '?', '#', or '%' as URI syntax.
-        db_uri = Path(events_db).as_uri() + "?mode=ro"
+        if not Path(events_db).exists():
+            logger.debug('count_done_in_window: DB not found (fail-open): %s', events_db)
+            return 0
+        # Use Path.resolve().as_uri() so the path is always absolute (as_uri()
+        # requires an absolute path) and special characters are percent-encoded
+        # before appending the ?mode=ro query string.
+        db_uri = Path(events_db).resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(db_uri, uri=True)
         try:
             (count,) = conn.execute(
@@ -234,18 +237,6 @@ def count_done_in_window(
             return int(count)
         finally:
             conn.close()
-    except sqlite3.OperationalError as exc:
-        # "unable to open database file" is the expected condition before the
-        # EventStore is created (missing DB).  Log at DEBUG to avoid noisy
-        # stack traces during normal startup.  All other OperationalErrors
-        # (e.g. "no such table: events") are unexpected and deserve a WARNING.
-        if "unable to open database file" in str(exc):
-            logger.debug(
-                'count_done_in_window: DB not found (fail-open): %s', events_db
-            )
-        else:
-            logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
-        return 0
     except Exception:
         logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
         return 0
