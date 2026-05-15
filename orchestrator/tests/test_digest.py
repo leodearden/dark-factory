@@ -6,6 +6,7 @@ Task 1327 — AFK hardening: Per-N-escalation digest + EWA escalation/done trip.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import UTC, timedelta
 from datetime import datetime as _datetime
@@ -476,8 +477,8 @@ class TestRenderDigestMarkdown:
         """Parked tasks section shows live count and window churn."""
         md = digest.render_digest_markdown(_make_digest_inputs())
         assert '## Parked tasks' in md
-        assert '- Live parked:    3\n' in md  # parked_live (4 spaces of padding)
-        assert '- Window churn:   7\n' in md  # parked_window_churn (3 spaces of padding)
+        assert re.search(r'- Live parked:\s+3\b', md)    # parked_live anchored to label (whitespace-flexible)
+        assert re.search(r'- Window churn:\s+7\b', md)  # parked_window_churn anchored to label (whitespace-flexible)
 
     def test_ewa_section_not_tripped(self) -> None:
         """EWA line shows value/threshold; no TRIPPED marker when not tripped."""
