@@ -4945,6 +4945,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self._escalate_suggestions(reviews)
             else:
                 await self._write_suggestions_to_memory(reviews)
+                logger.warning(
+                    'Task %s: dropping %d review suggestion(s) — no MCP transport and no '
+                    'escalation queue configured (CLI/dry-run/test no-op)',
+                    self.task_id, len(suggestions),
+                )
             return
 
         content_hash = review_suggestion_payload_hash(suggestions)
