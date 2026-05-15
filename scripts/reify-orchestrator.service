@@ -1,5 +1,5 @@
 [Unit]
-Description=Dark Factory Orchestrator (supervised)
+Description=Reify Orchestrator (supervised)
 Documentation=file:///home/leo/src/dark-factory/DESIGN.md
 # WorkingDirectory must be /home/leo/src/dark-factory for both orchestrator units.
 # `uv run --project orchestrator` resolves the orchestrator/ project dir relative
@@ -10,7 +10,7 @@ Requires=fused-memory.service
 [Service]
 Type=simple
 WorkingDirectory=/home/leo/src/dark-factory
-ExecStart=/home/leo/.local/bin/uv run --project orchestrator orchestrator run --config /home/leo/src/dark-factory/orchestrator/config.yaml
+ExecStart=/home/leo/.local/bin/uv run --project orchestrator orchestrator run --config /home/leo/src/reify/orchestrator.yaml
 
 # Restart policy: restart on failure, back off up to 60s
 Restart=on-failure
