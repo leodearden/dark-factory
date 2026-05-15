@@ -408,7 +408,7 @@ class TestRouteReviewSuggestionsToCurator:
 
 
 class TestRouteReviewSuggestionsIntegration:
-    """Integration tests: stall guard and DONE-branch call-site routing."""
+    """Integration test: stall guard for `_route_review_suggestions_to_curator` fire-and-forget POST."""
 
     @pytest.mark.asyncio
     async def test_stall_guard_returns_in_ms_despite_slow_stub(self):
@@ -445,27 +445,6 @@ class TestRouteReviewSuggestionsIntegration:
         # Cancel background tasks so they don't leak into the next test
         for t in list(wf._background_tasks):
             t.cancel()
-
-    @pytest.mark.asyncio
-    async def test_done_branch_falls_back_to_memory_when_no_suggestions(self):
-        """CALL-SITE ROUTING: when suggestions empty, _write_suggestions_to_memory is called."""
-        reviews = _fake_reviews([])
-
-        wf = _make_workflow()
-        route_mock = AsyncMock()
-        write_mock = AsyncMock()
-
-        with (
-            patch.object(wf, '_route_review_suggestions_to_curator', route_mock),
-            patch.object(wf, '_write_suggestions_to_memory', write_mock),
-        ):
-            if reviews.suggestions:
-                await wf._route_review_suggestions_to_curator(reviews)
-            else:
-                await wf._write_suggestions_to_memory(reviews)
-
-        write_mock.assert_called_once_with(reviews)
-        route_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
