@@ -10,7 +10,6 @@ import importlib.util
 import pathlib
 import subprocess
 import types
-import sys
 
 import pytest
 

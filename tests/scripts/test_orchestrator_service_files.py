@@ -13,8 +13,6 @@ See also:
 
 import pathlib
 
-import pytest
-
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "dark-factory-orchestrator.service"
 REIFY_SERVICE = REPO_ROOT / "scripts" / "reify-orchestrator.service"

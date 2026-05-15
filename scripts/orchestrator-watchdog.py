@@ -11,7 +11,6 @@ scripts/orchestrator-watchdog.timer).
 """
 
 import subprocess
-import sys
 
 # (port, systemd unit name) pairs to watch.  Port order matches the
 # config files: dark-factory=8102 (orchestrator/config.yaml:38),
