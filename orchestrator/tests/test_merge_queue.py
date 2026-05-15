@@ -4349,10 +4349,12 @@ class TestEscalationServerMergeRequestModuleConfigsNone:
         merge_queue: asyncio.Queue = asyncio.Queue()
         event_store = EventStore(db_path=tmp_path / 'test.db', run_id='test')
 
-        # Stub orch_config with the post-1405 None sentinel (not {})
-        _spec2 = pydantic_spec(OrchestratorConfig)
-        stub_config = MagicMock(spec_set=_spec2)
-        stub_config._module_configs = None  # ← post-1405 direct-instantiation path
+        # Real OrchestratorConfig — _module_configs stays at its PrivateAttr default
+        # (None), which is exactly the post-1405 direct-instantiation path exercised
+        # by build_eval_orch_config in evals/runner.py.  Using a real instance means
+        # the module_configs_or_empty property is actually invoked and the None→{}
+        # normalization is genuinely tested (not shadowed by MagicMock's __iter__).
+        stub_config = OrchestratorConfig(project_root=tmp_path)
 
         # Mock resolves the future so the tool doesn't hang
         async def _mock_enqueue(queue, req, es):
