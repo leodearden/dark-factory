@@ -12,7 +12,7 @@ import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -975,6 +975,64 @@ class TestHarnessCostCeiling:
             'no task-id match); ~104.0 or similar would indicate noise row leaked in '
             '(IN clause matched everything).'
         )
+
+
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_delegates_to_aggregate_window(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """_enforce_cost_ceilings delegates to cost_store.aggregate_window.
+
+        Monkeypatches aggregate_window to a stub returning (total, watcher)
+        values that trip the watcher ceiling.  Asserts:
+        - stub called exactly once
+        - args were (cutoff_24h_iso, now_iso) where cutoff ≈ now-24h (within 10s)
+          and end ≈ now (within 10s)
+        - scheduler was paused with cost_ceiling_watcher_exceeded
+        """
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=5.0,
+            orch_daily_cost_ceiling_usd=1000.0,
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-delegate-0001'
+        store = await _cost_store_factory()
+        harness.cost_store = store
+
+        # Stub returns (total, watcher) that trips the watcher ceiling.
+        stub = AsyncMock(return_value=(20.0, 10.0))  # watcher=10.0 > ceiling=5.0
+        store.aggregate_window = stub
+
+        before = datetime.now(UTC)
+        await harness._enforce_cost_ceilings()
+        after = datetime.now(UTC)
+
+        # Exactly one call was made.
+        assert stub.call_count == 1, f'Expected 1 call, got {stub.call_count}'
+
+        # Check the single call's args: (cutoff_24h_iso, now_iso).
+        args = stub.call_args_list[0].args
+        assert len(args) == 2, f'Expected 2 positional args, got {args!r}'
+        cutoff_iso, now_iso = args
+
+        cutoff_dt = datetime.fromisoformat(cutoff_iso)
+        now_dt = datetime.fromisoformat(now_iso)
+
+        expected_cutoff_lo = before - timedelta(hours=24) - timedelta(seconds=10)
+        expected_cutoff_hi = after - timedelta(hours=24) + timedelta(seconds=10)
+        assert expected_cutoff_lo <= cutoff_dt <= expected_cutoff_hi, (
+            f'cutoff_dt {cutoff_dt} not within 10s of (before - 24h)'
+        )
+        assert before - timedelta(seconds=10) <= now_dt <= after + timedelta(seconds=10), (
+            f'now_dt {now_dt} not within 10s of now'
+        )
+
+        # Watcher ceiling was tripped.
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_reason == 'cost_ceiling_watcher_exceeded'
 
 
 class TestDigestConfig:
