@@ -424,6 +424,39 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     return h
 
 
+def _build_monotonic_timestamps(
+    durations: list[float],
+    *,
+    expect_cancelled: bool = True,
+) -> list[float]:
+    """Build paired (start, end) monotonic timestamps for a sequence of rotations.
+
+    Each entry *d* in *durations* contributes ``[t0, t0 + d]`` to the list,
+    representing the two ``time.monotonic()`` calls made inside the supervisor
+    for each rotation (one before, one after).
+
+    When *expect_cancelled* is ``True`` (the default), one trailing ``t0``
+    is appended to cover the start-of-rotation ``time.monotonic()`` call
+    that happens before the cancelling (n+1)th ``fake_rotation`` raises
+    ``CancelledError``.
+
+    This helper centralises the pairing logic shared by
+    ``_run_supervisor_with_rotation_durations`` and any inline test that
+    needs deterministic monotonic control (e.g. tests with mixed
+    clean/unclean sequences).  Eliminates the risk of off-by-one errors
+    when the sequence is hand-built in multiple places.
+    """
+    import time as _time_mod
+
+    t0 = _time_mod.monotonic()
+    timestamps: list[float] = []
+    for dur in durations:
+        timestamps.extend([t0, t0 + dur])
+    if expect_cancelled:
+        timestamps.append(t0)
+    return timestamps
+
+
 async def _run_supervisor_with_rotation_durations(
     h: Harness,
     rotation_durations_secs: list[float],
@@ -449,23 +482,13 @@ async def _run_supervisor_with_rotation_durations(
     ``asyncio.sleep``.  The caller is responsible for configuring *h* (config
     overrides, etc.) before calling this helper.
     """
-    import time as _time_mod
-
     from shared.cli_invoke import AgentResult
 
     sleep_durations: list[float] = []
     rotation_calls = 0
     n = len(rotation_durations_secs)
 
-    t0 = _time_mod.monotonic()
-    # Build paired (start, end) sequence; when expect_cancelled=True also append
-    # one trailing start for the cancelling (n+1)th rotation call.
-    timestamps: list[float] = []
-    for dur in rotation_durations_secs:
-        timestamps.extend([t0, t0 + dur])
-    if expect_cancelled:
-        timestamps.append(t0)  # start of the rotation that will raise CancelledError
-
+    timestamps = _build_monotonic_timestamps(rotation_durations_secs, expect_cancelled=expect_cancelled)
     monotonic_sequence = iter(timestamps)
 
     def fake_monotonic() -> float:
@@ -1542,8 +1565,14 @@ class TestWatcherMisconfiguredGuard:
         code path — uses consecutive_unclean instead of consecutive_degenerate_clean).
         No time.monotonic patch needed: the unclean path is duration-independent.
 
-        RED: without the exponent clamp the loop crashes with OverflowError on the
-        ~1025th unclean exit, so the assertions on sleep_durations are never reached.
+        RED: without the exponent clamp the unclean-path OverflowError is caught by
+        the broad ``except Exception`` handler (harness.py) and the loop degrades
+        gracefully to the base-backoff fallback (~1.0 s per iteration) rather than
+        crashing.  The discriminating assertion is ``sleep_durations[-1]``: with the
+        clamp it saturates at ``_WATCHER_MAX_BACKOFF_SECS`` (3600.0 s); without it
+        the final sleep is the degraded ~1.0 s fallback.  (Contrast the
+        degenerate-clean path, whose overflow computation is outside its try block,
+        so that test's crash-based RED claim is accurate.)
         """
         from shared.cli_invoke import AgentResult
 
@@ -1578,9 +1607,20 @@ class TestWatcherMisconfiguredGuard:
             f'One or more sleeps exceeded _WATCHER_MAX_BACKOFF_SECS={_WATCHER_MAX_BACKOFF_SECS}: '
             f'{[s for s in sleep_durations if s > _WATCHER_MAX_BACKOFF_SECS]}'
         )
-        # Tail values must saturate at the ceiling (not silently drop to 0 or raise)
+        # Tail values must saturate at the ceiling (not silently drop to 0 or raise).
+        # Check the last element as the primary discriminating signal: without the
+        # clamp the OverflowError is swallowed by except Exception and the fallback
+        # sleep(base≈1.0) runs instead of sleep(3600.0).
         assert sleep_durations[-1] == pytest.approx(_WATCHER_MAX_BACKOFF_SECS), (
             f'Final sleep should saturate at {_WATCHER_MAX_BACKOFF_SECS}s; got {sleep_durations[-1]}'
+        )
+        # Bulk check: the post-1024 tail (where overflow would occur without fix) must
+        # all saturate, not all degrade to the fallback base rate.
+        post_overflow_tail = sleep_durations[1024:]
+        assert post_overflow_tail, 'Expected at least one sleep beyond iteration 1024'
+        assert all(s == pytest.approx(_WATCHER_MAX_BACKOFF_SECS) for s in post_overflow_tail), (
+            f'Post-overflow tail sleeps should all be {_WATCHER_MAX_BACKOFF_SECS}s; '
+            f'first 5 tail values: {post_overflow_tail[:5]}'
         )
 
     @pytest.mark.asyncio
@@ -1604,8 +1644,6 @@ class TestWatcherMisconfiguredGuard:
         RED: without the reset, sleep[3] == 4.0 (consecutive_degenerate=3 → base*2^2),
         because the unclean exit does not zero consecutive_degenerate_clean.
         """
-        import time as _time_mod
-
         from shared.cli_invoke import AgentResult
 
         h = _make_loop_harness(tmp_path)
@@ -1627,15 +1665,12 @@ class TestWatcherMisconfiguredGuard:
         idx = 0
         sleep_durations: list[float] = []
 
-        # Build paired (start, end) timestamps for all 4 rotations + 1 cancel start.
-        # Each clean rotation uses tiny duration (1s < 120s threshold → degenerate).
-        # The unclean rotation also uses a tiny duration (classification is by result,
-        # not duration, so the monotonic values just need to be consumed in pairs).
-        t0 = _time_mod.monotonic()
-        timestamps = []
-        for _ in range(4):  # 4 rotations × 2 monotonic() calls each
-            timestamps.extend([t0, t0 + 1.0])
-        timestamps.append(t0)  # start of the cancelling 5th call
+        # Build paired (start, end) timestamps for all 4 rotations + 1 cancel start
+        # via the shared helper so the pairing logic isn't duplicated.
+        # Each rotation uses duration 1.0 s (well under 120 s threshold → degenerate).
+        # The unclean rotation still consumes a start/end pair (classification is by
+        # result, not duration), so duration 1.0 is harmless for that slot.
+        timestamps = _build_monotonic_timestamps([1.0] * 4, expect_cancelled=True)
 
         monotonic_iter = iter(timestamps)
 
