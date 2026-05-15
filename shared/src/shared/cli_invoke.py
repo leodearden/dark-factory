@@ -41,8 +41,47 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
-_DEFAULT_MAX_CAP_RETRIES = 20
-_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0  # kept for back-compat; no branch checks it
+# Per-caller cap-wait policy (post-1365 audit, task 1401)
+# ─────────────────────────────────────────────────────────────────────────────
+# _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
+# pass an explicit cap_wait_sanity_secs= override.  Each call site below has
+# been audited; the policy for each is documented here so future readers know
+# why an override is or is not present.
+#
+# Caller                                  Policy / WHY
+# ───────────────────────────────────────────────────────────────────────────
+# orchestrator/workflow.py                14-day default OK.  Per-task AFK
+#   (implementer/debugger invocation)     implementer/debugger; 14-day patient
+#                                         wait is the documented AFK A1 intent.
+#
+# orchestrator/steward.py                 14-day default OK.  Pre-triage; the
+#   (pre-triage invocation)               AllAccountsCappedException handler
+#                                         logs and falls back to inline triage.
+#
+# orchestrator/review_checkpoint.py       14-day default OK.  Deep reviewer;
+#   (deep reviewer invocation)            AllAccountsCappedException handler
+#                                         returns an empty report, no queue
+#                                         stall.
+#
+# orchestrator/harness.py                 14-day default OK for both sites.
+#   (module tagging + watcher rotation)   AllAccountsCappedException handlers
+#                                         log and return / supervisor-driven
+#                                         restart; neither blocks a queue.
+#
+# fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s.
+#   (LLM triage calls)                    Best-effort middleware, fast-fail/
+#                                         defer contract; 120 s is intentional.
+#
+# fused_memory/reconciliation/agent_loop  _AGENT_LOOP_CAP_WAIT_SANITY_SECS
+# fused_memory/reconciliation/judge       _JUDGE_CAP_WAIT_SANITY_SECS         = 1800 s (30 min).
+# fused_memory/reconciliation/cli_stage_runner  _STAGE_RUNNER_CAP_WAIT_SANITY_SECS
+#   (reconciliation stage runners)        Short-lived stage runners; expected
+#                                         to complete promptly within the
+#                                         reconciliation cycle.  14-day default
+#                                         would stall the queue indefinitely
+#                                         under sustained cap.  1800 s lets a
+#                                         brief cap window resolve in-band.
+# ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0        # emit at most one cap_wait log per ~10 min
 CAP_HIT_RESUME_PROMPT = (
@@ -65,9 +104,6 @@ __all__ = [
 
 class AllAccountsCappedException(Exception):
     """Raised when the cap-hit retry loop exceeds the sanity-bound wall-clock deadline.
-
-    The count-based guard (``max_cap_retries``) no longer triggers this exception;
-    it is kept in the ``invoke_with_cap_retry`` signature for back-compat only.
 
     Attributes:
     - ``retries``: number of consecutive cap hits before giving up
@@ -341,8 +377,6 @@ async def invoke_with_cap_retry(
     task_id: str = '',
     project_id: str = '',
     role: str = '',
-    max_cap_retries: int | None = None,
-    cap_retry_deadline_secs: float | None = None,
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
@@ -364,8 +398,7 @@ async def invoke_with_cap_retry(
     When total elapsed time since the first cap hit exceeds this value,
     ``AllAccountsCappedException`` is raised so the caller can escalate.
     Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).  Pass ``None``
-    to wait indefinitely.  ``cap_retry_deadline_secs`` is kept for
-    back-compat but is now vestigial — no branch checks it.
+    to wait indefinitely.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").

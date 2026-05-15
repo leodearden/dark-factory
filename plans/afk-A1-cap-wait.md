@@ -44,3 +44,46 @@ In `fused-memory/src/fused_memory/middleware/ticket_janitor.py`:
 ## Out of scope
 
 Cap-park / wake-hook / worker-release machinery — explicitly rejected.
+
+---
+
+## Per-caller cap-wait policy (post-1365 audit, task 1401)
+
+> **Implementation note:** The "Concrete changes" bullets above refer to
+> `_DEFAULT_MAX_CAP_RETRIES` and `_DEFAULT_CAP_RETRY_DEADLINE_SECS`, which
+> were removed in task 1401 (no production caller passed them; they silently
+> no-op'd after 1365).  The cap-wait mechanism today is controlled solely by
+> `cap_wait_sanity_secs=` on each `invoke_with_cap_retry` call site.
+
+The authoritative per-caller policy table lives as a comment block adjacent to
+`_DEFAULT_CAP_WAIT_SANITY_SECS` in `shared/src/shared/cli_invoke.py`.  The
+operator-facing summary below mirrors that table with additional context.
+
+### Long-running daemons (inherit the 14-day default — no override)
+
+| Call site | What it does when capped |
+|-----------|--------------------------|
+| `orchestrator/workflow.py` (implementer/debugger) | Awaits gate open for up to 14 days, then escalates as L0 (steward-retryable). This IS the AFK A1 intent — the task parks until accounts uncap. |
+| `orchestrator/steward.py` (pre-triage) | Awaits gate open; `AllAccountsCappedException` handler logs and falls back to inline triage without a queue stall. |
+| `orchestrator/review_checkpoint.py` (deep reviewer) | Awaits gate open; `AllAccountsCappedException` handler returns an empty report and the caller treats it as a no-op review pass. |
+| `orchestrator/harness.py` (module tagging at startup) | Awaits gate open; `AllAccountsCappedException` handler logs and returns — startup continues without tagging. |
+| `orchestrator/harness.py` (escalation watcher rotation) | Awaits gate open; supervisor-driven restart on exception; no queue stall. |
+
+These sites either have no downstream queue (daemons that restart naturally) or
+their `AllAccountsCappedException` handlers are designed to cope gracefully,
+so the 14-day patience is appropriate.
+
+### Stage runners and best-effort middleware (explicit shorter overrides)
+
+| Call site | Override constant | Value | Why short |
+|-----------|-------------------|-------|-----------|
+| `fused_memory/middleware/task_curator.py` | `_CURATOR_CAP_WAIT_SANITY_SECS` | 120 s | Best-effort triage middleware; fast-fail/defer contract. |
+| `fused_memory/reconciliation/agent_loop.py` | `_AGENT_LOOP_CAP_WAIT_SANITY_SECS` | 1800 s | Short-lived reconciliation stage; must complete promptly within the cycle. |
+| `fused_memory/reconciliation/judge.py` | `_JUDGE_CAP_WAIT_SANITY_SECS` | 1800 s | Single-shot judge; same cycle-promptness requirement. |
+| `fused_memory/reconciliation/cli_stage_runner.py` | `_STAGE_RUNNER_CAP_WAIT_SANITY_SECS` | 1800 s | Already re-raises `AllAccountsCappedException` to the harness for deferral; override aligns with the existing fast-defer contract. |
+
+The 1800 s (30 min) value is well below the 14-day default and well above
+the curator's 120 s — appropriate for a stage's expected work duration within
+a reconciliation cycle (`stage_timeout_seconds` defaults to 3600 s,
+`cycle_timeout_seconds` to 21600 s).  A brief cap window can resolve in-band;
+a sustained cap propagates promptly to the harness for deferral.
