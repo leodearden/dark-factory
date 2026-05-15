@@ -945,3 +945,47 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
     assert msg.startswith('Claude CLI judge failed:'), f'unexpected prefix: {msg!r}'
     assert 'Traceback: JSONDecodeError in line 42' in msg, f'stderr missing from: {msg!r}'
     assert "subtype='error_unexpected'" in msg, f'subtype missing from: {msg!r}'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _JUDGE_CAP_WAIT_SANITY_SECS: minutes-scale override forwarded to
+# invoke_with_cap_retry (task 1401)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestJudgeCapWaitSanityBound:
+    """_JUDGE_CAP_WAIT_SANITY_SECS is minutes-scale and forwarded to
+    invoke_with_cap_retry; prevents stalling the reconciliation queue under cap."""
+
+    def test_constant_importable_and_minutes_scale(self):
+        """(a) _JUDGE_CAP_WAIT_SANITY_SECS is importable, >0, <14d, <=3600s."""
+        from fused_memory.reconciliation.judge import _JUDGE_CAP_WAIT_SANITY_SECS
+
+        _FOURTEEN_DAYS_SECS = 14 * 86400
+        assert _JUDGE_CAP_WAIT_SANITY_SECS > 0
+        assert _JUDGE_CAP_WAIT_SANITY_SECS < _FOURTEEN_DAYS_SECS  # not the default 14d
+        assert _JUDGE_CAP_WAIT_SANITY_SECS <= 3600.0  # hours-scale upper bound
+
+    @pytest.mark.asyncio
+    async def test_call_judge_cli_forwards_cap_wait_sanity_secs(self):
+        """(b) _call_judge_cli forwards cap_wait_sanity_secs=_JUDGE_CAP_WAIT_SANITY_SECS."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import _JUDGE_CAP_WAIT_SANITY_SECS
+
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+        )
+        mock_jrnl = MagicMock()
+        judge = Judge(config=config, journal=mock_jrnl, usage_gate=make_gate_mock())
+        empty_result = AgentResult(success=True, output='')
+        mock = AsyncMock(return_value=empty_result)
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await judge._call_judge_cli('p')
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _JUDGE_CAP_WAIT_SANITY_SECS
