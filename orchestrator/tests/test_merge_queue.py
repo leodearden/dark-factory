@@ -4287,9 +4287,9 @@ class TestEscalationServerUsesEnqueueHelper:
         merge_queue: asyncio.Queue = asyncio.Queue()
         event_store = EventStore(db_path=tmp_path / 'test.db', run_id='test')
 
-        # Stub orch_config with _module_configs attribute
+        # Stub orch_config — _module_configs is a PrivateAttr, not in model_fields
         _spec2 = pydantic_spec(OrchestratorConfig)
-        _spec2._module_configs = None  # workflow attr read via orch_config in create_server
+        _spec2._module_configs = None  # PrivateAttr not in model_fields; expose to spec_set
         stub_config = MagicMock(spec_set=_spec2)
         stub_config._module_configs = {}
 
