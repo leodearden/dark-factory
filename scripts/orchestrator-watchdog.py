@@ -14,9 +14,9 @@ scripts/orchestrator-watchdog.timer).
 import subprocess
 import time
 
-# (port, systemd unit name) pairs to watch.  Port order matches the
-# config files: dark-factory=8102 (orchestrator/config.yaml:38),
-# reify=8100 (/home/leo/src/reify/orchestrator.yaml:87).
+# (port, systemd unit name) pairs to watch.  Port values match each
+# orchestrator's configured escalation.port (guarded by the drift test in
+# tests/scripts/test_orchestrator_watchdog.py).
 WATCHED = [
     (8102, "dark-factory-orchestrator.service"),
     (8100, "reify-orchestrator.service"),
