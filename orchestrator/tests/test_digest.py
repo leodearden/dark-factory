@@ -6,11 +6,13 @@ Task 1327 — AFK hardening: Per-N-escalation digest + EWA escalation/done trip.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 import orchestrator.digest as digest
+from orchestrator.event_store import EventStore, EventType
 
 
 class TestUpdateEwa:
@@ -172,3 +174,68 @@ class TestAggregateEscalations:
         assert total == 0, f"Expected 0 in-window; got {total}"
         assert stats.first_ts is None
         assert stats.last_ts is None
+
+
+def _seed_events_db_direct(db_path: Path) -> None:
+    """Seed an events DB (via EventStore schema + direct SQLite) with task_completed rows."""
+    # Create schema via EventStore
+    store = EventStore(db_path, 'run-test')
+    del store  # schema is created in __init__
+
+    rows = [
+        # (timestamp, task_id, outcome)
+        ('2026-05-10T08:00:00+00:00', 't1', 'done'),       # in-window done
+        ('2026-05-10T10:00:00+00:00', 't2', 'done'),       # in-window done
+        ('2026-05-10T11:00:00+00:00', 't3', 'requeued'),   # in-window non-done
+        ('2026-05-10T12:00:00+00:00', 't4', 'blocked'),    # in-window non-done
+        ('2026-05-09T23:59:59+00:00', 't5', 'done'),       # before window
+        ('2026-05-11T00:00:01+00:00', 't6', 'done'),       # after window
+    ]
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for ts, tid, outcome in rows:
+            conn.execute(
+                'INSERT INTO events (timestamp, run_id, task_id, event_type, data) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (ts, 'run-test', tid, 'task_completed', json.dumps({'outcome': outcome})),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestCountDoneInWindow:
+    """Tests for digest.count_done_in_window(events_db_path, start_iso, end_iso)."""
+
+    def test_counts_done_in_window(self, tmp_path: Path) -> None:
+        """Returns count of task_completed rows with outcome='done' inside window."""
+        db_path = tmp_path / 'events.db'
+        _seed_events_db_direct(db_path)
+
+        count = digest.count_done_in_window(
+            db_path,
+            '2026-05-10T00:00:00+00:00',
+            '2026-05-10T23:59:59+00:00',
+        )
+        assert count == 2, f"Expected 2 done in window; got {count}"
+
+    def test_missing_db_returns_zero(self, tmp_path: Path) -> None:
+        """Non-existent DB returns 0 (fail-open)."""
+        count = digest.count_done_in_window(
+            tmp_path / 'no-such.db',
+            '2026-05-10T00:00:00+00:00',
+            '2026-05-10T23:59:59+00:00',
+        )
+        assert count == 0, f"Expected 0 for missing DB; got {count}"
+
+    def test_empty_window_returns_zero(self, tmp_path: Path) -> None:
+        """Window with no matching rows returns 0."""
+        db_path = tmp_path / 'events.db'
+        _seed_events_db_direct(db_path)
+
+        count = digest.count_done_in_window(
+            db_path,
+            '2026-05-01T00:00:00+00:00',
+            '2026-05-01T23:59:59+00:00',
+        )
+        assert count == 0, f"Expected 0 for empty window; got {count}"
