@@ -18,8 +18,8 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _orch_helpers import pydantic_spec
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeInfo
 from orchestrator.workflow import TaskWorkflow

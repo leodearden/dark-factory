@@ -12,8 +12,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from _orch_helpers import pydantic_spec
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport

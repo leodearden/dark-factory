@@ -12,8 +12,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _orch_helpers import pydantic_spec
+
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, ROLES
 from orchestrator.config import OrchestratorConfig

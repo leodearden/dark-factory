@@ -10,12 +10,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _orch_helpers import pydantic_spec
-from orchestrator.config import OrchestratorConfig
 from escalation.models import Escalation
 from shared.usage_gate import InvokeSlot
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.steward import (
     StewardMetrics,
     TaskSteward,

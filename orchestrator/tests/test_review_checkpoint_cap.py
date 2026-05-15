@@ -12,9 +12,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 from shared.cli_invoke import AllAccountsCappedException
 
-from _orch_helpers import pydantic_spec
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.verify import VerifyResult

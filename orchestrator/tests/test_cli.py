@@ -9,9 +9,7 @@ import traceback as traceback_module
 from unittest.mock import MagicMock
 
 import pytest
-
 from _orch_helpers import pydantic_spec
-from orchestrator.config import OrchestratorConfig
 from click.testing import CliRunner
 
 import orchestrator.cli as cli_module
@@ -22,6 +20,7 @@ from orchestrator.cli import (
     _parse_duration,
     main,
 )
+from orchestrator.config import OrchestratorConfig
 
 
 class TestParseDuration:

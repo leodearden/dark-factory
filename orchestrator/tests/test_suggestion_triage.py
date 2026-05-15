@@ -9,9 +9,9 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
+from _orch_helpers import pydantic_spec
 from shared.cli_invoke import AllAccountsCappedException
 
-from _orch_helpers import pydantic_spec
 from orchestrator.config import OrchestratorConfig
 
 # ---------------------------------------------------------------------------

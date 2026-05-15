@@ -7,10 +7,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from _orch_helpers import pydantic_spec
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.review_checkpoint import ReviewCheckpoint

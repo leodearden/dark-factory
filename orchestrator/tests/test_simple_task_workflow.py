@@ -8,9 +8,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 from shared.cli_invoke import AgentResult
 
-from _orch_helpers import pydantic_spec
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
