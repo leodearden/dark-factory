@@ -574,9 +574,20 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
     (which stamps ``created_at``).  Without it, a legitimate same-cycle marker
     written fractionally before the persisted start time would be swept.
 
-    Naive parsed datetimes are assumed UTC (``replace(tzinfo=UTC)``).  Any type
-    mismatch or parse failure returns ``False`` (fail-open: falls back to the
-    existing pure run_id partition behaviour).
+    Naive datetimes are assumed UTC on **both** sides of the comparison:
+
+    * A naive parsed *created_at* is normalized via ``replace(tzinfo=UTC)``
+      (existing behaviour, documented convention).
+    * A naive *run_window_start* is also normalized via ``replace(tzinfo=UTC)``
+      (task-1383 hardening).  Without this, the comparison
+      ``parsed(tz-aware) >= run_window_start(naive) - _CLOCK_SKEW_GRACE`` raises
+      ``TypeError``, which the ``except`` clause silently swallows, causing the
+      guard to return ``False`` for *every* marker and disabling the run-window
+      guard for the entire cycle (the task-1369 regression).  Assuming UTC is
+      safe: the journal persists ``started_at`` via ``datetime.now(UTC)``.
+
+    Any type mismatch or parse failure returns ``False`` (fail-open: falls back
+    to the existing pure run_id partition behaviour).
 
     .. note::
         Only a lower-bound check is applied.  The absence of an upper bound is
@@ -588,6 +599,8 @@ def _marker_is_within_run_window(created_at: object, run_window_start: object) -
     """
     if not isinstance(run_window_start, datetime):
         return False
+    if run_window_start.tzinfo is None:
+        run_window_start = run_window_start.replace(tzinfo=UTC)
     if not created_at or not isinstance(created_at, str):
         return False
     try:
