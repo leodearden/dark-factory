@@ -130,3 +130,73 @@ class TestFindViolationsSpecHandling:
         source = 'config = create_autospec(SomeClass)\n'
         violations = find_violations(source, 'test_autospec.py')
         assert violations == []
+
+
+class TestFindViolationsExemption:
+    """Exemption comment: # noqa: bare-magicmock — <reason> suppresses the violation."""
+
+    def test_exemption_em_dash_suppresses_violation(self):
+        """# noqa: bare-magicmock — reason directly above → no violation."""
+        source = (
+            '# noqa: bare-magicmock — needed for legacy fixture migration\n'
+            'config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_exempt.py')
+        assert violations == []
+
+    def test_exemption_ascii_hyphen_suppresses_violation(self):
+        """# noqa: bare-magicmock - reason with ASCII hyphen → no violation."""
+        source = (
+            '# noqa: bare-magicmock - legacy interface, cannot add spec yet\n'
+            'config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_exempt_hyphen.py')
+        assert violations == []
+
+    def test_exemption_with_blank_line_between_comment_and_assignment(self):
+        """Blank lines between exemption comment and assignment are tolerated."""
+        source = (
+            '# noqa: bare-magicmock — bridging task 1339 migration\n'
+            '\n'
+            '    \n'
+            'config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_exempt_blank.py')
+        assert violations == []
+
+    def test_no_exemption_for_bare_noqa_no_reason(self):
+        """# noqa: bare-magicmock (no separator, no reason) → still a violation."""
+        source = (
+            '# noqa: bare-magicmock\n'
+            'config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_no_reason.py')
+        assert len(violations) == 1
+
+    def test_no_exemption_for_separator_only_empty_reason(self):
+        """# noqa: bare-magicmock — (em-dash but no reason text) → still a violation."""
+        source = (
+            '# noqa: bare-magicmock —\n'
+            'config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_empty_reason.py')
+        assert len(violations) == 1
+
+    def test_no_exemption_when_intervening_code_line_between_comment_and_assignment(self):
+        """Intervening non-blank code line breaks the exemption."""
+        source = (
+            '# noqa: bare-magicmock — some reason\n'
+            'some_code = 42\n'
+            'config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_broken_exemption.py')
+        assert len(violations) == 1
+
+    def test_no_exemption_for_unrelated_comment_above(self):
+        """An unrelated comment immediately above → still a violation."""
+        source = (
+            '# just a regular comment\n'
+            'config = MagicMock()\n'
+        )
+        violations = find_violations(source, 'test_unrelated_comment.py')
+        assert len(violations) == 1
