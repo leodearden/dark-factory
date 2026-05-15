@@ -36,6 +36,8 @@ class MemoryResult(BaseModel):
     temporal: dict | None = None  # {valid_at, invalid_at}
     entities: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
+    # Mem0 server-stamped write time (tz-aware UTC ISO string); None for Graphiti results.
+    created_at: str | None = None
 
 
 class AddEpisodeResponse(BaseModel):

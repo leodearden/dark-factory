@@ -988,6 +988,7 @@ class MemoryService:
                 source_store=SourceStore.mem0,
                 relevance_score=min(score, 1.0),
                 metadata=meta,
+                created_at=item.get('created_at'),
             ))
         return results
 
