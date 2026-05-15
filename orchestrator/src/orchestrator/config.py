@@ -409,6 +409,11 @@ _OVERRIDABLE_FIELDS = frozenset({
     'scope_cargo',
 })
 
+_DISCOVERY_EXCLUDED_DIRS = frozenset({
+    '.git', '.venv', 'venv', '.worktrees',
+    'node_modules', '__pycache__', 'build', 'target', '.gradle',
+})
+
 
 @dataclass
 class ModuleConfig:
@@ -434,6 +439,7 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
     """Scan project_root recursively for orchestrator.yaml files and load overridable fields."""
     found: list[tuple[str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(project_root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in _DISCOVERY_EXCLUDED_DIRS]
         if 'orchestrator.yaml' not in filenames:
             continue
         yaml_path = Path(dirpath) / 'orchestrator.yaml'
