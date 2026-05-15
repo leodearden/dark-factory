@@ -1123,6 +1123,41 @@ class TestSchedulerDoneCounter:
 
 
 # ---------------------------------------------------------------------------
+# TestSchedulerDoneCounterRemoved (step-1, task 1434)
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerDoneCounterRemoved:
+    """Absence test: Scheduler must NOT expose done_transitions_total (task 1434).
+
+    Task 1421 moved EWA input to EventStore.done_count.  Task 1434 removes the
+    now-unused counter entirely.  This test is a permanent regression guard —
+    if anyone reintroduces _done_transitions_total or done_transitions_total,
+    this test will fail with an explicit message pointing to this task.
+    """
+
+    def test_scheduler_does_not_expose_done_transitions_counter(
+        self, tmp_path: Path
+    ) -> None:
+        """Scheduler must not have done_transitions_total or _done_transitions_total.
+
+        EWA reads from EventStore.done_count (task 1421).  Reintroducing this
+        counter would silently restore a dead code path — hence the guard.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+
+        assert not hasattr(scheduler, 'done_transitions_total'), (
+            'counter was removed in task 1434 — do not reintroduce; '
+            'EWA reads from EventStore.done_count instead'
+        )
+        assert not hasattr(scheduler, '_done_transitions_total'), (
+            'counter was removed in task 1434 — do not reintroduce; '
+            'EWA reads from EventStore.done_count instead'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestHarnessEscalationEventCounter (step-17)
 # ---------------------------------------------------------------------------
 
