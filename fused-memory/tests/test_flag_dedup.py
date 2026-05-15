@@ -3588,3 +3588,51 @@ class TestConfirmationCircuitBreaker:
         assert len(write_fail_warnings) == 3, (
             f'Expected 3 per-flag write-failure WARNINGs but got: {write_fail_warnings}'
         )
+
+
+# ---------------------------------------------------------------------------
+# _marker_query builder (step-1 / step-2)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerQuery:
+    """Unit tests for the _marker_query(tid, ftype) -> str builder."""
+
+    def test_returns_canonical_format_for_simple_ids(self):
+        """Returns the exact canonical string for straightforward id values."""
+        from fused_memory.reconciliation.flag_dedup import _marker_query
+
+        result = _marker_query('42', 'missing_deliverable')
+        assert result == 'stage1 flag marker task 42 type missing_deliverable'
+
+    def test_format_is_byte_identical_to_legacy_production_template(self):
+        """Pins the query format: starts correctly, contains ' type ', no extra punctuation."""
+        from fused_memory.reconciliation.flag_dedup import _marker_query
+
+        tid, ftype = '99', 'overdue_task'
+        result = _marker_query(tid, ftype)
+        assert result.startswith('stage1 flag marker task '), (
+            f'Result {result!r} must start with "stage1 flag marker task "'
+        )
+        assert ' type ' in result, f'Result {result!r} must contain " type "'
+        # No extra punctuation — format is exactly the two-field template
+        expected = f'stage1 flag marker task {tid} type {ftype}'
+        assert result == expected, (
+            f'Got {result!r} but expected {expected!r}'
+        )
+
+    def test_round_trips_through_regex_used_by_legacy_test_stub(self):
+        """Output is parseable by the legacy regex format (protects out-of-tree callers)."""
+        import re
+        from fused_memory.reconciliation.flag_dedup import _marker_query
+
+        legacy_re = re.compile(r'^stage1 flag marker task (\S+) type (\S+)$')
+        tid, ftype = 'task-7', 'blocked_dependency'
+        result = _marker_query(tid, ftype)
+        m = legacy_re.match(result)
+        assert m is not None, (
+            f'Result {result!r} did not match legacy regex {legacy_re.pattern!r}'
+        )
+        assert m.groups() == (tid, ftype), (
+            f'Regex groups {m.groups()!r} != ({tid!r}, {ftype!r})'
+        )
