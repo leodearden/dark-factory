@@ -2811,7 +2811,9 @@ Output JSON matching the schema. Every task must appear in the output.
                     await asyncio.sleep(floor)
                 else:
                     # Healthy clean (duration >= watcher_misconfigured_min_rotation_secs):
-                    # flat floor — queue had real work, no cost-runaway concern.
+                    # positive evidence the queue had real work — reset the cost-runaway
+                    # counter so the next degenerate burst starts fresh from base.
+                    consecutive_degenerate_clean = 0
                     logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
                     await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
