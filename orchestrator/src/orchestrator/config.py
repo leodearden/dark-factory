@@ -443,12 +443,34 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
       ``foo/bar``).  A root-level ``orchestrator.yaml`` (prefix ``"."``) is skipped because
       it is the top-level orchestrator config, not a module config.
     - Excludes standard build/VCS dirs (``_DISCOVERY_EXCLUDED_DIRS``) by pruning ``dirnames``
-      in place during the walk so their subtrees are never visited.
+      in place during the walk so their subtrees are never visited.  Exclusions are
+      **name-based** and applied at *every* level of the tree, so any directory with a
+      reserved name — however deeply nested — is silently skipped.  If a legitimate module
+      directory shares a name with a reserved dir (e.g. a module literally called ``build``),
+      its ``orchestrator.yaml`` will not be discovered; rename the directory or place the
+      config at a depth that avoids the collision.
     - Uses ``followlinks=False`` (passed explicitly) for symlink-cycle safety — a symlink that
       points back into an ancestor directory cannot drive infinite recursion because the walk
       will not follow it.
     - Results are inserted into the returned dict in ``(depth, lex)`` order so iteration is
       deterministic regardless of filesystem order.
+
+    Performance note:
+    This performs a full recursive walk of *project_root* on every call (once at startup via
+    ``load_config``, and again inside ``run_full_verification``).  On large repositories with
+    many non-excluded subdirectories this can be noticeable.  If discovery latency is a
+    concern, consider adding project-specific directories to ``_DISCOVERY_EXCLUDED_DIRS`` or
+    reducing the nesting depth of your module layout.
+
+    Depth and scheduler coherence:
+    ``OrchestratorConfig.for_module`` resolves configs via longest-matching prefix walk, but
+    the scheduler (``_limit_for``) and workflow (``_resolve_module_configs``) always pass paths
+    that have been truncated to ``lock_depth`` components by ``shared.locking.normalize_lock``.
+    A module config whose prefix has *more* components than ``lock_depth`` will be honoured by
+    ``run_full_verification`` (which iterates ``module_configs.values()`` directly) but will be
+    unreachable through the scheduler/workflow path.  ``load_config`` emits a warning when this
+    mismatch is detected so misplaced ``orchestrator.yaml`` files are surfaced rather than
+    silently half-applied.
     """
     found: list[tuple[str, Path]] = []
     # followlinks=False (the default, stated explicitly so a future refactor cannot flip it
@@ -865,6 +887,15 @@ class OrchestratorConfig(BaseSettings):
           exactly a depth-``lock_depth`` path like ``foo/bar``)
         - ``workflow._resolve_module_configs`` (passes normalized module lock paths)
 
+        Precondition / known limitation:
+        The scheduler and workflow always pass paths truncated to ``lock_depth``
+        components, so a config registered at a prefix *deeper* than ``lock_depth``
+        (e.g. ``foo/bar/baz`` with ``lock_depth=2``) is reachable here and by
+        ``run_full_verification``, but is **unreachable** through the scheduler /
+        workflow path.  ``load_config`` logs a warning when such a mismatch is
+        detected.  For full scheduler/workflow integration, keep module configs at a
+        prefix depth no greater than ``lock_depth``.
+
         Backwards-compatible: single-segment prefixes resolve identically to before
         because the deepest candidate that matches is still the first path component.
         """
@@ -949,4 +980,18 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     os.environ['ORCH_CONFIG_PATH'] = str(config_path)
     config = OrchestratorConfig()
     config._module_configs = _discover_module_configs(config.project_root)
+    # Warn when a discovered config prefix is deeper than lock_depth: its test/lint
+    # commands will run in full verification, but scheduler and workflow consumers
+    # truncate module paths to lock_depth components via normalize_lock, so the
+    # config's scheduling limits (max_per_module, module_overrides) will be silently
+    # ignored.  Surface the mismatch so operators can adjust the layout or lock_depth.
+    for prefix in config._module_configs:
+        prefix_depth = prefix.count('/') + 1  # number of path components
+        if prefix_depth > config.lock_depth:
+            logger.warning(
+                'Module config %r has prefix depth %d but lock_depth=%d; '
+                'its scheduling limits are unreachable through the scheduler/workflow path. '
+                'Move the orchestrator.yaml up or raise lock_depth.',
+                prefix, prefix_depth, config.lock_depth,
+            )
     return config

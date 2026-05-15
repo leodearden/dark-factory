@@ -363,6 +363,29 @@ class TestModuleConfigDiscovery:
         # (e) Completely unrelated path returns None
         assert config.for_module('unrelated/x.py') is None
 
+    def test_discover_skips_root_level_orchestrator_yaml(self, tmp_path: Path):
+        """A root-level orchestrator.yaml is NOT returned as a module config.
+
+        Regression guard for the explicit ``if prefix == '.': continue`` guard in
+        _discover_module_configs.  The old glob('*/orchestrator.yaml') excluded the
+        root by construction; the new os.walk relies on an explicit check.
+        """
+        # Root-level config — should be skipped
+        (tmp_path / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'pytest',
+        }))
+        # Sub-level config — should be found
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({
+            'test_command': 'pytest sub/',
+        }))
+        configs = _discover_module_configs(tmp_path)
+        assert 'sub' in configs, "sub-level config should be discovered"
+        assert '.' not in configs, "root-level (prefix '.') must not appear in results"
+        # Confirm no key for the root-level file leaked in any form
+        assert len(configs) == 1
+
 
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
