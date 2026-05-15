@@ -33,6 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_acct_evt_account
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture()
 def cap_db(tmp_path):
     """Empty account_events DB (schema only). Tests insert their own rows."""
@@ -55,7 +56,10 @@ async def cap_conn(cap_db):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _insert_event(conn_sync: sqlite3.Connection, account: str, event_type: str, ts: datetime) -> None:
+
+def _insert_event(
+    conn_sync: sqlite3.Connection, account: str, event_type: str, ts: datetime
+) -> None:
     conn_sync.execute(
         'INSERT INTO account_events (account_name, event_type, created_at) VALUES (?, ?, ?)',
         (account, event_type, ts.isoformat()),
@@ -120,10 +124,14 @@ class TestReadCapIntervals:
         now = datetime.now(UTC)
         t1 = now - timedelta(hours=2)
         t2 = now - timedelta(hours=1)
-        db_path = _make_db_with_events(tmp_path, 'single.db', [
-            ('acc-a', 'cap_hit', t1),
-            ('acc-a', 'resumed', t2),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'single.db',
+            [
+                ('acc-a', 'cap_hit', t1),
+                ('acc-a', 'resumed', t2),
+            ],
+        )
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await read_cap_intervals([conn], days=7)
@@ -141,9 +149,13 @@ class TestReadCapIntervals:
         """cap_hit@T1 with no resumed → CapInterval(end=None)."""
         now = datetime.now(UTC)
         t1 = now - timedelta(hours=3)
-        db_path = _make_db_with_events(tmp_path, 'open.db', [
-            ('acc-b', 'cap_hit', t1),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'open.db',
+            [
+                ('acc-b', 'cap_hit', t1),
+            ],
+        )
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await read_cap_intervals([conn], days=7)
@@ -160,12 +172,16 @@ class TestReadCapIntervals:
         t2 = now - timedelta(hours=3)
         t3 = now - timedelta(hours=2)
         t4 = now - timedelta(hours=1)
-        db_path = _make_db_with_events(tmp_path, 'fifo.db', [
-            ('acc-c', 'cap_hit', t1),
-            ('acc-c', 'cap_hit', t2),
-            ('acc-c', 'resumed', t3),
-            ('acc-c', 'resumed', t4),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'fifo.db',
+            [
+                ('acc-c', 'cap_hit', t1),
+                ('acc-c', 'cap_hit', t2),
+                ('acc-c', 'resumed', t3),
+                ('acc-c', 'resumed', t4),
+            ],
+        )
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await read_cap_intervals([conn], days=7)
@@ -188,12 +204,16 @@ class TestReadCapIntervals:
         t2 = now - timedelta(hours=3)
         t3 = now - timedelta(hours=2)
         t4 = now - timedelta(hours=1)
-        db_path = _make_db_with_events(tmp_path, 'multi_acct.db', [
-            ('alpha', 'cap_hit', t1),
-            ('beta', 'cap_hit', t2),
-            ('alpha', 'resumed', t3),
-            ('beta', 'resumed', t4),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'multi_acct.db',
+            [
+                ('alpha', 'cap_hit', t1),
+                ('beta', 'cap_hit', t2),
+                ('alpha', 'resumed', t3),
+                ('beta', 'resumed', t4),
+            ],
+        )
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await read_cap_intervals([conn], days=7)
@@ -216,12 +236,20 @@ class TestReadCapIntervals:
         now = datetime.now(UTC)
         t1 = now - timedelta(hours=2)
         t2 = now - timedelta(hours=1)
-        db1 = _make_db_with_events(tmp_path, 'db1.db', [
-            ('acc-x', 'cap_hit', t1),
-        ])
-        db2 = _make_db_with_events(tmp_path, 'db2.db', [
-            ('acc-y', 'cap_hit', t2),
-        ])
+        db1 = _make_db_with_events(
+            tmp_path,
+            'db1.db',
+            [
+                ('acc-x', 'cap_hit', t1),
+            ],
+        )
+        db2 = _make_db_with_events(
+            tmp_path,
+            'db2.db',
+            [
+                ('acc-y', 'cap_hit', t2),
+            ],
+        )
         async with (
             aiosqlite.connect(str(db1)) as conn1,
             aiosqlite.connect(str(db2)) as conn2,
@@ -240,10 +268,14 @@ class TestReadCapIntervals:
         now = datetime.now(UTC)
         recent = now - timedelta(hours=2)
         old = now - timedelta(days=10)
-        db_path = _make_db_with_events(tmp_path, 'cutoff.db', [
-            ('acc-r', 'cap_hit', recent),
-            ('acc-o', 'cap_hit', old),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'cutoff.db',
+            [
+                ('acc-r', 'cap_hit', recent),
+                ('acc-o', 'cap_hit', old),
+            ],
+        )
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await read_cap_intervals([conn], days=7)
@@ -261,13 +293,13 @@ class TestReadCapIntervals:
     @pytest.mark.asyncio
     async def test_days_zero_raises_value_error(self, cap_conn):
         """days=0 must raise ValueError with message containing 'positive'."""
-        with pytest.raises(ValueError, match="positive"):
+        with pytest.raises(ValueError, match='positive'):
             await read_cap_intervals([cap_conn], days=0)
 
     @pytest.mark.asyncio
     async def test_days_negative_raises_value_error(self, cap_conn):
         """days=-1 must raise ValueError with message containing 'positive'."""
-        with pytest.raises(ValueError, match="positive"):
+        with pytest.raises(ValueError, match='positive'):
             await read_cap_intervals([cap_conn], days=-1)
 
     @pytest.mark.asyncio
@@ -287,25 +319,27 @@ class TestReadCapIntervals:
         """
         real_now = datetime.now(UTC)
         event_ts = real_now - timedelta(days=30)
-        db_path = _make_db_with_events(tmp_path, 'now_param.db', [
-            ('acc-x', 'cap_hit', event_ts),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'now_param.db',
+            [
+                ('acc-x', 'cap_hit', event_ts),
+            ],
+        )
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
 
             # 1. Default now: 30-day-old event outside 7-day window
             result_default = await read_cap_intervals([conn], days=7)
             assert result_default == [], (
-                f"Expected [] with default now (event 30d old, window 7d), "
-                f"got {result_default}"
+                f'Expected [] with default now (event 30d old, window 7d), got {result_default}'
             )
 
             # 2. Synthetic now 28 days ago: cutoff shifts to 35 days ago, includes event
             synthetic_now = real_now - timedelta(days=28)
             result_shifted = await read_cap_intervals([conn], days=7, now=synthetic_now)
             assert len(result_shifted) == 1, (
-                f"Expected 1 interval with now=real_now-28d (cutoff 35d ago), "
-                f"got {result_shifted}"
+                f'Expected 1 interval with now=real_now-28d (cutoff 35d ago), got {result_shifted}'
             )
             assert result_shifted[0].account_name == 'acc-x'
             assert result_shifted[0].end is None  # open-ended (no resumed)
@@ -337,9 +371,13 @@ class TestReadCapIntervals:
         # Insert the boundary event as a NAIVE datetime so _make_db_with_events
         # stores its isoformat without a +00:00 suffix — the only configuration
         # where the lexicographic mismatch is detectable.
-        db_path = _make_db_with_events(tmp_path, 'naive_now.db', [
-            ('acc-n', 'cap_hit', cutoff_instant.replace(tzinfo=None)),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'naive_now.db',
+            [
+                ('acc-n', 'cap_hit', cutoff_instant.replace(tzinfo=None)),
+            ],
+        )
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -347,23 +385,21 @@ class TestReadCapIntervals:
             result_naive = await read_cap_intervals(
                 [conn], days=7, now=real_now.replace(tzinfo=None)
             )
-            result_aware = await read_cap_intervals(
-                [conn], days=7, now=real_now
-            )
+            result_aware = await read_cap_intervals([conn], days=7, now=real_now)
 
         # Both should be empty: the boundary-naive row is AT the cutoff, but
         # with a consistent tz-aware cutoff ``created_at >= cutoff`` is False
         # (the row string sorts before the +00:00 cutoff string).
         assert len(result_naive) == len(result_aware), (
-            f"naive now → {len(result_naive)} interval(s), "
-            f"aware now → {len(result_aware)} interval(s); expected equal counts. "
-            f"Bug: naive cutoff has no +00:00 so it equals the naive boundary row "
-            f"(>= true), whereas aware cutoff sorts after it (>= false)."
+            f'naive now → {len(result_naive)} interval(s), '
+            f'aware now → {len(result_aware)} interval(s); expected equal counts. '
+            f'Bug: naive cutoff has no +00:00 so it equals the naive boundary row '
+            f'(>= true), whereas aware cutoff sorts after it (>= false).'
         )
         assert {iv.account_name for iv in result_naive} == {iv.account_name for iv in result_aware}
         assert result_aware == [], (
-            f"Expected 0 intervals with tz-aware now (boundary row at exact cutoff "
-            f"is excluded under half-open semantics), got {result_aware}"
+            f'Expected 0 intervals with tz-aware now (boundary row at exact cutoff '
+            f'is excluded under half-open semantics), got {result_aware}'
         )
 
     @pytest.mark.asyncio
@@ -409,37 +445,75 @@ class TestReadCapIntervals:
         # The tz-aware (+00:00) format mirrors production DB rows, exercising
         # the cutoff-normalisation branch rather than the row-normalisation branch.
         probe_ts = cutoff_instant_utc - timedelta(hours=1)
-        db_path = _make_db_with_events(tmp_path, 'non_utc_now.db', [
-            ('acc-x', 'cap_hit', probe_ts),
-        ])
+        db_path = _make_db_with_events(
+            tmp_path,
+            'non_utc_now.db',
+            [
+                ('acc-x', 'cap_hit', probe_ts),
+            ],
+        )
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
 
-            result_utc = await read_cap_intervals(
-                [conn], days=7, now=real_now_utc
-            )
-            result_minus8 = await read_cap_intervals(
-                [conn], days=7, now=real_now_minus8
-            )
+            result_utc = await read_cap_intervals([conn], days=7, now=real_now_utc)
+            result_minus8 = await read_cap_intervals([conn], days=7, now=real_now_minus8)
 
         # Load-bearing exact-count assertions:
         # result_utc: correct UTC cutoff excludes probe row (pre- and post-fix)
         assert result_utc == [], (
-            f"Expected [] with UTC now (probe row at cutoff-1h is before +00:00 "
-            f"cutoff string), got {result_utc}"
+            f'Expected [] with UTC now (probe row at cutoff-1h is before +00:00 '
+            f'cutoff string), got {result_utc}'
         )
         # result_minus8: pre-fix the buggy -08:00 cutoff includes probe row (→
         # fails red); post-fix astimezone(UTC) normalises to UTC cutoff (→ green)
         assert result_minus8 == [], (
-            f"Expected [] with -08:00 now (should normalize to UTC cutoff), "
-            f"got {result_minus8}. "
-            f"Bug: without astimezone(UTC), -08:00 cutoff string sorts before "
+            f'Expected [] with -08:00 now (should normalize to UTC cutoff), '
+            f'got {result_minus8}. '
+            f'Bug: without astimezone(UTC), -08:00 cutoff string sorts before '
             f"the probe row's +00:00 string, causing false inclusion."
         )
         # Supplementary inter-result consistency checks
         assert len(result_utc) == len(result_minus8)
         assert {iv.account_name for iv in result_utc} == {iv.account_name for iv in result_minus8}
+
+    @pytest.mark.asyncio
+    async def test_db_row_non_utc_aware_canonised_to_utc(self, tmp_path):
+        """DB rows with tz-aware non-UTC created_at are canonicalised to UTC.
+
+        Locks the row-normalisation path in _to_utc: a tz-aware non-UTC
+        timestamp stored in created_at (e.g. ``2026-01-01T04:00:00-08:00``)
+        is parsed by fromisoformat then converted via astimezone(UTC), so the
+        resulting CapInterval.start and .end carry UTC tzinfo and the correct
+        UTC wall-clock value — not the original offset.
+        """
+        tz_minus8 = timezone(timedelta(hours=-8))
+        # Represent "2026-01-01 12:00 UTC" as "2026-01-01 04:00 -08:00"
+        cap_start_utc = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        cap_end_utc = datetime(2026, 1, 1, 13, 0, 0, tzinfo=UTC)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'non_utc_row.db',
+            [
+                ('acc-r', 'cap_hit', cap_start_utc.astimezone(tz_minus8)),
+                ('acc-r', 'resumed', cap_end_utc.astimezone(tz_minus8)),
+            ],
+        )
+
+        now = datetime(2026, 1, 1, 14, 0, 0, tzinfo=UTC)  # after both events
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await read_cap_intervals([conn], days=7, now=now)
+
+        assert len(result) == 1
+        iv = result[0]
+        # Bounds must be UTC-aware despite the DB row carrying -08:00 offset
+        assert iv.start.tzinfo == UTC
+        assert iv.end is not None
+        assert iv.end.tzinfo == UTC
+        # Wall-clock value must match the UTC equivalent (no shift)
+        assert iv.start == cap_start_utc
+        assert iv.end == cap_end_utc
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +675,7 @@ class TestMergeAllAccountsCapped:
 # Step-5 tests: compute_overlap_ms
 # ---------------------------------------------------------------------------
 
+
 class TestComputeOverlapMs:
     def _sec(self, s: float) -> int:
         """Convert seconds to milliseconds."""
@@ -702,8 +777,8 @@ class TestComputeCappedNowAndWindows:
     def test_empty_intervals_returns_zero_and_empty_windows(self):
         """Empty input → (0, [])."""
         capped_now, windows = compute_capped_now_and_windows([])
-        assert capped_now == 0, f"Expected capped_now=0 for empty, got {capped_now}"
-        assert windows == [], f"Expected [] windows for empty, got {windows}"
+        assert capped_now == 0, f'Expected capped_now=0 for empty, got {capped_now}'
+        assert windows == [], f'Expected [] windows for empty, got {windows}'
 
     def test_all_closed_intervals_returns_capped_now_zero(self):
         """All intervals closed → capped_now=0; windows may still be non-empty."""
@@ -716,11 +791,9 @@ class TestComputeCappedNowAndWindows:
             CapInterval('beta', t1, t2),
         ]
         capped_now, windows = compute_capped_now_and_windows(intervals)
-        assert capped_now == 0, (
-            f"Expected capped_now=0 (all closed), got {capped_now}"
-        )
+        assert capped_now == 0, f'Expected capped_now=0 (all closed), got {capped_now}'
         assert len(windows) >= 1, (
-            f"Expected >=1 merged window (both accounts fully overlapping), got {windows}"
+            f'Expected >=1 merged window (both accounts fully overlapping), got {windows}'
         )
 
     def test_any_open_ended_returns_capped_now_one(self):
@@ -730,12 +803,8 @@ class TestComputeCappedNowAndWindows:
         # Simplified: just one open-ended is enough for capped_now=1
         open_only = [CapInterval('alpha', t1, None)]
         capped_now, windows = compute_capped_now_and_windows(open_only)
-        assert capped_now == 1, (
-            f"Expected capped_now=1 for open-ended interval, got {capped_now}"
-        )
-        assert len(windows) >= 1, (
-            f"Expected >=1 window (single open-ended account), got {windows}"
-        )
+        assert capped_now == 1, f'Expected capped_now=1 for open-ended interval, got {capped_now}'
+        assert len(windows) >= 1, f'Expected >=1 window (single open-ended account), got {windows}'
 
     def test_sorted_account_names_deterministic(self):
         """Two consecutive calls with differently-ordered inputs produce same windows."""
@@ -752,8 +821,8 @@ class TestComputeCappedNowAndWindows:
         _, windows1 = compute_capped_now_and_windows(intervals_fwd)
         _, windows2 = compute_capped_now_and_windows(intervals_rev)
         assert windows1 == windows2, (
-            f"Expected deterministic windows regardless of input order. "
-            f"Got {windows1} vs {windows2}"
+            f'Expected deterministic windows regardless of input order. '
+            f'Got {windows1} vs {windows2}'
         )
 
 
@@ -782,7 +851,9 @@ class TestBucketiseCapSparkline:
     def test_all_values_are_zero_or_one(self):
         """All values are in {0, 1}."""
         now = datetime.now(UTC)
-        capped: list[tuple[datetime, datetime | None]] = [(now - timedelta(hours=1), now - timedelta(minutes=30))]
+        capped: list[tuple[datetime, datetime | None]] = [
+            (now - timedelta(hours=1), now - timedelta(minutes=30))
+        ]
         result = bucketise_cap_sparkline(capped, window_hours=4, bucket_seconds=600, now=now)
         assert all(v in (0, 1) for v in result['values'])
 
@@ -832,9 +903,9 @@ class TestBucketiseCapSparkline:
         values = result['values']
         for label, value in zip(labels, values, strict=False):
             if c_start <= label < c_end:  # half-open: c_end boundary excluded
-                assert value == 1, f"Expected 1 at {label}"
+                assert value == 1, f'Expected 1 at {label}'
             else:
-                assert value == 0, f"Expected 0 at {label}"
+                assert value == 0, f'Expected 0 at {label}'
 
     def test_open_ended_cap_marks_all_buckets_after_start(self):
         """Open-ended cap starting 2h ago → all buckets from 2h onwards are 1.
@@ -855,9 +926,9 @@ class TestBucketiseCapSparkline:
         values = result['values']
         for label, value in zip(labels, values, strict=False):
             if label >= c_start:
-                assert value == 1, f"Expected 1 at {label} (open-ended)"
+                assert value == 1, f'Expected 1 at {label} (open-ended)'
             else:
-                assert value == 0, f"Expected 0 at {label} (before cap started)"
+                assert value == 0, f'Expected 0 at {label} (before cap started)'
 
     def test_cap_entirely_outside_window_all_zero(self):
         """Cap interval entirely before the window → all zero."""
@@ -888,6 +959,7 @@ class TestBucketiseCapSparkline:
         )
         assert len(res_naive['values']) == len(res_aware['values'])
         assert res_naive['values'] == res_aware['values']
+        assert res_naive['labels'] == res_aware['labels']
 
     def test_non_utc_now_matches_utc_window(self):
         """Non-UTC now must produce the same values as the UTC-equivalent now."""
@@ -897,10 +969,9 @@ class TestBucketiseCapSparkline:
         capped: list[tuple[datetime, datetime | None]] = [
             (now_utc - timedelta(hours=2), now_utc - timedelta(hours=1)),
         ]
-        res_utc = bucketise_cap_sparkline(
-            capped, window_hours=24, bucket_seconds=600, now=now_utc
-        )
+        res_utc = bucketise_cap_sparkline(capped, window_hours=24, bucket_seconds=600, now=now_utc)
         res_minus8 = bucketise_cap_sparkline(
             capped, window_hours=24, bucket_seconds=600, now=now_minus8
         )
         assert res_minus8['values'] == res_utc['values']
+        assert res_minus8['labels'] == res_utc['labels']

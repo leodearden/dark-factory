@@ -59,18 +59,22 @@ class CapInterval:
 
 
 # ---------------------------------------------------------------------------
-# _normalize_now_utc
+# _to_utc
 # ---------------------------------------------------------------------------
 
 
-def _normalize_now_utc(now: datetime | None) -> datetime:
-    """Return a UTC-aware datetime from *now*.
+def _to_utc(dt: datetime | None) -> datetime:
+    """Return a UTC-aware datetime from *dt*.
+
+    Works for both a caller's *now* reference value (``None`` means "use the
+    current instant") and for arbitrary event timestamps parsed from the
+    database (always a concrete ``datetime``):
 
     - ``None`` → ``datetime.now(UTC)``
     - naive (no ``tzinfo``) → assumed UTC, attached via ``replace(tzinfo=UTC)``
     - tz-aware but non-UTC → converted via ``astimezone(UTC)``
     """
-    effective = now if now is not None else datetime.now(UTC)
+    effective = dt if dt is not None else datetime.now(UTC)
     if effective.tzinfo is None:
         return effective.replace(tzinfo=UTC)
     return effective.astimezone(UTC)
@@ -116,7 +120,7 @@ async def read_cap_intervals(
     """
     if days <= 0:
         raise ValueError('days must be positive')
-    effective_now = _normalize_now_utc(now)
+    effective_now = _to_utc(now)
     cutoff = (effective_now - timedelta(days=days)).isoformat()
 
     async def _read_one(db: aiosqlite.Connection) -> list[CapInterval]:
@@ -133,7 +137,9 @@ async def read_cap_intervals(
         by_account: dict[str, list[tuple[str, datetime]]] = {}
         for row in rows:
             ts_str: str = row['created_at']
-            ts = _normalize_now_utc(datetime.fromisoformat(ts_str))
+            # Canonicalise to UTC: naive rows (no tzinfo) assumed UTC;
+            # tz-aware non-UTC rows converted via astimezone(UTC).
+            ts = _to_utc(datetime.fromisoformat(ts_str))
             by_account.setdefault(row['account_name'], []).append((row['event_type'], ts))
 
         intervals: list[CapInterval] = []
@@ -342,7 +348,7 @@ def bucketise_cap_sparkline(
         :class:`ChartData` with ``labels`` (ISO right-edge timestamps) and
         ``values`` (list of 0 or 1).
     """
-    effective_now = _normalize_now_utc(now)
+    effective_now = _to_utc(now)
     start_at = effective_now - timedelta(hours=window_hours)
     num_buckets = (window_hours * 3600) // bucket_seconds
 
