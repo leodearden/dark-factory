@@ -448,9 +448,14 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
       reserved name — however deeply nested — is silently skipped.  If a legitimate module
       directory shares a name with a reserved dir (e.g. a module literally called ``build``),
       its ``orchestrator.yaml`` will not be discovered; rename the directory or place the
-      config at a depth that avoids the collision.  When a pruned directory directly contains
-      an ``orchestrator.yaml`` (a "shadow" config), a runtime warning is emitted so operators
-      can detect and resolve the collision rather than having the config silently disappear.
+      config at a depth that avoids the collision.  When a pruned directory **directly**
+      contains an ``orchestrator.yaml`` (a "shadow" config, i.e. ``<reserved>/orchestrator.yaml``
+      with no intervening subdirectory), a runtime warning is emitted so operators can detect
+      and resolve the collision rather than having the config silently disappear.
+      **Limitation**: an ``orchestrator.yaml`` nested *deeper* inside a pruned directory
+      (e.g. ``build/some_sub/orchestrator.yaml``) is **still silently dropped** — the walk
+      never descends into the pruned tree, so no stat is performed for deeper levels.  Only
+      the immediate child case is diagnosed.
     - Uses ``followlinks=False`` (passed explicitly) for symlink-cycle safety — a symlink that
       points back into an ancestor directory cannot drive infinite recursion because the walk
       will not follow it.

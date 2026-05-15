@@ -3787,12 +3787,25 @@ class TestRunFullVerificationReuse:
         monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
 
         passing = self._make_passing_result()
-        with patch('orchestrator.verify.run_verification', new=AsyncMock(return_value=passing)):
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
             await run_full_verification(tmp_path, config)
 
         assert call_count == 0, (
             f'Expected _discover_module_configs not to be called when reusing '
             f'config._module_configs; called {call_count} time(s)'
+        )
+        # Confirm semantic equivalence: the reused dict was actually consumed —
+        # run_verification should have been called exactly once, with the 'dashboard'
+        # ModuleConfig passed as the third positional arg.
+        assert mock_run_verification.call_count == 1, (
+            f'Expected run_verification to be called exactly once (one module config); '
+            f'called {mock_run_verification.call_count} time(s)'
+        )
+        called_mc = mock_run_verification.call_args[0][2]  # positional arg index 2
+        assert called_mc.prefix == 'dashboard', (
+            f"Expected run_verification to be called with the 'dashboard' ModuleConfig; "
+            f"got prefix={called_mc.prefix!r}"
         )
 
     @pytest.mark.asyncio

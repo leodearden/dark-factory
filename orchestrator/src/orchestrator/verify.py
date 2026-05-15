@@ -1644,6 +1644,17 @@ async def run_full_verification(
     *project_root* differs from ``config.project_root`` or where the config was
     constructed without going through ``load_config`` (e.g. direct instantiation
     in tests that leave ``_module_configs`` empty).
+
+    **Staleness note**: because the reuse path reads a snapshot captured at
+    process startup (by ``load_config``), a new subproject whose
+    ``orchestrator.yaml`` is added or merged *after* startup will not appear in
+    the module set until the process restarts.  In the primary production call
+    site (``review_checkpoint.py``) this means a freshly-created subproject
+    module is absent from full verification for the remainder of the current
+    orchestrator run.  If dynamic re-discovery is needed (e.g. after a merge
+    that introduces a new module), pass a fresh ``OrchestratorConfig`` instance
+    (with ``_module_configs`` empty or with a root that differs from
+    ``config.project_root``) to force the fallback walk.
     """
     from orchestrator.config import _discover_module_configs
 
