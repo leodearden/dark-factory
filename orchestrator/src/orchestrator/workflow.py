@@ -1007,7 +1007,8 @@ class TaskWorkflow:
                 f'{e.retries} retries in {e.elapsed_secs:.1f}s (label={e.label!r})'
             )
             return await self._mark_blocked(
-                f'All accounts capped: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s'
+                f'All accounts capped: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s',
+                suggested_action='cap_wait_exceeded_sanity_bound',
             )
 
         except _SessionBudgetExhausted as e:
@@ -4378,6 +4379,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         skip_escalation: bool = False,
         merge_phase: bool = False,
         escalate_to_human: bool = False,
+        suggested_action: str = 'investigate_and_retry',
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -4459,7 +4461,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     category='task_failure',
                     summary=reason[:200],
                     detail=detail or reason,
-                    suggested_action='investigate_and_retry',
+                    suggested_action=suggested_action,
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
                 )
