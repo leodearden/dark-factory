@@ -3931,3 +3931,61 @@ class TestRunFullVerificationReuse:
             f'Expected global-fallback call to pass exactly 2 positional args '
             f'(project_root, config); got {mock_run_verification.call_args[0]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_force_rediscover_bypasses_snapshot(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """force_rediscover=True bypasses the cached snapshot and re-walks the filesystem.
+
+        Even when config._module_configs is populated (snapshot present) and the root
+        matches, passing force_rediscover=True must trigger a fresh _discover_module_configs
+        call — so a subproject orchestrator.yaml written after the snapshot is picked up.
+
+        RED until step-4 adds the force_rediscover parameter to run_full_verification.
+        Currently raises TypeError: unexpected keyword argument 'force_rediscover'.
+        """
+        import yaml
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        # Populate the snapshot with only 'dashboard'
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+        }
+
+        # Write a SECOND on-disk orchestrator.yaml that isn't in the snapshot
+        newmod_dir = tmp_path / 'newmod'
+        newmod_dir.mkdir()
+        (newmod_dir / 'orchestrator.yaml').write_text(
+            yaml.dump({'test_command': 'echo newmod'})
+        )
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, force_rediscover=True)
+
+        assert call_count >= 1, (
+            f'Expected _discover_module_configs to be called when force_rediscover=True '
+            f'despite snapshot being present; called {call_count} time(s)'
+        )
+        # The freshly-discovered 'newmod' prefix must appear among the call args
+        prefixes = {
+            call.args[2].prefix
+            for call in mock_run_verification.call_args_list
+            if len(call.args) >= 3
+        }
+        assert 'newmod' in prefixes, (
+            f"Expected run_verification to be called for the on-disk 'newmod' module "
+            f"after force_rediscover; found prefixes: {prefixes!r}"
+        )
