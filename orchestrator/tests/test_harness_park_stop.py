@@ -356,3 +356,34 @@ class TestParkStopE2E:
             f'Expected persisted reason {persisted_reason!r}; '
             f'got {harness2.scheduler.pause_reason!r}'
         )
+
+
+class TestHarnessCostCeiling:
+    """Tests for cost-ceiling config fields, _trailing_24h_cost_usd, and _enforce_cost_ceilings.
+
+    Task 1323 — AFK hardening: Daily cost ceiling with watcher + orch-wide budgets.
+    """
+
+    # ------------------------------------------------------------------
+    # Step 1 — config fields
+    # ------------------------------------------------------------------
+
+    def test_config_defaults(self, tmp_path: Path) -> None:
+        """OrchestratorConfig exposes the two ceiling fields with correct defaults."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.watcher_daily_cost_ceiling_usd == 50.0, (
+            f'Expected 50.0; got {config.watcher_daily_cost_ceiling_usd!r}'
+        )
+        assert config.orch_daily_cost_ceiling_usd == 200.0, (
+            f'Expected 200.0; got {config.orch_daily_cost_ceiling_usd!r}'
+        )
+
+    def test_config_overridable(self, tmp_path: Path) -> None:
+        """Both ceiling fields accept custom values."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=7.0,
+            orch_daily_cost_ceiling_usd=99.5,
+        )
+        assert config.watcher_daily_cost_ceiling_usd == 7.0
+        assert config.orch_daily_cost_ceiling_usd == 99.5
