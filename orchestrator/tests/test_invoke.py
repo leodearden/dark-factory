@@ -109,6 +109,7 @@ def _make_gate_yielding(slots, *, active_account_name=None):
     gate.on_agent_complete = MagicMock()
     gate.confirm_account_ok = MagicMock()
     gate.release_probe_slot = MagicMock()
+    gate.soonest_resets_at = None
     return gate
 
 
