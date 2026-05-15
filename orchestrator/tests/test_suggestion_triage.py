@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
@@ -386,7 +387,12 @@ class TestRouteReviewSuggestionsToCurator:
 
     @pytest.mark.asyncio
     async def test_mcp_none_falls_back_to_memory_when_no_queue(self):
-        """When both self.mcp and escalation_queue are None, _write_suggestions_to_memory is used."""
+        """When both self.mcp and escalation_queue are None, only the audit WARNING is emitted.
+
+        _write_suggestions_to_memory is NOT called — the previous dead call (which
+        immediately returned when mcp is None) was removed so the branch is now
+        unambiguous: log-only, no sink.
+        """
         suggestions = self._suggestions()
         wf = _make_workflow(escalation_queue=None)
         wf.mcp = None  # simulate missing MCP transport
@@ -399,7 +405,48 @@ class TestRouteReviewSuggestionsToCurator:
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
 
         mock_post.assert_not_called()
-        write_mock.assert_called_once()
+        write_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_no_queue_logs_audit_warning_on_dropped_suggestions(
+        self, caplog
+    ):
+        """(mcp=None, queue=None) must emit a WARNING so the drop is auditable.
+
+        Before step-2 impl: the fallback silently drops suggestions after the
+        no-op _write_suggestions_to_memory call — no log record is produced.
+        After step-2 impl: a WARNING is emitted containing 'suggestion' and
+        one of {'drop', 'no-op', 'no sink'} plus the count (2).
+        """
+        suggestions = self._suggestions()
+        wf = _make_workflow(escalation_queue=None)
+        wf.mcp = None  # simulate CLI/dry-run/test context
+
+        # _write_suggestions_to_memory is no longer called in this branch (dead call
+        # removed), so no patch is needed — the WARNING fires unconditionally.
+        with (
+            patch('httpx.AsyncClient.post', new_callable=AsyncMock) as mock_post,
+            caplog.at_level(logging.WARNING, logger='orchestrator.workflow'),
+        ):
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+
+        # Regression guard: must not attempt any HTTP against missing MCP
+        mock_post.assert_not_called()
+
+        # The audit warning must be present
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        drop_keywords = {'drop', 'no-op', 'no sink'}
+        assert any(
+            'suggestion' in t.lower() and any(kw in t.lower() for kw in drop_keywords)
+            for t in warning_texts
+        ), f'Expected WARNING with "suggestion" + drop keyword, got: {warning_texts}'
+
+        # Must also mention the count of dropped suggestions as a standalone number.
+        # Use word-boundary regex so '2' in task_id '42' does not satisfy the check.
+        n = len(suggestions)
+        assert any(
+            re.search(rf'\b{n}\b', t) is not None for t in warning_texts
+        ), f'Expected WARNING mentioning standalone count {n}, got: {warning_texts}'
 
 
 # ---------------------------------------------------------------------------
