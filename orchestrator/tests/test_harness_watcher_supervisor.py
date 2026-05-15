@@ -623,6 +623,53 @@ class TestWatcherSupervisorLoopClassification:
             f'Post-reset backoff should be base {base}s; got {sleep_durations[2]}'
         )
 
+    @pytest.mark.asyncio
+    async def test_rotation_exception_classified_unclean(self, tmp_path: Path) -> None:
+        """When _run_watcher_rotation raises an exception (not CancelledError),
+        the supervisor treats it as an unclean exit: the unclean deque grows and
+        backoff sleep is applied.
+
+        Coverage backfill (S4a): verifies the existing
+        `except Exception: result = None` sentinel path at harness.py:2753-2758.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': 99,    # disable crashloop trip
+            'watcher_max_misconfigured_clean_exits': 99,  # disable misconfig trip
+            'watcher_crashloop_window_secs': 9999,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+        })
+
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls == 1:
+                raise RuntimeError('boom')   # exception path under test
+            raise asyncio.CancelledError()   # exit on second call
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
+
+        # Raised exception must be classified as unclean: deque grows
+        assert len(h._watcher_unclean_exits) == 1, (
+            f'RuntimeError from rotation should be classified unclean; '
+            f'_watcher_unclean_exits has {len(h._watcher_unclean_exits)} entries'
+        )
+        # Backoff sleep must be applied (not skipped on the exception path)
+        assert len(sleep_durations) >= 1, (
+            'Backoff sleep must occur after exception-classified unclean exit'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-11: Crashloop trip — pause_scheduler + window eviction
