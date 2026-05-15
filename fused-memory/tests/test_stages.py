@@ -5884,6 +5884,159 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         assert report.stats['stale_missing_run_id_markers'] == 0
 
 
+class TestAssemblePayloadRunWindowStart:
+    """step-5 (task-1369): assemble_payload threads journal.get_run().started_at into _query_stage2_flags.
+
+    All tests FAIL until step-6: assemble_payload currently does not call
+    self.journal.get_run(), so journal.get_run.assert_awaited_* always fails.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.search.return_value = []
+        memory_service.add_memory.return_value = {'memory_ids': []}
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    def _fake_cli_result(self):
+        return MagicMock(
+            success=True,
+            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
+            llm_calls=1, tokens_used=0, cost_usd=0.0,
+            model='test-model', error=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_sourced_from_journal_started_at(self, mock_deps):
+        """(a) journal.get_run(run_id).started_at is passed as run_window_start to _query_stage2_flags."""
+        from types import SimpleNamespace
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            TaskKnowledgeSync,
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        mock_run = MagicMock()
+        mock_run.started_at = run_window_start
+        mock_deps['journal'].get_run = AsyncMock(return_value=mock_run)
+
+        # Capture run_window_start kwarg passed to _query_stage2_flags
+        captured_kwargs: dict = {}
+
+        async def capture_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return Stage2FlagPartition([], [], [])
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+            side_effect=capture_query,
+        ):
+            with patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ):
+                await stage.run(events=[], watermark=Watermark(project_id='reify'),
+                                prior_reports=[], run_id='test-run')
+
+        # journal.get_run must be called with the current run_id
+        mock_deps['journal'].get_run.assert_awaited_once_with('test-run')
+        # run_window_start must equal the stub's started_at
+        assert captured_kwargs.get('run_window_start') == run_window_start, (
+            f"Expected run_window_start={run_window_start!r}, "
+            f"got {captured_kwargs.get('run_window_start')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_none_when_journal_raises(self, mock_deps):
+        """(b) When journal.get_run raises, assemble_payload completes with run_window_start=None."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            TaskKnowledgeSync,
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal unavailable'))
+
+        captured_kwargs: dict = {}
+
+        async def capture_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return Stage2FlagPartition([], [], [])
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+            side_effect=capture_query,
+        ):
+            with patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ):
+                # Must not raise even though journal.get_run raises
+                await stage.run(events=[], watermark=Watermark(project_id='reify'),
+                                prior_reports=[], run_id='test-run')
+
+        # journal.get_run was still attempted
+        mock_deps['journal'].get_run.assert_awaited_once_with('test-run')
+        # Graceful degradation: run_window_start=None
+        assert captured_kwargs.get('run_window_start') is None
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_none_when_started_at_not_datetime(self, mock_deps):
+        """(c) When get_run() returns an object whose started_at is not a datetime, run_window_start=None."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            Stage2FlagPartition,
+            TaskKnowledgeSync,
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        mock_run = MagicMock()
+        mock_run.started_at = 'not-a-datetime'  # not a datetime instance
+        mock_deps['journal'].get_run = AsyncMock(return_value=mock_run)
+
+        captured_kwargs: dict = {}
+
+        async def capture_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return Stage2FlagPartition([], [], [])
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync._query_stage2_flags',
+            side_effect=capture_query,
+        ):
+            with patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ):
+                await stage.run(events=[], watermark=Watermark(project_id='reify'),
+                                prior_reports=[], run_id='test-run')
+
+        mock_deps['journal'].get_run.assert_awaited_once_with('test-run')
+        assert captured_kwargs.get('run_window_start') is None
+
+
 class TestStage3PayloadIncludesProjectRoot:
     """IntegrityCheck.assemble_payload() must emit a Use project_root="..." directive.
 
