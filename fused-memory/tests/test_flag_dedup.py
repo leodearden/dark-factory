@@ -4144,8 +4144,9 @@ class TestConfirmationCircuitBreaker:
           [12]  (flag-4 confirmation retry — only reached without breaker)
 
         Asserts:
-          (a) Exactly ONE circuit-breaker WARNING whose text contains '3'
-              (anchoring the new default value).
+          (a) Exactly ONE circuit-breaker WARNING whose text contains
+              'tripped after 3 consecutive' (anchoring both the event type
+              and the exact count; a bare '3' would also match 13 or 30).
           (b) search.call_count == 11 (1 suppression + 4 pre-write +
               3×2 confirmations for flags 1-3 + 0 confirmations for flag-4).
           (c) All 4 flags returned (MISS-path, no 'persisted_from_run').
@@ -4189,14 +4190,17 @@ class TestConfirmationCircuitBreaker:
 
         all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
 
-        # (a) Exactly ONE breaker WARNING whose text contains '3' (the new default).
+        # (a) Exactly ONE breaker WARNING whose text contains 'tripped after 3 consecutive'
+        #     (anchoring both the event type and the exact count rendered into the message).
+        #     A bare '3' would match counts like 13 or 30; the longer substring is precise.
         breaker_warnings = [m for m in all_warnings if 'tripped after' in m]
         assert len(breaker_warnings) == 1, (
             f"Expected exactly 1 circuit-breaker WARNING but got "
             f"{len(breaker_warnings)}: {breaker_warnings}\nAll WARNINGs: {all_warnings}"
         )
-        assert '3' in breaker_warnings[0], (
-            f"Breaker WARNING must mention count '3' (the default threshold); "
+        assert 'tripped after 3 consecutive' in breaker_warnings[0], (
+            f"Breaker WARNING must contain 'tripped after 3 consecutive' "
+            f"(the default threshold rendered into the message); "
             f"got: {breaker_warnings[0]!r}"
         )
 
