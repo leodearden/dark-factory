@@ -3812,15 +3812,16 @@ class TestRunFullVerificationReuse:
     async def test_falls_back_to_discovery_when_module_configs_empty(
         self, tmp_path: Path, monkeypatch
     ):
-        """run_full_verification calls _discover_module_configs when config._module_configs is empty.
+        """run_full_verification calls _discover_module_configs when config._module_configs is None.
 
+        None is the sentinel meaning "discovery never ran" (the PrivateAttr default).
         With no orchestrator.yaml files under tmp_path, discovery returns {} and
         the global-fallback branch fires (run_verification once with no module_config).
         """
         from orchestrator.config import _discover_module_configs as real_discover
 
         config = OrchestratorConfig(project_root=tmp_path)
-        # config._module_configs left as default empty dict
+        # config._module_configs left as default None (never-discovered sentinel)
 
         call_count = 0
 
@@ -3876,4 +3877,190 @@ class TestRunFullVerificationReuse:
         assert call_count >= 1, (
             f'Expected _discover_module_configs to be called when project_root differs '
             f'from config.project_root; called {call_count} time(s)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_discovered_empty_engages_reuse_path_no_walk(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Discovered-empty ({}) config._module_configs should engage the reuse path.
+
+        When load_config runs discovery and finds zero subproject orchestrator.yamls it
+        stores {} in config._module_configs.  That empty dict means "discovery ran and
+        found nothing" — NOT "discovery never ran".  run_full_verification must not
+        perform a redundant walk in this case; it should reuse the cached {} and fall
+        through to the global-fallback branch (run_verification with no ModuleConfig).
+
+        RED until the sentinel is implemented (step-2 changes the guard from
+        `if config._module_configs` to `if config._module_configs is not None`).
+        With the current falsy guard, {} triggers the else-branch and _discover_module_configs
+        IS called — so call_count will be >= 1 and this assertion fails.
+        """
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        # Simulate a load_config that ran discovery and found zero subprojects.
+        config._module_configs = {}  # discovered-empty; NOT the never-ran sentinel
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert call_count == 0, (
+            f'Expected _discover_module_configs NOT to be called when config._module_configs '
+            f'is {{}} (discovered-empty); called {call_count} time(s). '
+            f'The reuse guard must use `is not None` to distinguish '
+            f'"never discovered" (None) from "discovered, found nothing" ({{}}).'
+        )
+        # Global fallback: run_verification called once with only project_root + config
+        assert mock_run_verification.call_count == 1, (
+            f'Expected run_verification to be called exactly once (global fallback); '
+            f'called {mock_run_verification.call_count} time(s)'
+        )
+        assert len(mock_run_verification.call_args[0]) == 2, (
+            f'Expected global-fallback call to pass exactly 2 positional args '
+            f'(project_root, config); got {mock_run_verification.call_args[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_rediscover_bypasses_snapshot(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """force_rediscover=True bypasses the cached snapshot and re-walks the filesystem.
+
+        Even when config._module_configs is populated (snapshot present) and the root
+        matches, passing force_rediscover=True must trigger a fresh _discover_module_configs
+        call — so a subproject orchestrator.yaml written after the snapshot is picked up.
+
+        RED until step-4 adds the force_rediscover parameter to run_full_verification.
+        Currently raises TypeError: unexpected keyword argument 'force_rediscover'.
+        """
+        import yaml
+
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        # Populate the snapshot with only 'dashboard'
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+        }
+
+        # Write a SECOND on-disk orchestrator.yaml that isn't in the snapshot
+        newmod_dir = tmp_path / 'newmod'
+        newmod_dir.mkdir()
+        (newmod_dir / 'orchestrator.yaml').write_text(
+            yaml.dump({'test_command': 'echo newmod'})
+        )
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, force_rediscover=True)
+
+        assert call_count >= 1, (
+            f'Expected _discover_module_configs to be called when force_rediscover=True '
+            f'despite snapshot being present; called {call_count} time(s)'
+        )
+        # The freshly-discovered 'newmod' prefix must appear among the call args
+        prefixes = {
+            call.args[2].prefix
+            for call in mock_run_verification.call_args_list
+            if len(call.args) >= 3
+        }
+        assert 'newmod' in prefixes, (
+            f"Expected run_verification to be called for the on-disk 'newmod' module "
+            f"after force_rediscover; found prefixes: {prefixes!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_midrun_added_orchestrator_yaml_excluded_from_snapshot(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Mid-run staleness lock-in: a subproject yaml added after snapshot is NOT discovered.
+
+        This is a characterization test that locks the intentional default behaviour:
+        run_full_verification without force_rediscover reuses the load_config-time snapshot,
+        so a new orchestrator.yaml written to disk after config._module_configs was populated
+        is silently excluded.  A future change cannot accidentally introduce a fresh walk or
+        drop the snapshot without this test turning RED.
+
+        The decided trade-off: snapshot eliminates the redundant walk on the hot production
+        review-checkpoint path; mid-run subproject additions are excluded until restart or
+        an explicit force_rediscover=True call.
+        """
+        import yaml
+
+        from orchestrator.config import _discover_module_configs as real_discover
+
+        # Populate the snapshot with only 'dashboard' — BEFORE writing the second yaml
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+        }
+
+        # Write a SECOND orchestrator.yaml AFTER the snapshot was "taken"
+        newmod_dir = tmp_path / 'newmod'
+        newmod_dir.mkdir()
+        (newmod_dir / 'orchestrator.yaml').write_text(
+            yaml.dump({'test_command': 'echo newmod'})
+        )
+
+        call_count = 0
+
+        def counting_discover(root):
+            nonlocal call_count
+            call_count += 1
+            return real_discover(root)
+
+        monkeypatch.setattr('orchestrator.config._discover_module_configs', counting_discover)
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            # Default: no force_rediscover — snapshot must be reused
+            await run_full_verification(tmp_path, config)
+
+        # Snapshot reused → no walk
+        assert call_count == 0, (
+            f'Expected _discover_module_configs NOT to be called (snapshot reused); '
+            f'called {call_count} time(s). The intentional default is snapshot-reuse; '
+            f'a caller that needs fresh discovery must pass force_rediscover=True.'
+        )
+        # Only the snapshot's 'dashboard' should have been verified
+        assert mock_run_verification.call_count == 1, (
+            f'Expected run_verification to be called exactly once (snapshot has 1 module); '
+            f'called {mock_run_verification.call_count} time(s)'
+        )
+        called_mc = mock_run_verification.call_args[0][2]
+        assert called_mc.prefix == 'dashboard', (
+            f"Expected the snapshot 'dashboard' module to be verified; got {called_mc.prefix!r}"
+        )
+        # Lock: the mid-run 'newmod' must NOT appear
+        prefixes = {
+            call.args[2].prefix
+            for call in mock_run_verification.call_args_list
+            if len(call.args) >= 3
+        }
+        assert 'newmod' not in prefixes, (
+            f"Expected 'newmod' to be absent from snapshot run (mid-run staleness lock-in); "
+            f"found prefixes: {prefixes!r}.  Pass force_rediscover=True for fresh discovery."
         )
