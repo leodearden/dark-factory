@@ -2051,3 +2051,55 @@ def test_write_suppression_record_importable_from_canonical_path():
     (see STAGE1_SYSTEM_PROMPT ## Flag Suppression Check section).
     """
     from fused_memory.reconciliation.flag_dedup import write_suppression_record  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# TestConfirmMarkerPersisted (task-1400 step-1+) — post-write confirmation helper
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmMarkerPersisted:
+    """Tests for confirm_marker_persisted(memory_service, *, project_id, task_id,
+    flag_type, run_id, log) — the canonical-id confirmation helper.
+
+    step-1: test_returns_canonical_id_from_search_not_response
+    step-3: test_miss_then_retry_finds_marker
+    step-5: test_miss_after_retry_returns_none_and_warns_never_raises
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_canonical_id_from_search_not_response(self):
+        """Returns MemoryResult.id from the search (canonical id), NOT any add_memory response id.
+
+        Step-1 RED: confirm_marker_persisted does not exist yet → ImportError.
+        When the confirmation search finds a matching marker, the returned id is
+        the MemoryResult.id ('canonical-XYZ'), not any id from an add_memory
+        response (which is the root-cause vector for the ID-mismatch bug).
+        """
+        import logging
+        from fused_memory.reconciliation.flag_dedup import confirm_marker_persisted  # step-1: ImportError
+
+        confirmed_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'x',
+            'run_id': 'r1',
+        })
+        confirmed_marker.id = 'canonical-XYZ'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[confirmed_marker])
+
+        result = await confirm_marker_persisted(
+            memory_service,
+            project_id='p',
+            task_id='42',
+            flag_type='x',
+            run_id='r1',
+            log=logging.getLogger('fused_memory.reconciliation.flag_dedup'),
+        )
+
+        assert result == 'canonical-XYZ', (
+            f"confirm_marker_persisted must return the canonical MemoryResult.id "
+            f"('canonical-XYZ'), not any add_memory response id; got {result!r}"
+        )
