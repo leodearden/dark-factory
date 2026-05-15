@@ -41,3 +41,9 @@
 
 __pycache__/
 *.pyc
+
+# ── Test SQLite artifacts — MagicMock path side-effects ──────────────
+# OverrideStore creates an SQLite DB at config.overrides_db_path; when
+# tests pass an unpatched MagicMock as config the stringified mock name
+# becomes the path, producing files like "<MagicMock name='...' id='...'>".
+<MagicMock*
