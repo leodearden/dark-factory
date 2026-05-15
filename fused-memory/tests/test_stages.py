@@ -4821,6 +4821,87 @@ class TestQueryStage2Flags:
         assert not any(f['id'] == 'outside-grace' for f in partition.current)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('case_id, created_at, metadata, in_window', [
+        pytest.param(
+            'naive-no-offset',
+            '2026-05-15T10:00:05',  # no offset, no Z — triggers replace(tzinfo=UTC) branch
+            {'flag_for_stage2': True, 'task_id': '101'},  # no run_id → stale-missing absent guard
+            True,   # 10:00:05 UTC > 09:59:30 threshold → in-window
+            id='naive_no_offset',
+        ),
+        pytest.param(
+            'non-utc-offset',
+            '2026-05-15T10:00:10+05:00',  # = 05:00:10 UTC — BEFORE the 09:59:30 threshold
+            {'flag_for_stage2': True, 'task_id': '102', 'run_id': 'wrong-run'},  # mismatched → stale absent guard
+            False,  # 05:00:10 UTC < 09:59:30 threshold → out-of-window; stays stale
+            id='non_utc_offset_out_of_window',
+        ),
+        pytest.param(
+            'z-suffixed',
+            '2026-05-15T10:00:05Z',  # Z suffix — fromisoformat returns tz-aware UTC directly
+            {'flag_for_stage2': True, 'task_id': '103'},  # no run_id → stale-missing absent guard
+            True,   # 10:00:05 UTC > 09:59:30 threshold → in-window
+            id='z_suffix',
+        ),
+    ])
+    async def test_created_at_timestamp_format_normalisation(
+        self, case_id, created_at, metadata, in_window
+    ):
+        """_marker_is_within_run_window normalises created_at regardless of ISO 8601 format.
+
+        Three timestamp formats correspond to distinct parse paths, each tested via a
+        parametrised case using run_window_start=2026-05-15T10:00:00+00:00
+        (threshold = window_start - _CLOCK_SKEW_GRACE = 09:59:30 UTC):
+
+          naive_no_offset — '2026-05-15T10:00:05' (no offset, no Z suffix):
+            fromisoformat returns a naive datetime; the ``if parsed.tzinfo is None``
+            branch inside _marker_is_within_run_window normalises it to 10:00:05+00:00.
+            The marker (no run_id) is trivially after window start → in-window →
+            rescued to partition.current.
+
+          non_utc_offset_out_of_window — '2026-05-15T10:00:10+05:00' = 05:00:10 UTC:
+            fromisoformat returns an offset-aware datetime. 05:00:10 UTC is *before*
+            the 09:59:30 threshold, so the marker (mismatched run_id) stays in
+            stale_mismatched_run_id_ids. A naive-stripping regression would read
+            the wall-clock digits as 10:00:10 UTC (> threshold) and wrongly rescue
+            it — making this the decisive differentiator between correct offset-aware
+            comparison and a buggy naive-stripping implementation. Mirrors the
+            MemoryResult.created_at contract: "UTC offset is not guaranteed — Mem0
+            may stamp in any offset".
+
+          z_suffix — '2026-05-15T10:00:05Z':
+            fromisoformat on Python >= 3.11 returns tz-aware UTC directly (project
+            requires-python >=3.11,<4), so the ``tzinfo is None`` branch is NOT
+            entered. 10:00:05+00:00 is after window start → in-window → rescued to
+            partition.current.
+
+        Regression guard: locks in already-correct behaviour against future refactors
+        of _marker_is_within_run_window.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
+
+        run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.search.return_value = [
+            self._make_result(case_id, 'ts-format normalisation test', metadata, created_at=created_at),
+        ]
+        partition = await _query_stage2_flags(
+            memory_service, 'reify', 'r-current', run_window_start=run_window_start
+        )
+        if in_window:
+            assert any(f['id'] == case_id for f in partition.current), (
+                f'{case_id!r}: in-window created_at must rescue marker to partition.current'
+            )
+            assert case_id not in partition.stale_missing_run_id_ids
+            assert case_id not in partition.stale_mismatched_run_id_ids
+        else:
+            assert not any(f['id'] == case_id for f in partition.current), (
+                f'{case_id!r}: out-of-window created_at must NOT rescue marker to current'
+            )
+            # run_id='wrong-run' routes to stale_mismatched when not rescued
+            assert case_id in partition.stale_mismatched_run_id_ids
+
+    @pytest.mark.asyncio
     async def test_info_log_emitted_when_missing_run_id_marker_rescued(self, caplog):
         """An INFO log is emitted when a missing-run_id marker is rescued by the run-window guard."""
         import logging
