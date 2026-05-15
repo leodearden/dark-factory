@@ -580,3 +580,80 @@ def test_api_curator_uses_LIST_TICKETS_LIMIT_constant(tmp_path: Path, monkeypatc
         "app.py is passing a magic literal that overrides the constant — "
         "remove the limit=2000 kwarg from the fan_out_list_tickets call in app.py."
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1329 step-1: per-leg DB degradation — OSError from pool.get stays
+# contained to the sparks/intervals legs (fan-out leg unaffected)
+# ---------------------------------------------------------------------------
+
+
+def test_api_curator_db_resolution_failure_degrades_per_leg(tmp_path: Path):
+    """DB resolution failure must degrade only sparks/intervals legs, not 500.
+
+    RED baseline: `metrics_db = await pool.get(...)` and
+    `cost_dbs_raw = await _cost_dbs(...)` run BEFORE asyncio.gather with no
+    error handling.  An OSError from pool.get propagates out of api_curator
+    → 500.  The fix moves these resolutions into per-leg wrapper coroutines
+    inside the gather so safe_gather_result absorbs the failure per-leg.
+
+    DbPool.get is patched at the class (dashboard.data.db.DbPool.get) with
+    AsyncMock(side_effect=OSError) because api_curator resolves pool.get on
+    the app.state.db instance — patching the instance method is cumbersome;
+    patching the class method covers metrics_db AND _cost_dbs→_project_scoped_dbs
+    in one shot.
+
+    Expected post-fix behaviour:
+    - status 200 (no 500)
+    - cs['pending'] has the one row returned by the fan-out mock (DB failure
+      must NOT affect the fan-out leg which uses mcp_tool_call, not pool.get)
+    - cs['state']['pending_total'] == 1
+    - cs['latency_spark'], cs['pending_spark'], cs['capped_spark'] are all
+      empty series (DB leg failures → safe_gather_result returns defaults)
+    - cs['state']['capped_now'] == 0
+    """
+    now = datetime.now(UTC)
+    created_at = (now - timedelta(seconds=60)).isoformat()
+    ticket_row = {
+        'ticket_id': 'tkt_a',
+        'candidate_title': 'A',
+        'created_at': created_at,
+        'project_id': 'proj_p',
+    }
+    mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
+
+    config = _make_config(tmp_path)
+    with (
+        _override_client(config) as c,
+        patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
+        patch(
+            'dashboard.data.db.DbPool.get',
+            new=AsyncMock(side_effect=OSError('simulated transient FS error')),
+        ),
+    ):
+        resp = c.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200, (
+        f'Expected 200 (per-leg degradation), got {resp.status_code}. '
+        'pool.get OSError is propagating out of api_curator before the gather.'
+    )
+    cs = resp.json()['CURATOR_STATE']
+
+    # Fan-out leg is unaffected (uses mcp_tool_call, not pool.get).
+    assert len(cs['pending']) == 1
+    assert cs['pending'][0]['ticket_id'] == 'tkt_a'
+    assert cs['state']['pending_total'] == 1
+
+    # DB legs degrade gracefully to empty series.
+    ls = cs['latency_spark']
+    assert ls['labels'] == []
+    assert ls['p50'] == []
+    assert ls['p90'] == []
+    assert ls['p99'] == []
+    ps = cs['pending_spark']
+    assert ps['labels'] == []
+    assert ps['values'] == []
+    capped = cs['capped_spark']
+    assert capped['labels'] == []
+    assert capped['values'] == []
+    assert cs['state']['capped_now'] == 0
