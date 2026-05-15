@@ -871,3 +871,36 @@ class TestBucketiseCapSparkline:
             now=now,
         )
         assert all(v == 0 for v in result['values'])
+
+    def test_naive_now_does_not_raise_and_matches_utc(self):
+        """naive now must not raise and must produce the same values as UTC-equivalent now."""
+        now_utc = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        capped: list[tuple[datetime, datetime | None]] = [
+            (now_utc - timedelta(hours=1), now_utc - timedelta(minutes=30)),
+        ]
+        res_aware = bucketise_cap_sparkline(
+            capped, window_hours=24, bucket_seconds=600, now=now_utc
+        )
+        now_naive = now_utc.replace(tzinfo=None)
+        # Must not raise (was: TypeError comparing naive right_edge vs tz-aware c_start)
+        res_naive = bucketise_cap_sparkline(
+            capped, window_hours=24, bucket_seconds=600, now=now_naive
+        )
+        assert len(res_naive['values']) == len(res_aware['values'])
+        assert res_naive['values'] == res_aware['values']
+
+    def test_non_utc_now_matches_utc_window(self):
+        """Non-UTC now must produce the same values as the UTC-equivalent now."""
+        now_utc = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        tz_minus8 = timezone(timedelta(hours=-8))
+        now_minus8 = now_utc.astimezone(tz_minus8)
+        capped: list[tuple[datetime, datetime | None]] = [
+            (now_utc - timedelta(hours=2), now_utc - timedelta(hours=1)),
+        ]
+        res_utc = bucketise_cap_sparkline(
+            capped, window_hours=24, bucket_seconds=600, now=now_utc
+        )
+        res_minus8 = bucketise_cap_sparkline(
+            capped, window_hours=24, bucket_seconds=600, now=now_minus8
+        )
+        assert res_minus8['values'] == res_utc['values']
