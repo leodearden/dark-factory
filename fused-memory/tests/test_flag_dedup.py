@@ -2543,7 +2543,7 @@ class TestConfirmMarkerPersisted:
         import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
         from fused_memory.reconciliation.flag_dedup import (
             _CONFIRM_RETRY_DELAY_SECS,  # noqa: F401 — AttributeError if absent (RED)
-            _sleep,                      # noqa: F401 — AttributeError if absent (RED)
+            _sleep,  # noqa: F401 — AttributeError if absent (RED)
             confirm_marker_persisted,
         )
 
