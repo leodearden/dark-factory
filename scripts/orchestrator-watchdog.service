@@ -1,0 +1,6 @@
+[Unit]
+Description=Probe escalation MCP ports; restart unresponsive orchestrator
+
+[Service]
+Type=oneshot
+ExecStart=/home/leo/src/dark-factory/scripts/orchestrator-watchdog.py
