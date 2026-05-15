@@ -3927,16 +3927,22 @@ class TestConfirmationCircuitBreaker:
         for f in result:
             assert 'persisted_from_run' in f, f'Expected HIT-path annotation: {f}'
 
-    def test_confirmation_miss_threshold_constant_is_pinned_to_5(self):
-        """Regression-pin: _CONFIRMATION_MISS_THRESHOLD was chosen at task-1412 as 5.
+    def test_confirmation_miss_threshold_constant_is_pinned_to_3(self):
+        """Regression-pin: _CONFIRMATION_MISS_THRESHOLD was lowered to 3 at task-1415.
 
         A change to this constant affects how aggressively the circuit-breaker
         fires during a Mem0 brownout.  Changing it should be a deliberate
         decision with an accompanying test update, not a silent shift.
+
+        Trade-off: resilience to single-flag flakiness (higher threshold) vs
+        brownout load-shedding latency (lower threshold).  3 was chosen because
+        confirm_marker_persisted retries internally (each miss = 2 round-trips),
+        3 still tolerates a single spurious miss (a hit resets the counter), and
+        activating the breaker sooner is consistent with its load-shedding purpose.
         """
         from fused_memory.reconciliation.flag_dedup import _CONFIRMATION_MISS_THRESHOLD
-        assert _CONFIRMATION_MISS_THRESHOLD == 5, (
-            'Threshold was chosen at task-1412 default; a change should be a '
+        assert _CONFIRMATION_MISS_THRESHOLD == 3, (
+            'Threshold was lowered to 3 at task-1415; a change should be a '
             'deliberate decision with a test update, not a silent shift.'
         )
 

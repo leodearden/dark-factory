@@ -195,16 +195,24 @@ class SuppressionPayload(TypedDict):
 # with _DELETE_DEAD_BATCH_SIZE).  See "Confirmation circuit-breaker (task-1412)"
 # section in the module docstring for the full design rationale.
 #
-# 5 was chosen as the default: during a sustained brownout confirm_marker_persisted
-# always misses (initial miss + one retry = 2 search calls per flag), so 5
-# consecutive misses manifest quickly and indicate a real backend failure.  Under
-# healthy-but-slow indexing, strictly-consecutive miss runs of 5 are rare because
-# any single successful confirmation resets the counter.  Note: write failures
-# (add_memory exceptions) do NOT count toward this threshold — the counter only
-# advances on confirmation misses from successful writes; see the module docstring
-# "Confirmation circuit-breaker" section for the "write failures do not count"
-# design rationale.
-_CONFIRMATION_MISS_THRESHOLD: int = 5
+# Trade-off: resilience to single-flag flakiness (higher threshold) vs
+# brownout load-shedding latency (lower threshold).
+#
+# 3 was chosen as the default (task-1415, lowered from 5):
+# - confirm_marker_persisted already retries internally so each "miss" costs 2
+#   search round-trips.  At threshold 5 the worst-case batch pays up to
+#   5 × (1 write + 2 confirmation searches) ≈ 15 round-trips before the breaker
+#   activates; at 3 that drops to ≈ 9.
+# - Threshold 3 still tolerates a single spurious miss without tripping: a
+#   sporadic miss followed by a hit resets the counter to 0, so strictly-
+#   consecutive miss runs of 3 are rare under healthy-but-slow indexing.
+# - The whole point of the breaker is to shed load during real brownouts, so
+#   activating it sooner (lower threshold) is consistent with its purpose.
+# - Write failures (add_memory exceptions) do NOT count — the counter only
+#   advances on confirmation misses from successful writes; see the module
+#   docstring "Confirmation circuit-breaker" section for the "write failures do
+#   not count" design rationale.
+_CONFIRMATION_MISS_THRESHOLD: int = 3
 
 # Bounded delay (seconds) awaited between the first-search miss and the retry in
 # confirm_marker_persisted.  Default 0.0 = pure event-loop yield (asyncio.sleep(0)
