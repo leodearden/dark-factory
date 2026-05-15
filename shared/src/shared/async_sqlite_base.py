@@ -104,6 +104,14 @@ class AsyncSqliteBase(abc.ABC):
 
         async with MyStore(path) as store:
             ...
+
+    **Durability**: ``open()`` calls :func:`apply_full_durability_pragmas` on
+    every subclass, applying the Phase 3 triad (``synchronous=FULL``,
+    ``wal_autocheckpoint=100``, ``journal_size_limit=64 MiB``) — see
+    ``docs/task-recovery-2026-05-13/`` for the production incident that
+    mandated this convention.  A future subclass that needs WAL-only semantics
+    (e.g. an ephemeral or test store) must override ``open()`` and bypass
+    ``apply_full_durability_pragmas``; no class-level opt-out toggle exists.
     """
 
     def __init__(self, db_path: Path, *, busy_timeout_ms: int = 5000) -> None:
