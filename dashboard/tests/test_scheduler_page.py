@@ -286,7 +286,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, modules, pin_queue, events_by_task, offline_projects = \
+        rows, modules, pin_queue, events_by_task, offline_projects, paused_projects = \
             await collect_scheduler_state(dummy_client, dummy_config)
 
     assert offline_projects == []
@@ -354,7 +354,7 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
         patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, modules, pin_queue, events_by_task, offline_projects = \
+        rows, modules, pin_queue, events_by_task, offline_projects, paused_projects = \
             await collect_scheduler_state(dummy_client, dummy_config)
 
     assert rows == []
@@ -362,6 +362,108 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
     assert pin_queue == []
     assert events_by_task == {}
     assert offline_projects == [project]
+
+
+# ---------------------------------------------------------------------------
+# step-1370-5: collect_scheduler_state surfaces paused_projects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collect_scheduler_state_surfaces_paused_projects(
+    dummy_client, dummy_config
+):
+    """collect_scheduler_state returns paused_projects in the 6th tuple element.
+
+    Mirrors test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable.
+    A snapshot with is_paused=True must yield paused_projects=[{project, reason}].
+    A snapshot with is_paused absent or False must yield paused_projects=[].
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
+    pause_reason = 'park-stop: 5 tasks parked in 1h'
+
+    # --- Snapshot with is_paused=True ---
+    paused_snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'is_paused': True,
+        'pause_reason': pause_reason,
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+
+    mock_mcp_paused = AsyncMock(side_effect=[paused_snapshot, []])
+    mock_active = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_paused),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        _, _, _, _, _, paused_projects = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert paused_projects == [{'project': project, 'reason': pause_reason}], (
+        f'Expected paused_projects with one entry; got {paused_projects!r}'
+    )
+
+    # --- Snapshot with is_paused=False (or absent) must yield empty list ---
+    not_paused_snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'is_paused': False,
+        'pause_reason': None,
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+
+    mock_mcp_not_paused = AsyncMock(side_effect=[not_paused_snapshot, []])
+    mock_active2 = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_not_paused),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active2),
+    ):
+        _, _, _, _, _, paused_projects_empty = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert paused_projects_empty == [], (
+        f'Expected empty paused_projects when not paused; got {paused_projects_empty!r}'
+    )
+
+    # --- Snapshot with is_paused absent (pre-upgrade on-disk) must yield empty list ---
+    legacy_snapshot = {
+        'skip_counts': {},
+        'parks': {},
+        'effective_priorities': {},
+        'pin_queue': [],
+        'overrides': {},
+        'current_holders': {},
+        'snapshot_at': '2026-05-15T00:00:00+00:00',
+    }
+
+    mock_mcp_legacy = AsyncMock(side_effect=[legacy_snapshot, []])
+    mock_active3 = AsyncMock(return_value=([], {}, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp_legacy),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active3),
+    ):
+        _, _, _, _, _, paused_projects_legacy = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert paused_projects_legacy == [], (
+        f'Expected empty paused_projects for legacy snapshot; got {paused_projects_legacy!r}'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +959,7 @@ async def test_collect_scheduler_state_enriches_active_tasks_with_project_root(
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        rows, _, _, _, offline_projects = await collect_scheduler_state(dummy_client, config)
+        rows, _, _, _, offline_projects, _ = await collect_scheduler_state(dummy_client, config)
 
     assert offline_projects == []
     assert len(rows) == 2
@@ -1220,7 +1322,7 @@ async def test_collect_scheduler_state_tags_pins_with_project(dummy_client, tmp_
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        _rows, _modules, pin_queue, _events, _offline = \
+        _rows, _modules, pin_queue, _events, _offline, _paused = \
             await collect_scheduler_state(dummy_client, config)
 
     assert len(pin_queue) == 2
@@ -1305,7 +1407,7 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mock_mcp_call),
         patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
     ):
-        _rows, modules, _pins, _events, _offline = \
+        _rows, modules, _pins, _events, _offline, _paused = \
             await collect_scheduler_state(dummy_client, config)
 
     # Two project-scoped entries, NOT one conflated row
