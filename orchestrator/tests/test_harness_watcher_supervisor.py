@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness
+from orchestrator.harness import Harness, _WATCHER_TIMEOUT_GRACE_SECS
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -278,7 +278,10 @@ class TestRunWatcherRotation:
 
     @pytest.mark.asyncio
     async def test_timeout_seconds_includes_grace(self, tmp_path: Path) -> None:
-        """timeout_seconds = rotation_hours * 3600 + grace (> 0)."""
+        """timeout_seconds == rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS exactly.
+
+        Pinned to exact equality so shrinking the grace constant causes this test to fail.
+        """
         from shared.cli_invoke import AgentResult
 
         h = _make_rotation_harness(tmp_path)
@@ -291,10 +294,11 @@ class TestRunWatcherRotation:
         with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
             await h._run_watcher_rotation()
 
-        expected_min = h.config.watcher_rotation_hours * 3600
+        expected = h.config.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS
         assert captured['timeout_seconds'] is not None
-        assert captured['timeout_seconds'] > expected_min, (
-            'timeout_seconds must be > rotation_hours*3600 (grace not added)'
+        assert captured['timeout_seconds'] == expected, (
+            f'timeout_seconds must equal rotation_hours*3600 + _WATCHER_TIMEOUT_GRACE_SECS '
+            f'({expected}); got {captured["timeout_seconds"]}'
         )
 
     @pytest.mark.asyncio
