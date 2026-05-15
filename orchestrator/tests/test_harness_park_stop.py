@@ -517,3 +517,60 @@ class TestHarnessCostCeiling:
         assert total_sum == pytest.approx(45.0), (
             f'Expected 45.0 for watcher_only=False; got {total_sum!r}'
         )
+
+    # ------------------------------------------------------------------
+    # Step 7 — _enforce_cost_ceilings: watcher ceiling trip
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_watcher_trip(self, tmp_path: Path) -> None:
+        """Watcher cost exceeding watcher_daily_cost_ceiling_usd pauses the scheduler.
+
+        Watcher sum > watcher ceiling; total still under orch ceiling.
+        Expects: is_paused=True, reason='cost_ceiling_watcher_exceeded',
+        RunStore.save_scheduler_pause called with that reason.
+        """
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=10.0,   # will be exceeded
+            orch_daily_cost_ceiling_usd=1000.0,    # will NOT be exceeded
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-ceil-0001'
+        store = await _make_cost_store(tmp_path)
+        harness.cost_store = store
+
+        # Seed watcher rows summing to 11.0 (> ceiling of 10.0)
+        for i in range(2):
+            await store.save_invocation(
+                run_id=f'r{i}', task_id=f't{i}', project_id='dark_factory',
+                account_name='acct', model='opus', role='escalation-watcher-auto',
+                cost_usd=5.5, input_tokens=None, output_tokens=None,
+                cache_read_tokens=None, cache_create_tokens=None,
+                duration_ms=100, capped=False,
+                started_at=_iso(timedelta(hours=-(i + 1))),
+                completed_at=_iso(timedelta(hours=-(i + 1))),
+            )
+
+        await harness._enforce_cost_ceilings()
+
+        assert harness.scheduler.is_paused is True, (
+            'Scheduler must be paused when watcher cost exceeds ceiling'
+        )
+        assert harness.scheduler.pause_reason == 'cost_ceiling_watcher_exceeded', (
+            f'Expected cost_ceiling_watcher_exceeded; got {harness.scheduler.pause_reason!r}'
+        )
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        call_args = mock_run_store.save_scheduler_pause.call_args
+        kwargs = {**call_args.kwargs}
+        args = call_args.args or ()
+        all_args = dict(zip(
+            ['project_id', 'reason', 'pause_at_iso', 'set_by_run_id'],
+            args, strict=False,
+        ))
+        all_args.update(kwargs)
+        assert all_args.get('reason') == 'cost_ceiling_watcher_exceeded', (
+            f'Expected reason=cost_ceiling_watcher_exceeded in RunStore call; got {all_args!r}'
+        )
