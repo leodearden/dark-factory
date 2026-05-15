@@ -476,8 +476,7 @@ async def dedup_flags(
                                 consecutive_confirmation_misses,
                             )
                             confirmation_disabled = True
-                    else:
-                        consecutive_confirmation_misses = 0
+                    # counter reset on hit is added in step-4
                     write_succeeded = confirmed_id is not None
                 else:
                     # Breaker tripped: gate on add_memory response directly.

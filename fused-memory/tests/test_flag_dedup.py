@@ -3122,3 +3122,138 @@ class TestConfirmationCircuitBreaker:
         assert len(result) == 3
         for f in result:
             assert 'persisted_from_run' in f, f"Expected HIT-path annotation: {f}"
+
+    @pytest.mark.asyncio
+    async def test_consecutive_misses_reset_on_successful_confirmation(
+        self, monkeypatch, caplog,
+    ):
+        """Counter resets to 0 on any successful confirmation (strictly consecutive).
+
+        Monkeypatches threshold to 3.  Five HIT-path flags with confirmation
+        pattern: miss-miss-HIT-miss-miss.  After the HIT (flag-3) the counter
+        resets to 0, so flag-4+flag-5 only accumulate 2 consecutive misses
+        (< 3 → no trip).
+
+        search side_effect (15 total):
+          [0]  suppression → []
+          [1]  flag-1 pre-write → [prior-1]  (HIT)
+          [2]  flag-1 confirmation miss
+          [3]  flag-1 confirmation retry
+          [4]  flag-2 pre-write → [prior-2]  (HIT)
+          [5]  flag-2 confirmation miss  → counter=2
+          [6]  flag-2 confirmation retry
+          [7]  flag-3 pre-write → [prior-3]  (HIT)
+          [8]  flag-3 confirmation HIT   → counter=0 (reset)
+          [9]  flag-4 pre-write → [prior-4]  (HIT)
+          [10] flag-4 confirmation miss  → counter=1
+          [11] flag-4 confirmation retry
+          [12] flag-5 pre-write → [prior-5]  (HIT)
+          [13] flag-5 confirmation miss  → counter=2 (<3, no trip)
+          [14] flag-5 confirmation retry
+
+        Without counter-reset (step-2's impl only): counter after flag-4 miss
+        would be 3 → breaker trips → flag-5 skips confirmation → search.call_count
+        drops to 13 and a breaker WARNING is emitted.
+
+        Asserts:
+          (a) NO circuit-breaker WARNING emitted.
+          (b) search.call_count == 15 (all 5 flags confirmed; no short-circuit).
+          (c) delete_memory.call_count == 1 (only flag-3: only flag whose confirmed_id
+              is non-None; flags 1,2,4,5 miss confirmation → confirmed_id=None → not deleted).
+
+        Will FAIL until step-4 adds `consecutive_confirmation_misses = 0` on hit.
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as _flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        monkeypatch.setattr(_flag_dedup_mod, '_CONFIRMATION_MISS_THRESHOLD', 3)
+
+        run_id = 'r1'
+
+        def _make_prior(task_id: str) -> MagicMock:
+            p = _make_memory_result({
+                'source': 'stage1_flag_marker', 'task_id': task_id,
+                'flag_type': 'missing_deliverable', 'run_id': 'r0',
+            })
+            p.id = f'prior-{task_id}'
+            return p
+
+        # New marker from the current run for flag-3's confirmation search.
+        new_3 = _make_memory_result({
+            'source': 'stage1_flag_marker', 'task_id': '203',
+            'flag_type': 'missing_deliverable', 'run_id': run_id,
+        })
+        new_3.id = 'new-3'
+
+        priors = {tid: _make_prior(tid) for tid in ['201', '202', '203', '204', '205']}
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=[
+            [],                   # [0]  suppression
+            [priors['201']],      # [1]  flag-1 pre-write HIT
+            [],                   # [2]  flag-1 confirmation miss
+            [],                   # [3]  flag-1 confirmation retry   → counter=1
+            [priors['202']],      # [4]  flag-2 pre-write HIT
+            [],                   # [5]  flag-2 confirmation miss
+            [],                   # [6]  flag-2 confirmation retry   → counter=2
+            [priors['203']],      # [7]  flag-3 pre-write HIT
+            [new_3],              # [8]  flag-3 confirmation HIT     → counter=0 (reset)
+            [priors['204']],      # [9]  flag-4 pre-write HIT
+            [],                   # [10] flag-4 confirmation miss
+            [],                   # [11] flag-4 confirmation retry   → counter=1
+            [priors['205']],      # [12] flag-5 pre-write HIT
+            [],                   # [13] flag-5 confirmation miss
+            [],                   # [14] flag-5 confirmation retry   → counter=2 (<3)
+        ])
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        flags = [
+            {'task_id': int(tid), 'flag_type': 'missing_deliverable', 'description': f'flag-{tid}'}
+            for tid in ['201', '202', '203', '204', '205']
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id=run_id,
+                flags=flags,
+            )
+
+        all_warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+
+        # (a) NO circuit-breaker WARNING (counter resets on flag-3 hit)
+        breaker_warnings = [
+            m for m in all_warnings
+            if any(kw in m.lower() for kw in ('circuit', 'breaker', 'falling back'))
+        ]
+        assert len(breaker_warnings) == 0, (
+            f"Expected NO circuit-breaker WARNING but got: {breaker_warnings}\n"
+            f"All WARNINGs: {all_warnings}"
+        )
+
+        # (b) All 5 confirmations were attempted — no short-circuit
+        assert memory_service.search.call_count == 15, (
+            f"Expected 15 search calls (1 suppression + 5 pre-write + "
+            f"2+2+1+2+2 confirmations), got: {memory_service.search.call_count}"
+        )
+
+        # (c) Only flag-3's prior deleted (confirmed_id non-None only for flag-3)
+        assert memory_service.delete_memory.call_count == 1, (
+            f"Expected 1 deletion (only flag-3's prior) but got "
+            f"{memory_service.delete_memory.call_count}"
+        )
+        deleted_ids = [
+            c.kwargs.get('memory_id') for c in memory_service.delete_memory.call_args_list
+        ]
+        assert deleted_ids == ['prior-203'], (
+            f"Expected only prior-203 deleted, got: {deleted_ids}"
+        )
+
+        # All 5 flags returned, all HIT-path annotated
+        assert len(result) == 5
+        for f in result:
+            assert 'persisted_from_run' in f, f"Expected HIT annotation: {f}"
