@@ -458,7 +458,9 @@ async def dedup_flags(
     async def _confirm_and_track(
         response_memory_ids: list[str],
         miss_warning_msg: str,
-        *msg_args: object,
+        *,
+        tid: str,
+        ftype: str,
     ) -> tuple[str | None, bool]:
         """Shared circuit-breaker helper for HIT and MISS branches.
 
@@ -475,10 +477,14 @@ async def dedup_flags(
         - Emits ``miss_warning_msg`` iff ``bool(response_memory_ids)`` is False.
         - Returns ``(None, bool(response_memory_ids))``.
 
+        ``tid`` and ``ftype`` are explicit keyword-only parameters so this helper
+        is safe to schedule out-of-order (e.g. ``asyncio.gather``); the enclosing-
+        loop variables would otherwise be captured by free-variable lookup,
+        silently picking up the LAST iteration's values under concurrent scheduling.
+
         Mutates nonlocal ``consecutive_confirmation_misses`` and
         ``confirmation_disabled``; captures ``memory_service``, ``project_id``,
-        ``run_id``, and ``logger`` from the enclosing ``dedup_flags`` scope; and
-        reads ``tid``/``ftype`` from the enclosing for-loop's current iteration.
+        ``run_id``, and ``logger`` from the enclosing ``dedup_flags`` scope.
         """
         nonlocal consecutive_confirmation_misses, confirmation_disabled
         if not confirmation_disabled:
@@ -491,7 +497,7 @@ async def dedup_flags(
                 log=logger,
             )
             if c_id is None:
-                logger.warning(miss_warning_msg, *msg_args)
+                logger.warning(miss_warning_msg, tid, ftype)
                 consecutive_confirmation_misses += 1
                 if consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD:
                     logger.warning(
@@ -511,7 +517,7 @@ async def dedup_flags(
         else:
             write_succeeded = bool(response_memory_ids)
             if not write_succeeded:
-                logger.warning(miss_warning_msg, *msg_args)
+                logger.warning(miss_warning_msg, tid, ftype)
             return None, write_succeeded
 
     result: list[dict[str, Any]] = []
@@ -590,7 +596,7 @@ async def dedup_flags(
                     response.memory_ids,
                     'flag_dedup: replacement marker for task %s flag_type %s could not'
                     ' be confirmed findable — skipping prior deletion',
-                    tid, ftype,
+                    tid=tid, ftype=ftype,
                 )
             except Exception as e:
                 logger.warning(
@@ -659,7 +665,7 @@ async def dedup_flags(
                     miss_response.memory_ids,
                     'flag_dedup: MISS marker for task %s flag_type %s could not be'
                     ' confirmed findable — recurring flag will not be detected next cycle',
-                    tid, ftype,
+                    tid=tid, ftype=ftype,
                 )
             except Exception as e:
                 logger.warning('flag_dedup failed for task %s flag_type %s: %s', tid, ftype, e)
