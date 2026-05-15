@@ -15,6 +15,7 @@ Steps covered by this file:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -280,7 +281,7 @@ class TestRunWatcherRotation:
     async def test_timeout_seconds_includes_grace(self, tmp_path: Path) -> None:
         """timeout_seconds == rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS exactly.
 
-        Pinned to exact equality so shrinking the grace constant causes this test to fail.
+        Pinned to exact equality so a refactor that drops the grace addition causes this test to fail.
         """
         from shared.cli_invoke import AgentResult
 
@@ -640,13 +641,15 @@ class TestWatcherSupervisorLoopClassification:
         )
 
     @pytest.mark.asyncio
-    async def test_rotation_exception_classified_unclean(self, tmp_path: Path) -> None:
+    async def test_rotation_exception_classified_unclean(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         """When _run_watcher_rotation raises an exception (not CancelledError),
         the supervisor treats it as an unclean exit: the unclean deque grows and
         backoff sleep is applied.
 
         Coverage backfill (S4a): verifies the existing
         `except Exception: result = None` sentinel path at harness.py:2753-2758.
+        Also asserts logger.exception fires so a silent swallow (bare except: pass)
+        would be caught.
         """
         from shared.cli_invoke import AgentResult
 
@@ -673,6 +676,7 @@ class TestWatcherSupervisorLoopClassification:
 
         h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
 
+        caplog.set_level(logging.ERROR, logger='orchestrator.harness')
         with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
             await h._watcher_supervisor_loop()
 
@@ -684,6 +688,14 @@ class TestWatcherSupervisorLoopClassification:
         # Backoff sleep must be applied (not skipped on the exception path)
         assert len(sleep_durations) >= 1, (
             'Backoff sleep must occur after exception-classified unclean exit'
+        )
+        # logger.exception must have fired — a silent swallow would not emit this record
+        assert any(
+            'rotation raised unexpected exception' in r.message
+            for r in caplog.records
+        ), (
+            'Expected logger.exception with "rotation raised unexpected exception" '
+            f'in orchestrator.harness; records: {[r.message for r in caplog.records]}'
         )
 
 
