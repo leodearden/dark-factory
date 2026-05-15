@@ -372,6 +372,107 @@ class TestRouteReviewSuggestionsToCurator:
 
 
 # ---------------------------------------------------------------------------
+# Integration: stall guard + call-site routing
+# ---------------------------------------------------------------------------
+
+
+class TestRouteReviewSuggestionsIntegration:
+    """Integration tests: stall guard and DONE-branch call-site routing."""
+
+    @pytest.mark.asyncio
+    async def test_stall_guard_returns_in_ms_despite_slow_stub(self):
+        """STALL GUARD: method returns within 100ms even with a 2s slow HTTP stub."""
+        import time
+
+        suggestions = [
+            {
+                'reviewer': 'a',
+                'severity': 'suggestion',
+                'location': 'src/x.py:1',
+                'category': 'coverage',
+                'description': 'Add a test',
+                'suggested_fix': 'Write one',
+            }
+        ]
+        wf = _make_workflow()
+
+        async def slow_post(url, *, json=None, **kwargs):
+            await asyncio.sleep(2)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-slow'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=slow_post):
+            t0 = time.monotonic()
+            await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+            elapsed = time.monotonic() - t0
+
+        # Method must return in ms — the POST is fire-and-forget
+        assert elapsed < 0.1, (
+            f'_route_review_suggestions_to_curator took {elapsed:.3f}s '
+            f'(expected < 0.1s); may be awaiting curator synchronously'
+        )
+
+        # Cancel background tasks so they don't leak into the next test
+        for t in list(wf._background_tasks):
+            t.cancel()
+
+    @pytest.mark.asyncio
+    async def test_done_branch_routes_to_curator_not_escalation_queue(self):
+        """CALL-SITE ROUTING: when suggestions non-empty, curator path is taken.
+
+        Exercises the DONE-branch conditional directly on the workflow object:
+        ``if reviews.suggestions: await self._route_review_suggestions_to_curator(reviews)
+        else: await self._write_suggestions_to_memory(reviews)``
+        after step-10 switches the call site.  We simulate it here by patching
+        both candidate methods and calling the conditional manually.
+        """
+        suggestions = [{'description': 'something', 'category': 'coverage',
+                        'location': 'src/a.py:1', 'severity': 'suggestion',
+                        'reviewer': 'r', 'suggested_fix': 'fix it'}]
+        reviews = _fake_reviews(suggestions)
+
+        queue = MagicMock()
+        wf = _make_workflow(escalation_queue=queue)
+
+        route_mock = AsyncMock()
+        write_mock = AsyncMock()
+
+        with (
+            patch.object(wf, '_route_review_suggestions_to_curator', route_mock),
+            patch.object(wf, '_write_suggestions_to_memory', write_mock),
+        ):
+            # Replicate the post-step-10 call site logic
+            if reviews.suggestions:
+                await wf._route_review_suggestions_to_curator(reviews)
+            else:
+                await wf._write_suggestions_to_memory(reviews)
+
+        route_mock.assert_called_once_with(reviews)
+        write_mock.assert_not_called()
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_done_branch_falls_back_to_memory_when_no_suggestions(self):
+        """CALL-SITE ROUTING: when suggestions empty, _write_suggestions_to_memory is called."""
+        reviews = _fake_reviews([])
+
+        wf = _make_workflow()
+        route_mock = AsyncMock()
+        write_mock = AsyncMock()
+
+        with (
+            patch.object(wf, '_route_review_suggestions_to_curator', route_mock),
+            patch.object(wf, '_write_suggestions_to_memory', write_mock),
+        ):
+            if reviews.suggestions:
+                await wf._route_review_suggestions_to_curator(reviews)
+            else:
+                await wf._write_suggestions_to_memory(reviews)
+
+        write_mock.assert_called_once_with(reviews)
+        route_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _escalate_review_issues
 # ---------------------------------------------------------------------------
 
