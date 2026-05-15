@@ -835,7 +835,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
     """SCHEDULER — task contention, parks, overrides, and event sparklines."""
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    rows, modules, pin_queue, events_by_task, offline_projects = await collect_scheduler_state(
+    rows, modules, pin_queue, events_by_task, offline_projects, paused_projects = await collect_scheduler_state(
         http_client, config
     )
     return JSONResponse(
@@ -845,6 +845,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
             pin_queue=pin_queue,
             events_by_task=events_by_task,
             offline_projects=offline_projects,
+            paused_projects=paused_projects,
             snapshot_at=None,
         )
     )
