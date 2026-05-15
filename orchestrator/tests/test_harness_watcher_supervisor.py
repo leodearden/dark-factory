@@ -1583,6 +1583,109 @@ class TestWatcherMisconfiguredGuard:
             f'Final sleep should saturate at {_WATCHER_MAX_BACKOFF_SECS}s; got {sleep_durations[-1]}'
         )
 
+    @pytest.mark.asyncio
+    async def test_unclean_exit_resets_degenerate_clean_floor(self, tmp_path: Path) -> None:
+        """An unclean exit resets the degenerate-clean floor counter (symmetric reset).
+
+        The clean path already resets ``consecutive_unclean = 0`` on both healthy AND
+        degenerate-clean exits.  By symmetry, the unclean path should reset
+        ``consecutive_degenerate_clean = 0`` so that degenerate-clean bursts are
+        isolated — an interleaved unclean exit breaks any in-progress degen burst.
+
+        Sequence (4 rotations then cancel):
+          [degen-clean(1s), degen-clean(1s), unclean, degen-clean(1s)]
+
+        With watcher_subprocess_restart_backoff_secs=1.0:
+          sleep[0] = 1.0  (consecutive_degenerate=1 → base*2^0)
+          sleep[1] = 2.0  (consecutive_degenerate=2 → base*2^1)
+          sleep[2] = 1.0  (unclean, consecutive_unclean=1 → base*2^0)
+          sleep[3] = 1.0  (KEY: post-unclean degen resets to consecutive_degenerate=1)
+
+        RED: without the reset, sleep[3] == 4.0 (consecutive_degenerate=3 → base*2^2),
+        because the unclean exit does not zero consecutive_degenerate_clean.
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,   # disable misconfig trip
+            'watcher_max_crashloop_restarts': 99,           # disable crashloop trip
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+            'watcher_crashloop_window_secs': 600,
+        })
+
+        # 4 rotations: degen-clean, degen-clean, unclean, degen-clean, then cancel
+        results = [
+            AgentResult(success=True, output=''),    # degen-clean → floor(1.0)
+            AgentResult(success=True, output=''),    # degen-clean → floor(2.0)
+            AgentResult(success=False, output=''),   # unclean     → backoff(1.0) + reset degen counter
+            AgentResult(success=True, output=''),    # degen-clean → floor(1.0) — KEY: reset worked
+        ]
+        idx = 0
+        sleep_durations: list[float] = []
+
+        # Build paired (start, end) timestamps for all 4 rotations + 1 cancel start.
+        # Each clean rotation uses tiny duration (1s < 120s threshold → degenerate).
+        # The unclean rotation also uses a tiny duration (classification is by result,
+        # not duration, so the monotonic values just need to be consumed in pairs).
+        t0 = _time_mod.monotonic()
+        timestamps = []
+        for _ in range(4):  # 4 rotations × 2 monotonic() calls each
+            timestamps.extend([t0, t0 + 1.0])
+        timestamps.append(t0)  # start of the cancelling 5th call
+
+        monotonic_iter = iter(timestamps)
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal idx
+            if idx >= len(results):
+                raise asyncio.CancelledError()
+            r = results[idx]
+            idx += 1
+            return r
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=lambda: next(monotonic_iter)),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        base = h.config.watcher_subprocess_restart_backoff_secs
+        assert len(sleep_durations) == 4, (
+            f'Expected 4 sleeps (degen/degen/unclean/degen); got {sleep_durations}'
+        )
+        # Verify the first two degenerate-clean floors to confirm exponential growth is working
+        assert sleep_durations[0] == pytest.approx(base), (
+            f'sleep[0] should be base={base}s (consecutive_degenerate=1); got {sleep_durations[0]}'
+        )
+        assert sleep_durations[1] == pytest.approx(2 * base), (
+            f'sleep[1] should be 2*base={2*base}s (consecutive_degenerate=2); got {sleep_durations[1]}'
+        )
+        # Verify the unclean backoff
+        assert sleep_durations[2] == pytest.approx(base), (
+            f'sleep[2] should be base={base}s (unclean, consecutive_unclean=1); got {sleep_durations[2]}'
+        )
+        # KEY: the post-unclean degen floor must reset to base (not continue to 4.0)
+        assert sleep_durations[3] == pytest.approx(base), (
+            f'sleep[3] should be base={base}s — unclean exit must reset consecutive_degenerate_clean '
+            f'so the next degenerate burst starts fresh; got {sleep_durations[3]} '
+            f'(without fix: 4.0 = base*2^2, counter not reset)'
+        )
+        # The observable symmetric-reset assertion: post-unclean degen < pre-unclean escalated
+        assert sleep_durations[3] < sleep_durations[1], (
+            f'Post-unclean degenerate floor {sleep_durations[3]} must be < pre-unclean escalated '
+            f'{sleep_durations[1]} — proves consecutive_degenerate_clean was zeroed by unclean exit'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-13: Wiring — __init__ attrs + run() source guard
