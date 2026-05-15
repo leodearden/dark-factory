@@ -55,14 +55,27 @@ the number of outage cycles (transient Mem0 failures) and is expected to
 remain far below 50; the self-healing property still holds over multiple
 cycles.
 
+Post-write confirmation (task-1400)
+------------------------------------
+``add_memory`` returns an id in ``memory_ids``, but Mem0 may store the content
+under a DIFFERENT canonical id.  ``confirm_marker_persisted`` performs a
+read-back search immediately after each write to verify the marker is
+*findable* (not just written).  It returns the CANONICAL id from the matched
+``MemoryResult.id`` — not the unverified ``response.memory_ids[0]``.  On a
+miss it logs a WARNING and retries the search exactly once; returns ``None``
+after a failed retry, never raises.  The HIT-branch prior-deletion gate and
+the MISS-branch no-op WARNING are both driven off this confirmed id.
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
+- ``confirm_marker_persisted(memory_service, *, project_id, task_id, flag_type, run_id, log)``
+  — async, post-write confirmation search; returns canonical id or None.
 - ``filter_suppressed(memory_service, project_id, flags)`` — async, one
   project-scoped Mem0 search; drops suppressed flags before signature dedup.
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
-  ``filter_suppressed`` first then does Mem0 search + write + delete per flag;
-  best-effort (exceptions are logged, not raised).
+  ``filter_suppressed`` first then does Mem0 search + write + confirm + delete
+  per flag; best-effort (exceptions are logged, not raised).
 """
 from __future__ import annotations
 
@@ -99,6 +112,98 @@ class SuppressionPayload(TypedDict):
     content: str
     category: Literal['observations_and_summaries']
     metadata: _SuppressionMetadata
+
+
+async def confirm_marker_persisted(
+    memory_service: Any,
+    *,
+    project_id: str,
+    task_id: str,
+    flag_type: str,
+    run_id: str,
+    log: logging.Logger,
+) -> str | None:
+    """Confirm a just-written ``stage1_flag_marker`` is findable by a subsequent search.
+
+    Addresses the root-cause ID-mismatch bug: ``add_memory`` returns an id in
+    ``memory_ids``, but Mem0 may store the content under a DIFFERENT canonical
+    id.  This helper performs a confirmation search using the same query and
+    kind-filter semantics as the next cycle's pre-write dedup search, so the
+    id it returns is the one the next cycle will actually find.
+
+    Strategy:
+    1. Run a confirmation search via ``find_prior_memories`` with the same query
+       and ``kind={'source':'stage1_flag_marker','flag_type':flag_type}`` as
+       the pre-write dedup search (symmetry guarantee).
+    2. If a match is found, return ``match.id`` (the canonical id).
+    3. On a miss, log a WARNING (task_id + flag_type) and retry the search once.
+    4. Return the retry's first match id if found; otherwise log a final WARNING
+       and return ``None``.
+    5. Never raises — the whole body is wrapped in a best-effort try/except so
+       a non-search error path cannot abort ``dedup_flags``.
+
+    Args:
+        memory_service: Mem0 service with an async ``search`` method.
+        project_id: Project scope forwarded to ``find_prior_memories``.
+        task_id: Task identifier (str-coerced by ``find_prior_memories``).
+        flag_type: Flag type; used in both the ``kind`` filter and the WARNING.
+        run_id: Current run identifier; included in WARNING messages for tracing.
+        log: Logger to use (should be the ``flag_dedup`` module logger so
+             caplog-based tests can capture WARNINGs under the right namespace).
+
+    Returns:
+        The canonical ``MemoryResult.id`` from the confirmation search, or
+        ``None`` if the marker could not be confirmed findable after one retry.
+    """
+    try:
+        query = f'stage1 flag marker task {task_id} type {flag_type}'
+        kind = {'source': 'stage1_flag_marker', 'flag_type': flag_type}
+
+        matches = await find_prior_memories(
+            memory_service,
+            project_id=project_id,
+            task_id=task_id,
+            kind=kind,
+            query=query,
+            categories=['observations_and_summaries'],
+            limit=50,
+            log=log,
+        )
+        if matches:
+            return matches[0].id
+
+        # Miss on first attempt — log WARNING and retry once.
+        log.warning(
+            'confirm_marker_persisted: marker not found after write for task %s'
+            ' flag_type %s run_id %s — retrying search',
+            task_id, flag_type, run_id,
+        )
+        retry_matches = await find_prior_memories(
+            memory_service,
+            project_id=project_id,
+            task_id=task_id,
+            kind=kind,
+            query=query,
+            categories=['observations_and_summaries'],
+            limit=50,
+            log=log,
+        )
+        if retry_matches:
+            return retry_matches[0].id
+
+        # Retry also missed — log final WARNING and return None.
+        log.warning(
+            'confirm_marker_persisted: could not confirm flag marker for task %s'
+            ' flag_type %s run_id %s after retry — marker may be unfindable next cycle',
+            task_id, flag_type, run_id,
+        )
+        return None
+    except Exception as e:
+        log.warning(
+            'confirm_marker_persisted: unexpected error for task %s flag_type %s: %s',
+            task_id, flag_type, e,
+        )
+        return None
 
 
 async def filter_suppressed(
