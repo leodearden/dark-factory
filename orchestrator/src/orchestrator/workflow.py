@@ -1930,10 +1930,11 @@ class TaskWorkflow:
         total += 1
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
-        new_metadata = dict(await self._merge_fresh_metadata(
+        new_metadata = await self._merge_fresh_metadata(
             metadata, log_context='no-plan counter',
-        ))
+        )
         new_metadata['last_no_plan_main_sha'] = current_main_sha
+        # Counters intentionally sourced from in-memory metadata; backend overlay is only for non-counter keys (e.g. memory_hints).
         new_metadata['consecutive_no_plan_failures'] = counter
         new_metadata['total_no_plan_failures'] = total
         self.task['metadata'] = new_metadata
