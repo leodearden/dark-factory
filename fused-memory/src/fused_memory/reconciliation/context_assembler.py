@@ -310,7 +310,7 @@ class ContextAssembler:
                         formatted=_format_memory_result(r),
                     ))
             except Exception:
-                pass
+                logger.warning('memory.search failed for hint query; skipping', exc_info=True)
         return items
 
     async def _ctx_task_deleted(
