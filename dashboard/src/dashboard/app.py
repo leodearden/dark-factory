@@ -592,9 +592,12 @@ async def api_performance(request: Request) -> JSONResponse:
     ))
 
 
-# Cap str(exc) inside the 502 `detail` field to bound response-body
-# leakage when an upstream MCP server returns a large error body via
-# httpx.HTTPStatusError (whose __str__ embeds the full response).  The
+# Cap str(exc) inside the 502 `detail` field to bound arbitrary-length
+# exception message text from any of the caught exception types (e.g. a
+# long ValueError arg, or a long httpx exception message string).  Note:
+# httpx.HTTPStatusError.__str__ (inherited from BaseException) returns
+# only its message arg — NOT the response body — so the cap defends
+# against long message strings rather than response-body leakage.  The
 # WARNING log still records the full untruncated exception text.
 # Intentionally cancel-handler-scoped for now; other proxy handlers can
 # adopt the same constant if they gain an equivalent truncation path.
