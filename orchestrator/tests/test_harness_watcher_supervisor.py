@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness
+from orchestrator.harness import _WATCHER_TIMEOUT_GRACE_SECS, Harness
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -75,6 +75,17 @@ class TestWatcherConfig:
     def test_watcher_backend_default(self, tmp_path: Path) -> None:
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.watcher_backend == 'claude'
+
+    # Misconfigured-clean-exit cost-runaway guard (task 1388)
+    def test_watcher_misconfigured_min_rotation_secs_default(self, tmp_path: Path) -> None:
+        """Clean rotations shorter than this are classified as degenerate (misconfigured)."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.watcher_misconfigured_min_rotation_secs == 120.0
+
+    def test_watcher_max_misconfigured_clean_exits_default(self, tmp_path: Path) -> None:
+        """After this many degenerate clean exits in the window, trip watcher_misconfigured."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.watcher_max_misconfigured_clean_exits == 5
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +278,10 @@ class TestRunWatcherRotation:
 
     @pytest.mark.asyncio
     async def test_timeout_seconds_includes_grace(self, tmp_path: Path) -> None:
-        """timeout_seconds = rotation_hours * 3600 + grace (> 0)."""
+        """timeout_seconds == rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS exactly.
+
+        Pinned to exact equality so shrinking the grace constant causes this test to fail.
+        """
         from shared.cli_invoke import AgentResult
 
         h = _make_rotation_harness(tmp_path)
@@ -280,10 +294,11 @@ class TestRunWatcherRotation:
         with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
             await h._run_watcher_rotation()
 
-        expected_min = h.config.watcher_rotation_hours * 3600
+        expected = h.config.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS
         assert captured['timeout_seconds'] is not None
-        assert captured['timeout_seconds'] > expected_min, (
-            'timeout_seconds must be > rotation_hours*3600 (grace not added)'
+        assert captured['timeout_seconds'] == expected, (
+            f'timeout_seconds must equal rotation_hours*3600 + _WATCHER_TIMEOUT_GRACE_SECS '
+            f'({expected}); got {captured["timeout_seconds"]}'
         )
 
     @pytest.mark.asyncio
@@ -399,6 +414,7 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     h.config = config
     h._watcher_supervisor_task = None
     h._watcher_unclean_exits = deque()
+    h._watcher_degenerate_clean_exits = deque()  # cost-runaway guard (task 1388)
     h.usage_gate = None
     h.cost_store = MagicMock()
     h._run_id = 'run-loop-test-001'
@@ -562,11 +578,15 @@ class TestWatcherSupervisorLoopClassification:
     async def test_clean_exit_resets_backoff(self, tmp_path: Path) -> None:
         """A clean exit after unclean exits resets the backoff to base.
 
-        Sequence unclean→clean→unclean produces 3 sleeps:
-          [unclean_backoff, clean_floor, unclean_base_again]
-        The clean-path floor sleep uses watcher_subprocess_restart_backoff_secs (same
-        value as base backoff), so all three sleeps are equal to base.  The key
-        assertion is that the unclean after the clean reset uses base (not doubled).
+        Sequence [unclean, unclean, clean, unclean] produces 4 sleeps:
+          sleep[0] = base          (consecutive=1)
+          sleep[1] = 2*base        (consecutive=2, escalated)
+          sleep[2] = base          (clean floor)
+          sleep[3] = base          (consecutive reset → 1 again)
+
+        The reset is OBSERVABLE because sleep[1] is escalated (2*base) and
+        sleep[3] drops back to base.  Asserting sleep[3] < sleep[1] proves the
+        consecutive counter was zeroed — a broken reset would yield sleep[3]=4*base.
         """
         from shared.cli_invoke import AgentResult
 
@@ -574,12 +594,14 @@ class TestWatcherSupervisorLoopClassification:
         h.config = h.config.model_copy(update={
             'watcher_max_crashloop_restarts': 99,
             'watcher_crashloop_window_secs': 9999,
+            'watcher_max_misconfigured_clean_exits': 99,  # disable misconfig trip
         })
-        # Sequence: unclean, clean, unclean, then cancel
+        # Sequence: unclean, unclean, clean, unclean, then cancel
         results = [
-            AgentResult(success=False, output=''),   # unclean → backoff(base)
-            AgentResult(success=True, output=''),    # clean   → reset + floor(base)
-            AgentResult(success=False, output=''),   # unclean → base backoff again
+            AgentResult(success=False, output=''),   # unclean → backoff(base, consecutive=1)
+            AgentResult(success=False, output=''),   # unclean → backoff(2*base, consecutive=2)
+            AgentResult(success=True, output=''),    # clean   → reset consecutive + floor(base)
+            AgentResult(success=False, output=''),   # unclean → base backoff (consecutive reset to 1)
         ]
         idx = 0
         sleep_durations: list[float] = []
@@ -601,14 +623,67 @@ class TestWatcherSupervisorLoopClassification:
             await h._watcher_supervisor_loop()
 
         base = h.config.watcher_subprocess_restart_backoff_secs
-        # 3 sleeps: unclean backoff | clean floor | unclean base-reset
-        assert len(sleep_durations) == 3, (
-            f'Expected 3 sleeps (unclean/clean-floor/unclean); got {sleep_durations}'
+        # 4 sleeps: unclean | escalated-unclean | clean-floor | reset-unclean
+        assert len(sleep_durations) == 4, (
+            f'Expected 4 sleeps (u/u/clean-floor/u); got {sleep_durations}'
         )
-        # The clean-path floor and the unclean base happen to be the same value.
-        # The critical assertion: post-reset unclean uses base (not doubled).
-        assert sleep_durations[2] == pytest.approx(base), (
-            f'Post-reset backoff should be base {base}s; got {sleep_durations[2]}'
+        assert sleep_durations[1] == pytest.approx(2 * base), (
+            f'Pre-clean backoff should be 2*base ({2*base}s); got {sleep_durations[1]}'
+        )
+        assert sleep_durations[3] == pytest.approx(base), (
+            f'Post-reset backoff should be base ({base}s); got {sleep_durations[3]}'
+        )
+        # This is the key observable assertion: reset worked iff post-clean < pre-clean.
+        assert sleep_durations[3] < sleep_durations[1], (
+            f'Post-reset backoff {sleep_durations[3]} must be < pre-clean escalated '
+            f'backoff {sleep_durations[1]} (proves consecutive counter was zeroed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_rotation_exception_classified_unclean(self, tmp_path: Path) -> None:
+        """When _run_watcher_rotation raises an exception (not CancelledError),
+        the supervisor treats it as an unclean exit: the unclean deque grows and
+        backoff sleep is applied.
+
+        Coverage backfill (S4a): verifies the existing
+        `except Exception: result = None` sentinel path at harness.py:2753-2758.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': 99,    # disable crashloop trip
+            'watcher_max_misconfigured_clean_exits': 99,  # disable misconfig trip
+            'watcher_crashloop_window_secs': 9999,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+        })
+
+        rotation_calls = 0
+        sleep_durations: list[float] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls == 1:
+                raise RuntimeError('boom')   # exception path under test
+            raise asyncio.CancelledError()   # exit on second call
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with patch('orchestrator.harness.asyncio.sleep', fake_sleep), pytest.raises(asyncio.CancelledError):
+            await h._watcher_supervisor_loop()
+
+        # Raised exception must be classified as unclean: deque grows
+        assert len(h._watcher_unclean_exits) == 1, (
+            f'RuntimeError from rotation should be classified unclean; '
+            f'_watcher_unclean_exits has {len(h._watcher_unclean_exits)} entries'
+        )
+        # Backoff sleep must be applied (not skipped on the exception path)
+        assert len(sleep_durations) >= 1, (
+            'Backoff sleep must occur after exception-classified unclean exit'
         )
 
 
@@ -726,11 +801,13 @@ class TestWatcherCrashloopTrip:
         # Monotonic clock advances to put first exits outside the window.
         # Sequence: 2 old exits (at t=0), then clock jumps past window, then
         # (max_restarts - 1) exits (insufficient alone to trip), then cancel.
+        # Each loop iteration makes 2 monotonic calls (start + end); sequences
+        # are [start1, end1, start2, end2, ...] pairs.
         old_time = _time_mod.monotonic()
         new_time = old_time + window + 1  # beyond the window
         time_sequence = iter(
-            [old_time, old_time]            # first 2 unclean exits: old
-            + [new_time] * (max_restarts)   # subsequent exits: recent
+            [old_time] * 4              # 2 old iterations × (start, end) each
+            + [new_time] * (max_restarts * 2)   # subsequent iterations × 2 calls
         )
 
         async def fake_rotation() -> AgentResult:
@@ -762,6 +839,409 @@ class TestWatcherCrashloopTrip:
 
         assert pause_calls == [], (
             'Old exits outside window should be evicted; pause_scheduler must NOT trip'
+        )
+
+    @pytest.mark.asyncio
+    async def test_pause_scheduler_failure_still_stops_supervisor(
+        self, tmp_path: Path
+    ) -> None:
+        """When pause_scheduler raises on a crashloop trip, the supervisor must
+        still stop (not silently continue).
+
+        Regression test (S2/S4b): the broad try/except around the unclean path
+        previously swallowed pause_scheduler failures, causing the loop to restart
+        the agent indefinitely instead of stopping.
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_restarts = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_crashloop_restarts': max_restarts,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            # Guard: cancel after max_restarts * 2 iterations to prevent an infinite
+            # loop when the S2 defect is present (makes RED state fail fast).
+            if rotation_calls > max_restarts * 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=False, output='')
+
+        async def raising_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+            raise RuntimeError('pause failed')
+
+        h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
+        h.pause_scheduler = raising_pause_scheduler          # type: ignore[method-assign]
+
+        stable_time = _time_mod.monotonic()
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', return_value=stable_time),
+        ):
+            # Supervisor must return even though pause_scheduler raises.
+            # In RED state: CancelledError fires at max_restarts*2+1 rotations, and
+            # rotation_calls != max_restarts assertion reveals the defect.
+            await h._watcher_supervisor_loop()
+
+        # pause_scheduler was called exactly once with the crashloop reason
+        assert pause_calls == ['watcher_crashloop'], (
+            f'Expected pause_scheduler("watcher_crashloop") once; got {pause_calls}'
+        )
+        # No 4th rotation after the failing trip (supervisor stopped)
+        assert rotation_calls == max_restarts, (
+            f'Expected exactly {max_restarts} rotations; got {rotation_calls} '
+            f'(supervisor did not stop after failing pause)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-1388: Misconfigured-clean-exit cost-runaway guard
+# ---------------------------------------------------------------------------
+
+class TestWatcherMisconfiguredGuard:
+    """Fast degenerate-clean exit guard: trips watcher_misconfigured after N fast-clean exits.
+
+    A 'degenerate clean' exit is one where success=True but the rotation
+    completed in less than watcher_misconfigured_min_rotation_secs seconds
+    (indicating an empty queue, SKILL.md drift, or misconfigured env).
+    """
+
+    @pytest.mark.asyncio
+    async def test_fast_clean_exit_appends_degenerate_deque(self, tmp_path: Path) -> None:
+        """A fast clean exit (duration < min_rotation_secs) appends to _watcher_degenerate_clean_exits."""
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,  # disable trip during this test
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        # Rotation duration 1.0s — well under default 120s threshold
+        t0 = _time_mod.monotonic()
+        time_seq = iter([t0, t0 + 1.0])  # start, end for one rotation
+
+        def fake_monotonic() -> float:
+            try:
+                return next(time_seq)
+            except StopIteration:
+                return t0 + 1.0
+
+        rotation_calls = 0
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert len(h._watcher_degenerate_clean_exits) == 1, (
+            f'Expected 1 degenerate-clean entry after fast rotation; '
+            f'got {len(h._watcher_degenerate_clean_exits)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_slow_clean_exit_does_not_append(self, tmp_path: Path) -> None:
+        """A slow clean exit (duration >= min_rotation_secs) does NOT append to the degenerate deque."""
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_misconfigured_clean_exits': 99,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+        })
+
+        # Rotation duration 200s — above the 120s threshold
+        t0 = _time_mod.monotonic()
+        time_seq = iter([t0, t0 + 200.0])  # start, end for one rotation
+
+        def fake_monotonic() -> float:
+            try:
+                return next(time_seq)
+            except StopIteration:
+                return t0 + 200.0
+
+        rotation_calls = 0
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls >= 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert len(h._watcher_degenerate_clean_exits) == 0, (
+            f'Expected 0 degenerate-clean entries for slow rotation; '
+            f'got {len(h._watcher_degenerate_clean_exits)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_misconfigured_trips_pause_scheduler(self, tmp_path: Path) -> None:
+        """After watcher_max_misconfigured_clean_exits fast-clean exits in the window,
+        pause_scheduler is called once with 'watcher_misconfigured' and the loop exits."""
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_misconfig = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': max_misconfig,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        # All rotations are fast-clean (duration 1s < 120s).
+        # Guard: cancel after max_misconfig * 2 rotations to prevent an infinite loop
+        # when the threshold trip is not yet implemented (makes RED state fail fast).
+        t0 = _time_mod.monotonic()
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > max_misconfig * 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
+        h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
+
+        # Each iteration: start=t0, end=t0+1.0 (duration 1s < 120s threshold)
+        call_count = 0
+
+        def fake_monotonic() -> float:
+            nonlocal call_count
+            call_count += 1
+            # start call (odd): t0; end call (even): t0 + 1.0
+            if call_count % 2 == 1:
+                return t0
+            return t0 + 1.0
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+        ):
+            # Loop should exit after max_misconfig fast-clean exits (no CancelledError)
+            await h._watcher_supervisor_loop()
+
+        assert pause_calls == ['watcher_misconfigured'], (
+            f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
+        )
+        assert rotation_calls == max_misconfig, (
+            f'Expected exactly {max_misconfig} rotations before trip; got {rotation_calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_old_degenerate_exits_outside_window_are_evicted(self, tmp_path: Path) -> None:
+        """Degenerate-clean exits older than watcher_crashloop_window_secs are evicted
+        so they do not contribute to the misconfigured count.
+
+        Sequence: 2 old fast-clean exits, time-jump past window, 2 more new fast-clean
+        exits (total in-window = 2 < max_misconfig=3) → no trip, loop cancels normally.
+
+        Uses a paired-values iterator (start, end per iteration) so BOTH monotonic
+        calls within a single rotation use matched timestamps — ensures iteration 2
+        also has a short duration and is classified as degenerate (the previous
+        impl used iter_count tracking which made iteration 2's duration ≈ window+2s,
+        so only 1 old entry was actually added instead of the intended 2).
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_misconfig = 3
+        window = 600
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': max_misconfig,
+            'watcher_crashloop_window_secs': window,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+        })
+
+        pause_calls: list[str] = []
+        rotation_calls = 0
+
+        # Drive 2 fast-clean exits at old_time, then jump past window,
+        # then drive 2 more fast-clean exits (< max_misconfig=3), then cancel.
+        old_time = _time_mod.monotonic()
+        new_time = old_time + window + 1  # beyond the window
+
+        # Paired iterator: (start, end) per iteration — both calls within one
+        # rotation use matched timestamps so duration is always 1s (< 120s threshold).
+        # iter 1: old start, old end
+        # iter 2: old start, old end
+        # iter 3: new start, new end  (old entries evicted here)
+        # iter 4: new start, new end
+        # iter 5: new start only (CancelledError raised before end)
+        monotonic_sequence = iter(
+            [old_time, old_time + 1.0,   # iter 1 — old fast-clean
+             old_time, old_time + 1.0,   # iter 2 — old fast-clean
+             new_time, new_time + 1.0,   # iter 3 — new fast-clean (old entries evicted)
+             new_time, new_time + 1.0,   # iter 4 — new fast-clean
+             new_time]                   # iter 5 start (before CancelledError)
+        )
+
+        def fake_monotonic() -> float:
+            return next(monotonic_sequence)
+
+        # Track deque size at the start of each rotation to verify that 2 old
+        # entries were actually in the deque before the time jump.
+        deque_snapshots: dict[int, int] = {}
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            # Snapshot is taken BEFORE this iteration's deque update, so
+            # snapshot[3] == 2 proves two old entries existed before eviction.
+            deque_snapshots[rotation_calls] = len(h._watcher_degenerate_clean_exits)
+            if rotation_calls > max_misconfig + 1:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        h._run_watcher_rotation = fake_rotation          # type: ignore[method-assign]
+        h.pause_scheduler = fake_pause_scheduler         # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            # Loop should cancel (not trip) because old entries are evicted
+            await h._watcher_supervisor_loop()
+
+        assert pause_calls == [], (
+            'Old degenerate exits outside window should be evicted; '
+            'pause_scheduler must NOT trip'
+        )
+        # Verify that 2 old entries were genuinely added before the time jump
+        # (snapshot taken at start of iter 3, before iter 3's deque update).
+        assert deque_snapshots.get(3) == 2, (
+            f'Expected 2 old entries in deque at start of iteration 3 '
+            f'(before time-jump eviction); got {deque_snapshots.get(3)}'
+        )
+        # After eviction at iter 3 and iter 4: only 2 new entries remain.
+        assert len(h._watcher_degenerate_clean_exits) == 2, (
+            f'Expected 2 in-window entries after old entries evicted; '
+            f'got {len(h._watcher_degenerate_clean_exits)}'
+        )
+        # All remaining entries must be from new_time (old_time entries evicted).
+        assert all(t >= new_time for t in h._watcher_degenerate_clean_exits), (
+            'All remaining deque entries must use new_time (old entries evicted)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_misconfigured_pause_scheduler_failure_still_stops_supervisor(
+        self, tmp_path: Path
+    ) -> None:
+        """When pause_scheduler raises on a misconfigured trip, the supervisor must
+        still stop (not silently continue).
+
+        Regression test (symmetry with S2/crashloop): the defensive try/except
+        added in step-6 around pause_scheduler('watcher_misconfigured') must
+        return regardless of whether pause_scheduler itself raises.
+        """
+        import time as _time_mod
+
+        from shared.cli_invoke import AgentResult
+
+        max_misconfig = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': max_misconfig,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_subprocess_restart_backoff_secs': 0.0,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+        })
+
+        rotation_calls = 0
+        pause_calls: list[str] = []
+
+        # Guard: cancel after max_misconfig * 2 iterations to prevent an infinite
+        # loop when the defensive wrapper is absent (makes failure fast).
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            if rotation_calls > max_misconfig * 2:
+                raise asyncio.CancelledError()
+            return AgentResult(success=True, output='', timed_out=False)
+
+        async def raising_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+            raise RuntimeError('pause failed')
+
+        h._run_watcher_rotation = fake_rotation              # type: ignore[method-assign]
+        h.pause_scheduler = raising_pause_scheduler          # type: ignore[method-assign]
+
+        t0 = _time_mod.monotonic()
+        call_count = 0
+
+        def fake_monotonic() -> float:
+            nonlocal call_count
+            call_count += 1
+            # odd call = start (t0), even call = end (t0 + 1.0s < 120s threshold)
+            return t0 if call_count % 2 == 1 else t0 + 1.0
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+        ):
+            # Supervisor must return even though pause_scheduler raises.
+            await h._watcher_supervisor_loop()
+
+        assert pause_calls == ['watcher_misconfigured'], (
+            f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
+        )
+        assert rotation_calls == max_misconfig, (
+            f'Expected exactly {max_misconfig} rotations; got {rotation_calls} '
+            f'(supervisor did not stop after failing pause)'
         )
 
 
@@ -802,6 +1282,15 @@ class TestWatcherSupervisorWiring:
         h = _make_real_harness(tmp_path)
         assert isinstance(h._watcher_unclean_exits, deque)
         assert len(h._watcher_unclean_exits) == 0
+
+    def test_init_sets_watcher_degenerate_clean_exits_empty_deque(self, tmp_path: Path) -> None:
+        """Real Harness.__init__ sets _watcher_degenerate_clean_exits to an empty deque.
+
+        This deque is the cost-runaway guard for fast-clean exits (task 1388).
+        """
+        h = _make_real_harness(tmp_path)
+        assert isinstance(h._watcher_degenerate_clean_exits, deque)
+        assert len(h._watcher_degenerate_clean_exits) == 0
 
     def test_start_and_stop_are_bound_methods(self, tmp_path: Path) -> None:
         """_start_watcher_supervisor and _stop_watcher_supervisor are callable."""

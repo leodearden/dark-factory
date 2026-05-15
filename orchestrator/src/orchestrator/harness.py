@@ -348,6 +348,11 @@ class Harness:
         # Monotonic timestamps of unclean watcher exits; used by the crashloop guard
         # to count failures within watcher_crashloop_window_secs.
         self._watcher_unclean_exits: deque[float] = deque()
+        # Monotonic timestamps of degenerate-clean watcher exits (duration below
+        # watcher_misconfigured_min_rotation_secs); used by the cost-runaway guard
+        # (task 1388).  Separate from _watcher_unclean_exits so the trip reason
+        # ('watcher_misconfigured' vs 'watcher_crashloop') is unambiguous.
+        self._watcher_degenerate_clean_exits: deque[float] = deque()
 
         # Background sweep: periodic re-run of the startup
         # ``_reconcile_stranded_in_progress`` pass during a long run, so
@@ -2746,6 +2751,7 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         consecutive_unclean: int = 0
         while True:
+            start = time.monotonic()
             try:
                 result = await self._run_watcher_rotation()
             except asyncio.CancelledError:
@@ -2756,6 +2762,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
                 # Treat as unclean: backoff below
                 result = None  # sentinel for unclean path
+            end = time.monotonic()  # captured after rotation; reused as 'now' below
 
             clean = (
                 result is not None
@@ -2787,37 +2794,46 @@ Output JSON matching the schema. Every task must appear in the output.
                 # pattern.  watcher_subprocess_restart_backoff_secs (default 30s)
                 # doubles as the clean-restart floor.
                 consecutive_unclean = 0
+                # Cost-runaway guard: track degenerate-clean exits (task 1388).
+                # A healthy rotation takes at least watcher_misconfigured_min_rotation_secs
+                # seconds; one that exits faster is degenerate (empty queue, SKILL.md
+                # drift, misconfigured env).
+                duration = end - start
+                # _check_watcher_guard: append+evict+trip, fully defensive.
+                # Only called when duration is below the healthy-rotation floor;
+                # reuses watcher_crashloop_window_secs as the burst-detection
+                # window — semantically identical for both failure modes.
+                if (
+                    duration < self.config.watcher_misconfigured_min_rotation_secs
+                    and await self._check_watcher_guard(
+                        self._watcher_degenerate_clean_exits,
+                        'watcher_misconfigured',
+                        self.config.watcher_max_misconfigured_clean_exits,
+                        self.config.watcher_crashloop_window_secs,
+                        end,
+                    )
+                ):
+                    return
                 logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
                 await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
 
             # --- Unclean exit path ---
-            # Wrapped in try/except so an unexpected error (e.g. pause_scheduler
-            # transiently raising) is logged and the loop degrades gracefully
-            # rather than dying unobserved with the scheduler still running.
+            consecutive_unclean += 1
+            # _check_watcher_guard handles append+evict+trip defensively.  Called
+            # outside any broad try/except so pause_scheduler failure cannot be
+            # swallowed by the backoff-degradation handler (S2 defect prevention).
+            if await self._check_watcher_guard(
+                self._watcher_unclean_exits,
+                'watcher_crashloop',
+                self.config.watcher_max_crashloop_restarts,
+                self.config.watcher_crashloop_window_secs,
+                end,
+            ):
+                return
+
+            # No trip — apply exponential backoff.
             try:
-                now = time.monotonic()
-                self._watcher_unclean_exits.append(now)
-                consecutive_unclean += 1
-
-                # Crashloop guard: evict entries older than the window, then check.
-                window = self.config.watcher_crashloop_window_secs
-                while (
-                    self._watcher_unclean_exits
-                    and self._watcher_unclean_exits[0] < now - window
-                ):
-                    self._watcher_unclean_exits.popleft()
-
-                if len(self._watcher_unclean_exits) >= self.config.watcher_max_crashloop_restarts:
-                    logger.error(
-                        'Escalation-watcher-auto crashloop detected '
-                        '(%d unclean exits in %ds window) — pausing scheduler',
-                        len(self._watcher_unclean_exits),
-                        window,
-                    )
-                    await self.pause_scheduler('watcher_crashloop')
-                    return  # stop supervising
-
                 backoff = min(
                     self.config.watcher_subprocess_restart_backoff_secs
                     * (2 ** (consecutive_unclean - 1)),
@@ -2835,7 +2851,7 @@ Output JSON matching the schema. Every task must appear in the output.
             except Exception:
                 logger.exception(
                     'Escalation-watcher-auto supervisor: unexpected error in '
-                    'unclean-path bookkeeping — sleeping base backoff to avoid '
+                    'unclean-path backoff — sleeping base backoff to avoid '
                     'silent supervisor death'
                 )
                 # Degrade gracefully: sleep base backoff then continue the loop.
@@ -2846,6 +2862,56 @@ Output JSON matching the schema. Every task must appear in the output.
                     )
                 except asyncio.CancelledError:
                     raise
+
+    async def _check_watcher_guard(
+        self,
+        exits_deque: deque[float],
+        reason: str,
+        max_count: int,
+        window_secs: float,
+        now: float,
+    ) -> bool:
+        """Append *now* to *exits_deque*, evict stale entries, trip if threshold met.
+
+        Returns True  → guard tripped; caller should stop the supervisor.
+        Returns False → threshold not reached or bookkeeping error; caller continues.
+
+        Bookkeeping errors (deque ops) are logged and suppressed so a rare
+        collection anomaly cannot silently kill the supervisor.
+
+        pause_scheduler failure is also caught and logged, but the method
+        still returns True so a broken pause_scheduler cannot defeat the stop.
+        CancelledError is always re-raised (clean shutdown signal).
+        """
+        try:
+            exits_deque.append(now)
+            while exits_deque and exits_deque[0] < now - window_secs:
+                exits_deque.popleft()
+        except Exception:
+            logger.exception(
+                'watcher %s guard: bookkeeping error — skipping trip check',
+                reason,
+            )
+            return False
+        if len(exits_deque) < max_count:
+            return False
+        logger.error(
+            'Escalation-watcher-auto %s guard tripped '
+            '(%d exits in %ds window) — pausing scheduler',
+            reason,
+            len(exits_deque),
+            window_secs,
+        )
+        try:
+            await self.pause_scheduler(reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                'pause_scheduler raised on %s trip; stopping supervisor anyway',
+                reason,
+            )
+        return True  # always stop, even if pause_scheduler raised
 
     async def _scan_for_terminal_active_tasks(self) -> int:
         """Single pass: cancel any active workflow whose task is terminal.
