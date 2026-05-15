@@ -312,6 +312,26 @@ class TestModuleConfigDiscovery:
                     f"Excluded dir {excluded!r} leaked into results as key {key!r}"
                 )
 
+    def test_discover_handles_self_referencing_symlink_loop(self, tmp_path: Path):
+        """_discover_module_configs completes without infinite recursion when a symlink loop exists.
+
+        Regression guard: pins the followlinks=False behavior so a future refactor
+        that flips it is caught immediately.
+        """
+        import os as _os
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest sub/'}))
+        # Create a self-referencing symlink inside sub -> sub
+        try:
+            _os.symlink(str(sub), str(sub / 'loop'))
+        except OSError:
+            pytest.skip('Cannot create symlinks on this platform')
+        # With followlinks=False this must finish quickly and return exactly {'sub': ...}
+        configs = _discover_module_configs(tmp_path)
+        assert list(configs.keys()) == ['sub']
+        assert configs['sub'].test_command == 'pytest sub/'
+
 
 class TestLayeredConfig:
     """Tests for deep merge of package defaults + project config."""
