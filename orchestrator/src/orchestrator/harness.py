@@ -2990,6 +2990,10 @@ Output JSON matching the schema. Every task must appear in the output.
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
         # Increment before the event-set logic so the counter reflects every submission.
+        # Best-effort observability counter — incremented here from arbitrary callbacks
+        # without a lock.  _maybe_write_digest snapshots it once at entry so concurrent
+        # callbacks cannot cause a double-skip between the threshold check and the advance.
+        # May drift by a small constant under concurrency; not a correctness gate.
         self._escalation_event_count += 1  # task 1327 AFK hardening
         event = self._escalation_events.get(escalation.task_id)
         if event:
@@ -2999,6 +3003,8 @@ Output JSON matching the schema. Every task must appear in the output.
         """Callback when an escalation is resolved — wake the waiting workflow."""
         # Increment for any status transition (resolved or dismissed) — both are
         # escalation events that the EWA digest needs to count.
+        # Best-effort observability counter — same concurrency caveat as _on_escalation
+        # above; _maybe_write_digest snapshots it at entry to avoid double-skip drift.
         self._escalation_event_count += 1  # task 1327 AFK hardening
         event = self._escalation_events.get(escalation.task_id)
         if event:
@@ -3207,22 +3213,34 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Algorithm:
         1. Early-return when digest_enabled=False.
-        2. Early-return when (escalation_event_count - last_count) < N.
-        3. Snapshot escalation delta.
-        4. Compute window (last window_end → now).
-        5. Aggregate escalation stats (fail-open).
-        6. Count done tasks in EventStore (fail-open).
+        2. Snapshot _escalation_event_count (best-effort; see note below).
+        3. Early-return when (snapshot - last_count) < N.
+        4. Snapshot escalation delta.
+        5. Compute window (last window_end → now).
+        6. Aggregate escalation stats (fail-open).
+        7. Count done tasks in EventStore (fail-open).
            done_count from EventStore is the single source of truth for both
            the rendered digest figure and the update_ewa input — ensuring the
            operator sees exactly the number that drove the EWA decision.
            (Task 1421: removed the scheduler.done_transitions_total delta path.)
-        7. Query cost stats from CostStore (fail-open).
-        8. Read parked-task counts from Scheduler state.
-        9. Update EWA using EventStore done_count.
-        10. Compute trip flag and anomaly flags.
-        11. Write digest file (fail-open via write_digest_entry).
-        12. Advance counters/state.
-        13. If tripped and not already paused, call pause_scheduler (post-write).
+        8. Query cost stats from CostStore (fail-open).
+        9. Read parked-task counts from Scheduler state.
+        10. Update EWA using EventStore done_count.
+        11. Compute trip flag and anomaly flags.
+        12. Write digest file (fail-open via write_digest_entry).
+        13. Advance counters/state using the snapshot from step 2 (not the
+            live counter), so that concurrent callbacks firing inside this
+            function do not silently skip counted events.
+        14. If tripped and not already paused, call pause_scheduler (post-write).
+
+        Note on _escalation_event_count: incremented from _on_escalation and
+        _on_escalation_resolved callbacks without a lock (Python GIL prevents
+        torn writes, but the logical sequence here is still non-atomic).
+        Snapshotting once at step 2 makes the threshold check and the advance
+        consistent — concurrent callbacks cannot cause a "double-skip" where
+        the advance overshoots the events that triggered this digest.  The
+        counter is best-effort observability; a small drift under concurrency
+        is acceptable.
 
         Task 1327 AFK hardening.
         """
@@ -3231,12 +3249,17 @@ Output JSON matching the schema. Every task must appear in the output.
             if not self.config.digest_enabled:
                 return
 
-            # (2) Early-return if not enough new events.
-            diff = self._escalation_event_count - self._last_digest_event_count
+            # (2) Snapshot _escalation_event_count so the threshold check (3)
+            # and the advance (13) are consistent even if a concurrent callback
+            # increments the live counter between those two reads.
+            event_count_snapshot = self._escalation_event_count
+
+            # (3) Early-return if not enough new events.
+            diff = event_count_snapshot - self._last_digest_event_count
             if diff < self.config.digest_every_n_escalations:
                 return
 
-            # (3) Snapshot escalation delta.
+            # (4) Snapshot escalation delta.
             escalations_in_step = diff
 
             # (4) Compute window timestamps.
@@ -3321,9 +3344,12 @@ Output JSON matching the schema. Every task must appear in the output.
             # Write the digest file (never raises — fail-open).
             digest_mod.write_digest_entry(digest_dir, inputs)
 
-            # (12) Advance EWA state and counters.
+            # (13) Advance EWA state and counters.
+            # Use event_count_snapshot (not the live self._escalation_event_count)
+            # so that concurrent callbacks that fired after the snapshot are not
+            # silently skipped — they will be counted in the next digest step.
             self._ewa_value = new_ewa
-            self._last_digest_event_count = self._escalation_event_count
+            self._last_digest_event_count = event_count_snapshot
             self._last_digest_window_end_iso = window_end
 
             # (13) EWA trip: pause scheduler AFTER the digest is written so the
