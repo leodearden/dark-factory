@@ -10,6 +10,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from _orch_helpers import pydantic_spec
+from orchestrator.config import OrchestratorConfig
 from escalation.models import Escalation
 from shared.usage_gate import InvokeSlot
 
@@ -65,7 +68,7 @@ def worktree(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def mock_config():
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = Path('/tmp/fake-project')
     config.models.steward = 'opus'
     config.budgets.steward = 5.0

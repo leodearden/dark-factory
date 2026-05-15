@@ -14,13 +14,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from shared.cli_invoke import AllAccountsCappedException
 
+from _orch_helpers import pydantic_spec
+from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.verify import VerifyResult
 
 
 def _make_checkpoint() -> ReviewCheckpoint:
     """Construct a minimal ReviewCheckpoint with mocked config."""
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     # Use /tmp as project_root — avoids the '/tmp/pytest-' guard in _run_review
     # without needing the directory to actually exist (since run_full_verification
     # is mocked out in these tests).

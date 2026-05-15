@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from _orch_helpers import pydantic_spec
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -4205,7 +4206,9 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         assignment.task = {'id': '42', 'title': 'T', 'description': 'desc'}
         assignment.modules = []
 
-        wf_config = MagicMock()
+        _spec = pydantic_spec(OrchestratorConfig)
+        _spec.for_module = None  # custom method not in model_fields; expose to spec_set
+        wf_config = MagicMock(spec_set=_spec)
         wf_config.fused_memory.project_id = 'test'
         wf_config.fused_memory.url = 'http://localhost'
         wf_config.max_review_cycles = 2
@@ -4285,7 +4288,9 @@ class TestEscalationServerUsesEnqueueHelper:
         event_store = EventStore(db_path=tmp_path / 'test.db', run_id='test')
 
         # Stub orch_config with _module_configs attribute
-        stub_config = MagicMock()
+        _spec2 = pydantic_spec(OrchestratorConfig)
+        _spec2._module_configs = None  # workflow attr read via orch_config in create_server
+        stub_config = MagicMock(spec_set=_spec2)
         stub_config._module_configs = {}
 
         # Mock resolves the future so the tool doesn't hang
