@@ -60,11 +60,11 @@ Post-write confirmation (task-1400, corrected in task-1400 step-15)
 ``add_memory`` returns an id in ``memory_ids``, but Mem0 may store the content
 under a DIFFERENT canonical id.  ``confirm_marker_persisted`` performs a
 read-back search immediately after each write to verify the marker is
-*findable* (not just written).  It returns the CANONICAL id from the matched
-``MemoryResult.id`` — not the unverified ``response.memory_ids[0]``.  On a
-miss it logs a WARNING and retries the search exactly once; returns ``None``
-after a failed retry, never raises.  The HIT-branch prior-deletion gate and
-the MISS-branch no-op WARNING are both driven off this confirmed id.
+*findable* (not just written).  It returns ``True`` iff at least one matching
+marker is findable; ``False`` after one retry-miss; never raises.  On a miss
+it logs a WARNING and retries the search exactly once; returns ``False``
+after a failed retry.  The HIT-branch prior-deletion gate and the MISS-branch
+no-op WARNING are both driven off this bool.
 
 Confirmation kind filter is intentionally ASYMMETRIC with the pre-write dedup
 search (design decision #6): it additionally includes ``run_id`` (the current
@@ -84,8 +84,8 @@ compounding pressure on the already-failing backend.  To limit this, ``dedup_fla
 maintains a **per-invocation** circuit-breaker:
 
 - ``consecutive_confirmation_misses`` counts strictly-consecutive ``confirm_marker_persisted``
-  misses (``None`` return).  The counter resets to 0 on any successful confirmation
-  (non-``None`` id) so sporadic misses during otherwise-healthy operation do **not**
+  misses (``False`` return).  The counter resets to 0 on any successful confirmation
+  (``True`` return) so sporadic misses during otherwise-healthy operation do **not**
   accumulate toward the threshold.
 - ``confirmation_disabled`` starts ``False`` and is set ``True`` the first time
   ``consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD``.
@@ -128,7 +128,7 @@ Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
 - ``confirm_marker_persisted(memory_service, *, project_id, task_id, flag_type, run_id, log)``
-  — async, post-write confirmation search; returns canonical id or None.
+  — async, post-write confirmation search; returns True if findable, False otherwise.
 - ``filter_suppressed(memory_service, project_id, flags)`` — async, one
   project-scoped Mem0 search; drops suppressed flags before signature dedup.
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
@@ -218,13 +218,12 @@ async def confirm_marker_persisted(
     flag_type: str,
     run_id: str,
     log: logging.Logger,
-) -> str | None:
+) -> bool:
     """Confirm a just-written ``stage1_flag_marker`` is findable by a subsequent search.
 
-    Addresses the root-cause ID-mismatch bug: ``add_memory`` returns an id in
-    ``memory_ids``, but Mem0 may store the content under a DIFFERENT canonical
-    id.  This helper returns the CANONICAL id from ``MemoryResult.id`` — not
-    the unverified ``response.memory_ids[0]``.
+    Performs a read-back search to confirm findability; returns ``True`` iff at
+    least one matching marker is returned (initial search or retry), ``False``
+    otherwise.
 
     The confirmation kind filter includes ``run_id`` (the current run) so that
     surviving priors from earlier runs cannot masquerade as confirmation of this
@@ -238,12 +237,10 @@ async def confirm_marker_persisted(
     Strategy:
     1. Run a confirmation search via ``find_prior_memories`` with
        ``kind={'source':'stage1_flag_marker','flag_type':flag_type,'run_id':run_id}``.
-    2. If matches are found, lex-sort by id and return ``matches[0].id``
-       (deterministic canonical id; matches the module's lex-sort convention
-       and the LLM-side directive to emit a confirmed canonical id).
+    2. If matches are found, return ``True``.
     3. On a miss, log a WARNING (task_id + flag_type) and retry the search once.
-    4. Return the retry's lowest-lex id if found; otherwise log a final WARNING
-       and return ``None``.
+    4. Return ``True`` if the retry finds matches; otherwise log a final WARNING
+       and return ``False``.
     5. Never raises — the whole body is wrapped in a best-effort try/except so
        a non-search error path cannot abort ``dedup_flags``.
 
@@ -267,11 +264,10 @@ async def confirm_marker_persisted(
              caplog-based tests can capture WARNINGs under the right namespace).
 
     Returns:
-        The canonical ``MemoryResult.id`` (lowest lex) from the confirmation
-        search, or ``None`` if the marker could not be confirmed findable after
-        one retry.  Within ``dedup_flags`` this value is consumed only as a
-        truthy presence sentinel; the id string itself is not used for deletion
-        (deletion iterates the pre-write ``priors`` list directly).
+        ``True`` if at least one matching marker is findable (initial search or
+        retry); ``False`` if no match after retry or if an unexpected error
+        occurred.  Within ``dedup_flags`` this drives the HIT-branch
+        prior-deletion gate (skip if False) and the MISS-branch no-op WARNING.
     """
     try:
         query = _marker_query(task_id, flag_type)
@@ -293,7 +289,7 @@ async def confirm_marker_persisted(
             log=log,
         )
         if matches:
-            return sorted(matches, key=lambda m: m.id)[0].id
+            return True
 
         # Miss on first attempt — log WARNING and retry once.
         log.warning(
@@ -312,21 +308,21 @@ async def confirm_marker_persisted(
             log=log,
         )
         if retry_matches:
-            return sorted(retry_matches, key=lambda m: m.id)[0].id
+            return True
 
-        # Retry also missed — log final WARNING and return None.
+        # Retry also missed — log final WARNING and return False.
         log.warning(
             'confirm_marker_persisted: could not confirm flag marker for task %s'
             ' flag_type %s run_id %s after retry — marker may be unfindable next cycle',
             task_id, flag_type, run_id,
         )
-        return None
+        return False
     except Exception as e:
         log.warning(
             'confirm_marker_persisted: unexpected error for task %s flag_type %s: %s',
             task_id, flag_type, e,
         )
-        return None
+        return False
 
 
 async def filter_suppressed(
@@ -416,9 +412,9 @@ async def _write_and_confirm_marker(
     tid: str,
     ftype: str,
     log: logging.Logger,
-    confirm_and_track,  # async callable: (response_memory_ids, miss_warning_msg, *, tid, ftype) -> tuple[str|None, bool]
+    confirm_and_track,  # async callable: (response_memory_ids, miss_warning_msg, *, tid, ftype) -> bool
     miss_warning_template: str,
-) -> tuple[str | None, bool]:
+) -> bool:
     """Write a stage1_flag_marker memory and confirm it is findable.
 
     Single source of truth for the canonical marker payload contract:
@@ -428,23 +424,16 @@ async def _write_and_confirm_marker(
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
 
-    On add_memory exception: logs a unified WARNING and returns ``(None, False)``.
+    On add_memory exception: logs a unified WARNING and returns ``False``.
 
     On success: delegates to ``confirm_and_track`` (the circuit-breaker-aware
-    inner closure from ``dedup_flags``) and propagates its
-    ``(confirmed_id, write_succeeded)`` tuple verbatim.  This means:
+    inner closure from ``dedup_flags``) and propagates its bool verbatim.
 
-    - Normal path: ``write_succeeded == (confirmed_id is not None)``.
-    - Breaker-tripped path: ``confirmed_id`` is None but ``write_succeeded`` may
-      be True if ``bool(response.memory_ids)`` was True; the gate degrades to
-      the cheaper memory_ids check.  The helper MUST NOT derive
-      ``write_succeeded`` locally — propagation is essential for the
-      circuit-breaker contract.
-
-    The ``miss_warning_template`` parameter is the branch-specific consequence
-    WARNING string (e.g. "skipping prior deletion" for HIT, "will not be
-    detected next cycle" for MISS).  It is forwarded to ``confirm_and_track``,
-    which logs it on confirmation miss.
+    Propagates the bool returned by ``confirm_and_track`` verbatim — does NOT
+    derive locally.  The ``miss_warning_template`` parameter is the
+    branch-specific consequence WARNING string (e.g. "skipping prior deletion"
+    for HIT, "will not be detected next cycle" for MISS).  It is forwarded to
+    ``confirm_and_track``, which logs it on confirmation miss.
     """
     try:
         response = await memory_service.add_memory(
@@ -466,7 +455,7 @@ async def _write_and_confirm_marker(
             'flag_dedup: failed to write marker for task %s flag_type %s: %s',
             tid, ftype, e,
         )
-        return None, False
+        return False
     # ``confirm_and_track`` is required to never raise (``confirm_marker_persisted``
     # has its own internal try/except; the breaker counter mutations are non-raising).
     # If that invariant is broken by a future refactor, the exception will propagate
@@ -514,7 +503,7 @@ async def dedup_flags(
 
     # --- Confirmation circuit-breaker (task-1412) ---
     # Per-invocation counter: strictly consecutive miss count.  Reset to 0 on any
-    # successful confirmation (non-None id).  When the count reaches
+    # successful confirmation (True return).  When the count reaches
     # _CONFIRMATION_MISS_THRESHOLD, log ONE breaker WARNING and set
     # confirmation_disabled = True so the remainder of the batch skips
     # confirm_marker_persisted entirely and gates on bool(response.memory_ids).
@@ -529,21 +518,22 @@ async def dedup_flags(
         *,
         tid: str,
         ftype: str,
-    ) -> tuple[str | None, bool]:
+    ) -> bool:
         """Shared circuit-breaker helper for HIT and MISS branches.
 
         When the breaker is ACTIVE (``confirmation_disabled`` is False):
-        - Calls ``confirm_marker_persisted``; on miss emits ``miss_warning_msg``,
-          increments the consecutive miss counter, and trips the breaker when the
-          threshold is reached (one breaker WARNING logged at trip-time only).
-        - On hit: resets the counter so sporadic misses don't accumulate.
-        - Returns ``(confirmed_id, write_succeeded)`` where
-          ``write_succeeded = confirmed_id is not None``.
+        - Calls ``confirm_marker_persisted``; on miss (``False`` return) emits
+          ``miss_warning_msg``, increments the consecutive miss counter, and
+          trips the breaker when the threshold is reached (one breaker WARNING
+          logged at trip-time only).
+        - On hit (``True`` return): resets the counter so sporadic misses don't
+          accumulate.
+        - Returns the bool from ``confirm_marker_persisted``.
 
         When the breaker is TRIPPED (``confirmation_disabled`` is True):
         - Skips ``confirm_marker_persisted``; gates on ``bool(response_memory_ids)``.
         - Emits ``miss_warning_msg`` iff ``bool(response_memory_ids)`` is False.
-        - Returns ``(None, bool(response_memory_ids))``.
+        - Returns ``bool(response_memory_ids)``.
 
         ``tid`` and ``ftype`` are explicit keyword-only parameters so this helper
         is safe to schedule out-of-order (e.g. ``asyncio.gather``); the enclosing-
@@ -556,7 +546,7 @@ async def dedup_flags(
         """
         nonlocal consecutive_confirmation_misses, confirmation_disabled
         if not confirmation_disabled:
-            c_id = await confirm_marker_persisted(
+            is_found = await confirm_marker_persisted(
                 memory_service,
                 project_id=project_id,
                 task_id=tid,
@@ -564,7 +554,7 @@ async def dedup_flags(
                 run_id=run_id,
                 log=logger,
             )
-            if c_id is None:
+            if not is_found:
                 # ``miss_warning_msg`` MUST be a printf-style string with exactly
                 # two %s placeholders in order: (task_id, flag_type).
                 logger.warning(miss_warning_msg, tid, ftype)
@@ -583,12 +573,12 @@ async def dedup_flags(
                 # Reset ONLY inside `if not confirmation_disabled` so a tripped
                 # breaker can't be un-tripped mid-batch.
                 consecutive_confirmation_misses = 0
-            return c_id, c_id is not None
+            return is_found
         else:
             write_succeeded = bool(response_memory_ids)
             if not write_succeeded:
                 logger.warning(miss_warning_msg, tid, ftype)
-            return None, write_succeeded
+            return write_succeeded
 
     result: list[dict[str, Any]] = []
     for flag in flags:
@@ -634,9 +624,9 @@ async def dedup_flags(
             # (2) Write replacement marker first.  If this fails, skip the
             #     delete so all priors remain intact for next cycle.
             #     After writing, confirm the marker is findable via a read-back
-            #     search (task-1400): add_memory may return a different id than
-            #     the one Mem0 actually stores.  Only a confirmed canonical id
-            #     proves the new marker is findable by the next cycle's search.
+            #     search (task-1400): add_memory may store content under a
+            #     different id than the one returned.  write_succeeded is True
+            #     only when the marker is confirmed findable by a subsequent search.
             #     An unconfirmed write (write exception OR confirmation miss)
             #     preserves priors for next cycle (best-effort at-least-one-marker).
             #
@@ -645,7 +635,7 @@ async def dedup_flags(
             #     encapsulates confirm_marker_persisted + circuit-breaker counter).
             # See: _confirm_and_track docstring and "Confirmation circuit-breaker"
             # section in the module docstring.
-            confirmed_id, write_succeeded = await _write_and_confirm_marker(
+            write_succeeded = await _write_and_confirm_marker(
                 memory_service,
                 project_id=project_id, run_id=run_id, tid=tid, ftype=ftype, log=logger,
                 confirm_and_track=_confirm_and_track,
