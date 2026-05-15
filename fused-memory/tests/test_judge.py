@@ -948,29 +948,24 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _JUDGE_CAP_WAIT_SANITY_SECS: minutes-scale override forwarded to
+# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS forwarded by judge to
 # invoke_with_cap_retry (task 1401)
 # ─────────────────────────────────────────────────────────────────────
 
 
 class TestJudgeCapWaitSanityBound:
-    """_JUDGE_CAP_WAIT_SANITY_SECS is minutes-scale and forwarded to
-    invoke_with_cap_retry; prevents stalling the reconciliation queue under cap."""
-
-    def test_constant_importable_and_minutes_scale(self):
-        """(a) _JUDGE_CAP_WAIT_SANITY_SECS is importable and pinned to the documented 30-min policy."""
-        from fused_memory.reconciliation.judge import _JUDGE_CAP_WAIT_SANITY_SECS
-
-        assert _JUDGE_CAP_WAIT_SANITY_SECS == 1800.0
+    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
+    invoke_with_cap_retry by judge; prevents stalling the reconciliation
+    queue under cap."""
 
     @pytest.mark.asyncio
     async def test_call_judge_cli_forwards_cap_wait_sanity_secs(self):
-        """(b) _call_judge_cli forwards cap_wait_sanity_secs=_JUDGE_CAP_WAIT_SANITY_SECS."""
+        """(b) _call_judge_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
         from unittest.mock import AsyncMock, MagicMock
 
         from shared.cli_invoke import AgentResult
 
-        from fused_memory.reconciliation.judge import _JUDGE_CAP_WAIT_SANITY_SECS
+        from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
         config = _make_judge_config(
             judge_llm_provider='claude_cli',
@@ -985,4 +980,4 @@ class TestJudgeCapWaitSanityBound:
             new=mock,
         ):
             await judge._call_judge_cli('p')
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _JUDGE_CAP_WAIT_SANITY_SECS
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS

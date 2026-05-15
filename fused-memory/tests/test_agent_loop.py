@@ -1522,25 +1522,20 @@ async def test_call_claude_cli_failure_surfaces_stderr_and_summary_in_runtime_er
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _AGENT_LOOP_CAP_WAIT_SANITY_SECS: minutes-scale override forwarded to
+# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS forwarded by agent_loop to
 # invoke_with_cap_retry (task 1401, post-1365 audit)
 # ─────────────────────────────────────────────────────────────────────
 
 
 class TestAgentLoopCapWaitSanityBound:
-    """_AGENT_LOOP_CAP_WAIT_SANITY_SECS is minutes-scale and forwarded to
-    invoke_with_cap_retry; prevents stalling the reconciliation queue under cap."""
-
-    def test_constant_importable_and_minutes_scale(self):
-        """(a) _AGENT_LOOP_CAP_WAIT_SANITY_SECS is importable and pinned to the documented 30-min policy."""
-        from fused_memory.reconciliation.agent_loop import _AGENT_LOOP_CAP_WAIT_SANITY_SECS
-
-        assert _AGENT_LOOP_CAP_WAIT_SANITY_SECS == 1800.0
+    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
+    invoke_with_cap_retry by agent_loop; prevents stalling the reconciliation
+    queue under cap."""
 
     @pytest.mark.asyncio
     async def test_call_claude_cli_forwards_cap_wait_sanity_secs(self):
-        """(b) _call_claude_cli forwards cap_wait_sanity_secs=_AGENT_LOOP_CAP_WAIT_SANITY_SECS."""
-        from fused_memory.reconciliation.agent_loop import _AGENT_LOOP_CAP_WAIT_SANITY_SECS
+        """(b) _call_claude_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
+        from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
         config = _make_cli_config()
         agent = AgentLoop(
@@ -1560,4 +1555,4 @@ class TestAgentLoopCapWaitSanityBound:
             new=mock,
         ):
             await agent._call_claude_cli(prompt='p', tools=[])
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _AGENT_LOOP_CAP_WAIT_SANITY_SECS
+        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
