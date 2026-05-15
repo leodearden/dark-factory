@@ -12,7 +12,7 @@ import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -977,6 +977,66 @@ class TestHarnessCostCeiling:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_enforce_cost_ceilings_delegates_to_cost_totals_in_window(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """_enforce_cost_ceilings delegates to cost_store.cost_totals_in_window.
+
+        Monkeypatches cost_totals_in_window to a stub returning (total, watcher)
+        values that trip the watcher ceiling.  Asserts:
+        - stub called exactly once
+        - start ≈ now-24h (within 10s) and end ≈ now (within 10s),
+          regardless of whether passed positionally or as keyword args
+        - scheduler was paused with cost_ceiling_watcher_exceeded
+        """
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            watcher_daily_cost_ceiling_usd=5.0,
+            orch_daily_cost_ceiling_usd=1000.0,
+        )
+        harness = Harness(config)
+        mock_run_store = MagicMock(spec=RunStore)
+        harness._run_store = mock_run_store
+        harness._run_id = 'run-test-delegate-0001'
+        store = await _cost_store_factory()
+        harness.cost_store = store
+
+        # Stub returns (total, watcher) that trips the watcher ceiling.
+        stub = AsyncMock(return_value=(20.0, 10.0))  # watcher=10.0 > ceiling=5.0
+        store.cost_totals_in_window = stub
+
+        before = datetime.now(UTC)
+        await harness._enforce_cost_ceilings()
+        after = datetime.now(UTC)
+
+        # Exactly one call was made.
+        assert stub.call_count == 1, f'Expected 1 call, got {stub.call_count}'
+
+        # Extract start/end regardless of positional vs keyword calling convention.
+        call = stub.call_args_list[0]
+        cutoff_iso = call.args[0] if call.args else call.kwargs.get('start_iso')
+        now_iso = (call.args[1] if len(call.args) > 1 else call.kwargs.get('end_iso'))
+
+        assert cutoff_iso is not None, 'start_iso arg missing from aggregate_window call'
+        assert now_iso is not None, 'end_iso arg missing from aggregate_window call'
+        cutoff_dt = datetime.fromisoformat(cutoff_iso)
+        now_dt = datetime.fromisoformat(now_iso)
+
+        expected_cutoff_lo = before - timedelta(hours=24) - timedelta(seconds=10)
+        expected_cutoff_hi = after - timedelta(hours=24) + timedelta(seconds=10)
+        assert expected_cutoff_lo <= cutoff_dt <= expected_cutoff_hi, (
+            f'cutoff_dt {cutoff_dt} not within 10s of (before - 24h)'
+        )
+        assert before - timedelta(seconds=10) <= now_dt <= after + timedelta(seconds=10), (
+            f'now_dt {now_dt} not within 10s of now'
+        )
+
+        # Watcher ceiling was tripped.
+        assert harness.scheduler.is_paused is True
+        assert harness.scheduler.pause_reason == 'cost_ceiling_watcher_exceeded'
+
+
 class TestDigestConfig:
     """Tests for the five digest_* config fields on OrchestratorConfig.
 
@@ -1190,8 +1250,6 @@ class TestHarnessMaybeWriteDigest:
         self, tmp_path: Path, _cost_store_factory
     ) -> None:
         """write_digest_entry raising does not propagate from _maybe_write_digest."""
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness.config = OrchestratorConfig(
             project_root=tmp_path,
@@ -1339,8 +1397,6 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
     @pytest.mark.asyncio
     async def test_clean_exit_triggers_maybe_write_digest(self, tmp_path: Path) -> None:
         """A clean rotation exit causes _maybe_write_digest to be awaited."""
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness._maybe_write_digest = AsyncMock()
 
@@ -1372,8 +1428,6 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
 
         Quiet days where the watcher crashes must not silence the digest.
         """
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness._maybe_write_digest = AsyncMock()
 
@@ -1405,8 +1459,6 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
 
         The supervisor must continue to the next rotation after a digest failure.
         """
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         # Replace with a raising async mock to simulate digest failure.
         harness._maybe_write_digest = AsyncMock(side_effect=RuntimeError('digest failure'))
@@ -1537,8 +1589,6 @@ class TestHarnessDigestEscalationCounterSnapshot:
         before the await points (cost_in_window, pause_scheduler) — the only
         locations where escalation callbacks can actually interleave.
         """
-        from unittest.mock import patch
-
         harness, _, _ = _make_harness_with_mocks(tmp_path)
         harness.config = OrchestratorConfig(
             project_root=tmp_path,
