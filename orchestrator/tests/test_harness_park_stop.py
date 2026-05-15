@@ -1525,15 +1525,17 @@ class TestHarnessDigestEscalationCounterSnapshot:
     ) -> None:
         """_last_digest_event_count advances to the snapshot taken at entry, not the live value.
 
-        Setup: _escalation_event_count=5 at entry; a patch on aggregate_escalations
-        fires a side-effect that increments _escalation_event_count by 100 mid-function
-        (simulating a concurrent callback).  After _maybe_write_digest returns:
+        Setup: _escalation_event_count=5 at entry; a patch on cost_in_window
+        fires a side-effect that increments _escalation_event_count by 100 at
+        the await point (simulating a concurrent callback).  After
+        _maybe_write_digest returns:
           - _last_digest_event_count must be 5  (the snapshot at entry)
           - NOT 105 (the live value after the concurrent +100)
 
         Today the function reads self._escalation_event_count directly at the
         advance line, so it picks up 105.  After Fix 2 it uses a snapshot taken
-        before aggregate_escalations is called.
+        before the await points (cost_in_window, pause_scheduler) — the only
+        locations where escalation callbacks can actually interleave.
         """
         from unittest.mock import patch
 
@@ -1547,15 +1549,18 @@ class TestHarnessDigestEscalationCounterSnapshot:
         harness._escalation_event_count = 5
         harness._last_digest_event_count = 0
 
-        # Side-effect: simulate a concurrent escalation callback firing inside
-        # aggregate_escalations — bumps _escalation_event_count by 100.
-        from orchestrator.digest import EscalationStats
+        # Side-effect: simulate a concurrent escalation callback firing at the
+        # real await point (cost_in_window) — bumps _escalation_event_count by
+        # 100 during the await, which is the documented concurrency window in
+        # _maybe_write_digest (callbacks fire between awaits on the asyncio loop
+        # thread).
+        from orchestrator.digest import CostStats
 
         def _concurrent_bump(*_args, **_kwargs):
             harness._escalation_event_count += 100
-            return EscalationStats()
+            return CostStats()
 
-        with patch('orchestrator.digest.aggregate_escalations', side_effect=_concurrent_bump):
+        with patch('orchestrator.digest.cost_in_window', new=AsyncMock(side_effect=_concurrent_bump)):
             await harness._maybe_write_digest()
 
         # Must use the snapshot (5), not the post-mutation value (105).
