@@ -2169,11 +2169,55 @@ class TestCompletionOrderVsIdOrderPreservesIdTitlePairing:
                     f'  Full line: {line!r}'
                 )
 
-    def test_format_filtered_task_tree_done_section_preserves_id_title_pairing(self):
-        """format_filtered_task_tree: done_tasks section lines pair each id with its OWN title."""
-        import re
+    def test_format_filtered_task_tree_active_tasks_preserve_id_title_pairing(self):
+        """format_filtered_task_tree: active task lines pair each id with its OWN title.
 
-        # Build a FilteredTaskTree with the 8df8bdcd done tasks in completion order
+        Pins the REAL format_filtered_task_tree active-rendering path for the
+        8df8bdcd scenario: tasks are fed as in-progress (active) so they are
+        individually line-rendered, with completion order ≠ id order.
+        Includes an explicit anti-vacuity guard: asserts exactly 3 lines matched.
+        """
+        # Use in-progress status so the tasks are line-rendered as active tasks
+        active_tasks = [
+            {**t, 'status': 'in-progress'} for t in self._TASKS
+        ]
+        result = filter_task_tree({'tasks': active_tasks})
+        rendered = format_filtered_task_tree(result)
+
+        line_pattern = re.compile(r'^- \[(\d+)\] \([^)]+\) (.+?) deps=')
+        matched: list[tuple[int, str]] = []
+        for line in rendered.splitlines():
+            m = line_pattern.match(line)
+            if not m:
+                continue
+            tid = int(m.group(1))
+            rendered_title = m.group(2)
+            matched.append((tid, rendered_title))
+            if tid in self._TITLE_BY_ID:
+                expected_title = self._TITLE_BY_ID[tid]
+                assert rendered_title == expected_title, (
+                    f'Filtered tree line for id={tid}: title={rendered_title!r}, '
+                    f'expected own title={expected_title!r}\n'
+                    f'  Full line: {line!r}'
+                )
+
+        # Anti-vacuity guard: exactly 3 active task lines must have been matched
+        matched_ids = [t for t, _ in matched]
+        assert len(matched) == 3, (
+            f'Expected exactly 3 active task lines in format_filtered_task_tree output, '
+            f'got {len(matched)} (matched ids={matched_ids}). '
+            f'If this is 0, the regex matched nothing — test is vacuous.\n'
+            f'Rendered output:\n{rendered}'
+        )
+
+    def test_format_filtered_task_tree_done_tasks_appear_only_in_summary_count(self):
+        """format_filtered_task_tree: done tasks appear ONLY in the summary count, never as task lines.
+
+        Pins the true done-task contract: format_filtered_task_tree never
+        line-renders done tasks individually. Done tasks contribute to the
+        '{done_count} done … — omitted' summary line, and none of their titles
+        or individual '[id] (' fragments appear in the rendered output.
+        """
         tree = FilteredTaskTree(
             active_tasks=[],
             done_tasks=list(self._TASKS),
@@ -2185,20 +2229,21 @@ class TestCompletionOrderVsIdOrderPreservesIdTitlePairing:
         )
         rendered = format_filtered_task_tree(tree)
 
-        line_pattern = re.compile(r'^- \[(\d+)\] \([^)]+\) (.+?) deps=')
-        for line in rendered.splitlines():
-            m = line_pattern.match(line)
-            if not m:
-                continue
-            tid = int(m.group(1))
-            rendered_title = m.group(2)
-            if tid in self._TITLE_BY_ID:
-                expected_title = self._TITLE_BY_ID[tid]
-                assert rendered_title == expected_title, (
-                    f'Filtered tree line for id={tid}: title={rendered_title!r}, '
-                    f'expected={expected_title!r}\n'
-                    f'  Full line: {line!r}'
-                )
+        # No individual task lines should exist for done tasks
+        task_line_pattern = re.compile(r'- \[\d+\] \(')
+        assert not task_line_pattern.search(rendered), (
+            f'format_filtered_task_tree rendered individual task lines for done tasks '
+            f'(done tasks should only appear in the summary count).\n'
+            f'Rendered output:\n{rendered}'
+        )
+
+        # None of the done-task titles should appear in the output
+        for task in self._TASKS:
+            assert task['title'] not in rendered, (
+                f'Done task title {task["title"]!r} (id={task["id"]}) found in '
+                f'format_filtered_task_tree output — should only appear in count summary.\n'
+                f'Rendered output:\n{rendered}'
+            )
 
     def test_render_task_line_pairs_id_with_own_title(self):
         """_render_task_line: each task dict produces a line with that task's own id and title."""
