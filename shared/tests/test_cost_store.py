@@ -648,3 +648,146 @@ class TestCostStoreInheritsAsyncSqliteBase:
         """CostStore sets busy_timeout_ms=30000 on the base class."""
         store = CostStore(tmp_path / 'costs.db')
         assert store.busy_timeout_ms == 30000
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateWindow — CostStore.aggregate_window(start_iso, end_iso)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_row(
+    store: CostStore,
+    *,
+    role: str,
+    cost_usd: float,
+    completed_at: str,
+) -> None:
+    """Insert a minimal invocation row for aggregate_window testing."""
+    await store.save_invocation(
+        run_id='r1',
+        task_id=None,
+        project_id='p',
+        account_name='a',
+        model='m',
+        role=role,
+        cost_usd=cost_usd,
+        input_tokens=None,
+        output_tokens=None,
+        cache_read_tokens=None,
+        cache_create_tokens=None,
+        duration_ms=0,
+        capped=False,
+        started_at=completed_at,
+        completed_at=completed_at,
+    )
+
+
+@pytest.mark.asyncio
+class TestAggregateWindow:
+    """Tests for CostStore.aggregate_window(start_iso, end_iso) -> (total_usd, watcher_usd)."""
+
+    async def test_empty_db_returns_zeros(self, tmp_path: Path) -> None:
+        """Empty table → (0.0, 0.0)."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            result = await store.aggregate_window(
+                '2026-01-01T00:00:00',
+                '2026-12-31T23:59:59',
+            )
+        assert result == (0.0, 0.0)
+
+    async def test_single_watcher_row_returns_cost_twice(self, tmp_path: Path) -> None:
+        """One watcher row inside window → (cost, cost)."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_row(
+                store, role='watcher', cost_usd=3.5,
+                completed_at='2026-06-01T12:00:00',
+            )
+            result = await store.aggregate_window(
+                '2026-06-01T00:00:00',
+                '2026-06-01T23:59:59',
+            )
+        assert result == (pytest.approx(3.5), pytest.approx(3.5))
+
+    async def test_single_non_watcher_row_returns_zero_watcher(
+        self, tmp_path: Path
+    ) -> None:
+        """One non-watcher row inside window → (cost, 0.0)."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_row(
+                store, role='orchestrator', cost_usd=2.0,
+                completed_at='2026-06-01T12:00:00',
+            )
+            result = await store.aggregate_window(
+                '2026-06-01T00:00:00',
+                '2026-06-01T23:59:59',
+            )
+        assert result == (pytest.approx(2.0), pytest.approx(0.0))
+
+    async def test_mixed_roles_sums_correctly(self, tmp_path: Path) -> None:
+        """Mixed watcher + non-watcher → (sum_all, sum_watcher)."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_row(
+                store, role='watcher', cost_usd=4.0,
+                completed_at='2026-06-01T10:00:00',
+            )
+            await _seed_row(
+                store, role='orchestrator', cost_usd=1.5,
+                completed_at='2026-06-01T11:00:00',
+            )
+            result = await store.aggregate_window(
+                '2026-06-01T00:00:00',
+                '2026-06-01T23:59:59',
+            )
+        total, watcher = result
+        assert total == pytest.approx(5.5)
+        assert watcher == pytest.approx(4.0)
+
+    async def test_out_of_window_rows_excluded(self, tmp_path: Path) -> None:
+        """Rows outside [start, end] are not counted."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            # Before window
+            await _seed_row(
+                store, role='watcher', cost_usd=99.0,
+                completed_at='2026-05-31T23:59:59',
+            )
+            # After window
+            await _seed_row(
+                store, role='watcher', cost_usd=99.0,
+                completed_at='2026-06-02T00:00:00',
+            )
+            # Inside window
+            await _seed_row(
+                store, role='watcher', cost_usd=1.0,
+                completed_at='2026-06-01T12:00:00',
+            )
+            result = await store.aggregate_window(
+                '2026-06-01T00:00:00',
+                '2026-06-01T23:59:59',
+            )
+        assert result == (pytest.approx(1.0), pytest.approx(1.0))
+
+    async def test_watcher_substring_roles_all_match(self, tmp_path: Path) -> None:
+        """Roles with 'watcher' as substring (e.g. 'escalation-watcher-auto',
+        'watcher-supervisor') all match the LIKE '%watcher%' pattern."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            for role in ('escalation-watcher-auto', 'watcher-supervisor', 'my-watcher'):
+                await _seed_row(
+                    store, role=role, cost_usd=1.0,
+                    completed_at='2026-06-01T12:00:00',
+                )
+            result = await store.aggregate_window(
+                '2026-06-01T00:00:00',
+                '2026-06-01T23:59:59',
+            )
+        total, watcher = result
+        assert total == pytest.approx(3.0)
+        assert watcher == pytest.approx(3.0)
+
+    async def test_not_opened_raises_runtime_error(self, tmp_path: Path) -> None:
+        """Calling aggregate_window on a never-opened store raises RuntimeError."""
+        store = CostStore(tmp_path / 'costs.db')
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.aggregate_window(
+                '2026-01-01T00:00:00',
+                '2026-12-31T23:59:59',
+            )
