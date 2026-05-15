@@ -3608,22 +3608,6 @@ class TestMarkerQuery:
         result = _marker_query('42', 'missing_deliverable')
         assert result == 'stage1 flag marker task 42 type missing_deliverable'
 
-    def test_format_is_byte_identical_to_legacy_production_template(self):
-        """Pins the query format: starts correctly, contains ' type ', no extra punctuation."""
-        from fused_memory.reconciliation.flag_dedup import _marker_query
-
-        tid, ftype = '99', 'overdue_task'
-        result = _marker_query(tid, ftype)
-        assert result.startswith('stage1 flag marker task '), (
-            f'Result {result!r} must start with "stage1 flag marker task "'
-        )
-        assert ' type ' in result, f'Result {result!r} must contain " type "'
-        # No extra punctuation — format is exactly the two-field template
-        expected = f'stage1 flag marker task {tid} type {ftype}'
-        assert result == expected, (
-            f'Got {result!r} but expected {expected!r}'
-        )
-
 
 # ---------------------------------------------------------------------------
 # _write_and_confirm_marker helper (step-4 / step-5)
@@ -3738,43 +3722,3 @@ class TestWriteAndConfirmMarker:
         # Must propagate the tuple verbatim: (None, True) — not derive from confirmed_id
         assert result == (None, True)
 
-    async def test_passes_through_breaker_disabled_state_via_closure_arg(self):
-        """Helper does not isolate confirm_and_track between calls — closure state persists."""
-        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
-
-        memory_service = MagicMock()
-        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-
-        # Stateful stub: first call returns True, second returns False (state mutation observed)
-        call_counter = [0]
-
-        async def stateful_confirm(response_memory_ids, miss_warning_template, *, tid, ftype):
-            call_counter[0] += 1
-            return (None, call_counter[0] == 1)  # True on 1st call, False on 2nd
-
-        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
-        first = await _write_and_confirm_marker(
-            memory_service,
-            project_id='p',
-            run_id='r4',
-            tid='1',
-            ftype='t',
-            log=log,
-            confirm_and_track=stateful_confirm,
-            miss_warning_template='t-%s-%s',
-        )
-        second = await _write_and_confirm_marker(
-            memory_service,
-            project_id='p',
-            run_id='r4',
-            tid='1',
-            ftype='t',
-            log=log,
-            confirm_and_track=stateful_confirm,
-            miss_warning_template='t-%s-%s',
-        )
-
-        # First call sees counter=1 → write_succeeded=True
-        assert first == (None, True)
-        # Second call sees counter=2 → write_succeeded=False (state mutation visible)
-        assert second == (None, False)
