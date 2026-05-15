@@ -230,6 +230,22 @@ class TestFindViolationsExemption:
         violations = find_violations(source, 'test_unrelated_comment.py')
         assert len(violations) == 1
 
+    def test_inline_trailing_noqa_is_intentionally_not_honored(self):
+        """Inline trailing # noqa: bare-magicmock is NOT honored — only the preceding line is checked.
+
+        The exemption contract is defined as: the nearest preceding non-blank source line
+        must match the # noqa: bare-magicmock — <reason> pattern.  An inline comment
+        on the same assignment line is NOT consulted — this is an intentional design
+        choice to keep the contract surface minimal.
+        """
+        source = 'config = MagicMock()  # noqa: bare-magicmock — inline reason\n'
+        violations = find_violations(source, 'test_inline_noqa.py')
+        assert len(violations) == 1, (
+            'Inline trailing # noqa: bare-magicmock should NOT be honored; '
+            'only the nearest preceding non-blank line is checked. '
+            f'Got {len(violations)} violations (expected 1).'
+        )
+
 
 class TestFindViolationsAnnAssign:
     """AnnAssign branch: config: Foo = MagicMock() is detected; annotation-only and exempted forms are not."""
