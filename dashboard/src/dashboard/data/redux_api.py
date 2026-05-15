@@ -779,9 +779,10 @@ def shape_scheduler(
     pin_queue: list,
     events_by_task: dict,
     offline_projects: list,
+    paused_projects: list,
     snapshot_at: str | None,
 ) -> dict:
-    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects}}``.
+    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` style.  Shallow-copies top-level
     containers only (``list(rows)``, ``dict(events_by_task)``); inner dicts and
@@ -798,5 +799,7 @@ def shape_scheduler(
             'snapshot_at': snapshot_at,
             'offline': bool(offline_projects),
             'offline_projects': list(offline_projects),
+            'paused': bool(paused_projects),
+            'paused_projects': list(paused_projects),
         }
     }
