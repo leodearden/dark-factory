@@ -19,6 +19,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
 
+from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -311,6 +312,18 @@ class Harness:
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
         self._orphan_reaper_task: asyncio.Task | None = None
+
+        # Digest + EWA trip counters (task 1327 AFK hardening).
+        # _escalation_event_count: incremented on every escalation submit/resolve callback.
+        # _last_digest_event_count: snapshot of the count at the last digest write.
+        # _last_digest_done_count: snapshot of scheduler.done_transitions_total at last digest.
+        # _ewa_value: current EWA state (process-local; resets on restart).
+        # _last_digest_window_end_iso: ISO timestamp of the last digest window's end.
+        self._escalation_event_count: int = 0
+        self._last_digest_event_count: int = 0
+        self._last_digest_done_count: int = 0
+        self._ewa_value: float = 0.0
+        self._last_digest_window_end_iso: str = ''  # set to start time on first run
 
         # Soft-cancel registry — keyed by task_id, set externally to abort
         # long workflow waits (merge queue future, steward grace period).
@@ -2750,6 +2763,21 @@ Output JSON matching the schema. Every task must appear in the output.
                 and not bool(getattr(result, 'timed_out', False))
             )
 
+            # Best-effort digest check after each rotation (task 1327).
+            # Single call site — applies to both clean and unclean paths.
+            # Never allowed to break the supervisor: CancelledError re-raised,
+            # every other exception logged and swallowed.
+            try:
+                await self._maybe_write_digest()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    '_maybe_write_digest raised unexpectedly in supervisor loop '
+                    '(best-effort swallowed)',
+                    exc_info=True,
+                )
+
             if clean:
                 # Healthy rotation completed — reset backoff.
                 # Enforce a minimum floor between rotations even on clean exit:
@@ -2895,12 +2923,17 @@ Output JSON matching the schema. Every task must appear in the output.
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
+        # Increment before the event-set logic so the counter reflects every submission.
+        self._escalation_event_count += 1  # task 1327 AFK hardening
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
 
     def _on_escalation_resolved(self, escalation) -> None:
         """Callback when an escalation is resolved — wake the waiting workflow."""
+        # Increment for any status transition (resolved or dismissed) — both are
+        # escalation events that the EWA digest needs to count.
+        self._escalation_event_count += 1  # task 1327 AFK hardening
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
@@ -3015,9 +3048,22 @@ Output JSON matching the schema. Every task must appear in the output.
         1. Delegates to ``scheduler.resume()`` (idempotent).
         2. Clears persistence via ``RunStore.clear_scheduler_pause`` (best-effort).
         3. Emits ``EventType.scheduler_resumed`` (best-effort).
-        4. Logs INFO.
+        4. If the pause was caused by an EWA trip (reason starts with 'ewa_trip_'),
+           resets ``_ewa_value`` to 0.0 so the next digest step does not immediately
+           re-trigger a pause.  EWA decays naturally with alpha=0.3 (~N digests of
+           low ratio to fall back below threshold), but an operator-driven resume
+           signals that the situation is under control — a clean reset is less
+           surprising than watching the EWA trip instantly again.
+        5. Logs INFO.
         """
+        # Snapshot pause reason BEFORE resume() clears it.
+        prior_reason = self.scheduler.pause_reason or ''
         self.scheduler.resume()
+        if prior_reason.startswith('ewa_trip_'):
+            self._ewa_value = 0.0
+            logger.info(
+                'resume_scheduler: EWA value reset to 0.0 (prior pause was ewa_trip).'
+            )
         logger.info('Scheduler resumed.')
 
         if self._run_store:
@@ -3081,3 +3127,144 @@ Output JSON matching the schema. Every task must appear in the output.
                 '_load_persisted_scheduler_pause: failed to read pause state',
                 exc_info=True,
             )
+
+    # ------------------------------------------------------------------ #
+    # Digest + EWA trip (task 1327)                                       #
+    # ------------------------------------------------------------------ #
+
+    async def _maybe_write_digest(self) -> None:
+        """Check if it is time to write a digest; if so gather data, write, and update EWA.
+
+        Called from _watcher_supervisor_loop after each rotation (best-effort).
+        Any exception is swallowed and logged as a WARNING — a failed digest must
+        never break the watcher supervisor loop.
+
+        Algorithm:
+        1. Early-return when digest_enabled=False.
+        2. Early-return when (escalation_event_count - last_count) < N.
+        3. Snapshot step deltas (escalations + done transitions).
+        4. Compute window (last window_end → now).
+        5. Aggregate escalation stats (fail-open).
+        6. Count done tasks in EventStore (fail-open).
+        7. Query cost stats from CostStore (fail-open).
+        8. Read parked-task counts from Scheduler state.
+        9. Update EWA.
+        10. Compute trip flag and anomaly flags.
+        11. Write digest file (fail-open via write_digest_entry).
+        12. Advance counters/state.
+        13. If tripped and not already paused, call pause_scheduler (post-write).
+
+        Task 1327 AFK hardening.
+        """
+        try:
+            # (1) Early-return if disabled.
+            if not self.config.digest_enabled:
+                return
+
+            # (2) Early-return if not enough new events.
+            diff = self._escalation_event_count - self._last_digest_event_count
+            if diff < self.config.digest_every_n_escalations:
+                return
+
+            # (3) Snapshot step deltas.
+            escalations_in_step = diff
+            done_in_step = (
+                self.scheduler.done_transitions_total - self._last_digest_done_count
+            )
+
+            # (4) Compute window timestamps.
+            window_end = datetime.now(UTC).isoformat()
+            window_start = self._last_digest_window_end_iso
+            if not window_start:
+                # First digest: use 24h ago as window start.
+                window_start = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+
+            # (5) Gather escalation stats (fail-open via aggregate_escalations).
+            escalations_dir = (
+                Path(self.config.project_root) / self.config.escalation.queue_dir
+            )
+            escalation_stats = digest_mod.aggregate_escalations(
+                escalations_dir, window_start, window_end
+            )
+
+            # (6) Count done tasks in window (fail-open via count_done_in_window).
+            events_db_path = self.event_store.db_path if self.event_store else None
+            done_count = (
+                digest_mod.count_done_in_window(
+                    events_db_path, window_start, window_end
+                )
+                if events_db_path is not None
+                else 0
+            )
+
+            # (7) Cost stats (fail-open via cost_in_window).
+            cost_stats = await digest_mod.cost_in_window(
+                self.cost_store, window_start, window_end
+            )
+
+            # (8) Parked-task counts via public Scheduler properties (task 1327).
+            parked_live = self.scheduler.parked_live_count
+            parked_window_churn = self.scheduler.parked_window_churn_count
+
+            # (9) Update EWA.
+            new_ewa = digest_mod.update_ewa(
+                prev_ewa=self._ewa_value,
+                escalations_in_step=escalations_in_step,
+                done_in_step=done_in_step,
+                alpha=self.config.digest_ewa_alpha,
+            )
+
+            # (10) Trip flag and anomaly flags.
+            tripped = new_ewa >= self.config.digest_ewa_threshold
+            anomaly_flags = {
+                'cost_spike': (
+                    cost_stats.watcher_cost_in_window
+                    > self.config.watcher_daily_cost_ceiling_usd * 0.5
+                ),
+                'park_spike': (
+                    parked_window_churn >= self.config.park_stop_parked_threshold
+                ),
+                'ewa_above_threshold': tripped,
+                'infra_dedupe_active': escalation_stats.dedupe_children_total > 0,
+            }
+
+            # (11) Resolve digest directory.
+            if self.config.digest_dir:
+                digest_dir = Path(self.config.digest_dir)
+            else:
+                digest_dir = Path(self.config.project_root) / 'data' / 'digests'
+
+            inputs = digest_mod.DigestInputs(
+                window_start_iso=window_start,
+                window_end_iso=window_end,
+                escalation_stats=escalation_stats,
+                done_count=done_count,
+                cost_stats=cost_stats,
+                parked_live=parked_live,
+                parked_window_churn=parked_window_churn,
+                ewa_value=new_ewa,
+                ewa_threshold=self.config.digest_ewa_threshold,
+                tripped=tripped,
+                anomaly_flags=anomaly_flags,
+                watcher_clusters=[],
+                dry_run_proposals=[],
+            )
+
+            # Write the digest file (never raises — fail-open).
+            digest_mod.write_digest_entry(digest_dir, inputs)
+
+            # (12) Advance EWA state and counters.
+            self._ewa_value = new_ewa
+            self._last_digest_event_count = self._escalation_event_count
+            self._last_digest_done_count = self.scheduler.done_transitions_total
+            self._last_digest_window_end_iso = window_end
+
+            # (13) EWA trip: pause scheduler AFTER the digest is written so the
+            # markdown captures the trip-causing state.
+            if tripped and not self.scheduler.is_paused:
+                await self.pause_scheduler(f'ewa_trip_{new_ewa:.4f}')
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning('_maybe_write_digest: unexpected error (fail-open)', exc_info=True)

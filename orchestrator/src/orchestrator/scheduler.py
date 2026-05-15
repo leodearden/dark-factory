@@ -769,6 +769,11 @@ class Scheduler:
         # is a static deployment condition, so one traceback per instance is
         # enough — callers are time-throttled by _write_snapshot_best_effort.
         self._override_store_warned: bool = False
+        # Monotonic counter of confirmed done-status writes (task 1327 AFK hardening).
+        # Incremented in set_task_status success branch when status=='done', mirrors
+        # the blocked-transition recording pattern next to _maybe_fire_park_stop_trip.
+        # Process-local — resets on restart (same convention as park-stop counters).
+        self._done_transitions_total: int = 0
 
     # --- Park-and-stop pause API (task 1322) ---
 
@@ -781,6 +786,35 @@ class Scheduler:
     def pause_reason(self) -> str | None:
         """Human-readable reason for the current pause, or None if not paused."""
         return self._pause_reason
+
+    @property
+    def done_transitions_total(self) -> int:
+        """Monotonic count of confirmed done-status writes (task 1327 AFK hardening).
+
+        Incremented once per non-rejected set_task_status(..., 'done') call.
+        Process-local — resets to 0 on orchestrator restart.
+        """
+        return self._done_transitions_total
+
+    @property
+    def parked_live_count(self) -> int:
+        """Count of task_ids currently in the park-stop sliding window (de-duped).
+
+        Equal to len(_blocked_task_ids_in_window).  Exposed as a public property
+        so the digest subsystem (and any other observer) does not need to access
+        the private set directly.  Task 1327 encapsulation.
+        """
+        return len(self._blocked_task_ids_in_window)
+
+    @property
+    def parked_window_churn_count(self) -> int:
+        """Count of (task_id, timestamp) entries in the park-stop rolling deque.
+
+        Equal to len(_blocked_transitions).  Counts raw transitions in the window
+        (may exceed parked_live_count if the deque has not been evicted yet).
+        Exposed as a public property for the digest subsystem.  Task 1327.
+        """
+        return len(self._blocked_transitions)
 
     def pause(self, reason: str) -> None:
         """Pause the scheduler.  acquire_next() will return None until resume().
@@ -1112,6 +1146,8 @@ class Scheduler:
                 if status == 'blocked':
                     self._record_blocked_transition(task_id)
                     self._maybe_fire_park_stop_trip()
+                if status == 'done':
+                    self._done_transitions_total += 1
                 return  # success
             last_rejection = rejection
             if not is_transient_rejection(rejection):

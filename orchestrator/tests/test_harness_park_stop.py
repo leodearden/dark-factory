@@ -879,3 +879,549 @@ class TestHarnessCostCeiling:
             'Scheduler must NOT be paused when cost query fails (fail-open)'
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
+
+
+class TestDigestConfig:
+    """Tests for the five digest_* config fields on OrchestratorConfig.
+
+    Task 1327 — AFK hardening: Per-N-escalation digest + EWA escalation/done trip.
+    """
+
+    # ------------------------------------------------------------------
+    # Step 1 — config field defaults
+    # ------------------------------------------------------------------
+
+    def test_config_defaults(self, tmp_path: Path) -> None:
+        """OrchestratorConfig exposes the five digest fields with correct defaults."""
+        import math
+
+        config = OrchestratorConfig(project_root=tmp_path)
+
+        assert config.digest_enabled is True, (
+            f'Expected digest_enabled=True; got {config.digest_enabled!r}'
+        )
+        assert config.digest_every_n_escalations == 10, (
+            f'Expected digest_every_n_escalations=10; got {config.digest_every_n_escalations!r}'
+        )
+        assert config.digest_dir == '', (
+            f'Expected digest_dir=\'\' (empty, callers resolve to <project_root>/data/digests/); '
+            f'got {config.digest_dir!r}'
+        )
+        assert config.digest_ewa_alpha == pytest.approx(0.3), (
+            f'Expected digest_ewa_alpha≈0.3; got {config.digest_ewa_alpha!r}'
+        )
+        # Threshold is the reify 23-day baseline mean+2σ; just assert it's a finite
+        # positive float — the exact value can be tuned without breaking this test.
+        assert isinstance(config.digest_ewa_threshold, float), (
+            f'Expected digest_ewa_threshold to be a float; got {type(config.digest_ewa_threshold)}'
+        )
+        assert math.isfinite(config.digest_ewa_threshold), (
+            f'Expected digest_ewa_threshold to be finite; got {config.digest_ewa_threshold!r}'
+        )
+        assert 0.0 < config.digest_ewa_threshold < 1e6, (
+            f'Expected 0 < digest_ewa_threshold < 1e6; got {config.digest_ewa_threshold!r}'
+        )
+
+    def test_config_overridable(self, tmp_path: Path) -> None:
+        """All five digest fields are overridable via constructor kwargs."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_enabled=False,
+            digest_every_n_escalations=25,
+            digest_dir='/tmp/my-digests',
+            digest_ewa_alpha=0.5,
+            digest_ewa_threshold=99.9,
+        )
+        assert config.digest_enabled is False
+        assert config.digest_every_n_escalations == 25
+        assert config.digest_dir == '/tmp/my-digests'
+        assert isinstance(config.digest_ewa_alpha, float)
+        assert config.digest_ewa_alpha == pytest.approx(0.5)
+        assert isinstance(config.digest_ewa_threshold, float)
+        assert config.digest_ewa_threshold == pytest.approx(99.9)
+
+
+# ---------------------------------------------------------------------------
+# TestSchedulerDoneCounter (step-15)
+# ---------------------------------------------------------------------------
+
+# A minimal success response — extract_rejection({}) returns None (success).
+_MCP_SUCCESS = {}
+
+# A non-transient, non-terminal-exit rejection that causes SetTaskStatusRejected.
+_MCP_REJECTION = {
+    'result': {
+        'structuredContent': {
+            'error': 'some_rejection',
+            'success': False,
+        }
+    }
+}
+
+
+class TestSchedulerDoneCounter:
+    """Tests for Scheduler.done_transitions_total monotonic counter (step-16 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    @pytest.mark.asyncio
+    async def test_done_transitions_increments_on_done(self, tmp_path: Path) -> None:
+        """set_task_status('tX', 'done') increments done_transitions_total."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
+
+        assert scheduler.done_transitions_total == 0
+
+        await scheduler.set_task_status('t1', 'done')
+        await scheduler.set_task_status('t2', 'done')
+        await scheduler.set_task_status('t3', 'done')
+
+        assert scheduler.done_transitions_total == 3, (
+            f'Expected 3 after three done transitions; got {scheduler.done_transitions_total}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_done_status_does_not_increment(self, tmp_path: Path) -> None:
+        """Non-done status (e.g. 'in-progress') does NOT increment the counter."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
+
+        await scheduler.set_task_status('t1', 'in-progress')
+        await scheduler.set_task_status('t2', 'blocked')
+
+        assert scheduler.done_transitions_total == 0, (
+            f'Expected 0 for non-done statuses; got {scheduler.done_transitions_total}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejected_done_does_not_increment(self, tmp_path: Path) -> None:
+        """A rejected set_task_status('t1', 'done') does NOT increment the counter."""
+        from orchestrator.scheduler import SetTaskStatusRejected
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_REJECTION)
+
+        with pytest.raises(SetTaskStatusRejected):
+            await scheduler.set_task_status('t1', 'done')
+
+        assert scheduler.done_transitions_total == 0, (
+            f'Expected 0 after a rejected done; got {scheduler.done_transitions_total}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mark_done_increments_counter(self, tmp_path: Path) -> None:
+        """mark_done routes through set_task_status and increments done_transitions_total."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        scheduler = harness.scheduler
+        scheduler.dispatch_tool = AsyncMock(return_value=_MCP_SUCCESS)
+
+        await scheduler.mark_done('t42', kind='merged', sha='abc123')
+
+        assert scheduler.done_transitions_total == 1, (
+            f'Expected 1 after mark_done; got {scheduler.done_transitions_total}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessEscalationEventCounter (step-17)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_escalation(task_id: str = 't1') -> object:
+    """Build a minimal Escalation instance for callback tests."""
+    from escalation.models import Escalation
+    return Escalation(
+        id=f'esc-{task_id}-1',
+        task_id=task_id,
+        agent_role='r',
+        severity='info',
+        category='infra_issue',
+        summary='s',
+    )
+
+
+class TestHarnessEscalationEventCounter:
+    """Tests for Harness._escalation_event_count sync counter (step-18 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    def test_counter_starts_at_zero(self, tmp_path: Path) -> None:
+        """_escalation_event_count is zero on harness construction."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        assert harness._escalation_event_count == 0, (
+            f'Expected 0; got {harness._escalation_event_count}'
+        )
+
+    def test_on_escalation_increments_counter(self, tmp_path: Path) -> None:
+        """_on_escalation increments _escalation_event_count each call."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+
+        assert harness._escalation_event_count == 3, (
+            f'Expected 3; got {harness._escalation_event_count}'
+        )
+
+    def test_on_escalation_resolved_also_increments(self, tmp_path: Path) -> None:
+        """_on_escalation_resolved increments the same counter."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation_resolved(esc)
+        harness._on_escalation_resolved(esc)
+
+        assert harness._escalation_event_count == 5, (
+            f'Expected 5 (3 submit + 2 resolve); got {harness._escalation_event_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessMaybeWriteDigest (step-19)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessMaybeWriteDigest:
+    """Tests for Harness._maybe_write_digest (step-20 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    @pytest.mark.asyncio
+    async def test_writes_digest_file_when_threshold_met(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When escalation diff >= N, _maybe_write_digest writes a digest file."""
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,  # high threshold — no trip
+        )
+        harness.cost_store = await _cost_store_factory()
+        # diff=5 >= 3 → should trigger
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md'))
+        assert len(files) == 1, f'Expected 1 digest file; got {files}'
+        assert harness._last_digest_event_count == 5, (
+            f'Expected _last_digest_event_count=5; got {harness._last_digest_event_count}'
+        )
+        assert harness._ewa_value != 0.0, (
+            f'Expected _ewa_value to be updated (non-zero); got {harness._ewa_value}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_skips_write(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When digest_enabled=False, _maybe_write_digest returns without writing."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_enabled=False,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 100
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md')) if digest_dir.exists() else []
+        assert files == [], 'Expected no digest file when digest_enabled=False'
+        assert harness._last_digest_event_count == 0, (
+            f'Expected _last_digest_event_count unchanged at 0; '
+            f'got {harness._last_digest_event_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_skips_write(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When diff < N, _maybe_write_digest returns without writing."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 2   # diff=2 < 3 → no trigger
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md')) if digest_dir.exists() else []
+        assert files == [], 'Expected no digest file when diff < N'
+        assert harness._last_digest_event_count == 0, (
+            f'Expected _last_digest_event_count unchanged; '
+            f'got {harness._last_digest_event_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_best_effort_does_not_propagate_exception(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """write_digest_entry raising does not propagate from _maybe_write_digest."""
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+
+        # Patch write_digest_entry to raise — the outer try/except must swallow it.
+        with patch('orchestrator.digest.write_digest_entry', side_effect=RuntimeError('boom')):
+            # Must not raise.
+            await harness._maybe_write_digest()
+
+        # Scheduler must not be paused after a write failure (fail-open).
+        assert harness.scheduler.is_paused is False, (
+            'Scheduler must not be paused when write_digest_entry raises (fail-open)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessEwaTrip (step-21)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessEwaTrip:
+    """Tests for the EWA trip logic in Harness._maybe_write_digest (step-22 impl).
+
+    Task 1327 — AFK hardening.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ewa_trip_pauses_scheduler(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """EWA >= threshold triggers pause_scheduler with reason starting 'ewa_trip_'.
+
+        alpha=1.0, threshold=0.01, done=0, esc=1 → EWA = 1.0*(1/1) = 1.0 >= 0.01 → trip.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=0.01,   # very low — any escalation trips
+            digest_ewa_alpha=1.0,        # alpha=1 → EWA = raw ratio
+        )
+        harness.cost_store = await _cost_store_factory()
+        # 1 new escalation, 0 done → EWA = 1.0*(1/1) = 1.0 >= 0.01
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        assert harness.scheduler.is_paused is True, (
+            'Scheduler must be paused after EWA trip'
+        )
+        reason = harness.scheduler.pause_reason
+        assert reason is not None, 'pause_reason must not be None'
+        assert re.match(r'^ewa_trip_\d+\.\d+$', reason), (
+            f'pause_reason must match ewa_trip_<float>; got {reason!r}'
+        )
+        # RunStore.save_scheduler_pause must have been called with the ewa_trip_ reason.
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        call_kwargs = mock_run_store.save_scheduler_pause.call_args
+        recorded_reason = call_kwargs.kwargs.get('reason') or call_kwargs.args[1]
+        assert recorded_reason.startswith('ewa_trip_'), (
+            f'RunStore reason must start with ewa_trip_; got {recorded_reason!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ewa_trip_already_paused_no_second_pause(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When scheduler is already paused, EWA trip does not issue a second pause.
+
+        RunStore.save_scheduler_pause call count must be 0 after the pre-existing pause
+        is cleared from the mock, proving _maybe_write_digest skips the trip.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=0.01,
+            digest_ewa_alpha=1.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+
+        # Pre-pause the scheduler.
+        await harness.pause_scheduler('pre-existing-pause')
+        mock_run_store.reset_mock()  # clear the prior save_scheduler_pause call
+
+        await harness._maybe_write_digest()
+
+        # No additional save_scheduler_pause must be called.
+        mock_run_store.save_scheduler_pause.assert_not_called()
+        # Original reason is preserved.
+        assert harness.scheduler.pause_reason == 'pre-existing-pause', (
+            f'pause_reason must be unchanged; got {harness.scheduler.pause_reason!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_below_ewa_threshold_no_pause(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """When EWA < threshold, digest file is written but scheduler is NOT paused."""
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=1_000_000_000.0,  # absurdly high — never trips
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 1
+        harness._last_digest_event_count = 0
+
+        await harness._maybe_write_digest()
+
+        # File must exist.
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md'))
+        assert len(files) == 1, f'Expected 1 digest file; got {files}'
+
+        # Scheduler must NOT be paused.
+        assert harness.scheduler.is_paused is False, (
+            'Scheduler must not be paused when EWA is below threshold'
+        )
+        mock_run_store.save_scheduler_pause.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestWatcherSupervisorCallsMaybeWriteDigest (step-23)
+# ---------------------------------------------------------------------------
+
+
+class TestWatcherSupervisorCallsMaybeWriteDigest:
+    """Tests that _watcher_supervisor_loop calls _maybe_write_digest after each rotation.
+
+    Task 1327 — AFK hardening (step-24 impl).
+    """
+
+    @pytest.mark.asyncio
+    async def test_clean_exit_triggers_maybe_write_digest(self, tmp_path: Path) -> None:
+        """A clean rotation exit causes _maybe_write_digest to be awaited."""
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness._maybe_write_digest = AsyncMock()
+
+        # First rotation: clean exit. Second rotation: CancelledError (stops loop).
+        rotation_count = 0
+
+        async def fake_rotation():
+            nonlocal rotation_count
+            rotation_count += 1
+            if rotation_count == 1:
+                return MagicMock(success=True, timed_out=False)
+            raise asyncio.CancelledError()
+
+        harness._run_watcher_rotation = fake_rotation
+
+        async def fast_sleep(_secs):
+            pass  # no-op — skip real delays
+
+        with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
+            await harness._watcher_supervisor_loop()
+
+        harness._maybe_write_digest.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unclean_exit_also_triggers_maybe_write_digest(
+        self, tmp_path: Path
+    ) -> None:
+        """An unclean rotation exit (success=False) also causes _maybe_write_digest to run.
+
+        Quiet days where the watcher crashes must not silence the digest.
+        """
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness._maybe_write_digest = AsyncMock()
+
+        # First rotation: unclean. Second rotation: CancelledError (stops loop).
+        rotation_count = 0
+
+        async def fake_rotation():
+            nonlocal rotation_count
+            rotation_count += 1
+            if rotation_count == 1:
+                return MagicMock(success=False, timed_out=False)
+            raise asyncio.CancelledError()
+
+        harness._run_watcher_rotation = fake_rotation
+
+        async def fast_sleep(_secs):
+            pass  # no-op
+
+        with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
+            await harness._watcher_supervisor_loop()
+
+        harness._maybe_write_digest.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_maybe_write_digest_raising_does_not_break_supervisor(
+        self, tmp_path: Path
+    ) -> None:
+        """_maybe_write_digest raising must not kill the watcher supervisor loop.
+
+        The supervisor must continue to the next rotation after a digest failure.
+        """
+        from unittest.mock import patch
+
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        # Replace with a raising async mock to simulate digest failure.
+        harness._maybe_write_digest = AsyncMock(side_effect=RuntimeError('digest failure'))
+
+        # First rotation: success (digest raises but is swallowed). Second: CancelledError.
+        rotation_count = 0
+
+        async def fake_rotation():
+            nonlocal rotation_count
+            rotation_count += 1
+            if rotation_count == 1:
+                return MagicMock(success=True, timed_out=False)
+            raise asyncio.CancelledError()
+
+        harness._run_watcher_rotation = fake_rotation
+
+        async def fast_sleep(_secs):
+            pass  # no-op
+
+        with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
+            await harness._watcher_supervisor_loop()
+
+        # Supervisor ran two rotations — proving it continued past the digest failure.
+        assert rotation_count == 2, (
+            f'Supervisor must loop to next rotation after digest failure; '
+            f'rotation_count={rotation_count}'
+        )
+        # _maybe_write_digest was called once (on the first rotation).
+        harness._maybe_write_digest.assert_awaited_once()
