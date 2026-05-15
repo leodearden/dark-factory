@@ -2214,3 +2214,45 @@ class TestCompletionOrderVsIdOrderPreservesIdTitlePairing:
         assert 'Add retry logic for database connections' not in rendered, (
             f'Done task 1361 title leaked into rendered Stage-1 block:\n{rendered}'
         )
+
+    def test_filter_task_tree_done_tasks_preserve_id_title_pairing_after_nlargest(self):
+        """filter_task_tree: each done_tasks entry carries its OWN title after heapq.nlargest reorder.
+
+        Pins the regression locus at task_filter.py:235-242:
+            heapq.nlargest(MAX_DONE_TASKS_RETAINED, enumerate(done),
+                           key=lambda p: (id_key(p[1]), -p[0]))
+        The 8df8bdcd scenario has completion order [1369, 1355, 1361].  nlargest
+        reorders by id-descending to [1369, 1361, 1355].  This test asserts:
+        1. Anti-vacuity: exactly 3 done_tasks are returned.
+        2. Each entry's title == the title for THAT entry's id (no neighbor bleed).
+        3. The resulting id order [1369, 1361, 1355] differs from completion order
+           [1369, 1355, 1361], proving the nlargest reorder path is exercised.
+
+        Expected to PASS on addition — production filter_task_tree is already correct
+        and must NOT be modified (task 1403 is test-suite-only).
+        """
+        result = filter_task_tree({'tasks': list(self._TASKS)})
+
+        # Anti-vacuity: all three done tasks returned
+        assert len(result.done_tasks) == 3, (
+            f'Expected 3 done_tasks, got {len(result.done_tasks)}: {result.done_tasks}'
+        )
+
+        # Each entry carries its OWN title (the cycle-8df8bdcd regression contract)
+        title_by_id = {int(k): v for k, v in self._TITLE_BY_ID.items()}
+        for entry in result.done_tasks:
+            eid = int(entry['id'])
+            assert entry['title'] == title_by_id[eid], (
+                f'id {eid}: got title {entry["title"]!r}, expected {title_by_id[eid]!r}'
+            )
+
+        # nlargest reorders completion order [1369,1355,1361] → id-desc [1369,1361,1355]
+        id_order = [int(t['id']) for t in result.done_tasks]
+        assert id_order == [1369, 1361, 1355], (
+            f'Expected id-desc order [1369,1361,1355], got {id_order}'
+        )
+        # Confirm this differs from completion order, proving the reorder path is exercised
+        completion_order = [1369, 1355, 1361]
+        assert id_order != completion_order, (
+            'done_tasks id order matches completion order — nlargest reorder path not exercised'
+        )

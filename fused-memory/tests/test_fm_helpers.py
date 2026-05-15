@@ -147,17 +147,15 @@ async def test_submit_and_resolve_raises_when_no_result_json(row_value):
 
 
 # ---------------------------------------------------------------------------
-# Tests for 8df8bdcd shared scenario builder + parse helpers (step-1 RED)
+# Tests for 8df8bdcd shared scenario builder + parse helpers
 # ---------------------------------------------------------------------------
-# These tests will FAIL until the helpers are implemented in _fm_helpers.py.
-# The imports below are intentionally expected to fail with ImportError or
-# AttributeError until step-2 provides the implementation.
-# ---------------------------------------------------------------------------
+# Helpers are imported lazily inside each test (not at module level) so that
+# a future missing or renamed name surfaces as a localized test failure
+# rather than a collection error that breaks unrelated tests.
 
-# We import the helpers lazily inside each test so that ImportError is the
-# failure mode rather than a collection error that breaks unrelated tests.
-# (If the names don't exist yet, the import will raise ImportError inside
-# the test body, which pytest reports as ERROR/FAILED as expected.)
+# Invalid 'kind' values shared by the two ValueError parametrize tests below.
+# Keep in one place so the contract stays in sync if spelling/cases change.
+_INVALID_KINDS = ['actve', '', 'Active', 'provenence']
 
 
 class TestMake8df8Scenario:
@@ -280,14 +278,6 @@ class TestMake8df8Scenario:
 class TestLineRegexConstants:
     """ID_TITLE_LINE_RE and PROVENANCE_LINE_RE constants exist and parse correctly."""
 
-    def test_id_title_line_re_exists(self):
-        """ID_TITLE_LINE_RE is importable from _fm_helpers."""
-        from _fm_helpers import ID_TITLE_LINE_RE  # noqa: F401
-
-    def test_provenance_line_re_exists(self):
-        """PROVENANCE_LINE_RE is importable from _fm_helpers."""
-        from _fm_helpers import PROVENANCE_LINE_RE  # noqa: F401
-
     def test_id_title_line_re_matches_active_line(self):
         """ID_TITLE_LINE_RE matches a typical active-task rendered line."""
         from _fm_helpers import ID_TITLE_LINE_RE
@@ -368,6 +358,44 @@ class TestParseRenderedIdTitlePairs:
 
         found = parse_rendered_id_title_pairs('No tasks here.', kind='provenance')
         assert found == {}
+
+    @pytest.mark.parametrize('bad_kind', _INVALID_KINDS)
+    def test_parse_raises_value_error_for_invalid_kind(self, bad_kind):
+        """parse_rendered_id_title_pairs raises ValueError for any kind that is not
+        'active' or 'provenance', and the error message includes repr(bad_kind)."""
+        from _fm_helpers import parse_rendered_id_title_pairs
+
+        with pytest.raises(ValueError) as excinfo:
+            parse_rendered_id_title_pairs('- [1369] Some title\n', kind=bad_kind)
+
+        assert repr(bad_kind) in str(excinfo.value), (
+            f"repr({bad_kind!r}) not found in error message: {excinfo.value!r}"
+        )
+
+    def test_parse_valid_kinds_do_not_raise(self):
+        """parse_rendered_id_title_pairs does NOT raise for the two valid kinds,
+        and returns {} for input with no matching lines (empty-input contract)."""
+        from _fm_helpers import parse_rendered_id_title_pairs
+
+        assert parse_rendered_id_title_pairs('No tasks.', kind='active') == {}
+        assert parse_rendered_id_title_pairs('No tasks.', kind='provenance') == {}
+
+    @pytest.mark.parametrize('bad_kind', _INVALID_KINDS)
+    def test_assert_id_title_pairing_raises_value_error_transitively(self, bad_kind):
+        """assert_id_title_pairing fires ValueError transitively for invalid kind
+        (it delegates to parse_rendered_id_title_pairs, so the guard covers both)."""
+        from _fm_helpers import assert_id_title_pairing
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_id_title_pairing(
+                '- [1369] Some title\n',
+                {1369: 'Some title'},
+                kind=bad_kind,
+            )
+
+        assert repr(bad_kind) in str(excinfo.value), (
+            f"repr({bad_kind!r}) not found in error message: {excinfo.value!r}"
+        )
 
 
 class TestAssertIdTitlePairing:
