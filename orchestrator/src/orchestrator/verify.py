@@ -1629,6 +1629,8 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
 async def run_full_verification(
     project_root: Path,
     config: OrchestratorConfig,
+    *,
+    force_rediscover: bool = False,
 ) -> VerifyResult:
     """Run verification for ALL subprojects against the project root.
 
@@ -1646,21 +1648,24 @@ async def run_full_verification(
     the config was constructed without going through ``load_config`` (e.g.
     direct instantiation in tests) so ``_module_configs`` is still ``None``.
 
-    **Staleness note**: because the reuse path reads a snapshot captured at
-    process startup (by ``load_config``), a new subproject whose
-    ``orchestrator.yaml`` is added or merged *after* startup will not appear in
-    the module set until the process restarts.  In the primary production call
-    site (``review_checkpoint.py``) this means a freshly-created subproject
-    module is absent from full verification for the remainder of the current
-    orchestrator run.  If dynamic re-discovery is needed (e.g. after a merge
-    that introduces a new module), pass a fresh ``OrchestratorConfig`` instance
-    (with ``_module_configs`` empty or with a root that differs from
-    ``config.project_root``) to force the fallback walk.
+    **Staleness note**: the reuse path reads a load_config-time snapshot, so a
+    subproject whose ``orchestrator.yaml`` is added or merged *after* startup
+    is absent from full verification for the remainder of the run.  This is an
+    intentional trade-off: the snapshot eliminates the redundant filesystem walk
+    on the hot production review-checkpoint path, where the vast majority of
+    runs see a stable module set.  A mid-run addition is rare; documenting the
+    trade-off and providing an explicit escape hatch is the right balance.
+
+    To force fresh discovery (e.g. after a merge that introduces a new module),
+    pass ``force_rediscover=True``.  The primary production caller
+    ``review_checkpoint.py`` does **not** pass this flag — it keeps the fast
+    snapshot path.  The ``force_rediscover`` parameter is keyword-only so call
+    sites that opt in must state the intent explicitly.
     """
     from orchestrator.config import _discover_module_configs
 
     resolved = project_root.resolve()
-    if config._module_configs is not None and resolved == config.project_root:
+    if not force_rediscover and config._module_configs is not None and resolved == config.project_root:
         module_configs = config._module_configs
     else:
         module_configs = _discover_module_configs(project_root)
