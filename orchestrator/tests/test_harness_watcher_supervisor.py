@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import _WATCHER_TIMEOUT_GRACE_SECS, Harness
+from orchestrator.harness import _WATCHER_MAX_BACKOFF_SECS, _WATCHER_TIMEOUT_GRACE_SECS, Harness
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -427,13 +427,23 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
 async def _run_supervisor_with_rotation_durations(
     h: Harness,
     rotation_durations_secs: list[float],
+    *,
+    expect_cancelled: bool = True,
 ) -> list[float]:
     """Drive _watcher_supervisor_loop with controlled per-rotation durations.
 
     Each entry in *rotation_durations_secs* becomes one paired (start, end)
-    timestamp consumed by the patched ``time.monotonic``.  After all rotations
-    a final start is issued and ``fake_rotation`` raises ``CancelledError`` so
-    the loop terminates cleanly.
+    timestamp consumed by the patched ``time.monotonic``.
+
+    When *expect_cancelled* is ``True`` (the default), a final start timestamp
+    is appended and ``fake_rotation`` raises ``CancelledError`` on the (n+1)th
+    call so the loop terminates cleanly via ``pytest.raises``.
+
+    When *expect_cancelled* is ``False`` the loop is expected to return normally
+    (e.g. because a guard trip fires on the last provided rotation), so no
+    trailing cancellation is injected and ``pytest.raises`` is omitted.  The
+    caller is responsible for configuring any trip-triggering state (e.g. setting
+    ``h.pause_scheduler``) before calling this helper.
 
     Returns the list of floor/backoff sleep durations recorded via the patched
     ``asyncio.sleep``.  The caller is responsible for configuring *h* (config
@@ -448,12 +458,13 @@ async def _run_supervisor_with_rotation_durations(
     n = len(rotation_durations_secs)
 
     t0 = _time_mod.monotonic()
-    # Build paired (start, end) sequence plus one trailing start for the
-    # cancelling (n+1)th rotation call.
+    # Build paired (start, end) sequence; when expect_cancelled=True also append
+    # one trailing start for the cancelling (n+1)th rotation call.
     timestamps: list[float] = []
     for dur in rotation_durations_secs:
         timestamps.extend([t0, t0 + dur])
-    timestamps.append(t0)  # start of the rotation that will raise CancelledError
+    if expect_cancelled:
+        timestamps.append(t0)  # start of the rotation that will raise CancelledError
 
     monotonic_sequence = iter(timestamps)
 
@@ -463,7 +474,7 @@ async def _run_supervisor_with_rotation_durations(
     async def fake_rotation() -> AgentResult:
         nonlocal rotation_calls
         rotation_calls += 1
-        if rotation_calls > n:
+        if expect_cancelled and rotation_calls > n:
             raise asyncio.CancelledError()
         return AgentResult(success=True, output='', timed_out=False)
 
@@ -472,12 +483,19 @@ async def _run_supervisor_with_rotation_durations(
 
     h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
 
-    with (
-        patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-        patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
-        pytest.raises(asyncio.CancelledError),
-    ):
-        await h._watcher_supervisor_loop()
+    if expect_cancelled:
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+    else:
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+        ):
+            await h._watcher_supervisor_loop()
 
     return sleep_durations
 
@@ -1373,6 +1391,104 @@ class TestWatcherMisconfiguredGuard:
         assert sleep_durations == pytest.approx([1.0, 2.0, 1.0, 1.0]), (
             f'Expected [1.0, 2.0, 1.0, 1.0] — healthy rotation at index 2 must reset '
             f'the degenerate counter so index 3 is base (not 4.0); got {sleep_durations}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degenerate_clean_floor_saturates_at_cap(self, tmp_path: Path) -> None:
+        """The exponential degenerate-clean floor is capped at _WATCHER_MAX_BACKOFF_SECS.
+
+        Guards the ``min(..., _WATCHER_MAX_BACKOFF_SECS)`` saturation cap in
+        ``_watcher_supervisor_loop`` (task 1430, degenerate-clean branch) against
+        a regression that drops it.  With base=10.0 and 10
+        consecutive degenerate-clean exits the uncapped sequence would be:
+          [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120]
+        The 10th value (5120.0) exceeds _WATCHER_MAX_BACKOFF_SECS=3600.0 by ~42 %,
+        so a missing cap is unambiguous — the test would observe 5120 instead of 3600.
+        Earlier values (all ≤ 2560) fall below the cap, confirming the cap only
+        triggers when it should.
+        """
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,   # disable trip
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 10.0,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_max_crashloop_restarts': 99,          # disable crashloop trip
+        })
+        # 10 consecutive degenerate-clean rotations (1s each, well under 120s threshold)
+        sleep_durations = await _run_supervisor_with_rotation_durations(h, [1.0] * 10)
+        assert len(sleep_durations) == 10, (
+            f'Expected 10 sleep durations (one per rotation); got {len(sleep_durations)}'
+        )
+        assert sleep_durations == pytest.approx([
+            10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 640.0, 1280.0, 2560.0,
+            _WATCHER_MAX_BACKOFF_SECS,
+        ]), (
+            f'Expected exponential sequence capped at {_WATCHER_MAX_BACKOFF_SECS} on '
+            f'the 10th rotation (uncapped value would be 5120.0); got {sleep_durations}'
+        )
+        # Extra cross-check: every sleep must respect the cap
+        assert all(s <= _WATCHER_MAX_BACKOFF_SECS for s in sleep_durations), (
+            f'One or more sleeps exceeded _WATCHER_MAX_BACKOFF_SECS={_WATCHER_MAX_BACKOFF_SECS}: '
+            f'{sleep_durations}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degenerate_clean_trip_fires_during_exponential_growth(
+        self, tmp_path: Path
+    ) -> None:
+        """Trip fires correctly while the exponential floor is actively growing.
+
+        Task 1430 moved ``consecutive_degenerate_clean += 1`` *before* the
+        ``_check_watcher_guard`` call in ``_watcher_supervisor_loop`` so the
+        floor calculation always uses the post-increment counter.  This test
+        verifies that ordering:
+
+        - Iters 1 and 2: no trip (deque length < max_misconfig=3); floor is
+          base * 2^(n-1) using the post-increment counter → sleeps [1.0, 2.0].
+        - Iter 3: trip arms (deque length == max_misconfig=3) → pause_scheduler
+          called, loop returns; no sleep issued for iter 3.
+
+        Complements the existing ``test_misconfigured_trips_pause_scheduler`` which
+        uses base=0.0 (floor always 0, increment ordering invisible).  With base=1.0
+        a regression moving the increment to *after* the guard call would yield
+        floors [base, base] = [1.0, 1.0] instead of [1.0, 2.0], catching the ordering
+        bug while still firing the trip on iter 3.
+        """
+        max_misconfig = 3
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': max_misconfig,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,  # NON-zero: floor is observable
+            'watcher_crashloop_window_secs': 600,
+            'watcher_max_crashloop_restarts': 99,  # disable crashloop trip
+        })
+
+        pause_calls: list[str] = []
+
+        async def fake_pause_scheduler(reason: str) -> None:
+            pause_calls.append(reason)
+
+        h.pause_scheduler = fake_pause_scheduler  # type: ignore[method-assign]
+
+        # 3 rotations of 1s each (all < 120s threshold → degenerate-clean).
+        # On iter 3 the trip arms and the supervisor returns normally — not via CancelledError.
+        sleep_durations = await _run_supervisor_with_rotation_durations(
+            h, [1.0, 1.0, 1.0], expect_cancelled=False
+        )
+
+        assert pause_calls == ['watcher_misconfigured'], (
+            f'Expected pause_scheduler("watcher_misconfigured") once; got {pause_calls}'
+        )
+        # Key assertion: floor sequence proves pre-guard increment ordering.
+        # Iter 1: consecutive=1 → floor = 1.0 * 2^0 = 1.0
+        # Iter 2: consecutive=2 → floor = 1.0 * 2^1 = 2.0
+        # Iter 3: trip fires → no sleep (returns before reaching floor calculation)
+        # len(sleep_durations)==2 also confirms exactly 3 rotations ran (2 slept + 1 tripped).
+        assert sleep_durations == pytest.approx([1.0, 2.0]), (
+            f'Expected sleep_durations [1.0, 2.0] (pre-guard increment gives base*2^0 '
+            f'then base*2^1 before trip arms on iter 3); got {sleep_durations}'
         )
 
 
