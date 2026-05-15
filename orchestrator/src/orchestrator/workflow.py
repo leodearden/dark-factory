@@ -345,6 +345,13 @@ class TaskWorkflow:
         # from destroying long-running investigations before they complete.
         self._background_tasks: set = set()
 
+        # In-task dedup cache for _route_review_suggestions_to_curator.
+        # Stores the content_hash of the most recently routed suggestion batch.
+        # The escalation→resume cycle can re-enter REVIEW→DONE with identical
+        # suggestions; this sentinel short-circuits the re-entry so the
+        # curator R4 gate never has to absorb redundant N-HTTP batches.
+        self._last_routed_suggestion_hash: str | None = None
+
         # One-shot guard for the architect plan-tightening retry.  Set
         # True on first _try_narrow_plan call regardless of outcome so
         # the workflow never loops the narrowing pass on the same task.
@@ -4939,6 +4946,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not suggestions:
             return
 
+        # In-task dedup: compute the hash first so the cache check sits above
+        # ALL routing branches (curator submit, escalation-queue fallback, no-op).
+        # The escalation→resume cycle can re-enter REVIEW→DONE with an identical
+        # suggestion set; short-circuiting here avoids N HTTP round-trips that
+        # the curator R4 gate (_check_escalation_idempotency) would otherwise
+        # have to absorb on the server side.
+        content_hash = review_suggestion_payload_hash(suggestions)
+        if self._last_routed_suggestion_hash == content_hash:
+            logger.info(
+                'Task %s: skipping duplicate curator route (hash=%s already sent)',
+                self.task_id, content_hash,
+            )
+            return
+
         # Guard: fall back if MCP transport is unavailable so suggestions are
         # never silently dropped.  _escalate_suggestions is the real caller of
         # the steward-escalation fallback path.
@@ -4951,9 +4972,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     'escalation queue configured (CLI/dry-run/test no-op)',
                     self.task_id, len(suggestions),
                 )
+            self._last_routed_suggestion_hash = content_hash
             return
-
-        content_hash = review_suggestion_payload_hash(suggestions)
         task_id = self.task_id
         project_root = str(self.config.project_root)
 
@@ -4992,6 +5012,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 'Task %s: failed to schedule curator submits: %s',
                 task_id, exc,
             )
+
+        # Record the hash so subsequent identical re-entries short-circuit.
+        self._last_routed_suggestion_hash = content_hash
 
         logger.info(
             'Task %s: scheduled %d suggestion(s) for direct curator intake '
