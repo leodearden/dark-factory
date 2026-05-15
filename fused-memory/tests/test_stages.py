@@ -39,6 +39,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _format_flagged,
     _needs_hint_conversion,
     _queue_briefing_refresh_tasks,
+    _render_done_provenance_section,
     _resolve_live_status,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
@@ -50,6 +51,7 @@ from fused_memory.reconciliation.task_filter import (
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
     filter_task_tree,
+    format_task_list,
     id_key,
 )
 
@@ -8895,3 +8897,204 @@ class TestStage2HintConversionDetection:
             f'Hint section references task IDs absent from the Active Task Tree: {sorted(orphaned)}\n'
             f'hint_ids={sorted(hint_ids)}, active_tree_ids={sorted(active_tree_ids)}'
         )
+
+
+# ── Regression: cycle 8df8bdcd — Stage 2 Recently-Completed/Done-Provenance
+#    title↔task_id contract (task 1379) ─────────────────────────────────────
+#
+# Cycle 8df8bdcd: tasks 1355/1361/1369 appeared in Stage 1 output each
+# carrying the NEXT task's title in the sorted completion sequence.
+# Investigation (task 1379, supersedes dc68f7b9, corroborates d3f56765):
+# _render_done_provenance_section and format_task_list read id+title from the
+# SAME task dict — no zip/index offset possible.  These tests lock the Stage 2
+# "Recently Completed Tasks" and "Done-task Provenance" formatters so any
+# future reintroduction of positional title resolution is caught.
+
+
+class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
+    """Stage 2 formatters: id↔title pairing locked across all provenance branches.
+
+    Rendering notes for _render_done_provenance_section:
+    - Legacy branch (no metadata.done_provenance): always renders '- [id] title — ...'
+    - Commit branch (project_root set):            renders '- [id] title\n  commit: sha'
+    - Commit branch (project_root=None):           renders nothing (commit and project_root check fails)
+    - Note-only branch:                            renders '  note: text' with NO [id] header
+    Tests assert id↔title for every branch that DOES render a parseable id-line,
+    and verify no neighbor-title bleed in each branch's individual output.
+    """
+
+    # Fixture: 8df8bdcd scenario (non-consecutive ids, distinct titles,
+    # completion order 1369→1355→1361 differs from id-sort order 1355<1361<1369).
+    # Provenance branches:
+    #   1369 — commit (rendered with project_root='/tmp' so branch fires)
+    #   1355 — note-only (renders '  note: ...' without a [id] header)
+    #   1361 — legacy/none (renders '- [id] title — provenance: unknown (legacy)')
+    _TASKS: list[dict] = [
+        {
+            'id': 1369,
+            'title': 'Refactor event dispatch to async',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'done_provenance': {'commit': 'abc123deadbeef'}},
+        },
+        {
+            'id': 1355,
+            'title': 'Implement rate limiter middleware',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {'done_provenance': {'note': 'Covered by sibling task 1354'}},
+        },
+        {
+            'id': 1361,
+            'title': 'Add retry logic for database connections',
+            'status': 'done',
+            'dependencies': [],
+            # No metadata.done_provenance → legacy branch
+        },
+    ]
+    _TITLE_BY_ID: dict[int, str] = {t['id']: t['title'] for t in _TASKS}
+
+    @pytest.mark.asyncio
+    async def test_render_done_provenance_section_commit_and_legacy_preserve_id_title(self):
+        """_render_done_provenance_section: rendered [id] headers carry each task's OWN title.
+
+        Covers the commit branch (project_root=/tmp → fires header even if git fails
+        on a fake sha) and the legacy branch.  The note-only branch (id=1355) does
+        NOT render a [id] header by design — its note line has no id to check.
+        Regex-extracts [id] → title from rendered lines and compares to the seeded map.
+        """
+        import re
+
+        # project_root='/tmp' → commit branch fires (git show fails gracefully on fake sha)
+        rendered = await _render_done_provenance_section(list(self._TASKS), project_root='/tmp')
+
+        assert '### Done-task Provenance' in rendered, (
+            f'Provenance section header missing:\n{rendered!r}'
+        )
+
+        # Extract pairs from lines of the form: '- [<id>] <title>' (optionally followed by — or newline)
+        line_pattern = re.compile(r'^- \[(\d+)\] (.+?)(?:\s*—|\s*$)', re.MULTILINE)
+        found: dict[int, str] = {}
+        for m in line_pattern.finditer(rendered):
+            tid = int(m.group(1))
+            found_title = m.group(2).strip()
+            found[tid] = found_title
+
+        # Commit (1369) and legacy (1361) must appear; note-only (1355) has no [id] line
+        assert 1369 in found, (
+            f'Commit branch id=1369 missing from rendered:\n{rendered!r}'
+        )
+        assert 1361 in found, (
+            f'Legacy branch id=1361 missing from rendered:\n{rendered!r}'
+        )
+
+        # Each rendered [id] must carry its OWN title
+        for tid, rendered_title in found.items():
+            expected_title = self._TITLE_BY_ID[tid]
+            assert rendered_title == expected_title, (
+                f'[{tid}] rendered title={rendered_title!r}, '
+                f'expected own title={expected_title!r}\n'
+                f'rendered:\n{rendered}'
+            )
+
+        # No task's title should appear adjacent to another task's id
+        all_titles = list(self._TITLE_BY_ID.values())
+        for line in rendered.splitlines():
+            id_match = re.search(r'\[(\d+)\]', line)
+            if not id_match:
+                continue
+            tid = int(id_match.group(1))
+            if tid not in self._TITLE_BY_ID:
+                continue
+            own_title = self._TITLE_BY_ID[tid]
+            for title in all_titles:
+                if title == own_title:
+                    continue
+                assert title not in line, (
+                    f'Line for [{tid}] contains neighbor title {title!r}:\n  {line!r}'
+                )
+
+    def test_format_task_list_recently_completed_preserves_id_title_pairing(self):
+        """format_task_list for Recently Completed section: id↔title locked.
+
+        The '### Recently Completed Tasks' section is rendered via format_task_list
+        on done_tasks.  Verifies the 8df8bdcd scenario across completion-order
+        ≠ id-sort-order, covering all provenance branch types.
+        """
+        import re
+
+        rendered = format_task_list(list(self._TASKS))
+        assert rendered != 'No tasks.'
+
+        line_pattern = re.compile(r'^- \[(\d+)\] \([^)]+\) (.+?) deps=', re.MULTILINE)
+        found: dict[int, str] = {}
+        for m in line_pattern.finditer(rendered):
+            found[int(m.group(1))] = m.group(2)
+
+        assert set(found.keys()) == set(self._TITLE_BY_ID.keys()), (
+            f'Expected ids {set(self._TITLE_BY_ID.keys())}, got {set(found.keys())}\n'
+            f'rendered:\n{rendered}'
+        )
+
+        for tid, rendered_title in found.items():
+            expected_title = self._TITLE_BY_ID[tid]
+            assert rendered_title == expected_title, (
+                f'Recently Completed [id={tid}]: rendered={rendered_title!r}, '
+                f'expected own title={expected_title!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_provenance_branch_commit_renders_own_id_and_title(self):
+        """commit branch (project_root set): header carries this task's OWN id and title."""
+        task = self._TASKS[0]  # id=1369, commit branch
+        # project_root='/tmp' → branch fires; git show returns '' for fake sha (graceful)
+        rendered = await _render_done_provenance_section([task], project_root='/tmp')
+
+        assert f'[{task["id"]}]' in rendered, (
+            f'Commit branch: id {task["id"]} missing:\n{rendered!r}'
+        )
+        assert task['title'] in rendered, (
+            f'Commit branch: title {task["title"]!r} missing:\n{rendered!r}'
+        )
+        # Neighbor titles must NOT appear
+        for other in self._TASKS[1:]:
+            assert other['title'] not in rendered, (
+                f'Commit branch: neighbor title {other["title"]!r} leaked into:\n{rendered!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_provenance_branch_note_content_does_not_bleed_neighbor_titles(self):
+        """note-only branch: rendered note text contains no neighbor task titles.
+
+        The note branch renders '  note: <text>' WITHOUT a [id] header (by design).
+        The contract asserted here: no other task's title bleeds into the note line.
+        """
+        task = self._TASKS[1]  # id=1355, note branch
+        rendered = await _render_done_provenance_section([task], project_root=None)
+
+        # Note line is rendered
+        assert 'note: Covered by sibling task 1354' in rendered, (
+            f'Note branch: note text missing:\n{rendered!r}'
+        )
+        # No neighbor title should appear anywhere
+        for other in [self._TASKS[0], self._TASKS[2]]:
+            assert other['title'] not in rendered, (
+                f'Note branch: neighbor title {other["title"]!r} leaked:\n{rendered!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_provenance_branch_legacy_renders_own_id_and_title(self):
+        """legacy branch: header line carries this task's OWN id and title."""
+        task = self._TASKS[2]  # id=1361, legacy branch
+        rendered = await _render_done_provenance_section([task], project_root=None)
+
+        assert f'[{task["id"]}]' in rendered, (
+            f'Legacy branch: id {task["id"]} missing:\n{rendered!r}'
+        )
+        assert task['title'] in rendered, (
+            f'Legacy branch: title {task["title"]!r} missing:\n{rendered!r}'
+        )
+        for other in self._TASKS[:2]:
+            assert other['title'] not in rendered, (
+                f'Legacy branch: neighbor title {other["title"]!r} leaked:\n{rendered!r}'
+            )
