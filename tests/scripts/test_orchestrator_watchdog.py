@@ -12,6 +12,7 @@ import subprocess
 import types
 
 import pytest
+import yaml
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
@@ -409,6 +410,46 @@ def test_elapsed_empty_stdout_returns_none(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert wdog._unit_start_elapsed_secs("some.service") is None
+
+
+# ---------------------------------------------------------------------------
+# Config-drift guard test
+# ---------------------------------------------------------------------------
+
+
+def test_watched_ports_match_configured_escalation_ports() -> None:
+    """WATCHED ports must equal the escalation.port values in each orchestrator's config.
+
+    This is a behavioral drift guard: it passes when the ports are aligned and
+    fails if WATCHED or either config file drifts to a different port number.
+    The reify config is skipped gracefully if it is not reachable (e.g. CI).
+    """
+    wdog = _load_watchdog()
+
+    # Build a unit→port map from WATCHED for convenient lookup
+    unit_to_port = {unit: port for port, unit in wdog.WATCHED}
+
+    # --- dark-factory orchestrator ---
+    df_config_path = REPO_ROOT / "orchestrator" / "config.yaml"
+    df_cfg = yaml.safe_load(df_config_path.read_text())
+    df_port = df_cfg["escalation"]["port"]
+    assert unit_to_port["dark-factory-orchestrator.service"] == df_port, (
+        f"WATCHED port for dark-factory-orchestrator.service "
+        f"({unit_to_port['dark-factory-orchestrator.service']}) != "
+        f"orchestrator/config.yaml escalation.port ({df_port})"
+    )
+
+    # --- reify orchestrator (skip if absent in this environment) ---
+    reify_config_path = pathlib.Path("/home/leo/src/reify/orchestrator.yaml")
+    if not reify_config_path.exists():
+        pytest.skip("reify orchestrator.yaml not reachable in this environment")
+    reify_cfg = yaml.safe_load(reify_config_path.read_text())
+    reify_port = reify_cfg["escalation"]["port"]
+    assert unit_to_port["reify-orchestrator.service"] == reify_port, (
+        f"WATCHED port for reify-orchestrator.service "
+        f"({unit_to_port['reify-orchestrator.service']}) != "
+        f"reify/orchestrator.yaml escalation.port ({reify_port})"
+    )
 
 
 # ---------------------------------------------------------------------------
