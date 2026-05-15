@@ -1,5 +1,6 @@
 """Tests for configuration loading."""
 
+import logging
 from importlib import resources as pkg_resources
 from pathlib import Path
 
@@ -385,6 +386,64 @@ class TestModuleConfigDiscovery:
         assert '.' not in configs, "root-level (prefix '.') must not appear in results"
         # Confirm no key for the root-level file leaked in any form
         assert len(configs) == 1
+
+    @pytest.mark.parametrize('excluded_name', ['build', 'target'])
+    def test_pruned_dir_containing_orchestrator_yaml_is_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, excluded_name: str
+    ):
+        """_discover_module_configs emits a WARNING when a pruned reserved-name directory
+        directly contains an orchestrator.yaml (the 'shadow' case).
+
+        Acceptance criteria:
+          (a) The excluded directory is NOT returned in configs (exclusion preserved).
+          (b) A warning record mentions both the relative path and the reserved name.
+        """
+        shadow_dir = tmp_path / excluded_name
+        shadow_dir.mkdir()
+        (shadow_dir / 'orchestrator.yaml').write_text(yaml.dump({'test_command': 'pytest'}))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            configs = _discover_module_configs(tmp_path)
+
+        # (a) Excluded directory must not appear in returned configs
+        assert excluded_name not in configs, (
+            f"Reserved dir {excluded_name!r} must not appear in discovery results"
+        )
+
+        # (b) At least one warning mentioning the path and the reserved name
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            excluded_name in r.getMessage()
+            for r in warning_records
+        ), (
+            f"Expected a WARNING mentioning {excluded_name!r} for shadow orchestrator.yaml; "
+            f"got records: {[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_pruned_dir_without_orchestrator_yaml_emits_no_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """_discover_module_configs does NOT emit a warning for a pruned directory that
+        has no direct orchestrator.yaml (false-positive guard)."""
+        # build/ exists but only contains a subdirectory — no immediate orchestrator.yaml
+        build_sub = tmp_path / 'build' / 'some_sub'
+        build_sub.mkdir(parents=True)
+        (build_sub / 'file.py').write_text('# placeholder')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            _discover_module_configs(tmp_path)
+
+        pruned_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'build' in r.getMessage()
+        ]
+        assert pruned_warnings == [], (
+            f"Expected no warnings for build/ (no direct orchestrator.yaml); "
+            f"got: {[r.getMessage() for r in pruned_warnings]}"
+        )
 
 
 class TestLayeredConfig:
