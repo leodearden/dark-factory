@@ -4323,6 +4323,66 @@ class TestEscalationServerUsesEnqueueHelper:
 
 
 # ---------------------------------------------------------------------------
+# TestEscalationServerMergeRequestModuleConfigsNone — step-1 regression test
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationServerMergeRequestModuleConfigsNone:
+    """Regression: merge_request must not raise when _module_configs is None.
+
+    Post-1405, OrchestratorConfig._module_configs defaults to None (PrivateAttr).
+    Configs built by direct instantiation (e.g. build_eval_orch_config) keep the
+    sentinel at None.  Pre-fix server.py:321 calls None.values() → AttributeError.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merge_request_with_none_module_configs_does_not_raise(
+        self, tmp_path: Path,
+    ):
+        """merge_request tool must succeed and pass module_configs=[] when
+        _module_configs is the post-1405 None sentinel (not {})."""
+        from escalation.server import create_server
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+
+        merge_queue: asyncio.Queue = asyncio.Queue()
+        event_store = EventStore(db_path=tmp_path / 'test.db', run_id='test')
+
+        # Stub orch_config with the post-1405 None sentinel (not {})
+        _spec2 = pydantic_spec(OrchestratorConfig)
+        stub_config = MagicMock(spec_set=_spec2)
+        stub_config._module_configs = None  # ← post-1405 direct-instantiation path
+
+        # Mock resolves the future so the tool doesn't hang
+        async def _mock_enqueue(queue, req, es):
+            if not req.result.done():
+                req.result.set_result(MergeOutcome('done'))
+
+        mock_helper = AsyncMock(side_effect=_mock_enqueue)
+
+        with patch('orchestrator.merge_queue.enqueue_merge_request', mock_helper):
+            mcp = create_server(
+                MagicMock(),
+                merge_queue=merge_queue,
+                orch_config=stub_config,
+                event_store=event_store,
+            )
+            from fastmcp.tools.function_tool import FunctionTool
+            tool = await mcp.get_tool('merge_request')
+            assert isinstance(tool, FunctionTool)
+            # Pre-fix: raises AttributeError: 'NoneType' object has no attribute 'values'
+            await tool.fn(task_id='9', branch='task/9', worktree='/tmp/x')
+
+        # (a) no AttributeError — we reached here
+        mock_helper.assert_called_once()
+        call_queue, call_req, call_es = mock_helper.call_args.args
+        assert isinstance(call_req, MergeRequest)
+        # (c) None sentinel must collapse to [] via the `or {}` fallback
+        assert call_req.module_configs == []
+
+
+# ---------------------------------------------------------------------------
 # TestPushHook — main is mirrored to origin after every successful CAS advance
 # ---------------------------------------------------------------------------
 
