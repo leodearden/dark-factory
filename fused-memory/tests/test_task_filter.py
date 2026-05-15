@@ -2147,6 +2147,9 @@ class TestCompletionOrderVsIdOrderPreservesIdTitlePairing:
 
         Uses the 8df8bdcd done-task set in completion order (1369→1355→1361)
         and regex-extracts the id→title mapping from the rendered output.
+        Includes an explicit anti-vacuity guard: asserts all 3 expected ids were
+        matched (so a zero-match regex can never silently pass — mirrors the sibling
+        tests in test_stages.py and test_format_filtered_task_tree_active_tasks_*).
         """
         import re
 
@@ -2154,20 +2157,25 @@ class TestCompletionOrderVsIdOrderPreservesIdTitlePairing:
         assert rendered != 'No tasks.', 'format_task_list returned empty output'
 
         # Parse lines of the form: - [<id>] (<status>) <title> deps=[...]
-        line_pattern = re.compile(r'^- \[(\d+)\] \([^)]+\) (.+?) deps=')
-        for line in rendered.splitlines():
-            m = line_pattern.match(line)
-            if not m:
-                continue
-            tid = int(m.group(1))
-            rendered_title = m.group(2)
-            if tid in self._TITLE_BY_ID:
-                expected_title = self._TITLE_BY_ID[tid]
-                assert rendered_title == expected_title, (
-                    f'Line for id={tid}: rendered title={rendered_title!r}, '
-                    f'expected own title={expected_title!r}\n'
-                    f'  Full line: {line!r}'
-                )
+        line_pattern = re.compile(r'^- \[(\d+)\] \([^)]+\) (.+?) deps=', re.MULTILINE)
+        found: dict[int, str] = {}
+        for m in line_pattern.finditer(rendered):
+            found[int(m.group(1))] = m.group(2)
+
+        # Anti-vacuity guard: all expected ids must appear in the rendered output
+        assert set(found.keys()) == set(self._TITLE_BY_ID.keys()), (
+            f'Expected ids {set(self._TITLE_BY_ID.keys())}, got {set(found.keys())}.\n'
+            f'If found is empty the regex matched nothing — test is vacuous.\n'
+            f'Rendered output:\n{rendered}'
+        )
+
+        for tid, rendered_title in found.items():
+            expected_title = self._TITLE_BY_ID[tid]
+            assert rendered_title == expected_title, (
+                f'Line for id={tid}: rendered title={rendered_title!r}, '
+                f'expected own title={expected_title!r}\n'
+                f'Rendered output:\n{rendered}'
+            )
 
     def test_format_filtered_task_tree_active_tasks_preserve_id_title_pairing(self):
         """format_filtered_task_tree: active task lines pair each id with its OWN title.

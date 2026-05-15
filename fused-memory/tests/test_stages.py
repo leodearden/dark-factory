@@ -8958,15 +8958,21 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
     async def test_render_done_provenance_section_commit_and_legacy_preserve_id_title(self):
         """_render_done_provenance_section: rendered [id] headers carry each task's OWN title.
 
-        Covers the commit branch (project_root=/tmp → fires header even if git fails
-        on a fake sha) and the legacy branch.  The note-only branch (id=1355) does
-        NOT render a [id] header by design — its note line has no id to check.
+        Covers the commit branch (project_root set → fires [id] header) and the legacy
+        branch.  The note-only branch (id=1355) does NOT render a [id] header by design.
         Regex-extracts [id] → title from rendered lines and compares to the seeded map.
+        _git_show_name_only is patched to '' to avoid spawning a real git subprocess
+        (which is env-dependent if project_root happens to be inside a git worktree).
         """
         import re
 
-        # project_root='/tmp' → commit branch fires (git show fails gracefully on fake sha)
-        rendered = await _render_done_provenance_section(list(self._TASKS), project_root='/tmp')
+        # Patch _git_show_name_only so commit branch fires deterministically without a
+        # real subprocess (git show result is irrelevant to the id↔title assertion).
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync._git_show_name_only',
+            new=AsyncMock(return_value=''),
+        ):
+            rendered = await _render_done_provenance_section(list(self._TASKS), project_root='/tmp')
 
         assert '### Done-task Provenance' in rendered, (
             f'Provenance section header missing:\n{rendered!r}'
@@ -9045,10 +9051,18 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
 
     @pytest.mark.asyncio
     async def test_provenance_branch_commit_renders_own_id_and_title(self):
-        """commit branch (project_root set): header carries this task's OWN id and title."""
+        """commit branch (project_root set): header carries this task's OWN id and title.
+
+        _git_show_name_only is patched to '' to avoid spawning a real git subprocess
+        (env-dependent if project_root is inside a git worktree).
+        """
         task = self._TASKS[0]  # id=1369, commit branch
-        # project_root='/tmp' → branch fires; git show returns '' for fake sha (graceful)
-        rendered = await _render_done_provenance_section([task], project_root='/tmp')
+        # Patch _git_show_name_only so the commit branch fires without a real subprocess.
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync._git_show_name_only',
+            new=AsyncMock(return_value=''),
+        ):
+            rendered = await _render_done_provenance_section([task], project_root='/tmp')
 
         assert f'[{task["id"]}]' in rendered, (
             f'Commit branch: id {task["id"]} missing:\n{rendered!r}'
